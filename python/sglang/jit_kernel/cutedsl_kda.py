@@ -1,11 +1,17 @@
 """CuTe DSL Fused Sigmoid Gating Delta Rule Kernel for KDA Decode.
 
-KDA (Kimi Delta Attention) differs from GDN in that the gating parameters
-`a` and `dt_bias` are per-key-dimension vectors instead of scalars.
-This results in per-row (per-K-dim) gating of the hidden state matrix:
-    h[k, v] *= exp(g[k])   (KDA, g is a K-vector)
-vs.
-    h *= exp(g)             (GDN, g is a scalar)
+This version uses production / Triton-compatible VK state layout:
+    state.shape == (pool_size, HV, V, K)
+
+The kernel still computes on a logical (K, V) matrix in shared memory. Global
+state loads/stores therefore explicitly map:
+    global(V, K) <-> shared(K, V)
+
+Notes:
+- This is a correctness-first implementation for decode.
+- It keeps the original small-batch / large-batch split.
+- It preserves the previous PAD semantics: if pool_idx < 0 the block does not
+  load / update / write output or state, consistent with the earlier CuTe path.
 """
 
 import logging
@@ -15,13 +21,13 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
 logger = logging.getLogger(__name__)
 
 _compiled_kernels: Dict[Tuple, object] = {}
 _cu_seqlens_cache: Dict[Tuple, torch.Tensor] = {}
+
 TILE_K = 128
 TILE_V = 32
 TILE_V_PADDED = 36
@@ -68,7 +74,8 @@ def _define_kernels():
         HV: cutlass.Constexpr[int],
         use_qk_l2norm: cutlass.Constexpr[bool],
     ):
-        """Small batch KDA kernel for (N, 1, ...) format."""
+        """Small batch KDA kernel for dense decode: q/k/v shapes (N, 1, ...)."""
+        del tiled_copy_load
         tidx, _, _ = cute.arch.thread_idx()
         in_warp_tid = tidx % 32
         warp_idx = cute.arch.warp_idx()
@@ -98,33 +105,17 @@ def _define_kernels():
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
             smem_k_layout = cute.make_layout((TILE_K,), stride=(1,))
             smem_q_layout = cute.make_layout((TILE_K,), stride=(1,))
+            smem_g_layout = cute.make_layout((TILE_K,), stride=(1,))
             sK = smem.allocate_tensor(cutlass.Float32, smem_k_layout, 128)
             sQ = smem.allocate_tensor(cutlass.Float32, smem_q_layout, 128)
-            # KDA: shared memory for per-K gating values
-            smem_g_layout = cute.make_layout((TILE_K,), stride=(1,))
             sG = smem.allocate_tensor(cutlass.Float32, smem_g_layout, 128)
 
             if tidx < TILE_K:
                 sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
 
-            gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
-            gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
-            thr_copy_load = tiled_copy_load.get_slice(tidx)
-
-            prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles_per_block)
-            for v_tile_offset in range(prefetch_count):
-                v_tile = start_v_tile + v_tile_offset
-                stage = v_tile_offset % NUM_STAGES
-                gSrc_tile = gSrc[(None, None, v_tile)]
-                sData_stage = sData[(None, None, stage)]
-                thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
-                thr_sData = thr_copy_load.partition_D(sData_stage)
-                cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-                cute.arch.cp_async_commit_group()
-
-            # KDA: compute per-K gating values in parallel
             r_A_log = cutlass.Float32(A_log[i_hv])
+            r_exp_A = cute.exp(r_A_log)
             if tidx < TILE_K:
                 r_a_k = cutlass.Float32(a[i_n, 0, i_hv, tidx])
                 r_dt_bias_k = cutlass.Float32(dt_bias[i_hv, tidx])
@@ -140,13 +131,11 @@ def _define_kernels():
                     )
                 else:
                     softplus_x = x
-                r_g_value = -cute.exp(r_A_log) * softplus_x
-                sG[tidx] = cute.exp(r_g_value)
+                sG[tidx] = cute.exp(-r_exp_A * softplus_x)
 
-            # Compute beta (scalar, same as GDN)
-            r_b = cutlass.Float32(b[i_n, 0, i_hv])
             r_beta = 0.0
             if in_warp_tid == 0:
+                r_b = cutlass.Float32(b[i_n, 0, i_hv])
                 r_beta = 1.0 / (1.0 + cute.exp(-r_b))
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
@@ -174,8 +163,6 @@ def _define_kernels():
                     smem_o[warp_idx + 4] = sum_k_partial
                 cute.arch.barrier()
 
-                inv_norm_q = 0.0
-                inv_norm_k = 0.0
                 if warp_idx == 0:
                     local_sum_q = 0.0
                     local_sum_k = 0.0
@@ -207,34 +194,34 @@ def _define_kernels():
                 cute.arch.barrier()
 
             for v_tile_offset in range(num_v_tiles_per_block):
-                v_tile = start_v_tile + v_tile_offset
                 stage = v_tile_offset % NUM_STAGES
+                v_tile = start_v_tile + v_tile_offset
 
-                cute.arch.cp_async_wait_group(0)
+                for k_iter in range(NUM_K_ITERS_SMALL):
+                    flat_idx = tidx + k_iter * NUM_THREADS
+                    k_load = flat_idx // TILE_V_SMALL
+                    v_load = flat_idx % TILE_V_SMALL
+                    if k_load < TILE_K:
+                        v_global_load = v_tile * TILE_V_SMALL + v_load
+                        h_val = 0.0
+                        if v_global_load < v.shape[3]:
+                            h_val = cutlass.Float32(
+                                h0_source[(pool_idx, i_hv, v_global_load, k_load)]
+                            )
+                        sData[(k_load, v_load, stage)] = h_val
+
                 cute.arch.barrier()
 
-                next_v_tile_offset = v_tile_offset + prefetch_count
-                if next_v_tile_offset < num_v_tiles_per_block:
-                    next_v_tile = start_v_tile + next_v_tile_offset
-                    next_stage = next_v_tile_offset % NUM_STAGES
-                    gSrc_next = gSrc[(None, None, next_v_tile)]
-                    sData_next = sData[(None, None, next_stage)]
-                    thr_gSrc = thr_copy_load.partition_S(gSrc_next)
-                    thr_sData = thr_copy_load.partition_D(sData_next)
-                    cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-                    cute.arch.cp_async_commit_group()
-
                 v_global = v_tile * TILE_V_SMALL + v_idx
-                r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
+                r_v = 0.0
+                if v_global < v.shape[3]:
+                    r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
-                # KDA: use per-K gating sG[k_idx] instead of scalar r_g
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in range(NUM_K_ITERS_SMALL):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
-                    h_val = sData[(k_idx, v_idx, stage)] * sG[k_idx]
-                    r_k_val = sK[k_idx]
-                    sum_hk += h_val * r_k_val
+                    sum_hk += sData[(k_idx, v_idx, stage)] * sG[k_idx] * sK[k_idx]
 
                 for offset in [4, 2, 1]:
                     sum_hk += cute.arch.shuffle_sync_bfly(
@@ -247,17 +234,14 @@ def _define_kernels():
                 v_new = (r_v - sum_hk) * r_beta
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
-                # KDA: use per-K gating sG[k_idx] instead of scalar r_g
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in range(NUM_K_ITERS_SMALL):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * sG[k_idx]
-                    r_k_val = sK[k_idx]
-                    r_q_val = sQ[k_idx]
-                    h_new = h_old + r_k_val * v_new
+                    h_new = h_old + sK[k_idx] * v_new
                     sData[(k_idx, v_idx, stage)] = h_new
-                    sum_hq += h_new * r_q_val
+                    sum_hq += h_new * sQ[k_idx]
 
                 for offset in [4, 2, 1]:
                     sum_hq += cute.arch.shuffle_sync_bfly(
@@ -267,20 +251,21 @@ def _define_kernels():
                         mask_and_clamp=31,
                     )
 
-                if k_local == 0:
-                    v_global_out = v_tile * TILE_V_SMALL + v_idx
-                    o[(i_n, 0, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
+                if k_local == 0 and v_global < v.shape[3]:
+                    o[(i_n, 0, i_hv, v_global)] = cutlass.BFloat16(sum_hq)
 
                 cute.arch.barrier()
 
                 for k_iter in range(NUM_K_ITERS_SMALL):
-                    flat_idx = tidx + k_iter * 128
+                    flat_idx = tidx + k_iter * NUM_THREADS
                     k_write = flat_idx // TILE_V_SMALL
                     v_write = flat_idx % TILE_V_SMALL
                     if k_write < TILE_K:
-                        h_val = sData[(k_write, v_write, stage)]
                         v_global_write = v_tile * TILE_V_SMALL + v_write
-                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                        if v_global_write < v.shape[3]:
+                            h0_source[(pool_idx, i_hv, v_global_write, k_write)] = (
+                                sData[(k_write, v_write, stage)]
+                            )
 
                 cute.arch.barrier()
 
@@ -306,7 +291,8 @@ def _define_kernels():
         HV: cutlass.Constexpr[int],
         use_qk_l2norm: cutlass.Constexpr[bool],
     ):
-        """Small batch KDA kernel for varlen decode (1, N, ...) format."""
+        """Small batch KDA kernel for varlen decode: q/k/v shapes (1, N, ...)."""
+        del tiled_copy_load
         tidx, _, _ = cute.arch.thread_idx()
         in_warp_tid = tidx % 32
         warp_idx = cute.arch.warp_idx()
@@ -336,34 +322,17 @@ def _define_kernels():
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
             smem_k_layout = cute.make_layout((TILE_K,), stride=(1,))
             smem_q_layout = cute.make_layout((TILE_K,), stride=(1,))
+            smem_g_layout = cute.make_layout((TILE_K,), stride=(1,))
             sK = smem.allocate_tensor(cutlass.Float32, smem_k_layout, 128)
             sQ = smem.allocate_tensor(cutlass.Float32, smem_q_layout, 128)
-            # KDA: shared memory for per-K gating values
-            smem_g_layout = cute.make_layout((TILE_K,), stride=(1,))
             sG = smem.allocate_tensor(cutlass.Float32, smem_g_layout, 128)
 
             if tidx < TILE_K:
                 sK[tidx] = cutlass.Float32(k[0, i_n, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[0, i_n, i_h, tidx])
 
-            gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
-            gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V_SMALL), (0, None))
-            thr_copy_load = tiled_copy_load.get_slice(tidx)
-
-            prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles_per_block)
-            for v_tile_offset in range(prefetch_count):
-                v_tile = start_v_tile + v_tile_offset
-                stage = v_tile_offset % NUM_STAGES
-                gSrc_tile = gSrc[(None, None, v_tile)]
-                sData_stage = sData[(None, None, stage)]
-                thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
-                thr_sData = thr_copy_load.partition_D(sData_stage)
-                cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-                cute.arch.cp_async_commit_group()
-
-            # KDA: compute per-K gating values in parallel
-            # Varlen: a shape is (N, HV, K), dt_bias shape is (HV, K)
             r_A_log = cutlass.Float32(A_log[i_hv])
+            r_exp_A = cute.exp(r_A_log)
             if tidx < TILE_K:
                 r_a_k = cutlass.Float32(a[i_n, i_hv, tidx])
                 r_dt_bias_k = cutlass.Float32(dt_bias[i_hv, tidx])
@@ -379,14 +348,11 @@ def _define_kernels():
                     )
                 else:
                     softplus_x = x
-                r_g_value = -cute.exp(r_A_log) * softplus_x
-                sG[tidx] = cute.exp(r_g_value)
+                sG[tidx] = cute.exp(-r_exp_A * softplus_x)
 
-            # Compute beta (scalar, same as GDN)
-            # Varlen: b shape is (N, HV)
-            r_b = cutlass.Float32(b[i_n, i_hv])
             r_beta = 0.0
             if in_warp_tid == 0:
+                r_b = cutlass.Float32(b[i_n, i_hv])
                 r_beta = 1.0 / (1.0 + cute.exp(-r_b))
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
@@ -414,8 +380,6 @@ def _define_kernels():
                     smem_o[warp_idx + 4] = sum_k_partial
                 cute.arch.barrier()
 
-                inv_norm_q = 0.0
-                inv_norm_k = 0.0
                 if warp_idx == 0:
                     local_sum_q = 0.0
                     local_sum_k = 0.0
@@ -447,34 +411,34 @@ def _define_kernels():
                 cute.arch.barrier()
 
             for v_tile_offset in range(num_v_tiles_per_block):
-                v_tile = start_v_tile + v_tile_offset
                 stage = v_tile_offset % NUM_STAGES
+                v_tile = start_v_tile + v_tile_offset
 
-                cute.arch.cp_async_wait_group(0)
+                for k_iter in range(NUM_K_ITERS_SMALL):
+                    flat_idx = tidx + k_iter * NUM_THREADS
+                    k_load = flat_idx // TILE_V_SMALL
+                    v_load = flat_idx % TILE_V_SMALL
+                    if k_load < TILE_K:
+                        v_global_load = v_tile * TILE_V_SMALL + v_load
+                        h_val = 0.0
+                        if v_global_load < v.shape[3]:
+                            h_val = cutlass.Float32(
+                                h0_source[(pool_idx, i_hv, v_global_load, k_load)]
+                            )
+                        sData[(k_load, v_load, stage)] = h_val
+
                 cute.arch.barrier()
 
-                next_v_tile_offset = v_tile_offset + prefetch_count
-                if next_v_tile_offset < num_v_tiles_per_block:
-                    next_v_tile = start_v_tile + next_v_tile_offset
-                    next_stage = next_v_tile_offset % NUM_STAGES
-                    gSrc_next = gSrc[(None, None, next_v_tile)]
-                    sData_next = sData[(None, None, next_stage)]
-                    thr_gSrc = thr_copy_load.partition_S(gSrc_next)
-                    thr_sData = thr_copy_load.partition_D(sData_next)
-                    cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-                    cute.arch.cp_async_commit_group()
-
                 v_global = v_tile * TILE_V_SMALL + v_idx
-                r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
+                r_v = 0.0
+                if v_global < v.shape[3]:
+                    r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
-                # KDA: use per-K gating sG[k_idx]
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in range(NUM_K_ITERS_SMALL):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
-                    h_val = sData[(k_idx, v_idx, stage)] * sG[k_idx]
-                    r_k_val = sK[k_idx]
-                    sum_hk += h_val * r_k_val
+                    sum_hk += sData[(k_idx, v_idx, stage)] * sG[k_idx] * sK[k_idx]
 
                 for offset in [4, 2, 1]:
                     sum_hk += cute.arch.shuffle_sync_bfly(
@@ -487,17 +451,14 @@ def _define_kernels():
                 v_new = (r_v - sum_hk) * r_beta
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
-                # KDA: use per-K gating sG[k_idx]
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in range(NUM_K_ITERS_SMALL):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * sG[k_idx]
-                    r_k_val = sK[k_idx]
-                    r_q_val = sQ[k_idx]
-                    h_new = h_old + r_k_val * v_new
+                    h_new = h_old + sK[k_idx] * v_new
                     sData[(k_idx, v_idx, stage)] = h_new
-                    sum_hq += h_new * r_q_val
+                    sum_hq += h_new * sQ[k_idx]
 
                 for offset in [4, 2, 1]:
                     sum_hq += cute.arch.shuffle_sync_bfly(
@@ -507,20 +468,21 @@ def _define_kernels():
                         mask_and_clamp=31,
                     )
 
-                if k_local == 0:
-                    v_global_out = v_tile * TILE_V_SMALL + v_idx
-                    o[(0, i_n, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
+                if k_local == 0 and v_global < v.shape[3]:
+                    o[(0, i_n, i_hv, v_global)] = cutlass.BFloat16(sum_hq)
 
                 cute.arch.barrier()
 
                 for k_iter in range(NUM_K_ITERS_SMALL):
-                    flat_idx = tidx + k_iter * 128
+                    flat_idx = tidx + k_iter * NUM_THREADS
                     k_write = flat_idx // TILE_V_SMALL
                     v_write = flat_idx % TILE_V_SMALL
                     if k_write < TILE_K:
-                        h_val = sData[(k_write, v_write, stage)]
                         v_global_write = v_tile * TILE_V_SMALL + v_write
-                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                        if v_global_write < v.shape[3]:
+                            h0_source[(pool_idx, i_hv, v_global_write, k_write)] = (
+                                sData[(k_write, v_write, stage)]
+                            )
 
                 cute.arch.barrier()
 
@@ -546,12 +508,14 @@ def _define_kernels():
         HV: cutlass.Constexpr[int],
         use_qk_l2norm: cutlass.Constexpr[bool],
     ):
-        """Large batch KDA kernel for (N, 1, ...) format."""
+        """Large batch KDA kernel for dense decode: q/k/v shapes (N, 1, ...)."""
+        del tiled_copy_load
         tidx, _, _ = cute.arch.thread_idx()
         in_warp_tid = tidx % 32
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         batch_idx, _, _ = cute.arch.block_idx()
+
         i_n = batch_idx // HV
         i_hv = batch_idx % HV
         i_h = i_hv // (HV // H)
@@ -570,33 +534,17 @@ def _define_kernels():
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
             smem_k_layout = cute.make_layout((TILE_K,), stride=(1,))
             smem_q_layout = cute.make_layout((TILE_K,), stride=(1,))
+            smem_g_layout = cute.make_layout((TILE_K,), stride=(1,))
             sK = smem.allocate_tensor(cutlass.Float32, smem_k_layout, 128)
             sQ = smem.allocate_tensor(cutlass.Float32, smem_q_layout, 128)
-            # KDA: shared memory for per-K gating values
-            smem_g_layout = cute.make_layout((TILE_K,), stride=(1,))
             sG = smem.allocate_tensor(cutlass.Float32, smem_g_layout, 128)
 
             if tidx < TILE_K:
                 sK[tidx] = cutlass.Float32(k[i_n, 0, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[i_n, 0, i_h, tidx])
 
-            gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
-            gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V), (0, None))
-            thr_copy_load = tiled_copy_load.get_slice(tidx)
-
-            prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles)
-            for v_tile in range(prefetch_count):
-                stage = v_tile % NUM_STAGES
-                gSrc_tile = gSrc[(None, None, v_tile)]
-                sData_stage = sData[(None, None, stage)]
-                thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
-                thr_sData = thr_copy_load.partition_D(sData_stage)
-                cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-                cute.arch.cp_async_commit_group()
-
-            # KDA: compute per-K gating values in parallel
-            # Normal: a shape is (N, 1, HV, K), dt_bias shape is (HV, K)
             r_A_log = cutlass.Float32(A_log[i_hv])
+            r_exp_A = cute.exp(r_A_log)
             if tidx < TILE_K:
                 r_a_k = cutlass.Float32(a[i_n, 0, i_hv, tidx])
                 r_dt_bias_k = cutlass.Float32(dt_bias[i_hv, tidx])
@@ -612,13 +560,11 @@ def _define_kernels():
                     )
                 else:
                     softplus_x = x
-                r_g_value = -cute.exp(r_A_log) * softplus_x
-                sG[tidx] = cute.exp(r_g_value)
+                sG[tidx] = cute.exp(-r_exp_A * softplus_x)
 
-            # Compute beta (scalar, same as GDN)
-            r_b = cutlass.Float32(b[i_n, 0, i_hv])
             r_beta = 0.0
             if in_warp_tid == 0:
+                r_b = cutlass.Float32(b[i_n, 0, i_hv])
                 r_beta = 1.0 / (1.0 + cute.exp(-r_b))
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
@@ -646,8 +592,6 @@ def _define_kernels():
                     smem_o[warp_idx + 8] = sum_k_partial
                 cute.arch.barrier()
 
-                inv_norm_q = 0.0
-                inv_norm_k = 0.0
                 if warp_idx == 0:
                     local_sum_q = 0.0
                     local_sum_k = 0.0
@@ -681,70 +625,75 @@ def _define_kernels():
             for v_tile in range(num_v_tiles):
                 stage = v_tile % NUM_STAGES
 
-                cute.arch.cp_async_wait_group(0)
+                for k_iter in range(NUM_K_ITERS):
+                    flat_idx = tidx + k_iter * NUM_THREADS_LARGE
+                    k_load = flat_idx // TILE_V
+                    v_load = flat_idx % TILE_V
+                    if k_load < TILE_K:
+                        v_global_load = v_tile * TILE_V + v_load
+                        h_val = 0.0
+                        if v_global_load < v.shape[3]:
+                            h_val = cutlass.Float32(
+                                h0_source[(pool_idx, i_hv, v_global_load, k_load)]
+                            )
+                        sData[(k_load, v_load, stage)] = h_val
+
                 cute.arch.barrier()
 
-                next_v_tile = v_tile + prefetch_count
-                if next_v_tile < num_v_tiles:
-                    next_stage = next_v_tile % NUM_STAGES
-                    gSrc_next = gSrc[(None, None, next_v_tile)]
-                    sData_next = sData[(None, None, next_stage)]
-                    thr_gSrc = thr_copy_load.partition_S(gSrc_next)
-                    thr_sData = thr_copy_load.partition_D(sData_next)
-                    cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-                    cute.arch.cp_async_commit_group()
-
                 v_global = v_tile * TILE_V + v_idx
-                r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
+                r_v = 0.0
+                if v_global < v.shape[3]:
+                    r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
-                # KDA: use per-K gating sG[k_idx]
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in range(NUM_K_ITERS):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
-                    h_val = sData[(k_idx, v_idx, stage)] * sG[k_idx]
-                    r_k_val = sK[k_idx]
-                    sum_hk += h_val * r_k_val
+                    sum_hk += sData[(k_idx, v_idx, stage)] * sG[k_idx] * sK[k_idx]
 
                 for offset in [4, 2, 1]:
                     sum_hk += cute.arch.shuffle_sync_bfly(
-                        sum_hk, offset=offset * V_PER_WARP, mask=-1, mask_and_clamp=31
+                        sum_hk,
+                        offset=offset * V_PER_WARP,
+                        mask=-1,
+                        mask_and_clamp=31,
                     )
 
                 v_new = (r_v - sum_hk) * r_beta
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
-                # KDA: use per-K gating sG[k_idx]
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in range(NUM_K_ITERS):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * sG[k_idx]
-                    r_k_val = sK[k_idx]
-                    r_q_val = sQ[k_idx]
-                    h_new = h_old + r_k_val * v_new
+                    h_new = h_old + sK[k_idx] * v_new
                     sData[(k_idx, v_idx, stage)] = h_new
-                    sum_hq += h_new * r_q_val
+                    sum_hq += h_new * sQ[k_idx]
 
                 for offset in [4, 2, 1]:
                     sum_hq += cute.arch.shuffle_sync_bfly(
-                        sum_hq, offset=offset * V_PER_WARP, mask=-1, mask_and_clamp=31
+                        sum_hq,
+                        offset=offset * V_PER_WARP,
+                        mask=-1,
+                        mask_and_clamp=31,
                     )
 
-                if k_local == 0:
-                    v_global_out = v_tile * TILE_V + v_idx
-                    o[(i_n, 0, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
+                if k_local == 0 and v_global < v.shape[3]:
+                    o[(i_n, 0, i_hv, v_global)] = cutlass.BFloat16(sum_hq)
 
                 cute.arch.barrier()
 
                 for k_iter in range(NUM_K_ITERS):
-                    flat_idx = tidx + k_iter * 256
+                    flat_idx = tidx + k_iter * NUM_THREADS_LARGE
                     k_write = flat_idx // TILE_V
                     v_write = flat_idx % TILE_V
                     if k_write < TILE_K:
-                        h_val = sData[(k_write, v_write, stage)]
                         v_global_write = v_tile * TILE_V + v_write
-                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                        if v_global_write < v.shape[3]:
+                            h0_source[(pool_idx, i_hv, v_global_write, k_write)] = (
+                                sData[(k_write, v_write, stage)]
+                            )
 
                 cute.arch.barrier()
 
@@ -770,12 +719,14 @@ def _define_kernels():
         HV: cutlass.Constexpr[int],
         use_qk_l2norm: cutlass.Constexpr[bool],
     ):
-        """Large batch KDA kernel for varlen decode (1, N, ...) format."""
+        """Large batch KDA kernel for varlen decode: q/k/v shapes (1, N, ...)."""
+        del tiled_copy_load
         tidx, _, _ = cute.arch.thread_idx()
         in_warp_tid = tidx % 32
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         batch_idx, _, _ = cute.arch.block_idx()
+
         i_n = batch_idx // HV
         i_hv = batch_idx % HV
         i_h = i_hv // (HV // H)
@@ -794,33 +745,17 @@ def _define_kernels():
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
             smem_k_layout = cute.make_layout((TILE_K,), stride=(1,))
             smem_q_layout = cute.make_layout((TILE_K,), stride=(1,))
+            smem_g_layout = cute.make_layout((TILE_K,), stride=(1,))
             sK = smem.allocate_tensor(cutlass.Float32, smem_k_layout, 128)
             sQ = smem.allocate_tensor(cutlass.Float32, smem_q_layout, 128)
-            # KDA: shared memory for per-K gating values
-            smem_g_layout = cute.make_layout((TILE_K,), stride=(1,))
             sG = smem.allocate_tensor(cutlass.Float32, smem_g_layout, 128)
 
             if tidx < TILE_K:
                 sK[tidx] = cutlass.Float32(k[0, i_n, i_h, tidx])
                 sQ[tidx] = cutlass.Float32(q[0, i_n, i_h, tidx])
 
-            gSrc_batch = h0_source[(pool_idx, i_hv, None, None)]
-            gSrc = cute.local_tile(gSrc_batch, (TILE_K, TILE_V), (0, None))
-            thr_copy_load = tiled_copy_load.get_slice(tidx)
-
-            prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles)
-            for v_tile in range(prefetch_count):
-                stage = v_tile % NUM_STAGES
-                gSrc_tile = gSrc[(None, None, v_tile)]
-                sData_stage = sData[(None, None, stage)]
-                thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
-                thr_sData = thr_copy_load.partition_D(sData_stage)
-                cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-                cute.arch.cp_async_commit_group()
-
-            # KDA: compute per-K gating values in parallel
-            # Varlen: a shape is (N, HV, K), dt_bias shape is (HV, K)
             r_A_log = cutlass.Float32(A_log[i_hv])
+            r_exp_A = cute.exp(r_A_log)
             if tidx < TILE_K:
                 r_a_k = cutlass.Float32(a[i_n, i_hv, tidx])
                 r_dt_bias_k = cutlass.Float32(dt_bias[i_hv, tidx])
@@ -836,14 +771,11 @@ def _define_kernels():
                     )
                 else:
                     softplus_x = x
-                r_g_value = -cute.exp(r_A_log) * softplus_x
-                sG[tidx] = cute.exp(r_g_value)
+                sG[tidx] = cute.exp(-r_exp_A * softplus_x)
 
-            # Compute beta (scalar, same as GDN)
-            # Varlen: b shape is (N, HV)
-            r_b = cutlass.Float32(b[i_n, i_hv])
             r_beta = 0.0
             if in_warp_tid == 0:
+                r_b = cutlass.Float32(b[i_n, i_hv])
                 r_beta = 1.0 / (1.0 + cute.exp(-r_b))
             r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
@@ -871,8 +803,6 @@ def _define_kernels():
                     smem_o[warp_idx + 8] = sum_k_partial
                 cute.arch.barrier()
 
-                inv_norm_q = 0.0
-                inv_norm_k = 0.0
                 if warp_idx == 0:
                     local_sum_q = 0.0
                     local_sum_k = 0.0
@@ -906,70 +836,75 @@ def _define_kernels():
             for v_tile in range(num_v_tiles):
                 stage = v_tile % NUM_STAGES
 
-                cute.arch.cp_async_wait_group(0)
+                for k_iter in range(NUM_K_ITERS):
+                    flat_idx = tidx + k_iter * NUM_THREADS_LARGE
+                    k_load = flat_idx // TILE_V
+                    v_load = flat_idx % TILE_V
+                    if k_load < TILE_K:
+                        v_global_load = v_tile * TILE_V + v_load
+                        h_val = 0.0
+                        if v_global_load < v.shape[3]:
+                            h_val = cutlass.Float32(
+                                h0_source[(pool_idx, i_hv, v_global_load, k_load)]
+                            )
+                        sData[(k_load, v_load, stage)] = h_val
+
                 cute.arch.barrier()
 
-                next_v_tile = v_tile + prefetch_count
-                if next_v_tile < num_v_tiles:
-                    next_stage = next_v_tile % NUM_STAGES
-                    gSrc_next = gSrc[(None, None, next_v_tile)]
-                    sData_next = sData[(None, None, next_stage)]
-                    thr_gSrc = thr_copy_load.partition_S(gSrc_next)
-                    thr_sData = thr_copy_load.partition_D(sData_next)
-                    cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-                    cute.arch.cp_async_commit_group()
-
                 v_global = v_tile * TILE_V + v_idx
-                r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
+                r_v = 0.0
+                if v_global < v.shape[3]:
+                    r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
-                # KDA: use per-K gating sG[k_idx]
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in range(NUM_K_ITERS):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
-                    h_val = sData[(k_idx, v_idx, stage)] * sG[k_idx]
-                    r_k_val = sK[k_idx]
-                    sum_hk += h_val * r_k_val
+                    sum_hk += sData[(k_idx, v_idx, stage)] * sG[k_idx] * sK[k_idx]
 
                 for offset in [4, 2, 1]:
                     sum_hk += cute.arch.shuffle_sync_bfly(
-                        sum_hk, offset=offset * V_PER_WARP, mask=-1, mask_and_clamp=31
+                        sum_hk,
+                        offset=offset * V_PER_WARP,
+                        mask=-1,
+                        mask_and_clamp=31,
                     )
 
                 v_new = (r_v - sum_hk) * r_beta
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
-                # KDA: use per-K gating sG[k_idx]
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in range(NUM_K_ITERS):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * sG[k_idx]
-                    r_k_val = sK[k_idx]
-                    r_q_val = sQ[k_idx]
-                    h_new = h_old + r_k_val * v_new
+                    h_new = h_old + sK[k_idx] * v_new
                     sData[(k_idx, v_idx, stage)] = h_new
-                    sum_hq += h_new * r_q_val
+                    sum_hq += h_new * sQ[k_idx]
 
                 for offset in [4, 2, 1]:
                     sum_hq += cute.arch.shuffle_sync_bfly(
-                        sum_hq, offset=offset * V_PER_WARP, mask=-1, mask_and_clamp=31
+                        sum_hq,
+                        offset=offset * V_PER_WARP,
+                        mask=-1,
+                        mask_and_clamp=31,
                     )
 
-                if k_local == 0:
-                    v_global_out = v_tile * TILE_V + v_idx
-                    o[(0, i_n, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
+                if k_local == 0 and v_global < v.shape[3]:
+                    o[(0, i_n, i_hv, v_global)] = cutlass.BFloat16(sum_hq)
 
                 cute.arch.barrier()
 
                 for k_iter in range(NUM_K_ITERS):
-                    flat_idx = tidx + k_iter * 256
+                    flat_idx = tidx + k_iter * NUM_THREADS_LARGE
                     k_write = flat_idx // TILE_V
                     v_write = flat_idx % TILE_V
                     if k_write < TILE_K:
-                        h_val = sData[(k_write, v_write, stage)]
                         v_global_write = v_tile * TILE_V + v_write
-                        h0_source[(pool_idx, i_hv, k_write, v_global_write)] = h_val
+                        if v_global_write < v.shape[3]:
+                            h0_source[(pool_idx, i_hv, v_global_write, k_write)] = (
+                                sData[(k_write, v_write, stage)]
+                            )
 
                 cute.arch.barrier()
 
@@ -1012,26 +947,16 @@ def _create_jit_functions():
         use_qk_l2norm: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
-        pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
+        del cu_seqlens, B, T, K, use_initial_state
+        _, hv_dim, v_dim, _ = h0_source.layout.shape
         n_indices = h0_indices.layout.shape[0]
         batch_size = n_indices * hv_dim
 
-        copy_atom = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            cutlass.Float32,
-            num_bits_per_copy=128,
-        )
         num_v_tiles_small = cute.ceil_div(v_dim, TILE_V_SMALL)
         smem_layout_small = cute.make_layout(
             (TILE_K, TILE_V_SMALL, NUM_STAGES),
             stride=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
         )
-        thread_layout_small = cute.make_layout((32, 4), stride=(4, 1))
-        val_layout_small = cute.make_layout((1, 4))
-        tiled_copy_load_small = cute.make_tiled_copy_tv(
-            copy_atom, thread_layout_small, val_layout_small
-        )
-        # KDA: extra TILE_K floats for sG
         smem_bytes_small = (
             4 * TILE_K * TILE_V_SMALL_PADDED * NUM_STAGES
             + 4 * TILE_V_SMALL
@@ -1041,7 +966,7 @@ def _create_jit_functions():
         )
 
         kda_small(
-            tiled_copy_load_small,
+            None,
             h0_source,
             smem_layout_small,
             num_v_tiles_small,
@@ -1093,26 +1018,16 @@ def _create_jit_functions():
         use_qk_l2norm: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
-        pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
+        del cu_seqlens, B, T, K, use_initial_state
+        _, hv_dim, v_dim, _ = h0_source.layout.shape
         n_indices = h0_indices.layout.shape[0]
         batch_size = n_indices * hv_dim
 
-        copy_atom = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            cutlass.Float32,
-            num_bits_per_copy=128,
-        )
         num_v_tiles_small = cute.ceil_div(v_dim, TILE_V_SMALL)
         smem_layout_small = cute.make_layout(
             (TILE_K, TILE_V_SMALL, NUM_STAGES),
             stride=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
         )
-        thread_layout_small = cute.make_layout((32, 4), stride=(4, 1))
-        val_layout_small = cute.make_layout((1, 4))
-        tiled_copy_load_small = cute.make_tiled_copy_tv(
-            copy_atom, thread_layout_small, val_layout_small
-        )
-        # KDA: extra TILE_K floats for sG
         smem_bytes_small = (
             4 * TILE_K * TILE_V_SMALL_PADDED * NUM_STAGES
             + 4 * TILE_V_SMALL
@@ -1122,7 +1037,7 @@ def _create_jit_functions():
         )
 
         kda_small_varlen(
-            tiled_copy_load_small,
+            None,
             h0_source,
             smem_layout_small,
             num_v_tiles_small,
@@ -1174,24 +1089,16 @@ def _create_jit_functions():
         use_qk_l2norm: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
-        pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
+        del cu_seqlens, B, T, K, use_initial_state
+        _, hv_dim, v_dim, _ = h0_source.layout.shape
         n_indices = h0_indices.layout.shape[0]
         batch_size = n_indices * hv_dim
 
-        copy_atom = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            cutlass.Float32,
-            num_bits_per_copy=128,
-        )
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-        base_smem_layout = cute.make_layout(
+        smem_layout = cute.make_layout(
             (TILE_K, TILE_V, NUM_STAGES),
             stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
         )
-        thread_layout = cute.make_layout((32, 8), stride=(8, 1))
-        val_layout = cute.make_layout((1, 4))
-        tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
-        # KDA: extra TILE_K floats for sG
         smem_bytes = (
             4 * TILE_K * TILE_V_PADDED * NUM_STAGES
             + 4 * TILE_V
@@ -1201,9 +1108,9 @@ def _create_jit_functions():
         )
 
         kda_large(
-            tiled_copy_load,
+            None,
             h0_source,
-            base_smem_layout,
+            smem_layout,
             num_v_tiles,
             q,
             k,
@@ -1253,24 +1160,16 @@ def _create_jit_functions():
         use_qk_l2norm: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
-        pool_size, hv_dim, k_dim, v_dim = h0_source.layout.shape
+        del cu_seqlens, B, T, K, use_initial_state
+        _, hv_dim, v_dim, _ = h0_source.layout.shape
         n_indices = h0_indices.layout.shape[0]
         batch_size = n_indices * hv_dim
 
-        copy_atom = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            cutlass.Float32,
-            num_bits_per_copy=128,
-        )
         num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-        base_smem_layout = cute.make_layout(
+        smem_layout = cute.make_layout(
             (TILE_K, TILE_V, NUM_STAGES),
             stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
         )
-        thread_layout = cute.make_layout((32, 8), stride=(8, 1))
-        val_layout = cute.make_layout((1, 4))
-        tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
-        # KDA: extra TILE_K floats for sG
         smem_bytes = (
             4 * TILE_K * TILE_V_PADDED * NUM_STAGES
             + 4 * TILE_V
@@ -1280,9 +1179,9 @@ def _create_jit_functions():
         )
 
         kda_large_varlen(
-            tiled_copy_load,
+            None,
             h0_source,
-            base_smem_layout,
+            smem_layout,
             num_v_tiles,
             q,
             k,
@@ -1338,7 +1237,6 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
         q = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
         k = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
         v = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
-        # KDA: a has extra K dimension; varlen shape (N, HV, K)
         a = torch.zeros(N, HV, K, dtype=torch.bfloat16, device="cuda")
         b = torch.zeros(N, HV, dtype=torch.bfloat16, device="cuda")
         o = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
@@ -1346,15 +1244,13 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
         q = torch.zeros(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
         k = torch.zeros(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
         v = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
-        # KDA: a has extra K dimension; normal shape (N, 1, HV, K)
         a = torch.zeros(N, 1, HV, K, dtype=torch.bfloat16, device="cuda")
         b = torch.zeros(N, 1, HV, dtype=torch.bfloat16, device="cuda")
         o = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
 
     A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
-    # KDA: dt_bias has extra K dimension; shape (HV, K)
     dt_bias = torch.zeros(HV, K, dtype=torch.bfloat16, device="cuda")
-    h0_source = torch.zeros(pool_size, HV, K, V, dtype=torch.float32, device="cuda")
+    h0_source = torch.zeros(pool_size, HV, V, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
 
     cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
@@ -1372,18 +1268,10 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     run_small, run_small_varlen, run_large, run_large_varlen = _get_jit_functions()
-
     if use_small_batch:
         kernel_func = run_small_varlen if is_varlen_decode else run_small
     else:
         kernel_func = run_large_varlen if is_varlen_decode else run_large
-
-    scale = K**-0.5
-    softplus_beta = 1.0
-    softplus_threshold = 20.0
-
-    B_compile = 1 if is_varlen_decode else N
-    T_compile = N if is_varlen_decode else 1
 
     compiled_kernel = cute.compile(
         kernel_func,
@@ -1398,11 +1286,11 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
         h0_source_tensor,
         h0_indices_tensor,
         o_tensor,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        scale=scale,
-        B=B_compile,
-        T=T_compile,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        scale=K**-0.5,
+        B=1 if is_varlen_decode else N,
+        T=N if is_varlen_decode else 1,
         H=H,
         K=K,
         V=V,
@@ -1414,11 +1302,51 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
 
     _compiled_kernels[key] = compiled_kernel
     logger.info(
-        f"CuTe DSL KDA kernel compiled: N={N}, H={H}, HV={HV}, K={K}, V={V}, "
-        f"pool_size={pool_size}, small_batch={use_small_batch}, varlen={is_varlen_decode}"
+        "CuTe DSL KDA kernel compiled: "
+        f"N={N}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, "
+        f"small_batch={use_small_batch}, varlen={is_varlen_decode}"
     )
-
     return compiled_kernel
+
+
+def _normalize_A_log(A_log: torch.Tensor, HV: int) -> torch.Tensor:
+    if A_log.numel() != HV:
+        raise ValueError(f"Unexpected A_log shape: {A_log.shape}; expected numel={HV}")
+    return A_log.reshape(HV).contiguous()
+
+
+def _normalize_dt_bias(dt_bias: torch.Tensor, HV: int, K: int) -> torch.Tensor:
+    if dt_bias.numel() != HV * K:
+        raise ValueError(
+            f"Unexpected dt_bias shape: {dt_bias.shape}; expected numel={HV * K}"
+        )
+    return dt_bias.reshape(HV, K).contiguous()
+
+
+def _normalize_kda_a(a, *, is_varlen_decode, N, HV, K):
+    """Normalize `a` to match the compile-time shape expected by the kernel.
+
+    varlen kernel compiled shape: (N, HV, K)  -- 3D
+    dense kernel compiled shape:  (N, 1, HV, K) -- 4D
+    """
+    if is_varlen_decode:
+        # Target: (N, HV, K) -- 3D
+        if a.dim() == 2 and a.shape == (N, HV * K):
+            return a.view(N, HV, K)
+        if a.dim() == 3 and a.shape == (N, HV, K):
+            return a  # already correct
+        if a.dim() == 4 and a.shape == (1, N, HV, K):
+            return a.squeeze(0)  # remove leading dim
+        raise ValueError(f"Unexpected a shape for varlen: {a.shape}")
+    else:
+        # Target: (N, 1, HV, K) -- 4D
+        if a.dim() == 2 and a.shape == (N, HV * K):
+            return a.view(N, 1, HV, K)
+        if a.dim() == 3 and a.shape == (N, HV, K):
+            return a.unsqueeze(1)
+        if a.dim() == 4 and a.shape == (N, 1, HV, K):
+            return a
+        raise ValueError(f"Unexpected a shape for dense: {a.shape}")
 
 
 def cutedsl_fused_sigmoid_gating_kda_update(
@@ -1437,42 +1365,54 @@ def cutedsl_fused_sigmoid_gating_kda_update(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
 ) -> torch.Tensor:
-    """CuTe DSL implementation of fused sigmoid gating KDA (delta rule) update.
+    """CuTe DSL implementation of fused sigmoid gating KDA update.
 
-    Key difference from GDN: `a` and `dt_bias` are per-key-dimension vectors,
-    resulting in per-row gating of the hidden state matrix.
+    State layout contract:
+        initial_state_source.shape == (pool_size, HV, V, K)
 
-    Args:
-        A_log: Log of decay rate, shape (HV,)
-        dt_bias: Timestep bias, shape (HV, K) — per-key in KDA
-        q: Query, shape (B, T, H, K) or (1, N, H, K) for varlen
-        k: Key, shape (B, T, H, K) or (1, N, H, K) for varlen
-        v: Value, shape (B, T, HV, V) or (1, N, HV, V) for varlen
-        a: Gating input, shape (B, T, HV, K) — per-key in KDA
-        b: Beta gating input, shape (B, T, HV) — scalar per head
-        initial_state_source: State pool, shape (pool_size, HV, K, V)
-        initial_state_indices: Indices into state pool, shape (N,)
-        cu_seqlens: Cumulative sequence lengths for varlen mode
-        scale: Query scaling factor (default: K^{-0.5})
-        use_qk_l2norm_in_kernel: Whether to L2-normalize q and k
-        softplus_beta: Softplus beta parameter
-        softplus_threshold: Softplus threshold for numerical stability
+    Dense decode:
+        q/k: (N, 1, H, K)
+        v:   (N, 1, HV, V)
+        a:   (N, 1, HV, K)
+        b:   (N, 1, HV)
+
+    Varlen decode:
+        q/k: (1, N, H, K)
+        v:   (1, N, HV, V)
+        a:   (N, HV, K) or (1, N, HV, K)
+        b:   (N, HV) or (1, N, HV)
     """
+
+    A_log = A_log.contiguous()
 
     B_q, T_q, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
     N = initial_state_indices.shape[0]
 
+    assert K == TILE_K, f"Current CuTe DSL KDA kernel requires K={TILE_K}, got {K}"
+    assert (
+        V % TILE_V_SMALL == 0
+    ), f"Current CuTe DSL KDA kernel requires V % {TILE_V_SMALL} == 0, got V={V}"
+    assert (
+        V % TILE_V == 0
+    ), f"Current CuTe DSL KDA kernel requires V % {TILE_V} == 0, got V={V}"
+    assert (V // TILE_V_SMALL) % NUM_BLOCKS_PER_STATE_SMALL == 0, (
+        "Small-batch KDA kernel requires num_v_tiles_small divisible by "
+        f"{NUM_BLOCKS_PER_STATE_SMALL}, got V={V}"
+    )
+
     is_varlen_decode = B_q == 1 and T_q == N and N > 1
     if scale is None:
         scale = K**-0.5
+    else:
+        assert scale > 0, f"scale must be positive, got {scale}"
 
     use_small_batch = N < SMALL_BATCH_THRESHOLD
 
     if initial_state_source.dim() == 1:
-        pool_size = initial_state_source.numel() // (HV * K * V)
-        h0_source = initial_state_source.view(pool_size, HV, K, V)
+        pool_size = initial_state_source.numel() // (HV * V * K)
+        h0_source = initial_state_source.view(pool_size, HV, V, K)
     elif initial_state_source.dim() == 4:
         pool_size = initial_state_source.shape[0]
         h0_source = initial_state_source
@@ -1481,24 +1421,23 @@ def cutedsl_fused_sigmoid_gating_kda_update(
             f"Unexpected initial_state_source shape: {initial_state_source.shape}"
         )
 
+    a = _normalize_kda_a(a, is_varlen_decode=is_varlen_decode, N=N, HV=HV, K=K)
+
     if is_varlen_decode:
-        # KDA varlen: a is (1, N, HV, K) -> squeeze to (N, HV, K)
-        if a.dim() == 4:
-            a = a.squeeze(0)
-        # b is (1, N, HV) -> squeeze to (N, HV)
+        # varlen b compiled: (N, HV) -- 2D
         if b.dim() == 3:
-            b = b.squeeze(0)
+            b = b.squeeze(0)  # (1, N, HV) -> (N, HV)
+        # b should be 2D (N, HV)
         o = q.new_empty(1, N, HV, V, dtype=torch.bfloat16)
     else:
-        # KDA normal: a is (N, 1, HV, K), keep as-is
-        if a.dim() == 3:
-            a = a.unsqueeze(1)
-        # b is (N, HV) -> unsqueeze to (N, 1, HV)
+        # dense b compiled: (N, 1, HV) -- 3D
         if b.dim() == 2:
             b = b.unsqueeze(1)
+        # b should be 3D (N, 1, HV)
         o = q.new_empty(N, 1, HV, V, dtype=torch.bfloat16)
 
-    q, k, v = [t.contiguous() for t in (q, k, v)]
+    q, k, v, a, b = [t.contiguous() for t in (q, k, v, a, b)]
+    dt_bias = dt_bias.contiguous()
 
     global _cu_seqlens_cache
     if cu_seqlens is not None:
@@ -1510,6 +1449,15 @@ def cutedsl_fused_sigmoid_gating_kda_update(
                 N + 1, dtype=torch.int32, device=q.device
             )
         cu_seqlens_to_use = _cu_seqlens_cache[cache_key]
+
+    A_log = _normalize_A_log(A_log, HV)
+    dt_bias = _normalize_dt_bias(dt_bias, HV, K)
+
+    h0_source = h0_source.contiguous()
+
+    initial_state_indices = initial_state_indices.contiguous()
+    if cu_seqlens is not None:
+        cu_seqlens = cu_seqlens.contiguous()
 
     cu_seqlens_tensor = from_dlpack(
         cu_seqlens_to_use.detach(), assumed_align=16
