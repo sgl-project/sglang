@@ -437,7 +437,7 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 # delete feature to save memory
-                if req.multimodal_inputs is not None:
+                if req.multimodal_inputs is not None and req.session is None:
                     for mm_item in req.multimodal_inputs.mm_items:
                         pixel_values = mm_item.feature
                         if isinstance(pixel_values, torch.Tensor):
