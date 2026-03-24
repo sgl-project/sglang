@@ -2843,11 +2843,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def post_process_weights(self, recv_req):
         """
-        Execute post-processing logic for model weights, such as Marlin quantization format conversion.
+        Execute post-processing logic for model weights, such as Marlin quantization format conversion
+        and model-specific post_load_weights hooks (e.g., DeepSeek MLA kv_b_proj decomposition).
         """
         from sglang.srt.model_loader.loader import device_loading_context
 
         target_device = torch.device("cuda", torch.cuda.current_device())
+
+        if recv_req.post_load_weights:
+            # Call model.post_load_weights() if available (e.g., for DeepSeek MLA
+            # models that need to decompose kv_b_proj.weight into w_kc/w_vc tensors
+            # after RDMA weight transfer)
+            if hasattr(self.model, "post_load_weights"):
+                self.model.post_load_weights()
 
         if recv_req.restore_weights_before_load:
             for _, module in self.model.named_modules():
