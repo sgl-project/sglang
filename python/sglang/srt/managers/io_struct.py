@@ -319,19 +319,29 @@ class GenerateReqInput(BaseReq):
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
+        get_sampling_param_n = (
+            lambda sampling_params: sampling_params.get("n", 1)
+            if isinstance(sampling_params, dict)
+            else sampling_params.n
+        )
+
         # Determine parallel sample count
         if self.sampling_params is None:
             self.parallel_sample_num = 1
             return
-        elif isinstance(self.sampling_params, dict):
-            self.parallel_sample_num = self.sampling_params.get("n", 1)
-        else:  # isinstance(self.sampling_params, list):
-            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
-            for sampling_params in self.sampling_params:
-                if self.parallel_sample_num != sampling_params.get("n", 1):
-                    raise ValueError(
-                        "The parallel_sample_num should be the same for all samples in sample params."
-                    )
+
+        sampling_params_list = (
+            self.sampling_params
+            if isinstance(self.sampling_params, list)
+            else [self.sampling_params]
+        )
+        self.parallel_sample_num = get_sampling_param_n(sampling_params_list[0])
+        for sampling_params in sampling_params_list[1:]:
+            sample_n = get_sampling_param_n(sampling_params)
+            if self.parallel_sample_num != sample_n:
+                raise ValueError(
+                    "The parallel_sample_num should be the same for all samples in sample params."
+                )
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -473,6 +483,8 @@ class GenerateReqInput(BaseReq):
         if self.sampling_params is None:
             self.sampling_params = [{}] * num
         elif isinstance(self.sampling_params, dict):
+            self.sampling_params = [self.sampling_params] * num
+        elif isinstance(self.sampling_params, SamplingParams):
             self.sampling_params = [self.sampling_params] * num
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
