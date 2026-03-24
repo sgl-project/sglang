@@ -2,6 +2,19 @@
 
 This guide outlines the requirements for contributing to the SGLang Diffusion module (`sglang.multimodal_gen`).
 
+## Architecture Boundary and Refactor Scope
+
+Before large refactors, read [Diffusion Runtime Architecture](architecture.md).
+
+When changing runtime abstractions:
+
+- keep protocol adapters thin
+- preserve default behavior while refactoring internals
+- migrate in small, non-breaking commits
+- keep transport, orchestration, and pipeline concerns separated
+
+Use the architecture document as the source of truth for layer responsibilities and non-goals.
+
 ## On AI-Assisted ("Vibe Coding") PRs
 
 Vibe-coded PRs are welcome — we judge code quality, not how it was produced. The bar is the same for all PRs:
