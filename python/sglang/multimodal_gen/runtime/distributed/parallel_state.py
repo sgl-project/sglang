@@ -642,6 +642,9 @@ def maybe_init_distributed_environment_and_model_parallel(
     elif current_platform.is_npu():
         device = torch.device(f"npu:{local_rank}")
         torch.npu.set_device(device)
+    elif current_platform.is_xpu():
+        device = torch.device(f"xpu:{local_rank}")
+        torch.xpu.set_device(device)
 
 
 def model_parallel_is_initialized() -> bool:

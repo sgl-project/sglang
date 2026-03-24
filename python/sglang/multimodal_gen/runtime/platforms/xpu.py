@@ -100,6 +100,10 @@ class XPUPlatform(Platform):
         # Use PyTorch's native SDPA which works on XPU
         return "SDPA"
 
+    def get_torch_distributed_backend_str(self) -> str:
+        # Intel XPU uses oneCCL (Intel Collective Communications Library)
+        return "ccl"
+
     @classmethod
     def is_xpu(cls) -> bool:
         return True
