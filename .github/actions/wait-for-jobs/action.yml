@@ -18,7 +18,7 @@ inputs:
   poll-interval-seconds:
     description: 'Seconds between polling attempts'
     required: false
-    default: '120'
+    default: '30'
   github-token:
     description: 'GitHub token for API calls'
     required: false
