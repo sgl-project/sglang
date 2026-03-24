@@ -433,7 +433,7 @@ class Glm4ForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
