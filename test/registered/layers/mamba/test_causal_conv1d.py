@@ -231,6 +231,48 @@ def test_causal_conv1d_update_aiter(dim, width, seqlen, has_bias, silu_activatio
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(
+    not _aiter_available,
+    reason="Requires HIP + SGLANG_USE_AITER=1 + aiter package",
+)
+@pytest.mark.parametrize("itype", [torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("seqlen", [1])
+@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
+def test_causal_conv1d_update_aiter_vs_triton(
+    dim, width, seqlen, has_bias, silu_activation, itype
+):
+    """Compare aiter vs triton backend outputs for causal_conv1d_update (parity test)."""
+    from sglang.srt.layers.attention.mamba import causal_conv1d_aiter
+
+    device = get_device()
+    rtol, atol = 1e-2, 5e-2
+    torch.manual_seed(0)
+    batch = 2
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
+    conv_state = torch.randn(batch, dim, width - 1, device=device, dtype=itype)
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    activation = None if not silu_activation else "silu"
+
+    x_triton = x.clone()
+    conv_state_triton = conv_state.clone()
+    out_triton = causal_conv1d_update(
+        x_triton, conv_state_triton, weight, bias, activation=activation
+    )
+
+    x_aiter = x.clone()
+    conv_state_aiter = conv_state.clone()
+    out_aiter = causal_conv1d_aiter.causal_conv1d_update(
+        x_aiter, conv_state_aiter, weight, bias, activation=activation
+    )
+
+    assert torch.allclose(out_triton, out_aiter, rtol=rtol, atol=atol)
+    assert torch.allclose(conv_state_triton, conv_state_aiter, rtol=rtol, atol=atol)
+
+
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
@@ -385,6 +427,86 @@ def test_causal_conv1d_update_with_batch_gather_aiter(
         conv_state[unused_states_bool], conv_state_for_padding_test[unused_states_bool]
     )
     assert torch.allclose(out[:batch_size], out_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(
+    not _aiter_available,
+    reason="Requires HIP + SGLANG_USE_AITER=1 + aiter package",
+)
+@pytest.mark.parametrize("itype", [torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("seqlen", [1, 3])
+@pytest.mark.parametrize("width", [3, 4])
+@pytest.mark.parametrize("dim", [2048 + 16, 4096])
+@pytest.mark.parametrize("with_padding", [True, False])
+@pytest.mark.parametrize("batch_size", [3])
+def test_causal_conv1d_update_with_batch_gather_aiter_vs_triton(
+    batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation, itype
+):
+    """Compare aiter vs triton backend with batch gather (conv_state_indices) - parity test."""
+    from sglang.srt.layers.attention.mamba import causal_conv1d_aiter
+
+    device = get_device()
+    rtol, atol = 1e-2, 5e-2
+
+    torch.manual_seed(0)
+
+    padding = 5 if with_padding else 0
+    padded_batch_size = batch_size + padding
+    total_entries = 10 * batch_size
+
+    x = torch.randn(
+        padded_batch_size, seqlen, dim, device=device, dtype=itype
+    ).transpose(1, 2)
+    conv_state_indices = torch.randperm(total_entries)[:batch_size].to(
+        dtype=torch.int32, device=device
+    )
+    padded_state_indices = torch.concat(
+        [
+            conv_state_indices,
+            torch.as_tensor([PAD_SLOT_ID] * padding, dtype=torch.int32, device=device),
+        ],
+        dim=0,
+    )
+    conv_state = torch.randn(
+        total_entries, width - 1, dim, device=device, dtype=itype
+    ).transpose(1, 2)
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    activation = None if not silu_activation else "silu"
+
+    x_triton = x.clone()
+    conv_state_triton = conv_state.clone()
+    out_triton = causal_conv1d_update(
+        x_triton,
+        conv_state_triton,
+        weight,
+        bias,
+        activation=activation,
+        conv_state_indices=padded_state_indices,
+        pad_slot_id=PAD_SLOT_ID,
+    )
+
+    x_aiter = x.clone()
+    conv_state_aiter = conv_state.clone()
+    out_aiter = causal_conv1d_aiter.causal_conv1d_update(
+        x_aiter,
+        conv_state_aiter,
+        weight,
+        bias,
+        activation=activation,
+        conv_state_indices=padded_state_indices,
+        pad_slot_id=PAD_SLOT_ID,
+    )
+
+    assert torch.allclose(out_triton[:batch_size], out_aiter[:batch_size], rtol=rtol, atol=atol)
+    assert torch.allclose(
+        conv_state_triton[conv_state_indices, :],
+        conv_state_aiter[conv_state_indices, :],
+        rtol=rtol,
+        atol=atol,
+    )
 
 
 @pytest.mark.parametrize("itype", [torch.bfloat16])
