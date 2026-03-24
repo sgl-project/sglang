@@ -614,13 +614,13 @@ class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
         )
 
     def _init_graph_inputs(self, model_runner):
-        """Initialize graph input tensors."""
+        """Initialize graph input tensors and create the buffers dataclass."""
         with torch.device(model_runner.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
-            self.out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros(
+            input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
+            positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            mrope_positions = torch.zeros(
                 (3, self.max_num_token), dtype=torch.int64
             )
 
@@ -636,38 +636,40 @@ class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
             else:
                 hidden_dim = self.model_runner.model_config.hidden_size
 
-            self.hidden_states = torch.zeros(
+            hidden_states = torch.zeros(
                 (self.max_num_token, hidden_dim),
                 dtype=self.model_runner.dtype,
             )
             self.seq_len_fill_value = (
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             )
-            self.seq_lens = torch.full(
+            seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
-            self.accept_length = torch.full(
+            extend_seq_lens = torch.full(
+                (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
+            )
+            accept_length = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
-                    self.global_num_tokens_gpu = torch.zeros(
+                    global_num_tokens_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
                 else:
                     assert self.require_attn_tp_gather
-                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                    global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
             else:
-                self.global_num_tokens_gpu = None
-                self.global_num_tokens_for_logprob_gpu = None
+                global_num_tokens_gpu = None
+                global_num_tokens_for_logprob_gpu = None
 
             if hasattr(
                 self.model_runner.model_config.hf_config, "draft_vocab_size"
@@ -680,7 +682,7 @@ class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
 
-            self.next_token_logits_buffer = torch.zeros(
+            next_token_logits_buffer = torch.zeros(
                 (
                     (
                         self.max_bs * self.num_tokens_per_bs
@@ -691,3 +693,20 @@ class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
                 ),
                 dtype=torch.float,
             )
+
+        self.buffers = EagleDraftExtendInputBuffers(
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+            mrope_positions=mrope_positions,
+            hidden_states=hidden_states,
+            seq_lens=seq_lens,
+            seq_lens_cpu=self.seq_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            accept_length=accept_length,
+            next_token_logits_buffer=next_token_logits_buffer,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+        )
+        self.buffers.share_buffers()

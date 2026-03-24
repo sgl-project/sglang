@@ -517,41 +517,59 @@ class EAGLEDraftCudaGraphRunnerAuto(EAGLEDraftCudaGraphRunner):
         )
 
     def _init_graph_inputs(self, model_runner):
-        """Initialize graph input tensors."""
+        """Initialize graph input tensors and create the buffers dataclass."""
         with torch.device(model_runner.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
-            self.out_cache_loc = torch.zeros(
-                (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
+            input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
+            out_cache_loc = torch.zeros(
+                (self.max_num_token * self.speculative_num_steps,),
+                dtype=self._cache_loc_dtype(),
             )
-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros(
+            positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            mrope_positions = torch.zeros(
                 (3, self.max_num_token), dtype=torch.int64
             )
-            self.seq_lens = torch.full(
+            seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
-            self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
-            self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
-            self.hidden_states = torch.zeros(
+            extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
+            topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
+            topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
+            hidden_states = torch.zeros(
                 (self.max_bs, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
             )
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
-                    self.global_num_tokens_gpu = torch.zeros(
+                    global_num_tokens_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
                 else:
                     assert self.require_attn_tp_gather
-                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                    global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                    global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
             else:
-                self.global_num_tokens_gpu = None
-                self.global_num_tokens_for_logprob_gpu = None
+                global_num_tokens_gpu = None
+                global_num_tokens_for_logprob_gpu = None
+
+        self.buffers = EagleDraftInputBuffers(
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            out_cache_loc=out_cache_loc,
+            positions=positions,
+            mrope_positions=mrope_positions,
+            seq_lens=seq_lens,
+            seq_lens_cpu=self.seq_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            topk_p=topk_p,
+            topk_index=topk_index,
+            hidden_states=hidden_states,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+        )
+        self.buffers.share_buffers()
