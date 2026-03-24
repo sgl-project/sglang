@@ -1,4 +1,5 @@
 import math
+import sys
 
 import pytest
 import torch
@@ -82,4 +83,4 @@ def test_fast_hadamard_transform(dim, dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))
