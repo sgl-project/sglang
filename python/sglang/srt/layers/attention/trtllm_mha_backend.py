@@ -837,11 +837,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if save_kv_cache and k is not None:
             if (
                 self.support_rope_fusion()
-                and kwargs.get("rotary_emb") is not None
+                and kwargs.get("cos_sin_cache") is not None
+                and kwargs.get("is_neox_style") is not None
                 and (not self.is_xqa_impl)
             ):
                 # Use fused RoPE + FP8 quantization + KV cache update path
-                rotary_emb = kwargs.get("rotary_emb")
+                cos_sin_cache = kwargs.get("cos_sin_cache")
+                is_neox_style = kwargs.get("is_neox_style")
 
                 q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 k_cache = k_cache.view(
@@ -857,14 +859,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_nope=None,
                     k_nope=None,
                     v=v,
-                    cos_sin_cache=rotary_emb.cos_sin_cache,
+                    cos_sin_cache=cos_sin_cache,
                     pos_ids=forward_batch.positions,
                     paged_kv_cache=(k_cache, v_cache),
                     kv_indices=self.forward_metadata.kv_indices,
                     kv_indptr=self.forward_metadata.kv_indptr,
                     batch_indices=self.forward_metadata.batch_indices,
                     positions=self.forward_metadata.positions,
-                    is_neox=rotary_emb.is_neox_style,
+                    is_neox=is_neox_style,
                     quantize_dtype=torch.float8_e4m3fn,
                     quant_scale_q=q_scale_float,
                     quant_scale_kv=k_scale_float,
@@ -956,9 +958,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         if save_kv_cache and k is not None:
-            if self.support_rope_fusion() and kwargs.get("rotary_emb") is not None:
+            if (
+                self.support_rope_fusion()
+                and kwargs.get("cos_sin_cache") is not None
+                and kwargs.get("is_neox_style") is not None
+            ):
                 # Use fused RoPE + FP8 quantization + KV cache update path
-                rotary_emb = kwargs.get("rotary_emb")
+                cos_sin_cache = kwargs.get("cos_sin_cache")
+                is_neox_style = kwargs.get("is_neox_style")
 
                 q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 k_cache = k_cache.view(
@@ -974,14 +981,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_nope=None,
                     k_nope=None,
                     v=v,
-                    cos_sin_cache=rotary_emb.cos_sin_cache,
+                    cos_sin_cache=cos_sin_cache,
                     pos_ids=forward_batch.positions,
                     paged_kv_cache=(k_cache, v_cache),
                     kv_indices=self.forward_metadata.kv_indices,
                     kv_indptr=self.forward_metadata.kv_indptr,
                     batch_indices=self.forward_metadata.batch_indices,
                     positions=self.forward_metadata.positions,
-                    is_neox=rotary_emb.is_neox_style,
+                    is_neox=is_neox_style,
                     quantize_dtype=torch.float8_e4m3fn,
                     quant_scale_q=q_scale_float,
                     quant_scale_kv=k_scale_float,

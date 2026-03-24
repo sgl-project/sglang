@@ -411,7 +411,8 @@ class GptOssAttention(nn.Module):
         extra_args = {}
         if forward_batch.attn_backend.support_rope_fusion():
             extra_args = {
-                "rotary_emb": self.rotary_emb,
+                "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+                "is_neox_style": self.rotary_emb.is_neox_style,
             }
 
         attn_output = self.attn(
