@@ -29,7 +29,8 @@ elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_update_cpu
 
     causal_conv1d_update = causal_conv1d_update_cpu
-elif _use_aiter and get_bool_env_var("SGLANG_CONV1D_UPDATE_BACKEND", "aiter") == "aiter":
+elif _use_aiter and get_bool_env_var("SGLANG_CONV1D_UPDATE_IMPL") == "aiter":
+    # Currently, default to disable aiter impl for KDA
     from sglang.srt.layers.attention.mamba.causal_conv1d_aiter import (
         causal_conv1d_update,
     )

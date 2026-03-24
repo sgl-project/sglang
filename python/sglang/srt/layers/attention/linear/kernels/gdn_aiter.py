@@ -65,8 +65,8 @@ def _load_aiter_gdn_kernels():
 class AiterGDNKernel(LinearAttnKernelBase):
     """Aiter-based kernel for GDN (Gated Delta Network) linear attention.
 
-    Uses aiter kernels for decode and extend when available on HIP.
-    Falls back to Triton for extend/target_verify if aiter only provides decode.
+    Uses aiter kernels for decode and extend on HIP.
+    Use --linear-attn-*-backend triton for extend/target_verify if aiter lacks support.
     """
 
     def __init__(self):
@@ -82,17 +82,13 @@ class AiterGDNKernel(LinearAttnKernelBase):
         self._extend_available = extend_ok
 
         if not extend_ok:
-            from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
-                TritonGDNKernel,
+            logger.warning(
+                "Aiter GDN extend kernel not available. "
+                "Use --linear-attn-prefill-backend triton for prefill."
             )
-
-            self._triton_fallback = TritonGDNKernel()
-            logger.info(
-                "Aiter GDN: decode=aiter, extend=triton (aiter extend not available)"
-            )
-        else:
-            self._triton_fallback = None
-            logger.info("Aiter GDN: decode=aiter, extend=aiter")
+        logger.info(
+            f"Aiter GDN: decode=aiter, extend={'aiter' if extend_ok else 'unavailable'}"
+        )
 
     def decode(
         self,
@@ -138,37 +134,30 @@ class AiterGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
-        if self._extend_available and self._extend_fn is not None:
-            from sglang.srt.utils import is_cpu, is_npu
-
-            recurrent_state = ssm_states
-            recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-            if is_npu() or is_cpu():
-                recurrent_state = ssm_states[cache_indices]
-                recurrent_state_indices_args = {}
-            # chunk_gated_delta_rule returns (o, last_recurrent_state, h)
-            return self._extend_fn(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-                **recurrent_state_indices_args,
+        if not self._extend_available or self._extend_fn is None:
+            raise NotImplementedError(
+                "Aiter GDN extend kernel is not available. "
+                "Use --linear-attn-prefill-backend triton for prefill."
             )
-        return self._triton_fallback.extend(
+        from sglang.srt.utils import is_cpu, is_npu
+
+        recurrent_state = ssm_states
+        recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+        if is_npu() or is_cpu():
+            recurrent_state = ssm_states[cache_indices]
+            recurrent_state_indices_args = {}
+        # chunk_gated_delta_rule returns (o, last_recurrent_state, h)
+        return self._extend_fn(
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            **kwargs,
+            initial_state=recurrent_state,
+            cu_seqlens=query_start_loc,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+            **recurrent_state_indices_args,
         )
 
     def target_verify(
@@ -186,22 +175,8 @@ class AiterGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        # target_verify requires Triton (intermediate_states_buffer, etc.)
-        if self._triton_fallback is not None:
-            return self._triton_fallback.target_verify(
-                A_log=A_log,
-                dt_bias=dt_bias,
-                q=q,
-                k=k,
-                v=v,
-                a=a,
-                b=b,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                **kwargs,
-            )
         raise NotImplementedError(
-            "AiterGDNKernel target_verify requires Triton fallback. "
-            "Aiter extend kernel was available but target_verify is not supported."
+            "Aiter GDN does not support target_verify (speculative decoding). "
+            "Use --linear-attn-decode-backend triton and --linear-attn-prefill-backend triton "
+            "for speculative decoding."
         )
