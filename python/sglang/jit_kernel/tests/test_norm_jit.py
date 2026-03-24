@@ -7,8 +7,8 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=125, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=500, suite="nightly-kernel-1-gpu", nightly=True)
 
 # JIT rmsnorm: fp16/bf16 only
 # - Warp norm path (one warp per token):  hidden_size in {64, 128, 256}
