@@ -537,9 +537,7 @@ class GemmaRMSNorm(MultiPlatformOp):
             residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            fused_add_rms_norm(
-                out, x, residual_out, residual, w, self.variance_epsilon
-            )
+            fused_add_rms_norm(out, x, residual_out, residual, w, self.variance_epsilon)
             return out, residual_out
         out = torch.empty_like(x)
         rms_norm(out, x, w, self.variance_epsilon)
