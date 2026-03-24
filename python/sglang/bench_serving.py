@@ -38,7 +38,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
-from sglang.benchmark.power import get_power_recorder
+from sglang.benchmark.power import get_power_recorder, print_power_summary
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1548,84 +1548,11 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+
     if power_stats is not None:
-        print("{s:{c}^{n}}".format(s="GPU Power (all devices)", n=50, c="-"))
-        print(
-            "{:<40} {:<10.2f}".format(
-                "P25 Total Power (total W):", power_stats["p25_power_w"]
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Mean Total Power (total W):", power_stats["mean_power_w"]
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Median Total Power (total W):", power_stats["median_power_w"]
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "Median Power (per-GPU W):",
-                power_stats["median_power_per_accelerator_w"],
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                "P75 Total Power (total W):", power_stats["p75_power_w"]
-            )
-        )
-        print("{:<40} {:<10}".format("Power samples:", power_stats["num_samples"]))
-
-        print("{s:{c}^{n}}".format(s="CPU Power (all sockets)", n=50, c="-"))
-
-        def _fmt(val) -> str:
-            return f"{val:<10.2f}" if val is not None else "None"
-
-        print(
-            "{:<40} {}".format(
-                "CPU P25 Total Power (W):", _fmt(power_stats["cpu_p25_power_w"])
-            )
-        )
-        print(
-            "{:<40} {}".format(
-                "CPU Mean Total Power (W):", _fmt(power_stats["cpu_mean_power_w"])
-            )
-        )
-        print(
-            "{:<40} {}".format(
-                "CPU Median Total Power (W):", _fmt(power_stats["cpu_median_power_w"])
-            )
-        )
-        print(
-            "{:<40} {}".format(
-                "CPU Median Power (per-socket W):",
-                _fmt(power_stats["cpu_median_power_per_socket_w"]),
-            )
-        )
-        print(
-            "{:<40} {}".format(
-                "CPU P75 Total Power (W):", _fmt(power_stats["cpu_p75_power_w"])
-            )
-        )
-        print(
-            "{:<40} {}".format(
-                "CPU Power samples:",
-                (
-                    power_stats["cpu_num_samples"]
-                    if power_stats["cpu_num_samples"] is not None
-                    else "None"
-                ),
-            )
-        )
-
         median_power = power_stats["median_power_w"]
-
-        description = "GPU"
         if power_stats["cpu_median_power_w"] is not None:
             median_power += power_stats["cpu_median_power_w"]
-            description = "CPU + GPU"
 
         input_toks_per_watt = metrics.total_input / median_power
         output_toks_per_watt = metrics.total_output / median_power
@@ -1634,25 +1561,11 @@ async def benchmark(
         ) / median_power
 
         power_stats["input_toks_per_watt"] = input_toks_per_watt
-        power_stats["input_toks_per_watt"] = output_toks_per_watt
-        power_stats["input_toks_per_watt"] = total_toks_per_watt
+        power_stats["output_toks_per_watt"] = output_toks_per_watt
+        power_stats["total_toks_per_watt"] = total_toks_per_watt
 
-        print("{s:{c}^{n}}".format(s="Power summary", n=50, c="-"))
-        print(
-            "{:<40} {:<10.2f}".format(
-                f"Input tokens/({description} median W):", input_toks_per_watt
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                f"Output tokens/({description} median W):", output_toks_per_watt
-            )
-        )
-        print(
-            "{:<40} {:<10.2f}".format(
-                f"Total tokens/({description} median W):", total_toks_per_watt
-            )
-        )
+        print_power_summary(power_stats)
+
     print("=" * 50)
 
     resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())

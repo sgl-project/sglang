@@ -11,9 +11,11 @@ import torch
 if torch.version.hip:
     try:
         import amdsmi
+
         amdsmi.amdsmi_init(amdsmi.AmdSmiInitFlags.INIT_ALL_PROCESSORS)
     except Exception as e:
         amdsmi.amdsmi_init(amdsmi.AmdSmiInitFlags.INIT_AMD_GPUS)
+
 
 class PowerRecorderMixin(ABC):
     """Abstract base class for power recorders."""
@@ -109,6 +111,7 @@ class PowerRecorderMixin(ABC):
             )
         return stats
 
+
 class PowerRecorderAMD(PowerRecorderMixin):
     """Records GPU and CPU power usage in a background thread using amdsmi."""
 
@@ -117,10 +120,11 @@ class PowerRecorderAMD(PowerRecorderMixin):
         self._accelerator_handles = amdsmi.amdsmi_get_processor_handles()
         # Will be an empty list if amdsmi CPU dependencies are not met.
         self._cpu_handles = amdsmi.amdsmi_get_cpusocket_handles()
-        
-        if len(self._cpu_handles) == 0:
-            print("WARNING: could not find CPU handles for power recording, amdsmi dependencies are likely not met. Recording GPU power only.")
 
+        if len(self._cpu_handles) == 0:
+            print(
+                "WARNING: could not find CPU handles for power recording, amdsmi dependencies are likely not met. Recording GPU power only."
+            )
 
     def _record_accelerator(self) -> float:
         """Sample total GPU power across all devices. Returns watts."""
@@ -141,6 +145,102 @@ class PowerRecorderAMD(PowerRecorderMixin):
         return total_power_mw / 1000.0
 
 
+def print_power_summary(power_stats: dict) -> None:
+    def _fmt(val) -> str:
+        return f"{val:<10.2f}" if val is not None else "None"
+
+    print("{s:{c}^{n}}".format(s="GPU Power (all devices)", n=50, c="-"))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "P25 Total Power (total W):", power_stats["p25_power_w"]
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Mean Total Power (total W):", power_stats["mean_power_w"]
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Median Total Power (total W):", power_stats["median_power_w"]
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Median Power (per-GPU W):",
+            power_stats["median_power_per_accelerator_w"],
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "P75 Total Power (total W):", power_stats["p75_power_w"]
+        )
+    )
+    print("{:<40} {:<10}".format("Power samples:", power_stats["num_samples"]))
+
+    print("{s:{c}^{n}}".format(s="CPU Power (all sockets)", n=50, c="-"))
+    print(
+        "{:<40} {}".format(
+            "CPU P25 Total Power (W):", _fmt(power_stats["cpu_p25_power_w"])
+        )
+    )
+    print(
+        "{:<40} {}".format(
+            "CPU Mean Total Power (W):", _fmt(power_stats["cpu_mean_power_w"])
+        )
+    )
+    print(
+        "{:<40} {}".format(
+            "CPU Median Total Power (W):", _fmt(power_stats["cpu_median_power_w"])
+        )
+    )
+    print(
+        "{:<40} {}".format(
+            "CPU Median Power (per-socket W):",
+            _fmt(power_stats["cpu_median_power_per_socket_w"]),
+        )
+    )
+    print(
+        "{:<40} {}".format(
+            "CPU P75 Total Power (W):", _fmt(power_stats["cpu_p75_power_w"])
+        )
+    )
+    print(
+        "{:<40} {}".format(
+            "CPU Power samples:",
+            (
+                power_stats["cpu_num_samples"]
+                if power_stats["cpu_num_samples"] is not None
+                else "None"
+            ),
+        )
+    )
+
+    description = "GPU"
+    if power_stats["cpu_median_power_w"] is not None:
+        description = "CPU + GPU"
+
+    print("{s:{c}^{n}}".format(s="Power summary", n=50, c="-"))
+    print(
+        "{:<40} {:<10.2f}".format(
+            f"Input tokens/({description} median W):",
+            power_stats["input_toks_per_watt"],
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            f"Output tokens/({description} median W):",
+            power_stats["output_toks_per_watt"],
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            f"Total tokens/({description} median W):",
+            power_stats["total_toks_per_watt"],
+        )
+    )
+
+
 def get_power_recorder(interval: float = 5.0) -> PowerRecorderMixin:
     """Return the appropriate PowerRecorder for the current hardware."""
     from sglang.srt.utils import is_hip
@@ -150,4 +250,3 @@ def get_power_recorder(interval: float = 5.0) -> PowerRecorderMixin:
     raise NotImplementedError(
         "Power recording is only implemented on AMD GPUs (is_hip()=False)."
     )
-
