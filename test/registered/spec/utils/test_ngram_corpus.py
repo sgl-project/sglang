@@ -6,12 +6,12 @@ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
 
 
 def _make_corpus(match_type="BFS", **kwargs):
     defaults = dict(
-        branch_length=12,
+        max_trie_depth=12,
         min_match_window_size=1,
         max_match_window_size=10,
         min_bfs_breadth=1,
@@ -240,7 +240,7 @@ class TestNgramCorpusSqueeze(CustomTestCase):
 
     def test_eviction_preserves_recent(self):
         corpus = _make_corpus(
-            "BFS", capacity=500, branch_length=6, max_match_window_size=5
+            "BFS", capacity=500, max_trie_depth=6, max_match_window_size=5
         )
 
         old_seq = list(range(1000, 1050))
@@ -358,7 +358,7 @@ class TestFrequencyBoosting(CustomTestCase):
             max_bfs_breadth=1,
             min_bfs_breadth=1,
             max_match_window_size=3,
-            branch_length=5,
+            max_trie_depth=5,
         )
         corpus.batch_put([[1, 2, 3, 10, 11]])
         corpus.synchronize()
@@ -387,7 +387,7 @@ class TestRecencyOrdering(CustomTestCase):
             max_bfs_breadth=1,
             min_bfs_breadth=1,
             max_match_window_size=3,
-            branch_length=5,
+            max_trie_depth=5,
         )
         corpus.batch_put([[1, 2, 3, 10, 11]])
         corpus.synchronize()
@@ -433,10 +433,10 @@ class TestSingleTokenContext(CustomTestCase):
 
 
 class TestLongContext(CustomTestCase):
-    """Verify behavior when query context exceeds branch_length."""
+    """Verify behavior when query context exceeds max_trie_depth."""
 
-    def test_context_longer_than_branch_length(self):
-        corpus = _make_corpus("BFS", branch_length=6, max_match_window_size=5)
+    def test_context_longer_than_max_trie_depth(self):
+        corpus = _make_corpus("BFS", max_trie_depth=6, max_match_window_size=5)
         seq = list(range(1, 20))
         corpus.batch_put([seq])
         corpus.synchronize()
@@ -539,7 +539,7 @@ class TestSqueezeEvictsOld(CustomTestCase):
 
     def test_old_data_evicted(self):
         corpus = _make_corpus(
-            "BFS", capacity=150, branch_length=6, max_match_window_size=5
+            "BFS", capacity=150, max_trie_depth=6, max_match_window_size=5
         )
 
         old_seq = list(range(5000, 5030))

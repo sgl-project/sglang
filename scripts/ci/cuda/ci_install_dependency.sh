@@ -340,6 +340,11 @@ fi
 
 mark_step_done "Fix other dependencies"
 
+# Force reinstall nvidia-cutlass-dsl to ensure the .pth file exists.
+# The Docker image ships nvidia-cutlass-dsl-libs-base 4.3.5; upgrading to 4.4.2
+# can delete the .pth file without reliably recreating it (pip race condition).
+$PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --no-deps --force-reinstall $PIP_INSTALL_SUFFIX || true
+
 # ------------------------------------------------------------------------------
 # Prepare runner
 # ------------------------------------------------------------------------------

@@ -253,18 +253,18 @@ def handle_rerun_stage(
 
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
-        "stage-a-test-small-1-gpu",
-        "stage-a-cpu-only",
-        "stage-b-test-small-1-gpu",
-        "stage-b-test-large-1-gpu",
-        "stage-b-test-large-2-gpu",
+        "stage-a-test-1-gpu-small",
+        "stage-a-test-cpu",
+        "stage-b-test-1-gpu-small",
+        "stage-b-test-1-gpu-large",
+        "stage-b-test-2-gpu-large",
         "stage-b-test-4-gpu-b200",
         "stage-c-test-4-gpu-h100",
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-4-gpu-b200",
         "stage-c-test-4-gpu-gb200",
-        "stage-c-test-deepep-4-gpu",
+        "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
@@ -274,12 +274,12 @@ def handle_rerun_stage(
     amd_stages = [
         "sgl-kernel-unit-test-amd",
         "sgl-kernel-unit-test-2-gpu-amd",
-        "stage-a-test-small-1-gpu-amd",
-        "stage-b-test-small-1-gpu-amd",
-        "stage-b-test-small-1-gpu-amd-nondeterministic",
-        "stage-b-test-small-1-gpu-amd-mi35x",
-        "stage-b-test-large-1-gpu-amd",
-        "stage-b-test-large-2-gpu-amd",
+        "stage-a-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd-nondeterministic",
+        "stage-b-test-1-gpu-small-amd-mi35x",
+        "stage-b-test-1-gpu-large-amd",
+        "stage-b-test-2-gpu-large-amd",
         "multimodal-gen-test-1-gpu-amd",
         "multimodal-gen-test-2-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
@@ -412,23 +412,23 @@ def handle_rerun_stage(
 
 
 CUDA_SUITE_TO_RUNNER = {
-    "stage-a-test-small-1-gpu": "1-gpu-5090",
-    "stage-a-cpu-only": "ubuntu-latest",
-    "stage-b-test-small-1-gpu": "1-gpu-5090",
-    "stage-b-test-large-1-gpu": "1-gpu-h100",
-    "stage-b-test-large-2-gpu": "2-gpu-h100",
+    "stage-a-test-1-gpu-small": "1-gpu-5090",
+    "stage-a-test-cpu": "ubuntu-latest",
+    "stage-b-test-1-gpu-small": "1-gpu-5090",
+    "stage-b-test-1-gpu-large": "1-gpu-h100",
+    "stage-b-test-2-gpu-large": "2-gpu-h100",
     "stage-b-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-8-gpu-h200": "8-gpu-h200",
     "stage-c-test-8-gpu-h20": "8-gpu-h20",
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-deepep-4-gpu": "4-gpu-h100",
+    "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
 }
 
 DEEPEP_SUITES = {
     "stage-c-test-8-gpu-h20",
-    "stage-c-test-deepep-4-gpu",
+    "stage-c-test-deepep-4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200",
 }
 

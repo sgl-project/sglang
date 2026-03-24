@@ -9,7 +9,10 @@ from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
+
+register_cuda_ci(est_time=13, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 if is_in_ci():
     B_RANGE, S_RANGE, D_RANGE = [1], [128], [3072]
