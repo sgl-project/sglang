@@ -22,6 +22,8 @@ from typing import Optional, Tuple
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
 try:
     from sglang.jit_kernel.fused_store_index_cache import (
         can_use_nsa_fused_store,
@@ -45,6 +47,9 @@ try:
     _is_fp8_fnuz = is_fp8_fnuz()
 except ImportError:
     _is_fp8_fnuz = False
+
+register_cuda_ci(est_time=24, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 PAGE_SIZE = 64
 HEAD_DIM = 128

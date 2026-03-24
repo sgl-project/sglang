@@ -6,9 +6,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
-
-logger = logging.getLogger(__name__)
-
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -18,6 +15,9 @@ from sglang.jit_kernel.utils import (
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+logger = logging.getLogger(__name__)
 
 
 @cache_once
