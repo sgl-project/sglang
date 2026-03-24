@@ -412,6 +412,13 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            # Auto-spec: feed acceptance data to the tuning engine
+            if self.auto_spec and self.auto_spec_engine is not None:
+                self.auto_spec_engine.update(
+                    batch.batch_size(),
+                    result.num_accepted_tokens,
+                    self.model_worker.speculative_num_draft_tokens,
+                )
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph

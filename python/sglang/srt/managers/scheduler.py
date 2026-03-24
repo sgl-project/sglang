@@ -368,6 +368,10 @@ class Scheduler(
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
+        # Auto-speculative decoding
+        self.auto_spec = server_args.auto_spec
+        self.auto_spec_engine = None
+
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -662,6 +666,18 @@ class Scheduler(
         else:
             self.external_corpus_manager = None
 
+    def _init_auto_spec(self):
+        """Initialize the auto-spec engine and pass it to the model worker."""
+        from sglang.srt.speculative.auto_spec_engine import AutoSpecEngine
+
+        self.auto_spec_engine = AutoSpecEngine(self.server_args)
+        self.auto_spec_engine.initialize(self.gpu_id)
+
+        # Pass the engine to the model worker for multi-step graph capture
+        if hasattr(self.model_worker, "init_auto_spec"):
+            self.model_worker.init_auto_spec(self.auto_spec_engine)
+        logger.info("AutoSpec engine initialized and attached to model worker.")
+
     def init_model_worker(self):
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
@@ -671,6 +687,10 @@ class Scheduler(
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
+
+        # Initialize auto-spec if enabled
+        if self.auto_spec and not self.spec_algorithm.is_none():
+            self._init_auto_spec()
 
         # Get token and memory info from the model worker
         (

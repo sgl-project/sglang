@@ -33,9 +33,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
+    EAGLEDraftCudaGraphRunnerAuto,
 )
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
+    EAGLEDraftExtendCudaGraphRunnerAuto,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
@@ -102,6 +104,10 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # Auto-spec support
+        self.auto_spec = server_args.auto_spec
+        self.auto_spec_engine = None  # Set later by scheduler
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -205,6 +211,10 @@ class EAGLEWorker(TpModelWorker):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
+        # Auto-spec: additional initialization for multi-step graphs
+        # (must be done after normal init completes)
+        self._auto_spec_initialized = False
+
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -272,6 +282,138 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
+    def init_auto_spec(self, auto_spec_engine):
+        """Initialize auto-spec multi-step CUDA graphs and attention backends.
+
+        Must be called after init_cuda_graphs() completes and after
+        auto_spec_engine.initialize() is called.
+        """
+        if not self.auto_spec or self._auto_spec_initialized:
+            return
+
+        self.auto_spec_engine = auto_spec_engine
+        step_range = auto_spec_engine.step_range
+
+        # Store the default (already-captured) graphs for the initial num_steps
+        default_step = self.speculative_num_steps
+        self.draft_attn_backend_for_steps = {default_step: self.draft_attn_backend}
+        self.draft_extend_attn_backend_for_steps = {
+            default_step: self.draft_extend_attn_backend
+        }
+        self.cuda_graph_runner_for_steps = {default_step: self.cuda_graph_runner}
+        self.cuda_graph_runner_for_draft_extend_for_steps = {
+            default_step: self.cuda_graph_runner_for_draft_extend
+        }
+
+        # Capture additional graphs for other steps
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            for num_steps in step_range:
+                if num_steps == default_step:
+                    continue
+
+                logger.info(f"AutoSpec: capturing draft graphs for num_steps={num_steps}")
+
+                # Save and update server_args for this step
+                saved_steps = self.draft_model_runner.server_args.speculative_num_steps
+                saved_draft = self.draft_model_runner.server_args.speculative_num_draft_tokens
+                self.draft_model_runner.server_args.speculative_num_steps = num_steps
+                self.draft_model_runner.server_args.speculative_num_draft_tokens = num_steps + 1
+
+                # Create attention backend for this step
+                draft_backend_factory = DraftBackendFactory(
+                    self.server_args,
+                    self.draft_model_runner,
+                    self.topk,
+                    num_steps,
+                )
+                draft_attn = draft_backend_factory.create_decode_backend()
+                draft_extend_attn = draft_backend_factory.create_draft_extend_backend()
+
+                self.draft_attn_backend_for_steps[num_steps] = draft_attn
+                self.draft_extend_attn_backend_for_steps[num_steps] = draft_extend_attn
+                self.draft_model_runner.draft_attn_backend = draft_attn
+
+                # Capture draft CUDA graph for this step
+                if num_steps > 1:
+                    bs_for_step = auto_spec_engine.steps_bs_mapping.get(num_steps)
+                    self.cuda_graph_runner_for_steps[num_steps] = (
+                        EAGLEDraftCudaGraphRunnerAuto(
+                            self,
+                            num_steps,
+                            batch_sizes=bs_for_step,
+                            draft_attn_backend=draft_attn,
+                        )
+                    )
+                else:
+                    self.cuda_graph_runner_for_steps[num_steps] = None
+
+                # Capture draft extend CUDA graph
+                if draft_extend_attn and not _is_npu:
+                    self.draft_extend_attn_backend = draft_extend_attn
+                    self.cuda_graph_runner_for_draft_extend_for_steps[num_steps] = (
+                        EAGLEDraftExtendCudaGraphRunnerAuto(self, num_steps)
+                    )
+                else:
+                    self.cuda_graph_runner_for_draft_extend_for_steps[num_steps] = None
+
+                # Restore
+                self.draft_model_runner.server_args.speculative_num_steps = saved_steps
+                self.draft_model_runner.server_args.speculative_num_draft_tokens = saved_draft
+
+        # Also init verify-side multi-step graphs on the target model runner
+        target_runner = self.target_worker.model_runner
+        target_runner.init_attention_backend_for_steps(step_range)
+        target_runner.init_device_graphs_for_steps(step_range)
+
+        # Restore current backends to the default step
+        self.draft_attn_backend = self.draft_attn_backend_for_steps[default_step]
+        self.draft_extend_attn_backend = self.draft_extend_attn_backend_for_steps[default_step]
+        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.cuda_graph_runner = self.cuda_graph_runner_for_steps[default_step]
+        self.cuda_graph_runner_for_draft_extend = (
+            self.cuda_graph_runner_for_draft_extend_for_steps[default_step]
+        )
+
+        self._auto_spec_initialized = True
+        logger.info(
+            f"AutoSpec V1 initialized: step_range={step_range}, "
+            f"default_step={default_step}"
+        )
+
+    def _switch_to_step(self, num_steps: int):
+        """Switch all CUDA graph runners and attention backends to a given num_steps."""
+        if num_steps == self.speculative_num_steps:
+            return
+
+        self.speculative_num_steps = num_steps
+        self.speculative_num_draft_tokens = num_steps + 1
+
+        # Switch draft-side
+        self.draft_attn_backend = self.draft_attn_backend_for_steps[num_steps]
+        self.draft_extend_attn_backend = self.draft_extend_attn_backend_for_steps.get(num_steps)
+        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.cuda_graph_runner = self.cuda_graph_runner_for_steps.get(num_steps)
+        self.cuda_graph_runner_for_draft_extend = (
+            self.cuda_graph_runner_for_draft_extend_for_steps.get(num_steps)
+        )
+
+        # Update draft server_args (needed for get_eagle_info in ForwardBatch)
+        self.draft_model_runner.server_args.speculative_num_steps = num_steps
+        self.draft_model_runner.server_args.speculative_num_draft_tokens = num_steps + 1
+
+        # Switch verify-side
+        target_runner = self.target_worker.model_runner
+        if num_steps in target_runner.graph_runner_for_steps:
+            target_runner.graph_runner = target_runner.graph_runner_for_steps[num_steps]
+        if num_steps in target_runner.attn_backend_for_steps:
+            target_runner.attn_backend = target_runner.attn_backend_for_steps[num_steps]
+
+        # Update target server_args
+        target_runner.server_args.speculative_num_steps = num_steps
+        target_runner.server_args.speculative_num_draft_tokens = num_steps + 1
+
     @property
     def draft_model_runner(self):
         return self.model_runner
@@ -312,6 +454,12 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            # Auto-spec: switch to the best num_steps for this batch size
+            if self.auto_spec and self._auto_spec_initialized:
+                best = self.auto_spec_engine.get_spec_params(batch.batch_size())
+                if best.num_steps != self.speculative_num_steps:
+                    self._switch_to_step(best.num_steps)
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -613,7 +761,7 @@ class EAGLEWorker(TpModelWorker):
             retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
-            draft_token_num=self.server_args.speculative_num_draft_tokens,
+            draft_token_num=self.speculative_num_draft_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,

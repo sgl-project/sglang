@@ -2501,6 +2501,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_device_graphs(self):
         """Capture device graphs."""
         self.graph_runner = None
+        self.graph_runner_for_steps = {}  # For auto_spec: step -> CudaGraphRunner
         self.graph_mem_usage = 0
 
         if not self.is_generation:
@@ -2541,6 +2542,75 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+        )
+
+    def init_attention_backend_for_steps(self, step_range: list):
+        """Init attention backends for each speculative step (auto_spec verify side)."""
+        self.attn_backend_for_steps = {}
+        saved_num_steps = self.server_args.speculative_num_steps
+        saved_num_draft = self.server_args.speculative_num_draft_tokens
+
+        for num_steps in step_range:
+            self.server_args.speculative_num_steps = num_steps
+            self.server_args.speculative_num_draft_tokens = num_steps + 1
+            self.attn_backend_for_steps[num_steps] = self._get_attention_backend()
+            logger.info(
+                f"AutoSpec: init verify attention backend for num_steps={num_steps}"
+            )
+
+        # Restore and set initial
+        initial_step = step_range[-1]
+        self.server_args.speculative_num_steps = saved_num_steps
+        self.server_args.speculative_num_draft_tokens = saved_num_draft
+        self.attn_backend = self.attn_backend_for_steps[initial_step]
+
+    def init_device_graphs_for_steps(self, step_range: list):
+        """Capture device graphs for each speculative step (auto_spec verify side)."""
+        if not self.is_generation or self.server_args.disable_cuda_graph:
+            return
+
+        saved_num_steps = self.server_args.speculative_num_steps
+        saved_num_draft = self.server_args.speculative_num_draft_tokens
+
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"AutoSpec: capture verify cuda graphs begin. avail mem={before_mem:.2f} GB"
+        )
+
+        graph_runners = defaultdict(
+            lambda: CudaGraphRunner,
+            {
+                "cpu": CPUGraphRunner,
+                "npu": NPUGraphRunner,
+            },
+        )
+
+        for num_steps in step_range:
+            self.server_args.speculative_num_steps = num_steps
+            self.server_args.speculative_num_draft_tokens = num_steps + 1
+            self.attn_backend = self.attn_backend_for_steps[num_steps]
+            step_before = get_available_gpu_memory(self.device, self.gpu_id)
+            self.graph_runner_for_steps[num_steps] = graph_runners[self.device](self)
+            step_after = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"AutoSpec: captured verify graph for num_steps={num_steps}, "
+                f"mem usage={step_before - step_after:.2f} GB"
+            )
+
+        # Restore and set initial
+        initial_step = step_range[-1]
+        self.server_args.speculative_num_steps = saved_num_steps
+        self.server_args.speculative_num_draft_tokens = saved_num_draft
+        self.attn_backend = self.attn_backend_for_steps[initial_step]
+        self.graph_runner = self.graph_runner_for_steps[initial_step]
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.graph_mem_usage = before_mem - after_mem
+        logger.info(
+            f"AutoSpec: capture verify cuda graphs end. "
+            f"Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
