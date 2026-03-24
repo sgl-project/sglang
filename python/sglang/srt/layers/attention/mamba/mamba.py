@@ -66,6 +66,7 @@ elif is_hip():
     if _use_aiter_conv and os.getenv("SGLANG_CONV1D_UPDATE_IMPL", "aiter") == "aiter":
         from sglang.srt.layers.attention.mamba.causal_conv1d_aiter import (
             causal_conv1d_update,
+            causal_conv1d_fn,
         )
 elif is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
