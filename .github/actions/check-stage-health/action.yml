@@ -1,5 +1,5 @@
 name: Check Stage Health
-description: Fail fast if any job in the current workflow run has already failed.
+description: Fail fast if any job in the current workflow run has already failed. Auto-skips for scheduled runs.
 
 inputs:
   github-token:
@@ -15,6 +15,12 @@ runs:
       with:
         github-token: ${{ inputs.github-token }}
         script: |
+          // Skip for scheduled runs — they should collect all failures, not fast-fail
+          if (context.eventName === 'schedule') {
+            core.info('Skipping health check for scheduled run');
+            return;
+          }
+
           const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
             owner: context.repo.owner,
             repo: context.repo.repo,
