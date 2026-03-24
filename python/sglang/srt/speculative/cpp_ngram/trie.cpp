@@ -109,7 +109,7 @@ const TrieNode* Trie::resolve(const MatchState& state, const NodeRef& ref) const
   return ref.ptr;
 }
 
-bool Trie::_validateMatchState(const MatchState& state) const {
+bool Trie::validateMatchState_(const MatchState& state) const {
   if (state.trie_epoch != trie_epoch_) {
     return false;
   }
@@ -121,7 +121,7 @@ bool Trie::_validateMatchState(const MatchState& state) const {
   return true;
 }
 
-bool Trie::_rebuildMatchState(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
+void Trie::rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
   const auto max_match_depth = std::min(len, param_.max_trie_depth);
   state.trie_epoch = trie_epoch_;
   state.processed_total_len = total_len;
@@ -143,11 +143,10 @@ bool Trie::_rebuildMatchState(const int32_t* context, size_t len, MatchState& st
       state.anchors[match_depth - 1] = capture(cursor);
     }
   }
-  return true;
 }
 
-bool Trie::_advanceMatchState(MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const {
-  if (!_validateMatchState(state)) {
+bool Trie::advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const {
+  if (!validateMatchState_(state)) {
     return false;
   }
 
@@ -185,7 +184,7 @@ bool Trie::_advanceMatchState(MatchState& state, const int32_t* tokens, size_t l
   return true;
 }
 
-std::vector<std::pair<const TrieNode*, int32_t>> Trie::_getExpandableAnchors(const MatchState& state) const {
+std::vector<std::pair<const TrieNode*, int32_t>> Trie::getExpandableAnchors_(const MatchState& state) const {
   std::vector<std::pair<const TrieNode*, int32_t>> result;
   result.reserve(state.anchors.size());
   for (size_t depth = state.anchors.size(); depth > 0; --depth) {
@@ -205,12 +204,12 @@ Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_
   const bool can_advance = state.trie_epoch == trie_epoch_ && has_forward_progress && appended_len <= len &&
                            state.anchors.size() == expected_prev_depth;
 
-  if (can_advance && _advanceMatchState(state, context + len - appended_len, appended_len, total_len)) {
-    return _getExpandableAnchors(state);
+  if (can_advance && advanceMatchState_(state, context + len - appended_len, appended_len, total_len)) {
+    return getExpandableAnchors_(state);
   }
 
-  _rebuildMatchState(context, len, state, total_len);
-  return _getExpandableAnchors(state);
+  rebuildMatchState_(context, len, state, total_len);
+  return getExpandableAnchors_(state);
 }
 
 Result Trie::buildRecency(
