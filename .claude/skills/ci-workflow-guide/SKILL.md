@@ -101,16 +101,17 @@ PR event
 
 ## Cross-Job Fast-Fail (`check-stage-health` action)
 
-Composite action called after checkout in every stage test job.
+Composite action called after checkout in every stage test job (21 jobs total across `pr-test.yml`, `pr-test-multimodal-gen.yml`, `pr-test-sgl-kernel.yml`, `pr-test-jit-kernel.yml`).
 
 **How it works:**
 1. Queries `listJobsForWorkflowRun` for the current workflow run
-2. Filters for any job with `status === 'completed' && conclusion === 'failure'`
-3. If found → sets `outputs.healthy = 'false'` + emits warning annotation
-4. If none → sets `outputs.healthy = 'true'`
-5. **Always succeeds** — never calls `core.setFailed()`
+2. Filters for **root cause failures only** — jobs with `conclusion === 'failure'` whose failing step is NOT `check-stage-health` (excludes cascade failures)
+3. If root cause failures found → calls `core.setFailed()` with the list of root cause job names
+4. If none → does nothing (step succeeds)
 
-**Step guard pattern:**
+**Cascade filtering**: When job A fast-fails due to health check, it also has `conclusion: failure`. Without filtering, job B would list both the original failure AND job A's fast-fail. The filter checks each failed job's `steps` array — if the failing step name contains `check-stage-health` or `Check stage health`, it's excluded from the root cause list.
+
+**Usage pattern:**
 ```yaml
 steps:
   - name: Checkout code
@@ -120,23 +121,21 @@ steps:
   - uses: ./.github/actions/check-stage-health
     id: stage-health
 
-  - name: Install dependencies
-    if: steps.stage-health.outputs.healthy == 'true'
-    ...
+  - name: Install dependencies        # skipped automatically if health check failed
+    ...                                # (default if: success() is false)
 
-  - name: Run test
-    if: steps.stage-health.outputs.healthy == 'true'
+  - name: Run test                     # also skipped
     ...
-
-  - uses: ./.github/actions/upload-cuda-coredumps
-    if: always() && steps.stage-health.outputs.healthy == 'true'
 ```
 
-**Visual effect**: Job shows **green** (success) but all steps after health check are **grey** (skipped) — easy to distinguish from real failures at a glance.
+**Visual effect**: Job shows **red X** (failure) with error annotation showing root cause job names. Subsequent steps are naturally skipped (default `if: success()` is false after a failed step). No per-step `if` guards needed.
 
-**No stage filtering**: Checks ALL jobs in the run, not just the current stage. Any failure anywhere triggers skip.
+**No stage filtering**: Checks ALL jobs in the run, not just the current stage. Any failure anywhere triggers fast-fail.
 
-**Why every step needs `if:`**: In GitHub Actions, a skipped step (`if: false`) does NOT cause subsequent steps to skip. The default `if: success()` means "no previous step **failed**" — skipped ≠ failed. So every step must be independently guarded.
+**Error message example:**
+```
+Fast-fail: skipping — root cause job(s): stage-b-test-1-gpu-small (0), stage-b-test-1-gpu-small (1)
+```
 
 ---
 
