@@ -121,9 +121,7 @@ class DeepseekModelNextN(nn.Module):
         ):
             layer_name = "layers." + str(config.num_hidden_layers)
 
-        self.needs_quant_draft = (
-            get_global_server_args().speculative_draft_model_quantization
-        )
+        self.quant_config = quant_config
         self.decoder = DeepseekV2DecoderLayer(
             config,
             0,
@@ -149,7 +147,7 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if _is_npu and not self.needs_quant_draft:
+        if _is_npu and self.quant_config is None:
             os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "1"
             os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
         zero_allocator = BumpAllocator(
@@ -210,7 +208,7 @@ class DeepseekModelNextN(nn.Module):
                     torch.cuda.current_stream(),
                 )
 
-        if _is_npu and not self.needs_quant_draft:
+        if _is_npu and self.quant_config is None:
             os.environ["SGLANG_DEEPEP_BF16_DISPATCH"] = "0"
             os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
         return hidden_states
@@ -236,12 +234,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
-        quant_config = (
-            None
-            if _is_npu
-            and not get_global_server_args().speculative_draft_model_quantization
-            else quant_config
-        )
         self.quant_config = quant_config
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
