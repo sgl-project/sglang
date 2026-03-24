@@ -881,7 +881,8 @@ class MiniMaxLongRoPEScaledRotaryEmbedding(nn.Module):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
-        total_seq_len: Optional[int] = None,
+        total_seq_len_val: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with dynamic position encoding switching.
 
@@ -891,9 +892,8 @@ class MiniMaxLongRoPEScaledRotaryEmbedding(nn.Module):
             key: Key tensor
             offsets: Optional offsets to add to positions
             fused_set_kv_buffer_arg: Optional fused KV buffer argument
-            total_seq_len: Total sequence length of the entire sequence (not just current chunk).
-                           If provided and exceeds original_max_position_embeddings,
-                           the entire batch will use long_cos_sin_cache.
+            total_seq_len_val: Tensor of shape [batch_size] containing original prefill sequence length for each sample
+            seq_lens: Tensor of shape [batch_size] containing sequence length for each sample in current chunk
         """
         # Reshape query and key for consistent processing
         query = query.unflatten(1, (-1, self.head_size))
@@ -907,15 +907,32 @@ class MiniMaxLongRoPEScaledRotaryEmbedding(nn.Module):
         # total_seq_len is the original prefill sequence length (not cumulative)
         # CUDA Graph compatible: always use tensor operations
         k = self.original_max_position_embeddings
-        # Convert to tensor if needed, default to 0 if None
-        total_seq_len_val = (
-            total_seq_len if total_seq_len is not None else 0
-        )
-        if not isinstance(total_seq_len_val, torch.Tensor):
-            total_seq_len_val = torch.tensor(total_seq_len_val, device=positions.device, dtype=torch.long)
+        # def print1(x=0):
+        #     print(f'x={x} x={x} x={x} x={x} x={x} x={x} x={x} x={x} x={x} x={x} x={x}')
+        #     if str(query.device)=="cuda:0":
+        #         if seq_lens is not None:
+        #             print('seq_lens shape--------',seq_lens.shape,'---value---',seq_lens)
+        #         print('total_seq_len_val shape--------',total_seq_len_val.shape,'---value---',total_seq_len_val)
+        #         print('positions  shape---------------',positions.shape,'---value---',positions)
+        # Expand total_seq_len from [batch_size] to [total_tokens] using repeat_interleave
+        # if total_seq_len_val is not None and seq_lens is not None and total_seq_len_val.shape != positions.shape:
+        if seq_lens is not None:
+            #print1(1)
+            # Expand each sample's total_seq_len by its sequence length
+            total_seq_len_val = total_seq_len_val.repeat_interleave(seq_lens)
+            
+        #and total_seq_len_val.shape != positions.shape
+        # elif total_seq_len_val is not None and total_seq_len_val.shape != positions.shape:
+        #     # Fallback: use max if seq_lens not provided
+        #     total_seq_len_val = torch.full_like(positions, total_seq_len_val.max())
+        #     print1(2)
+        # else:
+        #     total_seq_len_val = torch.zeros_like(positions)
+        
         long_prompt_offset = (
             (total_seq_len_val > k).float() * torch.full_like(positions, k)
         ).long()
+
         idx = torch.add(positions, long_prompt_offset)
 
         # Get cos/sin values from combined cache

@@ -661,11 +661,17 @@ class MiniMaxM2Attention(nn.Module):
         # For chunk prefill, use orig_seq_lens which is the original length without chunking (Qwen-1M related)
         # CUDA Graph compatible: keep as tensor, don't use .item()
         if forward_batch.orig_seq_lens is not None:
-            total_seq_len = forward_batch.orig_seq_lens.max()
+            total_seq_len = forward_batch.orig_seq_lens
         else:
             # Fallback for decode mode
-            total_seq_len = 0
-        q, k = self.rotary_emb(positions, q, k, total_seq_len=total_seq_len)
+            total_seq_len = None
+        
+        # Get seq_lens for expanding total_seq_len to token level
+        seq_lens = forward_batch.extend_seq_lens
+        # if forward_batch.extend_seq_lens is not None:
+        #     print('extend_seq_lens shape--------',forward_batch.extend_seq_lens.shape,'---value---',forward_batch.extend_seq_lens)
+        
+        q, k = self.rotary_emb(positions, q, k, total_seq_len_val=total_seq_len, seq_lens=seq_lens)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
