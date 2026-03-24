@@ -670,8 +670,11 @@ class Scheduler(
         """Initialize the auto-spec engine and pass it to the model worker."""
         from sglang.srt.speculative.auto_spec_engine import AutoSpecEngine
 
+        from sglang.srt.environ import envs
+
         self.auto_spec_engine = AutoSpecEngine(self.server_args)
-        self.auto_spec_engine.initialize(self.gpu_id)
+        is_spec_v2 = envs.SGLANG_ENABLE_SPEC_V2.get()
+        self.auto_spec_engine.initialize(self.gpu_id, is_spec_v2=is_spec_v2)
 
         # Pass the engine to the model worker for multi-step graph capture
         if hasattr(self.model_worker, "init_auto_spec"):

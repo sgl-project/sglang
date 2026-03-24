@@ -426,6 +426,18 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner_for_draft_extend_for_steps[default_step]
         )
 
+        # Prune bs_steps_mapping: only keep BS->step combinations where
+        # the draft graph runner can handle that BS (avoid eager mode fallback
+        # which can cause illegal memory access with large batches).
+        step_max_bs = {}
+        for num_steps, runner in self.cuda_graph_runner_for_steps.items():
+            if runner is not None:
+                step_max_bs[num_steps] = runner.max_bs
+            else:
+                # step=1 has no graph runner, allow any BS
+                step_max_bs[num_steps] = max(auto_spec_engine.bs_list)
+        auto_spec_engine.prune_by_graph_capacity(step_max_bs)
+
         self._auto_spec_initialized = True
         logger.info(
             f"AutoSpec V2 DraftWorker initialized: step_range={step_range}, "
@@ -456,9 +468,9 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner_for_draft_extend_for_steps.get(num_steps)
         )
 
-        # Update draft server_args
-        self.draft_runner.server_args.speculative_num_steps = num_steps
-        self.draft_runner.server_args.speculative_num_draft_tokens = num_steps + 1
+        # NOTE: Do NOT update draft_runner.server_args.speculative_num_steps here.
+        # server_args is set to the max step in init_auto_spec so that
+        # get_alloc_len_per_decode() always allocates enough KV cache slots.
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
@@ -843,6 +855,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         self.auto_spec_engine = auto_spec_engine
 
+        # Update global server_args to use the max step in auto-spec range.
+        # This ensures get_alloc_len_per_decode() allocates enough KV cache
+        # slots for the worst-case step count, preventing memory leaks when
+        # switching between steps at runtime.
+        max_step = max(auto_spec_engine.step_range)
+        self.server_args.speculative_num_steps = max_step
+        self.server_args.speculative_num_draft_tokens = max_step + 1
+
         # Initialize the draft worker's multi-step graphs
         self._draft_worker.init_auto_spec(auto_spec_engine)
 
@@ -878,8 +898,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             target_runner.graph_runner = target_runner.graph_runner_for_steps[num_steps]
         if num_steps in target_runner.attn_backend_for_steps:
             target_runner.attn_backend = target_runner.attn_backend_for_steps[num_steps]
-        target_runner.server_args.speculative_num_steps = num_steps
-        target_runner.server_args.speculative_num_draft_tokens = num_steps + 1
+        # NOTE: Do NOT update server_args.speculative_num_steps here.
+        # server_args is set to the max step in init_auto_spec so that
+        # get_alloc_len_per_decode() always allocates enough KV cache slots.
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (

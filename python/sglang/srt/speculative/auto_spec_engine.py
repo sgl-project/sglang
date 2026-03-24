@@ -101,16 +101,31 @@ class AutoSpecEngine:
         # Will be finalized in initialize() after GPU memory is known
         self._initialized = False
 
-    def initialize(self, gpu_id: int):
-        """Must be called after model loading to finalize based on available GPU memory."""
+    def initialize(self, gpu_id: int, is_spec_v2: bool = False):
+        """Must be called after model loading to finalize based on available GPU memory.
+
+        Args:
+            gpu_id: The GPU device index.
+            is_spec_v2: If True, use more conservative memory estimates for SpecV2
+                which captures both draft and verify CUDA graphs per step.
+        """
         from sglang.srt.utils.common import get_available_gpu_memory
 
         available_memory = get_available_gpu_memory(self.device_id, gpu_id, empty_cache=False)
-        # Reserve 4GB safety margin, ~2GB per step for CUDA graphs
-        max_num_graphs = int((available_memory - 4) // 2)
+        # SpecV2 captures both draft + verify graphs per step (~3.5GB each),
+        # while V1 only captures draft graphs (~2GB each).
+        # Reserve safety margin for inference runtime allocations (MoE, etc).
+        if is_spec_v2:
+            safety_margin = 6.0  # GB reserved for runtime
+            cost_per_step = 3.5  # GB per step (draft + verify graphs)
+        else:
+            safety_margin = 4.0
+            cost_per_step = 2.0
+        max_num_graphs = int((available_memory - safety_margin) // cost_per_step)
         max_num_graphs = max(max_num_graphs, 1)
         logger.info(
             f"AutoSpecEngine: available_memory={available_memory:.1f}GB, "
+            f"safety_margin={safety_margin}GB, cost_per_step={cost_per_step}GB, "
             f"max graph sets={max_num_graphs}"
         )
 
@@ -234,6 +249,36 @@ class AutoSpecEngine:
 
         # EMA acceptance rate tracker per batch size
         self.ema_accept_rate: Dict[int, float] = {bs: 0.5 for bs in self.bs_list}
+
+    def prune_by_graph_capacity(self, step_max_bs: Dict[int, int]):
+        """Remove BS->step mappings where the draft graph can't handle that BS.
+
+        After CUDA graphs are captured, the draft graph runner for each step has a
+        max_bs limit. If a batch size exceeds that limit, it would fall to eager mode
+        which can cause illegal memory access. This method prunes such mappings.
+
+        Args:
+            step_max_bs: Mapping from num_steps -> max batch size supported by graphs.
+        """
+        pruned = False
+        for bs in list(self.bs_steps_mapping.keys()):
+            original = self.bs_steps_mapping[bs]
+            filtered = [s for s in original if bs <= step_max_bs.get(s, 0)]
+            if not filtered:
+                # Keep at least the step with the largest max_bs for this entry
+                best_step = max(original, key=lambda s: step_max_bs.get(s, 0))
+                filtered = [best_step]
+            if filtered != original:
+                pruned = True
+                self.bs_steps_mapping[bs] = filtered
+
+        if pruned:
+            self._build_reverse_mapping()
+            self._init_current_params()
+            logger.info(
+                f"AutoSpecEngine: pruned bs_steps_mapping by graph capacity: "
+                f"{self.bs_steps_mapping}"
+            )
 
     def _find_closest_bs(self, target: int) -> int:
         """Find the closest batch size in our configured list."""
