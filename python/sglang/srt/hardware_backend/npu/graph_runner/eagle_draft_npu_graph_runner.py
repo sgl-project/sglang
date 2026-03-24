@@ -88,7 +88,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             seq_lens = torch.from_numpy(np.array(seq_lens_list).astype(np.int32))
 
         self.graphs[self.bs].update(
-            cpu_update_input=[{self.update_attr_name: seq_lens} for seq_lens in seq_lens_list]
+            cpu_update_input=[
+                {self.update_attr_name: seq_lens} for seq_lens in seq_lens_list
+            ]
         )
 
     def _replay(self, forward_batch: ForwardBatch):
@@ -98,11 +100,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             seq_lens_for_each_draft_step = []
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = forward_batch.seq_lens_cpu + speculative_step_id + 1
-                seq_lens = seq_lens_cpu.tolist() + [0] * (
-                    self.bs - self.raw_bs
-                )
+                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
                 seq_lens_for_each_draft_step.append(seq_lens)
-            thread = threading.Thread(target=self._replay_update, args=(seq_lens_for_each_draft_step,))
+            thread = threading.Thread(
+                target=self._replay_update, args=(seq_lens_for_each_draft_step,)
+            )
             thread.start()
             self.graphs[self.bs].replay()
             thread.join()
