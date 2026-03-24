@@ -104,10 +104,11 @@ if TYPE_CHECKING:
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
-# TODO (kaiximatteoc): parameterize this
 def _get_inductor_groupedmm_compile_options():
     compile_options = {
-        "max_autotune_gemm_backends": "TRITON",
+        "max_autotune_gemm_backends": os.environ.get(
+            "TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "TRITON"
+        ),
         "max_autotune_gemm": True,
         # "trace.enabled": True,
     }
