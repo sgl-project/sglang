@@ -26,6 +26,7 @@ _aiter_available = False
 if is_hip() and get_bool_env_var("SGLANG_USE_AITER"):
     try:
         import aiter  # noqa: F401
+
         from sglang.srt.layers.attention.mamba import causal_conv1d_aiter
 
         _aiter_available = True
@@ -202,7 +203,9 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
 @pytest.mark.parametrize("seqlen", [1])
 @pytest.mark.parametrize("width", [4])
 @pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
-def test_causal_conv1d_update_aiter(dim, width, seqlen, has_bias, silu_activation, itype):
+def test_causal_conv1d_update_aiter(
+    dim, width, seqlen, has_bias, silu_activation, itype
+):
     """Test causal_conv1d_update with aiter backend (decode path on ROCm)."""
     from sglang.srt.layers.attention.mamba import causal_conv1d_aiter
 
@@ -500,7 +503,9 @@ def test_causal_conv1d_update_with_batch_gather_aiter_vs_triton(
         pad_slot_id=PAD_SLOT_ID,
     )
 
-    assert torch.allclose(out_triton[:batch_size], out_aiter[:batch_size], rtol=rtol, atol=atol)
+    assert torch.allclose(
+        out_triton[:batch_size], out_aiter[:batch_size], rtol=rtol, atol=atol
+    )
     assert torch.allclose(
         conv_state_triton[conv_state_indices, :],
         conv_state_aiter[conv_state_indices, :],
