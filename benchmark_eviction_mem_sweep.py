@@ -39,12 +39,16 @@ DEFAULT_PORTS = [30000, 30001]
 @dataclass(frozen=True)
 class Experiment:
     policy: str
-    mem_fraction: float
+    mem_fraction: Optional[float]
 
     @property
     def slug(self) -> str:
-        mem_str = str(self.mem_fraction).replace(".", "p")
+        mem_str = "auto" if self.mem_fraction is None else str(self.mem_fraction).replace(".", "p")
         return f"{self.policy}_mem{mem_str}"
+
+    @property
+    def mem_label(self) -> str:
+        return "auto" if self.mem_fraction is None else f"{self.mem_fraction:.2f}"
 
 
 @dataclass(frozen=True)
@@ -56,7 +60,7 @@ class WorkerSlot:
 @dataclass
 class ExperimentResult:
     policy: str
-    mem_fraction: float
+    mem_fraction: Optional[float]
     gpu_id: str
     port: int
     status: str
@@ -72,6 +76,19 @@ class ExperimentResult:
 
 def parse_csv_floats(raw: str) -> List[float]:
     return [float(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def parse_csv_mem_fractions(raw: str) -> List[Optional[float]]:
+    out: List[Optional[float]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.lower() == "auto":
+            out.append(None)
+        else:
+            out.append(float(item))
+    return out
 
 
 def parse_csv_strs(raw: str) -> List[str]:
@@ -135,13 +152,17 @@ def build_server_cmd(exp: Experiment, slot: WorkerSlot, args: argparse.Namespace
         "--trust-remote-code",
         "--mamba-scheduler-strategy",
         args.mamba_scheduler_strategy,
-        "--mem-fraction-static",
-        f"{exp.mem_fraction:.2f}",
         "--host",
         args.host,
         "--port",
         str(slot.port),
     ]
+
+    if exp.mem_fraction is not None:
+        cmd += [
+            "--mem-fraction-static",
+            f"{exp.mem_fraction:.2f}",
+        ]
 
     if exp.policy in ("marconi", "seglen"):
         cmd += [
@@ -277,7 +298,7 @@ def worker_loop(
 
         print(
             f"[worker gpu={slot.gpu_id} port={slot.port}] "
-            f"starting {exp.policy} mem_fraction={exp.mem_fraction:.2f}",
+            f"starting {exp.policy} mem_fraction={exp.mem_label}",
             flush=True,
         )
         result = run_experiment(exp, slot, args, output_dir)
@@ -285,7 +306,7 @@ def worker_loop(
             results.append(result)
         print(
             f"[worker gpu={slot.gpu_id} port={slot.port}] "
-            f"{result.status} {exp.policy} mem_fraction={exp.mem_fraction:.2f}",
+            f"{result.status} {exp.policy} mem_fraction={exp.mem_label}",
             flush=True,
         )
         work_q.task_done()
@@ -311,7 +332,7 @@ def main() -> None:
         "--mem-fractions",
         type=str,
         default="0.3,0.5,0.7,1.0",
-        help="Comma-separated mem-fraction-static values.",
+        help="Comma-separated mem-fraction-static values. Use 'auto' to omit the flag.",
     )
     parser.add_argument(
         "--policies",
@@ -348,7 +369,7 @@ def main() -> None:
     args = parser.parse_args()
 
     policies = parse_csv_strs(args.policies)
-    mem_fractions = parse_csv_floats(args.mem_fractions)
+    mem_fractions = parse_csv_mem_fractions(args.mem_fractions)
     gpus = parse_csv_strs(args.gpus)
     ports = parse_csv_ints(args.ports)
 
@@ -378,6 +399,9 @@ def main() -> None:
         "host": args.host,
         "policies": policies,
         "mem_fractions": mem_fractions,
+        "mem_fraction_labels": [
+            "auto" if mf is None else f"{mf:.2f}" for mf in mem_fractions
+        ],
         "gpus": gpus,
         "ports": ports,
         "experiments": [asdict(x) for x in experiments],
@@ -405,7 +429,13 @@ def main() -> None:
     for t in threads:
         t.join()
 
-    results_sorted = sorted(results, key=lambda x: (x.mem_fraction, x.policy))
+    results_sorted = sorted(
+        results,
+        key=lambda x: (
+            float("inf") if x.mem_fraction is None else x.mem_fraction,
+            x.policy,
+        ),
+    )
     (output_dir / "results.json").write_text(
         json.dumps([asdict(x) for x in results_sorted], indent=2) + "\n"
     )
