@@ -530,36 +530,20 @@ class GemmaRMSNorm(MultiPlatformOp):
             return self.forward_native(x, residual, post_residual_addition)
 
         w = self.weight.data + 1.0
-        if _use_aiter:
-            # aiter API: rms_norm(input, weight, eps) -> output
-            #            fused_add_rms_norm(output, input, residual, residual_out, weight, eps)
-            if residual is not None:
-                output = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    output, x, residual, residual_out, w, self.variance_epsilon
-                )
-                return output, residual_out
-            return rms_norm(x, w, self.variance_epsilon)
-        else:
-            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
-            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
-            if not x.is_contiguous():
-                x = x.contiguous()
-            if residual is not None:
-                out = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    out, x, residual_out, residual, w, self.variance_epsilon
-                )
-                return out, residual_out
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if residual is not None:
             out = torch.empty_like(x)
-            rms_norm(out, x, w, self.variance_epsilon)
-            return out
+            residual_out = torch.empty_like(x)
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            fused_add_rms_norm(
+                out, x, residual_out, residual, w, self.variance_epsilon
+            )
+            return out, residual_out
+        out = torch.empty_like(x)
+        rms_norm(out, x, w, self.variance_epsilon)
+        return out
 
     def forward_cpu(
         self,
