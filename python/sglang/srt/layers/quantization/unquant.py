@@ -325,11 +325,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         return
 
     def create_native_activation_fn(self, moe_runner_config: MoeRunnerConfig) -> None:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import _swiglu_gpt_oss_sigmoid_alpha
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            _swiglu_gpt_oss_sigmoid_alpha,
+        )
 
-        # Define native activation function based on moe_runner_config
-        if moe_runner_config.activation == "silu" and moe_runner_config.gemm1_alpha and moe_runner_config.gemm1_clamp_limit:
-            self.native_activation_fn = _swiglu_gpt_oss_sigmoid_alpha
+        if moe_runner_config.activation == "silu":
+            if moe_runner_config.gemm1_alpha and moe_runner_config.gemm1_clamp_limit:
+                self.native_activation_fn = _swiglu_gpt_oss_sigmoid_alpha
+            else:
+                from sglang.srt.layers.activation import SiluAndMul
+
+                self.native_activation_fn = SiluAndMul().forward_native
+        elif moe_runner_config.activation == "gelu":
+            assert moe_runner_config.gemm1_alpha is None and moe_runner_config.gemm1_clamp_limit is None, "gemm1_alpha and gemm1_clamp_limit are not supported for gelu"
+            from sglang.srt.layers.activation import GeluAndMul
+
+            self.native_activation_fn = GeluAndMul().forward_native
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -647,11 +658,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     @staticmethod
     def create_native_activation_fn_args(x, alpha, limit) -> tuple:
         if alpha is None and limit is not None:
-            return x, limit
+            return (x, limit)
         elif alpha is None and limit is None:
-            return x
+            return (x,)
         else:
-            return x, alpha, limit
+            return (x, alpha, limit)
 
 
     def forward_native(
