@@ -8,10 +8,9 @@ description: Guide for achieving optimal performance with SGLang-Diffusion. Cove
 Use this guide when a user asks how to speed up diffusion inference, reduce latency, lower VRAM usage, or tune SGLang-Diffusion for production.
 
 Before running any `sglang generate` command below inside the diffusion container:
-- derive the repo root from `python3 -c "import os, sglang; print(os.path.abspath(os.path.join(os.path.dirname(sglang.__file__), '..', '..')))"` and `cd` there
+- use `python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/diffusion_skill_env.py` to derive the repo root, verify write access, and choose idle GPU(s)
 - export `FLASHINFER_DISABLE_VERSION_CHECK=1`
-- verify the repo is writable if you expect perf dumps or outputs
-- choose idle GPU(s) first; reuse `diffusion-kernel/scripts/diffusion_skill_env.py` when doing perf work
+- `cd` to the repo root resolved from `sglang.__file__`
 
 Reference: [SGLang-Diffusion Advanced Optimizations Blog](https://lmsys.org/blog/2026-02-16-sglang-diffusion-advanced-optimizations/)
 
@@ -19,7 +18,7 @@ Reference: [SGLang-Diffusion Advanced Optimizations Blog](https://lmsys.org/blog
 
 ## Section 1: Lossless Optimizations
 
-These options **do not** affect output quality. The generated images/videos are numerically identical (or within floating-point rounding) to the baseline.
+These options are intended to preserve output quality. In practice, some paths (most notably `torch.compile`) can still introduce small floating-point drift, so validate on your target model when numerical parity matters.
 
 | Option | CLI Flag / Env Var | What It Does | Speedup | Limitations / Notes |
 |---|---|---|---|---|
@@ -27,13 +26,13 @@ These options **do not** affect output quality. The generated images/videos are 
 | **Warmup** | `--warmup` | Runs dummy forward passes to warm up CUDA caches, JIT, and `torch.compile`. Eliminates cold-start penalty. | Removes first-request latency spike | Adds startup time. Without `--warmup-resolutions`, warmup happens on first request. |
 | **Warmup Resolutions** | `--warmup-resolutions 256x256 720x720` | Pre-compiles and warms up specific resolutions at server startup (instead of lazily on first request). | Faster first request per resolution | Each resolution adds to startup time. Serving mode only; useful when you know your target resolutions in advance. |
 | **Multi-GPU (SP)** | `--num-gpus N --ulysses-degree N` | Sequence parallelism across GPUs. Shards sequence tokens (not frames) to minimize padding. | Near-linear scaling with N GPUs | Requires NCCL; inter-GPU bandwidth matters. `ulysses_degree * ring_degree = sp_degree`. |
-| **CFG Parallel** | `--enable-cfg-parallel` | Runs conditional and unconditional CFG branches in parallel across GPUs. **For CFG models with multi-GPU, always prefer `--enable-cfg-parallel` + Ulysses over pure Ulysses** — it is generally faster at the same GPU count due to better compute-to-communication ratio and elimination of sequential branch execution. | Typically faster than pure SP for CFG models | Requires `num_gpus >= 2`. Halves the Ulysses group size (e.g. 8 GPU → two 4-GPU groups). Only for models that use CFG. |
-| **Layerwise Offload** | `--dit-layerwise-offload` | Async layer-by-layer H2D prefetch with compute overlap. Only ~2 DiT layers reside on GPU at a time, dramatically reducing VRAM. For **video models** (where per-layer compute >> H2D transfer), the memcpy is completely hidden behind computation — **zero-cost offload** that saves VRAM without speed penalty ([PR #15511](https://github.com/sgl-project/sglang/pull/15511)). | Saves VRAM (40 GB → ~11 GB for Wan A14B); zero or near-zero speed cost for video models | Enabled by default for Wan/MOVA video models. Incompatible with Cache-DiT. For **image models** or highly parallelized setups (many GPUs, small per-GPU compute), the copy stream may not be fully hidden and can cause slowdown. |
+| **CFG Parallel** | `--enable-cfg-parallel` | Runs conditional and unconditional CFG branches in parallel across GPUs. For CFG models on multi-GPU, benchmark this against pure Ulysses on your topology instead of assuming one always wins. | Often faster than pure SP for CFG models | Requires `num_gpus >= 2`. Halves the Ulysses group size (e.g. 8 GPU → two 4-GPU groups). Only for models that use CFG. |
+| **Layerwise Offload** | `--dit-layerwise-offload` | Async layer-by-layer H2D prefetch with compute overlap. Only ~2 DiT layers reside on GPU at a time, dramatically reducing VRAM. For some video models the copy stream can be almost fully hidden behind compute ([PR #15511](https://github.com/sgl-project/sglang/pull/15511)). | Saves VRAM (40 GB → ~11 GB for Wan A14B); can be near-zero speed cost on the right workload | Enabled by default for Wan/MOVA video models. Incompatible with Cache-DiT. For **image models** or highly parallelized setups (many GPUs, small per-GPU compute), the copy stream may not be fully hidden and can cause slowdown. |
 | **Offload Prefetch Size** | `--dit-offload-prefetch-size F` | Fine-grained control over layerwise offload: how many layers to prefetch ahead. `0.0` = 1 layer (min VRAM), `0.1` = 10% of layers, `≥1` = absolute layer count. | Tune for cases where default offload has copy stream interference (e.g. image models). 0.05–0.1 is a good starting point. | Values ≥ 0.5 approach no-offload VRAM with worse performance. See [PR #17693](https://github.com/sgl-project/sglang/pull/17693) for benchmarks on image models. |
 | **FSDP Inference** | `--use-fsdp-inference` | Uses PyTorch FSDP to shard model weights across GPUs with prefetch. Low latency, low VRAM. | Reduces per-GPU VRAM | Mutually exclusive with `--dit-layerwise-offload`. More overhead than SP on high-bandwidth interconnects. |
 | **CPU Offload (components)** | `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, `--dit-cpu-offload` | Offloads specific pipeline components to CPU when not in use. | Reduces peak VRAM | Adds H2D transfer latency when the component is needed. Auto-enabled for low-VRAM GPUs (<30 GB). **Tip:** after the first request completes, the console prints a peak VRAM analysis with suggestions on which offload flags can be safely disabled — look for the `"Components that could stay resident"` log line. |
 | **Pin CPU Memory** | `--pin-cpu-memory` | Uses pinned (page-locked) memory for CPU offload transfers. | Faster H2D transfers | Slightly higher host memory usage. Enabled by default; disable only as workaround for CUDA errors. |
-| **Attention Backend (lossless)** | `--attention-backend fa` | Selects lossless attention kernel: `fa` (FlashAttention 2/3/4), `torch_sdpa`. FA is the fastest lossless option. | FA >> SDPA for long sequences | FA requires compatible GPU (Ampere+). `fa3`/`fa4` are aliased to `fa`. Ring attention only works with `fa` or `sage_attn`. |
+| **Attention Backend (lossless)** | `--attention-backend fa` | Selects a lossless attention kernel for SGLang-native pipelines: `fa` (FlashAttention 2/3/4 alias) or `torch_sdpa`. | FA is usually faster than SDPA on long sequences | FA requires compatible GPU (Ampere+). For `--backend diffusers`, valid backend names differ; use the names documented in `docs/diffusion/performance/attention_backends.md`. |
 | **Parallel Folding** | *(automatic when SP > 1)* | Reuses the SP process group as TP for the T5 text encoder, so text encoding is parallelized "for free". | Faster text encoding on multi-GPU | Automatic; no user action needed. Only applies to T5-based pipelines. |
 
 ---
@@ -65,7 +64,7 @@ sglang generate --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --prompt "..." --save-output
 ```
 
-Note: `--dit-layerwise-offload` is enabled by default for Wan/MOVA video models and is zero-cost (H2D fully overlapped with compute). No need to disable it.
+Note: `--dit-layerwise-offload` is enabled by default for Wan/MOVA video models and is often a good default, but still benchmark it on your exact workload if latency matters.
 
 ### Maximum speed, image model, single GPU, lossless
 

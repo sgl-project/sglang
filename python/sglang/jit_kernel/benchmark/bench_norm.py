@@ -6,9 +6,10 @@ import triton.testing
 from flashinfer.norm import fused_add_rmsnorm as fi_fused_add_rmsnorm
 from flashinfer.norm import rmsnorm as fi_rmsnorm
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci, run_benchmark
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
+from sglang.utils import is_in_ci
 
 IS_CI = is_in_ci()
 

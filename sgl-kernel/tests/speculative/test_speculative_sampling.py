@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -126,4 +128,4 @@ def test_tree_speculative_sampling_target_only(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

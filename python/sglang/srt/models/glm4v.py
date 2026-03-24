@@ -35,6 +35,7 @@ from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -203,7 +204,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
         self.in_channels = in_channels
 
         kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv3d(
+        self.proj = Conv3dLayer(
             in_channels,
             hidden_size,
             kernel_size=kernel_size,
@@ -211,26 +212,17 @@ class Glm4vVisionPatchEmbed(nn.Module):
             bias=True,
         )
 
-        k = self.in_channels * self.temporal_patch_size * self.patch_size**2
-        self.linear = nn.Linear(
-            in_features=k,
-            out_features=self.hidden_size,
-            bias=True,
-            dtype=self.proj.weight.dtype,
-        )
-
-    def copy_conv3d_weight_to_linear(self):
-        # Call this after weight loading
-        with torch.no_grad():
-            self.linear.weight.copy_(self.proj.weight.view(self.hidden_size, -1))
-            self.linear.bias.copy_(self.proj.bias)
-        del self.proj
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # After copy_conv3d_weight_to_linear(), self.linear exists and
-        # self.proj has been deleted.  Input x is already 2-D:
-        #   (num_patches, C * T * P * P)
-        return self.linear(x)
+        # Input x is 2-D: (num_patches, C * T * P * P)
+        # Reshape to 5-D for Conv3dLayer, then flatten back.
+        x = x.view(
+            -1,
+            self.in_channels,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        return self.proj(x).view(-1, self.hidden_size)
 
 
 class Glm4vPatchMerger(nn.Module):
@@ -456,16 +448,10 @@ class Glm4vVisionModel(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
-        # After Conv3d to Linear conversion, self.proj is deleted and
-        # self.linear takes its place.
-        if hasattr(self.patch_embed, "linear"):
-            return self.patch_embed.linear.weight.dtype
         return self.patch_embed.proj.weight.dtype
 
     @property
     def device(self) -> torch.device:
-        if hasattr(self.patch_embed, "linear"):
-            return self.patch_embed.linear.weight.device
         return self.patch_embed.proj.weight.device
 
     def rot_pos_emb(
@@ -815,7 +801,6 @@ class Glm4vForConditionalGeneration(nn.Module):
                         self.config, name, loaded_weight
                     )
                 weight_loader(param, loaded_weight)
-        self.visual.patch_embed.copy_conv3d_weight_to_linear()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

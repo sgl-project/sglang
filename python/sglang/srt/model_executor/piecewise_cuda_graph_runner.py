@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
@@ -59,6 +60,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
+# Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
+warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -644,7 +647,7 @@ class PiecewiseCudaGraphRunner:
 
         out_cache_loc_swa = (
             buffers.out_cache_loc_swa[:static_num_tokens]
-            if forward_batch.out_cache_loc_swa is not None
+            if buffers.out_cache_loc_swa is not None
             else None
         )
 
@@ -728,6 +731,9 @@ class PiecewiseCudaGraphRunner:
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
         )
+
+        if out_cache_loc_swa is not None:
+            self.model_runner.token_to_kv_pool.set_swa_loc(out_cache_loc_swa)
 
         return static_forward_batch
 

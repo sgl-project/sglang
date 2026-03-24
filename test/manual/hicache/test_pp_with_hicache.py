@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     find_available_port,
+    flush_cache_with_retry,
     popen_launch_server,
 )
 
@@ -180,11 +181,7 @@ class TestPPWithHiCache(unittest.TestCase):
         return False
 
     def flush_cache(self) -> bool:
-        try:
-            response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
+        return flush_cache_with_retry(self.base_url)
 
     def test_eval_accuracy(self):
         args = SimpleNamespace(
