@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -13,4 +15,4 @@ def test_check_torch_defaults():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

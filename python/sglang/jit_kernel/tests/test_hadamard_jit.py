@@ -1,4 +1,5 @@
 import math
+import sys
 
 import numpy as np
 import pytest
@@ -420,4 +421,4 @@ def test_hadamard_transform_40n(dim, dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))
