@@ -18,8 +18,19 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from sglang.srt.utils import get_device
+from sglang.srt.utils import get_bool_env_var, get_device, is_hip
 from sglang.test.test_utils import empty_gpu_cache
+
+# Aiter backend: requires HIP + SGLANG_USE_AITER=1 + aiter package
+_aiter_available = False
+if is_hip() and get_bool_env_var("SGLANG_USE_AITER"):
+    try:
+        import aiter  # noqa: F401
+        from sglang.srt.layers.attention.mamba import causal_conv1d_aiter
+
+        _aiter_available = True
+    except ImportError:
+        pass
 
 
 def causal_conv1d_ref(
@@ -181,6 +192,45 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
     assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(
+    not _aiter_available,
+    reason="Requires HIP + SGLANG_USE_AITER=1 + aiter package",
+)
+@pytest.mark.parametrize("itype", [torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("seqlen", [1])
+@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
+def test_causal_conv1d_update_aiter(dim, width, seqlen, has_bias, silu_activation, itype):
+    """Test causal_conv1d_update with aiter backend (decode path on ROCm)."""
+    from sglang.srt.layers.attention.mamba import causal_conv1d_aiter
+
+    device = get_device()
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
+    if itype == torch.bfloat16:
+        rtol, atol = 1e-2, 5e-2
+    torch.manual_seed(0)
+    batch = 2
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
+    x_ref = x.clone()
+    conv_state = torch.randn(batch, dim, width - 1, device=device, dtype=itype)
+
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    conv_state_ref = conv_state.detach().clone()
+    activation = None if not silu_activation else "silu"
+    out = causal_conv1d_aiter.causal_conv1d_update(
+        x, conv_state, weight, bias, activation=activation
+    )
+    out_ref = causal_conv1d_update_ref(
+        x_ref, conv_state_ref, weight, bias, activation=activation
+    )
+
+    assert torch.equal(conv_state, conv_state_ref)
+    assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
+
+
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("silu_activation", [False, True])
 @pytest.mark.parametrize("has_bias", [False, True])
@@ -241,6 +291,83 @@ def test_causal_conv1d_update_with_batch_gather(
     activation = None if not silu_activation else "silu"
 
     out = causal_conv1d_update(
+        x,
+        conv_state,
+        weight,
+        bias,
+        activation=activation,
+        conv_state_indices=padded_state_indices,
+        pad_slot_id=PAD_SLOT_ID,
+    )
+    out_ref = causal_conv1d_update_ref(
+        x_ref[:batch_size], conv_state_ref, weight, bias, activation=activation
+    )
+
+    assert torch.equal(conv_state[conv_state_indices, :], conv_state_ref)
+    assert torch.equal(
+        conv_state[unused_states_bool], conv_state_for_padding_test[unused_states_bool]
+    )
+    assert torch.allclose(out[:batch_size], out_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(
+    not _aiter_available,
+    reason="Requires HIP + SGLANG_USE_AITER=1 + aiter package",
+)
+@pytest.mark.parametrize("itype", [torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("seqlen", [1, 3])
+@pytest.mark.parametrize("width", [3, 4])
+@pytest.mark.parametrize("dim", [2048 + 16, 4096])
+@pytest.mark.parametrize("with_padding", [True, False])
+@pytest.mark.parametrize("batch_size", [3])
+def test_causal_conv1d_update_with_batch_gather_aiter(
+    batch_size, with_padding, dim, width, seqlen, has_bias, silu_activation, itype
+):
+    """Test causal_conv1d_update with batch gather (conv_state_indices) using aiter backend."""
+    from sglang.srt.layers.attention.mamba import causal_conv1d_aiter
+
+    device = get_device()
+    rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
+    if itype == torch.bfloat16:
+        rtol, atol = 1e-2, 5e-2
+
+    torch.manual_seed(0)
+
+    padding = 5 if with_padding else 0
+    padded_batch_size = batch_size + padding
+    total_entries = 10 * batch_size
+
+    x = torch.randn(
+        padded_batch_size, seqlen, dim, device=device, dtype=itype
+    ).transpose(1, 2)
+    x_ref = x.clone()
+
+    conv_state_indices = torch.randperm(total_entries)[:batch_size].to(
+        dtype=torch.int32, device=device
+    )
+    unused_states_bool = torch.ones(total_entries, dtype=torch.bool, device=device)
+    unused_states_bool[conv_state_indices] = False
+    padded_state_indices = torch.concat(
+        [
+            conv_state_indices,
+            torch.as_tensor([PAD_SLOT_ID] * padding, dtype=torch.int32, device=device),
+        ],
+        dim=0,
+    )
+
+    conv_state = torch.randn(
+        total_entries, width - 1, dim, device=device, dtype=itype
+    ).transpose(1, 2)
+    conv_state_for_padding_test = conv_state.clone()
+
+    weight = torch.randn(dim, width, device=device, dtype=itype)
+    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    conv_state_ref = conv_state[conv_state_indices, :].detach().clone()
+    activation = None if not silu_activation else "silu"
+
+    out = causal_conv1d_aiter.causal_conv1d_update(
         x,
         conv_state,
         weight,
