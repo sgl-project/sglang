@@ -32,7 +32,7 @@ if not is_cpu():
 if is_npu():
     from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
         conv_state_rollback,
-        move_intermediate_cache_dynamic_h_block_v1,
+        move_intermediate_cache_dynamic_h_block,
     )
 
 logger = logging.getLogger(__name__)
@@ -1004,8 +1004,8 @@ class HybridLinearAttnBackend(AttentionBackend):
             valid_state_indices = state_indices_tensor.to(torch.int64)  # [N]
             last_steps = accepted_steps.to(torch.int64)  # [N]
 
-            move_intermediate_cache_dynamic_h_block_v1(
-                intermediate_state_cache, valid_state_indices, last_steps
+            move_intermediate_cache_dynamic_h_block(
+                ssm_states, intermediate_state_cache, valid_state_indices, last_steps
             )
 
             draft_token_num = intermediate_state_cache.shape[2]
@@ -1049,9 +1049,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices,
                 mamba_steps_to_track,
             )
-
-    def get_verify_buffers_to_fill_after_draft(self):
-        return [None, None]
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
