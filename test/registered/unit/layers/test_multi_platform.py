@@ -32,6 +32,12 @@ class DummyFusedMoE(_ForwardTrackerOp):
     pass
 
 
+class DummyLayerSubclass(DummyLayer):
+    """Subclass that inherits everything — simulates YaRNScalingRotaryEmbedding."""
+
+    pass
+
+
 class TestMultiPlatformTorchCompileOverride(CustomTestCase):
     def test_default_heuristic_switches_regular_layers(self):
         layer = DummyLayer()
@@ -126,6 +132,33 @@ class TestMultiPlatformTorchCompileOverride(CustomTestCase):
         layer.leave_torch_compile()
 
         self.assertEqual(layer.forward(), "platform")
+
+    def test_override_layers_match_subclass_via_parent_name(self):
+        layer = DummyLayerSubclass()
+
+        layer.enter_torch_compile(num_tokens=4, override_layers=["DummyLayer"])
+
+        self.assertEqual(layer.forward(), "native")
+        self.assertTrue(layer.is_torch_compile)
+
+        layer.leave_torch_compile()
+
+        self.assertEqual(layer.forward(), "platform")
+
+    def test_override_layers_match_subclass_via_own_name(self):
+        layer = DummyLayerSubclass()
+
+        layer.enter_torch_compile(num_tokens=4, override_layers=["DummyLayerSubclass"])
+
+        self.assertEqual(layer.forward(), "native")
+        self.assertTrue(layer.is_torch_compile)
+
+    def test_override_layers_unrelated_name_skips_subclass(self):
+        layer = DummyLayerSubclass()
+
+        layer.enter_torch_compile(num_tokens=4, override_layers=["TopK"])
+
+        self.assertFalse(layer.is_torch_compile)
 
 
 if __name__ == "__main__":

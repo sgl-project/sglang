@@ -104,13 +104,18 @@ class WeightsMapper:
         }
 
 
-def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+def enable_fused_set_kv_buffer(
+    forward_batch: ForwardBatch,
+    is_compiled: bool = False,
+):
+    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache.
+    When is_compiled=True (torch.compile path), also allows SWAKVPool
+    since forward_native handles the dual-pool addressing in pure PyTorch."""
     return (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
-        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+        and (is_compiled or not isinstance(forward_batch.token_to_kv_pool, SWAKVPool))
     )
 
 
@@ -127,11 +132,18 @@ def create_fused_set_kv_buffer_arg(
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
     assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
+
+    cache_loc = forward_batch.out_cache_loc
+    if isinstance(token_to_kv_pool, SWAKVPool):
+        _, is_swa_layer = token_to_kv_pool.layers_mapping[layer_id]
+        if is_swa_layer:
+            cache_loc = forward_batch.out_cache_loc_swa
+
     return FusedSetKVBufferArg(
         value=value,
         k_buffer=k_buffer.view(k_buffer.shape[0], -1),
         v_buffer=v_buffer.view(v_buffer.shape[0], -1),
-        cache_loc=forward_batch.out_cache_loc,
+        cache_loc=cache_loc,
     )
 
 

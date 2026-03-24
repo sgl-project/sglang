@@ -43,6 +43,15 @@ class MultiPlatformOp(nn.Module):
             dynamic=compile_dynamic,
         )
 
+    def _matches_override_layers(
+        self, override_layers: Collection[str]
+    ) -> bool:
+        """Check if any class in the MRO matches the override allowlist.
+
+        This lets `--torch-compile-override-layers RotaryEmbedding` match all
+        subclasses (YaRNScalingRotaryEmbedding, Llama3RotaryEmbedding, etc.)."""
+        return any(cls.__name__ in override_layers for cls in type(self).__mro__)
+
     def _get_torch_compile_forward_method(
         self,
         num_tokens: int,
@@ -54,7 +63,9 @@ class MultiPlatformOp(nn.Module):
         class_name = self.__class__.__name__
 
         if compile_scope == "local":
-            if override_layers is None or class_name not in override_layers:
+            if override_layers is None or not self._matches_override_layers(
+                override_layers
+            ):
                 return False, None
             return True, self._get_local_torch_compile_forward_method(
                 "forward_native",
@@ -63,10 +74,10 @@ class MultiPlatformOp(nn.Module):
             )
 
         if override_layers is not None:
-            # Exact class-name allowlist from `--torch-compile-override-layers`,
-            # e.g. `UnquantizedFusedMoEMethod RMSNorm`. Allowlisted ops switch
-            # to their torch-native implementation for torch.compile.
-            if class_name not in override_layers:
+            # Class-name allowlist from `--torch-compile-override-layers`,
+            # e.g. `UnquantizedFusedMoEMethod RMSNorm`. Matches any class in
+            # the MRO so that base-class names also cover subclasses.
+            if not self._matches_override_layers(override_layers):
                 return False, None
             return True, self.forward_native
 

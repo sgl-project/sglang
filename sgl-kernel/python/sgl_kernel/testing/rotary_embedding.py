@@ -110,10 +110,6 @@ class RotaryEmbedding(torch.nn.Module):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for native implementation"
-
         if offsets is not None:
             positions = positions + offsets
 
@@ -136,6 +132,14 @@ class RotaryEmbedding(torch.nn.Module):
         key_pass = key[..., self.rotary_dim :]
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+
+        if fused_set_kv_buffer_arg is not None:
+            cache_loc = fused_set_kv_buffer_arg.cache_loc
+            k_buffer = fused_set_kv_buffer_arg.k_buffer
+            v_buffer = fused_set_kv_buffer_arg.v_buffer
+            value = fused_set_kv_buffer_arg.value
+            k_buffer[cache_loc] = key.view(-1, k_buffer.shape[-1])
+            v_buffer[cache_loc] = value.view(-1, v_buffer.shape[-1])
 
         # Modification: convert to the correct dtype
         query = query.to(self.dtype)
