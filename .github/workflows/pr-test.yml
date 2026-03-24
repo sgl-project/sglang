@@ -654,7 +654,7 @@ jobs:
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a]  # TODO: restore sgl-kernel-build-wheels
     if: |
       always() &&
       (
@@ -678,6 +678,12 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - name: "[TEST] Deliberate failure for fast-fail testing"
+        if: matrix.partition == 0
+        run: |
+          echo "Deliberately failing partition 0 to test fast-fail"
+          exit 1
+
       - uses: ./.github/actions/check-stage-health
         id: stage-health
 
@@ -692,12 +698,6 @@ jobs:
           path: sgl-kernel/dist/
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
-
-      - name: "[TEST] Deliberate failure for fast-fail testing"
-        if: matrix.partition == 0
-        run: |
-          echo "Deliberately failing partition 0 to test fast-fail"
-          exit 1
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -724,7 +724,7 @@ jobs:
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   stage-b-test-1-gpu-large:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a]  # TODO: restore sgl-kernel-build-wheels
     if: |
       always() &&
       (
@@ -782,7 +782,7 @@ jobs:
           artifact-suffix: ${{ matrix.partition }}
 
   stage-b-test-2-gpu-large:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a]  # TODO: restore sgl-kernel-build-wheels
     if: |
       always() &&
       (
@@ -842,7 +842,7 @@ jobs:
           artifact-suffix: ${{ matrix.partition }}
 
   stage-b-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a]  # TODO: restore sgl-kernel-build-wheels
     if: |
       always() &&
       (
