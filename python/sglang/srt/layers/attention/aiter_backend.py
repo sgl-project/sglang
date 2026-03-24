@@ -2349,12 +2349,6 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
-
             window_size = (-1, -1)
             page_table = self.forward_metadata.kv_indices
 
