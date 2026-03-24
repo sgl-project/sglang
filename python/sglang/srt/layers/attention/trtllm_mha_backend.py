@@ -65,8 +65,10 @@ class TRTLLMMHAMetadata:
     swa_page_table: torch.Tensor = None
 
     # The following fields are used for Flashinfer KV update
-    # kv_indices: page indices for all requests
+    # kv_indices: page indices for all requests (full-attention)
     kv_indices: torch.Tensor = None
+    # kv_indices for SWA layers
+    swa_kv_indices: torch.Tensor = None
     # kv_indptr: cumulative page count per request
     kv_indptr: torch.Tensor = None
     # batch_indices: which request each token belongs to
@@ -231,6 +233,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 return swa_pt
         return self.forward_metadata.page_table
 
+    def _get_layer_kv_indices(self, layer: RadixAttention) -> torch.Tensor:
+        """Return the correct kv_indices for the RoPE fusion kernel (SWA or full)."""
+        swa_kv_indices = self.forward_metadata.swa_kv_indices
+        if swa_kv_indices is not None:
+            _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
+            if is_swa:
+                return swa_kv_indices
+        return self.forward_metadata.kv_indices
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -257,7 +268,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.decode_cuda_graph_metadata["kv_indices"] = torch.zeros(
                 max_bs * max_num_pages, dtype=torch.int32, device=self.device
             )
-
+            if self.use_sliding_window_kv_pool:
+                self.decode_cuda_graph_metadata["swa_kv_indices"] = torch.zeros(
+                    max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                )
         if (
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
@@ -335,6 +349,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.draft_extend_metadata["kv_indices"] = torch.zeros(
                     max_bs * max_num_pages, dtype=torch.int32, device=self.device
                 )
+                if self.use_sliding_window_kv_pool:
+                    self.target_verify_metadata["swa_kv_indices"] = torch.zeros(
+                        max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                    )
+                    self.draft_extend_metadata["swa_kv_indices"] = torch.zeros(
+                        max_bs * max_num_pages, dtype=torch.int32, device=self.device
+                    )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -475,10 +496,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.enable_rope_fusion:
             if forward_mode.is_decode_or_idle():
                 metadata.kv_indices = self.decode_cuda_graph_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.decode_cuda_graph_metadata.get(
+                    "swa_kv_indices"
+                )
             elif forward_mode.is_target_verify():
                 metadata.kv_indices = self.target_verify_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.target_verify_metadata.get(
+                    "swa_kv_indices"
+                )
             else:
                 metadata.kv_indices = self.draft_extend_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.draft_extend_metadata.get(
+                    "swa_kv_indices"
+                )
             self._init_forward_metadata_for_rope_fusion(metadata, bs, num_tokens)
 
         self.forward_metadata = metadata
@@ -595,12 +625,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 else:
                     total_num_tokens = bs
                 metadata.kv_indices = self.decode_cuda_graph_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.decode_cuda_graph_metadata.get(
+                    "swa_kv_indices"
+                )
             elif forward_mode.is_target_verify():
                 total_num_tokens = bs * self.speculative_num_draft_tokens
                 metadata.kv_indices = self.target_verify_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.target_verify_metadata.get(
+                    "swa_kv_indices"
+                )
             else:  # draft_extend
                 total_num_tokens = metadata.cu_seqlens_q[-1].item()
                 metadata.kv_indices = self.draft_extend_metadata["kv_indices"]
+                metadata.swa_kv_indices = self.draft_extend_metadata.get(
+                    "swa_kv_indices"
+                )
 
             self._init_forward_metadata_for_rope_fusion(metadata, bs, total_num_tokens)
 
@@ -751,7 +790,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         - kv_indptr: cumulative page count per request
         - batch_indices: which request each token belongs to
         - positions: position of each token within its sequence
-        - kv_indices: page indices for all requests
+        - kv_indices: page indices for all requests (full pool)
+        - swa_kv_indices: page indices for SWA layers
         """
 
         # Compute number of pages per request
@@ -780,8 +820,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         )
 
-        # kv_indices
+        # kv_indices (full-attention)
         device = metadata.kv_indptr.device
+        batch_idx = torch.arange(batch_size, dtype=torch.int32, device=device)
         if metadata.kv_indices is None:
             # The max number of pages is kv_indptr[-1]
             # Use upper bound to avoid D2H transfer from accessing kv_indptr[-1]
@@ -793,13 +834,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         create_flashinfer_kv_indices_triton[(batch_size,)](
             metadata.page_table,
-            torch.arange(batch_size, dtype=torch.int32, device=device),
+            batch_idx,
             num_pages_per_req,
             metadata.kv_indptr,
             None,
             metadata.kv_indices,
             metadata.page_table.stride(0),
         )
+
+        # swa_kv_indices (SWA)
+        if metadata.swa_page_table is not None:
+            if metadata.swa_kv_indices is None:
+                max_pages_per_req = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+                metadata.swa_kv_indices = torch.zeros(
+                    batch_size * max_pages_per_req, dtype=torch.int32, device=device
+                )
+            create_flashinfer_kv_indices_triton[(batch_size,)](
+                metadata.swa_page_table,
+                batch_idx,
+                num_pages_per_req,
+                metadata.kv_indptr,
+                None,
+                metadata.swa_kv_indices,
+                metadata.swa_page_table.stride(0),
+            )
 
     def forward_decode(
         self,
@@ -854,7 +914,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     cos_sin_cache=cos_sin_cache,
                     pos_ids=forward_batch.positions,
                     paged_kv_cache=(k_cache, v_cache),
-                    kv_indices=self.forward_metadata.kv_indices,
+                    kv_indices=self._get_layer_kv_indices(layer),
                     kv_indptr=self.forward_metadata.kv_indptr,
                     batch_indices=self.forward_metadata.batch_indices,
                     positions=self.forward_metadata.positions,
@@ -983,7 +1043,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     cos_sin_cache=cos_sin_cache,
                     pos_ids=forward_batch.positions,
                     paged_kv_cache=(k_cache, v_cache),
-                    kv_indices=self.forward_metadata.kv_indices,
+                    kv_indices=self._get_layer_kv_indices(layer),
                     kv_indptr=self.forward_metadata.kv_indptr,
                     batch_indices=self.forward_metadata.batch_indices,
                     positions=self.forward_metadata.positions,
