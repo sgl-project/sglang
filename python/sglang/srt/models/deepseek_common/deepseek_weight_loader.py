@@ -55,7 +55,11 @@ from sglang.srt.models.deepseek_common.utils import (
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
 )
-from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
+from sglang.srt.utils import (
+    bind_or_assign,
+    get_bool_env_var,
+    log_info_on_rank0,
+)
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
@@ -431,6 +435,8 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
+            self_attn.use_deep_gemm_bmm = False
+            self_attn.use_mxfp8_bmm = False
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
@@ -484,8 +490,62 @@ class DeepseekV2WeightLoaderMixin:
                     else:
                         weight = w
 
-                    # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
                     if (
+                        bool(getattr(selected_quant_config, "use_mxfp8", False))
+                        and _is_cuda
+                    ):
+                        from flashinfer import block_scale_interleave
+
+                        w_kc, w_vc = weight.unflatten(
+                            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                        ).split(
+                            [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
+                        )
+                        ws_kc, ws_vc = weight_scale.unflatten(
+                            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                        ).split(
+                            [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
+                        )
+                        ws_kc_for_bmm = ws_kc.contiguous()
+                        ws_vc_for_bmm = ws_vc.contiguous()
+
+                        ws_kc_for_bmm = block_scale_interleave(
+                            ws_kc_for_bmm.view(-1, ws_kc_for_bmm.shape[-1])
+                        ).contiguous()
+                        ws_vc_for_bmm = block_scale_interleave(
+                            ws_vc_for_bmm.view(-1, ws_vc_for_bmm.shape[-1])
+                        ).contiguous()
+                        self_attn.w_kc = bind_or_assign(
+                            self_attn.w_kc,
+                            w_kc.contiguous(),
+                        )
+                        self_attn.w_vc = bind_or_assign(
+                            self_attn.w_vc,
+                            w_vc.contiguous(),
+                        )
+                        self_attn.w_scale = None
+                        self_attn.w_scale_k = bind_or_assign(
+                            self_attn.w_scale_k,
+                            ws_kc_for_bmm,
+                        )
+                        self_attn.w_scale_v = bind_or_assign(
+                            self_attn.w_scale_v,
+                            ws_vc_for_bmm,
+                        )
+                        self_attn.use_deep_gemm_bmm = False
+                        self_attn.use_mxfp8_bmm = True
+                        # MXFP8 absorb path is fully initialized above.
+                        # Do not fall through to the generic re-quantized path.
+                        continue
+
+                    # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
+                    if bool(getattr(selected_quant_config, "use_mxfp8", False)):
+                        weight_scale = (
+                            (weight_scale.to(torch.int32) << 23)
+                            .view(torch.float32)
+                            .contiguous()
+                        )
+                    elif (
                         should_deepgemm_weight_requant_ue8m0(
                             weight_block_size=getattr(
                                 self.quant_config, "weight_block_size", None

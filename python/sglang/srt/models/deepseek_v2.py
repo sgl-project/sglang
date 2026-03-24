@@ -1256,6 +1256,7 @@ class DeepseekV2AttentionMLA(
         self.w_scale_k = None
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
+        self.use_mxfp8_bmm = False
 
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
