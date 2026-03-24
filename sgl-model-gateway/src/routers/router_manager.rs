@@ -407,13 +407,14 @@ impl RouterTrait for RouterManager {
     async fn health_generate(&self, req: Request<Body>) -> Response {
         if !self.enable_igw {
             let router = {
-                let default_id = self
+                let deafult_router = self
                     .default_router
                     .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                    .unwrap_or_else(|e| e.into_inner());
 
-                default_id.and_then(|id| self.routers.get(&id).map(|r| r.clone()))
+                default_router
+                    .as_ref()
+                    .and_then(|id| self.routers.get(&id).map(|r| r.clone()))
             };
 
             if let Some(router) = router {
