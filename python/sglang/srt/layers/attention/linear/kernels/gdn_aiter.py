@@ -122,15 +122,15 @@ class AiterGDNKernel(LinearAttnKernelBase):
                 "Aiter GDN extend kernel is not available. "
                 "Use --linear-attn-prefill-backend triton for prefill."
             )
-        from sglang.srt.utils import is_cpu, is_npu
-
-        recurrent_state = ssm_states
-        recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-        if is_npu() or is_cpu():
-            recurrent_state = ssm_states[cache_indices]
-            recurrent_state_indices_args = {}
-        # chunk_gated_delta_rule returns (o, last_recurrent_state, h)
-        return self._extend_fn(
+        
+        # aiter chunk_gated_delta_rule: no head_first, no initial_state_indices.
+        # For continuous batching, pass initial_state=ssm_states[cache_indices].
+        recurrent_state = (
+            ssm_states[cache_indices]
+            if cache_indices is not None
+            else ssm_states
+        )
+        o, final_state = self._extend_fn(
             q=q,
             k=k,
             v=v,
@@ -138,10 +138,11 @@ class AiterGDNKernel(LinearAttnKernelBase):
             beta=beta,
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
-            head_first=False,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
-            **recurrent_state_indices_args,
         )
+        # gdn_backend expects (core_attn_out, last_recurrent_state, h)
+        return o, final_state, final_state
 
     def target_verify(
         self,
