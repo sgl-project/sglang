@@ -3140,6 +3140,23 @@ class Scheduler(
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
 
+        # In PP mode, there are multiple microbatches (running_mbs).
+        # abort_request is called with self.running_batch set to only one of them.
+        # We must also check all other microbatches to ensure the request is aborted.
+        if hasattr(self, "running_mbs"):
+            for i, mb in enumerate(self.running_mbs):
+                if mb is self.running_batch:
+                    # Already handled above
+                    continue
+                for req in mb.reqs:
+                    if not req.finished() and (
+                        recv_req.abort_all or req.rid.startswith(recv_req.rid)
+                    ):
+                        logger.debug(
+                            f"Abort running request {req.rid} in PP microbatch[{i}]."
+                        )
+                        req.to_finish = FINISH_ABORT()
+
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
 
