@@ -12,6 +12,7 @@ PYBIND11_MODULE(ngram_corpus_cpp, m) {
       .def(py::init<size_t, const Param&>(), py::arg("capacity"), py::arg("param"))
       .def("asyncInsert", &Ngram::asyncInsert, "")
       .def("batchMatch", &Ngram::batchMatch, "")
+      .def("eraseMatchState", &Ngram::eraseMatchState, "")
       .def("reset", &Ngram::reset, "")
       .def("synchronize", &Ngram::synchronize, "");
 

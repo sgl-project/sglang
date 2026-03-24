@@ -52,9 +52,17 @@ class NgramCorpus:
     def reset(self):
         self._ngram.reset()
 
-    def batch_get(self, batch_tokens: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
-        result = self._ngram.batchMatch(batch_tokens)
+    def batch_get(
+        self,
+        req_ids: List[str],
+        batch_tokens: List[List[int]],
+        total_lens: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        result = self._ngram.batchMatch(req_ids, batch_tokens, total_lens)
         return np.array(result.token), np.array(result.mask)
+
+    def erase_match_state(self, req_ids: List[str]):
+        self._ngram.eraseMatchState(req_ids)
 
     def leaf_paths_from_mask(
         self, tokens: List[int], tree_mask: List[List[int]]
@@ -131,6 +139,11 @@ if __name__ == "__main__":
     corpus.batch_put(token_ids)
 
     corpus.synchronize()
-    decoding_ids, decoding_masks = corpus.batch_get([[1, 2, 3], [3, 44], [3, 6, 999]])
+    queries = [[1, 2, 3], [3, 44], [3, 6, 999]]
+    decoding_ids, decoding_masks = corpus.batch_get(
+        req_ids=[f"query-{i}" for i in range(len(queries))],
+        batch_tokens=queries,
+        total_lens=[len(q) for q in queries],
+    )
 
     corpus.debug_result(decoding_ids, decoding_masks)
