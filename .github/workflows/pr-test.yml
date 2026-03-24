@@ -693,6 +693,12 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda12.9
 
+      - name: "[TEST] Deliberate failure for fast-fail testing"
+        if: matrix.partition == 0
+        run: |
+          echo "Deliberately failing partition 0 to test fast-fail"
+          exit 1
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
