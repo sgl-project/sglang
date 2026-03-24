@@ -974,9 +974,7 @@ class DecodeTransferQueue:
                     [decode_req.req], decode_req.req.return_logprob
                 )
                 if self.scheduler.enable_hisparse:
-                    self.scheduler.hisparse_coordinator.request_finished(
-                        decode_req.req
-                    )
+                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
