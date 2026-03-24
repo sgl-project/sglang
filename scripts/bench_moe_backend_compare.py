@@ -82,10 +82,30 @@ RETRY_BACKOFF_SECS = [15, 30]
 def _num_prompts_for_concurrency(concurrency: int) -> int:
     """Return num-prompts for a given concurrency level.
 
+    num_prompts must be >= concurrency, otherwise bench_serving's async
+    semaphore never reaches the target in-flight count (effective peak
+    concurrency = min(num_prompts, max_concurrency)).
+
     Floor of 32 ensures stable latency percentiles at low concurrency.
-    Cap of 256 keeps high-concurrency runs (512+) from dominating runtime.
+
+    NOTE on the relationship between concurrency and MoE token count:
+    ``concurrency`` controls the number of HTTP requests in flight, but the
+    actual decode batch size (tokens entering the MoE layer per step) is
+    bounded by ``min(max_running_requests, cuda_graph_max_bs)`` on the
+    server side.  SGLang defaults (not set by this script):
+
+      * cuda_graph_max_bs: 512 on B200 (>= 160 GB HBM) and on H100/H200
+        with TP>=4.  See ServerArgs._set_default_values().
+      * max_running_requests: max_total_num_tokens // 2 when unset
+        (memory-dependent; typically a few thousand for DeepSeek-R1 on
+        4-8x B200).
+
+    To push decode batch sizes beyond these defaults, pass explicit
+    ``--max-running-requests N --cuda-graph-max-bs N`` via extra_server_args.
+    For token counts higher than what the server can physically sustain,
+    use the microbenchmark (bench_moe_deepseek.py --num-tokens N) instead.
     """
-    return min(max(concurrency, 32), 256)
+    return max(concurrency, 32)
 
 
 def _resolve_a2a_backend(
