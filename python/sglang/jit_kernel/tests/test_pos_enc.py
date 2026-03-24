@@ -1,3 +1,4 @@
+import sys
 import time
 from typing import Optional, Tuple, Union
 
@@ -486,4 +487,4 @@ def test_performance(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -29,7 +29,7 @@ struct ClampPosition {
 
     SymbolicSize N = {"num_elements"};
     SymbolicDevice device_;
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLCUDA, kDLROCM>();
 
     TensorMatcher({N})  //
         .with_dtype<T>()

@@ -15,6 +15,7 @@ so the YAML only needs ``dumper.dump(...)`` calls.
 
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -341,4 +342,4 @@ def _save_comparator_output(*, stdout: str, stderr: str) -> Path:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))
