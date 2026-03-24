@@ -56,36 +56,8 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          cd python/sglang/jit_kernel
-          pytest tests/
-
-  jit-kernel-unit-test-nightly:
-    if: |
-      github.event_name == 'schedule' &&
-      inputs.jit_kernel == 'true'
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    env:
-      SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run full nightly test
-        timeout-minutes: 60
-        run: |
-          cd python/sglang/jit_kernel
-          pytest tests/
+          cd test/
+          python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large
 
   jit-kernel-benchmark-test:
     if: |
@@ -111,23 +83,5 @@ jobs:
       - name: Run benchmark tests
         timeout-minutes: 45
         run: |
-          cd python/sglang/jit_kernel/benchmark
-          echo "Running jit-kernel benchmark tests in CI mode..."
-
-          failures=()
-
-          for bench_file in bench_*.py; do
-            echo "Testing $bench_file..."
-            if ! timeout 120 python3 "$bench_file"; then
-              failures+=("$bench_file")
-            fi
-            echo "Completed $bench_file"
-            echo "---"
-          done
-
-          if [ ${#failures[@]} -ne 0 ]; then
-            echo "The following benchmark tests failed: ${failures[*]}"
-            exit 1
-          fi
-
-          echo "All jit-kernel benchmark tests completed successfully!"
+          cd test/
+          python3 run_suite.py --hw cuda --suite stage-b-kernel-benchmark-1-gpu-large

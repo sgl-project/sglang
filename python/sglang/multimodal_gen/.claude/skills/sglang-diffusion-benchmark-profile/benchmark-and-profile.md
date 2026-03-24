@@ -1,6 +1,6 @@
 ---
-name: diffusion-benchmark-and-profile
-description: Denoise-stage benchmark and per-layer kernel profiling guide for SGLang Diffusion models. Use when measuring denoising latency, profiling DiT kernel breakdown with torch.profiler or nsys+gputrc2graph.py, investigating performance bottlenecks, or optimizing with custom Triton/CUDA kernels. Always verify output correctness before and after any optimization.
+name: benchmark-and-profile-reference
+description: Reference commands and workflow for denoise benchmarks and profiling in SGLang Diffusion.
 ---
 
 # SGLang Diffusion Benchmark and Profile Guide
@@ -18,11 +18,12 @@ description: Denoise-stage benchmark and per-layer kernel profiling guide for SG
 ## Prerequisites
 
 ```bash
-ENV_PY=python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/diffusion_skill_env.py
+ENV_PY=python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py
 ROOT=$(python3 "$ENV_PY" print-root)
 cd "$ROOT"
 python3 "$ENV_PY" check-write-access >/dev/null
 
+export HF_TOKEN=<your_hf_token>  # required for gated repos such as black-forest-labs/FLUX.*
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 1)
 
@@ -53,6 +54,7 @@ Environment notes:
 - **Level 1 profiling**: `torch.profiler` (bundled with torch).
 - **Level 2 profiling**: `nsys`, `pandas`, `plotly`, `regex`, and `gputrc2graph.py` from the sglang repo.
 - All commands below assume you are inside the configured diffusion container shell and already `cd`'d to the repo root derived from `sglang.__file__`.
+- Export `HF_TOKEN` before running any command against a gated Hugging Face repo such as `black-forest-labs/FLUX.*`. Without it, the top-level `sglang generate` auto-detection can fail before model loading and report a misleading `Generate subcommand is not yet supported for model ...`.
 - Export `FLASHINFER_DISABLE_VERSION_CHECK=1` before any benchmark or profiler command.
 - Re-run `print-idle-gpus` before each perf command if GPU availability may have changed.
 - Keep benchmark commands within 4 GPUs or fewer.
@@ -479,10 +481,10 @@ After pinpointing the slow op, choose the right tool:
 
 | Scenario | Skill to use |
 |----------|-------------|
-| New fused elementwise, norm variant, RoPE variant | **`add-triton-kernel.md`** — Triton JIT, faster iteration, NPU fallback |
-| Bandwidth-bound reduction (RMSNorm) needing max vectorization | **`add-cuda-kernel.md`** — CUDA JIT with `AlignedVector`, warp reductions |
-| Attention or tile-based op needing shared memory tuning | **`add-cuda-kernel.md`** — full control over CUDA primitives |
-| Slow op already covered by existing fused kernel | **`use-efficient-diffusion-kernels.md`** — check constraints & enable |
+| New fused elementwise, norm variant, RoPE variant | **`sglang-diffusion-triton-kernel`** — Triton JIT, faster iteration, NPU fallback |
+| Bandwidth-bound reduction (RMSNorm) needing max vectorization | **`sglang-diffusion-cuda-kernel`** — CUDA JIT with `AlignedVector`, warp reductions |
+| Attention or tile-based op needing shared memory tuning | **`sglang-diffusion-cuda-kernel`** — full control over CUDA primitives |
+| Slow op already covered by an existing fused kernel | **`existing-fast-paths.md`** — check constraints and enable it |
 
 **Quick decision rule**: start with Triton. Switch to CUDA JIT only when profiling shows Triton can't saturate hardware bandwidth.
 
@@ -531,9 +533,9 @@ TORCH_COMPILE_DEBUG=1 sglang generate ...
    → for CUDA graph: use --graph-profiling node
        ↓
 5. KERNEL OPTIMIZATION
-   Existing fused kernel?  → use-efficient-diffusion-kernels.md
-   New Triton kernel?      → add-triton-kernel.md
-   New CUDA JIT kernel?    → add-cuda-kernel.md
+   Existing fused kernel?  → existing-fast-paths.md
+   New Triton kernel?      → sglang-diffusion-triton-kernel
+   New CUDA JIT kernel?    → sglang-diffusion-cuda-kernel
    After writing kernel    → ncu again to verify bandwidth/occupancy ★
        ↓
 6. VERIFY CORRECTNESS

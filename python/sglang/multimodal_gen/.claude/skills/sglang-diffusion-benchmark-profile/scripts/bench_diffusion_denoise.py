@@ -2,21 +2,24 @@
 End-to-end denoise-stage benchmark presets for SGLang Diffusion.
 
 Measures denoise latency (primary metric ★) and peak GPU memory.
-All model configs are kept in exact sync with diffusion-benchmark-and-profile.md.
+All model configs are kept in exact sync with benchmark-and-profile.md.
 
 Usage:
     # Single model
     cd /path/to/sglang
-    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --model flux
+    python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux
 
     # Tag the run for later compare_perf.py usage
-    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --model flux --label tuned
+    python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
 
     # All 10 preset models
-    python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/bench_diffusion_denoise.py --all
+    python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
+
+For gated Hugging Face repos such as FLUX, export HF_TOKEN first:
+    export HF_TOKEN=<your_hf_token>
 
 Input images required for image-guided models:
-    ASSET_DIR=$(python3 python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/diffusion_skill_env.py print-assets-dir --mkdir)
+    ASSET_DIR=$(python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py print-assets-dir --mkdir)
     wget -O "${ASSET_DIR}/cat.png" \
       https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png
     wget -O "${ASSET_DIR}/astronaut.jpg" \
@@ -48,9 +51,10 @@ from diffusion_skill_env import (
 
 REPO_ROOT = get_repo_root()
 ASSET_DIR = ensure_dir(get_assets_dir(REPO_ROOT))
+GATED_MODELS = {"flux", "flux2"}
 
 # ---------------------------------------------------------------------------
-# Model configs — kept in exact sync with diffusion-benchmark-and-profile.md
+# Model configs — kept in exact sync with benchmark-and-profile.md
 # Each entry produces the same `sglang generate` command as shown in that doc.
 # ---------------------------------------------------------------------------
 MODELS = {
@@ -240,7 +244,7 @@ def build_sglang_cmd(
 ) -> list[str]:
     """
     Build the `sglang generate` command for the given model.
-    Matches the commands in diffusion-benchmark-and-profile.md exactly.
+    Matches the commands in benchmark-and-profile.md exactly.
     """
     cfg = MODELS[model_key]
 
@@ -292,6 +296,21 @@ def run_benchmark_once(
 
     env = os.environ.copy()
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    if env.get("HF_TOKEN") and not env.get("HUGGINGFACE_HUB_TOKEN"):
+        env["HUGGINGFACE_HUB_TOKEN"] = env["HF_TOKEN"]
+
+    if model_key in GATED_MODELS and not (
+        env.get("HF_TOKEN") or env.get("HUGGINGFACE_HUB_TOKEN")
+    ):
+        print(f"\n{'=' * 64}")
+        print(f"[{label.upper()}] {model_key}")
+        print("  ERROR: this preset uses a gated Hugging Face repo.")
+        print("  Export HF_TOKEN before running it, for example:")
+        print("    export HF_TOKEN=<your_hf_token>")
+        print("  Without a token, the top-level `sglang generate` model detection may")
+        print("  fail early and report a misleading unsupported-model error.")
+        return {"model": model_key, "label": label, "error": True, "elapsed_s": 0.0}
+
     if not env.get("CUDA_VISIBLE_DEVICES"):
         env["CUDA_VISIBLE_DEVICES"] = ",".join(
             str(index) for index in pick_idle_gpus(required_gpus_for_model(model_key))
@@ -370,7 +389,7 @@ def print_results_table(results: list[dict]):
     print()
     print("=" * 80)
     print("BENCHMARK RESULTS — Denoise Latency (primary metric ★)")
-    print("(Models and params match diffusion-benchmark-and-profile.md)")
+    print("(Models and params match benchmark-and-profile.md)")
     print("=" * 80)
 
     print(
@@ -438,7 +457,7 @@ def main():
 
     print(f"Perf dump JSONs → {output_dir}")
     print(
-        "Compare across runs: follow diffusion-benchmark-and-profile.md → Perf dump & before/after compare."
+        "Compare across runs: follow benchmark-and-profile.md -> Perf dump & before/after compare."
     )
 
 

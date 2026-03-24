@@ -1,14 +1,15 @@
 ---
-name: diffusion-optimal-perf
-description: Guide for achieving optimal performance with SGLang-Diffusion. Covers all perf-related CLI flags, env vars, and best practices for lossless and lossy speedup.
+name: sglang-diffusion-performance
+description: Use when choosing the fastest SGLang Diffusion flags for a model, GPU, and VRAM budget.
 ---
 
-# SGLang-Diffusion: Optimal Performance Guide
+# SGLang Diffusion Performance Tuning
 
-Use this guide when a user asks how to speed up diffusion inference, reduce latency, lower VRAM usage, or tune SGLang-Diffusion for production.
+Use this skill when the user wants the fastest command line, lower VRAM, or the right performance flags for a specific model and GPU setup.
 
 Before running any `sglang generate` command below inside the diffusion container:
-- use `python/sglang/multimodal_gen/.claude/skills/diffusion-kernel/scripts/diffusion_skill_env.py` to derive the repo root, verify write access, and choose idle GPU(s)
+- use `python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py` to derive the repo root, verify write access, and choose idle GPU(s)
+- export `HF_TOKEN` first when the selected model lives in a gated Hugging Face repo such as `black-forest-labs/FLUX.*`
 - export `FLASHINFER_DISABLE_VERSION_CHECK=1`
 - `cd` to the repo root resolved from `sglang.__file__`
 

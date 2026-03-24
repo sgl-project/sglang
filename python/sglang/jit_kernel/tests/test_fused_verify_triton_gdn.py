@@ -11,6 +11,8 @@ import sys
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
 try:
     from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.srt.layers.attention.fla.fused_recurrent import (
@@ -23,6 +25,9 @@ try:
     KERNELS_AVAILABLE = True
 except ImportError:
     KERNELS_AVAILABLE = False
+
+register_cuda_ci(est_time=6, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def _make_tensors(N, T, H, HV, K, V, device="cuda", seed=2025):
