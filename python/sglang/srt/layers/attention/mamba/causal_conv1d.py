@@ -8,11 +8,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import get_bool_env_var, is_hip
-
 from .causal_conv1d_triton import PAD_SLOT_ID
-from .causal_conv1d_triton import causal_conv1d_fn as _causal_conv1d_fn_triton
-from .causal_conv1d_triton import causal_conv1d_update as _causal_conv1d_update_triton
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _aiter_conv1d_update = None

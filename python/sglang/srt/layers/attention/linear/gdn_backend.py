@@ -21,6 +21,8 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import rank0_log
 
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
@@ -48,9 +50,10 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
-elif is_hip() and get_bool_env_var("SGLANG_USE_AITER"):
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_update,
+elif _use_aiter and get_bool_env_var("SGLANG_CONV1D_UPDATE_BACKEND", "aiter") == "aiter":
+    from sglang.srt.layers.attention.mamba.causal_conv1d_aiter import (
+        causal_conv1d_update, 
+        causal_conv1d_fn,
     )
 
 
