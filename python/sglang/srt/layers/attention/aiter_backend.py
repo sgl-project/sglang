@@ -204,7 +204,9 @@ class AiterAttnBackend(AttentionBackend):
             self.token_to_kv_pool = model_runner.token_to_kv_pool
             self.use_triton_unified_attention = True
         else:
-            self.use_triton_unified_attention = False
+            self.use_triton_unified_attention = get_bool_env_var(
+                "SGLANG_USE_AITER_UNIFIED_ATTN"
+            )
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -634,6 +636,7 @@ class AiterAttnBackend(AttentionBackend):
 
         num_kv_splits = None
         swa_page_table = None
+        max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
@@ -656,7 +659,6 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     max_q_len = 1
                     page_size = self.page_size
-                    max_kv_len = torch.max(forward_batch.seq_lens).item()
                     max_num_blocks_per_seq = (max_kv_len + page_size - 1) // page_size
                     kv_indices = torch.zeros(
                         bs, max_kv_len, dtype=torch.int32, device=self.device
@@ -682,6 +684,8 @@ class AiterAttnBackend(AttentionBackend):
 
                         kv_indices = self._transform_table_1_to_real(kv_indices)
                         swa_page_table = self._transform_table_1_to_real(swa_page_table)
+                    elif self.page_size > 1:
+                        kv_indices = self._transform_table_1_to_real(kv_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
                     qo_indptr[1 : bs + 1] = torch.cumsum(
@@ -1052,8 +1056,8 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens,
                     forward_batch.seq_lens_sum,
                     forward_batch.extend_seq_lens,
-                    forward_batch.extend_seq_lens.max().item(),
-                    forward_batch.seq_lens.max().item(),
+                    max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
                     spec_info=None,
                 )
 
@@ -1138,8 +1142,8 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.kv_indices,
                     None,
                     None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
                 )
 
@@ -1280,6 +1284,11 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices[:new_rows, :new_cols].copy_(page_indices)
                         swa_page_table = self.cuda_graph_swa_page_table
                         swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
+                    elif self.page_size > 1:
+                        page_indices = self._transform_table_1_to_real(page_indices)
+                        new_rows = page_indices.shape[0]
+                        new_cols = page_indices.shape[1]
+                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
                     qo_indptr[1 : bs + 1] = torch.cumsum(
@@ -1405,7 +1414,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -1428,7 +1437,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=max_q_len,
@@ -1486,7 +1495,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1557,7 +1566,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -1606,7 +1615,7 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map = None
 
         swa_page_table = None
-        max_kv_len = torch.max(seq_lens).item()
+        max_kv_len = seq_lens_cpu.max().item()
 
         if forward_mode.is_decode_or_idle():
             qo_indptr = None
@@ -1657,6 +1666,11 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices[:new_rows, :new_cols].copy_(page_indices)
                         swa_page_table = self.cuda_graph_swa_page_table
                         swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
+                    elif self.page_size > 1:
+                        page_indices = self._transform_table_1_to_real(page_indices)
+                        new_rows = page_indices.shape[0]
+                        new_cols = page_indices.shape[1]
+                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
                     qo_indptr[1 : bs + 1] = torch.cumsum(
@@ -1784,7 +1798,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -1806,7 +1820,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=max_q_len,
@@ -1872,7 +1886,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1938,7 +1952,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1983,7 +1997,15 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if self.use_triton_unified_attention:
+                # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+                # both unified attention and sliding window kv pool are active.
+                # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+                # use standard set_kv_buffer, as they lack SWA-specific attributes
+                # like full_to_swa_index_mapping.
+                if (
+                    self.use_triton_unified_attention
+                    and self.use_sliding_window_kv_pool
+                ):
                     token_to_kv_pool = forward_batch.token_to_kv_pool
                     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -2385,7 +2407,12 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
-            if self.use_triton_unified_attention:
+            # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+            # both unified attention and sliding window kv pool are active.
+            # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+            # use standard set_kv_buffer, as they lack SWA-specific attributes
+            # like full_to_swa_index_mapping.
+            if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -2608,10 +2635,9 @@ class AiterIndicesUpdaterPrefill:
             token_num = kv_indptr[-1]
             kv_indices[token_num:] = kv_indices[0]
 
-            self.max_kv_len = torch.max(paged_kernel_lens).item()
+            # self.max_kv_len = torch.max(paged_kernel_lens).item()
 
             extend_lens = seq_lens - prefix_lens
-            self.max_q_len = torch.max(extend_lens).item()
 
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
@@ -2846,7 +2872,7 @@ class AiterMultiStepDraftBackend:
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
-                seq_lens_cpu=None,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)

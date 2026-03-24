@@ -345,6 +345,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         x: torch.Tensor,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis=None,
+        num_replicated_prefix: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         query, key, value, encoder_query, encoder_key, encoder_value = (
             _get_qkv_projections(self, x, encoder_hidden_states)
@@ -380,6 +381,9 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
+            num_replicated_prefix = (
+                num_replicated_prefix or encoder_hidden_states.shape[1]
+            )
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
@@ -394,7 +398,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 query, key, cos_sin_cache, is_neox=False
             )
 
-        x = self.attn(query, key, value)
+        x = self.attn(query, key, value, num_replicated_prefix=num_replicated_prefix)
         x = x.flatten(2, 3)
         x = x.to(query.dtype)
 
@@ -510,6 +514,7 @@ class FluxSingleTransformerBlock(nn.Module):
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
         joint_attention_kwargs = joint_attention_kwargs or {}
+        joint_attention_kwargs.setdefault("num_replicated_prefix", text_seq_len or 0)
 
         if self.use_nunchaku_structure:
             if _nunchaku_fused_ops_available:

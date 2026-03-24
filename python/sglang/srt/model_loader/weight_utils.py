@@ -604,7 +604,11 @@ def maybe_add_mtp_safetensors(
     """
     # Only apply for GLM4Moe architecture with nextn layers
     arch = getattr(hf_config, "architectures", [None])[0]
-    num_nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+    num_nextn_layers = getattr(
+        getattr(hf_config, "text_config", hf_config),
+        "num_nextn_predict_layers",
+        getattr(hf_config, "num_nextn_predict_layers", 0),
+    )
     if not (
         arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
         and num_nextn_layers > 0
