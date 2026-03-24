@@ -2827,6 +2827,37 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
+        # Stacked params mapping for unified weight loading API
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        # Add A-proj fusion mapping when q_lora_rank is enabled
+        # q_a_proj + kv_a_proj_with_mqa -> fused_qkv_a_proj_with_mqa
+        if self.fuse_qkv_a_proj:
+            self.stacked_params_mapping.extend(
+                [
+                    ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+                    ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+                ]
+            )
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
+        )
+        # Params for special naming rules in mixed-precision models, for example:
+        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
+        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
+        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+            self.expert_params_mapping += (
+                FusedMoE.make_expert_input_scale_params_mapping(
+                    num_experts=self.config.n_routed_experts
+                )
+            )
+
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
@@ -2845,6 +2876,22 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
+
+    def mutate_weight_preload(self, name: str) -> str:
+        """DeepSeek V2: shared expert fusion."""
+        if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            return name.replace(
+                "mlp.shared_experts",
+                f"mlp.experts.{self.config.n_routed_experts}",
+            )
+        return name
+
+    def custom_scale_remap(self, name: str) -> str:
+        """DeepSeek V2: k_proj -> attn_mqa when k_scale in name, v_proj -> attn_mqa when v_scale in name."""
+        for scale in ["k_scale", "v_scale"]:
+            if scale in name:
+                return name.replace(f"{scale[0]}_proj", "attn_mqa")
+        return name
 
     @property
     def routed_experts_weights_of_layer(self):
