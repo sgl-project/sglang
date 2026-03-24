@@ -215,6 +215,10 @@ class ServerArgs:
     # Logging
     log_level: str = "info"
 
+    # Tracing
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
+
     @property
     def broker_port(self) -> int:
         return self.port + 1
@@ -805,6 +809,20 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+
+        # Tracing
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            default=False,
+            help="Enable OpenTelemetry tracing.",
+        )
+        parser.add_argument(
+            "--otlp-traces-endpoint",
+            type=str,
+            default=ServerArgs.otlp_traces_endpoint,
+            help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
         )
         parser.add_argument(
             "--backend",

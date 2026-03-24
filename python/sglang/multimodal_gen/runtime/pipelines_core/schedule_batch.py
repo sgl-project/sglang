@@ -152,6 +152,9 @@ class Req:
     # stage logging
     metrics: Optional["RequestMetrics"] = None
 
+    # tracing context (TraceReqContext or TraceNullContext)
+    trace_ctx: Any = None
+
     # results
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
@@ -274,6 +277,11 @@ class Req:
             self.guidance_scale_2 = self.guidance_scale
 
         self.metrics = RequestMetrics(request_id=self.request_id)
+
+        if self.trace_ctx is None:
+            from sglang.srt.observability.trace import TraceNullContext
+
+            self.trace_ctx = TraceNullContext()
 
     def adjust_size(self, server_args: ServerArgs):
         pass

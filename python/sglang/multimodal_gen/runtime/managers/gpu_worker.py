@@ -227,7 +227,11 @@ class GPUWorker:
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
-            result = self.pipeline.forward(req, self.server_args)
+            req.trace_ctx.trace_slice_start("gpu_forward", level=2)
+            try:
+                result = self.pipeline.forward(req, self.server_args)
+            finally:
+                req.trace_ctx.trace_slice_end("gpu_forward", level=2)
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
@@ -495,6 +499,15 @@ def run_scheduler_process(
         set_cuda_arch()
     elif current_platform.is_musa():
         set_musa_arch()
+
+    if server_args.enable_trace:
+        from sglang.srt.observability.trace import (
+            process_tracing_init,
+            trace_set_thread_info,
+        )
+
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
+        trace_set_thread_info(f"DiffWorker_rank{rank}")
 
     port_args = PortArgs.from_server_args(server_args)
 

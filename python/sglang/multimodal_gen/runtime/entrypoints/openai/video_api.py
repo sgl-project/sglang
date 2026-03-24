@@ -334,9 +334,13 @@ async def create_video(
     await VIDEO_STORE.upsert(request_id, job)
 
     # Build Req for scheduler
+    from sglang.srt.observability.trace import extract_trace_headers
+
+    trace_headers = extract_trace_headers(request.headers)
     batch = prepare_request(
         server_args=server_args,
         sampling_params=sampling_params,
+        external_trace_header=trace_headers,
     )
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:

@@ -186,6 +186,15 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
 
 
 def launch_http_server_only(server_args):
+    if server_args.enable_trace:
+        from sglang.srt.observability.trace import (
+            process_tracing_init,
+            trace_set_thread_info,
+        )
+
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
+        trace_set_thread_info("DiffHTTPServer")
+
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
     app = create_app(server_args)

@@ -281,6 +281,7 @@ def _maybe_mux_audio_into_mp4(
 def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
+    external_trace_header: dict[str, str] | None = None,
 ) -> Req:
     """
     Create a Req object with sampling_params as a parameter.
@@ -307,6 +308,17 @@ def prepare_request(
         raise ValueError(
             f"Height and width must be positive, got height={req.height}, width={req.width}"
         )
+
+    if server_args.enable_trace and external_trace_header:
+        from sglang.srt.observability.trace import TraceReqContext
+
+        trace_ctx = TraceReqContext(
+            rid=sampling_params.request_id,
+            module_name="diffusion",
+            external_trace_header=external_trace_header,
+        )
+        trace_ctx.trace_req_start()
+        req.trace_ctx = trace_ctx
 
     return req
 

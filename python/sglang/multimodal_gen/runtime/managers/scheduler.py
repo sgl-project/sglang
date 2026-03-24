@@ -165,7 +165,16 @@ class Scheduler:
                 )
             else:
                 logger.info("Processing warmup req...")
-        return self.worker.execute_forward(reqs)
+
+        req = reqs[0]
+        req.trace_ctx.rebuild_thread_context()
+        req.trace_ctx.trace_slice_start("scheduler_dispatch", level=1)
+        try:
+            return self.worker.execute_forward(reqs)
+        finally:
+            req.trace_ctx.trace_slice_end(
+                "scheduler_dispatch", level=1, thread_finish_flag=True
+            )
 
     def return_result(
         self,

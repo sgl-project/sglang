@@ -119,6 +119,15 @@ class DiffGenerator:
         instance = cls(
             server_args=server_args,
         )
+        if server_args.enable_trace:
+            from sglang.srt.observability.trace import (
+                process_tracing_init,
+                trace_set_thread_info,
+            )
+
+            process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
+            trace_set_thread_info("DiffGenerator")
+
         logger.info(f"Local mode: {local_mode}")
         if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
@@ -176,6 +185,7 @@ class DiffGenerator:
     def generate(
         self,
         sampling_params_kwargs: dict | None = None,
+        external_trace_header: dict[str, str] | None = None,
     ) -> GenerationResult | list[GenerationResult] | None:
         """Generate image(s)/video(s) based on the given prompt(s).
 
@@ -214,6 +224,7 @@ class DiffGenerator:
             req = prepare_request(
                 server_args=self.server_args,
                 sampling_params=sampling_params,
+                external_trace_header=external_trace_header,
             )
             requests.append(req)
 
@@ -325,6 +336,8 @@ class DiffGenerator:
                     exc_info=True,
                 )
                 continue
+            finally:
+                req.trace_ctx.trace_req_finish()
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
