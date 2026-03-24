@@ -162,6 +162,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         #   KV fp8: q_type = fp8, out_type=model_runner.dtype
         self.is_xqa_impl = is_sm90_supported() or is_sm120_supported()
 
+        self.enable_rope_fusion = envs.SGLANG_ENABLE_FLASHINFER_ROPE_FUSION.get()
+        if self.enable_rope_fusion:
+            logger.info("Flashinfer RoPE+Quant+cache update fusion is enabled")
+            assert (
+                self.data_type == torch.float8_e4m3fn
+            ), "RoPE+Quant+cache update fusion is only supported for FP8 KV cache dtype"
+
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -246,7 +253,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
         }
 
-        if self.support_rope_fusion():
+        if self.enable_rope_fusion:
             self.decode_cuda_graph_metadata["kv_indices"] = torch.zeros(
                 max_bs * max_num_pages, dtype=torch.int32, device=self.device
             )
@@ -321,7 +328,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
             }
 
-            if self.support_rope_fusion():
+            if self.enable_rope_fusion:
                 self.target_verify_metadata["kv_indices"] = torch.zeros(
                     max_bs * max_num_pages, dtype=torch.int32, device=self.device
                 )
@@ -465,7 +472,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
             self.draft_extend_metadata[bs] = metadata
 
-        if self.support_rope_fusion():
+        if self.enable_rope_fusion:
             if forward_mode.is_decode_or_idle():
                 metadata.kv_indices = self.decode_cuda_graph_metadata["kv_indices"]
             elif forward_mode.is_target_verify():
@@ -580,7 +587,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
 
-        if self.support_rope_fusion():
+        if self.enable_rope_fusion:
             # Compute total number of tokens
             if forward_mode.is_decode_or_idle():
                 if spec_info is not None:
@@ -595,9 +602,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 total_num_tokens = metadata.cu_seqlens_q[-1].item()
                 metadata.kv_indices = self.draft_extend_metadata["kv_indices"]
 
-            self._init_forward_metadata_for_rope_fusion(
-                metadata, bs, total_num_tokens, update_inplace=True
-            )
+            self._init_forward_metadata_for_rope_fusion(metadata, bs, total_num_tokens)
 
         self.forward_metadata = metadata
 
@@ -715,7 +720,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     metadata.swa_page_table[:, self.strided_indices] // self.page_size
                 )
 
-        if self.support_rope_fusion():
+        if self.enable_rope_fusion:
             # Compute total number of tokens
             if forward_batch.forward_mode.is_decode_or_idle():
                 if forward_batch.spec_info is not None:
@@ -740,7 +745,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         metadata: TRTLLMMHAMetadata,
         batch_size: int,
         total_num_tokens: int,
-        update_inplace: bool = False,
     ):
         """
         Initialize the following metadata for RoPE + FP8 quantization + KV cache update kernel.
@@ -756,17 +760,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         ) // self.page_size
 
         # kv_indptr
-        if update_inplace:
-            metadata.kv_indptr[1:].copy_(
-                torch.cumsum(num_pages_per_req, dim=0, dtype=torch.int32)
-            )
-        else:
+        if metadata.kv_indptr is None:
             metadata.kv_indptr = torch.nn.functional.pad(
                 torch.cumsum(num_pages_per_req, dim=0, dtype=torch.int32), (1, 0)
             )
+        else:
+            metadata.kv_indptr[1:].copy_(
+                torch.cumsum(num_pages_per_req, dim=0, dtype=torch.int32)
+            )
 
         # batch_indices and positions
-        if update_inplace:
+        metadata.batch_indices, metadata.positions = (
             flashinfer.page.get_batch_indices_positions(
                 metadata.cu_seqlens_q,
                 metadata.cache_seqlens_int32,
@@ -774,14 +778,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.batch_indices,
                 metadata.positions,
             )
-        else:
-            metadata.batch_indices, metadata.positions = (
-                flashinfer.page.get_batch_indices_positions(
-                    metadata.cu_seqlens_q,
-                    metadata.cache_seqlens_int32,
-                    total_num_tokens,
-                )
-            )
+        )
 
         # kv_indices
         device = metadata.kv_indptr.device
@@ -804,10 +801,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.page_table.stride(0),
         )
 
-    def support_rope_fusion(self) -> bool:
-        """Check if supports RoPE fusion."""
-        return self.data_type == torch.float8_e4m3fn
-
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -819,7 +812,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
-        cache_loc = self._get_layer_cache_loc(layer, forward_batch.out_cache_loc)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         q_scale_float = 1.0
@@ -836,7 +828,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if save_kv_cache and k is not None:
             if (
-                self.support_rope_fusion()
+                self.enable_rope_fusion
                 and kwargs.get("cos_sin_cache") is not None
                 and kwargs.get("is_neox_style") is not None
                 and (not self.is_xqa_impl)
@@ -875,6 +867,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )[0]
             elif self.data_type == torch.float8_e4m3fn:
                 # Use fused KV FP8 quantization + KV cache update path
+                cache_loc = self._get_layer_cache_loc(
+                    layer, forward_batch.out_cache_loc
+                )
                 fused_fp8_set_kv_buffer(
                     k=k,
                     v=v,
@@ -888,7 +883,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Use original set_kv_buffer path
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
                 )
 
         # For XQA, q_dtype should be bf16
@@ -942,7 +942,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for extend using TRTLLM MHA kernel."""
-        cache_loc = self._get_layer_cache_loc(layer, forward_batch.out_cache_loc)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         q_scale_float = 1.0
@@ -959,7 +958,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if save_kv_cache and k is not None:
             if (
-                self.support_rope_fusion()
+                self.enable_rope_fusion
                 and kwargs.get("cos_sin_cache") is not None
                 and kwargs.get("is_neox_style") is not None
             ):
@@ -997,6 +996,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )[0]
             elif self.data_type == torch.float8_e4m3fn:
                 # Use fused KV FP8 quantization + KV cache update path
+                cache_loc = self._get_layer_cache_loc(
+                    layer, forward_batch.out_cache_loc
+                )
                 fused_fp8_set_kv_buffer(
                     k=k,
                     v=v,
@@ -1010,7 +1012,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 # Use original set_kv_buffer path
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    forward_batch.out_cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
                 )
 
         if self.data_type == torch.float8_e4m3fn:

@@ -40,6 +40,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -396,8 +397,8 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-        # Skip RoPE if current attn backend supports RoPE fusion
-        if not forward_batch.attn_backend.support_rope_fusion():
+        # Defer RoPE to attn backend if RoPE fusion is enabled
+        if not envs.SGLANG_ENABLE_FLASHINFER_ROPE_FUSION.get():
             q, k = self.rotary_emb(positions, q, k, **extra_args)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
@@ -407,9 +408,9 @@ class GptOssAttention(nn.Module):
         if inner_state is None:
             return hidden_states
 
-        # Pass RoPE into attn backend if it supports RoPE fusion
+        # Pass required RoPE args into attn backend if RoPE fusion is enabled
         extra_args = {}
-        if forward_batch.attn_backend.support_rope_fusion():
+        if envs.SGLANG_ENABLE_FLASHINFER_ROPE_FUSION.get():
             extra_args = {
                 "cos_sin_cache": self.rotary_emb.cos_sin_cache,
                 "is_neox_style": self.rotary_emb.is_neox_style,
