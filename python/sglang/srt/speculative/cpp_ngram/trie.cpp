@@ -197,11 +197,8 @@ std::vector<std::pair<const TrieNode*, int32_t>> Trie::_getExpandableAnchors(con
   return result;
 }
 
-std::vector<std::pair<const TrieNode*, int32_t>> Trie::match(
-    const int32_t* context,
-    size_t len,
-    MatchState& state,
-    size_t total_len) const {
+std::vector<std::pair<const TrieNode*, int32_t>>
+Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
   const bool has_forward_progress = total_len >= state.processed_total_len;
   const auto appended_len = has_forward_progress ? total_len - state.processed_total_len : 0;
   const auto expected_prev_depth = std::min(state.processed_total_len, param_.max_trie_depth);

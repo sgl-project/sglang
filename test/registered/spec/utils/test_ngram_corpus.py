@@ -657,7 +657,11 @@ class TestNgramCorpusIncremental(CustomTestCase):
         full_ids, full_masks = _batch_get(corpus, [[2, 3]])
         np.testing.assert_array_equal(inc_ids, full_ids)
         np.testing.assert_array_equal(inc_masks, full_masks)
-        self.assertIn(4, inc_ids.tolist(), f"Expected token 4 after extension, got {inc_ids.tolist()}")
+        self.assertIn(
+            4,
+            inc_ids.tolist(),
+            f"Expected token 4 after extension, got {inc_ids.tolist()}",
+        )
 
     def test_stale_state_rebuilds_after_eviction(self):
         corpus = _make_corpus("BFS", capacity=150, max_trie_depth=6, draft_token_num=4)
@@ -672,7 +676,9 @@ class TestNgramCorpusIncremental(CustomTestCase):
             corpus.batch_put([new_seq])
             corpus.synchronize()
 
-        inc_ids, inc_masks = _batch_get_with_state(corpus, req_id, [5000, 5001, 5002], 3)
+        inc_ids, inc_masks = _batch_get_with_state(
+            corpus, req_id, [5000, 5001, 5002], 3
+        )
         full_ids, full_masks = _batch_get(corpus, [[5000, 5001, 5002]])
         np.testing.assert_array_equal(inc_ids, full_ids)
         np.testing.assert_array_equal(inc_masks, full_masks)

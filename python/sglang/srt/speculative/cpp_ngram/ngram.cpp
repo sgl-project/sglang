@@ -83,20 +83,12 @@ Result Ngram::batchMatch(
     const std::vector<std::vector<int32_t>>& tokens,
     const std::vector<size_t>& total_lens) {
   if (req_ids.size() != tokens.size() || req_ids.size() != total_lens.size()) {
-    throw std::runtime_error(
-        "batchMatch expects req_ids, tokens, and total_lens to match in size");
+    throw std::runtime_error("batchMatch expects req_ids, tokens, and total_lens to match in size");
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
 
-  using BuildFn = Result (Trie::*)(
-      const int32_t*,
-      size_t,
-      int32_t,
-      size_t,
-      const Param&,
-      MatchState&,
-      size_t) const;
+  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
   BuildFn build_fn;
   if (param_.match_type == "BFS") {
     build_fn = &Trie::buildRecency;
@@ -116,13 +108,7 @@ Result Ngram::batchMatch(
     auto& state = match_state_[req_ids[i]];
     auto draft_token_num = param_.get_draft_token_num(tokens.size());
     auto res = (trie_.get()->*build_fn)(
-        suffix.data(),
-        suffix.size(),
-        suffix.back(),
-        draft_token_num,
-        param_,
-        state,
-        total_lens[i]);
+        suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_, state, total_lens[i]);
     merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
     merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
   }

@@ -133,7 +133,9 @@ class NGRAMWorker:
             req_ids.append(req.rid)
             batch_tokens.append(check_token)
             total_lens.append(len(req.origin_input_ids) + len(req.output_ids))
-        req_drafts, mask = self.ngram_corpus.batch_get(req_ids, batch_tokens, total_lens)
+        req_drafts, mask = self.ngram_corpus.batch_get(
+            req_ids, batch_tokens, total_lens
+        )
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it

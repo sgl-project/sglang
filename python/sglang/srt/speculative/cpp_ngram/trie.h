@@ -85,19 +85,15 @@ class Trie {
   // this request, infer the newly appended suffix from (`context`, `total_len`)
   // and advance anchors incrementally; otherwise rebuild the cached anchors from
   // `context`. Returns only the suffix matches that are currently expandable.
-  std::vector<std::pair<const TrieNode*, int32_t>> match(
-      const int32_t* context,
-      size_t len,
-      MatchState& state,
-      size_t total_len) const;
+  std::vector<std::pair<const TrieNode*, int32_t>>
+  match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
   // Recompute all cached anchors from the current tail. After this, for every
   // d in [1, min(len, max_trie_depth)], anchors[d - 1] represents the suffix of
   // length d ending at context[len - 1].
   bool _rebuildMatchState(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
   // Advance the cached anchors by consuming the newly appended suffix one
   // token at a time, without re-walking all suffixes from root.
-  bool _advanceMatchState(
-      MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const;
+  bool _advanceMatchState(MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const;
   // Check that every non-empty cached NodeRef in MatchState still resolves to
   // the same logical trie node under the current trie_epoch_.
   bool _validateMatchState(const MatchState& state) const;
