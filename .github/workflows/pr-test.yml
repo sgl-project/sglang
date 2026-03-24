@@ -128,7 +128,7 @@ jobs:
               - "scripts/ci/utils/*"
               - "test/**"
             multimodal_gen:
-              # temporarily removed pr-test.yml to verify extglob filter
+              - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
