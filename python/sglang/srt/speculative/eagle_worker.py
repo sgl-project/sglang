@@ -315,11 +315,15 @@ class EAGLEWorker(TpModelWorker):
 
                 logger.info(f"AutoSpec: capturing draft graphs for num_steps={num_steps}")
 
-                # Save and update server_args for this step
+                # Save and update server_args + worker attrs for this step
                 saved_steps = self.draft_model_runner.server_args.speculative_num_steps
                 saved_draft = self.draft_model_runner.server_args.speculative_num_draft_tokens
+                saved_worker_steps = self.speculative_num_steps
+                saved_worker_draft = self.speculative_num_draft_tokens
                 self.draft_model_runner.server_args.speculative_num_steps = num_steps
                 self.draft_model_runner.server_args.speculative_num_draft_tokens = num_steps + 1
+                self.speculative_num_steps = num_steps
+                self.speculative_num_draft_tokens = num_steps + 1
 
                 # Create attention backend for this step
                 draft_backend_factory = DraftBackendFactory(
@@ -361,6 +365,8 @@ class EAGLEWorker(TpModelWorker):
                 # Restore
                 self.draft_model_runner.server_args.speculative_num_steps = saved_steps
                 self.draft_model_runner.server_args.speculative_num_draft_tokens = saved_draft
+                self.speculative_num_steps = saved_worker_steps
+                self.speculative_num_draft_tokens = saved_worker_draft
 
         # Also init verify-side multi-step graphs on the target model runner
         target_runner = self.target_worker.model_runner
