@@ -22,8 +22,10 @@ from typing import List, Optional, Union
 import torch
 
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-    causal_conv1d_fn as causal_conv1d_fn_triton,
     PAD_SLOT_ID,
+)
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    causal_conv1d_fn as causal_conv1d_fn_triton,
 )
 
 # Lazy import for decode path
@@ -82,7 +84,9 @@ def causal_conv1d_update(
 
     out = torch.zeros_like(x)
     bias_t = (
-        bias.to(dtype=x.dtype) if bias is not None else torch.empty(0, dtype=x.dtype, device=x.device)
+        bias.to(dtype=x.dtype)
+        if bias is not None
+        else torch.empty(0, dtype=x.dtype, device=x.device)
     )
     weight_t = weight.to(dtype=x.dtype) if weight.dtype != x.dtype else weight
     cache_seqlens_t = (
