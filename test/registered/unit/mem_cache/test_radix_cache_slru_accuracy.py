@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
 
 
 class TestSLRUAccuracy(unittest.TestCase):

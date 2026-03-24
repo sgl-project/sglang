@@ -393,7 +393,7 @@ Enable it with:
 | `--speculative-ngram-min-bfs-breadth` | Minimum BFS breadth. | `1` |
 | `--speculative-ngram-max-bfs-breadth` | Maximum BFS breadth. | `10` |
 | `--speculative-ngram-match-type` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion. | `"BFS"` |
-| `--speculative-ngram-branch-length` | How many recent tokens to insert into the cache. | `18` |
+| `--speculative-ngram-max-trie-depth` | The max trie depth for ngram speculative decoding. | `18` |
 | `--speculative-ngram-capacity` | Cache capacity (number of entries). | `10,000,000` |
 
 Notes:
@@ -469,7 +469,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
 | `--speculative-ngram-min-bfs-breadth` | `int` | `1` | Minimum BFS breadth |
 | `--speculative-ngram-max-bfs-breadth` | `int` | `10` | Maximum BFS breadth |
 | `--speculative-ngram-match-type` | `str` | `"BFS"` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion |
-| `--speculative-ngram-branch-length` | `int` | `18` | Recent tokens to insert into cache |
+| `--speculative-ngram-max-trie-depth` | `int` | `18` | Max trie depth for ngram speculative decoding |
 | `--speculative-ngram-capacity` | `int` | `10,000,000` | Cache capacity |
 
 ### Environment variables

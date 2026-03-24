@@ -1,5 +1,6 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -18,8 +19,14 @@ class Ngram {
   std::unique_ptr<Trie> trie_;
   Param param_;
 
+  // NOTE: protects trie_ and pending_count_. Ensures batchMatch never reads
+  // trie_ while insertWorker is writing. After synchronize(), no pending
+  // inserts remain so mutex_ contention is effectively zero.
   mutable std::mutex mutex_;
-  bool quit_flag_ = false;
+  mutable std::condition_variable sync_cv_;
+  // NOTE: tracks inserts from enqueue through trie_->insert() completion,
+  // not just queue occupancy. A dequeued item may still be mid-insert.
+  size_t pending_count_ = 0;
   utils::Queue<std::vector<int32_t>> insert_queue_;
   std::thread insert_worker_;
 
