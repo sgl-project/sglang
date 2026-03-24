@@ -1,5 +1,7 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/93e1a2634e22355b0856246b032b285ad1d1da6b/tests/test_sampling.py
 
+import sys
+
 import flashinfer.sampling
 import pytest
 import sgl_kernel
@@ -183,4 +185,4 @@ def test_min_p_sampling(batch_size, vocab_size, p):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

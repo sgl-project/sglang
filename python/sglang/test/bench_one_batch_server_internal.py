@@ -600,8 +600,8 @@ def run_one_case(
 
     # Compute metrics
     latency = time.perf_counter() - tic
-    input_throughput = batch_size * input_len / latency
-    output_throughput = batch_size * output_len / latency
+    input_throughput = batch_size * input_len / last_ttft
+    output_throughput = batch_size * output_len / (latency - last_ttft)
     overall_throughput = batch_size * (input_len + output_len) / latency
 
     if backend == "vllm":

@@ -8,10 +8,16 @@ This test suite verifies:
 4. Performance benchmarks and speedup measurements
 """
 
+import sys
 import time
 
 import pytest
 import torch
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=100, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=400, suite="nightly-kernel-1-gpu", nightly=True)
 
 # =============================================================================
 # Helper Functions
@@ -1064,4 +1070,4 @@ def test_fused_metadata_copy_multi_large_batch(bs):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
