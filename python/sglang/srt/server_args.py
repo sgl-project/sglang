@@ -2927,6 +2927,34 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        if (
+            self.speculative_algorithm == "EAGLE"
+            and self.speculative_draft_model_path
+        ):
+            try:
+                from sglang.srt.model_config import ModelConfig
+
+                draft_cfg = ModelConfig.from_server_args(
+                    self,
+                    model_path=self.speculative_draft_model_path,
+                    model_revision=self.speculative_draft_model_revision,
+                    is_draft_model=True,
+                )
+                arch = draft_cfg.hf_config.architectures[0]
+                if "Eagle3" in arch:
+                    logger.warning(
+                        "Draft model '%s' uses Eagle3 architecture (%s) but "
+                        "--speculative-algorithm is set to EAGLE. "
+                        "Automatically upgrading to EAGLE3. Using EAGLE with "
+                        "an Eagle3 draft model would silently produce "
+                        "accept_length=1.0 due to missing aux hidden states.",
+                        self.speculative_draft_model_path,
+                        arch,
+                    )
+                    self.speculative_algorithm = "EAGLE3"
+            except Exception:
+                pass
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
