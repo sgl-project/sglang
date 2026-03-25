@@ -87,6 +87,10 @@ def get_hidden_dim(
             return config.hidden_size, config.intermediate_size * 2
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
+        elif module_name == "gate_up_proj_moe":
+            return config.hidden_size, config.moe_intermediate_size * 2
+        elif module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
         elif module_name == "embed_tokens":
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
             # if contain extra tokens will be added; otherwise is 0.
@@ -148,6 +152,7 @@ def get_stacked_multiply(module_name: str) -> int:
     stacked_rank = {
         "qkv_proj": 3,
         "gate_up_proj": 2,
+        "gate_up_proj_moe": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 
@@ -168,7 +173,7 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj", "down_proj_moe"]
 
 
 def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:

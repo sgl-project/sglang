@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
+    moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -320,6 +321,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if self.ep_size > 1 and not should_allreduce_fusion:
+            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
         if (
             self.tp_size > 1
