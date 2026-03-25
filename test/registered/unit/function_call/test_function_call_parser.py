@@ -18,7 +18,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "default")
+register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
 class TestPythonicDetector(unittest.TestCase):
@@ -1295,9 +1295,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
-        from transformers import AutoTokenizer
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3.2")
+        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
