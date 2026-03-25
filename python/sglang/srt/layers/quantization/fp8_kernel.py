@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -2058,7 +2059,7 @@ def triton_scaled_mm(
 if _is_cuda:
     if enable_sgl_per_token_group_quant_8bit:
 
-        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_8bit")
+        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit")
         def _(
             input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
         ):
@@ -2066,12 +2067,12 @@ if _is_cuda:
 
     else:
 
-        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_fp8")
+        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_fp8")
         def _(
             input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
         ):
             return
 
-    @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
+    @register_fake_if_exists("sgl_kernel::sgl_per_token_quant_fp8")
     def _(input, output_q, output_s):
         return

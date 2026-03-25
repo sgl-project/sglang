@@ -74,8 +74,7 @@ SGLang supports various environment variables that can be used to configure its 
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
-| `SGLANG_MORI_FP8_DISP` | Use FP8 for dispatch | `"false"` |
-| `SGLANG_MORI_FP4_DISP` | Use MXFP4 for dispatch | `"false"` |
+| `SGLANG_MORI_DISPATCH_DTYPE` | Override MoRI-EP dispatch quantization type. `auto` uses auto-detection from weight dtype; `bf16`/`fp8`/`fp4` forces the specified type for all layers | `"auto"` |
 | `SGLANG_MORI_FP8_COMB` | Use FP8 for combine | `"false"` |
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
@@ -151,6 +150,11 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_TEST_RETRACT_NO_PREFILL_BS` | When SGLANG_TEST_RETRACT is enabled, no prefill is performed if the batch size exceeds SGLANG_TEST_RETRACT_NO_PREFILL_BS. | `2 ** 31`     |
 | `SGLANG_RECORD_STEP_TIME` | Record step time for profiling | `false` |
 | `SGLANG_TEST_REQUEST_TIME_STATS` | Test request time statistics | `false` |
+| `SGLANG_KERNEL_API_LOGLEVEL` | Controls crash-debug kernel API logging. `0` disables logging, `1` logs API names, `3` logs tensor metadata, `5` adds tensor statistics, and `10` also writes pre-call dump snapshots. | `0` |
+| `SGLANG_KERNEL_API_LOGDEST` | Destination for crash-debug kernel API logs. Use `stdout`, `stderr`, or a file path. `%i` is replaced with the process PID. | `stdout` |
+| `SGLANG_KERNEL_API_DUMP_DIR` | Output directory for level-10 kernel API input/output dumps. `%i` is replaced with the process PID. | `sglang_kernel_api_dumps` |
+| `SGLANG_KERNEL_API_DUMP_INCLUDE` | Comma-separated wildcard patterns for kernel API names to include in level-10 dumps. | Not set |
+| `SGLANG_KERNEL_API_DUMP_EXCLUDE` | Comma-separated wildcard patterns for kernel API names to exclude from level-10 dumps. | Not set |
 
 ## Profiling & Benchmarking
 
