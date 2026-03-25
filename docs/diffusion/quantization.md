@@ -141,8 +141,7 @@ Recommended auto-detected flow:
 sglang generate \
   --model-path Qwen/Qwen-Image \
   --transformer-weights-path /path/to/svdq-int4_r32-qwen-image.safetensors \
-  --prompt "change the raccoon to a cute cat" \
-  --attention-backend torch_sdpa \
+  --prompt "a beautiful sunset" \
   --save-output
 ```
 
@@ -156,7 +155,6 @@ sglang generate \
   --quantization-precision int4 \
   --quantization-rank 128 \
   --prompt "a beautiful sunset" \
-  --attention-backend torch_sdpa \
   --save-output
 ```
 

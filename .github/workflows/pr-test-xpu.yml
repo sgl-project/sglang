@@ -60,6 +60,7 @@ jobs:
               - "sgl-kernel/**"
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
+              - "!**/*.md"
 
   # ==================== PR Gate ==================== #
   pr-gate:
