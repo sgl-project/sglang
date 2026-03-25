@@ -122,7 +122,6 @@ class NunchakuSVDQuantArgs:
         if unsupported:
             raise ValueError(
                 "Nunchaku SVDQuant is currently only supported on Ampere (SM8x) or SM12x GPUs; "
-                "Hopper (SM90) is not supported. "
                 f"Unsupported devices: {', '.join(unsupported)}. "
                 "Disable it with --enable-svdquant false."
             )
