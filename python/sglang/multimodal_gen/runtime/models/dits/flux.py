@@ -192,7 +192,7 @@ def _get_qkv_projections(
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if getattr(attn, "use_fused_added_qkv", False):
+        if attn.use_fused_added_qkv:
             added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = [
                 x.contiguous() for x in added_qkv.chunk(3, dim=-1)
