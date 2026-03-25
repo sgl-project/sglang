@@ -60,8 +60,8 @@ Also, do not rely on the "Latency/Output throughput" from this script, as it is 
 
 GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
 You can find additional accuracy eval examples in:
-- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_eval_accuracy_large.py)
-- [test_moe_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_moe_eval_accuracy_large.py)
+- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/registered/eval/test_eval_accuracy_large.py)
+- [test_moe_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/registered/eval/test_moe_eval_accuracy_large.py)
 
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
@@ -127,16 +127,16 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
 
 ## How to update sgl-kernel
 Since sglang and sgl-kernel are separate Python packages, our current GitHub CI infrastructure does not support updating a kernel and using it immediately within the same pull request (PR).
-To add a new kernel or modify an existing one in the sgl-kernel package, you must use multiple PRs.
+To add a new kernel or modify an existing one in the `sgl-kernel/` source tree, you must use multiple PRs.
 
 Follow these steps:
 
 1. Submit a PR to update the sgl-kernel source code without using it in sglang python package (e.g., [#8884](https://github.com/sgl-project/sglang/pull/8884/files)).
-2. Bump the version of sgl-kernel (e.g., [#9220](https://github.com/sgl-project/sglang/pull/9220/files)).
-   - Once merged, this will trigger an automatic release of the sgl-kernel wheel to PyPI.
+2. Bump the version of the kernel package (e.g., [#9220](https://github.com/sgl-project/sglang/pull/9220/files)).
+   - Once merged, this will trigger an automatic release of the `sglang-kernel` wheel to PyPI.
    - If not urgent, you can wait for other people to release the wheel. A new version will typically be released within one week.
 3. Apply the changes:
-   - Update the sgl-kernel version in `sglang/python/pyproject.toml` to use the modified kernels.
+   - Update the `sglang-kernel` version in `sglang/python/pyproject.toml` to use the modified kernels.
    - Update the related caller code in the sglang to use the new kernel.
 
 ## How to update sgl-kernel-npu

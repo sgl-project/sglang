@@ -1,11 +1,4 @@
 import argparse
-import os
-
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
 import random
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -13,6 +6,10 @@ from typing import List, Tuple
 import deep_gemm
 import torch
 from sgl_kernel import fp8_blockwise_scaled_grouped_mm
+
+from sglang.utils import is_in_ci
+
+IS_CI = is_in_ci()
 
 
 def get_m_alignment_for_contiguous_layout():
