@@ -150,7 +150,18 @@ class LlamaModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
-            embeds = self.embed_tokens(input_ids)
+            embeds = forward_batch.mm_input_embeds
+            if (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_mm_inputs()
+                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            ):
+                assert embeds is not None
+                embeds = torch.cat(
+                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
+                )
+            if embeds is None:
+                embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
 
