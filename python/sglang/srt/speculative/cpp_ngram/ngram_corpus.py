@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 from torch.utils.cpp_extension import load
@@ -16,6 +16,7 @@ ngram_corpus_cpp = load(
         f"{_abs_path}/ngram_corpus_binding.cpp",
         f"{_abs_path}/ngram.cpp",
         f"{_abs_path}/trie.cpp",
+        f"{_abs_path}/suffix_automaton.cpp",
         f"{_abs_path}/result.cpp",
     ],
     extra_cflags=["-O3", "-std=c++20"],
@@ -31,14 +32,19 @@ class NgramCorpus:
         draft_token_num=8,
         match_type="BFS",
         capacity=1000000,
+        external_sam_budget=0,
+        external_corpus_documents: Optional[List[List[int]]] = None,
     ):
         param = ngram_corpus_cpp.Param()
         param.max_trie_depth = max_trie_depth
         param.min_bfs_breadth = min_bfs_breadth
         param.max_bfs_breadth = max_bfs_breadth
         param.draft_token_num = draft_token_num
+        param.external_sam_budget = external_sam_budget
         param.match_type = match_type
         self._ngram = ngram_corpus_cpp.Ngram(capacity, param)
+        if external_corpus_documents:
+            self._ngram.loadExternalCorpus(external_corpus_documents)
 
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num

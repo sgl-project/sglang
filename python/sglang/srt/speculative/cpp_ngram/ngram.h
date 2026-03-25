@@ -13,12 +13,14 @@
 #include "param.h"
 #include "queue.h"
 #include "result.h"
+#include "suffix_automaton.h"
 #include "trie.h"
 
 namespace ngram {
 
 class Ngram {
   std::unique_ptr<Trie> trie_;
+  std::unique_ptr<SuffixAutomaton> sam_;
   Param param_;
 
   // NOTE: protects trie_ and pending_count_. Ensures batchMatch never reads
@@ -41,6 +43,8 @@ class Ngram {
   void synchronize() const;
 
   void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
+
+  void loadExternalCorpus(const std::vector<std::vector<int32_t>>& documents);
 
   Result batchMatch(
       const std::vector<std::string>& req_ids,

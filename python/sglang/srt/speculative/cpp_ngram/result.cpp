@@ -1,7 +1,9 @@
 #include "result.h"
 
+#include <algorithm>
 #include <cstring>
 #include <queue>
+#include <unordered_set>
 #include <tuple>
 
 namespace ngram {
@@ -45,6 +47,109 @@ Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, 
   }
 
   return info;
+}
+
+std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
+  const auto n = static_cast<int>(result.token.size());
+  if (n <= 1) {
+    return {};
+  }
+
+  std::vector<int> parent(n, -1);
+  std::vector<int> depth(n, 1);
+  std::vector<bool> has_child(n, false);
+  for (int i = 1; i < n; ++i) {
+    int best_parent = 0;
+    int best_depth = depth[0];
+    for (int j = 0; j < i; ++j) {
+      if (!result.mask[i * n + j]) {
+        continue;
+      }
+      if (depth[j] >= best_depth) {
+        best_parent = j;
+        best_depth = depth[j];
+      }
+    }
+    parent[i] = best_parent;
+    depth[i] = depth[best_parent] + 1;
+    has_child[best_parent] = true;
+  }
+
+  std::vector<std::vector<int32_t>> paths;
+  for (int leaf = 1; leaf < n; ++leaf) {
+    if (has_child[leaf]) {
+      continue;
+    }
+    std::vector<int32_t> path;
+    for (int cursor = leaf; cursor > 0; cursor = parent[cursor]) {
+      path.emplace_back(result.token[cursor]);
+    }
+    std::reverse(path.begin(), path.end());
+    if (path.size() == 1 && path.front() == 0) {
+      continue;
+    }
+    paths.emplace_back(std::move(path));
+  }
+  return paths;
+}
+
+Result buildResultFromLeafPaths_(
+    int last_token,
+    int draft_token_num,
+    const std::vector<std::vector<int32_t>>& paths) {
+  std::vector<Node> tree(draft_token_num);
+  const int root = 0;
+  int cursor = 1;
+  for (const auto& path : paths) {
+    int parent = root;
+    for (const auto token : path) {
+      auto iter = tree[parent].next.find(token);
+      if (iter == tree[parent].next.end()) {
+        if (cursor >= draft_token_num) {
+          parent = -1;
+          break;
+        }
+        iter = tree[parent].next.insert({token, cursor++}).first;
+      }
+      parent = iter->second;
+    }
+    if (cursor >= draft_token_num) {
+      break;
+    }
+  }
+  return fillResult(last_token, draft_token_num, tree, root);
+}
+
+Result combineRootResults_(
+    int last_token,
+    int draft_token_num,
+    const Result& primary,
+    const Result& secondary) {
+  auto primary_paths = extractLeafPaths_(primary);
+  auto secondary_paths = extractLeafPaths_(secondary);
+
+  std::unordered_set<int32_t> occupied_root_tokens;
+  occupied_root_tokens.reserve(primary_paths.size());
+  for (const auto& path : primary_paths) {
+    if (!path.empty()) {
+      occupied_root_tokens.insert(path.front());
+    }
+  }
+
+  std::vector<std::vector<int32_t>> merged_paths = std::move(primary_paths);
+  merged_paths.reserve(merged_paths.size() + secondary_paths.size());
+  for (const auto& path : secondary_paths) {
+    if (path.empty()) {
+      continue;
+    }
+    if (occupied_root_tokens.contains(path.front())) {
+      continue;
+    }
+    occupied_root_tokens.insert(path.front());
+    merged_paths.emplace_back(path);
+  }
+
+  return buildResultFromLeafPaths_(last_token, draft_token_num, merged_paths);
 }
 
 void Result::truncate(size_t n) {

@@ -11,6 +11,9 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.cpp_ngram.external_corpus import (
+    load_external_corpus_documents,
+)
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -47,6 +50,17 @@ class NGRAMWorker:
 
         self._init_preallocated_tensors()
 
+        external_corpus_documents = None
+        if server_args.speculative_ngram_external_corpus_path is not None:
+            external_corpus_documents = load_external_corpus_documents(
+                server_args.speculative_ngram_external_corpus_path,
+                target_worker.tokenizer,
+            )
+            logger.info(
+                "Loaded %d external ngram documents for SAM speculative decoding.",
+                len(external_corpus_documents),
+            )
+
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
@@ -54,6 +68,8 @@ class NGRAMWorker:
             capacity=server_args.speculative_ngram_capacity,
             max_trie_depth=server_args.speculative_ngram_max_trie_depth,
             draft_token_num=server_args.speculative_num_draft_tokens,
+            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
+            external_corpus_documents=external_corpus_documents,
         )
 
     def clear_cache_pool(self):
