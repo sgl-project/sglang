@@ -58,7 +58,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
-from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils import CompilableRegionMixin, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -410,7 +410,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
-class Qwen3MoeAttention(nn.Module):
+class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
     def __init__(
         self,
         hidden_size: int,
@@ -498,7 +498,7 @@ class Qwen3MoeAttention(nn.Module):
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
         )
-        self._used_fused_qk_norm_rope_last_call = False
+        self._did_fused_kv_write_last_call = False
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -564,9 +564,54 @@ class Qwen3MoeAttention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
+    # -- CompilableRegionMixin interface ----------------------------------
+
+    def get_compilable_regions(self) -> dict[str, str]:
+        return {"QKNormRope": "_qk_norm_rope_kv"}
+
+    def _get_region_compile_method(
+        self,
+        region_name: str,
+        method_name: str,
+        compile_options: Optional[dict] = None,
+        compile_dynamic: bool = False,
+    ):
+        return torch.compile(
+            getattr(self, method_name),
+            options=compile_options,
+            dynamic=None,
+        )
+
+    def _qk_norm_rope_kv(self, q, k, v, positions, fused_kv_arg):
+        """Compilable region: qk-norm + rope + kv-cache-write."""
+        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
+        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
+        q, k = self.rotary_emb(
+            positions, q, k, fused_set_kv_buffer_arg=fused_kv_arg
+        )
+        return q, k
+
+    # -- apply_qk_norm_rope ---------------------------------------------
+
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
-        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
-        if use_fused:
+
+        if self.is_region_compiled("QKNormRope"):
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Compiled path: hoist the fused-KV-buffer decision outside the
+            # compiled region (avoids dynamic control-flow graph breaks).
+            fused_kv_arg = (
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if enable_fused_set_kv_buffer(forward_batch, is_compiled=True)
+                and self.compatible_with_fused_kv_buffer
+                else None
+            )
+            q, k = self._qk_norm_rope_kv(q, k, v, positions, fused_kv_arg)
+            self._did_fused_kv_write_last_call = fused_kv_arg is not None
+        elif self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
             theta = self.config.rope_parameters["rope_theta"]
             positions = (
                 positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
@@ -590,7 +635,7 @@ class Qwen3MoeAttention(nn.Module):
                 attention_factor,
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            self._used_fused_qk_norm_rope_last_call = True
+            self._did_fused_kv_write_last_call = False
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -617,7 +662,10 @@ class Qwen3MoeAttention(nn.Module):
                     else None
                 ),
             )
-            self._used_fused_qk_norm_rope_last_call = False
+            self._did_fused_kv_write_last_call = (
+                enable_fused_set_kv_buffer(forward_batch)
+                and self.compatible_with_fused_kv_buffer
+            )
         return q, k, v
 
     def forward_prepare(
@@ -651,11 +699,7 @@ class Qwen3MoeAttention(nn.Module):
 
         q, k, v, fb = inner_state
 
-        must_save_kv = self._used_fused_qk_norm_rope_last_call
-        save_kv_cache = must_save_kv or not (
-            enable_fused_set_kv_buffer(forward_batch)
-            and self.compatible_with_fused_kv_buffer
-        )
+        save_kv_cache = not self._did_fused_kv_write_last_call
         attn_output = self.attn(
             q,
             k,

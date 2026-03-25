@@ -62,7 +62,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
-from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.utils import CompilableRegionMixin, MultiPlatformOp
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -456,6 +456,23 @@ def _to_torch(
                     compile_options=compile_options,
                     compile_dynamic=compile_dynamic,
                 )
+
+        # CompilableRegionMixin: compile named sub-regions in local scope.
+        # In full scope the outer torch.compile traces through these methods
+        # normally, so region-level compile is skipped to avoid nesting.
+        if compile_scope == "local" and isinstance(sub, CompilableRegionMixin):
+            for region_name in sub.get_compilable_regions():
+                if override_layers is not None and region_name not in override_layers:
+                    continue
+                if reverse:
+                    sub.leave_region_compile(region_name)
+                else:
+                    sub.enter_region_compile(
+                        region_name,
+                        compile_options=compile_options,
+                        compile_dynamic=compile_dynamic,
+                    )
+
         if isinstance(sub, torch.nn.Module):
             _to_torch(
                 sub,
