@@ -1,5 +1,5 @@
-from collections import deque
 import unittest
+from collections import deque
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutput
