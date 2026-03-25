@@ -76,6 +76,33 @@ def _run_smi(query, query_type="gpu"):
         return []
 
 
+def _get_smi_version():
+    """Return nvidia-smi driver version and CUDA version, or None on failure."""
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=10,
+        )
+        driver = out.strip().splitlines()[0].strip() if out.strip() else "unknown"
+    except (subprocess.SubprocessError, FileNotFoundError, IndexError):
+        return None
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True,
+            timeout=10,
+        )
+        gpu_name = out.strip().splitlines()[0].strip() if out.strip() else "unknown"
+    except (subprocess.SubprocessError, FileNotFoundError, IndexError):
+        gpu_name = "unknown"
+    return f"driver {driver}, {gpu_name}"
+
+
 def _get_target_gpus():
     """Return GPU indices from CUDA_VISIBLE_DEVICES, or all visible GPUs.
 
@@ -367,6 +394,9 @@ def _ci_mode():
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     gpu_list = ", ".join(str(g) for g in sorted(gpu_indices))
 
+    smi_info = _get_smi_version()
+    if smi_info:
+        _log(f"nvidia-smi: {smi_info}")
     if cvd is None or not cvd.strip():
         _log(
             "WARNING: CUDA_VISIBLE_DEVICES is not set. "
