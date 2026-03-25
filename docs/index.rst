@@ -84,7 +84,9 @@ Its core features include:
    diffusion/index
    diffusion/installation
    diffusion/compatibility_matrix
-   diffusion/usage
+   diffusion/api/cli
+   diffusion/quantization
+   diffusion/api/openai_api
    diffusion/performance/index
    diffusion/reference
    diffusion/development
