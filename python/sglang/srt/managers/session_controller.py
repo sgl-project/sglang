@@ -169,9 +169,7 @@ class Session:
                 if req.mm_inputs:
                     for item in req.mm_inputs.get("mm_items", []):
                         if item.offsets:
-                            item.offsets = [
-                                (s - 1, e - 1) for s, e in item.offsets
-                            ]
+                            item.offsets = [(s - 1, e - 1) for s, e in item.offsets]
 
             input_ids = (
                 last_req.origin_input_ids
