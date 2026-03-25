@@ -6,7 +6,6 @@ from collections.abc import Callable
 from typing import Any, Dict
 
 import torch
-import torch_npu
 import triton
 import triton.language as tl
 
@@ -15,6 +14,8 @@ from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import calc_diff, get_bool_env_var
 
 _is_npu = is_npu()
+if _is_npu:
+    import torch_npu
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -986,7 +987,6 @@ def enable_batch_invariant_mode(
             _original_torch_bmm = torch.bmm
             torch.bmm = bmm_batch_invariant
     else:
-        import batch_invariant_ops
         _batch_invariant_LIB.impl(
             "aten::mm", torch.ops.batch_invariant_ops.npu_mm_batch_invariant, "NPU"
         )

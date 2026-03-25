@@ -526,12 +526,17 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 
-        if sampling_seed is not None:
-            batch_next_token_ids = multinomial_with_seed(
-                probs_top_k_top_p, sampling_seed, positions
-            )
-        else:
+        if sampling_seed is None:
             batch_next_token_ids = torch.multinomial(probs_top_k_top_p, num_samples=1)
+        else:
+            logprobs_top_k_top_p = probs_top_k_top_p.to(
+                torch.float64
+            )  # Using float64 for numerical stability
+            del probs_top_k_top_p
+            logprobs_top_k_top_p.log_()
+            batch_next_token_ids = multinomial_with_seed(
+                logprobs_top_k_top_p, sampling_seed, positions
+            )
     else:
         probs = torch.softmax(logits, dim=-1)
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
@@ -553,10 +558,15 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
             probs_sort.masked_fill_(min_p_mask, 0.0)
 
-        if sampling_seed is not None:
-            sampled_index = multinomial_with_seed(probs_sort, sampling_seed, positions)
-        else:
+        if sampling_seed is None:
             sampled_index = torch.multinomial(probs_sort, num_samples=1)
+        else:
+            logprobs = probs_sort.to(
+                torch.float64
+            )  # Using float64 for numerical stability
+            del probs_sort
+            logprobs.log_()
+            sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
         probs_idx = probs_idx.to(torch.int32)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
 

@@ -3751,9 +3751,7 @@ class ServerArgs:
                 self.enable_aiter_allreduce_fusion = False
 
             # Check sampling backend
-            if self.attention_backend == "ascend":
-                self.sampling_backend = "ascend"
-            else:
+            if self.sampling_backend != "ascend":
                 self.sampling_backend = "pytorch"
                 logger.warning(
                     "Sampling backend is set to pytorch for deterministic inference."
