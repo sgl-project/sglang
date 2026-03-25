@@ -6,7 +6,6 @@ from collections.abc import Callable
 from typing import Any, Dict, Tuple
 
 import torch
-import torch_npu
 import triton
 import triton.language as tl
 
@@ -20,6 +19,8 @@ from sglang.srt.utils.common import (
 )
 
 _is_npu = is_npu()
+if _is_npu:
+    import torch_npu
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
