@@ -37,20 +37,13 @@ class WeightChecker:
 
         tp_group = ps.get_tp_group()
         tp_rank = ps.get_tensor_model_parallel_rank()
-
-        requested_names = set(expected_checksums.keys())
-
-        scale_names = {
-            n.replace("weight", "weight_scale_inv")
-            for n in requested_names
-            if n.endswith("weight")
-        }
+        requested_names = set(expected_checksums)
 
         actual_state = {}
         for name, param in self._model_state():
-            if name in requested_names or name in scale_names:
+            if name in requested_names:
                 actual_state[name] = param
-            if len(actual_state) == len(requested_names) + len(scale_names):
+            if len(actual_state) == len(requested_names):
                 break
 
         errors = []
@@ -58,30 +51,13 @@ class WeightChecker:
 
         for name in sorted(expected_checksums.keys()):
             if name not in actual_state:
+                errors.append(f"name={name} TP_rank={tp_rank} missing!")
                 continue
 
             expected_hash = expected_checksums[name]
-            param = actual_state[name]
+            data = actual_state[name].data
 
-            # 1. Alignment & Dequantization
-            if (
-                name.endswith("weight")
-                and name.replace("weight", "weight_scale_inv") in actual_state
-            ):
-                w_q = param
-                w_s = actual_state[name.replace("weight", "weight_scale_inv")]
-                try:
-                    w_s_inv = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
-                    data = block_quant_dequant(
-                        w_q, w_s_inv, block_size=[128, 128], dtype=torch.bfloat16
-                    )
-                except Exception as e:
-                    logger.error(f"Dequantization failed for {name}: {e}")
-                    continue
-            else:
-                data = param.data.to(torch.bfloat16)
-
-            # 2. Shard Reconstruction
+            # Reconstruct a full TP-sharded tensor before hashing it.
             shard_dim = _get_shard_dim(name, data.ndim)
             if tp_group.world_size > 1 and shard_dim is not None:
                 all_shards = [
@@ -97,7 +73,6 @@ class WeightChecker:
             else:
                 actual_hash = _compute_hash(data)
 
-            # 3. Verification
             if actual_hash == expected_hash:
                 matched_count += 1
             else:
@@ -105,7 +80,7 @@ class WeightChecker:
 
             del data
 
-        if matched_count > 1:
+        if matched_count > 0:
             logger.info(
                 f"[WeightChecker] verified {matched_count} parameters on TP_rank {tp_rank}"
             )
