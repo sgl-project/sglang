@@ -5,7 +5,14 @@ description: Guide to SGLang CI workflow orchestration — stage ordering, fast-
 
 # SGLang CI Workflow Orchestration Guide
 
-This skill covers the CI **infrastructure** layer — how tests are dispatched, gated, and fast-failed across stages. For test authoring (CustomTestCase, registration, fixtures, model selection), see the `write-sglang-test` skill.
+This skill covers the CI **infrastructure** layer — how tests are dispatched, gated, and fast-failed across stages. For test authoring (templates, fixtures, registration, model selection), see the [write-sglang-test skill](../write-sglang-test/SKILL.md). For folder layout and running tests locally, see [`test/README.md`](../../../test/README.md).
+
+---
+
+## Naming Conventions
+
+- **Suite**: `stage-{a,b,c}-test-{gpu_count}-gpu-{hardware}` (e.g., `stage-b-test-1-gpu-small`)
+- **CI runner**: `{gpu_count}-gpu-{hardware}` (e.g., `1-gpu-5090`, `4-gpu-h100`, `8-gpu-h200`)
 
 ---
 
@@ -28,27 +35,80 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 ## Architecture Overview
 
 ```
-PR event
-  │
-  ├─ check-changes ──── detects which packages changed
-  │                      (main_package, sgl_kernel, jit_kernel, multimodal_gen)
-  │
-  ├─ call-gate ──────── pr-gate.yml (draft? label? rate limit?)
-  │
-  ├─ sgl-kernel-build-wheels ── builds kernel wheels (if sgl_kernel changed)
-  │
-  ├─ Stage A ────────── stage-a-test-1-gpu-small, stage-a-test-cpu
-  │     │
-  │     └─ wait-for-stage-a (PR only) ── polls until all stage-A jobs complete
-  │
-  ├─ Stage B ────────── stage-b-test-{1-gpu-small, 1-gpu-large, 2-gpu-large, 4-gpu-b200}
-  │     │                (each partitioned via matrix + LPT auto-partition)
-  │     └─ wait-for-stage-b (PR only) ── polls until all stage-B jobs complete
-  │
-  ├─ Stage C ────────── stage-c-test-{4-gpu-h100, 8-gpu-h200, 8-gpu-h20,
-  │                      deepep-4-gpu-h100, deepep-8-gpu-h200, 4-gpu-b200}
-  │
-  └─ pr-test-finish ─── aggregates all job results, fails if any failed/cancelled
+ ┌──────────────┐
+ │ build kernel │
+ └──────┬───────┘
+        │
+        ├─ check-changes ──── detects which packages changed
+        │                      (main_package, sgl_kernel, jit_kernel, multimodal_gen)
+        │
+        ├─ call-gate ──────── pr-gate.yml (draft? label? rate limit?)
+        │
+        ├─────────────────────────────────────────────────────┐
+        │                                                     │
+        ▼                                                     │
+ ┌─────────────────────────────────────┐                      │
+ │          Stage A (~3 min)           │                      │
+ │         pre-flight check            │                      │
+ │                                     │                      │
+ │  ┌─────────────────────────────┐    │                      │
+ │  │ stage-a-test-1-gpu-small    │    │                      │
+ │  │ (small GPUs)                │    │                      │
+ │  └─────────────────────────────┘    │                      │
+ │  ┌─────────────────────────────┐    │                      │
+ │  │ stage-a-test-cpu            │    │                      │
+ │  │ (CPU)                       │    │                      │
+ │  └─────────────────────────────┘    │                      │
+ └──────┬──────────────────────────────┘                      │
+        │                                                     │
+        ▼                                                     ▼
+ ┌─────────────────────────────────────┐          ┌──────────────────────────┐
+ │          Stage B (~30 min)          │          │      kernel test         │
+ │           basic tests               │          └──────────────────────────┘
+ │                                     │          ┌──────────────────────────┐
+ │  ┌─────────────────────────────┐    │          │   multimodal gen test    │
+ │  │ stage-b-test-1-gpu-small    │    │          └──────────────────────────┘
+ │  │ (small GPUs, e.g. 5090)     │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-b-test-1-gpu-large    │    │
+ │  │ (large GPUs, e.g. H100)     │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-b-test-2-gpu-large    │    │
+ │  │ (large GPUs, e.g. H100)     │    │
+ │  └─────────────────────────────┘    │
+ └──────┬──────────────────────────────┘
+        │
+        ▼
+ ┌─────────────────────────────────────┐
+ │          Stage C (~30 min)          │
+ │          advanced tests             │
+ │                                     │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-c-test-4-gpu-h100     │    │
+ │  │ (H100 GPUs)                 │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-c-test-8-gpu-h200     │    │
+ │  │ (8 x H200 GPUs)             │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ stage-c-test-4-gpu-b200     │    │
+ │  │ (4 x B200 GPUs)             │    │
+ │  └─────────────────────────────┘    │
+ │  ┌─────────────────────────────┐    │
+ │  │ Other advanced tests        │    │
+ │  │ (DeepEP, PD Disagg, GB300)  │    │
+ │  └─────────────────────────────┘    │
+ └──────┬──────────────────────────────┘
+        │
+        ▼
+ ┌─────────────────────────────────────┐
+ │         pr-test-finish              │
+ │  aggregates all results, fails if   │
+ │  any job failed/cancelled           │
+ └─────────────────────────────────────┘
 ```
 
 **Every stage test job** includes a `check-stage-health` step after checkout — if any job in the run has already failed, the job fast-fails (red X) with a root cause annotation.
@@ -215,12 +275,17 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `stage-b-test-1-gpu-large` | 14 | `1-gpu-h100` | dynamic (3 or 14) |
 | `stage-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
 | `stage-b-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
+| `stage-b-kernel-unit-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
+| `stage-b-kernel-benchmark-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
 | `stage-c-test-4-gpu-h100` | 3 | `4-gpu-h100` | — |
 | `stage-c-test-8-gpu-h200` | 4 | `8-gpu-h200` | — |
 | `stage-c-test-8-gpu-h20` | 2 | `8-gpu-h20` | — |
 | `stage-c-test-deepep-4-gpu-h100` | 1 (no matrix) | `4-gpu-h100` | — |
 | `stage-c-test-deepep-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
 | `stage-c-test-4-gpu-b200` | 4 | `4-gpu-b200` | — |
+| `stage-c-test-4-gpu-gb200` | 1 (no matrix) | `4-gpu-gb200` | — |
+
+> **Note**: Kernel suites (`stage-b-kernel-*`) run via `pr-test-jit-kernel.yml` and `pr-test-sgl-kernel.yml`, not the main `pr-test.yml`. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
 **Workflow usage:**
 ```yaml
