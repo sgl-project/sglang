@@ -8,6 +8,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    NunchakuConfig,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -43,6 +46,53 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         self.assertEqual(
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
+        )
+
+    @patch("sglang.multimodal_gen.configs.quantization.is_nunchaku_available")
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.torch.cuda.get_device_capability"
+    )
+    @patch("sglang.multimodal_gen.configs.quantization.torch.cuda.device_count")
+    @patch("sglang.multimodal_gen.configs.quantization.current_platform.is_cuda")
+    def test_nunchaku_args_are_resolved_out_of_server_args(
+        self,
+        mock_is_cuda,
+        mock_device_count,
+        mock_device_capability,
+        mock_is_nunchaku_available,
+    ):
+        mock_is_cuda.return_value = True
+        mock_device_count.return_value = 1
+        mock_device_capability.return_value = (8, 0)
+        mock_is_nunchaku_available.return_value = True
+
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "transformer_weights_path": "/tmp/svdq-int4_r32-qwen-image.safetensors",
+            }
+        )
+
+        self.assertIsInstance(args.nunchaku_config, NunchakuConfig)
+        self.assertEqual(
+            args.transformer_weights_path,
+            "/tmp/svdq-int4_r32-qwen-image.safetensors",
+        )
+        self.assertEqual(args.nunchaku_config.precision, "int4")
+        self.assertEqual(args.nunchaku_config.rank, 32)
+
+    def test_non_nunchaku_transformer_weights_path_stays_as_generic_override(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "transformer_weights_path": "/tmp/flux2-dev-nvfp4-mixed.safetensors",
+            }
+        )
+
+        self.assertIsNone(args.nunchaku_config)
+        self.assertEqual(
+            args.transformer_weights_path,
+            "/tmp/flux2-dev-nvfp4-mixed.safetensors",
         )
 
 

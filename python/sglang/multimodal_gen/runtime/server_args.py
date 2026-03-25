@@ -277,25 +277,14 @@ class ServerArgs:
     def _adjust_quant_config(self):
         """validate and adjust"""
 
-        # nunchaku
         ncfg = self.nunchaku_config
         if ncfg is None or isinstance(ncfg, NunchakuConfig):
             return
-        ncfg.validate()
 
-        # propagate the path to server_args
-        if ncfg.transformer_weights_path:
-            self.transformer_weights_path = ncfg.transformer_weights_path
-
-        if not ncfg.enable_svdquant or not ncfg.transformer_weights_path:
-            self.nunchaku_config = None
-        else:
-            self.nunchaku_config = NunchakuConfig(
-                precision=self.nunchaku_config.quantization_precision,
-                rank=self.nunchaku_config.quantization_rank,
-                act_unsigned=self.nunchaku_config.quantization_act_unsigned,
-                transformer_weights_path=self.nunchaku_config.transformer_weights_path,
-            )
+        resolution = ncfg.resolve_runtime_config()
+        if resolution.transformer_weights_path:
+            self.transformer_weights_path = resolution.transformer_weights_path
+        self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
         # enable parallel folding when SP is enabled
