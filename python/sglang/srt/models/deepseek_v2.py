@@ -1206,11 +1206,6 @@ class DeepseekV2AttentionMLA(
                         )
                     else:
                         self.next_skip_topk = False
-            print(
-                "layer_id {} DSA skip_topk {} next_skip_topk {} is_nextn {}".format(
-                    layer_id, self.skip_topk, self.next_skip_topk, is_nextn
-                )
-            )
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
