@@ -1074,21 +1074,16 @@ def prepare_block_fp8_matmul_inputs(
     assert Bs.ndim == 2
     N, K = B.shape
 
-    # Skip strict Bs shape validation for pre-transposed weight scales
-    # (TMA-aligned column-major layout may have different shape due to padding)
-    bs_pretransposed = getattr(Bs, "_pretransposed_for_deepgemm", False)
-
-    if not bs_pretransposed:
-        if Bs.dtype == torch.float:
-            assert triton.cdiv(N, block_n) == Bs.shape[0]
-            assert triton.cdiv(K, block_k) == Bs.shape[1]
-        elif Bs.dtype == torch.int:
-            assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
-            assert (
-                triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
-            ), f"{B.shape=} {Bs.shape=} {block_size=}"
-        else:
-            raise NotImplementedError
+    if Bs.dtype == torch.float:
+        assert triton.cdiv(N, block_n) == Bs.shape[0]
+        assert triton.cdiv(K, block_k) == Bs.shape[1]
+    elif Bs.dtype == torch.int:
+        assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
+        assert (
+            triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
+        ), f"{B.shape=} {Bs.shape=} {block_size=}"
+    else:
+        raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)

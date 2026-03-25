@@ -485,17 +485,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     self.quant_config.weight_block_size,
                 )
                 layer.weight_scale_inv.format_ue8m0 = True
-
-            # Pre-transpose weight scale for DeepGemm (non-UE8M0 / Hopper path).
-            # Eliminates runtime transpose overhead (~70ms on 256×256).
-            from sglang.srt.layers.quantization.fp8_utils import (
-                maybe_pretranspose_weight_scale_for_deepgemm,
-            )
-
-            maybe_pretranspose_weight_scale_for_deepgemm(
-                layer, self.w8a8_block_fp8_linear
-            )
-
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
         layer.weight.data = weight.data
