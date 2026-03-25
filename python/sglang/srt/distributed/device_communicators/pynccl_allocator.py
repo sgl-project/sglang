@@ -25,7 +25,8 @@ nccl_allocator_source = """
 
 #include <cuda_runtime.h>
 #include <mutex>
-#include <unordered_map>
+#include <vector>
+#include <utility>
 
 extern "C" {
 
@@ -53,21 +54,27 @@ const char*  ncclGetErrorString(ncclResult_t result);
   }                                                                       \
 } while(0)
 
-// Thread-safe segment tracking using unordered_map (keyed by ptr)
+// Thread-safe segment tracking using std::vector for FIFO order
 // Segments are tracked during their lifetime (from alloc to free).
-static std::unordered_map<void*, size_t> g_segments;
+// g_segments is maintained in insertion order (oldest first).
+static std::vector<std::pair<void*, size_t>> g_segments;
 static std::mutex g_segment_mutex;
 
-// Add or update a segment in the tracking map
+// Add a segment to the tracking vector (appends to end, maintaining FIFO order)
 static void track_segment(void* ptr, size_t size) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
-    g_segments[ptr] = size;
+    g_segments.emplace_back(ptr, size);
 }
 
-// Remove a segment from the tracking map
+// Remove a segment from the tracking vector
 static void untrack_segment(void* ptr) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
-    g_segments.erase(ptr);
+    for (auto it = g_segments.begin(); it != g_segments.end(); ++it) {
+        if (it->first == ptr) {
+            g_segments.erase(it);
+            break;
+        }
+    }
 }
 
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
@@ -87,7 +94,7 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
     ncclResult_t err = ncclMemFree(ptr);
 }
 
-// C API for Python to query tracked segments
+// C API for Python to query tracked segments in FIFO order
 // out_ptrs: output array for pointers (must have max_segments elements)
 // out_sizes: output array for sizes (must have max_segments elements)
 // max_segments: maximum number of segments to return
@@ -95,6 +102,7 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
 extern "C" int nccl_allocator_get_segments(void** out_ptrs, size_t* out_sizes, int max_segments) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
     int count = 0;
+    // Iterate in FIFO order (oldest first, as insertion order is preserved)
     for (const auto& seg : g_segments) {
         if (count >= max_segments) break;
         out_ptrs[count] = seg.first;
