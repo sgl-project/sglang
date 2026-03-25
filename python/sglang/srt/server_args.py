@@ -3143,15 +3143,24 @@ class ServerArgs:
             )
 
     def _is_mistral_native_format(self) -> bool:
-        """Detect if the model uses Mistral native format (params.json + consolidated weights)."""
+        """Detect if the model uses Mistral native format (params.json + consolidated weights).
+
+        Models like Mistral-7B-Instruct-v0.3 have BOTH params.json (native) and
+        config.json (HF standard). When both exist, prefer the HF format to avoid
+        parameter name mismatches between consolidated.safetensors (native names
+        like layers.0.attention.wk.weight) and HuggingFace model classes (names
+        like model.layers.0.self_attn.k_proj.weight).
+        """
         if os.path.isdir(self.model_path):
-            return os.path.exists(os.path.join(self.model_path, "params.json"))
+            has_params = os.path.exists(os.path.join(self.model_path, "params.json"))
+            has_hf_config = os.path.exists(os.path.join(self.model_path, "config.json"))
+            return has_params and not has_hf_config
         # For hub models, check remote files
         try:
             from huggingface_hub import HfApi
 
             files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
-            return "params.json" in files
+            return "params.json" in files and "config.json" not in files
         except Exception:
             return False
 
@@ -3234,9 +3243,15 @@ class ServerArgs:
         if len(devices) == 0:
             raise ValueError("No valid IB devices specified")
 
-        # Check for duplicates
-        if len(devices) != len(set(devices)):
-            raise ValueError(f"Duplicate IB devices specified: {device_str}")
+        # Deduplicate while preserving order
+        unique_devices = list(dict.fromkeys(devices))
+        if len(unique_devices) != len(devices):
+            logger.warning(
+                "Duplicate IB devices specified: %s. Deduplicating to: %s",
+                device_str,
+                ",".join(unique_devices),
+            )
+            devices = unique_devices
 
         # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"

@@ -63,11 +63,13 @@ class HiCacheStorageBaseMixin:
     @classmethod
     def tearDownClass(cls):
         """Clean up test environment"""
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
         import shutil
 
-        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        if hasattr(cls, "temp_dir"):
+            shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
     @classmethod
     def _get_model_name(cls):
