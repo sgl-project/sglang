@@ -1,25 +1,29 @@
-# openai/gpt-oss-20b-bf16 — Inductor Compilation Profile
+# openai/gpt-oss — Inductor Compilation Profiles
 
-## Setup
+## Common Setup
 
-- **Model:** `lmsys/gpt-oss-20b-bf16`
-- **MoE backend:** auto (triton\_kernel)
-- **Weights:** real (HuggingFace)
+- **MoE backend:** `auto`
+- **Weights:** real
 - **Dataset:** ShareGPT, output sequence length 8192
-- **TP:** 1
 - **Device:** GB200
-- **SGLang commit:**: `cb8105fe282fc373b5baed63d5df38682418a373`
-- **`sgl_kernel` version:**: `0.3.21` 
-- **`torch` commit:**: `cb8105fe282fc373b5baed63d5df38682418a373` (version nightly `2.12`)
+- **SGLang commit:** `cb8105fe282fc373b5baed63d5df38682418a373`
+- **`sgl_kernel` version:** `0.3.21`
+- **`torch` commit:** `cb8105fe282fc373b5baed63d5df38682418a373` (version nightly `2.12`)
 
-## Notes
+## Common Notes
 
-- The auto MoE backend for this model resolves to `triton_kernel`. This means Inductor-compiled MoE can substantially outperform the baseline at small batch sizes.
-- `inductor[moe]` replaces the `triton_kernel` MoE with Inductor-generated code, yielding large speedups at bs=1–4.
-- `inductor[topk-moe-rmsnorm]` combines top-k gating + MoE + RMSNorm compilation.
+- The auto MoE backend for gpt-oss models resolves to `triton_kernel`. This means Inductor-compiled MoE can substantially outperform the baseline at small batch sizes.
 - `inductor[rope]` can fuse the KV-cache update into the rotary embedding graph, while standard SGLang must fire 2 separate kernels because the SWA KV-cache type prevents fusion. The `SWAKVPool` uses dual addressing — SWA layers write to `out_cache_loc_swa`, non-SWA layers to `out_cache_loc` — which the JIT rope kernel doesn't handle. Inductor compiles the pure-PyTorch `forward_native` path where this dual addressing is expressed as `index_put_` ops that get fused into the rope graph.
 - **RMSNorm** is compiled with no dynamic shapes, so Inductor can specialize on the fixed decode batch sizes used by SGLang's CUDA graphs. This means efficient code with only slightly higher startup times.
 - **RotaryEmbedding** is compiled with dynamic shapes due to the KV-cache update (`index_put_` with variable `cache_loc`), which limits Inductor's ability to specialize and adds overhead.
+
+---
+
+# gpt-oss-20b-bf16
+
+- **Model:** `lmsys/gpt-oss-20b-bf16`
+- **Precision:** bf16
+- **TP:** 1
 
 ## bench\_one\_batch Speedup Charts
 
@@ -38,8 +42,6 @@ python profiles/plot_speedup.py profiles/openai/gpt-oss-20b-bf16
 - `inductor[rope]` shows a small ~1.07x decode speedup at bs=256.
 
 ## bench\_offline\_throughput (Real Engine)
-
-These benchmarks use `bench_offline_throughput.py`, which runs the full SGLang engine (scheduler, radix cache, continuous batching) to better reflect production serving performance.
 
 ```bash
 python3 -m sglang.bench_offline_throughput \
@@ -102,3 +104,75 @@ python3 -m sglang.bench_offline_throughput \
 | 128 prompts, cg-bs 128 | RMSNorm | 12,670 | **+3.6%** |
 
 Against the fair baseline (no piecewise CG), individual Inductor compilation shows consistent gains: **+1.4–1.7%** at B=1, **+4.5%** at B=32, and **+3.6%** at B=128 for both `RotaryEmbedding` and `RMSNorm` alone. The combined `RotaryEmbedding + RMSNorm` config still underperforms the individual ones (−1.7% at B=1, −0.2% at B=128), though it leads at B=32 (+4.7%).
+
+---
+
+# gpt-oss-120b (mxfp4)
+
+- **Model:** `openai/gpt-oss-120b`
+- **Precision:** mxfp4
+- **TP:** 1
+
+## bench\_offline\_throughput (Real Engine)
+
+```bash
+python3 -m sglang.bench_offline_throughput \
+  --model-path openai/gpt-oss-120b \
+  --trust-remote-code \
+  --cuda-graph-bs <cg-bs> \
+  --tp-size 1 \
+  --sharegpt-output-len 8192 \
+  --num-prompts <N> \
+  --dataset-name sharegpt \
+  --result-filename "" \
+  [--enable-torch-compile --torch-compile-override-layers RotaryEmbedding --torch-compile-scope local]
+```
+
+**Baseline note:** Piecewise CUDA graphs are not used in either baseline or Inductor configs for this model.
+
+### 1 prompt, cuda-graph-bs 1
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 448 | 449 | — |
+| Inductor — RotaryEmbedding | 471 | 472 | **+5.1%** |
+
+### 32 prompts, cuda-graph-bs 32
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 8,844 | 9,178 | — |
+| Inductor — RotaryEmbedding | 9,467 | 9,826 | **+7.1%** |
+
+### 128 prompts, cuda-graph-bs 128
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 20,150 | 21,046 | — |
+| Inductor — RotaryEmbedding | 21,023 | 21,958 | **+4.3%** |
+
+### Summary
+
+| Scenario | Config | Total tok/s | Total tok/s vs Baseline |
+|----------|--------|-------------|------------------------|
+| 1 prompt, cg-bs 1 | RotaryEmbedding | 472 | **+5.1%** |
+| 32 prompts, cg-bs 32 | RotaryEmbedding | 9,826 | **+7.1%** |
+| 128 prompts, cg-bs 128 | RotaryEmbedding | 21,958 | **+4.3%** |
+
+Inductor compilation of `RotaryEmbedding` delivers consistent and significant gains on the 120b mxfp4 model: **+5.1%** at B=1, **+7.1%** at B=32, and **+4.3%** at B=128. The larger model benefits more from the rope KV-cache fusion than the 20b variant, likely because the per-layer overhead of the 2-kernel SWA workaround is proportionally larger relative to the faster mxfp4 compute.
+
+### Nsys Kernel Traces
+
+The nsys profiles below show a single decode step, confirming the kernel fusion at the GPU level.
+
+**Baseline (no Inductor):**
+
+![Baseline nsys trace](gpt-oss-120b/gpt_oss_120b_rope.png)
+
+The baseline fires multiple separate kernels per layer: `fused_rope_kernel` (rope only), then ATen `index_put_` kernels (`at::native::index_elementwise_kernel`, `at::native::unrolled_e...`) for the SWA KV-cache addressing, followed by `store_kvcache` (the actual KV-cache write), and finally the attention kernel (`fmhaSm100Kernel`). The multi-kernel rope + KV-cache pattern is clearly visible for each layer.
+
+**Inductor — RotaryEmbedding:**
+
+![Inductor rope nsys trace](gpt-oss-120b/gpt_oss_120b_inductor[rope].png)
+
+With Inductor, the separate `fused_rope_kernel` + ATen index kernels + `store_kvcache` are all replaced by a single fused Triton kernel (`triton_poi_fused_0`) that performs rope and KV-cache write in one pass. This eliminates multiple kernel launches and memory round-trips per layer, directly explaining the throughput gains.
