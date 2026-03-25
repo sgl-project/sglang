@@ -15,38 +15,51 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar, overload
 
 import torch
 
+_logger = logging.getLogger("sglang.kernel_api")
 
-def _substitute_process_id(path: str) -> str:
+_T = TypeVar("_T")
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _str_with_pid(path: str) -> str:
     if "%i" in path:
         return path.replace("%i", str(os.getpid()))
     return path
 
 
-_KERNEL_API_LOG_LEVEL = int(os.environ.get("SGLANG_KERNEL_API_LOGLEVEL", "0"))
-_KERNEL_API_LOG_DEST = _substitute_process_id(
-    os.environ.get("SGLANG_KERNEL_API_LOGDEST", "stdout")
-)
-_DUMP_DIR = Path(
-    _substitute_process_id(
-        os.environ.get("SGLANG_KERNEL_API_DUMP_DIR", "sglang_kernel_api_dumps")
-    )
-)
-_DUMP_INCLUDE_PATTERNS = [
-    p.strip()
-    for p in os.environ.get("SGLANG_KERNEL_API_DUMP_INCLUDE", "").split(",")
-    if p.strip()
-]
-_DUMP_EXCLUDE_PATTERNS = [
-    p.strip()
-    for p in os.environ.get("SGLANG_KERNEL_API_DUMP_EXCLUDE", "").split(",")
-    if p.strip()
-]
+def _get_env(key: str, type: Callable[..., _T], default: _T) -> _T:
+    value_str = os.environ.get(key, None)
+    if value_str is None:
+        return default
+    try:
+        return type(value_str)
+    except Exception:
+        _logger.warning(
+            "Failed to parse environment variable %s=%r as %s, using default %r",
+            key,
+            value_str,
+            type.__name__,
+            default,
+        )
+        return default
 
-_logger = logging.getLogger("sglang.kernel_api")
+
+def _parse_pattern(value: str) -> list[str]:
+    return [p.strip() for p in value.split(",") if p.strip()]
+
+
+_KERNEL_API_LOG_LEVEL = _get_env("SGLANG_KERNEL_API_LOGLEVEL", int, 0)
+_KERNEL_API_LOG_DEST = _get_env("SGLANG_KERNEL_API_LOGDEST", _str_with_pid, "stdout")
+_DUMP_DIR = Path(
+    _get_env("SGLANG_KERNEL_API_DUMP_DIR", _str_with_pid, "sglang_kernel_api_dumps")
+)
+_DUMP_INCLUDE_PATTERNS = _get_env("SGLANG_KERNEL_API_DUMP_INCLUDE", _parse_pattern, [])
+_DUMP_EXCLUDE_PATTERNS = _get_env("SGLANG_KERNEL_API_DUMP_EXCLUDE", _parse_pattern, [])
+
 _dump_call_counter: dict[str, int] = {}
 
 
@@ -371,17 +384,36 @@ def _infer_func_name(func: Callable) -> str:
     return qualname
 
 
+@overload
+def debug_kernel_api(
+    func: _F,
+    *,
+    op_name: str | None = None,
+) -> _F: ...
+
+
+@overload
+def debug_kernel_api(
+    *,
+    op_name: str | None = None,
+) -> Callable[[_F], _F]: ...
+
+
 def debug_kernel_api(
     func: Callable | None = None,
     *,
     op_name: str | None = None,
 ) -> Callable:
+    # NOTE: avoid any overhead in the hot path when logging is disabled
     if _KERNEL_API_LOG_LEVEL == 0:
         if func is None:
             return lambda f: f
         return func
 
     def decorator(f: Callable) -> Callable:
+        if hasattr(f, "_debug_kernel_wrapped"):
+            return f
+
         @functools.wraps(f)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             if _is_compiling():
@@ -434,18 +466,29 @@ def debug_kernel_api(
                 _log_section("Output:", {"return": result})
             return result
 
+        setattr(wrapper, "_debug_kernel_wrapped", True)
         return wrapper
 
-    if func is None:
-        return decorator
-    return decorator(func)
+    return decorator if func is None else decorator(func)
 
 
-def debug_torch_op(op_name: str, *, namespace: str = "sglang") -> Callable:
-    def call(*args: Any, **kwargs: Any) -> Any:
-        return getattr(getattr(torch.ops, namespace), op_name)(*args, **kwargs)
-
-    return debug_kernel_api(call, op_name=f"{namespace}.custom_op.{op_name}")
+def debug_torch_op(
+    op_func: Callable,
+    op_name: str,
+    *,
+    namespace: str = "sglang",
+) -> Callable:
+    """NOTE: For internal use. Prefer `debug_kernel_api` for general use cases."""
+    # NOTE: avoid any overhead in the hot path when logging is disabled
+    impl = getattr(getattr(torch.ops, namespace), op_name)
+    if _KERNEL_API_LOG_LEVEL == 0:
+        return impl
+    # NOTE: propagate the marker to avoid double-wrapping
+    if hasattr(op_func, "_debug_kernel_wrapped"):
+        setattr(impl, "_debug_kernel_wrapped", True)
+        return impl
+    # NOTE: redirect the function name
+    return debug_kernel_api(impl, op_name=_infer_func_name(op_func))
 
 
 def wrap_method_with_debug_kernel_once(
@@ -455,6 +498,10 @@ def wrap_method_with_debug_kernel_once(
     op_name: str,
     marker_attr: str | None = None,
 ) -> Any:
+    # NOTE: avoid any overhead in the hot path when logging is disabled
+    if _KERNEL_API_LOG_LEVEL == 0:
+        return obj
+
     if marker_attr is None:
         marker_attr = f"_debug_kernel_{method_name}_wrapped"
 

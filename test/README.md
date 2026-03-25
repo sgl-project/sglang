@@ -88,7 +88,9 @@ Here is an illustration
 
 Because the system uses a custom registry and the `run_suite.py` launcher, it supports both Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) and the popular [pytest](https://docs.pytest.org/en/stable/) framework.
 The basic unit is a file, and you can use either framework in your file.
-The launcher runs `python filename.py` to execute tests, so make sure your file includes the following lines. Otherwise, CI will not run it.
+The launcher runs `python filename.py -f` to execute tests with **failfast enabled by default** — the first test method failure stops the file immediately. This avoids wasting CI time on remaining tests after a failure.
+
+Make sure your file ends with **exactly** one of the following blocks. Do not add custom `argparse` or modify `sys.argv` before calling `unittest.main()` / `pytest.main()` — the CI runner appends `-f` for failfast, and custom argument parsing will break it.
 
 ```python
 # for unittest
