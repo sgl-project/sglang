@@ -39,19 +39,32 @@ def _run_smi(query, query_type="gpu"):
         return []
 
 
+def _get_pid_cmdline(pid):
+    """Get command line for a PID. Linux-only via /proc."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        cmdline = cmdline.decode("utf-8", errors="replace").replace("\x00", " ").strip()
+        # Truncate long command lines
+        return cmdline[:120] + ("..." if len(cmdline) > 120 else "")
+    except (FileNotFoundError, PermissionError):
+        return "<unknown>"
+
+
 def _kill_pids(pids, label=""):
-    """Send SIGKILL to PIDs, skipping self and init."""
+    """Send SIGKILL to PIDs, skipping self and init. Logs to _LOG_LINES."""
     my_pid = os.getpid()
     pids = {p for p in pids if p != my_pid and p > 1}
     if not pids:
         return
     if label:
-        print(f"  Killing {label}: {sorted(pids)}")
-    for pid in pids:
+        _log(f"  Killing {label}:")
+    for pid in sorted(pids):
+        cmdline = _get_pid_cmdline(pid)
+        _log(f"    PID {pid}: {cmdline}")
         try:
             os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
-            pass
+            _log(f"    PID {pid}: failed (already dead or no permission)")
 
 
 def _get_target_gpus():
@@ -114,6 +127,27 @@ def _get_orchestrator_ancestors(pids):
 # ---------------------------------------------------------------------------
 
 
+def _log_gpu_memory(gpu_indices):
+    """Log memory usage for target GPUs. Returns list of dirty GPU descriptions."""
+    dirty = []
+    for line in _run_smi("index,memory.used,memory.total"):
+        parts = line.split(",")
+        if len(parts) != 3 or not parts[0].strip().isdigit():
+            continue
+        idx = int(parts[0].strip())
+        if idx not in gpu_indices:
+            continue
+        try:
+            used, total = int(float(parts[1].strip())), int(float(parts[2].strip()))
+        except ValueError:
+            continue
+        pct = used / total * 100 if total > 0 else 0
+        _log(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
+        if pct >= MEMORY_THRESHOLD_PCT:
+            dirty.append(f"GPU {idx} ({pct:.0f}%)")
+    return dirty
+
+
 _LOG_LINES = []
 
 
@@ -167,25 +201,18 @@ def _ci_mode():
 
     # Before cleanup
     _log("Before cleanup:")
-    for line in _run_smi("index,memory.used,memory.total"):
-        parts = line.split(",")
-        if len(parts) != 3 or not parts[0].strip().isdigit():
-            continue
-        idx = int(parts[0].strip())
-        if idx not in gpu_indices:
-            continue
-        try:
-            used, total = int(float(parts[1].strip())), int(float(parts[2].strip()))
-        except ValueError:
-            continue
-        pct = used / total * 100 if total > 0 else 0
-        _log(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
-
-    # Kill orchestrator ancestors first, then GPU processes (retry once)
+    _log_gpu_memory(gpu_indices)
     gpu_pids = _get_gpu_pids(gpu_indices)
     if not gpu_pids:
-        _log("  No processes found on target GPUs")
+        _log("  No processes on target GPUs")
     else:
+        _log(f"  Processes ({len(gpu_pids)}):")
+        for pid in sorted(gpu_pids):
+            _log(f"    PID {pid}: {_get_pid_cmdline(pid)}")
+    _log()
+
+    # Kill orchestrator ancestors first, then GPU processes (retry once)
+    if gpu_pids:
         _kill_pids(_get_orchestrator_ancestors(gpu_pids), "orchestrator ancestors")
         time.sleep(1)
         for attempt in range(2):
@@ -199,22 +226,14 @@ def _ci_mode():
 
     # Verify
     _log("After cleanup:")
-    dirty = []
-    for line in _run_smi("index,memory.used,memory.total"):
-        parts = line.split(",")
-        if len(parts) != 3 or not parts[0].strip().isdigit():
-            continue
-        idx = int(parts[0].strip())
-        if idx not in gpu_indices:
-            continue
-        try:
-            used, total = int(float(parts[1].strip())), int(float(parts[2].strip()))
-        except ValueError:
-            continue
-        pct = used / total * 100 if total > 0 else 0
-        _log(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
-        if pct >= MEMORY_THRESHOLD_PCT:
-            dirty.append(f"GPU {idx} ({pct:.0f}%)")
+    dirty = _log_gpu_memory(gpu_indices)
+    remaining_pids = _get_gpu_pids(gpu_indices)
+    if remaining_pids:
+        _log(f"  Remaining processes ({len(remaining_pids)}):")
+        for pid in sorted(remaining_pids):
+            _log(f"    PID {pid}: {_get_pid_cmdline(pid)}")
+    else:
+        _log("  No processes on target GPUs")
 
     if dirty:
         _log()
