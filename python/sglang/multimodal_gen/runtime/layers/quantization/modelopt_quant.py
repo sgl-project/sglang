@@ -314,9 +314,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=(
-                self._weight_scale_loader if is_row_parallel else weight_loader
-            ),
+            weight_loader=weight_loader,
         )
 
         layer.register_parameter("weight_scale", weight_scale)
