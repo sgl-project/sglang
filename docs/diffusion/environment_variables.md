@@ -1,3 +1,5 @@
+# Environment Variables
+
 ## Apple MPS
 
 | Environment Variable | Default | Description                                                  |

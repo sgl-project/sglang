@@ -84,19 +84,10 @@ Its core features include:
    diffusion/index
    diffusion/installation
    diffusion/compatibility_matrix
-   diffusion/api/cli
-   diffusion/quantization
-   diffusion/api/openai_api
+   diffusion/usage
    diffusion/performance/index
-   diffusion/performance/attention_backends
-   diffusion/performance/profiling
-   diffusion/performance/cache/index
-   diffusion/performance/cache/cache_dit
-   diffusion/performance/cache/teacache
-   diffusion/support_new_models
-   diffusion/contributing
-   diffusion/ci_perf
-   diffusion/environment_variables
+   diffusion/reference
+   diffusion/development
 
 .. toctree::
    :maxdepth: 1
