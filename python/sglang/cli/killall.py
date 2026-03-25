@@ -67,45 +67,37 @@ def _check_pid_namespace(pid):
     return f"DIFFERENT namespace (self={my_ns}, target={target_ns})"
 
 
-def _log_ps_diagnostic():
-    """Log ps auxf output filtered for GPU/sglang-related processes."""
+def _get_ps_diagnostic():
+    """Return ps auxf output filtered for GPU/sglang-related processes."""
     try:
         out = subprocess.run(["ps", "auxf"], capture_output=True, text=True, timeout=5)
-        matches = [
+        return [
             line.strip()[:140]
             for line in out.stdout.splitlines()
             if any(k in line.lower() for k in ["sglang", "python", "cuda", "gpu"])
-        ]
-        if matches:
-            _log("  Diagnostic (ps auxf, filtered):")
-            for line in matches[:20]:
-                _log(f"    {line}")
-        else:
-            _log("  Diagnostic (ps auxf): no sglang/python/gpu processes found")
+        ][:20]
     except (subprocess.SubprocessError, FileNotFoundError):
-        _log("  Diagnostic (ps auxf): command failed")
+        return []
 
 
 def _kill_pids(pids, label=""):
-    """Send SIGKILL to PIDs, skipping self and init. Logs to _LOG_LINES."""
+    """Send SIGKILL to PIDs, skipping self and init.
+
+    Summary goes to _LOG_LINES (box). Diagnostics go to stdout (outside box).
+    """
     my_pid = os.getpid()
     pids = {p for p in pids if p != my_pid and p > 1}
     if not pids:
         return
     if label:
         _log(f"  Killing {label}:")
-    failed_pids = []
     for pid in sorted(pids):
         cmdline = _get_pid_cmdline(pid)
-        _log(f"    PID {pid}: {cmdline}")
         try:
             os.kill(pid, signal.SIGKILL)
+            _log(f"    PID {pid}: killed ({cmdline})")
         except (ProcessLookupError, PermissionError) as e:
-            ns_info = _check_pid_namespace(pid)
-            _log(f"    PID {pid}: failed ({type(e).__name__}), ns: {ns_info}")
-            failed_pids.append(pid)
-    if failed_pids:
-        _log_ps_diagnostic()
+            _log(f"    PID {pid}: failed ({type(e).__name__})")
 
 
 def _get_target_gpus():
@@ -290,6 +282,7 @@ def _ci_mode():
     retry_interval = 10
     elapsed = 0
     dirty = None
+    unkillable_pids = set()
 
     while True:
         dirty = _check_gpu_memory(gpu_indices)
@@ -299,19 +292,22 @@ def _ci_mode():
             _log(f"Check at {elapsed}s: GPUs clean")
             break
 
-        # Log summary for this attempt
-        remaining_info = (
-            f", {len(remaining_pids)} processes remaining" if remaining_pids else ""
-        )
         dirty_summary = ", ".join(dirty)
-        _log(f"Check at {elapsed}s: still dirty [{dirty_summary}]{remaining_info}")
 
         if elapsed >= max_wait_secs:
+            remaining_info = (
+                f", {len(remaining_pids)} processes remaining" if remaining_pids else ""
+            )
+            _log(f"Check at {elapsed}s: still dirty [{dirty_summary}]{remaining_info}")
             break
 
-        # Kill remaining processes before waiting
+        # Kill remaining processes before waiting (silently for retries)
         if remaining_pids:
-            _kill_pids(remaining_pids, "retry kill")
+            for pid in remaining_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    unkillable_pids.add(pid)
 
         print(
             f"[killall] GPUs still dirty at {elapsed}s [{dirty_summary}], "
@@ -321,6 +317,12 @@ def _ci_mode():
         time.sleep(retry_interval)
         elapsed += retry_interval
 
+    if unkillable_pids:
+        _log(
+            f"  Unkillable PIDs (different namespace): "
+            f"{', '.join(str(p) for p in sorted(unkillable_pids))}"
+        )
+
     if dirty:
         _log()
         _log("Final GPU memory:")
@@ -328,6 +330,23 @@ def _ci_mode():
         _log(f"ERROR: memory >={MEMORY_THRESHOLD_PCT}%: {', '.join(dirty)}")
         _log(f"Orphaned CUDA contexts after {elapsed}s — container needs restart.")
         _flush_box(f"killall_sglang: GPUs [{gpu_list}]", status="FAIL — Aborting CI")
+
+        # Print detailed diagnostics after the box
+        if unkillable_pids:
+            print("\n[killall] Diagnostic — unkillable PIDs:")
+            for pid in sorted(unkillable_pids):
+                ns_info = _check_pid_namespace(pid)
+                print(f"  PID {pid}: ns: {ns_info}")
+            ps_lines = _get_ps_diagnostic()
+            if ps_lines:
+                print("\n[killall] Diagnostic — processes in this container (ps auxf):")
+                for line in ps_lines:
+                    print(f"  {line}")
+            else:
+                print(
+                    "\n[killall] Diagnostic — no sglang/python/gpu processes "
+                    "in this container"
+                )
         return 1
 
     _flush_box(f"killall_sglang: GPUs [{gpu_list}]", status="PASS — GPUs clean")
