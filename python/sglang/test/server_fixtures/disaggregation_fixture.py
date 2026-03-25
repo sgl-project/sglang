@@ -254,4 +254,5 @@ def get_rdma_devices_args():
     if not rdma_devices:
         return ",".join(_pick_default_pair(rdma_all_devices))
 
-    return ",".join(rdma_devices)
+    # Deduplicate while preserving order
+    return ",".join(dict.fromkeys(rdma_devices))
