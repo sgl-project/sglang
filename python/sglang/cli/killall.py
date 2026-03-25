@@ -84,29 +84,6 @@ def _get_gpu_pids(gpu_indices):
     return pids
 
 
-def _print_gpu_memory(gpu_indices, label=""):
-    """Print memory usage for target GPUs. Returns list of dirty GPU descriptions."""
-    if label:
-        print(f"\n{label}")
-    dirty = []
-    for line in _run_smi("index,memory.used,memory.total"):
-        parts = line.split(",")
-        if len(parts) != 3 or not parts[0].strip().isdigit():
-            continue
-        idx = int(parts[0].strip())
-        if idx not in gpu_indices:
-            continue
-        try:
-            used, total = int(float(parts[1].strip())), int(float(parts[2].strip()))
-        except ValueError:
-            continue
-        pct = used / total * 100 if total > 0 else 0
-        print(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
-        if pct >= MEMORY_THRESHOLD_PCT:
-            dirty.append(f"GPU {idx} ({pct:.0f}%)")
-    return dirty
-
-
 def _get_orchestrator_ancestors(pids):
     """Walk process tree upward from PIDs, return ancestors that are test orchestrators.
 
@@ -137,30 +114,77 @@ def _get_orchestrator_ancestors(pids):
 # ---------------------------------------------------------------------------
 
 
+_LOG_LINES = []
+
+
+def _log(msg=""):
+    """Buffer a line for boxed output."""
+    _LOG_LINES.append(msg)
+
+
+def _flush_box(title, status=""):
+    """Print all buffered lines inside a box, then clear buffer."""
+    lines = _LOG_LINES.copy()
+    _LOG_LINES.clear()
+
+    # Build content width from title, status, and all lines
+    all_text = [title] + ([status] if status else []) + lines
+    width = max((len(line) for line in all_text), default=40) + 4
+    width = max(width, 60)
+
+    h_bar = "─" * (width - 2)
+    print(f"\n┌{h_bar}┐")
+    print(f"│ {title:<{width - 3}}│")
+    print(f"├{h_bar}┤")
+    for line in lines:
+        print(f"│ {line:<{width - 3}}│")
+    if status:
+        print(f"├{h_bar}┤")
+        print(f"│ {status:<{width - 3}}│")
+    print(f"└{h_bar}┘")
+
+
 def _ci_mode():
     """GPU-scoped kill, abort if GPUs remain dirty."""
     gpu_indices = _get_target_gpus()
     if not gpu_indices:
-        print("No GPUs detected, skipping cleanup")
+        _log("No GPUs detected, skipping cleanup")
+        _flush_box("killall_sglang", status="SKIP")
         return 0
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cvd is None or not cvd.strip():
-        print(
-            "WARNING: CUDA_VISIBLE_DEVICES is not set in CI mode. "
-            "Falling back to all visible GPUs — this may kill processes "
-            "from other CI jobs on shared hosts."
-        )
-    print(f"[CI mode] Target GPUs: {sorted(gpu_indices)}")
-    if cvd is not None:
-        print(f"CUDA_VISIBLE_DEVICES={cvd}")
+    gpu_list = ", ".join(str(g) for g in sorted(gpu_indices))
 
-    _print_gpu_memory(gpu_indices, "Before cleanup:")
+    if cvd is None or not cvd.strip():
+        _log(
+            "WARNING: CUDA_VISIBLE_DEVICES is not set. "
+            "Falling back to all visible GPUs."
+        )
+        _log("This may kill processes from other CI jobs on shared hosts.")
+    else:
+        _log(f"CUDA_VISIBLE_DEVICES={cvd}")
+    _log()
+
+    # Before cleanup
+    _log("Before cleanup:")
+    for line in _run_smi("index,memory.used,memory.total"):
+        parts = line.split(",")
+        if len(parts) != 3 or not parts[0].strip().isdigit():
+            continue
+        idx = int(parts[0].strip())
+        if idx not in gpu_indices:
+            continue
+        try:
+            used, total = int(float(parts[1].strip())), int(float(parts[2].strip()))
+        except ValueError:
+            continue
+        pct = used / total * 100 if total > 0 else 0
+        _log(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
 
     # Kill orchestrator ancestors first, then GPU processes (retry once)
     gpu_pids = _get_gpu_pids(gpu_indices)
     if not gpu_pids:
-        print("  No processes found on target GPUs")
+        _log("  No processes found on target GPUs")
     else:
         _kill_pids(_get_orchestrator_ancestors(gpu_pids), "orchestrator ancestors")
         time.sleep(1)
@@ -171,17 +195,35 @@ def _ci_mode():
             label = "GPU processes" if attempt == 0 else "stubborn GPU processes"
             _kill_pids(gpu_pids, label)
             time.sleep(3)
+    _log()
 
     # Verify
-    dirty = _print_gpu_memory(gpu_indices, "After cleanup:")
+    _log("After cleanup:")
+    dirty = []
+    for line in _run_smi("index,memory.used,memory.total"):
+        parts = line.split(",")
+        if len(parts) != 3 or not parts[0].strip().isdigit():
+            continue
+        idx = int(parts[0].strip())
+        if idx not in gpu_indices:
+            continue
+        try:
+            used, total = int(float(parts[1].strip())), int(float(parts[2].strip()))
+        except ValueError:
+            continue
+        pct = used / total * 100 if total > 0 else 0
+        _log(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
+        if pct >= MEMORY_THRESHOLD_PCT:
+            dirty.append(f"GPU {idx} ({pct:.0f}%)")
+
     if dirty:
-        print(
-            f"\nERROR: GPU memory >={MEMORY_THRESHOLD_PCT}% after cleanup: "
-            f"{', '.join(dirty)}"
-        )
-        print("Orphaned CUDA contexts — container likely needs restart. Aborting CI.")
+        _log()
+        _log(f"ERROR: memory >={MEMORY_THRESHOLD_PCT}%: {', '.join(dirty)}")
+        _log("Orphaned CUDA contexts — container needs restart.")
+        _flush_box(f"killall_sglang: GPUs [{gpu_list}]", status="FAIL — Aborting CI")
         return 1
-    print("\nGPUs clean.")
+
+    _flush_box(f"killall_sglang: GPUs [{gpu_list}]", status="PASS — GPUs clean")
     return 0
 
 
