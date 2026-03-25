@@ -111,9 +111,11 @@ class SamplingParams:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
-        if self.top_k < 1 or self.top_k == -1:
+        if self.top_k < 1:
             raise ValueError(
-                f"top_k must be -1 (disable) or at least 1, got {self.top_k}."
+                f"top_k must be at least 1, got {self.top_k}. "
+                f"Note: top_k=-1 is also accepted as input, which disables top_k filtering "
+                f"(equivalent to top_k={TOP_K_ALL} internally)."
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
