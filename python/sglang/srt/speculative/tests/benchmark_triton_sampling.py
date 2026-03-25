@@ -6,7 +6,6 @@ Usage:
 """
 
 import argparse
-import sys
 
 import torch
 import torch.nn.functional as F
@@ -80,9 +79,17 @@ def bench_tree_spec(bs=1, num_draft_tokens=6, vocab_size=20):
         accept_index.fill_(-1)
         accept_token_num.fill_(0)
         tree_speculative_sampling_target_only(
-            predicts, accept_index, accept_token_num,
-            candidates, retrive_index, retrive_next_token, retrive_next_sibling,
-            coins, coins_final, target_probs, draft_probs,
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            coins,
+            coins_final,
+            target_probs,
+            draft_probs,
         )
 
     return bench_fn(run)
