@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
+from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.utils import is_npu
@@ -84,7 +85,12 @@ class TransformerLoader(ComponentLoader):
         safetensors_list: list[str],
         component_model_path: str,
     ) -> Optional[QuantizationConfig]:
-        # priority: model config.json → safetensors metadata → quantization config (nvfp4, nunchaku, ...)
+        # priority: CLI flag → model config.json → safetensors metadata → quantization config (nvfp4, nunchaku, ...)
+        
+        if server_args.quantization:
+            quant_cls = get_quantization_config(server_args.quantization)
+            return quant_cls()
+
         quant_config = get_quant_config(hf_config, component_model_path)
         if quant_config is None and server_args.transformer_weights_path:
             # try to read quantization_config from the safetensors metadata header

@@ -156,6 +156,10 @@ class ServerArgs:
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+
+    # Quantization method for online quantization
+    quantization: str | None = None
+
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -755,6 +759,18 @@ class ServerArgs:
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+
+        parser.add_argument(
+            "--quantization",
+            type=str,
+            default=ServerArgs.quantization,
+            help=(
+                "Quantization method for online quantization. "
+                "Options: 'fp8', 'mxfp4'. "
+                "Apply online weight and activation quantization to unquantized models. "
+                "Note: MXFP4 requires ROCm and MI300X (gfx95x)."
+            ),
         )
 
         # Nunchaku SVDQuant quantization parameters
