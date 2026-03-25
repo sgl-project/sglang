@@ -62,12 +62,14 @@ jobs:
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
+              - "!**/*.md"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - ".github/workflows/pr-test-npu.yml"
+              - "!**/*.md"
 
   # ==================== PR Gate ==================== #
   pr-gate:
