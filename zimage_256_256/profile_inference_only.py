@@ -46,7 +46,7 @@ print("=" * 60)
 # Build kwargs — use transformer_weights_path (the ServerArgs field name)
 gen_kwargs = dict(
     model_path=MODEL,
-    text_encoder_precisions="bf16",
+    text_encoder_precisions=["bf16"],
     warmup=True,
 )
 
