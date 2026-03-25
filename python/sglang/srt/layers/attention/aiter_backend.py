@@ -1153,7 +1153,9 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int)
+        self.cuda_graph_kv_last_page_len = torch.ones(
+            max_bs, dtype=torch.int, device=self.device
+        )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
