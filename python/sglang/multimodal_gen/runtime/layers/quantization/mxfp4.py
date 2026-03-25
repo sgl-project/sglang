@@ -1,7 +1,8 @@
+import logging
 from typing import Optional
+
 import torch
 from torch.nn.parameter import Parameter
-import logging
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -18,8 +19,8 @@ _is_hip = is_hip()
 
 if _is_hip:
     try:
-        from aiter.ops.triton.quant import dynamic_mxfp4_quant
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
     except ImportError as e:
         logger.warning(f"aiter MXFP4 kernels not available: {e}")
         dynamic_mxfp4_quant = None
