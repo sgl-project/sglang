@@ -123,7 +123,6 @@ jobs:
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**"
-              - "!**/*.md"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
@@ -131,17 +130,14 @@ jobs:
               - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
               - "python/sglang/jit_kernel/**"
               - "python/sglang/cli/**"
-              - "!**/*.md"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
               - "python/sglang/jit_kernel/**"
-              - "!**/*.md"
             sgl_kernel:
               - ".github/workflows/pr-test-sgl-kernel.yml"
               - "sgl-kernel/**"
-              - "!**/*.md"
 
       # For /rerun-stage (workflow_dispatch with target_stage), dorny/paths-filter doesn't work
       # correctly because it falls back to "last commit" detection which breaks for merge commits.
