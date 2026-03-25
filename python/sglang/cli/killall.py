@@ -50,6 +50,42 @@ def _get_pid_cmdline(pid):
         return "<unknown>"
 
 
+def _check_pid_namespace(pid):
+    """Check if a PID is in our PID namespace. Linux-only via /proc."""
+    try:
+        my_ns = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return "unknown (can't read self ns)"
+    try:
+        target_ns = os.readlink(f"/proc/{pid}/ns/pid")
+    except FileNotFoundError:
+        return f"NOT in our namespace (pid not in /proc, self={my_ns})"
+    except PermissionError:
+        return "unknown (no permission to read ns)"
+    if my_ns == target_ns:
+        return f"same namespace ({my_ns})"
+    return f"DIFFERENT namespace (self={my_ns}, target={target_ns})"
+
+
+def _log_ps_diagnostic():
+    """Log ps auxf output filtered for GPU/sglang-related processes."""
+    try:
+        out = subprocess.run(["ps", "auxf"], capture_output=True, text=True, timeout=5)
+        matches = [
+            line.strip()[:140]
+            for line in out.stdout.splitlines()
+            if any(k in line.lower() for k in ["sglang", "python", "cuda", "gpu"])
+        ]
+        if matches:
+            _log("  Diagnostic (ps auxf, filtered):")
+            for line in matches[:20]:
+                _log(f"    {line}")
+        else:
+            _log("  Diagnostic (ps auxf): no sglang/python/gpu processes found")
+    except (subprocess.SubprocessError, FileNotFoundError):
+        _log("  Diagnostic (ps auxf): command failed")
+
+
 def _kill_pids(pids, label=""):
     """Send SIGKILL to PIDs, skipping self and init. Logs to _LOG_LINES."""
     my_pid = os.getpid()
@@ -58,13 +94,18 @@ def _kill_pids(pids, label=""):
         return
     if label:
         _log(f"  Killing {label}:")
+    failed_pids = []
     for pid in sorted(pids):
         cmdline = _get_pid_cmdline(pid)
         _log(f"    PID {pid}: {cmdline}")
         try:
             os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            _log(f"    PID {pid}: failed (already dead or no permission)")
+        except (ProcessLookupError, PermissionError) as e:
+            ns_info = _check_pid_namespace(pid)
+            _log(f"    PID {pid}: failed ({type(e).__name__}), ns: {ns_info}")
+            failed_pids.append(pid)
+    if failed_pids:
+        _log_ps_diagnostic()
 
 
 def _get_target_gpus():
