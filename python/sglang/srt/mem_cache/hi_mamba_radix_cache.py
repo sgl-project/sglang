@@ -832,11 +832,12 @@ class HiMambaRadixCache(MambaRadixCache):
                 self._tombstone_internal_node(x)
             else:
                 # Leaf: evict KV + mamba atomically
-                assert (
-                    x.full_lock_ref == 0
-                ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=}"
-
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
+                if x.full_lock_ref > 0:
+                    # KV is locked by an in-flight request; skip for now.
+                    x = x_next
+                    continue
+
                 _, mamba_evicted = self._evict_device_leaf(x)
                 mamba_num_evicted += mamba_evicted
 
