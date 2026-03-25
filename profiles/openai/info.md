@@ -85,9 +85,9 @@ python3 -m sglang.bench_offline_throughput \
 |--------|-------------|-------------|------------------------|
 | with piecewise CG | 12,229 | 12,773 | — |
 | Baseline (no piecewise CG) | 11,711 | 12,232 | — |
-| Inductor — RotaryEmbedding + RMSNorm | 11,691 | 12,211 | −0.2% |
-| Inductor — RotaryEmbedding | 12,139 | 12,679 | **+3.6%** |
-| Inductor — RMSNorm | 12,131 | 12,670 | **+3.6%** |
+| Inductor — RotaryEmbedding + RMSNorm | 11,763 | 12,286 | **+0.4%** |
+| Inductor — RotaryEmbedding | 12,234 | 12,778 | **+4.5%** |
+| Inductor — RMSNorm | 12,110 | 12,649 | **+3.4%** |
 
 ### Summary
 
@@ -99,11 +99,11 @@ python3 -m sglang.bench_offline_throughput \
 | 32 prompts, cg-bs 32 | RotaryEmbedding + RMSNorm | 5,048 | **+4.7%** |
 | 32 prompts, cg-bs 32 | RotaryEmbedding | 5,038 | **+4.5%** |
 | 32 prompts, cg-bs 32 | RMSNorm | 5,035 | **+4.5%** |
-| 128 prompts, cg-bs 128 | RotaryEmbedding + RMSNorm | 12,211 | −0.2% |
-| 128 prompts, cg-bs 128 | RotaryEmbedding | 12,679 | **+3.6%** |
-| 128 prompts, cg-bs 128 | RMSNorm | 12,670 | **+3.6%** |
+| 128 prompts, cg-bs 128 | RotaryEmbedding + RMSNorm | 12,286 | **+0.4%** |
+| 128 prompts, cg-bs 128 | RotaryEmbedding | 12,778 | **+4.5%** |
+| 128 prompts, cg-bs 128 | RMSNorm | 12,649 | **+3.4%** |
 
-Against the fair baseline (no piecewise CG), individual Inductor compilation shows consistent gains: **+1.4–1.7%** at B=1, **+4.5%** at B=32, and **+3.6%** at B=128 for both `RotaryEmbedding` and `RMSNorm` alone. The combined `RotaryEmbedding + RMSNorm` config still underperforms the individual ones (−1.7% at B=1, −0.2% at B=128), though it leads at B=32 (+4.7%).
+Against the fair baseline (no piecewise CG), individual Inductor compilation shows consistent gains: **+1.4–1.7%** at B=1, **+4.5%** at B=32, and **+3.4–4.5%** at B=128 for `RotaryEmbedding` and `RMSNorm` alone. The combined `RotaryEmbedding + RMSNorm` config underperforms the individual ones at B=1 (−1.7%) but shows gains at B=32 (**+4.7%**) and B=128 (**+0.4%**).
 
 ---
 
@@ -149,7 +149,7 @@ python3 -m sglang.bench_offline_throughput \
 | Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|-------------|------------------------|
 | Baseline | 20,150 | 21,046 | — |
-| Inductor — RotaryEmbedding | 21,023 | 21,958 | **+4.3%** |
+| Inductor — RotaryEmbedding | 21,810 | 22,780 | **+8.2%** |
 
 ### Summary
 
@@ -157,9 +157,9 @@ python3 -m sglang.bench_offline_throughput \
 |----------|--------|-------------|------------------------|
 | 1 prompt, cg-bs 1 | RotaryEmbedding | 472 | **+5.1%** |
 | 32 prompts, cg-bs 32 | RotaryEmbedding | 9,826 | **+7.1%** |
-| 128 prompts, cg-bs 128 | RotaryEmbedding | 21,958 | **+4.3%** |
+| 128 prompts, cg-bs 128 | RotaryEmbedding | 22,780 | **+8.2%** |
 
-Inductor compilation of `RotaryEmbedding` delivers consistent and significant gains on the 120b mxfp4 model: **+5.1%** at B=1, **+7.1%** at B=32, and **+4.3%** at B=128. The larger model benefits more from the rope KV-cache fusion than the 20b variant, likely because the per-layer overhead of the 2-kernel SWA workaround is proportionally larger relative to the faster mxfp4 compute.
+Inductor compilation of `RotaryEmbedding` delivers consistent and significant gains on the 120b mxfp4 model: **+5.1%** at B=1, **+7.1%** at B=32, and **+8.2%** at B=128. The larger model benefits more from the rope KV-cache fusion than the 20b variant, likely because the per-layer overhead of the 2-kernel SWA workaround is proportionally larger relative to the faster mxfp4 compute.
 
 ### Nsys Kernel Traces
 
