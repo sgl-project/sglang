@@ -28,8 +28,8 @@ mod worker_management_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::healthy(19900),
-                TestWorkerConfig::healthy(19901),
+                TestWorkerConfig::healthy(9900),
+                TestWorkerConfig::healthy(9901),
             ],
         )
         .await;
@@ -61,8 +61,8 @@ mod worker_management_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::healthy(19902),
-                TestWorkerConfig::healthy(19903),
+                TestWorkerConfig::healthy(9902),
+                TestWorkerConfig::healthy(9903),
             ],
         )
         .await;
@@ -104,7 +104,7 @@ mod worker_management_tests {
         let config = TestRouterConfig::round_robin(3902);
 
         let ctx =
-            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(19904)]).await;
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(9904)]).await;
 
         let app = ctx.create_app().await;
 

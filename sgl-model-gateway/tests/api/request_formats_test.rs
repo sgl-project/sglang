@@ -12,7 +12,7 @@ mod request_format_tests {
     #[tokio::test]
     async fn test_generate_request_formats() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 19001,
+            port: 9001,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -59,7 +59,7 @@ mod request_format_tests {
     #[tokio::test]
     async fn test_v1_chat_completions_formats() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 19002,
+            port: 9002,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -107,7 +107,7 @@ mod request_format_tests {
     #[tokio::test]
     async fn test_v1_completions_formats() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 19003,
+            port: 9003,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -159,7 +159,7 @@ mod request_format_tests {
     #[tokio::test]
     async fn test_batch_requests() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 19004,
+            port: 9004,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -193,7 +193,7 @@ mod request_format_tests {
     #[tokio::test]
     async fn test_special_parameters() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 19005,
+            port: 9005,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -241,7 +241,7 @@ mod request_format_tests {
     #[tokio::test]
     async fn test_error_handling() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 19006,
+            port: 9006,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,

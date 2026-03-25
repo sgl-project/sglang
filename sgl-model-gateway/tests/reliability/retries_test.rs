@@ -31,8 +31,8 @@ mod retry_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(19200, 1.0), // First worker always fails
-                TestWorkerConfig::healthy(19201),    // Second worker always succeeds
+                TestWorkerConfig::flaky(9200, 1.0), // First worker always fails
+                TestWorkerConfig::healthy(9201),    // Second worker always succeeds
             ],
         )
         .await;
@@ -81,7 +81,7 @@ mod retry_tests {
 
         let ctx = AppTestContext::new_with_config(
             config,
-            vec![TestWorkerConfig::flaky(19202, 1.0)], // Always fail
+            vec![TestWorkerConfig::flaky(9202, 1.0)], // Always fail
         )
         .await;
 
@@ -123,7 +123,7 @@ mod retry_tests {
 
         let ctx = AppTestContext::new_with_config(
             config,
-            vec![TestWorkerConfig::flaky(19203, 1.0)], // Always fail
+            vec![TestWorkerConfig::flaky(9203, 1.0)], // Always fail
         )
         .await;
 
@@ -180,9 +180,9 @@ mod retry_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(19204, 1.0), // Fail
-                TestWorkerConfig::flaky(19205, 1.0), // Fail
-                TestWorkerConfig::healthy(19206),    // Succeed
+                TestWorkerConfig::flaky(9204, 1.0), // Fail
+                TestWorkerConfig::flaky(9205, 1.0), // Fail
+                TestWorkerConfig::healthy(9206),    // Succeed
             ],
         )
         .await;

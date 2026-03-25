@@ -39,7 +39,7 @@ mod payload_size_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
-                port: 20200,
+                port: 7200,
                 worker_type: WorkerType::Regular,
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
@@ -91,7 +91,7 @@ mod payload_size_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
-                port: 20201,
+                port: 7201,
                 worker_type: WorkerType::Regular,
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
@@ -145,7 +145,7 @@ mod payload_size_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
-                port: 20202,
+                port: 7202,
                 worker_type: WorkerType::Regular,
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
@@ -204,7 +204,7 @@ mod payload_size_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
-                port: 20203,
+                port: 7203,
                 worker_type: WorkerType::Regular,
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
@@ -260,7 +260,7 @@ mod payload_size_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
-                port: 20204,
+                port: 7204,
                 worker_type: WorkerType::Regular,
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,

@@ -44,8 +44,8 @@ mod fault_tolerance_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(20100, 1.0), // Always fails
-                TestWorkerConfig::healthy(20101),    // Always succeeds
+                TestWorkerConfig::flaky(7100, 1.0), // Always fails
+                TestWorkerConfig::healthy(7101),    // Always succeeds
             ],
         )
         .await;
@@ -93,8 +93,8 @@ mod fault_tolerance_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(20102, 1.0), // Always fails
-                TestWorkerConfig::flaky(20103, 1.0), // Always fails
+                TestWorkerConfig::flaky(7102, 1.0), // Always fails
+                TestWorkerConfig::flaky(7103, 1.0), // Always fails
             ],
         )
         .await;
@@ -133,8 +133,8 @@ mod fault_tolerance_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::slow(20104, 500), // Slow worker
-                TestWorkerConfig::healthy(20105),   // Fast worker
+                TestWorkerConfig::slow(7104, 500), // Slow worker
+                TestWorkerConfig::healthy(7105),   // Fast worker
             ],
         )
         .await;
@@ -207,8 +207,8 @@ mod fault_tolerance_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(20106, 1.0), // Failing worker
-                TestWorkerConfig::healthy(20107),    // Healthy worker
+                TestWorkerConfig::flaky(7106, 1.0), // Failing worker
+                TestWorkerConfig::healthy(7107),    // Healthy worker
             ],
         )
         .await;
@@ -268,8 +268,8 @@ mod fault_tolerance_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(20108, 0.5), // 50% failure rate
-                TestWorkerConfig::healthy(20109),    // Always succeeds
+                TestWorkerConfig::flaky(7108, 0.5), // 50% failure rate
+                TestWorkerConfig::healthy(7109),    // Always succeeds
             ],
         )
         .await;

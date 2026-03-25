@@ -26,7 +26,7 @@ mod manual_routing_tests {
         let config = TestRouterConfig::manual(3700);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19700, 2))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(9700, 2))
                 .await;
 
         let app = ctx.create_app().await;
@@ -85,7 +85,7 @@ mod manual_routing_tests {
         let config = TestRouterConfig::manual(3701);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19702, 2))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(9702, 2))
                 .await;
 
         let app = ctx.create_app().await;
@@ -127,7 +127,7 @@ mod manual_routing_tests {
         let config = TestRouterConfig::manual(3702);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19704, 3))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(9704, 3))
                 .await;
 
         let app = ctx.create_app().await;
@@ -210,7 +210,7 @@ mod manual_min_group_tests {
         let config = TestRouterConfig::manual_min_group(3910);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29910, 3, 500))
+            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(5910, 3, 500))
                 .await;
 
         let app = ctx.create_app().await;
@@ -259,7 +259,7 @@ mod manual_min_group_tests {
         let config = TestRouterConfig::manual_min_group(3911);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29920, 3, 200))
+            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(5920, 3, 200))
                 .await;
 
         let app = ctx.create_app().await;
@@ -297,7 +297,7 @@ mod manual_min_group_tests {
         let config = TestRouterConfig::manual_min_group(3912);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(29930, 2, 300))
+            AppTestContext::new_with_config(config, TestWorkerConfig::slow_workers(5930, 2, 300))
                 .await;
 
         let app = ctx.create_app().await;

@@ -26,12 +26,12 @@ mod pd_routing_tests {
         let config = RouterConfig::builder()
             .prefill_decode_mode(
                 vec![
-                    ("http://127.0.0.1:19800".to_string(), None),
-                    ("http://127.0.0.1:19801".to_string(), None),
+                    ("http://127.0.0.1:9800".to_string(), None),
+                    ("http://127.0.0.1:9801".to_string(), None),
                 ],
                 vec![
-                    "http://127.0.0.1:19802".to_string(),
-                    "http://127.0.0.1:19803".to_string(),
+                    "http://127.0.0.1:9802".to_string(),
+                    "http://127.0.0.1:9803".to_string(),
                 ],
             )
             .power_of_two_policy(1)
@@ -51,11 +51,11 @@ mod pd_routing_tests {
             config,
             vec![
                 // Prefill workers
-                TestWorkerConfig::prefill(19800),
-                TestWorkerConfig::prefill(19801),
+                TestWorkerConfig::prefill(9800),
+                TestWorkerConfig::prefill(9801),
                 // Decode workers
-                TestWorkerConfig::decode(19802),
-                TestWorkerConfig::decode(19803),
+                TestWorkerConfig::decode(9802),
+                TestWorkerConfig::decode(9803),
             ],
         )
         .await;
@@ -92,10 +92,10 @@ mod pd_routing_tests {
     async fn test_pd_mode_round_robin() {
         let config = RouterConfig::builder()
             .prefill_decode_mode(
-                vec![("http://127.0.0.1:19810".to_string(), None)],
+                vec![("http://127.0.0.1:9810".to_string(), None)],
                 vec![
-                    "http://127.0.0.1:19811".to_string(),
-                    "http://127.0.0.1:19812".to_string(),
+                    "http://127.0.0.1:9811".to_string(),
+                    "http://127.0.0.1:9812".to_string(),
                 ],
             )
             .round_robin_policy()
@@ -112,9 +112,9 @@ mod pd_routing_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::prefill(19810),
-                TestWorkerConfig::decode(19811),
-                TestWorkerConfig::decode(19812),
+                TestWorkerConfig::prefill(9810),
+                TestWorkerConfig::decode(9811),
+                TestWorkerConfig::decode(9812),
             ],
         )
         .await;
@@ -156,10 +156,10 @@ mod pd_routing_tests {
 
         let config = RouterConfig::builder()
             .prefill_decode_mode(
-                vec![("http://127.0.0.1:19820".to_string(), None)],
+                vec![("http://127.0.0.1:9820".to_string(), None)],
                 vec![
-                    "http://127.0.0.1:19821".to_string(),
-                    "http://127.0.0.1:19822".to_string(),
+                    "http://127.0.0.1:9821".to_string(),
+                    "http://127.0.0.1:9822".to_string(),
                 ],
             )
             .round_robin_policy()
@@ -182,15 +182,15 @@ mod pd_routing_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::prefill(19820),
+                TestWorkerConfig::prefill(9820),
                 MockWorkerConfig {
-                    port: 19821,
+                    port: 9821,
                     worker_type: WorkerType::Decode,
                     health_status: HealthStatus::Healthy,
                     response_delay_ms: 0,
                     fail_rate: 1.0, // Failing decode worker
                 },
-                TestWorkerConfig::decode(19822), // Healthy decode worker
+                TestWorkerConfig::decode(9822), // Healthy decode worker
             ],
         )
         .await;

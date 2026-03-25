@@ -68,16 +68,17 @@ impl MockWorker {
         let config = self.config.clone();
         let port = config.read().await.port;
 
-        // If port is 0, find an available port
-        let port = if port == 0 {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let port = listener.local_addr()?.port();
-            drop(listener);
-            config.write().await.port = port;
-            port
-        } else {
-            port
-        };
+        // Bind BEFORE spawning to avoid TOCTOU races with port=0 allocation.
+        // Use SO_REUSEADDR to handle TCP TIME_WAIT from previous test runs.
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.set_reuseaddr(true)?;
+        socket.bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))?;
+        let listener = socket.listen(1024)?;
+        let actual_port = listener.local_addr()?.port();
+
+        if port == 0 {
+            config.write().await.port = actual_port;
+        }
 
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -101,16 +102,8 @@ impl MockWorker {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         self.shutdown_tx = Some(shutdown_tx);
 
-        // Spawn the server in a separate task
+        // Spawn the server with the already-bound listener
         let handle = tokio::spawn(async move {
-            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Failed to bind to port {}: {}", port, e);
-                    return;
-                }
-            };
-
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             });
@@ -125,7 +118,7 @@ impl MockWorker {
         // Wait for the server to start
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let url = format!("http://127.0.0.1:{}", port);
+        let url = format!("http://127.0.0.1:{}", actual_port);
         Ok(url)
     }
 
