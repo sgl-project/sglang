@@ -42,7 +42,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         num_new_pages = (
             (seq_lens + self.roundup) // self.page_size
             - (prefix_lens + self.roundup) // self.page_size
-        ).sum(dim=-1)
+        ).sum()
         num_new_pages_item = num_new_pages.item()
         if self.need_sort and num_new_pages_item > len(self.free_pages):
             self.merge_and_sort_free()

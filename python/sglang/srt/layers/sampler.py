@@ -275,7 +275,13 @@ class Sampler(nn.Module):
         """
         if simple_sampling_case:
             probs = torch.softmax(logits, dim=-1)
-            batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
+            if sampling_info.sampling_seed is not None:
+                probabilities = probs.to(torch.float64).log_()
+                batch_next_token_ids = multinomial_with_seed(
+                    probabilities, sampling_info.sampling_seed, positions
+                ).view(-1)
+            else:
+                batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
             return batch_next_token_ids.to(torch.int32)
         else:
             assert (
@@ -573,7 +579,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     return batch_next_token_ids.view(-1)
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=is_npu())
 def multinomial_with_seed(
     logprobs: torch.Tensor, seed: torch.Tensor, positions: torch.Tensor
 ) -> torch.Tensor:
