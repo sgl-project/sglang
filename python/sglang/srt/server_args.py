@@ -3234,9 +3234,15 @@ class ServerArgs:
         if len(devices) == 0:
             raise ValueError("No valid IB devices specified")
 
-        # Check for duplicates
-        if len(devices) != len(set(devices)):
-            raise ValueError(f"Duplicate IB devices specified: {device_str}")
+        # Deduplicate while preserving order
+        unique_devices = list(dict.fromkeys(devices))
+        if len(unique_devices) != len(devices):
+            logger.warning(
+                "Duplicate IB devices specified: %s. Deduplicating to: %s",
+                device_str,
+                ",".join(unique_devices),
+            )
+            devices = unique_devices
 
         # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"
