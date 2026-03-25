@@ -5,6 +5,7 @@ from typing import Dict, Iterable, Optional, Tuple
 import torch
 
 import sglang.srt.distributed.parallel_state as ps
+from sglang.srt.layers.layernorm import Gemma3RMSNorm, GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -416,6 +417,9 @@ def _reconstruct_full_tensor(
         )
 
     if isinstance(module, ReplicatedLinear):
+        return tensor
+
+    if isinstance(module, (RMSNorm, GemmaRMSNorm, Gemma3RMSNorm)):
         return tensor
 
     if isinstance(module, VocabParallelEmbedding):
