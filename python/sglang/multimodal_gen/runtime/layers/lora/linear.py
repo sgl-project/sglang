@@ -48,7 +48,9 @@ class BaseLayerWithLoRA(nn.Module):
         self.base_layer: nn.Module = base_layer
 
         self.merged: bool = False
-        self.cpu_weight = base_layer.weight.to("cpu")
+        # Immutable base-weight snapshot; `to("cpu")` may alias CPU storage.
+        # Use `clone()` so merge updates cannot mutate this backup tensor.
+        self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
         # Default to True to prevent using uninitialized weights; set to False when weights are loaded
@@ -342,7 +344,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         super().__init__(base_layer, lora_rank, lora_alpha)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
-        return A.to(self.base_layer.weight)
+        return A
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()

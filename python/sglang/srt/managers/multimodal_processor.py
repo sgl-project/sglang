@@ -41,11 +41,13 @@ def import_processors(package_name: str, overwrite: bool = False):
 
 
 def get_mm_processor(
-    hf_config, server_args: ServerArgs, processor, transport_mode
+    hf_config, server_args: ServerArgs, processor, transport_mode, **kwargs
 ) -> BaseMultimodalProcessor:
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ in hf_config.architectures:
-            return processor_cls(hf_config, server_args, processor, transport_mode)
+            return processor_cls(
+                hf_config, server_args, processor, transport_mode, **kwargs
+            )
 
     raise ValueError(
         f"No processor registered for architecture: {hf_config.architectures}.\n"

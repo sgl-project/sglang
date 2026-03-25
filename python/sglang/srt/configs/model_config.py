@@ -26,7 +26,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -51,18 +51,29 @@ class ModelImpl(str, Enum):
     MINDSPORE = "mindspore"
 
 
-def is_deepseek_nsa(config: PretrainedConfig) -> bool:
+def is_deepseek_nsa(config) -> bool:
+    architectures = (
+        config.get("architectures")
+        if isinstance(config, dict)
+        else getattr(config, "architectures", None)
+    )
+    index_topk = (
+        config.get("index_topk")
+        if isinstance(config, dict)
+        else getattr(config, "index_topk", None)
+    )
     return (
-        config.architectures is not None
-        and config.architectures[0]
+        architectures is not None
+        and architectures[0]
         in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
+            "GlmMoeDsaForCausalLM",
         ]
-        and getattr(config, "index_topk", None) is not None
+        and index_topk is not None
     )
 
 
@@ -192,6 +203,11 @@ class ModelConfig:
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
+        self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        self.is_piecewise_cuda_graph_disabled_model = (
+            is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
+            or is_deepseek_nsa(self.hf_text_config)
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -241,6 +257,11 @@ class ModelConfig:
             if is_draft_model
             else server_args.quantization
         )
+        override_config_file = (
+            server_args.decrypted_draft_config_file
+            if is_draft_model
+            else server_args.decrypted_config_file
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -254,7 +275,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
-            override_config_file=server_args.decrypted_config_file,
+            override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
@@ -266,10 +287,10 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
-        ):
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "DeepseekV3ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] in [
@@ -277,6 +298,11 @@ class ModelConfig:
             "Glm4MoeLiteForCausalLM",
         ]:
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
+
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "GlmOcrForConditionalGeneration",
+        ]:
+            self.hf_config.architectures[0] = "GlmOcrForConditionalGenerationNextN"
 
         if (
             is_draft_model
@@ -292,9 +318,12 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM"
         ):
             self.hf_config.architectures[0] = "MiMoV2MTP"
+        if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
+            self.hf_config.architectures[0] = "Step3p5MTP"
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
+            "BailingMoeV2_5ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "BailingMoeForCausalLMNextN"
         if (
@@ -305,6 +334,17 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ]:
+            self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
+            self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
@@ -378,6 +418,16 @@ class ModelConfig:
             self.head_dim,
         )
 
+        self.swa_head_dim = getattr(
+            self.hf_text_config,
+            "swa_head_dim",
+            self.head_dim,
+        )
+        self.swa_v_head_dim = getattr(
+            self.hf_text_config,
+            "swa_v_head_dim",
+            self.v_head_dim,
+        )
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
@@ -385,41 +435,41 @@ class ModelConfig:
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
+            or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "MistralLarge3ForCausalLM" in self.hf_config.architectures
             or "PixtralForConditionalGeneration" in self.hf_config.architectures
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
+            or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.v_head_dim = self.hf_config.v_head_dim
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
-                get_nsa_index_head_dim(self.hf_config)
-                if is_deepseek_nsa(self.hf_config)
+                get_nsa_index_head_dim(self.hf_text_config)
+                if is_deepseek_nsa(self.hf_text_config)
                 else None
             )
-
-            if "Glm4MoeLiteForCausalLM" in self.hf_config.architectures:
-                self.scaling = 1
-                self.hf_config.rope_scaling = None
-            else:
-                # Handle rope scaling with yarn
-                self.scaling = 1 / math.sqrt(
-                    self.qk_nope_head_dim + self.qk_rope_head_dim
+            # Handle rope scaling
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            # in transformers v5, rope_scaling is just rope_parameters for backward compatibility
+            rope_scaling = self.hf_text_config.rope_scaling
+            if rope_scaling:
+                # v5 uses "rope_type", v4 uses "type"
+                rope_type = (
+                    rope_scaling.get("rope_type")
+                    or rope_scaling.get("type")
+                    or "default"
                 )
-                if self.hf_config.rope_scaling:
-                    mscale_all_dim = self.hf_config.rope_scaling.get(
-                        "mscale_all_dim", False
+                if rope_type != "default":
+                    self.scaling = compute_mla_mscale_scaling(
+                        rope_scaling, self.scaling
                     )
-                    scaling_factor = self.hf_config.rope_scaling["factor"]
-                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                    self.scaling = self.scaling * mscale * mscale
-
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -432,6 +482,7 @@ class ModelConfig:
             self.attention_arch = AttentionArch.MLA
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         elif "KimiVLForConditionalGeneration" in self.hf_config.architectures:
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -446,6 +497,36 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+        elif (
+            "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
+            or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
+        ):
+            self.head_dim = self.hf_text_config.head_dim
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_text_config.kv_lora_rank
+            self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+            self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            # Handle rope scaling with yarn
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                self.scaling = compute_mla_mscale_scaling(
+                    self.hf_config.rope_scaling, self.scaling
+                )
+        elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
+            self.head_dim = (
+                self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
+            )
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                self.scaling = compute_mla_mscale_scaling(
+                    self.hf_config.rope_scaling, self.scaling
+                )
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -462,6 +543,9 @@ class ModelConfig:
                         or self.hf_text_config.head_dim is None
                     ):
                         setattr(self.hf_text_config, "head_dim", self.head_dim)
+
+            elif "BaichuanForCausalLM" in self.hf_config.architectures:
+                self.use_alibi = self.hf_config.hidden_size != 4096
 
             self.attention_arch = AttentionArch.MHA
 
@@ -486,6 +570,17 @@ class ModelConfig:
         if "IQuestLoopCoderForCausalLM" in self.hf_config.architectures:
             loop_num = getattr(self.hf_text_config, "loop_num", 1)
             self.num_attention_layers = int(self.num_hidden_layers * int(loop_num))
+        if "WhisperForConditionalGeneration" in self.hf_config.architectures:
+            # Whisper has unique layer ID scheme:
+            # - Encoder self-attention: 0 to encoder_layers-1 (no KV cache)
+            # - Decoder self-attention: encoder_layers to encoder_layers+decoder_layers-1 (uses KV cache)
+            # - Decoder cross-attention: encoder_layers+decoder_layers to encoder_layers+2*decoder_layers-1
+            # Even though cross-attention doesn't save KV cache, attention backend needs buffer to exist
+            encoder_layers = getattr(self.hf_text_config, "encoder_layers", 0)
+            decoder_layers = getattr(
+                self.hf_text_config, "decoder_layers", self.num_hidden_layers
+            )
+            self.num_attention_layers = encoder_layers + 2 * decoder_layers
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
@@ -573,16 +668,34 @@ class ModelConfig:
 
     def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
-        if not self.is_hybrid_swa_compress:
-            return 0
-
-        # For MiMoV2FlashForCausalLM models
-        total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
-        return max(1, total_num_kv_heads // tensor_parallel_size)
+        if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
+            total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
+            return max(1, total_num_kv_heads // tensor_parallel_size)
+        elif hasattr(self.hf_text_config, "attention_other_setting"):  # For step3p5
+            total_num_kv_heads = self.hf_text_config.attention_other_setting.get(
+                "num_attention_groups"
+            )
+            return max(1, total_num_kv_heads // tensor_parallel_size)
+        else:
+            return self.get_num_kv_heads(tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is not None and not isinstance(quant_cfg, dict):
+            quant_cfg = quant_cfg.to_dict()
+        if quant_cfg is not None:
+            # Identify modelopt quantization
+            if (
+                "quant_method" not in quant_cfg
+                or quant_cfg["quant_method"] == "modelopt"
+            ):
+                parsed_cfg = self._parse_modelopt_quant_config(
+                    {"quantization": quant_cfg}
+                )
+                if parsed_cfg:
+                    quant_cfg.update(parsed_cfg)
+
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
@@ -683,16 +796,49 @@ class ModelConfig:
         quant_algo = json_quant_configs.get("quant_algo", None)
 
         if quant_algo == "MIXED_PRECISION":
-            return {"quant_method": "w4afp8"}
+            architectures = getattr(self.hf_config, "architectures", []) or []
+            if getattr(self.hf_config, "model_type", None) == "nemotron_h" or any(
+                arch.startswith("NemotronH") for arch in architectures
+            ):
+                return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
+            return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
-            return {"quant_method": "modelopt_fp4"}
+            return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}
         elif quant_algo and "FP8" in quant_algo:
-            return {"quant_method": "modelopt_fp8"}
+            return {"quant_method": "modelopt_fp8", "quant_algo": quant_algo}
         else:
+            return None
+
+    def get_quantization_config_log_str(self) -> Optional[str]:
+        """
+        Get a concise string representation of the quantization config for logging.
+        Returns something like "quant=fp8, fmt=e4m3" or "quant=gptq, bits=4".
+        """
+        try:
+            quant_cfg = self._parse_quant_hf_config()
+            if not quant_cfg:
+                return None
+
+            quant_method = quant_cfg.get("quant_method", "quantized")
+            log_str = f"quant={quant_method}"
+
+            # Append interesting fields if they exist
+            for field in ["bits", "quant_algo", "fmt"]:
+                if field in quant_cfg:
+                    log_str += f", {field}={quant_cfg[field]}"
+
+            return log_str
+        except Exception:
             return None
 
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
+        # Check for quantization in hf_config (config.json)
+        if getattr(self.hf_config, "quantization_config", None) or getattr(
+            self.hf_config, "compression_config", None
+        ):
+            return True
+
         # Check for HuggingFace quantization config
         from sglang.srt.utils import has_hf_quant_config
 
@@ -704,6 +850,10 @@ class ModelConfig:
             return "fp8"
         elif self.quantization == "modelopt_fp4":
             return "nvfp4"
+        elif self.quantization == "modelopt_mixed":
+            raise ValueError(
+                "modelopt_mixed is only supported for pre-quantized checkpoints."
+            )
         elif self.quantization == "modelopt":
             # Auto-detect from model config
             quant_cfg = self._parse_quant_hf_config()
@@ -734,6 +884,7 @@ class ModelConfig:
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
+            "modelopt_mixed",
         ]
         modelopt_quantization_specified = (
             self.quantization in _MODELOPT_QUANTIZATION_METHODS
@@ -775,6 +926,7 @@ class ModelConfig:
             "marlin",
             "modelopt_fp8",
             "modelopt_fp4",
+            "modelopt_mixed",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",
@@ -794,6 +946,7 @@ class ModelConfig:
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
+            "modelopt_mixed": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
@@ -804,8 +957,11 @@ class ModelConfig:
         # Parse quantization method from the HF and ModelSlim model config, if available.
         # Only one function should return config, other should return None.
         cfg_list = []
-        cfg_list.append(self._parse_quant_hf_config())
-        cfg_list.append(self._find_quant_modelslim_config())
+        hf_config = self._parse_quant_hf_config()
+        modelslim_config = self._find_quant_modelslim_config()
+        quant_config = modelslim_config or hf_config
+        if quant_config is not None:
+            cfg_list.append(quant_config)
 
         # Filter out None values
         cfg_list = [item for item in cfg_list if item is not None]
@@ -885,12 +1041,14 @@ class ModelConfig:
                     f"supported in ROCm."
                 )
             if self.quantization not in optimized_quantization_methods:
-                logger.warning(
-                    "%s quantization is not fully "
-                    "optimized yet. The speed can be slower than "
-                    "non-quantized models.",
-                    self.quantization,
-                )
+                # Don't warn for MXFP4 on SM100 since it has optimized kernels
+                if not (self.quantization == "mxfp4" and is_sm100_supported()):
+                    logger.warning(
+                        "%s quantization is not fully "
+                        "optimized yet. The speed can be slower than "
+                        "non-quantized models.",
+                        self.quantization,
+                    )
 
     def _verify_dual_chunk_attention_config(self) -> None:
         if hasattr(self.hf_config, "dual_chunk_attention_config"):
@@ -927,7 +1085,7 @@ class ModelConfig:
         needs_tf_v5 = is_glm_46vmoe
 
         tf_version = version.parse(tf_version_str)
-        required_version = version.parse("5.0.0")
+        required_version = version.parse("5.0.0dev0")
 
         if tf_version < required_version:
             if needs_tf_v5:
@@ -936,13 +1094,6 @@ class ModelConfig:
                     f"or model type {self.hf_config.model_type}. "
                     "Please upgrade transformers to >= 5.0.0."
                 )
-        elif not needs_tf_v5:
-            logger.warning(
-                f"Transformers version {tf_version_str} is used for model type {self.hf_config.model_type}. "
-                "If you experience issues related to RoPE parameters, "
-                "they may be due to incompatibilities between Transformers >=5.0.0 and some models. "
-                "You can try downgrading to transformers==4.57.1 as a workaround."
-            )
 
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
@@ -1037,7 +1188,12 @@ def _get_and_verify_dtype(
 ) -> torch.dtype:
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
-    config_dtype = getattr(config, "dtype", None)
+    if isinstance(config, dict):
+        config_dtype = config.get("dtype", None) or config.get("torch_dtype", None)
+        model_type = config.get("model_type", "")
+    else:
+        config_dtype = getattr(config, "dtype", None)
+        model_type = getattr(config, "model_type", "")
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_TORCH_DTYPE.get(config_dtype, None)
     if config_dtype is None:
@@ -1047,11 +1203,11 @@ def _get_and_verify_dtype(
         dtype = dtype.lower()
         if dtype == "auto":
             if config_dtype == torch.float32:
-                if config.model_type.startswith("gemma"):
-                    if config.model_type == "gemma":
+                if model_type.startswith("gemma"):
+                    if model_type == "gemma":
                         gemma_version = ""
                     else:
-                        gemma_version = config.model_type[5]
+                        gemma_version = model_type[5]
                     logger.info(
                         f"For Gemma {gemma_version}, we downcast float32 to bfloat16 instead "
                         "of float16 by default. Please specify `dtype` if you "
@@ -1102,6 +1258,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "LlamaForSequenceClassificationWithNormal_Weights" in model_architectures
         or "InternLM2ForRewardModel" in model_architectures
         or "Qwen2ForRewardModel" in model_architectures
+        or "Qwen3ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
         or "Qwen3ForSequenceClassification" in model_architectures
         or "CLIPModel" in model_architectures
@@ -1110,6 +1267,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
+        or "Gemma2ForSequenceClassification" in model_architectures
     ):
         return False
     else:
@@ -1119,10 +1277,12 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
 multimodal_model_archs = [
     "CLIPModel",
     "DeepseekVL2ForCausalLM",
+    "Ernie4_5_VLMoeForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
@@ -1132,6 +1292,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -1144,11 +1305,15 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
+    "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
@@ -1160,6 +1325,16 @@ multimodal_model_archs = [
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
+    "StepVLForConditionalGeneration",
+    "KimiK25ForConditionalGeneration",
+]
+
+piecewise_cuda_graph_disabled_model_archs = [
+    "DeepseekV32ForCausalLM",
+    "Qwen3NextForCausalLM",
+    "GlmMoeDsaForCausalLM",
+    "BailingMoeV2_5ForCausalLM",
+    "LLaDAModelLM",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1185,11 +1360,18 @@ def is_image_gen_model(model_architectures: List[str]):
 
 
 def is_audio_model(model_architectures: List[str]):
-    return False
+    models = [
+        "WhisperForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):
-    return "MllamaForConditionalGeneration" in model_architectures
+    models = [
+        "WhisperForConditionalGeneration",
+        "MllamaForConditionalGeneration",
+    ]
+    return any(model in model_architectures for model in models)
 
 
 def is_local_attention_model(model_architectures: List[str]):
@@ -1211,10 +1393,34 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         return True
 
 
+def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
+    return any(
+        arch in piecewise_cuda_graph_disabled_model_archs
+        for arch in model_architectures
+    )
+
+
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float:
+    """Compute MLA attention scaling factor from rope_scaling with mscale.
+
+    Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
+    Warns if 'factor' is missing from rope_scaling (common in v5 configs).
+    """
+    mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+    if "factor" not in rope_scaling:
+        logger.warning(
+            "rope_scaling missing 'factor', defaulting to 1.0. "
+            "Check model accuracy.",
+        )
+    scaling_factor = rope_scaling.get("factor", 1.0)
+    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+    return base_scaling * mscale * mscale
 
 
 def is_hybrid_swa_model(model_architectures: List[str]):
@@ -1224,6 +1430,8 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
+        "Step3p5ForCausalLM",
+        "Step3p5MTP",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1257,7 +1465,23 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     elif "MiMoV2MTP" in model_architectures:
-        return [0], []
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
+    elif "Step3p5ForCausalLM" in model_architectures:
+        layer_types = hf_text_config.layer_types
+        swa_attention_layer_ids = [
+            i
+            for i, x in enumerate(layer_types)
+            if x == "sliding_attention" and i < num_hidden_layers
+        ]
+        full_attention_layer_ids = [
+            i
+            for i, x in enumerate(layer_types)
+            if x == "full_attention" and i < num_hidden_layers
+        ]
+    elif "Step3p5MTP" in model_architectures:
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

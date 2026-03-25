@@ -54,6 +54,8 @@ class PipelineStage(ABC):
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
+        if self.server_args.comfyui_mode:
+            return
         logger.info(f"[{self.__class__.__name__}] {msg}", *args)
 
     def log_warning(self, msg, *args):
@@ -193,9 +195,10 @@ class PipelineStage(ABC):
         with StageProfiler(
             stage_name,
             logger=logger,
-            timings=batch.timings,
+            metrics=batch.metrics,
+            log_stage_start_end=not batch.is_warmup
+            and not (self.server_args and self.server_args.comfyui_mode),
             perf_dump_path_provided=batch.perf_dump_path is not None,
-            log_stage_start_end=not batch.is_warmup,
         ):
             result = self.forward(batch, server_args)
 

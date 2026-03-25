@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
+
 import logging
 import re
 from functools import lru_cache
@@ -27,7 +28,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3_moe import Qwen3MoeModel
+from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -43,8 +44,14 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         config: Qwen3VLMoeTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        decoder_layer_type=Qwen3MoeDecoderLayer,
     ):
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            decoder_layer_type=decoder_layer_type,
+        )
         self.hidden_size = config.hidden_size
         # Currently, we use 3 as len(config.vision_config.deepstack_visual_indexes) is not directly accessible here.
         # This approach follows the original implementation.
@@ -219,10 +226,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         num_experts = self.config.num_experts
 
-        # Cache params_dict to avoid repeated expensive traversal of model parameters
-        if not hasattr(self, "_cached_params_dict"):
-            self._cached_params_dict = dict(self.named_parameters())
-        params_dict = self._cached_params_dict
+        # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.
+        params_dict = dict(self.named_parameters())
+
         for name, loaded_weight in weights:
             name = name.replace(r"model.language_model.", r"model.")
 

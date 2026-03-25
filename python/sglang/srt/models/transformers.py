@@ -15,6 +15,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/a1a2aaadb9122f05667140e39cf67e5736c8b6d6/vllm/model_executor/models/transformers.py
 """Wrapper around `transformers` models"""
+
 import logging
 import re
 from typing import Iterable, Literal, Optional, Tuple, Union

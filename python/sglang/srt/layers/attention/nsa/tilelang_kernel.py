@@ -4,21 +4,28 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
 
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    tilelang.PassConfigKey.TL_DISABLE_FAST_MATH: True,
 }
-
-BF16 = "bfloat16"
-FP8 = "float8_e4m3"
-FP32 = "float32"
+# TL_DISABLE_FAST_MATH has deprecated in v0.1.7.post1 tilelang
+if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
+    pass_configs[tilelang.PassConfigKey.TL_DISABLE_FAST_MATH] = True
+elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
+    pass_configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
 
 _is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
+_is_fp8_fnuz = is_fp8_fnuz()
+
+BF16 = "bfloat16"
+FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3"
+FP32 = "float32"
 
 
 def fast_log2_ceil(x):
@@ -42,8 +49,8 @@ def act_quant_kernel(
     N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False
 ):
     M = T.symbolic("M")
-    fp8_min = -448.0
-    fp8_max = 448.0
+    fp8_min = -224.0 if _is_fp8_fnuz else -448.0
+    fp8_max = 224.0 if _is_fp8_fnuz else 448.0
     fp8_max_inv = 1 / fp8_max
     num_stages = 0 if round_scale else 2
     blk_m = 32
@@ -108,7 +115,10 @@ def act_quant(
         x.size(-1) % block_size == 0
     ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
     N = x.size(-1)
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    if _is_fp8_fnuz:
+        y = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
+    else:
+        y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
     kernel = act_quant_kernel(N, round_scale=scale_fmt is not None)
     kernel(x.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
@@ -763,6 +773,270 @@ def sparse_attention_fwd_kernel_v2(
     return main
 
 
+@tilelang.jit(
+    out_idx=[-2, -1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_mla_fwd_decode_partial(
+    heads,
+    dim,
+    tail_dim,
+    topk,
+    *,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    block_I=64,
+    inner_iter=1,
+    num_stages=1,
+    threads=256,
+):
+    """
+    grid: (seq_len * REPLICATE_H, top_k / block_I / inner_iter)
+    Each GPU block processes `inner_iter` consecutive KV tiles and writes one (partial_o, partial_lse) entry.
+    """
+
+    assert is_causal == True, "non-causal is not supported"
+    assert kv_group == 1
+    assert topk % block_I == 0
+    assert topk % (block_I * inner_iter) == 0, (
+        f"topk ({topk}) must be divisible by block_I * inner_iter = "
+        f"{block_I} * {inner_iter}"
+    )
+
+    # log2(e) = 1.44269504
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504
+    else:
+        sm_scale = sm_scale * 1.44269504
+
+    batch = 1
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
+
+    head_kv = heads // kv_group
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
+    REPLICATE_H = (head_kv // 64) if head_kv > 64 else 1
+    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    N_GROUPS = topk // (block_I * inner_iter)
+    BI = block_I
+    D = dim
+    D_tail = tail_dim
+
+    q_shape = [batch, seq_len, heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    partial_o_shape = [batch, seq_len, N_GROUPS, heads, dim]
+    partial_lse_shape = [batch, seq_len, N_GROUPS, heads]
+    indices_dtype = T.int32
+    dtype = T.bfloat16
+    accum_dtype = T.float32
+
+    _q_in_shared = inner_iter == 1
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),
+        KV: T.Tensor(kv_shape, dtype),
+        Indices: T.Tensor(indices_shape, indices_dtype),
+        Partial_O: T.Tensor(partial_o_shape, dtype),
+        Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
+    ):
+        with T.Kernel(seq_len * REPLICATE_H, N_GROUPS, threads=threads) as (bx, by):
+            if _q_in_shared:
+                Q_buf = T.alloc_shared([H_per_block, D], dtype)
+                Q_tail_buf = T.alloc_shared([H_per_block, D_tail], dtype)
+            else:
+                Q_buf = T.alloc_fragment([H_per_block, D], dtype)
+                Q_tail_buf = T.alloc_fragment([H_per_block, D_tail], dtype)
+
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+            S_shared = T.alloc_shared([H_per_block, BI], dtype)
+            mask = T.alloc_fragment([BI], T.bool)
+
+            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+            alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))
+
+            b_i, g_i = 0, 0
+            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
+            group_i = by
+            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
+            H1 = H0 + H_per_block
+
+            T.copy(Q[b_i, s_i, H0:H1, :D], Q_buf)
+            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_buf)
+
+            for k_i in T.Pipelined(inner_iter, num_stages=num_stages):
+                topk_block_i = group_i * inner_iter + k_i
+
+                for bi_i in T.Parallel(BI):
+                    mask[bi_i] = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i] >= 0
+                for bi_i, d_i in T.Parallel(BI, D):
+                    idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
+                    KV_shared[bi_i, d_i] = KV[
+                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
+                    ]
+                for bi_i, d_i in T.Parallel(BI, D_tail):
+                    idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
+                    K_tail_shared[bi_i, d_i] = KV[
+                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i
+                    ]
+
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
+                    )
+
+                T.gemm(
+                    Q_buf,
+                    KV_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+                T.gemm(
+                    Q_tail_buf,
+                    K_tail_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                )
+
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(H_per_block):
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.exp2(
+                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                    )
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for h_i in T.Parallel(H_per_block):
+                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    acc_o[h_i, d_i] *= alpha[h_i]
+
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullCol)
+
+            # sumexp==0 (all masked), divide by 1 to get 0 and avoid nan
+            for h_i, d_i in T.Parallel(H_per_block, D):
+                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
+                    sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
+                )
+            # sumexp==0 (all masked), use large negative so combine ignores this split
+            for h_i in T.Parallel(H_per_block):
+                sumexp[h_i] = T.if_then_else(
+                    sumexp[h_i] == 0.0,
+                    -(2**30),
+                    T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
+                )
+
+            T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :])
+            T.copy(sumexp, Partial_Lse[b_i, s_i, group_i, H0:H1])
+
+    return main
+
+
+@tilelang.jit(
+    out_idx=[-1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_mla_fwd_decode_combine(
+    heads,
+    dim,
+    topk,
+    head_per_block,
+    *,
+    block_I=64,
+    threads=256,
+):
+    """
+    grid: (seq_len * REPLICATE_H). batch=1, kv_group=1.
+    Each block does one tile of heads (e.g. 4 or 8 for decode).
+    """
+
+    assert heads % head_per_block == 0, f"head_per_block must divide heads"
+
+    batch = 1
+    seq_len = T.dynamic("seq_len")
+
+    NI = topk // block_I
+    H_per_block = head_per_block
+    REPLICATE_H = heads // H_per_block
+
+    partial_o_shape = [batch, seq_len, NI, heads, dim]
+    partial_lse_shape = [batch, seq_len, NI, heads]
+    o_shape = [batch, seq_len, heads, dim]
+    dtype = T.bfloat16
+    accum_dtype = T.float32
+
+    @T.prim_func
+    def main(
+        Partial_O: T.Tensor(partial_o_shape, dtype),
+        Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
+        Output: T.Tensor(o_shape, dtype),
+    ):
+        with T.Kernel(seq_len * REPLICATE_H, threads=threads) as (bx,):
+            shared_lse = T.alloc_shared([NI, H_per_block], accum_dtype)
+
+            lse_max = T.alloc_fragment([H_per_block], accum_dtype)
+            lse_sum = T.alloc_fragment([H_per_block], accum_dtype)
+            scale = T.alloc_fragment([H_per_block, NI], accum_dtype)
+            acc_o = T.alloc_fragment([H_per_block, dim], accum_dtype)
+
+            b_i = 0
+            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
+            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
+            H1 = H0 + H_per_block
+
+            for k in T.serial(NI):
+                T.copy(Partial_Lse[b_i, s_i, k, H0:H1], shared_lse[k, :])
+
+            T.fill(lse_max, -(2**30))
+            for k in T.serial(NI):
+                for h_i in T.Parallel(H_per_block):
+                    lse_max[h_i] = T.max(lse_max[h_i], shared_lse[k, h_i])
+            T.fill(lse_sum, 0)
+            for k in T.serial(NI):
+                for h_i in T.Parallel(H_per_block):
+                    lse_sum[h_i] = lse_sum[h_i] + T.exp2(
+                        shared_lse[k, h_i] - lse_max[h_i]
+                    )
+            for k in T.serial(NI):
+                for h_i in T.Parallel(H_per_block):
+                    scale[h_i, k] = T.exp2(
+                        shared_lse[k, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i])
+                    )
+
+            T.fill(acc_o, 0)
+            for k in T.serial(NI):
+                for h_i, d_i in T.Parallel(H_per_block, dim):
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k] * Partial_O[
+                        b_i, s_i, k, H0 + h_i, d_i
+                    ].astype(accum_dtype)
+
+            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+
+    return main
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -776,12 +1050,63 @@ def tilelang_sparse_fwd(
     tail_dim = dim - d_v
     topk = indices.shape[-1]
     assert topk == 2048
+
     if _is_hip:
-        kernel = sparse_attention_fwd_kernel_v1(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
+        # sparse_mla_fwd_decode_partial splits topk KV blocks into N_GROUPS
+        # independent tiles per query, then sparse_mla_fwd_decode_combine
+        # reduces them via online softmax.
+
+        if _is_gfx95_supported:
+            # gfx950
+            block_I, threads = 64, 256
+            block_per_cu = 2
+        else:
+            # gfx942
+            block_I, threads = 32, 128
+            block_per_cu = 1
+
+        NI = topk // block_I
+        CU = 304
+
+        def _inner_iter(seq: int) -> int:
+            """Largest inner_iter ≤ NI that keeps grid/CU ≥ block_per_cu."""
+            max_it = int(seq * NI / (CU * block_per_cu))
+            it = NI
+            while it >= 2:
+                if it <= max_it and NI % it == 0:
+                    return it
+                it //= 2
+            return 1
+
+        inner_iter = _inner_iter(q.shape[0])
+        n_groups = NI // inner_iter
+
+        kernel_partial = sparse_mla_fwd_decode_partial(
+            num_heads,
+            d_v,
+            tail_dim,
+            topk,
+            sm_scale=sm_scale,
+            block_I=block_I,
+            inner_iter=inner_iter,
+            num_stages=1,
+            threads=threads,
         )
+        kernel_combine = sparse_mla_fwd_decode_combine(
+            num_heads,
+            d_v,
+            n_groups * block_I,
+            head_per_block=4,
+            block_I=block_I,
+            threads=threads,
+        )
+        partial_o, partial_lse = kernel_partial(
+            q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+        )
+        out = kernel_combine(partial_o, partial_lse)
     else:
         kernel = sparse_attention_fwd_kernel_v2(
             num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
         )
-    return kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
+        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
+    return out

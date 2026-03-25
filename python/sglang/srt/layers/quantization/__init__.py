@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
+    ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
@@ -52,10 +53,12 @@ if TYPE_CHECKING:
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
+    "mxfp8": Fp8Config,
     "blockwise_int8": BlockInt8Config,
     "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
     "modelopt_fp8": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
+    "modelopt_mixed": ModelOptMixedPrecisionConfig,
     "w8a8_int8": W8A8Int8Config,
     "w8a8_fp8": W8A8Fp8Config,
     "awq": AWQConfig,

@@ -5,6 +5,7 @@ This stage extends LatentPreparationStage to handle device mismatch issues
 that occur when tensors are pickled and unpickled via broadcast_pyobj in
 multi-GPU scenarios.
 """
+
 import dataclasses
 
 import torch
@@ -106,17 +107,8 @@ class ComfyUILatentPreparationStage(LatentPreparationStage):
         result = super().forward(batch, server_args)
 
         if original_latents_shape is not None:
-            current_shape = result.latents.shape if result.latents is not None else None
-            if (
-                current_shape is not None
-                and len(current_shape) == 3
-                and len(original_latents_shape) == 4
-            ):
-                # Keep original shape for raw_latent_shape
-                result.raw_latent_shape = original_latents_shape
-            elif current_shape is not None and current_shape == original_latents_shape:
-                result.raw_latent_shape = current_shape
-            else:
-                result.raw_latent_shape = original_latents_shape
+            # Preserve the original shape before any potential packing/conversion
+            # (e.g., 4D spatial -> 3D sequence) to ensure proper unpadding later.
+            result.raw_latent_shape = original_latents_shape
 
         return result

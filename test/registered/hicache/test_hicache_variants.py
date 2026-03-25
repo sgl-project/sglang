@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=524, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=524, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=524, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")
 """
 Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.bench_serving import get_tokenizer
+from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (

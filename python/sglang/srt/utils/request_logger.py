@@ -29,7 +29,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-WHITELISTED_HEADERS = ["x-smg-routing-key"]
+_DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
+WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
+    h.lower() for h in envs.SGLANG_LOG_REQUEST_HEADERS.get()
+]
 
 
 def _extract_whitelisted_headers(
@@ -117,8 +120,43 @@ class RequestLogger:
             and obj.input_ids is not None
             and tokenizer is not None
         ):
-            decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
+            if obj.input_ids and isinstance(obj.input_ids[0], list):
+                # Prefill node warmup while PD disaggregated.
+                decoded = [
+                    tokenizer.decode(_input_ids, skip_special_tokens=False)
+                    for _input_ids in obj.input_ids
+                ]
+            else:
+                decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
             obj.text = decoded
+
+    def log_openai_received_request(
+        self,
+        obj: Any,
+        request: Optional["fastapi.Request"] = None,
+    ) -> None:
+        """Log the raw OpenAI request payload before request adaptation/tokenization."""
+        max_length, _, _ = self.metadata
+        max_length = max_length if max_length is not None else 2048
+        headers = _extract_whitelisted_headers(request)
+
+        if hasattr(obj, "model_dump"):
+            obj_to_log = obj.model_dump(exclude_none=True)
+        else:
+            obj_to_log = obj
+
+        if self.log_requests_format == "json":
+            log_data = {
+                "obj": _transform_data_for_logging(obj_to_log, max_length=max_length),
+            }
+            if headers:
+                log_data["headers"] = headers
+            log_json(self.targets, "request.received.openai", log_data)
+        else:
+            headers_str = f", headers={headers}" if headers else ""
+            self._log(
+                f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length)}{headers_str}"
+            )
 
     def log_finished_request(
         self,

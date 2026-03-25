@@ -215,12 +215,11 @@ mod pd_routing_unit_tests {
             let app_context = {
                 use std::sync::{Arc, OnceLock};
 
+                use data_connector::{
+                    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+                };
                 use smg::{
                     core::{LoadMonitor, WorkerRegistry},
-                    data_connector::{
-                        MemoryConversationItemStorage, MemoryConversationStorage,
-                        MemoryResponseStorage,
-                    },
                     middleware::TokenBucket,
                     policies::PolicyRegistry,
                 };

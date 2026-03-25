@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=181, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=330, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=181, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
 from types import SimpleNamespace
@@ -28,14 +28,21 @@ class TestLLaDA2Mini(CustomTestCase):
 
         other_args = [
             "--trust-remote-code",
+            "--tp-size",
+            "1",
             "--mem-fraction-static",
             "0.9",
             "--max-running-requests",
-            "1",
+            "4",
             "--attention-backend",
             "flashinfer",
             "--dllm-algorithm",
-            "LowConfidence",  # TODO: Add dLLM configurations
+            "LowConfidence",
+            "--cuda-graph-bs",
+            "1",
+            "2",
+            "3",
+            "4",
         ]
 
         cls.process = popen_launch_server(
@@ -66,7 +73,7 @@ class TestLLaDA2Mini(CustomTestCase):
         if is_in_amd_ci():
             self.assertGreater(metrics["output_throughput"], 80)
         else:
-            self.assertGreater(metrics["output_throughput"], 150)
+            self.assertGreater(metrics["output_throughput"], 350)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)

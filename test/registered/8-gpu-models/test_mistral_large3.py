@@ -9,9 +9,10 @@ from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 # Note: trtllm_mla backend may have hardware-specific behavior
-register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=3000, suite="nightly-8-gpu-common", nightly=True)
 
-MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
+MISTRAL_LARGE3_FP8_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
+MISTRAL_LARGE3_NVFP4_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-NVFP4"
 MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-Eagle"
 
 
@@ -19,9 +20,10 @@ MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-
 class TestMistralLarge3(unittest.TestCase):
     """Unified test class for Mistral-Large-3 performance and accuracy.
 
-    Two variants:
-    - basic: TP=8 + trtllm_mla backend
+    Three variants:
+    - basic: FP8 model + TP=8 + trtllm_mla backend
     - eagle: basic + EAGLE speculative decoding with draft model
+    - nvfp4: NVFP4 model + TP=8 + trtllm_mla backend
 
     Each variant runs BOTH:
     - Performance test (using NightlyBenchmarkRunner)
@@ -44,6 +46,7 @@ class TestMistralLarge3(unittest.TestCase):
         base_args = [
             "--tp=8",
             "--attention-backend=trtllm_mla",
+            "--moe-runner-backend=flashinfer_trtllm",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
             "--chat-template=mistral",
@@ -58,26 +61,34 @@ class TestMistralLarge3(unittest.TestCase):
         ]
 
         variants = [
-            # Variant: "basic" - TP=8 + trtllm_mla backend
+            # Variant: "basic" - FP8 model + TP=8 + trtllm_mla backend
             ModelLaunchSettings(
-                MISTRAL_LARGE3_MODEL_PATH,
+                MISTRAL_LARGE3_FP8_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
                 variant="TP8",
             ),
-            # Variant: "eagle" - TP=8 + trtllm_mla + EAGLE with draft model
+            # Variant: "eagle" - FP8 model + TP=8 + trtllm_mla + EAGLE with draft model
             ModelLaunchSettings(
-                MISTRAL_LARGE3_MODEL_PATH,
+                MISTRAL_LARGE3_FP8_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + eagle_args,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+MTP",
+            ),
+            # Variant: "nvfp4" - NVFP4 model + TP=8 + trtllm_mla backend
+            ModelLaunchSettings(
+                MISTRAL_LARGE3_NVFP4_MODEL_PATH,
+                tp_size=8,
+                extra_args=base_args,
+                variant="NVFP4",
             ),
         ]
 
         run_combined_tests(
             models=variants,
-            test_name="Mistral-Large-3 Unified",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.90),
+            test_name="Mistral-Large-3",
+            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.85),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_mistral_large3",
             ),

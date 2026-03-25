@@ -3,13 +3,13 @@ import tempfile
 from contextlib import nullcontext
 
 import torch
-from packaging import version
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import torch_release
 
-after_2_8_0 = version.parse(torch.__version__) >= version.parse("2.8.0")
+after_2_8_0 = torch_release >= (2, 8)
 
 nccl_allocator_source = """
 
@@ -104,7 +104,17 @@ def get_nccl_mem_pool():
     if _mem_pool is None:
         import torch.utils.cpp_extension
 
-        out_dir = tempfile.gettempdir()
+        out_dir = os.path.join(tempfile.gettempdir(), "symm_allocator")
+        os.makedirs(out_dir, exist_ok=True)
+        # Make sure to clean up leftover pytorch lock files
+        # from previous runs and synchronize across processes
+        # right after
+        try:
+            os.remove(os.path.join(out_dir, "lock"))
+        except FileNotFoundError:
+            pass
+        torch.distributed.barrier()
+
         nccl_allocator_libname = "nccl_allocator"
         torch.utils.cpp_extension.load_inline(
             name=nccl_allocator_libname,

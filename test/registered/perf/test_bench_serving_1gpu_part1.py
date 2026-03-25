@@ -9,7 +9,7 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -19,7 +19,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=1000, suite="stage-b-test-large-1-gpu-performance")
+register_cuda_ci(est_time=1000, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-large-amd")
 
 
 class TestBenchServing1GPUPart1(CustomTestCase):
@@ -240,14 +241,14 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--lora-paths",
-                "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
+                "nvidia/llama-3.1-nemoguard-8b-topic-control",
                 "--max-lora-rank",
                 "256",
             ],
             dataset_name="random",
             random_input_len=256,
             random_output_len=256,
-            lora_name=["Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"],
+            lora_name=["nvidia/llama-3.1-nemoguard-8b-topic-control"],
             background_task=background_task,
         )
 
