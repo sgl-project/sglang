@@ -127,6 +127,26 @@ def _get_orchestrator_ancestors(pids):
 # ---------------------------------------------------------------------------
 
 
+def _check_gpu_memory(gpu_indices):
+    """Check memory usage for target GPUs. Returns list of dirty GPU descriptions."""
+    dirty = []
+    for line in _run_smi("index,memory.used,memory.total"):
+        parts = line.split(",")
+        if len(parts) != 3 or not parts[0].strip().isdigit():
+            continue
+        idx = int(parts[0].strip())
+        if idx not in gpu_indices:
+            continue
+        try:
+            used, total = int(float(parts[1].strip())), int(float(parts[2].strip()))
+        except ValueError:
+            continue
+        pct = used / total * 100 if total > 0 else 0
+        if pct >= MEMORY_THRESHOLD_PCT:
+            dirty.append(f"GPU {idx} ({pct:.0f}%)")
+    return dirty
+
+
 def _log_gpu_memory(gpu_indices):
     """Log memory usage for target GPUs. Returns list of dirty GPU descriptions."""
     dirty = []
@@ -224,21 +244,48 @@ def _ci_mode():
             time.sleep(3)
     _log()
 
-    # Verify
-    _log("After cleanup:")
-    dirty = _log_gpu_memory(gpu_indices)
-    remaining_pids = _get_gpu_pids(gpu_indices)
-    if remaining_pids:
-        _log(f"  Remaining processes ({len(remaining_pids)}):")
-        for pid in sorted(remaining_pids):
-            _log(f"    PID {pid}: {_get_pid_cmdline(pid)}")
-    else:
-        _log("  No processes on target GPUs")
+    # Verify with retry: wait 10s per attempt, up to 100s total
+    max_wait_secs = 100
+    retry_interval = 10
+    elapsed = 0
+    dirty = None
+
+    while True:
+        dirty = _check_gpu_memory(gpu_indices)
+        remaining_pids = _get_gpu_pids(gpu_indices)
+
+        if not dirty:
+            _log(f"Check at {elapsed}s: GPUs clean")
+            break
+
+        # Log summary for this attempt
+        remaining_info = (
+            f", {len(remaining_pids)} processes remaining" if remaining_pids else ""
+        )
+        dirty_summary = ", ".join(dirty)
+        _log(f"Check at {elapsed}s: still dirty [{dirty_summary}]{remaining_info}")
+
+        if elapsed >= max_wait_secs:
+            break
+
+        # Kill remaining processes before waiting
+        if remaining_pids:
+            _kill_pids(remaining_pids, "retry kill")
+
+        print(
+            f"[killall] GPUs still dirty at {elapsed}s [{dirty_summary}], "
+            f"retrying in {retry_interval}s "
+            f"({elapsed + retry_interval}/{max_wait_secs}s)..."
+        )
+        time.sleep(retry_interval)
+        elapsed += retry_interval
 
     if dirty:
         _log()
+        _log("Final GPU memory:")
+        _log_gpu_memory(gpu_indices)
         _log(f"ERROR: memory >={MEMORY_THRESHOLD_PCT}%: {', '.join(dirty)}")
-        _log("Orphaned CUDA contexts — container needs restart.")
+        _log(f"Orphaned CUDA contexts after {elapsed}s — container needs restart.")
         _flush_box(f"killall_sglang: GPUs [{gpu_list}]", status="FAIL — Aborting CI")
         return 1
 
