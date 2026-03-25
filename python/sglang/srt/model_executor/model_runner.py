@@ -367,9 +367,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     draft_model_config.hf_config, "eagle_config", None
                 )
                 if eagle_config is None:
-                    raise ValueError(
-                        "eagle_config not found in draft model config"
-                    )
+                    raise ValueError("eagle_config not found in draft model config")
                 self.eagle_use_aux_hidden_state = eagle_config.get(
                     "use_aux_hidden_state", True
                 )

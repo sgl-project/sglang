@@ -16,7 +16,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 # ---------------------------------------------------------------------------
 # top_k_renorm_prob
 # ---------------------------------------------------------------------------
@@ -242,15 +241,13 @@ def _tree_spec_sampling_kernel(
                     )
                     prob_acc += target_prob
 
-                    accept = (
-                        coin <= prob_acc / capped_threshold_acc
-                    ) | (target_prob >= threshold_single)
+                    accept = (coin <= prob_acc / capped_threshold_acc) | (
+                        target_prob >= threshold_single
+                    )
 
                     if accept:
                         prob_acc = 0.0
-                        cur_prob_offset = ((base + cur_index) * vocab_size).to(
-                            tl.int64
-                        )
+                        cur_prob_offset = ((base + cur_index) * vocab_size).to(tl.int64)
                         coin = tl.load(uniform_samples_ptr + base + cur_index)
                         tl.store(
                             predicts_ptr + last_accepted_idx, draft_token.to(tl.int32)
@@ -269,9 +266,7 @@ def _tree_spec_sampling_kernel(
                             draft_probs_ptr + cur_prob_offset + draft_token,
                             target_prob,
                         )
-                        cur_index = tl.load(
-                            retrive_next_sibling_ptr + base + cur_index
-                        )
+                        cur_index = tl.load(retrive_next_sibling_ptr + base + cur_index)
 
             if step_accepted == 0:
                 tree_done = 1

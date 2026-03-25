@@ -17,7 +17,6 @@ from sglang.srt.speculative.triton_sampling_kernels import (
     tree_speculative_sampling_target_only,
 )
 
-
 # ---------------------------------------------------------------------------
 # PyTorch reference implementations (from bench_renorm.py upstream)
 # ---------------------------------------------------------------------------
@@ -79,9 +78,7 @@ def test_top_k_renorm_prob_scalar():
     probs = probs / probs.sum(dim=-1, keepdim=True)
     out = top_k_renorm_prob(probs, 10)
     sums = out.sum(dim=-1)
-    torch.testing.assert_close(
-        sums, torch.ones(4, device=device), rtol=1e-4, atol=1e-4
-    )
+    torch.testing.assert_close(sums, torch.ones(4, device=device), rtol=1e-4, atol=1e-4)
 
 
 def test_top_k_renorm_prob_k_equals_1():
@@ -124,9 +121,7 @@ def test_top_p_renorm_prob_scalar():
     probs = probs / probs.sum(dim=-1, keepdim=True)
     out = top_p_renorm_prob(probs, 0.9)
     sums = out.sum(dim=-1)
-    torch.testing.assert_close(
-        sums, torch.ones(4, device=device), rtol=1e-4, atol=1e-4
-    )
+    torch.testing.assert_close(sums, torch.ones(4, device=device), rtol=1e-4, atol=1e-4)
 
 
 def test_top_p_renorm_prob_tight():
@@ -216,9 +211,7 @@ def test_tree_speculative_sampling_target_only(
     predict_shape = (len(expected_predicts),)
 
     predicts = torch.full(predict_shape, -1, dtype=torch.int32, device=device)
-    accept_index = torch.full(
-        (bs, num_spec_step), -1, dtype=torch.int32, device=device
-    )
+    accept_index = torch.full((bs, num_spec_step), -1, dtype=torch.int32, device=device)
     accept_token_num = torch.full((bs,), 0, dtype=torch.int32, device=device)
 
     expanded_temperature = temperatures.unsqueeze(1).unsqueeze(1)

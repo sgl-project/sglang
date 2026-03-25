@@ -2927,10 +2927,7 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if (
-            self.speculative_algorithm == "EAGLE"
-            and self.speculative_draft_model_path
-        ):
+        if self.speculative_algorithm == "EAGLE" and self.speculative_draft_model_path:
             from sglang.srt.model_config import ModelConfig
 
             try:
