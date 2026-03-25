@@ -500,7 +500,7 @@ def mean_dim(
         Tensor with mean values along specified dimension
     """
     # Validate inputs
-    assert input.is_cuda or input.is_npu, "Input must be a CUDA tensor or a NPU tensor"
+    assert input.is_cuda, "Input must be a CUDA tensor"
     assert (
         -input.ndim <= dim < input.ndim
     ), f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
@@ -595,7 +595,13 @@ def _npu_log_softmax_batch_invariant(input, dim, _half_to_float):
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
     if len(dim) == 1:
-        return mean_dim(input, dim[0], keepdim=keepdim)
+        return (
+            mean_dim(input, dim[0], keepdim=keepdim)
+            if not _is_npu
+            else torch.ops.batch_invariant_ops.npu_reduce_mean_batch_invariant(
+                input, dim[0], keepdim=keepdim
+            )
+        )
     else:
         assert input.dtype in {
             torch.float16,
@@ -1021,6 +1027,8 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
             _original_torch_bmm = torch.bmm
             torch.bmm = bmm_batch_invariant
     else:
+        import batch_invariant_ops  # noqa: F401
+
         _batch_invariant_LIB.impl(
             "aten::mm", torch.ops.batch_invariant_ops.npu_mm_batch_invariant, "NPU"
         )
@@ -1030,7 +1038,7 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
             "NPU",
         )
         _batch_invariant_LIB.impl(
-            "aten::sum",
+            "aten::sum.dim",
             torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant,
             "NPU",
         )
