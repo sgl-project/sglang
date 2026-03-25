@@ -556,7 +556,7 @@ class SchedulerMetricsMixin:
             self.calculate_utilization()
             self.update_lora_metrics()
             self._log_hicache_stats()
-            self.metrics_collector.log_stats(self.stats)
+            self.metrics_collector.log_stats(self.stats, is_decode_stats=True)
             self._emit_kv_metrics()
         self._publish_kv_events()
 
