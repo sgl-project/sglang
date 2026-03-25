@@ -801,6 +801,7 @@ class MambaRadixCache(BasePrefixCache):
         return mamba_num_evicted
 
     def _evict_full_lru(self, full_num_tokens: int) -> int:
+        """Evict full KV cache. Returns the number of tokens evicted."""
         if self.disable or full_num_tokens <= 0:
             return 0
 
