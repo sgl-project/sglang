@@ -21,6 +21,11 @@ from typing import Optional, Union
 import torch
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.configs import NemotronHConfig
 from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
 from sglang.srt.distributed import (
@@ -61,6 +66,7 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
@@ -68,6 +74,7 @@ from sglang.srt.utils import (
     is_cuda,
     make_layers,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
@@ -213,7 +220,9 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if _is_cuda:
+        # torch.compile cannot trace CUDA streams, so use the non-overlapping
+        # path when inside piecewise CUDA graph compilation.
+        if _is_cuda and not is_in_piecewise_cuda_graph():
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
@@ -390,6 +399,23 @@ class NemotronHMambaDecoderLayer(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
+    def _forward_mamba(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Core Mamba forward logic, called directly or via split op."""
+        output = torch.empty_like(hidden_states)
+        attn_backend = forward_batch.attn_backend
+        assert isinstance(attn_backend, HybridLinearAttnBackend)
+        assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
+        attn_backend.linear_attn_backend.forward(
+            mixer=self.mixer,
+            layer_id=self.layer_id,
+            hidden_states=hidden_states,
+            output=output,
+            use_triton_causal_conv=True,
+        )
+        return output
+
     def forward(
         self,
         *,
@@ -403,18 +429,13 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
-        output = torch.empty_like(hidden_states)
-        attn_backend = forward_batch.attn_backend
-        assert isinstance(attn_backend, HybridLinearAttnBackend)
-        assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
-        attn_backend.linear_attn_backend.forward(
-            mixer=self.mixer,
-            layer_id=self.layer_id,
-            hidden_states=hidden_states,
-            output=output,
-            use_triton_causal_conv=True,  # TODO: investigate need of `use_triton_causal_conv`
-        )
-        return output, residual
+        if is_in_piecewise_cuda_graph():
+            output = torch.empty_like(hidden_states)
+            nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            return output, residual
+        else:
+            output = self._forward_mamba(hidden_states, forward_batch)
+            return output, residual
 
 
 class NemotronHAttention(nn.Module):
@@ -525,12 +546,12 @@ class NemotronHAttentionDecoderLayer(nn.Module):
 
 
 Layers = (
-    NemotronHAttentionDecoderLayer
-    | NemotronHMLPDecoderLayer
-    | NemotronHMambaDecoderLayer
-    | NemotronHMoEDecoderLayer
+    NemotronHAttentionDecoderLayer,
+    NemotronHMLPDecoderLayer,
+    NemotronHMambaDecoderLayer,
+    NemotronHMoEDecoderLayer,
 )
-ALL_DECODER_LAYER_TYPES: dict[str, type[Layers]] = {
+ALL_DECODER_LAYER_TYPES: dict[str, type] = {
     ATTENTION: NemotronHAttentionDecoderLayer,
     MLP: NemotronHMLPDecoderLayer,
     MAMBA: NemotronHMambaDecoderLayer,
@@ -633,7 +654,18 @@ class NemotronHForCausalLM(nn.Module):
     }
 
     remap_prefix = {"backbone": "model"}
-    remap_substr = {"A_log": "A", "embeddings": "embed_tokens"}
+    remap_substr = {
+        "A_log": "A",
+        "embeddings": "embed_tokens",
+        "k_proj.k_scale": "attn.k_scale",
+        "v_proj.v_scale": "attn.v_scale",
+    }
+
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "backbone.": "model.",
+        }
+    )
 
     def __init__(
         self,
@@ -645,6 +677,7 @@ class NemotronHForCausalLM(nn.Module):
         super().__init__()
         lora_config = None
         self.config = config
+        self.quant_config = quant_config
         self.model = self._init_model(
             config=config, quant_config=quant_config, prefix=prefix
         )
@@ -741,12 +774,6 @@ class NemotronHForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> None:
-        updated_weights = []
-        for name, loaded_weight in weights:
-            name = replace_prefix(name, self.remap_prefix)
-            name = replace_substrings(name, self.remap_substr)
-            updated_weights.append((name, loaded_weight))
-
         # - FusedMoe.w1 (aka gate_proj) should be up_proj since that's
         #   what the activation is applied to
         # - FusedMoe.w3 (aka up_proj) should be ignored since we're
@@ -760,7 +787,13 @@ class NemotronHForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
-        for name, loaded_weight in updated_weights:
+        # Stream weights directly from the generator to avoid buffering
+        # the entire checkpoint (~75 GB) into a Python list. On unified-
+        # memory systems (e.g. DGX Spark, 119 GB) the old buffered path
+        # caused OOM: skeleton 81.6 GB + buffer 75 GB = 157 GB peak.
+        for name, loaded_weight in weights:
+            name = replace_prefix(name, self.remap_prefix)
+            name = replace_substrings(name, self.remap_substr)
             if is_mtp:
                 if "mtp" not in name:
                     continue
@@ -776,9 +809,10 @@ class NemotronHForCausalLM(nn.Module):
                 continue
 
             if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
+                if name not in params_dict:
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
 
             layer_id = get_layer_id(name)
             if (
@@ -847,3 +881,35 @@ class NemotronHForCausalLM(nn.Module):
 
 
 EntryClass = [NemotronHForCausalLM]
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def nemotron_mamba2_with_output(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """Split op for Mamba2 forward in piecewise CUDA graph mode."""
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    mamba_layer = attention_layers[layer_id]
+
+    # In piecewise CUDA graph mode, hidden_states may be padded to the
+    # captured graph size. Slice to actual token count for Mamba forward.
+    attn_backend = forward_batch.attn_backend
+    metadata = attn_backend.linear_attn_backend.forward_metadata
+    num_actual_tokens = metadata.num_prefill_tokens + (
+        metadata.num_decodes * metadata.draft_token_num
+        if metadata.is_target_verify
+        else metadata.num_decodes
+    )
+    if hidden_states.shape[0] != num_actual_tokens:
+        hidden_states = hidden_states[:num_actual_tokens]
+
+    ret = mamba_layer._forward_mamba(hidden_states, forward_batch)
+
+    # Copy result back; output may be larger (padded) so only fill actual tokens
+    output[:num_actual_tokens].view(ret.shape).copy_(ret)
+    return

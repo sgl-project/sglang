@@ -22,6 +22,11 @@ class NPUACLFormat(IntEnum):
     ACL_FORMAT_FRACTAL_NZ = 29
 
 
+class FusedMoEMode(IntEnum):
+    FUSED_DEEP_MOE = 1
+    DISPATCH_FFN_COMBINE = 2
+
+
 def _call_once(fn: Callable):
 
     @functools.wraps(fn)
@@ -92,14 +97,6 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     import sgl_kernel_npu  # noqa: F401
-
-    try:
-        import custom_ops  # noqa: F401
-    except ImportError:
-        logger.warning(
-            f"custom_ops not found, dsv3.2 requires this package, which includes the npu_lightning_indexer and npu_sparse_flash_attention operators."
-        )
-
     import torch_npu
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
@@ -131,9 +128,15 @@ def npu_format_cast(
     if envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
         return tensor
 
-    import torch_npu
-
-    return torch_npu.npu_format_cast(tensor, acl_format.value)
+    if tensor.device == torch.device("cpu"):
+        logger.warning_once(
+            "Warning: The conversion from 'ND' to 'NZ' does not work on the CPU. "
+            "Please disable offloading, otherwise the performance will be "
+            "significantly reduced."
+        )
+        return tensor
+    else:
+        return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
 def get_indexer_weight_stream():

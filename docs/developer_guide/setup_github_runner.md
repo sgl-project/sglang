@@ -1,4 +1,4 @@
-# Set Up Self-Hosted Runners for GitHub Action
+# Set Up Self-Hosted Runners for GitHub Actions
 
 ## Add a Runner
 
@@ -12,9 +12,9 @@ docker pull nvidia/cuda:12.9.1-devel-ubuntu22.04
 # Nvidia
 docker run --shm-size 128g -it -v /tmp/huggingface:/hf_home --gpus all nvidia/cuda:12.9.1-devel-ubuntu22.04 /bin/bash
 # AMD
-docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video --shm-size 128g -it -v /tmp/huggingface:/hf_home lmsysorg/sglang:v0.5.0rc1-rocm630 /bin/bash
+docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video --shm-size 128g -it -v /tmp/huggingface:/hf_home lmsysorg/sglang:v0.5.8-rocm700-mi30x /bin/bash
 # AMD just the last 2 GPUs
-docker run --rm --device=/dev/kfd --device=/dev/dri/renderD176 --device=/dev/dri/renderD184 --group-add video --shm-size 128g -it -v /tmp/huggingface:/hf_home lmsysorg/sglang:v0.5.0rc1-rocm630 /bin/bash
+docker run --rm --device=/dev/kfd --device=/dev/dri/renderD176 --device=/dev/dri/renderD184 --group-add video --shm-size 128g -it -v /tmp/huggingface:/hf_home lmsysorg/sglang:v0.5.8-rocm700-mi30x /bin/bash
 ```
 
 ### Step 2: Configure the runner by `config.sh`
@@ -27,11 +27,11 @@ pip install --upgrade pip
 export RUNNER_ALLOW_RUNASROOT=1
 ```
 
-Then follow https://github.com/sgl-project/sglang/settings/actions/runners/new?arch=x64&os=linux to run `config.sh`
+Then follow https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners to run `config.sh`
 
 **Notes**
 - Do not need to specify the runner group
-- Give it a name (e.g., `test-sgl-gpu-0`) and some labels (e.g., `1-gpu-runner`). The labels can be edited later in Github Settings.
+- Give it a name (e.g., `test-sgl-gpu-0`) and some labels (e.g., `1-gpu-h100`). The labels can be edited later in Github Settings.
 - Do not need to change the work folder.
 
 ### Step 3: Run the runner by `run.sh`

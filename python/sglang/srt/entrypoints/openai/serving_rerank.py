@@ -212,9 +212,6 @@ class OpenAIServingRerank(OpenAIServingBase):
         self._yes_token_id, self._no_token_id = _get_yes_no_token_ids(
             tokenizer_manager.tokenizer
         )
-        logger.info(
-            f"Reranker yes/no token IDs: yes={self._yes_token_id}, no={self._no_token_id}"
-        )
 
     # NOTE: /v1/rerank is not an official OpenAI endpoint. This module may be moved
     # to another module in the future.
@@ -379,13 +376,13 @@ class OpenAIServingRerank(OpenAIServingBase):
                 for doc in request.documents
             ]
 
-            probs = await self.tokenizer_manager.score_prompts(
+            result = await self.tokenizer_manager.score_prompts(
                 prompts,
                 label_token_ids=[self._yes_token_id, self._no_token_id],
                 apply_softmax=False,
                 request=raw_request,
             )
-            scores = [_qwen3_rerank_score(p[0], p[1]) for p in probs]
+            scores = [_qwen3_rerank_score(s[0], s[1]) for s in result.scores]
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:

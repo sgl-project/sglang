@@ -28,11 +28,58 @@ pre-commit run --all-files
 
 - **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
 - **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
+- Link checking with lychee is **enforced in CI**. By default, it is not blocking local commits.
+- To run local link checks manually, use: `pre-commit run --hook-stage manual lychee --all-files`.
+
+### Link check guidance (lychee)
+
+- If your PR changes `docs/` or `README.md`, we recommend running local link checks before pushing.
+- Local lychee is optional (CI is the source of truth), but if you want a system installation, see the official project: [lycheeverse/lychee](https://github.com/lycheeverse/lychee).
+- Recommended local commands:
+
+```bash
+# Fast local/offline check (pre-commit config)
+pre-commit run --hook-stage manual lychee --all-files
+
+# CI-like online check (external links over network)
+lychee --config .github/linters/lychee-ci.toml README.md "docs/**/*.md" "docs/**/*.rst" "docs/**/*.ipynb"
+```
 
 ## Run and add unit tests
 
 If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
-SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
+SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework with [pytest](https://docs.pytest.org/) as the test runner.
+
+### Unit tests (no server required)
+
+Unit tests live under [`test/registered/unit/`](https://github.com/sgl-project/sglang/tree/main/test/registered/unit), organized to mirror the `python/sglang/srt/` source tree. These tests validate component logic **without** launching a server or loading real model weights.
+
+**When to add a unit test:** If you modify a file under `python/sglang/srt/`, check whether a corresponding test exists in `test/registered/unit/` and add coverage for your changes. For example:
+
+```
+srt/mem_cache/radix_cache.py   →  unit/mem_cache/test_radix_cache.py
+srt/sampling/sampling_params.py →  unit/sampling/test_sampling_params.py
+```
+
+**Run unit tests locally:**
+
+```bash
+pytest test/registered/unit/ -v                # all unit tests
+pytest test/registered/unit/mem_cache/ -v      # one module
+```
+
+**Run with coverage:**
+
+```bash
+pytest test/registered/unit/ --cov --cov-config=.coveragerc -v
+```
+
+For conventions on CI registration, test structure, and examples, see [`test/registered/unit/README.md`](https://github.com/sgl-project/sglang/tree/main/test/registered/unit/README.md).
+
+### E2E tests (server required)
+
+For tests that require launching a server, refer to [`test/registered/README.md`](https://github.com/sgl-project/sglang/tree/main/test/registered/README.md) for guidance on where to place your test.
+
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
 ## Write documentations
@@ -57,8 +104,8 @@ Also, do not rely on the "Latency/Output throughput" from this script, as it is 
 
 GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
 You can find additional accuracy eval examples in:
-- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_eval_accuracy_large.py)
-- [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_gpt_oss_1gpu.py)
+- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/registered/eval/test_eval_accuracy_large.py)
+- [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/registered/core/test_gpt_oss_1gpu.py)
 
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
@@ -73,6 +120,8 @@ Then your PR can be merged.
 We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
 Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
 
+**PR authors** can always use `/rerun-failed-ci` on their own PRs, even if they are not listed in `CI_PERMISSIONS.json`.
+
 For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
 - `/tag-run-ci-label`: Adds the "run-ci" label. Every future commit will trigger CI.
@@ -86,7 +135,7 @@ To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also t
 
 Example of rerunning a single test stage: `/rerun-stage unit-test-backend-4-gpu`.
 
-If you don’t have permission, please ask maintainers to trigger CI for you.
+If you don’t have permission and you’re not the PR author, please ask maintainers to trigger CI for you.
 
 ### CI rate limits
 
@@ -123,17 +172,17 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
   - If you write multiple if/else blocks for new features, ensure the common path (e.g., NVIDIA hardware or the existing code path) is the first branch.
 
 ## How to update sgl-kernel
-Since sglang and sgl-kernel are separate Python packages, our current GitHub CI infrastructure does not support updating a kernel and using it immediately within the same pull request (PR).
-To add a new kernel or modify an existing one in the sgl-kernel package, you must use multiple PRs.
+Since sglang and the `sglang-kernel` (prior `sgl-kernel`) distribution are separate Python packages, our current GitHub CI infrastructure does not support updating a kernel and using it immediately within the same pull request (PR).
+To add a new kernel or modify an existing one in the `sgl-kernel/` source tree, you must use multiple PRs.
 
 Follow these steps:
 
 1. Submit a PR to update the sgl-kernel source code without using it in sglang python package (e.g., [#8884](https://github.com/sgl-project/sglang/pull/8884/files)).
-2. Bump the version of sgl-kernel (e.g., [#9220](https://github.com/sgl-project/sglang/pull/9220/files)).
-   - Once merged, this will trigger an automatic release of the sgl-kernel wheel to PyPI.
+2. Bump the version of the kernel package (e.g., [#9220](https://github.com/sgl-project/sglang/pull/9220/files)).
+   - Once merged, this will trigger an automatic release of the `sglang-kernel` wheel to PyPI.
    - If not urgent, you can wait for other people to release the wheel. A new version will typically be released within one week.
 3. Apply the changes:
-   - Update the sgl-kernel version in `sglang/python/pyproject.toml` to use the modified kernels.
+   - Update the `sglang-kernel` version in `sglang/python/pyproject.toml` to use the modified kernels.
    - Update the related caller code in the sglang to use the new kernel.
 
 ## Tips for newcomers

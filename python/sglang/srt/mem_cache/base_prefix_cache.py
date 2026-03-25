@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import time
 from abc import ABC, abstractmethod
 from typing import (
@@ -16,10 +17,11 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.metrics.collector import RadixCacheMetricsCollector
+from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.radix_cache import RadixKey
 
 
 @runtime_checkable
@@ -28,6 +30,94 @@ class PrefixCacheTrait(Protocol):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
     disable: bool
+
+
+@dataclasses.dataclass
+class MatchPrefixParams:
+    """Unified parameters for match_prefix across different cache types"""
+
+    key: RadixKey
+
+    # Mamba specific
+    cow_mamba: bool = False
+    req: Optional[Req] = None
+
+
+@dataclasses.dataclass
+class InsertParams:
+    """Unified parameters for insert across different cache types"""
+
+    key: RadixKey
+    value: Optional[torch.Tensor] = None
+
+    # Mamba specific
+    mamba_value: Optional[torch.Tensor] = None
+
+    # SWA specific
+    prev_prefix_len: int = 0
+    swa_evicted_seqlen: int = 0
+
+    # General
+    chunked: bool = False
+    priority: int = 0
+
+
+@dataclasses.dataclass
+class InsertResult:
+    """Result of an insert operation"""
+
+    prefix_len: int
+    mamba_exist: bool = False
+
+
+@dataclasses.dataclass
+class EvictParams:
+    """Unified parameters for evict across different cache types"""
+
+    num_tokens: int
+    swa_num_tokens: int = 0
+    mamba_num: int = 0
+
+
+@dataclasses.dataclass
+class EvictResult:
+    """Result of an evict operation"""
+
+    num_tokens_evicted: int = 0
+    swa_num_tokens_evicted: int = 0
+    mamba_num_evicted: int = 0
+
+
+@dataclasses.dataclass
+class IncLockRefResult:
+    """Result of an inc_lock_ref operation."""
+
+    delta: Optional[int] = None
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefParams:
+    """Parameters for dec_lock_ref operation."""
+
+    swa_uuid_for_lock: Optional[int] = None
+
+
+@dataclasses.dataclass
+class DecLockRefResult:
+    """Result of an dec_lock_ref operation."""
+
+    delta: Optional[int] = None
+
+
+@dataclasses.dataclass
+class InitLoadBackParams:
+    """Unified parameters for init_load_back across different cache types"""
+
+    last_host_node: Any
+    host_hit_length: int
+    mem_quota: Optional[int] = None
+    req: Optional[Req] = None
 
 
 class MatchResult(NamedTuple):
@@ -39,7 +129,10 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
-        host_hit_length :   Length of the KV cache hit on the host, if applicable.
+        host_hit_length :   Length of the host cache hit. For pure-KV caches this is the
+                            number of evicted KV tokens on CPU. For hybrid Mamba models this
+                            is max(kv_host_tokens, 1-if-mamba-on-host) so that a mamba-only
+                            host hit still triggers load-back without adding a separate field.
                             0 if HiCache is not enabled.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
@@ -51,6 +144,7 @@ class MatchResult(NamedTuple):
     last_host_node: Any
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
+    cache_protected_len: Optional[int] = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
@@ -61,9 +155,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     )
 
     def init_metrics_collector(self):
-        self.metrics_collector = RadixCacheMetricsCollector(
-            labels={"cache_type": self.__class__.__name__}
-        )
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        labels = {"cache_type": self.__class__.__name__}
+        if server_args.extra_metric_labels:
+            labels.update(server_args.extra_metric_labels)
+        self.metrics_collector = RadixCacheMetricsCollector(labels=labels)
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:
@@ -77,7 +175,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def match_prefix(self, key: Any, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
 
     @abstractmethod
@@ -89,15 +187,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def evict(self, num_tokens: int):
+    def evict(self, params: EvictParams) -> EvictResult:
         pass
 
     @abstractmethod
-    def inc_lock_ref(self, node: Any):
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
 
     @abstractmethod
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+    def dec_lock_ref(
+        self, node: Any, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         pass
 
     def evictable_size(self):
@@ -126,8 +226,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_load_back(
         self,
-        last_host_node: Any,
-        host_hit_length: int,
+        params: InitLoadBackParams,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Preparing KV cache loading from host to device.
@@ -140,6 +239,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def flush_write_through_acks(self) -> None:
+        """Release lock_ref on radix-tree nodes whose write-through has completed.
+
+        Lightweight operation that only processes finished write acks.
+        No-op for caches without hierarchical write-through support.
+        """
+        pass
+
     def check_hicache_events(self) -> Any:
         """
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed
@@ -148,3 +255,20 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def take_events(self):
         return []
+
+    def supports_swa(self) -> bool:
+        return False
+
+    def supports_mamba(self) -> bool:
+        return False
+
+    def is_chunk_cache(self) -> bool:
+        return False
+
+    def is_tree_cache(self) -> bool:
+        return not self.is_chunk_cache()
+
+    def available_and_evictable_str(self) -> str:
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        evictable_size = self.evictable_size()
+        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

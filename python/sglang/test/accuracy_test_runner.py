@@ -26,6 +26,8 @@ class AccuracyTestParams:
     # Extended parameters for special evaluations (e.g., GPQA with thinking mode)
     thinking_mode: Optional[str] = None  # e.g., "deepseek-v3"
     temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
     repeat: Optional[int] = None
 
 
@@ -40,6 +42,7 @@ class AccuracyTestResult:
     baseline_accuracy: float
     error: Optional[str]
     latency: Optional[float] = None
+    variant: Optional[str] = None
 
 
 def write_accuracy_github_summary(
@@ -54,16 +57,18 @@ def write_accuracy_github_summary(
         dataset: Dataset name used for evaluation
         results: List of AccuracyTestResult objects
     """
-    summary = f"## {test_name} - Accuracy ({dataset})\n"
-    summary += "| model | status | score | baseline | error |\n"
-    summary += "| ----- | ------ | ----- | -------- | ----- |\n"
+    summary = f"#### {test_name} - Accuracy ({dataset})\n"
+    summary += "| config | status | score | baseline | error |\n"
+    summary += "| ------ | ------ | ----- | -------- | ----- |\n"
 
     for result in results:
         status_emoji = "✅" if result.passed else "❌"
         score_str = f"{result.score:.4f}" if result.score is not None else "N/A"
         baseline_str = f"{result.baseline_accuracy:.4f}"
         error_str = result.error if result.error else "-"
-        summary += f"| {result.model} | {status_emoji} | {score_str} | {baseline_str} | {error_str} |\n"
+        # Use variant name if available, otherwise use model path
+        config_name = result.variant if result.variant else result.model
+        summary += f"| {config_name} | {status_emoji} | {score_str} | {baseline_str} | {error_str} |\n"
 
     write_github_step_summary(summary)
 
@@ -78,6 +83,8 @@ def _run_simple_eval(
     return_latency: bool = False,
     thinking_mode: Optional[str] = None,
     temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
     repeat: Optional[int] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
@@ -92,6 +99,7 @@ def _run_simple_eval(
             base_url,
             other_args=model.extra_args,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=model.env,
         )
 
         args = SimpleNamespace(
@@ -113,6 +121,12 @@ def _run_simple_eval(
 
         if temperature is not None:
             args.temperature = temperature
+
+        if top_p is not None:
+            args.top_p = top_p
+
+        if top_k is not None:
+            args.top_k = top_k
 
         if repeat is not None:
             args.repeat = repeat
@@ -157,6 +171,7 @@ def _run_few_shot_eval(
             base_url,
             other_args=model.extra_args,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=model.env,
         )
 
         args = SimpleNamespace(
@@ -209,7 +224,13 @@ def run_accuracy_test(
     print(f"{'='*60}\n")
 
     # Run evaluation based on dataset type
-    if params.dataset == "gsm8k":
+    # Use few_shot_eval for gsm8k by default for backward compatibility.
+    # Use simple_eval when any extended params are set that few_shot_eval doesn't support.
+    has_extended_params = any(
+        getattr(params, field) is not None
+        for field in ("thinking_mode", "temperature", "top_p", "top_k", "repeat")
+    )
+    if params.dataset == "gsm8k" and not has_extended_params:
         success, error, metrics = _run_few_shot_eval(
             model=model,
             base_url=base_url,
@@ -227,6 +248,8 @@ def run_accuracy_test(
             return_latency=params.return_latency,
             thinking_mode=params.thinking_mode,
             temperature=params.temperature,
+            top_p=params.top_p,
+            top_k=params.top_k,
             repeat=params.repeat,
         )
 
@@ -239,6 +262,7 @@ def run_accuracy_test(
             score=None,
             baseline_accuracy=params.baseline_accuracy,
             error=error,
+            variant=model.variant,
         )
 
     # Validate against baseline
@@ -265,4 +289,5 @@ def run_accuracy_test(
         baseline_accuracy=params.baseline_accuracy,
         error=error if not passed else None,
         latency=latency,
+        variant=model.variant,
     )

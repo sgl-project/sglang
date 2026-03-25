@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only HunYuan model compatible with HuggingFace weights."""
+
 import re
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -401,8 +402,8 @@ class HunYuanDecoderLayer(nn.Module):
             if isinstance(config.intermediate_size, int)
             else config.intermediate_size[layer_id]
         )
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):

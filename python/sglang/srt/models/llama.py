@@ -221,7 +221,11 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if not _is_npu or not hasattr(self.rotary_emb, "get_cos_sin_with_position"):
+        if (
+            not _is_npu
+            or not hasattr(self.rotary_emb, "get_cos_sin_with_position")
+            or forward_batch.forward_mode.is_extend()
+        ):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -248,8 +252,8 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):

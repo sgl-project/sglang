@@ -8,7 +8,7 @@ import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.petit_utils import (
     prepare_nvfp4_layer_for_petit,
     verify_petit_nvfp4_supported,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_hip
 

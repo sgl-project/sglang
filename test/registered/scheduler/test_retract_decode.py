@@ -17,9 +17,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=311, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=400, suite="stage-b-test-small-1-gpu-5090")
-register_amd_ci(est_time=450, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=311, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestRetractDecode(CustomTestCase):

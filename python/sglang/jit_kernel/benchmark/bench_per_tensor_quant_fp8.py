@@ -1,11 +1,14 @@
-import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.testing
 
+from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 try:
     from vllm import _custom_ops as ops
@@ -21,11 +24,6 @@ try:
     _is_hip = is_hip()
 except ImportError:
     _is_hip = False
-
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
 
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
@@ -72,11 +70,11 @@ def calculate_diff(batch_size: int, seq_len: int):
     triton.testing.assert_close(vllm_scale, sglang_scale, rtol=1e-3, atol=1e-3)
 
 
-if IS_CI:
-    element_range = [16384]
-else:
-    element_range = [2**n for n in range(10, 20)]
-
+# Benchmark configuration
+element_range = get_benchmark_range(
+    full_range=[2**n for n in range(10, 20)],
+    ci_range=[16384],
+)
 
 if VLLM_AVAILABLE:
     line_vals = ["vllm", "sglang"]
@@ -107,8 +105,6 @@ def benchmark(element_count, provider):
 
     x = torch.randn(element_count, 4096, device=device, dtype=dtype)
 
-    quantiles = [0.5, 0.2, 0.8]
-
     if provider == "vllm":
         fn = lambda: vllm_scaled_fp8_quant(x.clone())
     elif provider == "sglang":
@@ -116,9 +112,7 @@ def benchmark(element_count, provider):
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":

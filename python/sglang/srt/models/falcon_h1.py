@@ -133,9 +133,9 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        self.rope_theta = config.rope_parameters["rope_theta"]
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.rope_scaling = config.rope_parameters
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
         self.layer_id = layer_id
 
@@ -394,7 +394,7 @@ class FalconH1Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
 
         def get_layer(idx: int, prefix: str):
