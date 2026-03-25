@@ -27,55 +27,22 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 
 ## Start Here
 
-### Getting Started
+- [Installation](installation.md): install SGLang Diffusion and platform dependencies
+- [Compatibility Matrix](compatibility_matrix.md): check model and optimization support
+- [CLI](api/cli.md): run one-off generation jobs or launch a persistent server
+- [OpenAI-Compatible API](api/openai_api.md): send image and video requests to the HTTP server
+- [Attention Backends](performance/attention_backends.md): choose the best backend for your model and hardware
+- [Caching Acceleration](performance/cache/index.md): use Cache-DiT or TeaCache to reduce denoising cost
+- [Quantization](quantization.md): load quantized transformer checkpoints
+- [Contributing](contributing.md): contribution workflow, adding new models, and CI perf baselines
 
-- **[Installation](installation.md)** - Install SGLang Diffusion via pip, uv, Docker, or from source
-- **[Compatibility Matrix](compatibility_matrix.md)** - Supported models and optimization compatibility
+## Additional Documentation
 
-### Usage
-
-- **[CLI Documentation](api/cli.md)** - Command-line interface for `sglang generate` and `sglang serve`
-- **[Quantization](quantization.md)** - Quantized transformer checkpoint usage and supported quantization families
-- **[OpenAI API](api/openai_api.md)** - OpenAI-compatible API for image/video generation and LoRA management
-- **[Post-Processing](api/post_processing.md)** - Frame interpolation (RIFE) and upscaling (Real-ESRGAN)
-
-### Performance Optimization
-
-- **[Performance Overview](performance/index.md)** - Overview of all performance optimization strategies
-- **[Attention Backends](performance/attention_backends.md)** - Available attention backends (FlashAttention, SageAttention, etc.)
-- **[Caching Strategies](performance/cache/)** - Cache-DiT and TeaCache acceleration
-- **[Profiling](performance/profiling.md)** - Profiling techniques with PyTorch Profiler and Nsight Systems
-
-### Reference
-
-- **[Environment Variables](environment_variables.md)** - Configuration via environment variables
-- **[Support New Models](support_new_models.md)** - Guide for adding new diffusion models
-- **[Contributing](contributing.md)** - Contribution guidelines and commit message conventions
-- **[CI Performance](ci_perf.md)** - Performance baseline generation script
-
----
-
-## CLI Quick Reference
-
-### Generate (one-off generation)
-
-```bash
-sglang generate --model-path <MODEL> --prompt "<PROMPT>" --save-output
-```
-
-### Serve (HTTP server)
-
-```bash
-sglang serve --model-path <MODEL> --port 30010
-```
-
-### Enable Cache-DiT acceleration
-
-```bash
-SGLANG_CACHE_DIT_ENABLED=true sglang generate --model-path <MODEL> --prompt "<PROMPT>"
-```
-
----
+- [Post-Processing](api/post_processing.md): frame interpolation and upscaling
+- [Performance Overview](performance/index.md): overview of attention, caching, and profiling
+- [Environment Variables](environment_variables.md): platform, caching, storage, and debugging configuration
+- [Support New Models](support_new_models.md): implementation guide for new diffusion pipelines
+- [CI Performance](ci_perf.md): performance baseline generation
 
 ## References
 
