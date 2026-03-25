@@ -128,8 +128,14 @@ class WeightChecker:
 
     def _model_state(self):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
-        yield from self._model_runner.model.named_parameters()
-        yield from self._model_runner.model.named_buffers()
+        model = self._model_runner.model
+        module_state = dict(model.named_modules())
+        yield from model.named_parameters()
+        for name, buffer in model.named_buffers():
+            module_name, _, local_name = name.rpartition(".")
+            if local_name in module_state[module_name]._non_persistent_buffers_set:
+                continue
+            yield name, buffer
 
 
 def _compute_hash(t: torch.Tensor) -> str:
