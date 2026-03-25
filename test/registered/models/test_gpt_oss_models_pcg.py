@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=400,
-    suite="stage-b-test-large-2-gpu",
+    suite="stage-b-test-2-gpu-large",
 )
 
 GPT_OSS_MODEL = "openai/gpt-oss-120b"

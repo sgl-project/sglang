@@ -22,13 +22,20 @@ from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
-    get_metadata_from_safetensors_file,
-    get_quant_config,
-    get_quant_config_from_safetensors_metadata,
     maybe_download_model,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    build_nvfp4_config_from_safetensors_list,
+    get_metadata_from_safetensors_file,
+    get_quant_config,
+    get_quant_config_from_safetensors_metadata,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 logger = init_logger(__name__)
 
@@ -75,9 +82,10 @@ class TransformerLoader(ComponentLoader):
         hf_config: Dict[str, List[str]],
         server_args: ServerArgs,
         safetensors_list: list[str],
-    ) -> Optional[dict]:
-        # priority: model config.json → safetensors metadata → nunchaku config
-        quant_config = get_quant_config(hf_config)
+        component_model_path: str,
+    ) -> Optional[QuantizationConfig]:
+        # priority: model config.json → safetensors metadata → quantization config (nvfp4, nunchaku, ...)
+        quant_config = get_quant_config(hf_config, component_model_path)
         if quant_config is None and server_args.transformer_weights_path:
             # try to read quantization_config from the safetensors metadata header
             for safetensors_file in safetensors_list:
@@ -85,7 +93,18 @@ class TransformerLoader(ComponentLoader):
                     safetensors_file
                 )
                 if quant_config:
-                    break
+                    return quant_config
+
+            # fallback: handle nvfp4 per-layer format metadata
+            # ({"format_version": ..., "layers": {"name": {"format": "nvfp4"}, ...}})
+            param_names_mapping_dict = (
+                server_args.pipeline_config.dit_config.arch_config.param_names_mapping
+            )
+            quant_config = build_nvfp4_config_from_safetensors_list(
+                safetensors_list, param_names_mapping_dict
+            )
+            if quant_config:
+                return quant_config
         return quant_config
 
     def _resolve_target_param_dtype(
@@ -129,7 +148,10 @@ class TransformerLoader(ComponentLoader):
         safetensors_list = self.get_list_of_safetensors_to_load(
             server_args, component_model_path
         )
-        quant_config = self._resolve_quant_config(config, server_args, safetensors_list)
+
+        quant_config = self._resolve_quant_config(
+            config, server_args, safetensors_list, component_model_path
+        )
 
         # 3. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config

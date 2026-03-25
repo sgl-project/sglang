@@ -51,7 +51,7 @@ def cuda_platform_plugin() -> str | None:
         if cuda_is_jetson():
             is_cuda = True
     if is_cuda:
-        logger.info("CUDA is available")
+        logger.debug("CUDA is available")
 
     return (
         "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform" if is_cuda else None
@@ -67,9 +67,9 @@ def mps_platform_plugin() -> str | None:
 
         if torch.backends.mps.is_available():
             is_mps = True
-            logger.info("MPS (Metal Performance Shaders) is available")
+            logger.debug("MPS (Metal Performance Shaders) is available")
     except Exception as e:
-        logger.info("MPS detection failed: %s", e)
+        logger.debug("MPS detection failed: %s", e)
 
     return "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform" if is_mps else None
 
@@ -90,11 +90,11 @@ def rocm_platform_plugin() -> str | None:
         try:
             if len(amdsmi.amdsmi_get_processor_handles()) > 0:
                 is_rocm = True
-                logger.info("ROCm platform is available")
+                logger.debug("ROCm platform is available")
         finally:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
-        logger.info("ROCm platform is unavailable: %s", e)
+        logger.debug("ROCm platform is unavailable: %s", e)
 
     return (
         "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform" if is_rocm else None
@@ -109,9 +109,9 @@ def npu_platform_plugin() -> str | None:
 
         if torch.npu.is_available():
             is_npu = True
-            logger.info("NPU is available")
+            logger.debug("NPU is available")
     except Exception as e:
-        logger.info("NPU detection failed: %s", e)
+        logger.debug("NPU detection failed: %s", e)
     return (
         "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase"
         if is_npu
@@ -131,7 +131,7 @@ def musa_platform_plugin() -> str | None:
         finally:
             pymtml.mtmlLibraryShutDown()
     except Exception as e:
-        logger.info("MUSA platform is unavailable: %s", e)
+        logger.debug("MUSA platform is unavailable: %s", e)
 
     return (
         "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform" if is_musa else None

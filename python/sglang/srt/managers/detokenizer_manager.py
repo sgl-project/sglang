@@ -39,10 +39,10 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
     freeze_gc,
-    get_zmq_socket,
     kill_itself_when_parent_died,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,

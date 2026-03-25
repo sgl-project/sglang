@@ -162,7 +162,7 @@ class ScaleResidualNormScaleShift:
         @cute.jit
         def copy_if(src, dst):
             if cutlass.const_expr(
-                isinstance(src, cute.Tensor) and isinstance(src, cute.Tensor)
+                isinstance(src, cute.Tensor) and isinstance(dst, cute.Tensor)
             ):
                 cute.autovec_copy(src, dst)  # LDG.128
 

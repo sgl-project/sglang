@@ -737,6 +737,28 @@ VALIDATOR_REGISTRY = {
 }
 
 
+def _extract_async_job_error_message(job: Any) -> str | None:
+    error = getattr(job, "error", None)
+    if error is None and isinstance(job, dict):
+        error = job.get("error")
+
+    if error is None:
+        return None
+
+    if isinstance(error, dict):
+        for key in ("message", "detail", "error"):
+            value = error.get(key)
+            if value:
+                return str(value)
+        return str(error)
+
+    message = getattr(error, "message", None)
+    if message:
+        return str(message)
+
+    return str(error)
+
+
 def get_generate_fn(
     model_path: str,
     modality: str,
@@ -796,10 +818,24 @@ def get_generate_fn(
         while True:
             page = client.videos.list()  # type: ignore[attr-defined]
             item = next((v for v in page.data if v.id == video_id), None)
+            status = getattr(item, "status", None) if item is not None else None
 
-            if item and getattr(item, "status", None) == "completed":
+            if status == "completed":
                 job_completed = True
                 break
+
+            if status == "failed":
+                error_message = (
+                    _extract_async_job_error_message(item) or "unknown error"
+                )
+                pytest.fail(
+                    f"{case_id}: video job {video_id} failed early: {error_message}"
+                )
+
+            if status in {"cancelled", "deleted"}:
+                pytest.fail(
+                    f"{case_id}: video job {video_id} ended with status={status}"
+                )
 
             if time.time() > deadline:
                 break
@@ -837,6 +873,15 @@ def get_generate_fn(
 
         # Validate output file
         expected_width, expected_height = parse_dimensions(size)
+        if (
+            extra_body is not None
+            and extra_body.get("enable_upscaling")
+            and expected_width
+            and expected_height
+        ):
+            scale = extra_body.get("upscaling_scale", 4)
+            expected_width *= scale
+            expected_height *= scale
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
@@ -871,9 +916,7 @@ def get_generate_fn(
         req_background = None  # Not specified in current request
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
 
         response = client.images.with_raw_response.generate(
             model=model_path,
@@ -898,6 +941,13 @@ def get_generate_fn(
 
         # Validate output file
         expected_width, expected_height = parse_dimensions(output_size)
+        if (
+            sampling_params.extras.get("enable_upscaling")
+            and expected_width
+            and expected_height
+        ):
+            expected_width *= sampling_params.extras.get("upscaling_scale", 4)
+            expected_height *= sampling_params.extras.get("upscaling_scale", 4)
         validate_image_file(
             tmp_path,
             expected_filename,
@@ -932,8 +982,9 @@ def get_generate_fn(
             if is_image_url(image_path):
                 new_image_paths.append(download_image_from_url(str(image_path)))
             else:
-                new_image_paths.append(Path(image_path))
-                if not image_path.exists():
+                local_path = Path(image_path)
+                new_image_paths.append(local_path)
+                if not local_path.exists():
                     pytest.skip(f"{case_id}: file missing: {image_path}")
 
         image_paths = new_image_paths
@@ -946,8 +997,7 @@ def get_generate_fn(
 
         # Build extra_body for optional features
         extra_body = {"num_frames": sampling_params.num_frames}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body.update(sampling_params.extras)
 
         images = [open(image_path, "rb") for image_path in image_paths]
         try:
@@ -1075,22 +1125,18 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no text prompt configured")
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
         if sampling_params.num_frames:
             extra_body["num_frames"] = sampling_params.num_frames
-        if sampling_params.enable_frame_interpolation:
-            extra_body["enable_frame_interpolation"] = True
-            extra_body["frame_interpolation_exp"] = (
-                sampling_params.frame_interpolation_exp
-            )
 
         # Compute expected output frame count for validation
         expected_frame_count = None
-        if sampling_params.enable_frame_interpolation and sampling_params.num_frames:
+        if (
+            sampling_params.extras.get("enable_frame_interpolation")
+            and sampling_params.num_frames
+        ):
             n = sampling_params.num_frames
-            exp = sampling_params.frame_interpolation_exp
+            exp = sampling_params.extras.get("frame_interpolation_exp", 1)
             expected_frame_count = (n - 1) * (2**exp) + 1
 
         return _create_and_download_video(
@@ -1117,9 +1163,7 @@ def get_generate_fn(
                 pytest.skip(f"{case_id}: file missing: {image_path}")
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
@@ -1139,8 +1183,7 @@ def get_generate_fn(
 
         # Build extra_body for optional features
         extra_body = {"reference_url": sampling_params.image_path}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body.update(sampling_params.extras)
 
         return _create_and_download_video(
             client,
@@ -1169,9 +1212,7 @@ def get_generate_fn(
                 pytest.skip(f"{case_id}: file missing: {image_path}")
 
         # Build extra_body for optional features
-        extra_body = {}
-        if sampling_params.enable_teacache:
-            extra_body["enable_teacache"] = True
+        extra_body = dict(sampling_params.extras)
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
@@ -1185,6 +1226,7 @@ def get_generate_fn(
                 extra_body={
                     "fps": sampling_params.fps,
                     "num_frames": sampling_params.num_frames,
+                    **extra_body,
                 },
             )
 

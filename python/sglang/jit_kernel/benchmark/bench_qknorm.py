@@ -13,6 +13,9 @@ from sglang.jit_kernel.benchmark.utils import (
 )
 from sglang.jit_kernel.norm import fused_inplace_qknorm
 from sglang.srt.utils import get_current_device_stream_fast
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 alt_stream = torch.cuda.Stream()
 
@@ -91,7 +94,7 @@ HEAD_DIM_RANGE = get_benchmark_range(
     ci_range=[128],
 )
 
-LINE_VALS = ["aot", "jit", "fi", "torch"]
+LINE_VALS = ["aot", "jit", "flashinfer", "torch"]
 LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
 STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
 
@@ -126,7 +129,7 @@ def benchmark(
     FN_MAP = {
         "aot": sglang_aot_qknorm,
         "jit": sglang_jit_qknorm,
-        "fi": flashinfer_qknorm,
+        "flashinfer": flashinfer_qknorm,
         "torch": torch_impl_qknorm,
     }
     fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)
