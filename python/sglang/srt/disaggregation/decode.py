@@ -278,8 +278,6 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[Req] = []
-        # Only allow add() fast path after an address is globally confirmed ready
-        # across all decode TP/CP ranks.
         self._globally_ready_prefill_addrs: set[str] = set()
         self._ensure_retry_count: Dict[str, int] = {}
         self._max_ensure_retries: int = 20  # scheduling cycles
