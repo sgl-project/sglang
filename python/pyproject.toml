@@ -163,6 +163,7 @@ vsa = ["torch", "setuptools"]
 
 [project.scripts]
 sglang = "sglang.cli.main:main"
+killall_sglang = "sglang.cli.killall:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
