@@ -865,14 +865,6 @@ class MambaRadixCache(BasePrefixCache):
             efficiencies
         ), "Candidate and efficiency lengths must match"
 
-        current_time = TreeNode.last_access_time_counter_float
-
-        recencies = []
-        for node in candidates:
-            time_delta = float(current_time - node.last_access_time)
-            recency = 1.0 / (time_delta + 1e-8)
-            recencies.append(recency)
-
         def _normalize(values):
             min_v = min(values)
             max_v = max(values)
@@ -880,24 +872,23 @@ class MambaRadixCache(BasePrefixCache):
                 return [0.5] * len(values)
             return [(v - min_v) / (max_v - min_v) for v in values]
 
+        current_time = TreeNode.last_access_time_counter_float
+        recencies = [
+            1.0 / (float(current_time - node.last_access_time) + 1e-8)
+            for node in candidates
+        ]
         norm_eff = _normalize(efficiencies)
         norm_rec = _normalize(recencies)
-
-        scored = []
-        for i, node in enumerate(candidates):
-            utility = self.seglen_eff_weight * norm_eff[i] + norm_rec[i]
-            scored.append((utility, node))
-
-        scored.sort(key=lambda x: x[0])
-        return [node for _, node in scored]
-
-    def _rank_candidates_seglen(
-        self, candidates: List[TreeNode]
-    ) -> List[TreeNode]:
-        efficiencies = [
-            float(self._get_mamba_recompute_length(node)) for node in candidates
+        scored = [
+            (
+                self.seglen_eff_weight * eff_score + rec_score,
+                node,
+            )
+            for node, eff_score, rec_score in zip(
+                candidates, norm_eff, norm_rec, strict=True
+            )
         ]
-        return self._rank_candidates_with_efficiencies(candidates, efficiencies)
+        return [node for _, node in sorted(scored, key=lambda item: item[0])]
 
     def _evict_mamba_seglen(self, mamba_num: int) -> int:
         """Evict mamba states using replay length from the nearest live anchor."""
@@ -911,7 +902,10 @@ class MambaRadixCache(BasePrefixCache):
         if not candidates:
             return 0
 
-        ranked = self._rank_candidates_seglen(candidates)
+        ranked = self._rank_candidates_with_efficiencies(
+            candidates,
+            [float(self._get_mamba_recompute_length(node)) for node in candidates],
+        )
 
         for x in ranked:
             if mamba_num_evicted >= mamba_num:
@@ -954,7 +948,10 @@ class MambaRadixCache(BasePrefixCache):
         if not candidates:
             return 0
 
-        ranked = self._rank_candidates_seglen(candidates)
+        ranked = self._rank_candidates_with_efficiencies(
+            candidates,
+            [float(self._get_mamba_recompute_length(node)) for node in candidates],
+        )
 
         for x in ranked:
             if full_num_evicted >= full_num_tokens:
