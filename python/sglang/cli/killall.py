@@ -16,6 +16,7 @@ Exit codes:
 """
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -23,6 +24,11 @@ import time
 from pathlib import Path
 
 MEMORY_THRESHOLD_PCT = 10
+
+# Patterns matching SGLang process command lines (equivalent to pgrep -f in killall_sglang.sh)
+_SGLANG_PROCESS_PATTERNS = re.compile(
+    r"sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::"
+)
 
 
 def _run_smi(query, query_type="gpu"):
@@ -48,6 +54,30 @@ def _get_pid_cmdline(pid):
         return cmdline[:120] + ("..." if len(cmdline) > 120 else "")
     except (FileNotFoundError, PermissionError):
         return "<unknown>"
+
+
+def _find_sglang_pids_by_name():
+    """Find SGLang process PIDs by command-line pattern matching.
+
+    Scans /proc/*/cmdline for patterns matching known SGLang entry points.
+    Equivalent to: pgrep -f 'sglang::|sglang.launch_server|...'
+    """
+    my_pid = os.getpid()
+    pids = set()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid <= 1 or pid == my_pid:
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+            cmdline = cmdline.decode("utf-8", errors="replace").replace("\x00", " ")
+        except (FileNotFoundError, PermissionError):
+            continue
+        if _SGLANG_PROCESS_PATTERNS.search(cmdline):
+            pids.add(pid)
+    return pids
 
 
 def _check_pid_namespace(pid):
@@ -160,7 +190,7 @@ def _get_orchestrator_ancestors(pids):
 # ---------------------------------------------------------------------------
 
 
-def _check_gpu_memory(gpu_indices):
+def _check_gpu_memory(gpu_indices, log=False):
     """Check memory usage for target GPUs. Returns list of dirty GPU descriptions."""
     dirty = []
     for line in _run_smi("index,memory.used,memory.total"):
@@ -175,27 +205,8 @@ def _check_gpu_memory(gpu_indices):
         except ValueError:
             continue
         pct = used / total * 100 if total > 0 else 0
-        if pct >= MEMORY_THRESHOLD_PCT:
-            dirty.append(f"GPU {idx} ({pct:.0f}%)")
-    return dirty
-
-
-def _log_gpu_memory(gpu_indices):
-    """Log memory usage for target GPUs. Returns list of dirty GPU descriptions."""
-    dirty = []
-    for line in _run_smi("index,memory.used,memory.total"):
-        parts = line.split(",")
-        if len(parts) != 3 or not parts[0].strip().isdigit():
-            continue
-        idx = int(parts[0].strip())
-        if idx not in gpu_indices:
-            continue
-        try:
-            used, total = int(float(parts[1].strip())), int(float(parts[2].strip()))
-        except ValueError:
-            continue
-        pct = used / total * 100 if total > 0 else 0
-        _log(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
+        if log:
+            _log(f"  GPU {idx}: {used} MiB / {total} MiB ({pct:.0f}%)")
         if pct >= MEMORY_THRESHOLD_PCT:
             dirty.append(f"GPU {idx} ({pct:.0f}%)")
     return dirty
@@ -254,7 +265,7 @@ def _ci_mode():
 
     # Before cleanup
     _log("Before cleanup:")
-    _log_gpu_memory(gpu_indices)
+    _check_gpu_memory(gpu_indices, log=True)
     gpu_pids = _get_gpu_pids(gpu_indices)
     if not gpu_pids:
         _log("  No processes on target GPUs")
@@ -262,6 +273,15 @@ def _ci_mode():
         _log(f"  Processes ({len(gpu_pids)}):")
         for pid in sorted(gpu_pids):
             _log(f"    PID {pid}: {_get_pid_cmdline(pid)}")
+    _log()
+
+    # Kill name-matched SGLang processes (catches processes not visible to nvidia-smi)
+    name_pids = _find_sglang_pids_by_name()
+    if name_pids:
+        name_only = name_pids - gpu_pids
+        if name_only:
+            _kill_pids(name_only, "name-matched SGLang processes")
+            time.sleep(1)
     _log()
 
     # Kill orchestrator ancestors first, then GPU processes (retry once)
@@ -326,7 +346,7 @@ def _ci_mode():
     if dirty:
         _log()
         _log("Final GPU memory:")
-        _log_gpu_memory(gpu_indices)
+        _check_gpu_memory(gpu_indices, log=True)
         _log(f"ERROR: memory >={MEMORY_THRESHOLD_PCT}%: {', '.join(dirty)}")
         _log(f"Orphaned CUDA contexts after {elapsed}s — container needs restart.")
         _flush_box(f"killall_sglang: GPUs [{gpu_list}]", status="FAIL — Aborting CI")
