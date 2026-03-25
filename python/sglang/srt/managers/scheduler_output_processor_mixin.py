@@ -955,6 +955,11 @@ class SchedulerOutputProcessorMixin:
                     # because of the one additional delayed token. This "continue" prevented the dummy output.
                     continue
                 req.finished_output = True
+
+                # Release grammar object to free CPU resources held by the grammar state machine.
+                if req.grammar is not None:
+                    req.grammar = None
+
                 if req.finished_len is None:
                     req.finished_len = len(req.output_ids)
                 should_output = True

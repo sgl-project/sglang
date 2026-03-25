@@ -267,6 +267,15 @@ class SamplingBatchInfo:
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
 
+        # Filter grammars list to match the filtered batch.
+        if self.grammars is not None:
+            if not keep_indices:
+                self.grammars = None
+            else:
+                self.grammars = [self.grammars[i] for i in keep_indices]
+                if not any(self.grammars):
+                    self.grammars = None
+
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
     ):
