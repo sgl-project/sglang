@@ -19,7 +19,7 @@ after_2_8_0 = torch_release >= (2, 8)
 #    (ptr, size). Does NOT register with any comm at allocation time.
 # 2. nccl_free_plug: Frees memory via ncclMemFree and UNTRACKS the segment.
 #    Each segment is tracked only during its lifetime (from alloc to free).
-# 3. Segment tracking uses a thread-safe map keyed by ptr.
+# 3. Segment tracking uses a thread-safe std::vector to preserve insertion order.
 # 4. Python layer handles registration at context exit time using pynccl API.
 nccl_allocator_source = """
 
