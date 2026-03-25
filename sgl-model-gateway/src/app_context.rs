@@ -372,6 +372,11 @@ impl AppContextBuilder {
     }
 
     /// Create rate limiter based on config
+    ///
+    /// When `rate_limit_tokens_per_second` is not set, uses pure concurrency limiting
+    /// (refill_rate=0, semaphore behavior) where tokens are only returned when requests
+    /// complete. When explicitly set, uses token bucket rate limiting with the specified
+    /// refill rate.
     fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
         self.rate_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
@@ -379,7 +384,7 @@ impl AppContextBuilder {
                 let rate_limit_tokens = config
                     .rate_limit_tokens_per_second
                     .filter(|&t| t > 0)
-                    .unwrap_or(n);
+                    .unwrap_or(0);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
                     rate_limit_tokens as usize,

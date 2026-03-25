@@ -33,7 +33,7 @@ pub fn create_test_app(
             let rate_limit_tokens = router_config
                 .rate_limit_tokens_per_second
                 .filter(|&t| t > 0)
-                .unwrap_or(n);
+                .unwrap_or(0);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,
