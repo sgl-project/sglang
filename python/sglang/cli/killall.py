@@ -302,7 +302,7 @@ def _ci_mode():
     retry_interval = 10
     elapsed = 0
     dirty = None
-    unkillable_pids = set()
+    unkillable_pids = {}  # pid -> exception name
 
     while True:
         dirty = _check_gpu_memory(gpu_indices)
@@ -324,10 +324,12 @@ def _ci_mode():
         # Kill remaining processes before waiting (silently for retries)
         if remaining_pids:
             for pid in remaining_pids:
+                if pid <= 1 or pid == os.getpid():
+                    continue
                 try:
                     os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    unkillable_pids.add(pid)
+                except (ProcessLookupError, PermissionError) as e:
+                    unkillable_pids[pid] = type(e).__name__
 
         print(
             f"[killall] GPUs still dirty at {elapsed}s [{dirty_summary}], "
@@ -338,10 +340,8 @@ def _ci_mode():
         elapsed += retry_interval
 
     if unkillable_pids:
-        _log(
-            f"  Unkillable PIDs (different namespace): "
-            f"{', '.join(str(p) for p in sorted(unkillable_pids))}"
-        )
+        parts = [f"{p} ({unkillable_pids[p]})" for p in sorted(unkillable_pids)]
+        _log(f"  Unkillable PIDs: {', '.join(parts)}")
 
     if dirty:
         _log()
@@ -357,16 +357,16 @@ def _ci_mode():
             for pid in sorted(unkillable_pids):
                 ns_info = _check_pid_namespace(pid)
                 print(f"  PID {pid}: ns: {ns_info}")
-            ps_lines = _get_ps_diagnostic()
-            if ps_lines:
-                print("\n[killall] Diagnostic — processes in this container (ps auxf):")
-                for line in ps_lines:
-                    print(f"  {line}")
-            else:
-                print(
-                    "\n[killall] Diagnostic — no sglang/python/gpu processes "
-                    "in this container"
-                )
+        ps_lines = _get_ps_diagnostic()
+        if ps_lines:
+            print("\n[killall] Diagnostic — processes in this container (ps auxf):")
+            for line in ps_lines:
+                print(f"  {line}")
+        else:
+            print(
+                "\n[killall] Diagnostic — no sglang/python/gpu processes "
+                "in this container"
+            )
         return 1
 
     _flush_box(f"killall_sglang: GPUs [{gpu_list}]", status="PASS — GPUs clean")
