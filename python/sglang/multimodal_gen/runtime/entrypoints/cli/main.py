@@ -32,7 +32,7 @@ def main() -> None:
         cmds[cmd.name] = cmd
     args, unknown_args = parser.parse_known_args()
     if args.subparser in cmds:
-        cmds[args.subparser].validate(args)
+        cmds[args.subparser]._validate(args)
 
     if hasattr(args, "dispatch_function"):
         args.dispatch_function(args, unknown_args=unknown_args)

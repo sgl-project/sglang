@@ -21,11 +21,12 @@ logger = init_logger(__name__)
 
 
 @dataclass
-class QuantizationArgsResolution:
-    """Normalized runtime quantization settings derived from CLI-facing args."""
+class NunchakuArgsResolution:
+    """Normalized runtime settings derived from Nunchaku CLI-facing args."""
 
     transformer_weights_path: str | None = None
     nunchaku_config: NunchakuConfig | None = None
+
 
 
 @dataclass
@@ -69,7 +70,7 @@ class NunchakuSVDQuantArgs:
 
         return enable_svdquant, inferred_precision, inferred_rank
 
-    def normalized(self) -> "NunchakuSVDQuantArgs":
+    def _normalized(self) -> "NunchakuSVDQuantArgs":
         enable_svdquant, inferred_precision, inferred_rank = (
             self._infer_from_weights_path()
         )
@@ -98,7 +99,7 @@ class NunchakuSVDQuantArgs:
 
         return normalized
 
-    def validate(self) -> None:
+    def _validate(self) -> None:
         # TODO: warn if the served model doesn't support nunchaku
         if not self.enable_svdquant:
             return
@@ -148,17 +149,17 @@ class NunchakuSVDQuantArgs:
                 f"Invalid --quantization-rank: {self.quantization_rank}. Must be > 0"
             )
 
-    def resolve_runtime_config(self) -> QuantizationArgsResolution:
-        normalized = self.normalized()
-        normalized.validate()
+    def resolve_runtime_config(self) -> NunchakuArgsResolution:
+        normalized = self._normalized()
+        normalized._validate()
 
         if not normalized.enable_svdquant or not normalized.transformer_weights_path:
-            return QuantizationArgsResolution(
+            return NunchakuArgsResolution(
                 transformer_weights_path=normalized.transformer_weights_path,
                 nunchaku_config=None,
             )
 
-        return QuantizationArgsResolution(
+        return NunchakuArgsResolution(
             transformer_weights_path=normalized.transformer_weights_path,
             nunchaku_config=NunchakuConfig(
                 precision=normalized.quantization_precision,

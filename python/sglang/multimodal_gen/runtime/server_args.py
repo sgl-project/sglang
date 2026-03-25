@@ -275,7 +275,11 @@ class ServerArgs:
             self.input_save_path = None
 
     def _adjust_quant_config(self):
-        """validate and adjust"""
+        """
+            resolve, validate and adjust quantization config
+
+            handles only nunchaku for now
+        """
 
         ncfg = self.nunchaku_config
         if ncfg is None or isinstance(ncfg, NunchakuConfig):

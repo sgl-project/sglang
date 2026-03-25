@@ -108,6 +108,7 @@ class TransformerLoader(ComponentLoader):
             strict=False,
         )
 
+        # post-hooks (e.g., patch scales (nunchaku))
         for post_load_hook in quant_spec.post_load_hooks:
             post_load_hook(model)
 

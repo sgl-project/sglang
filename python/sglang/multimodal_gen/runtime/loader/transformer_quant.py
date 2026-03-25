@@ -1,7 +1,8 @@
 """Helpers and adapters for transformer quantized checkpoint loading.
 
-This module keeps format-specific loading quirks out of `TransformerLoader`.
-The loader should stay focused on the generic load flow, while special cases
+This module keeps format-specific (nunchaku, nvfp4) loading hooks out of `TransformerLoader`.
+
+That loader should stay focused on the generic load flow, while special cases
 such as Nunchaku validation, NVFP4 fallback adjustments, and post-load patching
 are handled here behind a small helper/adapter layer.
 """
