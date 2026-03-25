@@ -118,6 +118,8 @@ jobs:
           filters: |
             main_package:
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/pr-gate.yml"
+              - ".github/actions/**"
               - "python/pyproject.toml"
               - "python/sglang/!(multimodal_gen)/**"
               - "scripts/ci/cuda/*"
@@ -179,7 +181,7 @@ jobs:
 
           # Check for main_package changes (excluding multimodal_gen)
           # Note: Need to filter out multimodal_gen before checking, not pipe grep -q output
-          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml)" | grep -v "^python/sglang/multimodal_gen/" || true)
+          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v "^python/sglang/multimodal_gen/" || true)
           if [ -n "$MAIN_PKG_FILES" ]; then
             echo "main_package=true" >> $GITHUB_OUTPUT
             echo "Detected main_package changes"

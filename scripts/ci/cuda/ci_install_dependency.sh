@@ -84,8 +84,15 @@ mark_step_done "Host / runner detection"
 # Kill existing processes
 # ------------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bash "${SCRIPT_DIR}/../../killall_sglang.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+python3 "${REPO_ROOT}/python/sglang/cli/killall.py"
+KILLALL_EXIT=$?
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+
+if [ $KILLALL_EXIT -ne 0 ]; then
+    echo "ERROR: killall.py detected uncleanable GPU memory. Aborting CI."
+    exit 1
+fi
 
 mark_step_done "Kill existing processes"
 
