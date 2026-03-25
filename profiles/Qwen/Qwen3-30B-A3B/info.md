@@ -19,6 +19,7 @@
 - `inductor[rope-rmsnorm]` does **not** use Inductor for the pre-attention q,k normalization — only the rotary embedding and the layer-level RMSNorm are compiled.
 - **RMSNorm** is compiled with no dynamic shapes, so Inductor can specialize on the fixed decode batch sizes used by SGLang's CUDA graphs. This means efficient code with only slightly higher startup times.
 - **RotaryEmbedding** is compiled with dynamic shapes due to the KV-cache update (`index_put_` with variable `cache_loc`), which limits Inductor's ability to specialize and adds overhead.
+- `inductor[qvnormropekv-rmsnorm]` compiles the full `QKNormRope` region — q/k normalization, rotary embedding, and KV-cache write — as a single fused Inductor graph, alongside the layer-level RMSNorm. This is the most comprehensive compilation scope, but the larger graph with dynamic shapes adds overhead that only amortizes at high concurrency.
 
 ## bench\_one\_batch Speedup Charts
 
@@ -58,33 +59,47 @@ python3 -m sglang.bench_offline_throughput \
 
 | Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|-------------|------------------------|
-| Baseline (no Inductor) | 363 | 363 | — |
-| Inductor — RotaryEmbedding + RMSNorm | 372 | 373 | **+2.5%** |
+| Baseline | 358 | 359 | — |
+| Inductor — QKNormRopeKV + RMSNorm | 338 | 339 | −5.6% |
+| Inductor — RotaryEmbedding + RMSNorm | 348 | 348 | −2.8% |
+| Inductor — RotaryEmbedding | 360 | 361 | **+0.5%** |
+| Inductor — RMSNorm | 346 | 347 | −3.3% |
 
-### 32 prompts, cuda-graph-bs 16
+### 32 prompts, cuda-graph-bs 32
 
 | Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|-------------|------------------------|
-| Baseline (no Inductor) | 737 | 765 | — |
-| Inductor — RotaryEmbedding + RMSNorm | 761 | 790 | **+3.2%** |
+| Baseline | 3,319 | 3,447 | — |
+| Inductor — QKNormRopeKV + RMSNorm | 3,297 | 3,424 | −0.7% |
+| Inductor — RotaryEmbedding + RMSNorm | 3,427 | 3,558 | **+3.2%** |
+| Inductor — RotaryEmbedding | 3,401 | 3,532 | **+2.5%** |
+| Inductor — RMSNorm | 3,368 | 3,497 | **+1.5%** |
 
 ### 128 prompts, cuda-graph-bs 128
 
 | Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|-------------|------------------------|
-| Baseline (no Inductor) | 7,019 | 7,338 | — |
-| Inductor — RotaryEmbedding + RMSNorm | 6,992 | 7,310 | −0.4% |
-| Inductor — RotaryEmbedding | 7,010 | 7,329 | −0.1% |
-| Inductor — RMSNorm | 7,012 | 7,331 | −0.1% |
+| Baseline | 6,963 | 7,280 | — |
+| Inductor — QKNormRopeKV + RMSNorm | 7,019 | 7,338 | **+0.8%** |
+| Inductor — RotaryEmbedding + RMSNorm | 7,048 | 7,368 | **+1.2%** |
+| Inductor — RotaryEmbedding | 7,030 | 7,350 | **+1.0%** |
+| Inductor — RMSNorm | 6,958 | 7,274 | −0.1% |
 
 ### Summary
 
 | Scenario | Config | Total tok/s | Total tok/s vs Baseline |
-|----------|--------|-------------|-------------|
-| 1 prompt, cg-bs 1 | RotaryEmbedding + RMSNorm | 373 | **+2.5%** |
-| 32 prompts, cg-bs 16 | RotaryEmbedding + RMSNorm | 790 | **+3.2%** |
-| 128 prompts, cg-bs 128 | RotaryEmbedding + RMSNorm | 7,310 | −0.4% |
-| 128 prompts, cg-bs 128 | RotaryEmbedding | 7,329 | −0.1% |
-| 128 prompts, cg-bs 128 | RMSNorm | 7,331 | −0.1% |
+|----------|--------|-------------|------------------------|
+| 1 prompt, cg-bs 1 | RotaryEmbedding | 361 | **+0.5%** |
+| 1 prompt, cg-bs 1 | RotaryEmbedding + RMSNorm | 348 | −2.8% |
+| 1 prompt, cg-bs 1 | RMSNorm | 347 | −3.3% |
+| 1 prompt, cg-bs 1 | QKNormRopeKV + RMSNorm | 339 | −5.6% |
+| 32 prompts, cg-bs 32 | RotaryEmbedding + RMSNorm | 3,558 | **+3.2%** |
+| 32 prompts, cg-bs 32 | RotaryEmbedding | 3,532 | **+2.5%** |
+| 32 prompts, cg-bs 32 | RMSNorm | 3,497 | **+1.5%** |
+| 32 prompts, cg-bs 32 | QKNormRopeKV + RMSNorm | 3,424 | −0.7% |
+| 128 prompts, cg-bs 128 | RotaryEmbedding + RMSNorm | 7,368 | **+1.2%** |
+| 128 prompts, cg-bs 128 | RotaryEmbedding | 7,350 | **+1.0%** |
+| 128 prompts, cg-bs 128 | QKNormRopeKV + RMSNorm | 7,338 | **+0.8%** |
+| 128 prompts, cg-bs 128 | RMSNorm | 7,274 | −0.1% |
 
-Inductor compilation of `RotaryEmbedding` + `RMSNorm` yields measurable gains at low concurrency: **+2.5%** at B=1 (363 → 373 tok/s) and **+3.2%** at B=32 (765 → 790 tok/s). At higher concurrency (128 prompts), all Inductor configs are within noise of the baseline (~7,330 tok/s) — the kernel overhead is amortized by the larger batch sizes and the bottleneck shifts elsewhere.
+At medium concurrency (B=32), the smaller-scope configs deliver clear gains: `RotaryEmbedding + RMSNorm` leads at **+3.2%** (3,447 → 3,558 tok/s), followed by `RotaryEmbedding` at **+2.5%** and `RMSNorm` at **+1.5%**. At high concurrency (B=128), `RotaryEmbedding + RMSNorm` still leads at **+1.2%** with `RotaryEmbedding` close behind at **+1.0%** and `QKNormRopeKV + RMSNorm` at **+0.8%**, while `RMSNorm` alone is within noise (−0.1%). The most comprehensive config — `QKNormRopeKV + RMSNorm`, which fuses q/k normalization, rotary embedding, and KV-cache write into a single Inductor graph — regresses at B=1 (−5.6%) and B=32 (−0.7%), only breaking even at B=128 (+0.8%). The larger compiled graph with dynamic shapes adds overhead that doesn't amortize until high concurrency, making the narrower `RotaryEmbedding + RMSNorm` the best overall config.
