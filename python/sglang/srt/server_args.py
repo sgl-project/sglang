@@ -3143,15 +3143,24 @@ class ServerArgs:
             )
 
     def _is_mistral_native_format(self) -> bool:
-        """Detect if the model uses Mistral native format (params.json + consolidated weights)."""
+        """Detect if the model uses Mistral native format (params.json + consolidated weights).
+
+        Models like Mistral-7B-Instruct-v0.3 have BOTH params.json (native) and
+        config.json (HF standard). When both exist, prefer the HF format to avoid
+        parameter name mismatches between consolidated.safetensors (native names
+        like layers.0.attention.wk.weight) and HuggingFace model classes (names
+        like model.layers.0.self_attn.k_proj.weight).
+        """
         if os.path.isdir(self.model_path):
-            return os.path.exists(os.path.join(self.model_path, "params.json"))
+            has_params = os.path.exists(os.path.join(self.model_path, "params.json"))
+            has_hf_config = os.path.exists(os.path.join(self.model_path, "config.json"))
+            return has_params and not has_hf_config
         # For hub models, check remote files
         try:
             from huggingface_hub import HfApi
 
             files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
-            return "params.json" in files
+            return "params.json" in files and "config.json" not in files
         except Exception:
             return False
 
