@@ -131,7 +131,9 @@ runs:
 
               for (const job of matchingJobs) {
                 totalCount++;
-                console.log(`${job.name}: status=${job.status}, conclusion=${job.conclusion}`);
+                if (!cached) {
+                  console.log(`${job.name}: status=${job.status}, conclusion=${job.conclusion}`);
+                }
 
                 if (job.status === 'completed') {
                   completedCount++;
