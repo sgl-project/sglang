@@ -26,11 +26,13 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    build_nvfp4_config_from_safetensors_list,
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -81,8 +83,8 @@ class TransformerLoader(ComponentLoader):
         server_args: ServerArgs,
         safetensors_list: list[str],
         component_model_path: str,
-    ) -> Optional[dict]:
-        # priority: model config.json → safetensors metadata → nunchaku config
+    ) -> Optional[QuantizationConfig]:
+        # priority: model config.json → safetensors metadata → quantization config (nvfp4, nunchaku, ...)
         quant_config = get_quant_config(hf_config, component_model_path)
         if quant_config is None and server_args.transformer_weights_path:
             # try to read quantization_config from the safetensors metadata header
@@ -91,7 +93,18 @@ class TransformerLoader(ComponentLoader):
                     safetensors_file
                 )
                 if quant_config:
-                    break
+                    return quant_config
+
+            # fallback: handle nvfp4 per-layer format metadata
+            # ({"format_version": ..., "layers": {"name": {"format": "nvfp4"}, ...}})
+            param_names_mapping_dict = (
+                server_args.pipeline_config.dit_config.arch_config.param_names_mapping
+            )
+            quant_config = build_nvfp4_config_from_safetensors_list(
+                safetensors_list, param_names_mapping_dict
+            )
+            if quant_config:
+                return quant_config
         return quant_config
 
     def _resolve_target_param_dtype(
