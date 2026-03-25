@@ -210,7 +210,9 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = None
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
-        self.speculative_step_offset_npu = torch.tensor(speculative_step_id + 1, device='npu')
+        self.speculative_step_offset_npu = torch.tensor(
+            speculative_step_id + 1, device='npu'
+        )
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         if self.use_mla:
