@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=350, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=350, suite="stage-b-test-2-gpu-large")
 
 
 class TestDPAttentionDP2TP2(
@@ -38,6 +38,10 @@ class TestDPAttentionDP2TP2(
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
+            True
+        )
+        cls._env_override.__enter__()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -58,6 +62,7 @@ class TestDPAttentionDP2TP2(
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        cls._env_override.__exit__(None, None, None)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(

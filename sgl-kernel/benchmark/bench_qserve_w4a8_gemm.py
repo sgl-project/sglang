@@ -18,6 +18,9 @@ IS_CI = (
     os.getenv("CI", "false").lower() == "true"
     or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
+from sglang.utils import is_in_ci
+
+IS_CI = is_in_ci()
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:

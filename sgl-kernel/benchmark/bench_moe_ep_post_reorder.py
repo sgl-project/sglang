@@ -1,16 +1,11 @@
-import os
-
 import torch
-
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
 import triton
 
 from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
+from sglang.utils import is_in_ci
+
+IS_CI = is_in_ci()
 
 # CI environment uses simplified parameters
 if IS_CI:

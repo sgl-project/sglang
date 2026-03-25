@@ -345,6 +345,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
+        self.enable_hisparse = server_args.enable_hisparse
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -417,6 +418,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
+
+        # For hisparse (must be set before initialize() so CUDA graph capture can see it)
+        self.hisparse_coordinator = None
 
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
@@ -611,6 +615,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
+        # Init hisparse coordinator (must happen before CUDA graph capture)
+        if self.enable_hisparse:
+            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            hisparse_cfg = parse_hisparse_config(self.server_args)
+            self.hisparse_coordinator = HiSparseCoordinator(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                top_k=hisparse_cfg.top_k,
+                device_buffer_size=hisparse_cfg.device_buffer_size,
+                device=self.device,
+                tp_group=(
+                    self.attention_tp_group.cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_group.cpu_group
+                ),
+                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+            )
+
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
@@ -676,6 +700,74 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
         ).to_host_port_str()
 
+    def _publish_modelexpress_metadata(self):
+        """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
+        try:
+            from modelexpress import p2p_pb2
+            from modelexpress.client import MxClient
+        except ImportError as exc:
+            raise ImportError(
+                "ModelExpress support requires the 'modelexpress' package. "
+                "Install it with: pip install modelexpress"
+            ) from exc
+
+        model_name = (
+            self.server_args.modelexpress_model_name or self.server_args.model_path
+        )
+        mx_url = self.server_args.modelexpress_url
+        session_id = self.remote_instance_transfer_engine_session_id
+        weight_info = self.remote_instance_transfer_engine_weight_info
+
+        if not session_id or weight_info is None:
+            logger.warning(
+                "ModelExpress source: skipping publish -- "
+                "TransferEngine not initialized or no weight info"
+            )
+            return
+
+        # Build tensor descriptors from weight_info dict
+        tensors = []
+        for name, (addr, numel, element_size) in weight_info.items():
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=name,
+                    addr=addr,
+                    size=numel * element_size,
+                    device_id=self.gpu_id,
+                )
+            )
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            transfer_engine_session_id=session_id,
+            tensors=tensors,
+        )
+
+        mx_client = MxClient(server_url=mx_url)
+        try:
+            logger.info(
+                "ModelExpress source: publishing metadata for model=%s, "
+                "tp_rank=%d, session=%s, %d tensors",
+                model_name,
+                self.tp_rank,
+                session_id,
+                len(tensors),
+            )
+            mx_client.publish_metadata(model_name, [worker])
+            mx_client.publish_ready(
+                model_name,
+                worker_id=self.tp_rank,
+                session_id=mx_client.session_id,
+                metadata_hash="",
+            )
+            logger.info(
+                "ModelExpress source: published ready for model=%s, tp_rank=%d",
+                model_name,
+                self.tp_rank,
+            )
+        finally:
+            mx_client.close()
+
     def model_specific_adjustment(self):
         server_args = self.server_args
 
@@ -718,7 +810,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"tp_size {self.tp_size} must be divisible by ep_size {self.moe_ep_size}"
                 )
-            moe_tp_size = self.tp_size // self.moe_ep_size
+            moe_tp_size = self.tp_size // self.moe_ep_size // self.moe_dp_size
 
             moe_intermediate_size = getattr(
                 self.model_config.hf_text_config, "moe_intermediate_size", None
@@ -963,6 +1055,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
             remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
+            modelexpress_url=self.server_args.modelexpress_url,
+            modelexpress_model_name=self.server_args.modelexpress_model_name
+            or self.server_args.model_path,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
@@ -1014,6 +1109,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
         monkey_patch_vllm_parallel_state(reverse=True)
+
+        # Publish metadata to ModelExpress if running as seed source
+        if self.server_args.modelexpress_source:
+            # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
+            # call register_memory_region(). Do it here so weight_info is populated.
+            if (
+                self.remote_instance_transfer_engine_weight_info is None
+                and self.remote_instance_transfer_engine is not None
+            ):
+                from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+                    register_memory_region,
+                )
+
+                self.remote_instance_transfer_engine_weight_info = (
+                    register_memory_region(
+                        self.model, self.remote_instance_transfer_engine
+                    )
+                )
+            self._publish_modelexpress_metadata()
 
         get_offloader().post_init()
 
@@ -2596,6 +2710,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if forward_batch.out_cache_loc_swa is not None:
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
+        forward_batch.hisparse_coordinator = self.hisparse_coordinator
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -2636,6 +2754,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+        # Release the vocab_mask GPU tensor immediately after it has been applied
+        # to the logits. In overlap scheduling, the sampling_info (and its
+        # vocab_mask) can be kept alive by the delay_sample_func closure and
+        # batch_record_buf until the next iteration, causing a steady VRAM leak
+        # when structured output (grammar) is used.
+        sampling_info.vocab_mask = None
 
     def sample(
         self,

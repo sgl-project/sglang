@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -640,7 +641,6 @@ class Req(ReqDllmMixin):
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
         self.last_host_node: Any = None
-        self.last_host_backup_node: Any = None
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
@@ -799,6 +799,9 @@ class Req(ReqDllmMixin):
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
 
+        # For hisparse
+        self.staging = False
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -873,6 +876,23 @@ class Req(ReqDllmMixin):
             self.fill_ids = self.origin_input_ids + self.output_ids
 
         input_len = len(self.fill_ids)
+
+        # Streaming sessions reuse committed KV from the session slot, so
+        # custom logprob_start_len is not supported — override to -1.
+        if (
+            self.session is not None
+            and self.session.streaming
+            and self.return_logprob
+            and self.logprob_start_len >= 0
+        ):
+            logger.warning(
+                "logprob_start_len=%d is not supported for streaming sessions "
+                "and will be ignored (rid=%s). Only new-token logprobs are returned.",
+                self.logprob_start_len,
+                self.rid,
+            )
+            self.logprob_start_len = -1
+
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
@@ -894,14 +914,12 @@ class Req(ReqDllmMixin):
                 self.prefix_indices,
                 self.last_node,
                 self.last_host_node,
-                self.last_host_backup_node,
                 self.host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
                 match_result.last_host_node,
-                match_result.last_host_backup_node,
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
@@ -1325,6 +1343,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
+
+    # HiSparse
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     @classmethod
     def init_new(
@@ -1980,6 +2001,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
 
+        # Clear context parallel metadata - CP is only for prefill, not decode
+        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
+            self.attn_cp_metadata = None
+        if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
+            self.nsa_cp_metadata = None
+
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
             draft_input: EagleDraftInput = self.spec_info
@@ -2041,6 +2068,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.map_last_loc_to_buffer(
+                self.seq_lens,
+                self.out_cache_loc,
+                self.req_pool_indices,
+                self.seq_lens_cpu,
+            )
 
         if get_global_server_args().enable_mamba_extra_buffer():
             if len(self.reqs) == 0:

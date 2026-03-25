@@ -28,11 +28,58 @@ pre-commit run --all-files
 
 - **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
 - **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
+- Link checking with lychee is **enforced in CI**. By default, it is not blocking local commits.
+- To run local link checks manually, use: `pre-commit run --hook-stage manual lychee --all-files`.
+
+### Link check guidance (lychee)
+
+- If your PR changes `docs/` or `README.md`, we recommend running local link checks before pushing.
+- Local lychee is optional (CI is the source of truth), but if you want a system installation, see the official project: [lycheeverse/lychee](https://github.com/lycheeverse/lychee).
+- Recommended local commands:
+
+```bash
+# Fast local/offline check (pre-commit config)
+pre-commit run --hook-stage manual lychee --all-files
+
+# CI-like online check (external links over network)
+lychee --config .github/linters/lychee-ci.toml README.md "docs/**/*.md" "docs/**/*.rst" "docs/**/*.ipynb"
+```
 
 ## Run and add unit tests
 
 If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
-SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework.
+SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework with [pytest](https://docs.pytest.org/) as the test runner.
+
+### Unit tests (no server required)
+
+Unit tests live under [`test/registered/unit/`](https://github.com/sgl-project/sglang/tree/main/test/registered/unit), organized to mirror the `python/sglang/srt/` source tree. These tests validate component logic **without** launching a server or loading real model weights.
+
+**When to add a unit test:** If you modify a file under `python/sglang/srt/`, check whether a corresponding test exists in `test/registered/unit/` and add coverage for your changes. For example:
+
+```
+srt/mem_cache/radix_cache.py   →  unit/mem_cache/test_radix_cache.py
+srt/sampling/sampling_params.py →  unit/sampling/test_sampling_params.py
+```
+
+**Run unit tests locally:**
+
+```bash
+pytest test/registered/unit/ -v                # all unit tests
+pytest test/registered/unit/mem_cache/ -v      # one module
+```
+
+**Run with coverage:**
+
+```bash
+pytest test/registered/unit/ --cov --cov-config=.coveragerc -v
+```
+
+For conventions on CI registration, test structure, and examples, see [`test/registered/unit/README.md`](https://github.com/sgl-project/sglang/tree/main/test/registered/unit/README.md).
+
+### E2E tests (server required)
+
+For tests that require launching a server, refer to [`test/registered/README.md`](https://github.com/sgl-project/sglang/tree/main/test/registered/README.md) for guidance on where to place your test.
+
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
 ## Write documentations
@@ -57,8 +104,8 @@ Also, do not rely on the "Latency/Output throughput" from this script, as it is 
 
 GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
 You can find additional accuracy eval examples in:
-- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_eval_accuracy_large.py)
-- [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_gpt_oss_1gpu.py)
+- [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/registered/eval/test_eval_accuracy_large.py)
+- [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/registered/core/test_gpt_oss_1gpu.py)
 
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
