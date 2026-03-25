@@ -54,6 +54,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 ### Usage
 
 - **[CLI Documentation](api/cli.md)** - Command-line interface for `sglang generate` and `sglang serve`
+- **[Quantization](quantization.md)** - Quantized transformer checkpoint usage and supported quantization families
 - **[OpenAI API](api/openai_api.md)** - OpenAI-compatible API for image/video generation and LoRA management
 - **[Post-Processing](api/post_processing.md)** - Frame interpolation (RIFE) and upscaling (Real-ESRGAN)
 

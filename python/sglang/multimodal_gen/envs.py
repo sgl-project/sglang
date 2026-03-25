@@ -277,6 +277,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
+    "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+    ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
 }
