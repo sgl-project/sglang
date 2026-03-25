@@ -167,3 +167,35 @@ sglang generate \
 SGLang-Diffusion will automatically read the `quantization_config` metadata embedded in the safetensors file header (if present). For the quant config to be auto-detected, the file's metadata must contain a JSON-encoded `quantization_config` key with at least a `quant_method` field (e.g. `"fp8"`).
 
 Note: this feature is a WIP
+
+#### Option 3: NVFP4 transformer checkpoint / repo
+
+NVFP4 support is currently for `FLUX.2-dev-NVFP4` style checkpoints.
+
+Recommended usage:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --transformer-weights-path black-forest-labs/FLUX.2-dev-NVFP4 \
+  --prompt "a curious pikachu"
+```
+
+This keeps the CLI semantics aligned with other quantization modes:
+
+SGLang also supports passing the NVFP4 repo or local directory directly as `--model-path`.
+In that case, SGLang keeps the user-provided NVFP4 path as the model identity, uses `black-forest-labs/FLUX.2-dev` as the base model for `model_index.json` and non-transformer components, and auto-resolves the quantized transformer weights from the NVFP4 repo or local directory.
+
+Example with direct `--model-path`:
+
+```bash
+sglang generate \
+  --model-path /path/to/FLUX.2-dev-NVFP4 \
+  --prompt "a curious pikachu"
+```
+
+Notes:
+
+- If `--transformer-weights-path` is provided explicitly, it still takes precedence.
+- For automatic resolution from a local directory, SGLang looks for `*-mixed.safetensors` first, then falls back to the whole directory.
+- On Blackwell, if `comfy-kitchen` is not installed, SGLang falls back to the generic ModelOpt FP4 path and prints a warning.
