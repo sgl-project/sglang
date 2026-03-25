@@ -27,9 +27,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-)
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -775,7 +773,7 @@ class MambaRadixCache(BasePrefixCache):
         x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
         # evict lru leaf nodes until mamba_num_tokens is reached
-        while mamba_num_evicted < mamba_num and self.mamba_lru_list.in_list(x):
+        while mamba_num_evicted < mamba_num and (self.mamba_lru_list.in_list(x)):
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
             assert (
                 len(x.mamba_value) == 1
