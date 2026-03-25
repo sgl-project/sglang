@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -196,7 +196,7 @@ def _jit_nvfp4_blockwise_moe_module() -> Module:
         )
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def cutlass_scaled_fp4_mm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -213,7 +213,7 @@ def cutlass_scaled_fp4_mm(
     return out
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def cutlass_fp4_group_mm(
     a_fp4: torch.Tensor,
     b_fp4: torch.Tensor,
@@ -293,7 +293,7 @@ def _scaled_fp4_quant_custom_op(
     module.scaled_fp4_quant(output, input, output_scale, input_global_scale)
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def scaled_fp4_quant(
     input: torch.Tensor, input_global_scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -363,7 +363,7 @@ def _scaled_fp4_experts_quant_custom_op(
     )
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -448,7 +448,7 @@ def _scaled_fp4_grouped_quant_custom_op(
     )
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def scaled_fp4_grouped_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -509,7 +509,7 @@ def _silu_and_mul_scaled_fp4_grouped_quant_custom_op(
     )
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def silu_and_mul_scaled_fp4_grouped_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
