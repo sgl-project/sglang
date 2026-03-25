@@ -335,11 +335,11 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             image_array[:, :, 3] = alpha_channel
             image = PILImage.fromarray(image_array)
 
-            image_tensor = torch.tensor(np.array(image) / 255.0).to(self.device)
+            image_tensor = torch.tensor(np.array(image) / 255.0).float().to(self.device)
             alpha = image_tensor[:, :, 3:]
             rgb_target = image_tensor[:, :, :3]
         else:
-            image_tensor = torch.tensor(np.array(image) / 255.0).to(self.device)
+            image_tensor = torch.tensor(np.array(image) / 255.0).float().to(self.device)
             alpha = torch.ones_like(image_tensor)[:, :, :1]
             rgb_target = image_tensor[:, :, :3]
 
@@ -356,7 +356,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             guidance_scale=self.config.delight_guidance_scale,
         ).images[0]
 
-        image_tensor = torch.tensor(np.array(image) / 255.0).to(self.device)
+        image_tensor = torch.tensor(np.array(image) / 255.0).float().to(self.device)
         rgb_src = image_tensor[:, :, :3]
         image = _recorrect_rgb(rgb_src, rgb_target, alpha)
         image = image[:, :, :3] * image[:, :, 3:] + torch.ones_like(image[:, :, :3]) * (
@@ -401,6 +401,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
         self._renderer = MeshRender(
             default_resolution=self.config.paint_render_size,
             texture_size=self.config.paint_texture_size,
+            device=self.device,
         )
         self._renderer_loaded = True
         logger.info("Mesh renderer initialized")

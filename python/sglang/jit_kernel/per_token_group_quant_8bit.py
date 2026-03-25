@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -73,7 +73,7 @@ def _per_token_group_quant_8bit_custom_op(
     return None
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def per_token_group_quant_8bit(
     input: torch.Tensor,
     output_q: torch.Tensor,

@@ -22,7 +22,7 @@ standard LLM support:
    to return `True` for your model.
 
 2. **Register a new chat-template**:
-   Only when your default chat-template is unable to accept images as input: Register a new chat template in [conversation.py](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/conversation.py) and the corresponding matching function.
+   Only when your default chat-template is unable to accept images as input: Register a new chat template in [conversation.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/parser/conversation.py) and the corresponding matching function.
 
 3. **Multimodal Data Processor**:
    Define a new `Processor` class that inherits from `BaseMultimodalProcessor` and register this processor as your
@@ -68,7 +68,7 @@ To ensure the new model is well maintained, add it to the test suite by includin
 the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/registered/models/test_generation_models.py)
 file, test the new model on your local machine and report the results on demonstrative benchmarks (GSM8K, MMLU, MMMU,
 MMMU-Pro, etc.) in your PR. \\
-For VLMs, also include a test in `test_vision_openai_server_{x}.py` (e.g. [test_vision_openai_server_a.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_a.py), [test_vision_openai_server_b.py](https://github.com/sgl-project/sglang/blob/main/test/srt/test_vision_openai_server_b.py)).
+For VLMs, also include a test in `test_vision_openai_server_{x}.py` (e.g. [test_vision_openai_server_a.py](https://github.com/sgl-project/sglang/blob/main/test/registered/vlm/test_vision_openai_server_a.py)).
 
 This is an example command to run to test a new model on your local machine:
 

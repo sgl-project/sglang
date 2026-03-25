@@ -414,12 +414,42 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 ## Step 4: Write tests (required)
 
+JIT kernel tests live under `python/sglang/jit_kernel/tests/`. **CI does not run `pytest` in that directory directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` there (and every `bench_*.py` under `benchmark/`), collects `register_*_ci(...)` calls by **statically parsing each file’s AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
+
+- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `stage-b-kernel-unit-1-gpu-large` (see `.github/workflows/pr-test-jit-kernel.yml`: `python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large`).
+- **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/jit_kernel/utils.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
+
+Registration pattern (module level, **literal** `est_time` and `suite` strings — required for AST parsing):
+
+```python
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+# Optional second registration: same file also listed under the nightly kernel suite
+# register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+```
+
+Keep `est_time` and `suite` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
+
+Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but should be skipped in CI (e.g. multi-GPU only).
+
+**Run like CI** (from repo root):
+
+```bash
+cd test && python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large
+```
+
+For fast iteration you can still run `pytest` on a single file locally; CI coverage is via `run_suite.py`.
+
 Create `python/sglang/jit_kernel/tests/test_scale.py`:
 
 ```python
 import pytest
 import torch
 from sglang.jit_kernel.scale import scale
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -456,12 +486,15 @@ def test_scale_unsupported_dtype():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    import sys
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
 ```
 
 ---
 
 ## Step 5: Add a benchmark (required)
+
+Benchmarks are `bench_*.py` files under `python/sglang/jit_kernel/benchmark/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`stage-b-kernel-benchmark-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite stage-b-kernel-benchmark-1-gpu-large`).
 
 Create `python/sglang/jit_kernel/benchmark/bench_scale.py`:
 
@@ -479,7 +512,9 @@ from sglang.jit_kernel.benchmark.utils import (
     run_benchmark,
 )
 from sglang.jit_kernel.scale import scale as jit_scale
+from sglang.test.ci.ci_register import register_cuda_ci
 
+register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 SIZE_LIST = get_benchmark_range(
     full_range=[2**n for n in range(10, 20)],  # 1K … 512K elements
@@ -518,16 +553,23 @@ if __name__ == "__main__":
     benchmark.run(print_data=True)
 ```
 
-Run:
+Run locally:
 
 ```bash
 python python/sglang/jit_kernel/benchmark/bench_scale.py
+```
+
+Run the benchmark suite the way CI does:
+
+```bash
+cd test && python3 run_suite.py --hw cuda --suite stage-b-kernel-benchmark-1-gpu-large
 ```
 
 ---
 
 ## Troubleshooting
 
+- **`No CI registry found in ...` from `run_suite.py`**: add a module-level `register_cuda_ci(...)` with literal `est_time` and `suite` (and optional `nightly=True`); starred args and non-literal values break AST collection
 - **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/jit_kernel/csrc/`; reduce template argument combinations
 - **CUDA crash / illegal memory access**: `CUDA_LAUNCH_BLOCKING=1`; `compute-sanitizer --tool memcheck python ...`
 - **Unstable benchmark results**: `run_benchmark` uses CUDA-graph-based timing by default
@@ -537,7 +579,9 @@ python python/sglang/jit_kernel/benchmark/bench_scale.py
 ## References
 
 - `docs/developer_guide/development_jit_kernel_guide.md`
-- `python/sglang/jit_kernel/utils.py` — `cache_once`, `load_jit`, `make_cpp_args`
+- `test/run_suite.py` — suite names, discovery of `jit_kernel/tests/` and `jit_kernel/benchmark/`, execution entrypoint for CI
+- `python/sglang/test/ci/ci_register.py` — `register_cuda_ci` and AST registration rules
+- `python/sglang/jit_kernel/utils.py` — `cache_once`, `load_jit`, `make_cpp_args`, `should_run_full_tests`, `get_ci_test_range`
 - `python/sglang/jit_kernel/include/sgl_kernel/tensor.h` — `TensorMatcher`, `SymbolicSize/DType/Device`
 - `python/sglang/jit_kernel/include/sgl_kernel/utils.cuh` — type aliases, `LaunchKernel`, `SGL_DEVICE`
 - `python/sglang/jit_kernel/include/sgl_kernel/vec.cuh` — `AlignedVector`
