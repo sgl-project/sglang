@@ -827,13 +827,7 @@ class MambaRadixCache(BasePrefixCache):
         return full_num_evicted
 
     def _get_mamba_recompute_length(self, node: TreeNode) -> int:
-        """Return replay length from the nearest reusable Mamba ancestor to this node.
-
-        The reusable anchor is the nearest ancestor on the path to root whose
-        ``mamba_value`` is not ``None``, excluding ``node`` itself. The replay
-        length is the total token length from that ancestor's child boundary down
-        to ``node``.
-        """
+        """Return replay length from the nearest reusable Mamba ancestor to this node."""
         recompute_length = 0
         cur = node
         while cur != self.root_node:
@@ -1178,7 +1172,7 @@ class MambaRadixCache(BasePrefixCache):
                 node_update, self.root_node
             )
 
-            # For sanity check
+            # This last_access_time is for sanity check, can be deleted after validation in production
             cur_time = get_last_access_time()
             while node_update:
                 node_update.last_access_time = cur_time
