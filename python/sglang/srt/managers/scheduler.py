@@ -3133,8 +3133,11 @@ class Scheduler(
         # In PP mode, there are multiple microbatches (running_mbs).
         # abort_request is called with self.running_batch set to only one of them.
         # We must also check all other microbatches to ensure the request is aborted.
-        mb_reqs = [reqs] if not hasattr(self, "running_mbs") \
+        mb_reqs = (
+            [reqs]
+            if not hasattr(self, "running_mbs")
             else [mb.reqs for mb in self.running_mbs]
+        )
         for reqs in mb_reqs:
             for req in reqs:
                 if not req.finished() and (

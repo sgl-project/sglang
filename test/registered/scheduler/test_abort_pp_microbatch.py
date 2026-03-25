@@ -11,8 +11,7 @@ This is a pure CPU unit test with no GPU / real model dependency. Run directly w
 """
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -22,6 +21,7 @@ register_cuda_ci(est_time=5, suite="stage-a-test-cpu")
 # ---------------------------------------------------------------------------
 # Lightweight mocks: minimal interfaces for Req / ScheduleBatch / AbortReq
 # ---------------------------------------------------------------------------
+
 
 class _Req:
     def __init__(self, rid: str, already_finished: bool = False):
@@ -33,13 +33,16 @@ class _Req:
     def finished(self) -> bool:
         return self.finished_reason is not None
 
+
 class _Batch:
     def __init__(self, reqs=None):
         self.reqs = reqs or []
 
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_scheduler_instance(pp_size: int, current_mb_id: int):
     """
@@ -69,19 +72,25 @@ def _make_scheduler_instance(pp_size: int, current_mb_id: int):
 
     return instance
 
+
 def _make_abort_req(rid: str, abort_all: bool = False):
     """Build a real AbortReq dataclass instance."""
     from sglang.srt.managers.io_struct import AbortReq
+
     return AbortReq(rid=rid, abort_all=abort_all)
+
 
 def _is_finish_abort(obj) -> bool:
     """Return True if obj is an instance of the real FINISH_ABORT class."""
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
     return isinstance(obj, FINISH_ABORT)
+
 
 # ---------------------------------------------------------------------------
 # Test cases
 # ---------------------------------------------------------------------------
+
 
 class TestAbortRequestPPMicrobatch(CustomTestCase):
     """Verify that abort_request correctly handles all microbatches in PP mode."""
@@ -166,6 +175,7 @@ class TestAbortRequestPPMicrobatch(CustomTestCase):
             "An already-finished request must not have to_finish overwritten",
         )
         self.assertTrue(_is_finish_abort(active.to_finish))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
