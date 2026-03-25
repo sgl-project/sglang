@@ -204,7 +204,9 @@ class AiterAttnBackend(AttentionBackend):
             self.token_to_kv_pool = model_runner.token_to_kv_pool
             self.use_triton_unified_attention = True
         else:
-            self.use_triton_unified_attention = False
+            self.use_triton_unified_attention = get_bool_env_var(
+                "SGLANG_USE_AITER_UNIFIED_ATTN"
+            )
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -634,6 +636,7 @@ class AiterAttnBackend(AttentionBackend):
 
         num_kv_splits = None
         swa_page_table = None
+        max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
@@ -656,7 +659,6 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     max_q_len = 1
                     page_size = self.page_size
-                    max_kv_len = torch.max(forward_batch.seq_lens).item()
                     max_num_blocks_per_seq = (max_kv_len + page_size - 1) // page_size
                     kv_indices = torch.zeros(
                         bs, max_kv_len, dtype=torch.int32, device=self.device
@@ -682,6 +684,8 @@ class AiterAttnBackend(AttentionBackend):
 
                         kv_indices = self._transform_table_1_to_real(kv_indices)
                         swa_page_table = self._transform_table_1_to_real(swa_page_table)
+                    elif self.page_size > 1:
+                        kv_indices = self._transform_table_1_to_real(kv_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
                     qo_indptr[1 : bs + 1] = torch.cumsum(
@@ -749,9 +753,7 @@ class AiterAttnBackend(AttentionBackend):
             self._ensure_spec_v2_topk_supported()
             if self.use_mla:
                 device = forward_batch.seq_lens.device
-                num_draft_tokens = self._resolve_v2_num_draft_tokens(
-                    extend_seq_lens=forward_batch.extend_seq_lens
-                )
+                num_draft_tokens = self._resolve_v2_num_draft_tokens()
                 qo_indptr = self._set_uniform_qo_indptr(bs, num_draft_tokens, device)
 
                 kv_indptr = self.kv_indptr[: bs + 1]
@@ -1052,8 +1054,8 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens,
                     forward_batch.seq_lens_sum,
                     forward_batch.extend_seq_lens,
-                    forward_batch.extend_seq_lens.max().item(),
-                    forward_batch.seq_lens.max().item(),
+                    max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
                     spec_info=None,
                 )
 
@@ -1138,8 +1140,8 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.kv_indices,
                     None,
                     None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    max(forward_batch.extend_seq_lens_cpu),
+                    forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
                 )
 
@@ -1149,7 +1151,9 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int)
+        self.cuda_graph_kv_last_page_len = torch.ones(
+            max_bs, dtype=torch.int, device=self.device
+        )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
@@ -1280,6 +1284,11 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices[:new_rows, :new_cols].copy_(page_indices)
                         swa_page_table = self.cuda_graph_swa_page_table
                         swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
+                    elif self.page_size > 1:
+                        page_indices = self._transform_table_1_to_real(page_indices)
+                        new_rows = page_indices.shape[0]
+                        new_cols = page_indices.shape[1]
+                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
                     qo_indptr[1 : bs + 1] = torch.cumsum(
@@ -1405,7 +1414,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -1428,7 +1437,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=max_q_len,
@@ -1486,7 +1495,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1557,7 +1566,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -1606,7 +1615,7 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map = None
 
         swa_page_table = None
-        max_kv_len = torch.max(seq_lens).item()
+        max_kv_len = seq_lens_cpu.max().item()
 
         if forward_mode.is_decode_or_idle():
             qo_indptr = None
@@ -1657,6 +1666,11 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices[:new_rows, :new_cols].copy_(page_indices)
                         swa_page_table = self.cuda_graph_swa_page_table
                         swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
+                    elif self.page_size > 1:
+                        page_indices = self._transform_table_1_to_real(page_indices)
+                        new_rows = page_indices.shape[0]
+                        new_cols = page_indices.shape[1]
+                        kv_indices[:new_rows, :new_cols].copy_(page_indices)
 
                     qo_indptr = self.qo_indptr[: bs + 1]
                     qo_indptr[1 : bs + 1] = torch.cumsum(
@@ -1784,7 +1798,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -1806,7 +1820,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     kv_last_page_len,
                     max_q_len,
-                    kv_indptr[-1].item(),
+                    max_kv_len,
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=max_q_len,
@@ -1872,7 +1886,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1938,7 +1952,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                max_kv_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1980,10 +1994,24 @@ class AiterAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
+        k_descale = None
+        v_descale = None
+        if self.kv_cache_dtype == fp8_dtype:
+            k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if self.use_triton_unified_attention:
+                # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+                # both unified attention and sliding window kv pool are active.
+                # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+                # use standard set_kv_buffer, as they lack SWA-specific attributes
+                # like full_to_swa_index_mapping.
+                if (
+                    self.use_triton_unified_attention
+                    and self.use_sliding_window_kv_pool
+                ):
                     token_to_kv_pool = forward_batch.token_to_kv_pool
                     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -2005,13 +2033,15 @@ class AiterAttnBackend(AttentionBackend):
                             if layer.sliding_window_size > 0
                             else None
                         ),
+                        k_scale=k_descale,
+                        v_scale=v_descale,
                     )
 
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer, cache_loc, k, v, k_descale, v_descale
                     )
 
         if self.use_mla:
@@ -2180,12 +2210,8 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_indptr=reduce_indptr,
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
-                    q_scale=(
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    ),
-                    kv_scale=(
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    ),
+                    q_scale=k_descale,
+                    kv_scale=k_descale,
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
@@ -2238,12 +2264,8 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr=reduce_indptr,
                         reduce_final_map=reduce_final_map,
                         reduce_partial_map=reduce_partial_map,
-                        q_scale=(
-                            layer.k_scale if layer.k_scale is not None else self.k_scale
-                        ),
-                        kv_scale=(
-                            layer.k_scale if layer.k_scale is not None else self.k_scale
-                        ),
+                        q_scale=k_descale,
+                        kv_scale=k_descale,
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
@@ -2273,12 +2295,8 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr=reduce_indptr,
                         reduce_final_map=reduce_final_map,
                         reduce_partial_map=reduce_partial_map,
-                        q_scale=(
-                            layer.k_scale if layer.k_scale is not None else self.k_scale
-                        ),
-                        kv_scale=(
-                            layer.k_scale if layer.k_scale is not None else self.k_scale
-                        ),
+                        q_scale=k_descale,
+                        kv_scale=k_descale,
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
@@ -2327,21 +2345,22 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
+            # To keep the mha_batch_prefill_func function parameters
+            # declare the necessary parameter and assign None as default value
+            q_descale = None
+
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
+                q = q.to(fp8_dtype)
+                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
 
             window_size = (-1, -1)
             page_table = self.forward_metadata.kv_indices
 
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
-                # page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                #    page_table
-                # )
-                page_table = self.forward_metadata.swa_page_table
+                if self.forward_metadata.swa_page_table is not None:
+                    page_table = self.forward_metadata.swa_page_table
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -2359,6 +2378,9 @@ class AiterAttnBackend(AttentionBackend):
                 return_attn_probs=False,
                 window_size=window_size,
                 sink_ptr=sinks,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -2384,8 +2406,19 @@ class AiterAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q, dtype=self.input_dtype)
 
+        k_descale = None
+        v_descale = None
+        if self.kv_cache_dtype == fp8_dtype:
+            k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+
         if save_kv_cache:
-            if self.use_triton_unified_attention:
+            # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+            # both unified attention and sliding window kv pool are active.
+            # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+            # use standard set_kv_buffer, as they lack SWA-specific attributes
+            # like full_to_swa_index_mapping.
+            if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -2403,6 +2436,8 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     forward_batch.out_cache_loc,
                     slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
+                    k_scale=k_descale,
+                    v_scale=v_descale,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -2439,8 +2474,8 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_indptr=reduce_indptr,
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
-                q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
-                kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                q_scale=k_descale,
+                kv_scale=k_descale,
                 intra_batch_mode=intra_batch_mode,
                 num_kv_splits=num_kv_splits,
             )
@@ -2450,13 +2485,6 @@ class AiterAttnBackend(AttentionBackend):
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-
-            # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                dtype = q.dtype
-
-                k_cache = k_cache.to(dtype)
-                v_cache = v_cache.to(dtype)
 
             if self.use_triton_unified_attention:
 
@@ -2469,9 +2497,10 @@ class AiterAttnBackend(AttentionBackend):
                     and layer.sliding_window_size > -1
                 ):
                     window_size = (layer.sliding_window_size - 1, 0)
-                    page_table = self.forward_metadata.swa_page_table
+                    if self.forward_metadata.swa_page_table is not None:
+                        page_table = self.forward_metadata.swa_page_table
 
-                o = torch.empty_like(q)
+                o = torch.empty_like(q, dtype=self.input_dtype)
 
                 max_kv_len = page_table.shape[1]
 
@@ -2494,11 +2523,15 @@ class AiterAttnBackend(AttentionBackend):
                     block_table=page_table,
                     softcap=0,
                     q_descale=None,
-                    k_descale=None,
-                    v_descale=None,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
                     sinks=sinks,
                 )
             else:
+                if self.kv_cache_dtype == fp8_dtype:
+                    k_cache = k_cache.to(self.input_dtype)
+                    v_cache = v_cache.to(self.input_dtype)
+
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     self.workspace_buffer,
@@ -2608,10 +2641,7 @@ class AiterIndicesUpdaterPrefill:
             token_num = kv_indptr[-1]
             kv_indices[token_num:] = kv_indices[0]
 
-            self.max_kv_len = torch.max(paged_kernel_lens).item()
-
             extend_lens = seq_lens - prefix_lens
-            self.max_q_len = torch.max(extend_lens).item()
 
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
@@ -2846,7 +2876,7 @@ class AiterMultiStepDraftBackend:
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
-                seq_lens_cpu=None,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)

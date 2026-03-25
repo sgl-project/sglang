@@ -139,6 +139,7 @@ import functools
 import os
 import random
 import shutil
+import sys
 import tempfile
 import threading
 from collections.abc import Callable
@@ -671,4 +672,4 @@ class TestUpdateWeightsFromDiskWithOffload(_UpdateWeightsApiMixin):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

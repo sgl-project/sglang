@@ -380,6 +380,9 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     bool disable_grouping,
     at::ScalarType out_dtype);
 
+// [NOTE] When registering kernels, we should accurately describe the in-place information.
+// Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
+// will be modified in-place to avoid incorrect fusing and execution order on graph mode.
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
