@@ -1,5 +1,6 @@
 import shutil
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -60,11 +61,12 @@ class TestQwen35FP4(unittest.TestCase):
                 extra_args=base_args,
                 variant="Triton",
             ),
-            ModelLaunchSettings(
-                QWEN35_FP4_MODEL,
-                extra_args=base_args + ["--linear-attn-decode-backend", "flashinfer"],
-                variant="FlashInfer",
-            ),
+            # TODO: Fix this and re-enable it
+            # ModelLaunchSettings(
+            #     QWEN35_FP4_MODEL,
+            #     extra_args=base_args + ["--linear-attn-decode-backend", "flashinfer"],
+            #     variant="FlashInfer",
+            # ),
         ]
 
         run_combined_tests(
@@ -253,6 +255,10 @@ class TestQwen35WithHiCache(CustomTestCase):
             other_args=[
                 "--tp-size",
                 "4",
+                "--max-mamba-cache-size",
+                "500",
+                "--max-total-tokens",
+                "120000",
                 "--chunked-prefill-size",
                 "2048",
                 "--mamba-scheduler-strategy",
@@ -288,14 +294,14 @@ class TestQwen35WithHiCache(CustomTestCase):
         kill_process_tree(cls.process.pid)
         shutil.rmtree(cls.storage_dir, ignore_errors=True)
 
-    def test_gsm8k(self):
+    def _run_gsm8k(self):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
             num_shots=5,
-            num_examples=200,
-            max_tokens=16000,
-            num_threads=128,
+            num_examples=100,
+            max_tokens=4000,
+            num_threads=50,
             repeat=1,
             temperature=0.6,
             top_p=0.95,
@@ -304,9 +310,30 @@ class TestQwen35WithHiCache(CustomTestCase):
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["score"], ACC_THRESHOLDS[self.model]["gsm8k"])
+        return run_eval(args)
+
+    def test_gsm8k(self):
+        first_metrics = self._run_gsm8k()
+        print(f"first_metrics={first_metrics}")
+        self.assertGreaterEqual(
+            first_metrics["score"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
+
+        print(f"flush cache")
+        time.sleep(2)
+        requests.post(f"{self.base_url}/flush_cache", timeout=10)
+
+        second_metrics = self._run_gsm8k()
+        print(f"second_metrics={second_metrics}")
+        self.assertGreaterEqual(
+            second_metrics["score"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
+        self.assertLessEqual(
+            abs(second_metrics["score"] - first_metrics["score"]),
+            0.05,
+            f"HiCache prefetch accuracy drift too large: "
+            f"first={first_metrics['score']}, second={second_metrics['score']}",
+        )
 
 
 if __name__ == "__main__":

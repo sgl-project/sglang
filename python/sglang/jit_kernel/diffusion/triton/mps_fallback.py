@@ -94,27 +94,6 @@ def fuse_scale_shift_kernel_native(
     return x * (scale_constant + scale) + shift
 
 
-def fuse_scale_shift_gate_select01_kernel_native(
-    x: torch.Tensor,
-    scale0: torch.Tensor,
-    shift0: torch.Tensor,
-    gate0: torch.Tensor,
-    scale1: torch.Tensor,
-    shift1: torch.Tensor,
-    gate1: torch.Tensor,
-    index: torch.Tensor,
-    block_l: int = 128,
-    block_c: int = 128,
-):
-    """Native fallback for fuse_scale_shift_gate_select01_kernel."""
-    idx = index.unsqueeze(-1).bool()
-    scale = torch.where(idx, scale1.unsqueeze(1), scale0.unsqueeze(1))
-    shift = torch.where(idx, shift1.unsqueeze(1), shift0.unsqueeze(1))
-    gate = torch.where(idx, gate1.unsqueeze(1), gate0.unsqueeze(1))
-    y = x * (1 + scale) + shift
-    return y, gate
-
-
 def apply_rotary_embedding_native(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:

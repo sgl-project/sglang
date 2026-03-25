@@ -649,7 +649,7 @@ class SamplingParams:
         add_argument(
             "--prompt-path",
             type=str,
-            help="Path to a text file containing the prompt",
+            help="Path to a text file containing prompts (one per line)",
         )
         add_argument(
             "--output-file-name",
@@ -743,6 +743,12 @@ class SamplingParams:
             type=float,
             dest="guidance_scale_2",
             help="Secondary guidance scale for dual-guidance models (e.g., Wan low-noise expert)",
+        )
+        add_argument(
+            "--true-cfg-scale",
+            type=float,
+            dest="true_cfg_scale",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
         )
         add_argument(
             "--guidance-rescale",
