@@ -38,7 +38,6 @@ class TestKimiK25(unittest.TestCase):
             "--speculative-num-steps=3",
             "--speculative-eagle-topk=1",
             "--speculative-num-draft-tokens=4",
-            "--mem-frac=0.85",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
