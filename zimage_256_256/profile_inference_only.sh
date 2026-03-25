@@ -1,8 +1,8 @@
 #!/bin/bash
 # Profile ONLY inference (skip warmup) using cudaProfilerApi.
 #
-# This uses nsys --capture-range=cudaProfilerApi so profiling is
-# precisely controlled by the Python script's cudaProfilerStart/Stop.
+# Uses nsys --capture-range=cudaProfilerApi so profiling is precisely
+# controlled by cudaProfilerStart/Stop in the Python script.
 # No guessing on --delay.
 #
 # Usage:
@@ -19,6 +19,7 @@ export SGLANG_ENABLE_JIT_DEEPGEMM=1
 NSYS_OUT_DIR=/mnt/geminihzceph/rhyshen/profiles/zimage_256_256/zimage_bench/nsys
 NSYS_OUT="$NSYS_OUT_DIR/fp8_inference_only_256"
 mkdir -p "$NSYS_OUT_DIR"
+mkdir -p "$NSYS_OUT_DIR/csv"
 
 echo "============================================================"
 echo "nsys profile with cudaProfilerApi capture range"

@@ -13,6 +13,7 @@ This script:
   5. cudaProfilerStop()
 
 Usage:
+  SGLANG_ENABLE_JIT_DEEPGEMM=1 \
   nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop \
     -t cuda -o /path/to/output -f true \
     python zimage_256_256/profile_inference_only.py
@@ -22,6 +23,8 @@ Usage:
     | grep -i transpose
 """
 
+import os
+
 import torch
 
 # Must be before any sglang import that triggers CUDA
@@ -29,8 +32,9 @@ torch.cuda.init()
 
 from sglang import DiffGenerator
 
-MODEL = "/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo"
-TRANSFORMER_PATH = f"{MODEL}/transformer-FP8-block128"
+MODEL = os.environ.get(
+    "SGLANG_MODEL_PATH", "/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo"
+)
 PROMPT = "A beautiful sunset over the ocean with golden clouds"
 HEIGHT = 256
 WIDTH = 256
@@ -39,14 +43,31 @@ print("=" * 60)
 print("Profile Inference Only (cudaProfilerApi)")
 print("=" * 60)
 
-# 1. Create generator with warmup
-print("\n[1] Creating DiffGenerator (includes JIT warmup)...")
-gen = DiffGenerator.from_pretrained(
+# Build kwargs — use transformer_weights_path (the ServerArgs field name)
+gen_kwargs = dict(
     model_path=MODEL,
-    transformer_path=TRANSFORMER_PATH,
     text_encoder_precisions="bf16",
     warmup=True,
 )
+
+# Auto-detect FP8 transformer weights
+transformer_path = os.environ.get("SGLANG_TRANSFORMER_WEIGHTS_PATH")
+if not transformer_path:
+    default_fp8 = os.path.join(MODEL, "transformer-FP8-block128")
+    if os.path.exists(default_fp8):
+        transformer_path = default_fp8
+
+if transformer_path:
+    gen_kwargs["transformer_weights_path"] = transformer_path
+    print(f"  FP8 transformer: {transformer_path}")
+else:
+    print(f"  No FP8 transformer found, using BF16")
+
+print(f"  Model: {MODEL}")
+
+# 1. Create generator with warmup
+print("\n[1] Creating DiffGenerator (includes JIT warmup)...")
+gen = DiffGenerator.from_pretrained(**gen_kwargs)
 
 # 2. Warmup inference (not profiled)
 print("\n[2] Running warmup inference (not profiled)...")
