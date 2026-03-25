@@ -56,10 +56,25 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      - name: Build sgl-kernel locally for PyTorch 2.11 compatibility
+        timeout-minutes: 30
+        run: |
+          pip install "cmake>=3.26"
+          cd sgl-kernel
+          pip install scikit-build-core>=0.10 ninja wheel numpy uv
+          pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu129
+          make build
+          for whl in dist/sgl_kernel-*-linux_x86_64.whl; do
+            if [ -f "$whl" ]; then
+              newname=$(echo "$whl" | sed 's/linux_x86_64/manylinux2014_x86_64/')
+              mv "$whl" "$newname"
+            fi
+          done
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=true bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
         timeout-minutes: 30
@@ -108,10 +123,25 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
+      - name: Build sgl-kernel locally for PyTorch 2.11 compatibility
+        timeout-minutes: 30
+        run: |
+          pip install "cmake>=3.26"
+          cd sgl-kernel
+          pip install scikit-build-core>=0.10 ninja wheel numpy uv
+          pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu129
+          make build
+          for whl in dist/sgl_kernel-*-linux_x86_64.whl; do
+            if [ -f "$whl" ]; then
+              newname=$(echo "$whl" | sed 's/linux_x86_64/manylinux2014_x86_64/')
+              mv "$whl" "$newname"
+            fi
+          done
+
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=true bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run benchmark tests
         timeout-minutes: 45
