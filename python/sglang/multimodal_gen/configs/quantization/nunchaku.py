@@ -28,7 +28,6 @@ class NunchakuArgsResolution:
     nunchaku_config: NunchakuConfig | None = None
 
 
-
 @dataclass
 class NunchakuSVDQuantArgs:
     """CLI-facing configuration for Nunchaku (SVDQuant) inference.

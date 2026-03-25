@@ -276,9 +276,9 @@ class ServerArgs:
 
     def _adjust_quant_config(self):
         """
-            resolve, validate and adjust quantization config
+        resolve, validate and adjust quantization config
 
-            handles only nunchaku for now
+        handles only nunchaku for now
         """
 
         ncfg = self.nunchaku_config

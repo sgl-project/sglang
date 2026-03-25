@@ -8,9 +8,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.registry import _get_config_info
-from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
-    NunchakuConfig,
-)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
