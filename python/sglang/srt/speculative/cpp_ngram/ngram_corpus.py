@@ -25,7 +25,7 @@ ngram_corpus_cpp = load(
 class NgramCorpus:
     def __init__(
         self,
-        branch_length=18,
+        max_trie_depth=18,
         min_match_window_size=1,
         max_match_window_size=10,
         min_bfs_breadth=1,
@@ -35,7 +35,7 @@ class NgramCorpus:
         capacity=1000000,
     ):
         param = ngram_corpus_cpp.Param()
-        param.branch_length = branch_length
+        param.max_trie_depth = max_trie_depth
         param.min_match_window_size = min_match_window_size
         param.max_match_window_size = max_match_window_size
         param.min_bfs_breadth = min_bfs_breadth
@@ -131,7 +131,7 @@ if __name__ == "__main__":
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         [1, 2, 3, 44, 55, 66, 77, 88, 99, 100],
     ]
-    corpus = NgramCorpus(branch_length=12, draft_token_num=8)
+    corpus = NgramCorpus(max_trie_depth=12, draft_token_num=8)
     corpus.batch_put(token_ids)
 
     corpus.synchronize()

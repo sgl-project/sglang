@@ -18,6 +18,7 @@ import itertools
 import logging
 import os
 import subprocess
+import sys
 from typing import Optional
 
 import pytest
@@ -29,6 +30,19 @@ import sglang.srt.distributed.parallel_state as ps
 from sglang.jit_kernel.all_reduce import AllReduceAlgo
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=120,
+    suite="stage-b-kernel-unit-1-gpu-large",
+    disabled="requires multi-GPU distributed setup",
+)
+register_cuda_ci(
+    est_time=120,
+    suite="nightly-kernel-1-gpu",
+    nightly=True,
+    disabled="requires multi-GPU distributed setup",
 )
 
 # ---------------------------------------------------------------------------
@@ -224,4 +238,7 @@ def worker_main() -> None:
 
 
 if __name__ == "__main__":
-    worker_main()
+    if "LOCAL_RANK" in os.environ:
+        worker_main()
+    else:
+        sys.exit(pytest.main([__file__, "-v", "-s"]))
