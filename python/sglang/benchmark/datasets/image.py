@@ -196,7 +196,11 @@ def create_mm_data_row(
             padding=False,
             return_tensors="pt",
         )["input_ids"].numel()
-    except Exception:
+    except Exception as e:
+        print(
+            f"Error computing text-only tokens via processor: {e}, "
+            "falling back to tokenizer.encode"
+        )
         text_prompt_len = len(tokenizer_to_use.encode(text_only_prompt))
 
     # Vision tokens = total tokens - text tokens
