@@ -559,6 +559,18 @@ Response:
 | `GET` | `/wasm` | List WASM modules |
 | `DELETE` | `/wasm/{module_uuid}` | Remove WASM module |
 
+`/flush_cache` parameters:
+
+| Name | In | Type | Default | Unit | Description |
+|------|----|------|---------|------|-------------|
+| `timeout` | query | `float` | `0` | seconds | Wait time for idle state before flushing. `0` means fail fast if not idle. |
+
+`/flush_cache` example:
+
+```bash
+curl -s -X POST "http://127.0.0.1:30000/flush_cache?timeout=30"
+```
+
 ---
 
 ## Load Balancing Policies
