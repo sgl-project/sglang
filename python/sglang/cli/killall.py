@@ -198,6 +198,9 @@ def _find_sglang_pids_by_name():
 
     Scans /proc/*/cmdline for patterns matching known SGLang entry points.
     Equivalent to: pgrep -f 'sglang::|sglang.launch_server|...'
+
+    Safe in shared-GPU containers: without --pid=host, /proc only exposes
+    processes in our own PID namespace, so this cannot kill other containers.
     """
     my_pid = os.getpid()
     pids = set()
