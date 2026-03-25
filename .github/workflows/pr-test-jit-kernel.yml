@@ -62,14 +62,11 @@ jobs:
           cd test/
           python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large
 
-  stage-b-kernel-unit-8-gpu-h200:
+  jit-kernel-multigpu-unit-test:
     if: |
-      inputs.target_stage == 'stage-b-kernel-unit-8-gpu-h200' ||
-      (
-        github.event_name != 'schedule' &&
-        inputs.test_parallel_dispatch != 'true' &&
-        !inputs.target_stage
-      )
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != 'true' &&
+      !inputs.target_stage
     runs-on: 8-gpu-h200
     timeout-minutes: 240
     steps:
@@ -90,7 +87,7 @@ jobs:
         timeout-minutes: 45
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-8-gpu-h200 --timeout-per-file 2700
+          python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-8-gpu-h200
 
   jit-kernel-benchmark-test:
     if: |
