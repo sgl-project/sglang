@@ -628,7 +628,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Compute total number of tokens
             if forward_mode.is_decode_or_idle():
                 if spec_info is not None:
-                    total_num_tokens = bs * spec_info.num_draft_tokens
+                    total_num_tokens = bs * self.topk
                 else:
                     total_num_tokens = bs
                 metadata.kv_indices = self.decode_cuda_graph_metadata["kv_indices"]
@@ -770,9 +770,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # Compute total number of tokens
             if forward_batch.forward_mode.is_decode_or_idle():
                 if forward_batch.spec_info is not None:
-                    total_num_tokens = (
-                        batch_size * forward_batch.spec_info.num_draft_tokens
-                    )
+                    total_num_tokens = batch_size * self.topk
                 else:
                     total_num_tokens = batch_size
             elif forward_batch.forward_mode.is_target_verify():
