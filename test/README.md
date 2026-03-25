@@ -81,14 +81,16 @@ Here is an illustration
 
 
 ## Folder organization
-- `registered`: The registered test files. They are run in CI. Most tests should live in this folder. We use a custom registry system with a file as the basic unit.
+- `registered`: The registered test files. They are run in CI. Most tests should live in this folder. The main exception is JIT kernel coverage, which lives under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`.
 - `manual`: Test files that CI does not run; you run them manually. Typically, these are temporary tests, deprecated tests, or tests that are not suitable for CI—such as those that take too long or require special setup. We would still like to keep some files here for anyone who wants to run them locally.
-- `run_suite.py`: The launch script to run a test suite.
+- `run_suite.py`: The launch script to run a test suite. It scans `test/registered/` and also the JIT kernel test / benchmark directories.
 - Other: utility scripts and metadata folders. The `srt` folder holds our legacy CI setup and should be deprecated as soon as possible.
 
 Because the system uses a custom registry and the `run_suite.py` launcher, it supports both Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) and the popular [pytest](https://docs.pytest.org/en/stable/) framework.
 The basic unit is a file, and you can use either framework in your file.
-The launcher runs `python filename.py` to execute tests, so make sure your file includes the following lines. Otherwise, CI will not run it.
+The launcher runs `python filename.py -f` to execute tests with **failfast enabled by default** — the first test method failure stops the file immediately. This avoids wasting CI time on remaining tests after a failure.
+
+Make sure your file ends with **exactly** one of the following blocks. Do not add custom `argparse` or modify `sys.argv` before calling `unittest.main()` / `pytest.main()` — the CI runner appends `-f` for failfast, and custom argument parsing will break it.
 
 ```python
 # for unittest
@@ -112,6 +114,9 @@ python3 test/registered/core/test_srt_endpoint.py
 
 # Run a single test
 python3 test/registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode
+
+# Run a single JIT kernel test file
+python3 python/sglang/jit_kernel/tests/test_add_constant.py
 ```
 
 ### Run a suite with multiple files
@@ -136,8 +141,9 @@ python test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-small \
 
 ## CI Registry System
 
-Tests in `test/registered/` use a registry-based CI system for flexible backend/schedule configuration.
-For every test file you add, you need to register it in a suite and provide an estimate execution time in seconds.
+CI-discovered tests use a registry-based CI system for flexible backend and schedule configuration.
+This includes files under `test/registered/` and, for JIT kernels, files under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`.
+For every CI-discovered file you add, you need to register it in a suite and provide an estimated execution time in seconds.
 
 ### Registration Functions
 
@@ -170,6 +176,26 @@ register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small", disabled="flaky - see #12345")
 ```
 
+### JIT kernel exception
+
+JIT kernel files are discovered by `test/run_suite.py`, but they do not live under `test/registered/`:
+
+- Correctness tests: `python/sglang/jit_kernel/tests/test_*.py`
+- Benchmarks: `python/sglang/jit_kernel/benchmark/bench_*.py`
+
+Use dedicated kernel suites:
+
+```python
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
+# Optional nightly registration
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+```
+
+Keep `est_time` and `suite` as literal values. `run_suite.py` collects them by statically parsing the file AST.
+
 ## Available Suites
 
 You can find the available suites for each hardware backend at [`test/run_suite.py`](run_suite.py) (`PER_COMMIT_SUITES`, `NIGHTLY_SUITES`). Here we briefly describe some suites.
@@ -183,6 +209,8 @@ You can find the available suites for each hardware backend at [`test/run_suite.
 | `stage-b-test-1-gpu-large` | `1-gpu-h100` | Tests that need H100-class memory or kernels (e.g. FA3) |
 | `stage-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP-style workloads) on H100 |
 | `stage-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (e.g. SM100+ paths) on four GPUs |
+| `stage-b-kernel-unit-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
+| `stage-b-kernel-benchmark-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `python/sglang/jit_kernel/benchmark/` |
 | `stage-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
 | `stage-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
 | `stage-c-test-8-gpu-h20` | `8-gpu-h20` | Large 8-GPU H20 runs for big models |
@@ -213,6 +241,7 @@ Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not 
 Nightly registry suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](run_suite.py). They are not driven by `pr-test.yml` / `pr-test-amd*.yml`; see workflows such as `nightly-test-nvidia.yml` and `nightly-test-amd.yml`. Examples:
 
 - `nightly-1-gpu` (CUDA)
+- `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
 - `nightly-8-gpu-h200` (CUDA)
 - `nightly-eval-vlm-2-gpu` (CUDA)
 - `nightly-amd` (AMD)
@@ -225,6 +254,7 @@ Use the lightest suite that still meets your test's needs.
 - Prefer the CPU suite (`stage-a-test-cpu`) when no GPU is required.
 - For most small GPU workloads that fit a 5090-class card in CI, use `stage-b-test-1-gpu-small`. Most tests should go here.
 - If you really need more GPU memory capacity or Hopper-specific features, use `stage-b-test-1-gpu-large`.
+- For JIT kernel work under `python/sglang/jit_kernel/`, use `stage-b-kernel-unit-1-gpu-large` for correctness tests and `stage-b-kernel-benchmark-1-gpu-large` for benchmarks.
 - Use multi-GPU suites only when the test actually needs multiple GPUs or other advanced multi-GPU behavior.
 
 In rare cases, if you need a new runner or custom setup, you might need to add a new suite.
