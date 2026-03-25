@@ -19,7 +19,7 @@ import torch
 warnings.filterwarnings("ignore")
 
 
-def setup_segments(num_segments: int, segment_size: int = 1024 * 1024) -> None:
+def setup_segments(num_segments: int, segment_size: int = 1024 * 1024):
     """
     Allocate a specified number of segments using the NCCL allocator.
     """
@@ -130,7 +130,6 @@ def bench_with_various_segment_counts(
 
     for num_segments in segment_counts:
         # Clean up previous segments
-        del all_tensors
         all_tensors = []
 
         # Force garbage collection to free previous segments
