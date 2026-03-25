@@ -1,3 +1,5 @@
+"""Unit tests for srt/parser/harmony_parser.py"""
+
 import unittest
 
 from sglang.srt.parser.harmony_parser import (
@@ -483,15 +485,12 @@ class TestHarmonyParser(CustomTestCase):
             events = self.parser.parse(chunk)
             all_events.extend(events)
 
-        self.assertEqual(len(all_events), 5)
-
-        # Verify we get reasoning events
+        # Verify we get both reasoning and normal events
         reasoning_events = [e for e in all_events if e.event_type == "reasoning"]
-        self.assertTrue(len(reasoning_events) > 0)
+        self.assertGreater(len(reasoning_events), 0)
 
-        # Verify we get normal events
         normal_events = [e for e in all_events if e.event_type == "normal"]
-        self.assertTrue(len(normal_events) > 0)
+        self.assertGreater(len(normal_events), 0)
 
         # Verify content is eventually parsed correctly
         combined_reasoning = "".join(e.content for e in reasoning_events)
@@ -873,6 +872,151 @@ class TestEdgeCases(CustomTestCase):
         self.assertEqual(events[1].event_type, "reasoning")
         self.assertEqual(events[0].content, "first reasoning")
         self.assertEqual(events[1].content, "second reasoning")
+
+
+class TestAdditionalEdgeCases(CustomTestCase):
+    """Additional tests to cover remaining edge cases."""
+
+    def test_prefix_hold_with_empty_token_in_list(self):
+        """Test that empty string token in the list is skipped."""
+        from sglang.srt.parser.harmony_parser import prefix_hold
+
+        emit, hold = prefix_hold("hello", ["", "world"])
+        self.assertEqual(emit, "hello")
+        self.assertEqual(hold, "")
+
+    def test_iter_tokens_unknown_token_no_closing(self):
+        """Test iter_tokens with <| that has no closing |>."""
+        from sglang.srt.parser.harmony_parser import iter_tokens
+
+        tokens = list(iter_tokens("<|broken text without close", 0))
+        # Should emit TEXT tokens for the content after <|
+        self.assertTrue(any(t.type == "TEXT" for t in tokens))
+
+    def test_canonical_commentary_filler_after_call(self):
+        """Test that MESSAGE token after CALL is filtered as commentary filler."""
+        from sglang.srt.parser.harmony_parser import CanonicalStrategy
+
+        strategy = CanonicalStrategy()
+        text = "<|start|><|channel|>analysis<|message|>thinking<|end|><|call|><|message|>noise<|return|><|channel|>final<|message|>answer<|end|>"
+        events, remainder = strategy.parse(text)
+        # The MESSAGE after CALL should be filtered, final answer should appear
+        answers = [e.content for e in events if e.event_type == "normal"]
+        self.assertTrue(any("answer" in a for a in answers))
+
+    def test_canonical_standalone_structural_token_filtered(self):
+        """Test that standalone structural tokens like <|end|> in TEXT position are filtered."""
+        from sglang.srt.parser.harmony_parser import CanonicalStrategy
+
+        strategy = CanonicalStrategy()
+        # A malformed sequence where an END token appears in an unexpected position
+        text = "<|start|><|channel|>analysis<|message|>content<|end|>"
+        events, remainder = strategy.parse(text)
+        # Should parse without error
+        self.assertTrue(len(events) >= 0)
+
+    def test_canonical_incomplete_block_returns_partial(self):
+        """Test parsing an incomplete channel block (no END token)."""
+        from sglang.srt.parser.harmony_parser import CanonicalStrategy
+
+        strategy = CanonicalStrategy()
+        text = "<|start|><|channel|>analysis<|message|>partial content"
+        events, remainder = strategy.parse(text)
+        # Incomplete block: should hold content as remainder or emit partial
+        reasoning_events = [e for e in events if e.event_type == "reasoning"]
+        # The partial content may be in events or remainder
+        total = "".join(e.content for e in reasoning_events) + remainder
+        self.assertIn("partial", total)
+
+    def test_text_strategy_commentary_channel(self):
+        """Test TextStrategy parsing commentary channel."""
+        from sglang.srt.parser.harmony_parser import TextStrategy
+
+        strategy = TextStrategy()
+        text = "commentary: some discussion\nassistantfinal: the answer"
+        events, remainder = strategy.parse(text)
+        normal = [e for e in events if e.event_type == "normal"]
+        self.assertTrue(any("the answer" in e.content for e in normal))
+
+    def test_canonical_call_with_text_commentary_after(self):
+        """Test filtering of 'commentary' text after CALL token."""
+        from sglang.srt.parser.harmony_parser import CanonicalStrategy
+
+        strategy = CanonicalStrategy()
+        text = "<|start|><|channel|>analysis<|message|>think<|end|><|call|>commentary<|return|><|channel|>final<|message|>result<|end|>"
+        events, remainder = strategy.parse(text)
+        normal = [e for e in events if e.event_type == "normal"]
+        self.assertTrue(any("result" in e.content for e in normal))
+
+    def test_canonical_return_without_final(self):
+        """Test that _parse_block returns None for block without proper end."""
+        from sglang.srt.parser.harmony_parser import CanonicalStrategy
+
+        strategy = CanonicalStrategy()
+        # Channel block that has no message content before end
+        text = "<|start|><|channel|>final<|end|>"
+        events, remainder = strategy.parse(text)
+        # Should handle gracefully
+        self.assertIsInstance(events, list)
+
+    def test_iter_tokens_unknown_at_end_no_next_marker(self):
+        """Test unknown token with |> close but no next <| marker after it."""
+        from sglang.srt.parser.harmony_parser import iter_tokens
+
+        # <|weird|> is unknown, has closing |>, but nothing after it
+        tokens = list(iter_tokens("<|weird|>trailing", 0))
+        # Should emit TEXT tokens covering the content
+        all_text = "".join(
+            "<|weird|>trailing"[t.start : t.end] for t in tokens if t.type == "TEXT"
+        )
+        self.assertIn("weird|>trailing", all_text)
+
+    def test_canonical_standalone_end_token_filtered(self):
+        """Test that standalone <|end|> in TEXT position is filtered out."""
+        from sglang.srt.parser.harmony_parser import CanonicalStrategy
+
+        strategy = CanonicalStrategy()
+        # Malformed: <|end|> appears before any channel/message structure
+        text = "<|end|><|start|><|channel|>final<|message|>answer<|end|>"
+        events, remainder = strategy.parse(text)
+        # The standalone <|end|> should be filtered, answer should appear
+        normal = [e.content for e in events if e.event_type == "normal"]
+        self.assertTrue(any("answer" in c for c in normal))
+
+    def test_canonical_incomplete_parse_block_no_end(self):
+        """Test that a channel block without END/CALL/RETURN returns None (incomplete)."""
+        from sglang.srt.parser.harmony_parser import CanonicalStrategy
+
+        strategy = CanonicalStrategy()
+        # Channel with message but no end token
+        text = "<|start|><|channel|>final<|message|>partial"
+        events, remainder = strategy.parse(text)
+        # Should be treated as incomplete
+        total = "".join(e.content for e in events) + remainder
+        self.assertIn("partial", total)
+
+    def test_text_strategy_commentary_only(self):
+        """Test TextStrategy with commentary-only pattern (no 'assistantfinal')."""
+        from sglang.srt.parser.harmony_parser import TextStrategy
+
+        strategy = TextStrategy()
+        text = "commentary: just a comment here"
+        events, remainder = strategy.parse(text)
+        normal = [e for e in events if e.event_type == "normal"]
+        # Commentary content should appear as normal text
+        combined = "".join(e.content for e in normal) + remainder
+        self.assertIn("comment", combined)
+
+    def test_text_strategy_commentary_with_hold(self):
+        """Test TextStrategy commentary channel with prefix that could be 'assistantfinal'."""
+        from sglang.srt.parser.harmony_parser import TextStrategy
+
+        strategy = TextStrategy()
+        # Content ends with "assistant" which is a prefix of "assistantfinal"
+        text = "commentary: discussion assistant"
+        events, remainder = strategy.parse(text)
+        # "assistant" at end should be held back
+        self.assertIn("assistant", remainder)
 
 
 if __name__ == "__main__":

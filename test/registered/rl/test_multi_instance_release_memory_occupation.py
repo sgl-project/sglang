@@ -12,7 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -21,6 +21,11 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=64, suite="stage-c-test-4-gpu-h100")
+register_amd_ci(
+    est_time=64,
+    suite="stage-c-test-4-gpu-amd",
+    disabled="torch_memory_saver incompatible with ROCm (libcuda.so.1 not found)",
+)
 
 TEST_SUITE = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
