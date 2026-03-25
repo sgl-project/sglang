@@ -30,7 +30,7 @@ import torch
 # Must be before any sglang import that triggers CUDA
 torch.cuda.init()
 
-from sglang import DiffGenerator
+from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 
 MODEL = os.environ.get(
     "SGLANG_MODEL_PATH", "/mnt/geminihzceph/rhyshen/models/Z-Image-Turbo"
