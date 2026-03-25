@@ -5,6 +5,7 @@ Support attention backend for TRTLLM MHA kernels from flashinfer.
 The kernel supports sm100 only, with sliding window and attention sink features.
 """
 
+import bisect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -170,6 +171,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             assert (
                 self.data_type == torch.float8_e4m3fn
             ), "RoPE+Quant+cache update fusion is only supported for FP8 KV cache dtype"
+
+        self.piecewise_cuda_graph_tokens = (
+            model_runner.server_args.piecewise_cuda_graph_tokens
+            if not model_runner.server_args.disable_piecewise_cuda_graph
+            else None
+        )
 
     def _maybe_translate_swa(
         self, token_indices: torch.Tensor
@@ -772,6 +779,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 total_num_tokens = batch_size * self.speculative_num_draft_tokens
             else:
                 total_num_tokens = forward_batch.extend_num_tokens
+                # For piecewise CUDA graph, we need to find padded token count
+                # to initialize the rope fusion metadata
+                if self.piecewise_cuda_graph_tokens is not None:
+                    idx = bisect.bisect_left(
+                        self.piecewise_cuda_graph_tokens, total_num_tokens
+                    )
+                    if idx < len(self.piecewise_cuda_graph_tokens):
+                        total_num_tokens = self.piecewise_cuda_graph_tokens[idx]
 
             self._init_forward_metadata_for_rope_fusion(
                 metadata, batch_size, total_num_tokens
