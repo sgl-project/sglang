@@ -49,18 +49,18 @@ class TestKimiK25(unittest.TestCase):
         ]
 
         variants = [
-            # ModelLaunchSettings(
-            #     KIMI_K25_MODEL_PATH,
-            #     tp_size=8,
-            #     extra_args=base_args,
-            #     variant="TP8",
-            # ),
-            # ModelLaunchSettings(
-            #     KIMI_K25_MODEL_PATH,
-            #     tp_size=8,
-            #     extra_args=base_args + eagle3_args,
-            #     variant="TP8+MTP",
-            # ),
+            ModelLaunchSettings(
+                KIMI_K25_MODEL_PATH,
+                tp_size=8,
+                extra_args=base_args,
+                variant="TP8",
+            ),
+            ModelLaunchSettings(
+                KIMI_K25_MODEL_PATH,
+                tp_size=8,
+                extra_args=base_args + eagle3_args,
+                variant="TP8+MTP",
+            ),
             ModelLaunchSettings(
                 KIMI_K25_MODEL_PATH,
                 tp_size=8,
