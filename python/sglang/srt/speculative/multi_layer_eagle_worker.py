@@ -85,6 +85,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
+        self.draft_kv_num_steps = self.speculative_num_steps - 1
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.gpu_id = gpu_id
         self.device = server_args.device
