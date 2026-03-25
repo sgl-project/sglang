@@ -19,7 +19,9 @@ class _FakeTokenizer:
 
         tokenized_lengths = [len(text.split()) for text in texts]
         if truncation:
-            tokenized_lengths = [min(length, max_length) for length in tokenized_lengths]
+            tokenized_lengths = [
+                min(length, max_length) for length in tokenized_lengths
+            ]
 
         if padding == "max_length":
             padded_length = max_length
@@ -38,7 +40,11 @@ class _FakeTokenizer:
             input_ids.append(list(range(row_len)))
             attention_mask.append([1] * length + [0] * (row_len - length))
 
-        return {"texts": texts, "input_ids": input_ids, "attention_mask": attention_mask}
+        return {
+            "texts": texts,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
 
 
 class TestFlux2KleinTokenization(unittest.TestCase):
@@ -118,5 +124,3 @@ class TestFlux2KleinTokenization(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-

@@ -706,5 +706,3 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
             return_tensors=return_tensors,
             **tok_kwargs,
         )
-
-
