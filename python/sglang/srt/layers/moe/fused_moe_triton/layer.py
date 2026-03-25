@@ -1464,7 +1464,6 @@ class FlashInferCuteDslMoE(FusedMoE):
             self._cutedsl_input_scale,
             sf_vec_size=self._FP4_SF_VEC_SIZE,
             is_sf_swizzled_layout=False,
-            is_weight=False,
         )
 
         w1_weight_sf = getattr(self, "w13_blockscale_mma", self.w13_blockscale_swizzled)
