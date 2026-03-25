@@ -226,7 +226,8 @@ def _get_cuda_arch_value() -> int:
 
 @cache_once
 def _get_cuda_arch_list() -> str:
-    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""
+    """Return the CUDA arch target string for TVM_FFI_CUDA_ARCH_LIST (e.g. ``8.9``, ``9.0a``, ``10.0a``), appending ``a`` on Hopper+ (CC >= 9.0) for full instruction-set coverage."""
     device = torch.cuda.current_device()
     major, minor = torch.cuda.get_device_capability(device)
-    return f"{major}.{minor}"
+    suffix = "a" if major >= 9 else ""
+    return f"{major}.{minor}{suffix}"
