@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -70,19 +71,6 @@ def _nvfp4_cuda_flags() -> list[str]:
     ]
 
 
-def _parse_cuda_version() -> tuple[int, int]:
-    v = torch.version.cuda
-    if not v:
-        return (0, 0)
-    parts = v.split(".")
-    if len(parts) < 2:
-        return (0, 0)
-    try:
-        return int(parts[0]), int(parts[1])
-    except ValueError:
-        return (0, 0)
-
-
 def _get_nvfp4_cuda_arch_list() -> str:
     if not torch.cuda.is_available():
         raise RuntimeError("NVFP4 JIT kernels require CUDA.")
@@ -93,20 +81,10 @@ def _get_nvfp4_cuda_arch_list() -> str:
         )
     # NVFP4 kernels use architecture-family-specific instructions and must be
     # compiled for `sm_*a` targets (e.g. sm_100a), not plain sm_100.
-    archs = [f"{major}.{minor}a"]
-    cuda_major, _cuda_minor = _parse_cuda_version()
-    if cuda_major >= 13 and "10.3a" not in archs:
-        # Match sgl-kernel AOT fatbin behavior on CUDA 13+ for Blackwell.
-        archs.append("10.3a")
-    # Preserve order while de-duplicating.
-    seen = set()
-    ordered_archs: list[str] = []
-    for arch in archs:
-        if arch in seen:
-            continue
-        seen.add(arch)
-        ordered_archs.append(arch)
-    return " ".join(ordered_archs)
+    # JIT compilation targets only the current device, unlike AOT fat-binaries;
+    # adding extra architectures here would clash with the single SGL_CUDA_ARCH
+    # value injected by load_jit().
+    return f"{major}.{minor}a"
 
 
 @contextmanager
@@ -218,6 +196,7 @@ def _jit_nvfp4_blockwise_moe_module() -> Module:
         )
 
 
+@debug_kernel_api
 def cutlass_scaled_fp4_mm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -234,6 +213,7 @@ def cutlass_scaled_fp4_mm(
     return out
 
 
+@debug_kernel_api
 def cutlass_fp4_group_mm(
     a_fp4: torch.Tensor,
     b_fp4: torch.Tensor,
@@ -313,6 +293,7 @@ def _scaled_fp4_quant_custom_op(
     module.scaled_fp4_quant(output, input, output_scale, input_global_scale)
 
 
+@debug_kernel_api
 def scaled_fp4_quant(
     input: torch.Tensor, input_global_scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -382,6 +363,7 @@ def _scaled_fp4_experts_quant_custom_op(
     )
 
 
+@debug_kernel_api
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -466,6 +448,7 @@ def _scaled_fp4_grouped_quant_custom_op(
     )
 
 
+@debug_kernel_api
 def scaled_fp4_grouped_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -526,6 +509,7 @@ def _silu_and_mul_scaled_fp4_grouped_quant_custom_op(
     )
 
 
+@debug_kernel_api
 def silu_and_mul_scaled_fp4_grouped_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,

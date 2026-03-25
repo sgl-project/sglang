@@ -253,18 +253,18 @@ def handle_rerun_stage(
 
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
-        "stage-a-test-1",
-        "stage-a-cpu-only",
-        "stage-b-test-small-1-gpu",
-        "stage-b-test-large-1-gpu",
-        "stage-b-test-large-2-gpu",
+        "stage-a-test-1-gpu-small",
+        "stage-a-test-cpu",
+        "stage-b-test-1-gpu-small",
+        "stage-b-test-1-gpu-large",
+        "stage-b-test-2-gpu-large",
         "stage-b-test-4-gpu-b200",
         "stage-c-test-4-gpu-h100",
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-4-gpu-b200",
         "stage-c-test-4-gpu-gb200",
-        "stage-c-test-deepep-4-gpu",
+        "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
@@ -274,12 +274,12 @@ def handle_rerun_stage(
     amd_stages = [
         "sgl-kernel-unit-test-amd",
         "sgl-kernel-unit-test-2-gpu-amd",
-        "stage-a-test-1-amd",
-        "stage-b-test-small-1-gpu-amd",
-        "stage-b-test-small-1-gpu-amd-nondeterministic",
-        "stage-b-test-small-1-gpu-amd-mi35x",
-        "stage-b-test-large-1-gpu-amd",
-        "stage-b-test-large-2-gpu-amd",
+        "stage-a-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd-nondeterministic",
+        "stage-b-test-1-gpu-small-amd-mi35x",
+        "stage-b-test-1-gpu-large-amd",
+        "stage-b-test-2-gpu-large-amd",
         "multimodal-gen-test-1-gpu-amd",
         "multimodal-gen-test-2-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
@@ -334,10 +334,12 @@ def handle_rerun_stage(
                 f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
             )
             if is_amd_stage:
-                inputs = {"target_stage": stage_name, "pr_head_sha": pr_head_sha}
+                inputs = {
+                    "target_stage": stage_name,
+                    "pr_head_sha": pr_head_sha,
+                }
             else:
                 inputs = {
-                    "version": "release",
                     "target_stage": stage_name,
                     "pr_head_sha": pr_head_sha,
                 }
@@ -349,7 +351,7 @@ def handle_rerun_stage(
             if is_amd_stage:
                 inputs = {"target_stage": stage_name}
             else:
-                inputs = {"version": "release", "target_stage": stage_name}
+                inputs = {"target_stage": stage_name}
 
         # Record dispatch time before triggering
         dispatch_time = time.time()
@@ -410,23 +412,23 @@ def handle_rerun_stage(
 
 
 CUDA_SUITE_TO_RUNNER = {
-    "stage-a-test-1": "1-gpu-runner",
-    "stage-a-cpu-only": "ubuntu-latest",
-    "stage-b-test-small-1-gpu": "1-gpu-5090",
-    "stage-b-test-large-1-gpu": "1-gpu-runner",
-    "stage-b-test-large-2-gpu": "2-gpu-runner",
+    "stage-a-test-1-gpu-small": "1-gpu-5090",
+    "stage-a-test-cpu": "ubuntu-latest",
+    "stage-b-test-1-gpu-small": "1-gpu-5090",
+    "stage-b-test-1-gpu-large": "1-gpu-h100",
+    "stage-b-test-2-gpu-large": "2-gpu-h100",
     "stage-b-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-8-gpu-h200": "8-gpu-h200",
     "stage-c-test-8-gpu-h20": "8-gpu-h20",
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-deepep-4-gpu": "4-gpu-h100",
+    "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
 }
 
 DEEPEP_SUITES = {
     "stage-c-test-8-gpu-h20",
-    "stage-c-test-deepep-4-gpu",
+    "stage-c-test-deepep-4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200",
 }
 
@@ -513,19 +515,23 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
     Handles the /rerun-ut <file>::<TestClass.test_method> command.
     Dispatches a lightweight workflow to run a single test on the correct CUDA runner.
     """
-    # SECURITY: Block /rerun-ut entirely for fork PRs. This command checks out and
-    # executes code from the PR branch on self-hosted GPU runners, which would bypass
-    # the run-ci label gate that requires maintainer review for fork PRs.
+    # SECURITY: For fork PRs, only allow /rerun-ut if the commenter has write+ permission.
+    # This command checks out and executes code from the PR branch on self-hosted GPU
+    # runners, so we must ensure the commenter is a trusted collaborator.
     is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
     if is_fork:
-        print("Permission denied: /rerun-ut is not allowed on fork PRs.")
-        comment.create_reaction("confused")
-        pr.create_issue_comment(
-            "❌ `/rerun-ut` is not available for fork PRs (security restriction).\n\n"
-            "Please ask a maintainer to add the `run-ci` label and use the normal CI flow, "
-            "or use `/rerun-failed-ci` to rerun workflows that have already passed the gate."
-        )
-        return False
+        commenter = comment.user.login
+        perm = gh_repo.get_collaborator_permission(commenter)
+        if perm not in ("admin", "write"):
+            print(f"Permission denied: /rerun-ut on fork PR by {commenter}.")
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                "❌ `/rerun-ut` is not available for fork PRs unless the commenter "
+                "has write permission on the repo.\n\n"
+                "Please ask a maintainer to run this command, or use the normal CI flow."
+            )
+            return False
+        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
 
     if not (
         user_perms.get("can_rerun_ut", False)

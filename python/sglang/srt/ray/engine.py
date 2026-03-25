@@ -41,26 +41,35 @@ class RaySchedulerInitResult(SchedulerInitResult):
     scheduler_actors: list = dataclasses.field(default_factory=list)
 
 
-def _get_rank0_node_ip(placement_group) -> str:
-    """Get the IP address of the node where rank 0 will run.
-
-    Uses a probe task to discover the IP of the placement group's first bundle node.
-    This is needed because rank 0 starts the TCPStore server for torch.distributed,
-    so dist_init_addr must be the IP of the node where rank 0 runs, not the driver node.
+def _find_engine_bundle(placement_group, nnodes: int) -> tuple[int, str]:
+    """Find which placement group bundle is on the same node as the Engine.
+    Rank0 scheduler must be co-located with the Engine. Returns (bundle_index, engine_ip).
     """
+    engine_ip = ray.util.get_node_ip_address()
 
     @ray.remote(num_cpus=0, num_gpus=0)
     def get_node_ip():
         return ray.util.get_node_ip_address()
 
-    return ray.get(
-        get_node_ip.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=placement_group,
-                placement_group_bundle_index=0,
-            ),
-        ).remote()
+    bundle_ips = ray.get(
+        [
+            get_node_ip.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=placement_group,
+                    placement_group_bundle_index=i,
+                ),
+            ).remote()
+            for i in range(nnodes)
+        ]
     )
+
+    try:
+        return bundle_ips.index(engine_ip), engine_ip
+    except ValueError:
+        raise RuntimeError(
+            f"Engine node {engine_ip} not found in any placement group bundle {bundle_ips}. "
+            f"Rank-0 scheduler must be co-located with the Engine."
+        )
 
 
 class RayEngine(Engine):
@@ -105,13 +114,20 @@ class RayEngine(Engine):
             f"Use {gpus_per_node} GPUs/node, world_size={world_size}"
         )
 
-        rank0_node_ip = _get_rank0_node_ip(pg)
+        # co-located with the Engine and rank0 scheduler at the same node
+        engine_bundle, engine_ip = _find_engine_bundle(pg, nnodes)
+        bundle_for_node = [engine_bundle] + [
+            i for i in range(nnodes) if i != engine_bundle
+        ]
+
+        rank0_node_ip = engine_ip
         dist_init_addr = f"{rank0_node_ip}:{server_args.port + ZMQ_TCP_PORT_DELTA}"
         logger.info(f"dist_init_addr: {dist_init_addr}")
 
         scheduler_actors = []
 
         for node_idx in range(nnodes):
+            bundle_idx = bundle_for_node[node_idx]
             pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
                 nnodes, server_args.pp_size, server_args.tp_size, node_rank=node_idx
             )
@@ -131,7 +147,7 @@ class RayEngine(Engine):
                         name=f"sglang_scheduler_rank0node={rank0_node_ip}_pp{pp_rank}_tp{tp_rank}",
                         scheduling_strategy=PlacementGroupSchedulingStrategy(
                             placement_group=pg,
-                            placement_group_bundle_index=node_idx,
+                            placement_group_bundle_index=bundle_idx,
                         ),
                     ).remote(
                         server_args=server_args,
