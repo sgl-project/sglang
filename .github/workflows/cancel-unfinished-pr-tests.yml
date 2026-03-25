@@ -129,8 +129,8 @@ jobs:
                 labels=$(gh pr view "$pr_number" --repo "$REPO" --json labels \
                   | jq -r '.labels[].name' 2>/dev/null || true)
 
-                if echo "$labels" | grep -Fxq "ci maintain"; then
-                  echo "  🛑 Skipping (ci maintain label, never cancelled)"
+                if echo "$labels" | grep -Fxq "bypass-maintenance"; then
+                  echo "  🛑 Skipping (bypass-maintenance label, never cancelled)"
                   continue
                 fi
 
