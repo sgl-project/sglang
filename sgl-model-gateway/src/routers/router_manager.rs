@@ -407,7 +407,7 @@ impl RouterTrait for RouterManager {
     async fn health_generate(&self, req: Request<Body>) -> Response {
         if !self.enable_igw {
             let router = {
-                let deafult_router = self
+                let default_router = self
                     .default_router
                     .read()
                     .unwrap_or_else(|e| e.into_inner());
