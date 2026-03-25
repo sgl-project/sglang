@@ -1,121 +1,81 @@
-# SGLang diffusion CLI Inference
+# SGLang Diffusion CLI
 
-The SGLang-diffusion CLI provides a quick way to access the inference pipeline for image and video generation.
+Use the CLI for one-off generation with `sglang generate` or to start a persistent HTTP server with `sglang serve`.
 
-## Prerequisites
+## Quick Start
 
-- A working SGLang diffusion installation and the `sglang` CLI available in `$PATH`.
+### Generate
 
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --prompt "A beautiful sunset over the mountains" \
+  --save-output
+```
 
-## Supported Arguments
+### Serve
 
+```bash
+sglang serve \
+  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --num-gpus 4 \
+  --ulysses-degree 2 \
+  --ring-degree 2 \
+  --port 30010
+```
 
-### Server Arguments
+For request and response examples, see [OpenAI-Compatible API](openai_api.md).
 
-- `--model-path {MODEL_PATH}`: Path to the model or model ID
-- `--lora-path {LORA_PATH}`: Path to a LoRA adapter (local path or HuggingFace model ID). If not specified, LoRA will not be applied.
-- `--lora-nickname {NAME}`: Nickname for the LoRA adapter. (default: `default`).
-- `--num-gpus {NUM_GPUS}`: Number of GPUs to use
-- `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
-- `--sp-degree {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
-- `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
-- `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
-- `--attention-backend {BACKEND}`: Attention backend to use. For SGLang-native pipelines use `fa`, `torch_sdpa`, `sage_attn`, etc. For diffusers pipelines use diffusers backend names like `flash`, `_flash_3_hub`, `sage`, `xformers`.
-- `--attention-backend-config {CONFIG}`: Configuration for the attention backend. Can be a JSON string (e.g., '{"k": "v"}'), a path to a JSON/YAML file, or key=value pairs (e.g., "k=v,k2=v2").
-- `--cache-dit-config {PATH}`: Path to a Cache-DiT YAML/JSON config (diffusers backend only)
-- `--dit-precision {DTYPE}`: Precision for the DiT model (currently supports fp32, fp16, and bf16).
+```{tip}
+Use `sglang generate --help` and `sglang serve --help` for the full argument list. The CLI help output is the source of truth for exhaustive flags.
+```
 
-### Quantized Transformers
+## Common Options
+
+### Model and runtime
+
+- `--model-path {MODEL}`: model path or Hugging Face model ID
+- `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
+- `--num-gpus {N}`: number of GPUs to use
+- `--tp-size {N}`: tensor parallelism size, mainly for encoders
+- `--sp-degree {N}`: sequence parallelism size
+- `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
+- `--attention-backend {BACKEND}`: attention backend for native SGLang pipelines
+- `--attention-backend-config {CONFIG}`: attention backend configuration
+
+### Sampling and output
+
+- `--prompt {PROMPT}` and `--negative-prompt {PROMPT}`
+- `--num-inference-steps {STEPS}` and `--seed {SEED}`
+- `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
+- `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
+
+For frame interpolation and upscaling, see [Post-Processing](post_processing.md).
+
+### Quantized transformers
 
 For quantized transformer checkpoints, prefer:
 
-- `--model-path` for the base model (the pipeline)
+- `--model-path` for the base pipeline
 - `--transformer-path` for a quantized `transformers` transformer component folder
 - `--transformer-weights-path` for a quantized safetensors file, directory, or repo
 
-See [Quantization](../quantization.md) for the supported quantization families and examples.
+See [Quantization](../quantization.md) for supported quantization families and examples.
 
+## Configuration Files
 
-### Sampling Parameters
-
-- `--prompt {PROMPT}`: Text description for the video you want to generate
-- `--num-inference-steps {STEPS}`: Number of denoising steps
-- `--negative-prompt {PROMPT}`: Negative prompt to guide generation away from certain concepts
-- `--seed {SEED}`: Random seed for reproducible generation
-
-
-**Image/Video Configuration**
-
-- `--height {HEIGHT}`: Height of the generated output
-- `--width {WIDTH}`: Width of the generated output
-- `--num-frames {NUM_FRAMES}`: Number of frames to generate
-- `--fps {FPS}`: Frames per second for the saved output, if this is a video-generation task
-
-
-**Post-Processing** (frame interpolation & upscaling)
-
-SGLang diffusion supports optional post-processing steps — frame interpolation
-(RIFE) for smoother video and upscaling (Real-ESRGAN) for higher resolution.
-See the dedicated **[Post-Processing](post_processing.md)** page for full
-details, supported models, and examples.
-
-**Output Options**
-
-- `--output-path {PATH}`: Directory to save the generated video
-- `--save-output`: Whether to save the image/video to disk
-- `--return-frames`: Whether to return the raw frames
-
-### Using Configuration Files
-
-Instead of specifying all parameters on the command line, you can use a configuration file:
+Use `--config` to load JSON or YAML configuration. Command-line flags override values from the config file.
 
 ```bash
-sglang generate --config {CONFIG_FILE_PATH}
+sglang generate --config config.yaml
 ```
 
-The configuration file should be in JSON or YAML format with the same parameter names as the CLI options. Command-line arguments take precedence over settings in the configuration file, allowing you to override specific values while keeping the rest from the configuration file.
-
-Example configuration file (config.json):
-
-```json
-{
-    "model_path": "FastVideo/FastHunyuan-diffusers",
-    "prompt": "A beautiful woman in a red dress walking down a street",
-    "output_path": "outputs/",
-    "num_gpus": 2,
-    "sp_size": 2,
-    "tp_size": 1,
-    "num_frames": 45,
-    "height": 720,
-    "width": 1280,
-    "num_inference_steps": 6,
-    "seed": 1024,
-    "fps": 24,
-    "precision": "bf16",
-    "vae_precision": "fp16",
-    "vae_tiling": true,
-    "vae_sp": true,
-    "vae_config": {
-        "load_encoder": false,
-        "load_decoder": true,
-        "tile_sample_min_height": 256,
-        "tile_sample_min_width": 256
-    },
-    "text_encoder_precisions": [
-        "fp16",
-        "fp16"
-    ],
-    "mask_strategy_file_path": null,
-    "enable_torch_compile": false
-}
-```
-
-Or using YAML format (config.yaml):
+Example:
 
 ```yaml
-model_path: "FastVideo/FastHunyuan-diffusers"
-prompt: "A beautiful woman in a red dress walking down a street"
-output_path: "outputs/"
+model_path: FastVideo/FastHunyuan-diffusers
+prompt: A beautiful woman in a red dress walking down a street
+output_path: outputs/
 num_gpus: 2
 sp_size: 2
 tp_size: 1
@@ -125,163 +85,95 @@ width: 1280
 num_inference_steps: 6
 seed: 1024
 fps: 24
-precision: "bf16"
-vae_precision: "fp16"
+precision: bf16
+vae_precision: fp16
 vae_tiling: true
 vae_sp: true
-vae_config:
-  load_encoder: false
-  load_decoder: true
-  tile_sample_min_height: 256
-  tile_sample_min_width: 256
-text_encoder_precisions:
-  - "fp16"
-  - "fp16"
-mask_strategy_file_path: null
 enable_torch_compile: false
 ```
 
+## Generate
 
-To see all the options, you can use the `--help` flag:
+`sglang generate` runs a single generation job and exits when the job finishes.
 
 ```bash
-sglang generate --help
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --text-encoder-cpu-offload \
+  --pin-cpu-memory \
+  --num-gpus 4 \
+  --ulysses-degree 2 \
+  --ring-degree 2 \
+  --prompt "A curious raccoon" \
+  --save-output \
+  --output-path outputs \
+  --output-file-name "a-curious-raccoon.mp4"
 ```
+
+```{note}
+HTTP server-only arguments are ignored by `sglang generate`.
+```
+
+For diffusers pipelines, Cache-DiT can be enabled with `SGLANG_CACHE_DIT_ENABLED=true` or `--cache-dit-config`. See [Cache-DiT](../performance/cache/cache_dit.md).
 
 ## Serve
 
-Launch the SGLang diffusion HTTP server and interact with it using the OpenAI SDK and curl.
-
-### Start the server
-
-Use the following command to launch the server:
+`sglang serve` starts the HTTP server and keeps the model loaded for repeated requests.
 
 ```bash
-SERVER_ARGS=(
-  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers
-  --text-encoder-cpu-offload
-  --pin-cpu-memory
-  --num-gpus 4
-  --ulysses-degree=2
-  --ring-degree=2
-)
-
-sglang serve "${SERVER_ARGS[@]}"
+sglang serve \
+  --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --text-encoder-cpu-offload \
+  --pin-cpu-memory \
+  --num-gpus 4 \
+  --ulysses-degree 2 \
+  --ring-degree 2 \
+  --port 30010
 ```
 
-- **--model-path**: Which model to load. The example uses `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
-- **--port**: HTTP port to listen on (the default here is `30010`).
+### Cloud Storage
 
-For detailed API usage, including Image, Video Generation and LoRA management, please refer to the [OpenAI API Documentation](openai_api.md).
-
-### Cloud Storage Support
-
-SGLang diffusion supports automatically uploading generated images and videos to S3-compatible cloud storage (e.g., AWS S3, MinIO, Alibaba Cloud OSS, Tencent Cloud COS).
-
-When enabled, the server follows a **Generate -> Upload -> Delete** workflow:
-1. The artifact is generated to a temporary local file.
-2. The file is immediately uploaded to the configured S3 bucket in a background thread.
-3. Upon successful upload, the local file is deleted.
-4. The API response returns the public URL of the uploaded object.
-
-**Configuration**
-
-Cloud storage is enabled via environment variables. Note that `boto3` must be installed separately (`pip install boto3`) to use this feature.
+SGLang Diffusion can upload generated images and videos to S3-compatible object storage after generation.
 
 ```bash
-# Enable S3 storage
 export SGLANG_CLOUD_STORAGE_TYPE=s3
 export SGLANG_S3_BUCKET_NAME=my-bucket
 export SGLANG_S3_ACCESS_KEY_ID=your-access-key
 export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
-
-# Optional: Custom endpoint for MinIO/OSS/COS
 export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 ```
 
-See [Environment Variables Documentation](../environment_variables.md) for more details.
-
-## Generate
-
-Run a one-off generation task without launching a persistent server.
-
-To use it, pass both server arguments and sampling parameters in one command, after the `generate` subcommand, for example:
-
-```bash
-SERVER_ARGS=(
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
-  --text-encoder-cpu-offload
-  --pin-cpu-memory
-  --num-gpus 4
-  --ulysses-degree=2
-  --ring-degree=2
-)
-
-SAMPLING_ARGS=(
-  --prompt "A curious raccoon"
-  --save-output
-  --output-path outputs
-  --output-file-name "A curious raccoon.mp4"
-)
-
-sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
-
-# Or, users can set `SGLANG_CACHE_DIT_ENABLED` env as `true` to enable cache acceleration
-SGLANG_CACHE_DIT_ENABLED=true sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
-```
-
-Once the generation task has finished, the server will shut down automatically.
-
-> [!NOTE]
-> The HTTP server-related arguments are ignored in this subcommand.
+See [Environment Variables](../environment_variables.md) for the full set of storage options.
 
 ## Component Path Overrides
 
-SGLang diffusion allows you to override any pipeline component (e.g., `vae`, `transformer`, `text_encoder`) by specifying a custom checkpoint path. This is useful for:
-
-### Example: FLUX.2-dev with Tiny AutoEncoder
-
-You can override **any** component by using `--<component>-path`, where `<component>` matches the key in the model's `model_index.json`:
-
-For example, replace the default VAE with a distilled tiny autoencoder for ~3x faster decoding:
+Override individual pipeline components such as `vae`, `transformer`, or `text_encoder` with `--<component>-path`.
 
 ```bash
 sglang serve \
-  --model-path=black-forest-labs/FLUX.2-dev \
-  # with a Huggingface Repo ID
-  --vae-path=fal/FLUX.2-Tiny-AutoEncoder
-  # or use a local path
-  --vae-path=~/.cache/huggingface/hub/models--fal--FLUX.2-Tiny-AutoEncoder/snapshots/.../vae
+  --model-path black-forest-labs/FLUX.2-dev \
+  --vae-path fal/FLUX.2-Tiny-AutoEncoder
 ```
 
-**Important:**
-- The component key must match the one in your model's `model_index.json` (e.g., `vae`).
-- The path must:
-    - either be a Huggingface Repo ID (e.g., fal/FLUX.2-Tiny-AutoEncoder)
-    - or point to a **complete component folder**, containing `config.json` and safetensors files
-
+The component key must match the key in the model's `model_index.json`, and the path must be either a Hugging Face repo ID or a complete component directory.
 
 ## Diffusers Backend
 
-SGLang diffusion supports a **diffusers backend** that allows you to run any diffusers-compatible model through SGLang's infrastructure using vanilla diffusers pipelines. This is useful for running models without native SGLang implementations or models with custom pipeline classes.
+Use `--backend diffusers` to force vanilla diffusers pipelines when no native SGLang implementation exists or when a model requires a custom pipeline class.
 
-### Arguments
+### Key Options
 
 | Argument | Values | Description |
 |----------|--------|-------------|
-| `--backend` | `auto` (default), `sglang`, `diffusers` | `auto`: prefer native SGLang, fallback to diffusers. `sglang`: force native (fails if unavailable). `diffusers`: force vanilla diffusers pipeline. |
-| `--diffusers-attention-backend` | `flash`, `_flash_3_hub`, `sage`, `xformers`, `native` | Attention backend for diffusers pipelines. See [diffusers attention backends](https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends). |
-| `--trust-remote-code` | flag | Required for models with custom pipeline classes (e.g., Ovis). |
-| `--vae-tiling` | flag | Enable VAE tiling for large image support (decodes tile-by-tile). |
-| `--vae-slicing` | flag | Enable VAE slicing for lower memory usage (decodes slice-by-slice). |
-| `--dit-precision` | `fp16`, `bf16`, `fp32` | Precision for the diffusion transformer. |
-| `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision for the VAE. |
-| `--enable-torch-compile` | flag | Enable `torch.compile` for diffusers pipelines. |
-| `--cache-dit-config` | `{PATH}` | Path to a Cache-DiT YAML/JSON config file for accelerating diffusers pipelines with Cache-DiT. |
+| `--backend` | `auto`, `sglang`, `diffusers` | Choose native SGLang, force native, or force diffusers |
+| `--diffusers-attention-backend` | `flash`, `_flash_3_hub`, `sage`, `xformers`, `native` | Attention backend for diffusers pipelines |
+| `--trust-remote-code` | flag | Required for models with custom pipeline classes |
+| `--vae-tiling` and `--vae-slicing` | flag | Lower memory usage for VAE decode |
+| `--dit-precision` and `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision controls |
+| `--enable-torch-compile` | flag | Enable `torch.compile` |
+| `--cache-dit-config` | `{PATH}` | Cache-DiT config for diffusers pipelines |
 
-### Example: Running Ovis-Image-7B
-
-[Ovis-Image-7B](https://huggingface.co/AIDC-AI/Ovis-Image-7B) is a 7B text-to-image model optimized for high-quality text rendering.
+### Example
 
 ```bash
 sglang generate \
@@ -298,25 +190,4 @@ sglang generate \
   --output-file-name ovis_garden.png
 ```
 
-### Extra Diffusers Arguments
-
-For pipeline-specific parameters not exposed via CLI, use `diffusers_kwargs` in a config file:
-
-```json
-{
-    "model_path": "AIDC-AI/Ovis-Image-7B",
-    "backend": "diffusers",
-    "prompt": "A beautiful landscape",
-    "diffusers_kwargs": {
-        "cross_attention_kwargs": {"scale": 0.5}
-    }
-}
-```
-
-```bash
-sglang generate --config config.json
-```
-
-### Cache-DiT Acceleration
-
-Users who use the diffusers backend can also leverage Cache-DiT acceleration and load custom cache configs from a YAML file to boost performance of diffusers pipelines. See the [Cache-DiT Acceleration](https://docs.sglang.io/diffusion/performance/cache/cache_dit.html) documentation for details.
+For pipeline-specific arguments not exposed in the CLI, pass `diffusers_kwargs` in a config file.
