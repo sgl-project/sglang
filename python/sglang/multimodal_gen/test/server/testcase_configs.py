@@ -798,6 +798,18 @@ if not current_platform.is_hip():
         )
     )
 
+# TODO: enable on 4090/5090/b200
+ONE_GPU_CASES_C = [
+    DiffusionTestCase(
+        "flux_2_nvfp4_t2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev-NVFP4",
+            modality="image",
+        ),
+        T2I_sampling_params,
+    )
+]
+
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
