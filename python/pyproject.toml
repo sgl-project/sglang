@@ -19,6 +19,7 @@ dependencies = [
   "aiohttp",
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
+  "arctic-inference==0.1.1",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",

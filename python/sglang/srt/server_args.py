@@ -507,6 +507,14 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_max_trie_depth: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    # For suffix decoding only
+    speculative_suffix_max_tree_depth: int = 24
+    speculative_suffix_max_cached_requests: int = 10000
+    speculative_suffix_max_spec_factor: float = 1.0
+    speculative_suffix_min_token_prob: float = 0.1
+
+    # Sampling for suffix/ngram on AMD
+    enable_speculative_sampling: bool = False
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -3084,6 +3092,73 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm == "SUFFIX":
+            # Validate Arctic Inference availability
+            from sglang.srt.utils.common import is_arctic_inference_available
+
+            if not is_arctic_inference_available():
+                raise ImportError(
+                    "Arctic Inference is required for suffix decoding. "
+                    "Install via: pip install arctic-inference==0.1.1"
+                )
+
+            if not self.device.startswith("cuda"):
+                raise ValueError("Suffix decoding only supports CUDA device.")
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for suffix decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            self.enable_mixed_chunk = False
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = (
+                    self.speculative_suffix_max_tree_depth
+                )
+                logger.warning(
+                    f"Defaulted speculative_num_draft_tokens to {self.speculative_suffix_max_tree_depth} for suffix decoding."
+                )
+            logger.warning(
+                "The overlap scheduler and mixed chunked prefill are disabled because of "
+                "using suffix decoding."
+            )
+
+            if self.speculative_suffix_max_tree_depth < 1:
+                raise ValueError(
+                    f"speculative_suffix_max_tree_depth={self.speculative_suffix_max_tree_depth} must be >= 1"
+                )
+
+            if self.speculative_suffix_max_cached_requests < -1:
+                raise ValueError(
+                    f"speculative_suffix_max_cached_requests={self.speculative_suffix_max_cached_requests} must be >= -1 (use -1 for unlimited)"
+                )
+
+            if self.speculative_suffix_max_spec_factor < 0:
+                raise ValueError(
+                    f"speculative_suffix_max_spec_factor={self.speculative_suffix_max_spec_factor} must be >= 0"
+                )
+
+            if not 0 <= self.speculative_suffix_min_token_prob <= 1:
+                raise ValueError(
+                    f"speculative_suffix_min_token_prob={self.speculative_suffix_min_token_prob} must be in [0, 1]"
+                )
+
+            if self.enable_dp_attention:
+                # TODO: support dp attention for suffix decoding
+                raise ValueError(
+                    "Currently suffix decoding does not support dp attention."
+                )
+
+            logger.info(
+                f"Suffix decoding configured with: "
+                f"max_tree_depth={self.speculative_suffix_max_tree_depth}, "
+                f"max_cached_requests={self.speculative_suffix_max_cached_requests}, "
+                f"max_spec_factor={self.speculative_suffix_max_spec_factor}, "
+                f"min_token_prob={self.speculative_suffix_min_token_prob}"
+            )
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -4661,7 +4736,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SUFFIX"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4801,6 +4876,45 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+        # Suffix decoding
+        parser.add_argument(
+            "--speculative-suffix-max-tree-depth",
+            type=int,
+            default=ServerArgs.speculative_suffix_max_tree_depth,
+            help="The maximum depth of the suffix decoding global and prompt trees. "
+            "The tree depth limits the sum of the prefix match and speculation lengths.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-max-cached-requests",
+            type=int,
+            default=ServerArgs.speculative_suffix_max_cached_requests,
+            help="The maximum number of requests to cache in the global suffix tree. "
+            "If exceeded, will trigger eviction in FIFO order. Set to -1 for unlimited "
+            "cache size, or 0 to disable the global suffix tree (past responses are not "
+            "cached, but prompt trees are still used).",
+        )
+        parser.add_argument(
+            "--speculative-suffix-max-spec-factor",
+            type=float,
+            default=ServerArgs.speculative_suffix_max_spec_factor,
+            help="The maximum spec factor for suffix decoding. The spec factor controls "
+            "speculation lengths based on the prefix match length: max_spec_tokens = "
+            "max_spec_factor * prefix_match_length.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-min-token-prob",
+            type=float,
+            default=ServerArgs.speculative_suffix_min_token_prob,
+            help="The minimum token probability for suffix decoding. Will only speculate "
+            "tokens with estimated probability (based on frequency counts) greater than "
+            "or equal to this value.",
+        )
+        parser.add_argument(
+            "--enable-speculative-sampling",
+            action="store_true",
+            help="Enable sampling-based verification for speculative decoding on AMD GPUs. "
+            "By default (False), it uses greedy verification which may ignore temperature settings.",
         )
 
         # Multi-layer Eagle speculative decoding

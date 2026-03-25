@@ -17,6 +17,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 
 [project.optional-dependencies]
 runtime_common = [
+  "arctic-inference==0.1.1",
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",

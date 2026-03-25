@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    SUFFIX = auto()
     NONE = auto()
 
     @classmethod
@@ -45,6 +46,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_suffix(self) -> bool:
+        return self == SpeculativeAlgorithm.SUFFIX
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
@@ -102,6 +106,16 @@ class SpeculativeAlgorithm(Enum):
 
             return NGRAMWorker
 
+        elif self.is_suffix():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.suffix_worker import SuffixWorker
+
+            return SuffixWorker
+
         raise ValueError("Unreachable code path in create_worker.")
 
 
@@ -111,6 +125,7 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    SUFFIX_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -126,6 +141,7 @@ class SpecInput(ABC):
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.SUFFIX_VERIFY,
         }
 
     @abstractmethod

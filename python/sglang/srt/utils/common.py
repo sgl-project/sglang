@@ -1754,6 +1754,11 @@ def is_habana_available() -> bool:
     return find_spec("habana_frameworks") is not None
 
 
+@lru_cache()
+def is_arctic_inference_available():
+    return importlib.util.find_spec("arctic_inference") is not None
+
+
 @lru_cache(maxsize=8)
 def get_device(device_id: Optional[int] = None) -> str:
     if is_cpu():
