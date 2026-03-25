@@ -263,6 +263,7 @@ class ParallelTiledVAE(ABC, nn.Module):
         tiles_per_rank = (total_tiles + world_size - 1) // world_size
         start_tile_idx = rank * tiles_per_rank
         end_tile_idx = min((rank + 1) * tiles_per_rank, total_tiles)
+
         local_results = []
         local_dim_metadata = []
         # Process assigned tiles
@@ -294,13 +295,14 @@ class ParallelTiledVAE(ABC, nn.Module):
 
             # Store metadata
             shape = tile.shape
+            # Store decoded data (flattened)
             decoded_flat = tile.reshape(-1)
             local_results.append(decoded_flat)
             local_dim_metadata.append(shape)
 
         results = torch.cat(local_results, dim=0).contiguous()
         del local_results
-
+        # first gather size to pad the results
         local_size = torch.tensor(
             [results.size(0)], device=results.device, dtype=torch.int64
         )
@@ -314,14 +316,17 @@ class ParallelTiledVAE(ABC, nn.Module):
         padded_results[: results.size(0)] = results
         del results
 
+        # Gather all results
         gathered_dim_metadata = [None] * world_size
         gathered_results = (
             torch.zeros_like(padded_results)
             .repeat(world_size, *[1] * len(padded_results.shape))
             .contiguous()
-        )
+        )  # use contiguous to make sure it won't copy data in the following operations
+        # TODO (PY): use sgl_diffusion distributed methods
         dist.all_gather_into_tensor(gathered_results, padded_results)
         dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
+        # Process gathered results
         data: list = [
             [[[] for _ in range(num_w_tiles)] for _ in range(num_h_tiles)]
             for _ in range(num_t_tiles)
@@ -334,7 +339,7 @@ class ParallelTiledVAE(ABC, nn.Module):
             h_idx = spatial_idx // num_w_tiles
             w_idx = spatial_idx % num_w_tiles
             data[t_idx][h_idx][w_idx] = current_data
-
+        # Merge results
         result_slices = []
         last_slice_data = None
         for i, tem_data in enumerate(data):
