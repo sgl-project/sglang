@@ -495,6 +495,7 @@ class ReasoningParser:
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
+        "mimo": Qwen3Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
