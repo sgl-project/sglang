@@ -33,7 +33,7 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 )
 from sglang.multimodal_gen.utils import get_mixed_precision_state
 
-torch._dynamo.config.recompile_limit = 16
+torch._dynamo.config.recompile_limit = 64
 
 
 class BaseLayerWithLoRA(nn.Module):

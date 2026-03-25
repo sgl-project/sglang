@@ -95,10 +95,6 @@ jobs:
         with:
           github-token: ${{ github.token }}
 
-      - name: Show test partition assignments
-        continue-on-error: true
-        run: python3 test/show_partitions.py
-
       - name: Determine run mode
         id: run-mode
         run: |
@@ -567,6 +563,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
         with:
           github-token: ${{ github.token }}
@@ -619,6 +618,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
         with:
@@ -673,6 +675,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
         with:
@@ -735,6 +740,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
         with:
           github-token: ${{ github.token }}
@@ -788,6 +796,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
         with:
@@ -844,6 +855,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
         with:
@@ -929,6 +943,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
         with:
           github-token: ${{ github.token }}
@@ -982,6 +999,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
         with:
@@ -1053,6 +1073,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
         with:
           github-token: ${{ github.token }}
@@ -1102,6 +1125,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
         with:
@@ -1162,6 +1188,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
         with:
@@ -1228,6 +1257,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
         with:

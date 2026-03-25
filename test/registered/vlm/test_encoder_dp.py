@@ -1,9 +1,7 @@
-import argparse
 import glob
 import json
 import os
 import random
-import sys
 import unittest
 from types import SimpleNamespace
 
@@ -255,20 +253,4 @@ class TestVLMEncoderDP(CustomTestCase):
 
 
 if __name__ == "__main__":
-    # Define and parse arguments here, before unittest.main
-    parser = argparse.ArgumentParser(description="Test VLM models")
-    parser.add_argument(
-        "--mem-fraction-static",
-        type=float,
-        help="Static memory fraction for the model",
-        default=DEFAULT_MEM_FRACTION_STATIC,
-    )
-
-    # Parse args intended for unittest
-    args = parser.parse_args()
-
-    # Store the parsed args object on the class
-    TestVLMEncoderDP.parsed_args = args
-
-    # Pass args to unittest
-    unittest.main(argv=[sys.argv[0]])
+    unittest.main()
