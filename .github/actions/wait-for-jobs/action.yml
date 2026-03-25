@@ -70,6 +70,8 @@ runs:
           // GitHub returns 304 Not Modified for unchanged data, which is FREE (no rate limit cost).
           let lastEtag = '';
           let lastJobs = null;
+          let apiCalls = 0;
+          let cachedCalls = 0;
 
           async function fetchJobs() {
             const url = `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`;
@@ -86,9 +88,10 @@ runs:
 
             try {
               const response = await github.request(url, params);
+              apiCalls++;
               const rateRemaining = response.headers['x-ratelimit-remaining'] || '?';
               const rateLimit = response.headers['x-ratelimit-limit'] || '?';
-              console.log(`[rate-limit] ${rateRemaining}/${rateLimit} remaining (ETag: ${lastEtag ? 'sent' : 'none'})`);
+              console.log(`[rate-limit] ${rateRemaining}/${rateLimit} remaining (ETag: ${lastEtag ? 'sent' : 'none'}) | this session: ${apiCalls} paid, ${cachedCalls} free`);
               lastEtag = response.headers.etag || '';
               const jobs = response.data.jobs;
 
@@ -111,7 +114,8 @@ runs:
               return { jobs, cached: false };
             } catch (err) {
               if (err.status === 304 && lastJobs) {
-                console.log(`[rate-limit] 304 Not Modified — no rate limit consumed`);
+                cachedCalls++;
+                console.log(`[rate-limit] 304 Not Modified | this session: ${apiCalls} paid, ${cachedCalls} free`);
                 return { jobs: lastJobs, cached: true };
               }
               throw err;
