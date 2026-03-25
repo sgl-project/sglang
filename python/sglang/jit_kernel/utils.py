@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import functools
+import importlib.util
+import logging
 import os
 import pathlib
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypeAlias,
+    TypeVar,
+    Union,
+)
 
 import torch
 
@@ -16,6 +29,8 @@ if TYPE_CHECKING:
 
 F = TypeVar("F", bound=Callable[..., Any])
 _FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
+
+logger = logging.getLogger(__name__)
 
 
 def should_run_full_tests() -> bool:
@@ -123,6 +138,7 @@ def load_jit(
     extra_cuda_cflags: List[str] | None = None,
     extra_ldflags: List[str] | None = None,
     extra_include_paths: List[str] | None = None,
+    extra_dependencies: List[str] | None = None,
     build_directory: str | None = None,
 ) -> Module:
     """
@@ -149,6 +165,8 @@ def load_jit(
     :type extra_ldflags: List[str] | None
     :param extra_include_paths: Extra include paths.
     :type extra_include_paths: List[str] | None
+    :param extra_dependencies: Extra dependencies for the JIT module, e.g., cutlass.
+    :type extra_dependencies: List[str] | None
     :param build_directory: The build directory for JIT compilation.
     :type build_directory: str | None
     :return: A just-in-time(JIT) compiled module.
@@ -165,6 +183,11 @@ def load_jit(
     extra_cuda_cflags = extra_cuda_cflags or []
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
+
+    for dep in set(extra_dependencies or []):
+        if dep not in _REGISTERED_DEPENDENCIES:
+            raise ValueError(f"Dependency {dep} is not registered.")
+        extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
     # include cpp files
     cpp_paths = [(KERNEL_PATH / "csrc" / f).resolve() for f in cpp_files]
@@ -207,8 +230,12 @@ class ArchInfo:
 @cache_once
 def _init_jit_cuda_arch_once():
     global _CUDA_ARCH
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
+    try:
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+    except Exception:
+        logger.warning("Cannot detect CUDA architecture.")
+        major, minor = 0, 0  # invalid value to trigger compile error if used
     _CUDA_ARCH = ArchInfo(major, minor, "")
 
 
@@ -229,6 +256,7 @@ def _jit_compile_context():
             os.environ[env_key] = old_value
 
 
+# NOTE: this might also be used in __main__.py for compile flags export
 def _get_default_target_flags() -> List[str]:
     if is_hip_runtime():
         return ["-DUSE_ROCM", "-std=c++20", "-O3"]
@@ -263,3 +291,104 @@ def is_arch_support_pdl() -> bool:
     if is_hip_runtime():
         return False
     return get_jit_cuda_arch().major >= 9
+
+
+def _find_package_root(package: str) -> Optional[pathlib.Path]:
+    spec = importlib.util.find_spec(package)
+    if spec is None or spec.origin is None:
+        return None
+    return pathlib.Path(spec.origin).resolve().parent
+
+
+# NOTE: this might also be used in __main__.py for compile flags export
+_REGISTERED_DEPENDENCIES: Dict[str, Callable[[], List[str]]] = {}
+
+
+def register_dependency(name: str):
+    def decorator(f: Callable[[], List[str]]) -> Callable[[], List[str]]:
+        if name in _REGISTERED_DEPENDENCIES:
+            raise ValueError(f"Dependency {name} already registered")
+        _REGISTERED_DEPENDENCIES[name] = f
+        return f
+
+    return decorator
+
+
+@register_dependency("flashinfer")
+def get_flashinfer_include_paths() -> List[str]:
+    include_paths: List[str] = []
+    flashinfer_root = _find_package_root("flashinfer")
+    if flashinfer_root is None:
+        raise RuntimeError(
+            "Cannot find flashinfer package. Please install flashinfer to get"
+            "the required headers for JIT compilation."
+        )
+
+    flashinfer_data = flashinfer_root / "data"
+    candidates = [
+        flashinfer_data / "include",
+        flashinfer_data / "csrc",
+        flashinfer_data / "cutlass" / "include",
+        flashinfer_data / "cutlass" / "tools" / "util" / "include",
+        flashinfer_data / "spdlog" / "include",
+    ]
+
+    for path in candidates:
+        if not path.exists():
+            raise RuntimeError(
+                f"Required header path {path} for flashinfer dependency not found."
+                " Please check your flashinfer installation."
+            )
+        include_paths.append(str(path))
+    return include_paths
+
+
+@register_dependency("cutlass")
+def get_cutlass_include_paths() -> List[str]:
+    include_paths: List[str] = []
+
+    flashinfer_root = _find_package_root("flashinfer")
+    if flashinfer_root is not None:
+        candidates = [
+            flashinfer_root / "data" / "cutlass" / "include",
+            flashinfer_root / "data" / "cutlass" / "tools" / "util" / "include",
+        ]
+        for path in candidates:
+            if path.exists():
+                include_paths.append(str(path))
+
+    deep_gemm_root = _find_package_root("deep_gemm")
+    if deep_gemm_root is not None:
+        candidate = deep_gemm_root / "include"
+        if candidate.exists():
+            include_paths.append(str(candidate))
+
+    # De-duplicate while preserving order.
+    unique_paths = []
+    seen = set()
+    for path in include_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique_paths.append(path)
+
+    if not unique_paths:
+        raise RuntimeError(
+            "Cannot find CUTLASS headers required for JIT compilation. "
+            "Please install flashinfer or deep_gemm with CUTLASS headers."
+        )
+    return unique_paths
+
+
+__all__ = [
+    "should_run_full_tests",
+    "get_ci_test_range",
+    "cache_once",
+    "is_hip_runtime",
+    "make_cpp_args",
+    "load_jit",
+    "override_jit_cuda_arch",
+    "get_jit_cuda_arch",
+    "is_arch_support_pdl",
+    "register_dependency",
+]
