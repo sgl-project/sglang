@@ -648,7 +648,10 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
+    shape_supported = (
+        weight.shape[0] % _DEEPGEMM_MIN_N_ALIGN == 0
+        and weight.shape[1] % _DEEPGEMM_MIN_K_ALIGN == 0
+    )
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
@@ -659,6 +662,24 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             weight_scale = _unpack_ue8m0_scale_for_triton(
                 weight_scale, weight.shape, block_size
             )
+        # Pre-transposed weight scales (column-major TMA-aligned) are not
+        # compatible with Triton. This can happen when dtype is not bfloat16
+        # even though shape is compatible. Log a warning rather than crashing,
+        # since this may occur legitimately in mixed-precision pipelines.
+        if getattr(weight_scale, "_pretransposed_for_deepgemm", False):
+            logger.warning(
+                "Pre-transposed weight scale detected but falling back to Triton "
+                "(dtype_supported=%s, shape_supported=%s, weight.shape=%s). "
+                "Reverse-transposing weight scale for Triton compatibility. "
+                "This incurs a one-time overhead.",
+                dtype_supported,
+                shape_supported,
+                weight.shape,
+            )
+            # Reverse the pre-transpose: make contiguous row-major copy.
+            # get_mn_major_tma_aligned_tensor produces a column-major view;
+            # .contiguous() materializes it back to row-major.
+            weight_scale = weight_scale.contiguous()
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
@@ -1134,6 +1155,82 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
 
     offloader.update_param(weight, new_weight)
     weight_scale_inv.data = new_weight_scale_inv
+
+
+# Shape alignment constants for DeepGemm fp8_gemm_nt compatibility.
+# Must match the runtime check in deepgemm_w8a8_block_fp8_linear_with_fallback().
+_DEEPGEMM_MIN_N_ALIGN = 64
+_DEEPGEMM_MIN_K_ALIGN = 128
+
+
+def maybe_pretranspose_weight_scale_for_deepgemm(layer, w8a8_block_fp8_linear):
+    """Conditionally pre-transpose weight scale for DeepGemm at model loading time.
+
+    On Hopper (SM90, non-UE8M0 path), DeepGemm's fp8_gemm_nt may internally call
+    get_mn_major_tma_aligned_tensor() on weight scales every forward pass.
+    For static weight scales this is wasted work.
+
+    This function checks all preconditions and performs the transformation once.
+    It is safe to call unconditionally — it is a no-op when conditions are not met.
+
+    Pre-transpose is only for the non-UE8M0 / Hopper path where weight scales
+    remain as float32. The UE8M0 path (Blackwell) uses int32 packed scales which
+    are already transformed by requant_weight_ue8m0_inplace() above.
+
+    IMPORTANT: On SM90 with recipe (1, 128, 128), DeepGemm's check_sf_layout
+    accepts row-major OR column-major-without-padding for sfb. The TMA alignment
+    in get_mn_major_tma_aligned_tensor adds padding when N/128 is not a multiple
+    of 4, which causes an assertion failure. We skip pre-transpose for such shapes.
+
+    Args:
+        layer: The linear layer module with weight and weight_scale_inv attributes.
+        w8a8_block_fp8_linear: The dispatch function bound to this layer.
+    """
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    if not (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and (w8a8_block_fp8_linear is deepgemm_w8a8_block_fp8_linear_with_fallback)
+        and layer.weight_scale_inv.dtype == torch.float32
+        # Only pre-transpose for DeepGemm-compatible shapes;
+        # incompatible shapes fall back to Triton at runtime.
+        and layer.weight.shape[0] % _DEEPGEMM_MIN_N_ALIGN == 0
+        and layer.weight.shape[1] % _DEEPGEMM_MIN_K_ALIGN == 0
+        and not getattr(layer.weight_scale_inv, "_pretransposed_for_deepgemm", False)
+    ):
+        return
+
+    # On SM90, check_sf_layout requires stride(-1) == size(-2) for col-major,
+    # i.e. no TMA padding. get_mn_major_tma_aligned_tensor pads N/128 to
+    # align(N/128, 4). Skip pre-transpose when padding would be introduced.
+    n_scale_dim = layer.weight.shape[0] // _DEEPGEMM_MIN_K_ALIGN  # N / 128
+    if n_scale_dim % 4 != 0:
+        return
+
+    _pretranspose_weight_scale_for_deepgemm(layer.weight_scale_inv)
+
+
+def _pretranspose_weight_scale_for_deepgemm(weight_scale_inv):
+    """Core pre-transpose: converts weight scale to TMA-aligned column-major layout.
+
+    Args:
+        weight_scale_inv: Parameter with shape (N//128, K//128) float32, row-major.
+            Modified in-place: .data is replaced with the TMA-aligned tensor.
+            A ._pretransposed_for_deepgemm = True attribute is set.
+    """
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+        get_mn_major_tma_aligned_tensor,
+    )
+
+    assert isinstance(weight_scale_inv, torch.nn.Parameter)
+    assert weight_scale_inv.dtype == torch.float32, (
+        f"Expected float32 weight scale for non-UE8M0 pre-transpose, "
+        f"got {weight_scale_inv.dtype}"
+    )
+
+    weight_scale_inv.data = get_mn_major_tma_aligned_tensor(weight_scale_inv.data)
+    weight_scale_inv._pretransposed_for_deepgemm = True
 
 
 def requant_weight_ue8m0(
