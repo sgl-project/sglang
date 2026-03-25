@@ -257,9 +257,7 @@ class TestProcessCachedTokensDetailsFromRet(unittest.TestCase):
 
     def test_device_and_host_only(self):
         """Without storage field, returns CachedTokensDetails with device+host."""
-        ret_item = {
-            "meta_info": {"cached_tokens_details": {"device": 100, "host": 50}}
-        }
+        ret_item = {"meta_info": {"cached_tokens_details": {"device": 100, "host": 50}}}
         result = process_cached_tokens_details_from_ret(
             ret_item, self._make_request(return_cached_tokens_details=True)
         )
