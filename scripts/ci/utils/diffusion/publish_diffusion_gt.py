@@ -10,7 +10,7 @@ import sys
 # Allow importing from the same directory (scripts/ci/utils/)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from publish_traces import (
+from ..publish_traces import (
     create_blobs,
     create_commit,
     create_tree,

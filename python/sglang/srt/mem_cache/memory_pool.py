@@ -37,7 +37,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -61,13 +60,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
-store_cache = register_custom_op(
-    debug_kernel_api(store_cache, op_name="jit_kernel.kvcache.store_cache"),
-    mutates_args=["k_cache", "v_cache"],
-)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
