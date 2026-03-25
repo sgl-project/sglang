@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Kill SGLang and related processes.
+"""Kill SGLang processes on CUDA_VISIBLE_DEVICES GPUs (CI mode only).
 
-In CI mode (SGLANG_IS_IN_CI=true): GPU-scoped kill via nvidia-smi,
-scoped to CUDA_VISIBLE_DEVICES (numeric indices only). Aborts with
-exit code 1 if GPU memory remains >10% after cleanup.
+Called at the start of every CI job to clean up orphaned processes from
+previous (possibly cancelled) runs. Requires SGLANG_IS_IN_CI=true.
 
-In local mode: pgrep-based kill of SGLang processes (same as the
-original killall_sglang.sh default behavior).
+For local/non-CI usage, use scripts/killall_sglang.sh instead.
 
 Usage:
     python killall.py
 
 Exit codes:
-    0 - Clean (or local mode completed)
-    1 - CI mode only: GPU memory still >10% after cleanup
+    0 - Clean: all target GPUs have <10% memory usage after cleanup
+    1 - Dirty: GPU memory still >10% after cleanup, indicating stuck processes
+        or orphaned CUDA contexts that need a container restart
 """
 
 import os
@@ -24,16 +23,6 @@ import time
 from pathlib import Path
 
 MEMORY_THRESHOLD_PCT = 10
-
-SGLANG_PROCESS_PATTERN = (
-    r"sglang::|sglang\.launch_server|sglang\.bench"
-    r"|sglang\.data_parallel|sglang\.srt|sgl_diffusion::"
-)
-
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
 
 
 def _run_smi(query, query_type="gpu"):
@@ -63,11 +52,6 @@ def _kill_pids(pids, label=""):
             os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-
-
-# ---------------------------------------------------------------------------
-# CI mode helpers
-# ---------------------------------------------------------------------------
 
 
 def _get_target_gpus():
@@ -202,52 +186,12 @@ def _ci_mode():
 
 
 # ---------------------------------------------------------------------------
-# Local mode
-# ---------------------------------------------------------------------------
-
-
-def _local_mode():
-    """pgrep-based kill of SGLang processes (original killall_sglang.sh behavior)."""
-    # Show current GPU status (if nvidia-smi available)
-    subprocess.run(["nvidia-smi"], capture_output=False, check=False)
-
-    # Find and kill SGLang processes
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", SGLANG_PROCESS_PATTERN],
-            capture_output=True,
-            text=True,
-        )
-        pids = {
-            int(p.strip())
-            for p in result.stdout.strip().splitlines()
-            if p.strip().isdigit()
-        }
-    except FileNotFoundError:
-        print("pgrep not found, skipping process cleanup")
-        return 0
-
-    if pids:
-        _kill_pids(pids, "SGLang processes")
-    else:
-        print("No SGLang processes found")
-
-    # Show GPU status after cleanup
-    subprocess.run(["nvidia-smi"], capture_output=False, check=False)
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 
 def main():
-    is_ci = os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("true", "1")
-    if is_ci:
-        return _ci_mode()
-    else:
-        return _local_mode()
+    return _ci_mode()
 
 
 if __name__ == "__main__":
