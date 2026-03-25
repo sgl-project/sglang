@@ -44,7 +44,7 @@ from sglang.srt.debug_utils.comparator.tensor_comparator.types import (
 from sglang.srt.debug_utils.comparator.utils import Pair, _check_equal_lengths
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="default", nightly=True)
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu", nightly=True)
 
 
 class TestCheckEqualLengths:
@@ -345,26 +345,37 @@ class TestOutputRecordCategories:
 
     def test_error_record_category_is_errored(self) -> None:
         record = ComparisonErrorRecord(
-            name="t", exception_type="ValueError", traceback_str="..."
+            name="t",
+            exception_type="ValueError",
+            exception_message="bad",
+            traceback_str="...",
         )
         assert record.category == "errored"
 
     def test_error_record_json_roundtrip(self) -> None:
         record = ComparisonErrorRecord(
-            name="t", exception_type="ValueError", traceback_str="traceback..."
+            name="t",
+            exception_type="ValueError",
+            exception_message="bad",
+            traceback_str="traceback...",
         )
         json_str: str = record.model_dump_json()
         roundtripped = parse_record_json(json_str)
         assert isinstance(roundtripped, ComparisonErrorRecord)
         assert roundtripped.name == "t"
         assert roundtripped.exception_type == "ValueError"
+        assert roundtripped.exception_message == "bad"
 
     def test_error_record_text_format(self) -> None:
         record = ComparisonErrorRecord(
-            name="t", exception_type="RuntimeError", traceback_str="Traceback..."
+            name="t",
+            exception_type="RuntimeError",
+            exception_message="oops",
+            traceback_str="Traceback...",
         )
         text: str = record.to_text()
         assert "RuntimeError" in text
+        assert "oops" in text
         assert "Traceback" in text
 
 

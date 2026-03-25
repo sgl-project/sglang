@@ -33,6 +33,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_maybe_tbo,
 )
 from sglang.srt.configs.model_config import (
+    compute_mla_mscale_scaling,
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
     get_nsa_index_topk,
@@ -43,7 +44,6 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -73,6 +73,7 @@ from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -138,7 +139,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
-    yarn_get_mscale,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -281,6 +281,7 @@ class MoEGate(nn.Module):
                 elif _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
+                    "quark",
                 ):
                     correction_bias_dtype = torch.bfloat16
             self.e_score_correction_bias = nn.Parameter(
@@ -325,7 +326,11 @@ class MoEGate(nn.Module):
                 logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
-            elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
+            elif (
+                _use_aiter_gfx95
+                and hidden_states.shape[0] <= 256
+                and self.weight.shape[0] <= 256
+            ):
                 logits = aiter_dsv3_router_gemm(
                     hidden_states, self.weight, gemm_output_zero_allocator
                 )
@@ -445,6 +450,7 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_nixl()
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_flashinfer()
@@ -489,6 +495,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
@@ -510,6 +517,7 @@ class DeepseekV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
@@ -564,17 +572,25 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(
             hidden_states, gemm_output_zero_allocator
         )
-
+        server_args = get_global_server_args()
+        dispatch_info = (
+            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if server_args.enable_eplb
+            else None
+        )
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=dispatch_info,
+            )
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
@@ -601,7 +617,12 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
-
+        server_args = get_global_server_args()
+        dispatch_info = (
+            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if server_args.enable_eplb
+            else None
+        )
         if hidden_states.shape[0] > 0:
             if (
                 not self._fuse_shared_experts_inside_sbo
@@ -611,7 +632,11 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                expert_location_dispatch_info=dispatch_info,
+            )
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -1195,11 +1220,8 @@ class DeepseekV2AttentionMLA(
                 device=get_global_server_args().device,
             )
 
-            if rope_scaling:
-                mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-                scaling_factor = rope_scaling["factor"]
-                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                self.scaling = self.scaling * mscale * mscale
+            if rope_scaling and rope_scaling.get("apply_yarn_scaling", True):
+                self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
         else:
             self.rotary_emb = None
         self.use_deepseek_yarn_rope = rope_scaling is not None
@@ -1492,7 +1514,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.config = config
         if hasattr(config, "rope_parameters"):
-            rope_theta = config.rope_parameters.get("rope_theta")
+            rope_theta = config.rope_parameters["rope_theta"]
             assert rope_theta is not None, f"rope_theta not found in config: {config}"
             rope_type = config.rope_parameters.get("rope_type")
             rope_scaling = config.rope_parameters if rope_type != "default" else None
@@ -1976,7 +1998,7 @@ class DeepseekV2Model(nn.Module):
             with ctx:
                 if i in self.layers_to_capture:
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = tensor_model_parallel_all_gather(
+                        aux_hidden_state = get_attention_tp_group().all_gather(
                             hidden_states + residual, dim=0
                         )
                         aux_hidden_states.append(aux_hidden_state)

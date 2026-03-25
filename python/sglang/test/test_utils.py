@@ -37,12 +37,13 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_blackwell,
     is_cuda,
-    is_port_available,
     is_xpu,
     kill_process_tree,
     retry,
 )
+from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
 
@@ -167,6 +168,31 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
+def flush_cache_with_retry(
+    base_url: str,
+    timeout: float = 30.0,
+    poll_interval: float = 0.5,
+) -> bool:
+    """Flush device cache, polling until success or timeout.
+
+    flush_cache only succeeds when the scheduler is fully idle, but
+    HiCache async ops (write-through, backup) may still be in-flight
+    after a request completes.  We poll with a short interval so idle
+    is detected quickly, while the generous timeout accommodates slow
+    CI environments.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            response = requests.post(f"{base_url}/flush_cache", timeout=10)
+            if response.status_code == 200:
+                return True
+        except requests.RequestException:
+            pass
+        time.sleep(poll_interval)
+    return False
+
+
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -178,8 +204,8 @@ def is_in_amd_ci():
 
 
 def is_blackwell_system():
-    """Return whether it is running on a Blackwell (B200) system."""
-    return envs.IS_BLACKWELL.get()
+    """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
+    return is_blackwell()
 
 
 def is_h200_system():
@@ -2056,6 +2082,7 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
 
 
 class CustomTestCase(unittest.TestCase):
+
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:

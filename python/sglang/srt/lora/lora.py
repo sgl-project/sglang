@@ -47,7 +47,6 @@ class LoRALayer(nn.Module):
 
 
 class LoRAAdapter(nn.Module):
-
     def __init__(
         self,
         uid: str,

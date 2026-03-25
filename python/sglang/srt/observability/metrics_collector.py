@@ -80,6 +80,7 @@ class SchedulerStats:
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_used_tokens: int = 0
     token_usage: float = 0.0
+    full_token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
@@ -199,6 +200,12 @@ class SchedulerMetricsCollector:
         self.token_usage = Gauge(
             name="sglang:token_usage",
             documentation="The token usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.full_token_usage = Gauge(
+            name="sglang:full_token_usage",
+            documentation="The token usage for full attention layers.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -687,6 +694,14 @@ class SchedulerMetricsCollector:
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
+        self.gpu_overlap_wait_seconds_total = Counter(
+            name="sglang:gpu_overlap_wait_seconds_total",
+            documentation=(
+                "Total time that GPU forward stream was idle waiting for "
+                "the CPU schedule stream (overlap bubble)."
+            ),
+            labelnames=list(labels.keys()) + ["category"],
+        )
 
         self.dp_cooperation_realtime_tokens_total = Counter(
             name="sglang:dp_cooperation_realtime_tokens_total",
@@ -851,9 +866,12 @@ class SchedulerMetricsCollector:
             num_retracted_output_tokens
         )
 
-    def increment_cuda_graph_pass(self, value: bool) -> None:
-        # leave room for piecewise cuda graph, etc
+    def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
+        self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
+
+    def increment_prefill_cuda_graph_pass(self, value: bool) -> None:
+        mode = "prefill_cuda_graph" if value else "prefill_none"
         self.cuda_graph_passes_total.labels(**self.labels, mode=mode).inc(1)
 
     def increment_eplb_balancedness(
@@ -885,6 +903,16 @@ class SchedulerMetricsCollector:
                     **dp_cooperation_info.to_labels(),
                 ).inc(delta)
 
+    def increment_gpu_overlap_wait_seconds(
+        self,
+        category: str,
+        t: float,
+        dp_cooperation_info: Optional[DPCooperationInfo],
+    ):
+        self.gpu_overlap_wait_seconds_total.labels(
+            **self.labels, category=category
+        ).inc(t)
+
     def increment_gpu_execution_seconds(
         self,
         category: str,
@@ -904,6 +932,7 @@ class SchedulerMetricsCollector:
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(self.full_token_usage, stats.full_token_usage)
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
