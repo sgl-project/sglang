@@ -9,12 +9,13 @@ Usage:
 
 import argparse
 import time
+
+# Suppress warnings for cleaner output
+import warnings
 from typing import List
 
 import torch
 
-# Suppress warnings for cleaner output
-import warnings
 warnings.filterwarnings("ignore")
 
 
@@ -23,7 +24,9 @@ def setup_segments(num_segments: int, segment_size: int = 1024 * 1024) -> None:
     Allocate a specified number of segments using the NCCL allocator.
     """
     import os
+
     import torch.distributed as dist
+
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         get_nccl_mem_pool,
     )
@@ -77,7 +80,9 @@ def bench_get_tracked_segments(num_iters: int = 10000) -> float:
     return avg_us
 
 
-def bench_mempool_snapshot(mem_pool: torch.cuda.MemPool, num_iters: int = 10000) -> float:
+def bench_mempool_snapshot(
+    mem_pool: torch.cuda.MemPool, num_iters: int = 10000
+) -> float:
     """
     Benchmark torch.cuda.MemPool.snapshot() function.
 
@@ -108,7 +113,6 @@ def bench_with_various_segment_counts(
     """
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         _get_tracked_segments,
-        get_nccl_mem_pool,
     )
 
     print("=" * 80)
@@ -117,7 +121,9 @@ def bench_with_various_segment_counts(
     print(f"Segment size: {segment_size / 1024 / 1024:.2f} MB")
     print(f"Iterations per measurement: {num_iters}")
     print()
-    print(f"{'Segments':<12} {'_get_tracked_segments (µs)':<30} {'snapshot (µs)':<20} {'Speedup':<10}")
+    print(
+        f"{'Segments':<12} {'_get_tracked_segments (µs)':<30} {'snapshot (µs)':<20} {'Speedup':<10}"
+    )
     print("-" * 80)
 
     all_tensors = []  # Keep all tensors alive
@@ -129,6 +135,7 @@ def bench_with_various_segment_counts(
 
         # Force garbage collection to free previous segments
         import gc
+
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -147,9 +154,11 @@ def bench_with_various_segment_counts(
         time_tracked = bench_get_tracked_segments(num_iters)
         time_snapshot = bench_mempool_snapshot(mem_pool, num_iters)
 
-        speedup = time_snapshot / time_tracked if time_tracked > 0 else float('inf')
+        speedup = time_snapshot / time_tracked if time_tracked > 0 else float("inf")
 
-        print(f"{actual_count:<12} {time_tracked:<30.3f} {time_snapshot:<20.3f} {speedup:<10.2f}x")
+        print(
+            f"{actual_count:<12} {time_tracked:<30.3f} {time_snapshot:<20.3f} {speedup:<10.2f}x"
+        )
 
     print("-" * 80)
     print()
