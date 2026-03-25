@@ -300,7 +300,7 @@ class TestQwen35WithHiCache(CustomTestCase):
             eval_name="gsm8k",
             num_shots=5,
             num_examples=100,
-            max_tokens=4000,
+            max_tokens=16000,
             num_threads=50,
             repeat=1,
             temperature=0.6,
