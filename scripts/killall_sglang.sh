@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# DEPRECATED: This script will be migrated to python/sglang/cli/killall.py.
+# CI mode is already handled there. This script remains for local/non-CI usage.
+#
+# TODO: Migrate remaining modes (rocm, all, gpus) to killall.py and remove this file.
+#
 # Usage:
 #   ./killall_sglang.sh              - Kill SGLang processes only (NVIDIA mode)
 #   ./killall_sglang.sh rocm         - Kill SGLang processes only (ROCm mode)
