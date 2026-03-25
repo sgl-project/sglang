@@ -9,6 +9,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 
 ## Supported Arguments
 
+
 ### Server Arguments
 
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
@@ -23,6 +24,16 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--attention-backend-config {CONFIG}`: Configuration for the attention backend. Can be a JSON string (e.g., '{"k": "v"}'), a path to a JSON/YAML file, or key=value pairs (e.g., "k=v,k2=v2").
 - `--cache-dit-config {PATH}`: Path to a Cache-DiT YAML/JSON config (diffusers backend only)
 - `--dit-precision {DTYPE}`: Precision for the DiT model (currently supports fp32, fp16, and bf16).
+
+### Quantized Transformers
+
+For quantized transformer checkpoints, prefer:
+
+- `--model-path` for the base model (the pipeline)
+- `--transformer-path` for a quantized `transformers` transformer component folder
+- `--transformer-weights-path` for a quantized safetensors file, directory, or repo
+
+See [Quantization](../quantization.md) for the supported quantization families and examples.
 
 
 ### Sampling Parameters
