@@ -2087,7 +2087,6 @@ class CustomTestCase(unittest.TestCase):
         if getattr(setup, "_safe_setup_wrapped", False):
             return
 
-        @classmethod
         def safe_setUpClass(klass, _orig=setup):
             try:
                 _orig.__func__(klass)
@@ -2100,8 +2099,10 @@ class CustomTestCase(unittest.TestCase):
                     pass
                 raise
 
+        # Set sentinel on the raw function so that bound method attribute
+        # lookup (which delegates to __func__) can detect it in subclasses.
         safe_setUpClass._safe_setup_wrapped = True
-        cls.setUpClass = safe_setUpClass
+        cls.setUpClass = classmethod(safe_setUpClass)
 
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
