@@ -278,6 +278,9 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[Req] = []
+        # Only allow add() fast path after an address is globally confirmed ready
+        # across all decode TP/CP ranks.
+        self._globally_ready_prefill_addrs: set[str] = set()
         self._ensure_retry_count: Dict[str, int] = {}
         self._max_ensure_retries: int = 20  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
@@ -435,12 +438,17 @@ class DecodePreallocQueue:
                 self._create_receiver_and_enqueue(req, 0)
                 return
 
-            # Fast path: cache-only lookup, no network calls
-            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-            if prefill_dp_rank is not None:
-                self._create_receiver_and_enqueue(req, prefill_dp_rank)
-            else:
-                self.pending_reqs.append(req)
+            bootstrap_addr = _bootstrap_addr(req)
+
+            # Fast path is gated by global readiness to avoid per-rank divergence
+            # (some ranks enqueue while others still leave the same request pending).
+            if bootstrap_addr in self._globally_ready_prefill_addrs:
+                prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+                if prefill_dp_rank is not None:
+                    self._create_receiver_and_enqueue(req, prefill_dp_rank)
+                    return
+
+            self.pending_reqs.append(req)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         if req.disagg_prefill_dp_rank is not None:
@@ -626,6 +634,8 @@ class DecodePreallocQueue:
         global_ready_addrs, global_failed_addrs = (
             self._sync_pending_prefill_info_state(ready_addrs, failed_addrs)
         )
+        self._globally_ready_prefill_addrs.update(global_ready_addrs)
+        self._globally_ready_prefill_addrs.difference_update(global_failed_addrs)
 
         for bootstrap_addr in global_failed_addrs:
             error_msg = (
