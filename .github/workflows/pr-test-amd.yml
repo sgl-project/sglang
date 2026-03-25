@@ -780,7 +780,7 @@ jobs:
 
 
   stage-c-test-4-gpu-amd:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    needs: [check-changes, call-gate, stage-b-test-1-gpu-small-amd, stage-b-test-2-gpu-large-amd]
     if: |
       always() &&
       (
