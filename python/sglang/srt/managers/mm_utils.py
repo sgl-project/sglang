@@ -1627,20 +1627,23 @@ class ShmPointerMMData:
     """
 
     def __init__(self, tensor: torch.Tensor):
-        cpu_tensor = (
-            tensor
-            if (tensor.is_cpu and tensor.is_contiguous())
-            else tensor.cpu().contiguous()
-        )
-        self.shape = cpu_tensor.shape
-        self.dtype = cpu_tensor.dtype
-        nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
-        self.shm = shared_memory.SharedMemory(create=True, size=nbytes)
-        self.shm_name = self.shm.name
-        # Direct copy: torch → shm buffer (no numpy intermediate)
-        dst = torch.frombuffer(self.shm.buf, dtype=torch.uint8)
-        dst.copy_(cpu_tensor.view(torch.uint8).reshape(-1))
-        self.shm.close()
+        if not tensor.is_cpu:
+            tensor = tensor.cpu()
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        self.shape = tensor.shape
+        self.dtype = tensor.dtype
+        nbytes = tensor.numel() * tensor.element_size()
+        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        try:
+            dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
+            dst.copy_(tensor.view(torch.uint8).reshape(-1))
+        except BaseException:
+            shm.close()
+            shm.unlink()
+            raise
+        self.shm_name = shm.name
+        shm.close()
         self._shm_handle = None
 
     def __getstate__(self):
