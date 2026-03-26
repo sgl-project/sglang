@@ -426,7 +426,18 @@ class PiecewiseCudaGraphRunner:
                 if start_len is not None and start_len < seq_len:
                     return False
         if num_tokens <= self.max_num_tokens:
-            return True
+            # Only run when num_tokens exactly matches a captured size. If padding would
+            # be needed (num_tokens < static_num_tokens), the padded q has shape
+            # [static_num_tokens, ...] but qo_indptr[-1] == num_tokens, causing either
+            # a shape mismatch crash or incorrect causal masks (real tokens attend to
+            # fewer KV positions than they should because flashinfer derives the causal
+            # boundary from total_q = static_num_tokens, not num_tokens).
+            index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
+            if (
+                index < len(self.capture_num_tokens)
+                and self.capture_num_tokens[index] == num_tokens
+            ):
+                return True
         return False
 
     def capture(self) -> None:
@@ -742,10 +753,7 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        num_tokens = len(forward_batch.input_ids)
-        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
-        static_num_tokens = self.capture_num_tokens[index]
-        with enable_piecewise_cuda_graph(num_tokens=static_num_tokens):
+        with enable_piecewise_cuda_graph():
             # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
