@@ -108,6 +108,7 @@ class ServerArgs:
     # Attention
     attention_backend: str = None
     attention_backend_config: addict.Dict | None = None
+    hybrid_attention_schedule: str | None = None
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -575,6 +576,17 @@ class ServerArgs:
             type=str,
             default=None,
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
+        )
+        parser.add_argument(
+            "--hybrid-attention-schedule",
+            type=str,
+            default=None,
+            help=(
+                "Hybrid attention schedule: 'high_backend:low_backend:first_steps:last_steps'. "
+                "Uses high-precision backend for the first and last N steps, "
+                "low-precision backend for middle steps. "
+                "Example: 'fa:sdpa:3:3'."
+            ),
         )
         parser.add_argument(
             "--cache-dit-config",

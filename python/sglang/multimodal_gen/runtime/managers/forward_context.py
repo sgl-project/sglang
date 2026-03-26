@@ -38,6 +38,7 @@ class ForwardContext:
     attn_metadata: "AttentionMetadata"  # set dynamically for each forward pass
     forward_batch: Optional["Req"] = None
     attention_backend_cls: Optional[Type] = None
+    total_timesteps: Optional[int] = None
 
     def set_attn_backend_cls(self, attention_backend_cls: Type):
         if self.attention_backend_cls:
@@ -64,7 +65,10 @@ def get_forward_context() -> "ForwardContext":
 # TODO(will): finalize the interface
 @contextmanager
 def set_forward_context(
-    current_timestep, attn_metadata, forward_batch: Optional["Req"] = None
+    current_timestep,
+    attn_metadata,
+    forward_batch: Optional["Req"] = None,
+    total_timesteps: Optional[int] = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -80,6 +84,7 @@ def set_forward_context(
         current_timestep=current_timestep,
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
+        total_timesteps=total_timesteps,
     )
 
     try:

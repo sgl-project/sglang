@@ -1084,6 +1084,7 @@ class DenoisingStage(PipelineStage):
                             server_args=server_args,
                             guidance=guidance,
                             latents=latents,
+                            total_timesteps=num_timesteps,
                         )
 
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
@@ -1531,6 +1532,7 @@ class DenoisingStage(PipelineStage):
         server_args,
         guidance,
         latents,
+        total_timesteps: int | None = None,
     ):
         """
         Predict the noise residual with classifier-free guidance.
@@ -1561,6 +1563,7 @@ class DenoisingStage(PipelineStage):
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
+                total_timesteps=total_timesteps,
             ):
                 noise_pred_cond = self._predict_noise(
                     current_model=current_model,
@@ -1585,6 +1588,7 @@ class DenoisingStage(PipelineStage):
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
+                total_timesteps=total_timesteps,
             ):
                 noise_pred_uncond = self._predict_noise(
                     current_model=current_model,
