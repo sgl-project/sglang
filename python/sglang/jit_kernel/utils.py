@@ -128,6 +128,64 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
     return CPPArgList(_convert(arg) for arg in args)
 
 
+@cache_once
+def _get_hip_arch() -> str:
+    """Get the ROCm GPU architecture (e.g. 'gfx942')."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.gcnArchName.split(":")[0]
+
+
+def _load_jit_hip(
+    name: str,
+    cpp_sources: List[str],
+    cuda_sources: List[str],
+    extra_cflags: List[str],
+    extra_cuda_cflags: List[str],
+    extra_ldflags: List[str],
+    extra_include_paths: List[str],
+    build_directory: str | None,
+) -> Module:
+    """HIP/ROCm variant of load_jit.
+
+    tvm_ffi's build system hardcodes nvcc/cudart which don't exist on ROCm.
+    Work around this by compiling CUDA sources as C++ with hipcc, which
+    natively understands CUDA syntax via the HIP compatibility layer.
+    """
+    from tvm_ffi.cpp import load_inline
+
+    rocm_home = os.environ.get("ROCM_HOME", "/opt/rocm")
+    hip_arch = _get_hip_arch()
+
+    all_cpp_sources = cpp_sources + cuda_sources
+    hip_cflags = (
+        DEFAULT_CFLAGS
+        + extra_cflags
+        + ["-x", "hip", f"--offload-arch={hip_arch}", "-DUSE_ROCM"]
+        + ["-std=c++20", "-O3"]
+        + extra_cuda_cflags
+    )
+    hip_ldflags = DEFAULT_LDFLAGS + [f"-L{rocm_home}/lib", "-lamdhip64"] + extra_ldflags
+
+    old_cxx = os.environ.get("CXX")
+    os.environ["CXX"] = f"{rocm_home}/bin/hipcc"
+    try:
+        return load_inline(
+            name,
+            cpp_sources=all_cpp_sources,
+            cuda_sources=[],
+            extra_cflags=hip_cflags,
+            extra_cuda_cflags=[],
+            extra_ldflags=hip_ldflags,
+            extra_include_paths=extra_include_paths,
+            build_directory=build_directory,
+        )
+    finally:
+        if old_cxx is None:
+            os.environ.pop("CXX", None)
+        else:
+            os.environ["CXX"] = old_cxx
+
+
 def load_jit(
     *args: str,
     cpp_files: List[str] | None = None,
@@ -198,6 +256,21 @@ def load_jit(
     cuda_paths = [(KERNEL_PATH / "csrc" / f).resolve() for f in cuda_files]
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
+
+    jit_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+
+    if is_hip_runtime():
+        extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
+        return _load_jit_hip(
+            name=jit_name,
+            cpp_sources=cpp_sources,
+            cuda_sources=cuda_sources,
+            extra_cflags=extra_cflags,
+            extra_cuda_cflags=extra_cuda_cflags,
+            extra_ldflags=extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+            build_directory=build_directory,
+        )
 
     with _jit_compile_context():
         return load_inline(
