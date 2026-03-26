@@ -8,9 +8,7 @@ def load_external_corpus_documents(path: str, tokenizer) -> List[List[int]]:
     if not corpus_path.is_file():
         raise ValueError(f"External ngram corpus path does not exist: {path}")
     if tokenizer is None:
-        raise ValueError(
-            "A tokenizer is required to load an external ngram corpus."
-        )
+        raise ValueError("A tokenizer is required to load an external ngram corpus.")
 
     documents: List[List[int]] = []
     with corpus_path.open("r", encoding="utf-8") as f:

@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstring>
 #include <queue>
-#include <unordered_set>
 #include <tuple>
+#include <unordered_set>
 
 namespace ngram {
 
@@ -93,10 +93,7 @@ std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
   return paths;
 }
 
-Result buildResultFromLeafPaths_(
-    int last_token,
-    int draft_token_num,
-    const std::vector<std::vector<int32_t>>& paths) {
+Result buildResultFromLeafPaths_(int last_token, int draft_token_num, const std::vector<std::vector<int32_t>>& paths) {
   std::vector<Node> tree(draft_token_num);
   const int root = 0;
   int cursor = 1;
@@ -120,11 +117,7 @@ Result buildResultFromLeafPaths_(
   return fillResult(last_token, draft_token_num, tree, root);
 }
 
-Result combineRootResults_(
-    int last_token,
-    int draft_token_num,
-    const Result& primary,
-    const Result& secondary) {
+Result combineRootResults_(int last_token, int draft_token_num, const Result& primary, const Result& secondary) {
   auto primary_paths = extractLeafPaths_(primary);
   auto secondary_paths = extractLeafPaths_(secondary);
 

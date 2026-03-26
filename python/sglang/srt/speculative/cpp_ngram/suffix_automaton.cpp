@@ -61,12 +61,11 @@ void SuffixAutomaton::extend_(int32_t token, int64_t pos) {
   last_ = cur;
 }
 
-void SuffixAutomaton::finalize_() {
+void SuffixAutomaton::propagateOccurrencesAndRecency_() {
   std::vector<int> order(states_.size());
   std::iota(order.begin(), order.end(), 0);
-  std::sort(order.begin(), order.end(), [this](int lhs, int rhs) {
-    return states_[lhs].max_len < states_[rhs].max_len;
-  });
+  std::sort(
+      order.begin(), order.end(), [this](int lhs, int rhs) { return states_[lhs].max_len < states_[rhs].max_len; });
 
   for (auto it = order.rbegin(); it != order.rend(); ++it) {
     const int state = *it;
@@ -75,8 +74,7 @@ void SuffixAutomaton::finalize_() {
       continue;
     }
     states_[link].occ_count += states_[state].occ_count;
-    states_[link].max_end_pos =
-        std::max(states_[link].max_end_pos, states_[state].max_end_pos);
+    states_[link].max_end_pos = std::max(states_[link].max_end_pos, states_[state].max_end_pos);
   }
 
   for (auto& state : states_) {
@@ -92,23 +90,16 @@ void SuffixAutomaton::finalize_() {
       state.children_by_recency.emplace_back(token, child_state);
     }
 
+    std::sort(state.children_by_freq.begin(), state.children_by_freq.end(), [this](const auto& lhs, const auto& rhs) {
+      const auto lhs_freq = states_[lhs.second].occ_count;
+      const auto rhs_freq = states_[rhs.second].occ_count;
+      return std::tie(rhs_freq, lhs.first, lhs.second) < std::tie(lhs_freq, rhs.first, rhs.second);
+    });
     std::sort(
-        state.children_by_freq.begin(),
-        state.children_by_freq.end(),
-        [this](const auto& lhs, const auto& rhs) {
-          const auto lhs_freq = states_[lhs.second].occ_count;
-          const auto rhs_freq = states_[rhs.second].occ_count;
-          return std::tie(rhs_freq, lhs.first, lhs.second) <
-                 std::tie(lhs_freq, rhs.first, rhs.second);
-        });
-    std::sort(
-        state.children_by_recency.begin(),
-        state.children_by_recency.end(),
-        [this](const auto& lhs, const auto& rhs) {
+        state.children_by_recency.begin(), state.children_by_recency.end(), [this](const auto& lhs, const auto& rhs) {
           const auto lhs_recency = states_[lhs.second].max_end_pos;
           const auto rhs_recency = states_[rhs.second].max_end_pos;
-          return std::tie(rhs_recency, lhs.first, lhs.second) <
-                 std::tie(lhs_recency, rhs.first, rhs.second);
+          return std::tie(rhs_recency, lhs.first, lhs.second) < std::tie(lhs_recency, rhs.first, rhs.second);
         });
   }
 }
@@ -138,14 +129,11 @@ void SuffixAutomaton::build(const std::vector<std::vector<int32_t>>& documents) 
     return;
   }
 
-  finalize_();
+  propagateOccurrencesAndRecency_();
   loaded_ = true;
 }
 
-std::vector<SamAnchor> SuffixAutomaton::collectAnchors_(
-    const int32_t* context,
-    size_t len,
-    size_t max_depth) const {
+std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len, size_t max_depth) const {
   if (empty() || len == 0) {
     return {};
   }
@@ -186,16 +174,10 @@ std::vector<SamAnchor> SuffixAutomaton::collectAnchors_(
 }
 
 Result SuffixAutomaton::buildRecency(
-    const int32_t* context,
-    size_t len,
-    int32_t last_token,
-    size_t draft_token_num,
-    const Param& param) const {
-  auto anchors = collectAnchors_(context, len, param.max_trie_depth);
-  const auto max_match_depth =
-      std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
-  const double bfs_breadth_scale =
-      double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
+    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
+  auto anchors = match(context, len, param.max_trie_depth);
+  const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
+  const double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
   std::vector<Node> tree(draft_token_num + 1);
   int root = 0;
   int cursor = 1;
@@ -203,10 +185,7 @@ Result SuffixAutomaton::buildRecency(
   for (const auto& anchor : anchors) {
     std::queue<std::tuple<int, double, int>> queue;
     queue.push(
-        {root,
-         (max_match_depth - anchor.matched_len) * bfs_breadth_scale +
-             param.min_bfs_breadth,
-         anchor.state});
+        {root, (max_match_depth - anchor.matched_len) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
     while (!queue.empty() && cursor <= static_cast<int>(draft_token_num)) {
       auto [parent, cur_breadth, state] = queue.front();
       queue.pop();
@@ -214,8 +193,7 @@ Result SuffixAutomaton::buildRecency(
       const auto& children = states_[state].children_by_recency;
       const auto breadth = std::max(1, static_cast<int32_t>(cur_breadth));
       for (int i = 0;
-           i < breadth && i < static_cast<int>(children.size()) &&
-           cursor <= static_cast<int>(draft_token_num);
+           i < breadth && i < static_cast<int>(children.size()) && cursor <= static_cast<int>(draft_token_num);
            ++i) {
         const auto [token, child_state] = children[i];
         int pos = -1;
@@ -232,16 +210,11 @@ Result SuffixAutomaton::buildRecency(
 }
 
 Result SuffixAutomaton::buildFrequency(
-    const int32_t* context,
-    size_t len,
-    int32_t last_token,
-    size_t draft_token_num,
-    const Param& param) const {
-  auto anchors = collectAnchors_(context, len, param.max_trie_depth);
+    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
+  auto anchors = match(context, len, param.max_trie_depth);
   struct CompareByProb {
     bool operator()(
-        const std::tuple<int, int32_t, int, double>& lhs,
-        const std::tuple<int, int32_t, int, double>& rhs) const {
+        const std::tuple<int, int32_t, int, double>& lhs, const std::tuple<int, int32_t, int, double>& rhs) const {
       return std::get<3>(lhs) < std::get<3>(rhs);
     }
   };
@@ -277,8 +250,7 @@ Result SuffixAutomaton::buildFrequency(
     }
     count = 0;
     for (const auto& [token, child_state] : children) {
-      const auto scaled_prob =
-          static_cast<double>(states_[child_state].occ_count) / sum_freq * prob;
+      const auto scaled_prob = static_cast<double>(states_[child_state].occ_count) / sum_freq * prob;
       heap.emplace(parent, token, child_state, scaled_prob);
       if (++count >= top_k) {
         break;

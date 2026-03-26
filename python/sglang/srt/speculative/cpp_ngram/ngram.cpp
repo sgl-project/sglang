@@ -99,8 +99,7 @@ Result Ngram::batchMatch(
 
   using TrieResultBuildFn =
       Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
-  using SamResultBuildFn =
-      Result (SuffixAutomaton::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
+  using SamResultBuildFn = Result (SuffixAutomaton::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
   TrieResultBuildFn trie_result_build_fn;
   SamResultBuildFn sam_result_build_fn;
   if (param_.match_type == "BFS") {
@@ -123,44 +122,21 @@ Result Ngram::batchMatch(
     auto& state = match_state_[req_ids[i]];
     const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
     const auto sam_budget =
-        sam_ && !sam_->empty()
-            ? std::min(param_.external_sam_budget, total_draft_token_num)
-            : size_t{0};
+        sam_ && !sam_->empty() ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
     const auto trie_budget = total_draft_token_num - sam_budget;
 
     if (sam_budget == 0) {
       auto res = (trie_.get()->*trie_result_build_fn)(
-          suffix.data(),
-          suffix.size(),
-          suffix.back(),
-          total_draft_token_num,
-          param_,
-          state,
-          total_lens[i]);
+          suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
       continue;
     }
 
     auto trie_res = (trie_.get()->*trie_result_build_fn)(
-        suffix.data(),
-        suffix.size(),
-        suffix.back(),
-        trie_budget,
-        param_,
-        state,
-        total_lens[i]);
-    auto sam_res = (sam_.get()->*sam_result_build_fn)(
-        suffix.data(),
-        suffix.size(),
-        suffix.back(),
-        sam_budget,
-        param_);
-    auto res = combineRootResults_(
-        suffix.back(),
-        static_cast<int>(total_draft_token_num + 1),
-        trie_res,
-        sam_res);
+        suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
+    auto sam_res = (sam_.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), sam_budget, param_);
+    auto res = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), trie_res, sam_res);
     merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
     merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
   }

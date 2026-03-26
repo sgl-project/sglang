@@ -3060,7 +3060,10 @@ class ServerArgs:
                         "--speculative-ngram-external-sam-budget must be positive when "
                         "--speculative-ngram-external-corpus-path is set."
                     )
-                if self.speculative_ngram_external_sam_budget > self.speculative_num_draft_tokens - 1:
+                if (
+                    self.speculative_ngram_external_sam_budget
+                    > self.speculative_num_draft_tokens - 1
+                ):
                     raise ValueError(
                         "speculative_ngram_external_sam_budget must be less than or equal to "
                         f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."

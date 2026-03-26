@@ -39,27 +39,16 @@ class SuffixAutomaton {
   }
 
   Result buildRecency(
-      const int32_t* context,
-      size_t len,
-      int32_t last_token,
-      size_t draft_token_num,
-      const Param& param) const;
+      const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
 
   Result buildFrequency(
-      const int32_t* context,
-      size_t len,
-      int32_t last_token,
-      size_t draft_token_num,
-      const Param& param) const;
+      const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
 
  private:
   void reset_();
   void extend_(int32_t token, int64_t pos);
-  void finalize_();
-  std::vector<SamAnchor> collectAnchors_(
-      const int32_t* context,
-      size_t len,
-      size_t max_depth) const;
+  void propagateOccurrencesAndRecency_();
+  std::vector<SamAnchor> match(const int32_t* context, size_t len, size_t max_depth) const;
 
   std::vector<SamState> states_;
   int last_ = 0;
