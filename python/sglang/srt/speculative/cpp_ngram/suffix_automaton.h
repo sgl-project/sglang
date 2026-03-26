@@ -30,9 +30,7 @@ class SuffixAutomaton {
  public:
   static constexpr int32_t kSeparatorToken = std::numeric_limits<int32_t>::min();
 
-  SuffixAutomaton();
-
-  void build(const std::vector<std::vector<int32_t>>& documents);
+  explicit SuffixAutomaton(const std::vector<std::vector<int32_t>>& documents);
 
   bool empty() const {
     return !loaded_;
@@ -45,7 +43,6 @@ class SuffixAutomaton {
       const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
 
  private:
-  void reset_();
   void extend_(int32_t token, int64_t pos);
   void propagateOccurrencesAndRecency_();
   std::vector<SamAnchor> match(const int32_t* context, size_t len, size_t max_depth) const;

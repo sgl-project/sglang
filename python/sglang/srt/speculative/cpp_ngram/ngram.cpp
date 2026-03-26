@@ -38,7 +38,6 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   }
 
   trie_ = std::make_unique<Trie>(capacity, param_);
-  sam_ = std::make_unique<SuffixAutomaton>();
 
   insert_worker_ = std::thread(&Ngram::insertWorker, this);
 }
@@ -67,10 +66,7 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
 
 void Ngram::loadExternalCorpus(const std::vector<std::vector<int32_t>>& documents) {
   std::unique_lock<std::mutex> lock(mutex_);
-  if (!sam_) {
-    sam_ = std::make_unique<SuffixAutomaton>();
-  }
-  sam_->build(documents);
+  sam_ = std::make_unique<SuffixAutomaton>(documents);
 }
 
 void Ngram::insertWorker() {

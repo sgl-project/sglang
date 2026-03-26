@@ -7,15 +7,31 @@
 
 namespace ngram {
 
-SuffixAutomaton::SuffixAutomaton() {
-  reset_();
-}
-
-void SuffixAutomaton::reset_() {
-  states_.clear();
+SuffixAutomaton::SuffixAutomaton(const std::vector<std::vector<int32_t>>& documents) {
   states_.emplace_back();
-  last_ = 0;
-  loaded_ = false;
+  int64_t pos = 0;
+  bool saw_token = false;
+  bool has_previous_doc = false;
+  for (const auto& document : documents) {
+    if (document.empty()) {
+      continue;
+    }
+    if (has_previous_doc) {
+      extend_(kSeparatorToken, pos++);
+    }
+    for (const auto token : document) {
+      extend_(token, pos++);
+      saw_token = true;
+    }
+    has_previous_doc = true;
+  }
+
+  if (!saw_token) {
+    return;
+  }
+
+  propagateOccurrencesAndRecency_();
+  loaded_ = true;
 }
 
 void SuffixAutomaton::extend_(int32_t token, int64_t pos) {
@@ -102,35 +118,6 @@ void SuffixAutomaton::propagateOccurrencesAndRecency_() {
           return std::tie(rhs_recency, lhs.first, lhs.second) < std::tie(lhs_recency, rhs.first, rhs.second);
         });
   }
-}
-
-void SuffixAutomaton::build(const std::vector<std::vector<int32_t>>& documents) {
-  reset_();
-
-  int64_t pos = 0;
-  bool saw_token = false;
-  bool has_previous_doc = false;
-  for (const auto& document : documents) {
-    if (document.empty()) {
-      continue;
-    }
-    if (has_previous_doc) {
-      extend_(kSeparatorToken, pos++);
-    }
-    for (const auto token : document) {
-      extend_(token, pos++);
-      saw_token = true;
-    }
-    has_previous_doc = true;
-  }
-
-  if (!saw_token) {
-    reset_();
-    return;
-  }
-
-  propagateOccurrencesAndRecency_();
-  loaded_ = true;
 }
 
 std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len, size_t max_depth) const {
