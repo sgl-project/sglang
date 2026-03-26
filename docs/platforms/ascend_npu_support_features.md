@@ -72,6 +72,11 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |      A2, A3      |
 | `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--radix-eviction-policy`                           | `lru`    | `lru`,<br/>`lfu`               |      A2, A3      |
+| `--enable-prefill-delayer`                          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--prefill-delayer-max-delay-passes`                | `30`     | Type: int                      |      A2, A3      |
+| `--prefill-delayer-token-usage-low-watermark`       | `None`   | Type: float                    |      A2, A3      |
+| `--prefill-delayer-forward-passes-buckets`          | `None`   | List[float]                    |      A2, A3      |
+| `--prefill-delayer-wait-seconds-buckets`            | `None`   | List[float]                    |      A2, A3      |
 | `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 
@@ -82,6 +87,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--device`                                         | `None`   | Type: str                 |      A2, A3      |
 | `--tensor-parallel-size`<br/>`--tp-size`           | `1`      | Type: int                 |      A2, A3      |
 | `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Type: int                 |      A2, A3      |
+| `--attention-context-parallel-size`<br/>`--attn-cp-size`  | `1` | Type: int               |      A2, A3      |
+| `--moe-data-parallel-size`<br/>`--moe-dp-size`     | `1`      | Type: int                 |      A2, A3      |
 | `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
 | `--pp-async-batch-depth`                           | `None`   | Type: int                 |      A2, A3      |
 | `--stream-interval`                                | `1`      | Type: int                 |      A2, A3      |
@@ -92,6 +99,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--watchdog-timeout`                               | `300`    | Type: float               |      A2, A3      |
 | `--soft-watchdog-timeout`                          | `300`    | Type: float               |      A2, A3      |
 | `--dist-timeout`                                   | `None`   | Type: int                 |      A2, A3      |
+| `--download-dir`                                   | `None`   | Type: str                 |      A2, A3      |
+| `--model-checksum`                                 | `None`   | Type: str                 |      A2, A3      |
 | `--base-gpu-id`                                    | `0`      | Type: int                 |      A2, A3      |
 | `--gpu-id-step`                                    | `1`      | Type: int                 |      A2, A3      |
 | `--sleep-on-idle`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
@@ -142,6 +151,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--served-model-name`   | `None`    | Type: str                      |      A2, A3      |
 | `--weight-version`      | `default` | Type: str                      |      A2, A3      |
 | `--chat-template`       | `None`    | Type: str                      |      A2, A3      |
+| `--hf-chat-template-name` | `None`  | Type: str                      |      A2, A3      |
 | `--completion-template` | `None`    | Type: str                      |      A2, A3      |
 | `--enable-cache-report` | `False`   | bool flag<br/> (set to enable) |      A2, A3      |
 | `--reasoning-parser`    | `None`    | `deepseek-r1`<br/>`deepseek-v3`<br/>`glm45`<br/>`gpt-oss`<br/>`kimi`<br/>`qwen3`<br/>`qwen3-thinking`<br/>`step3`                  |      A2, A3      |
@@ -154,7 +164,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 |----------------------------------------|---------------|-----------------------------------------------------------|:----------------:|
 | `--data-parallel-size`<br/>`--dp-size` | `1`           | Type: int                                                 |      A2, A3      |
 | `--load-balance-method`                | `auto` | `auto`,<br/> `round_robin`,<br/> `follow_bootstrap_room`,<br/> `total_requests`,<br/> `total_tokens` |      A2, A3      |
-| `--prefill-round-robin-balance`        | `False`       | bool flag<br/> (set to enable)                            |      A2, A3      |
 
 ## Multi-node distributed serving
 
@@ -229,7 +238,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--speculative-ngram-`<br/>`min-bfs-breadth`       | `1`        | Type: int          |   Experimental   |
 | `--speculative-ngram-`<br/>`max-bfs-breadth`       | `10`       | Type: int          |   Experimental   |
 | `--speculative-ngram-`<br/>`match-type`            | `BFS`      | `BFS`,<br/> `PROB` |   Experimental. `BFS` uses recency-based expansion; `PROB` uses frequency-based expansion. |
-| `--speculative-ngram-`<br/>`branch-length`         | `18`       | Type: int          |   Experimental   |
+| `--speculative-ngram-`<br/>`max-trie-depth`         | `18`       | Type: int          |   Experimental   |
 | `--speculative-ngram-`<br/>`capacity`              | `10000000` | Type: int          |   Experimental   |
 
 ## Expert parallelism
@@ -389,7 +398,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--disaggregation-bootstrap-port`                       | `8998`     | Type: int                             |      A2, A3      |
 | `--disaggregation-ib-device`                            | `None`     | Type: str                             | Special for GPU  |
 | `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
-| `--disaggregation-decode-`<br/>`enable-fake-auto`       | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
 | `--num-reserved-decode-tokens`                          | `512`      | Type: int                             |      A2, A3      |
 | `--disaggregation-decode-`<br/>`polling-interval`       | `1`        | Type: int                             |      A2, A3      |
 
@@ -464,7 +472,7 @@ NPU, like Ktransformer, checkpoint-engine etc.
 | `--kt-weight-path`                                                | `None`    | Type: str                 |
 | `--kt-method`                                                     | `AMXINT4` | Type: str                 |
 | `--kt-cpuinfer`                                                   | `None`    | Type: int                 |
-| `--kt-threadpool-count`                                           | 2         | Type: int                 |
+| `--kt-threadpool-count`                                           | `2`       | Type: int                 |
 | `--kt-num-gpu-experts`                                            | `None`    | Type: int                 |
 | `--kt-max-deferred-`<br/>`experts-per-token`                      | `None`    | Type: int                 |
 
