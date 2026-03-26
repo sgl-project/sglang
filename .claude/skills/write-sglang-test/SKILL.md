@@ -7,8 +7,6 @@ description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI reg
 
 This skill covers **how to write and register tests**. For CI pipeline internals (stage ordering, fast-fail, gating, partitioning, debugging CI failures), see the [CI workflow guide](../ci-workflow-guide/SKILL.md).
 
-**Also read [`test/README.md`](../../../test/README.md)** for folder layout, how to run tests locally, and suite selection guidance.
-
 ## Core Rules
 
 1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`. It ensures `tearDownClass` runs even when `setUpClass` fails, preventing resource leaks in CI.

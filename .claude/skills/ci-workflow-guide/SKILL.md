@@ -5,7 +5,7 @@ description: Guide to SGLang CI workflow orchestration — stage ordering, fast-
 
 # SGLang CI Workflow Orchestration Guide
 
-This skill covers the CI **infrastructure** layer — how tests are dispatched, gated, and fast-failed across stages. For test authoring (templates, fixtures, registration, model selection), see the [write-sglang-test skill](../write-sglang-test/SKILL.md). For folder layout and running tests locally, see [`test/README.md`](../../../test/README.md).
+This skill covers the CI **infrastructure** layer — how tests are dispatched, gated, and fast-failed across stages. For test authoring (templates, fixtures, registration, model selection), see the [write-sglang-test skill](../write-sglang-test/SKILL.md).
 
 ---
 

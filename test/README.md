@@ -1,9 +1,9 @@
 # Test and Continuous Integration (CI) System in SGLang
 
-This page covers the essentials: folder layout, how to run tests, how to register new tests, and suite selection. For deeper dives:
+This page covers principles and essentials: folder layout, how to run tests, registration, and suite selection. For complete references, see the skill guides:
 
-- **Writing tests** (templates, fixtures, model selection, checklist): [`.claude/skills/write-sglang-test/SKILL.md`](../.claude/skills/write-sglang-test/SKILL.md)
-- **CI pipeline internals** (stage ordering, fast-fail, gating, partitioning, debugging failures): [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
+- **Writing tests** — templates, fixtures, model selection, complete suite tables, checklist: [`.claude/skills/write-sglang-test/SKILL.md`](../.claude/skills/write-sglang-test/SKILL.md)
+- **CI pipeline internals** — stage flow diagrams, fast-fail layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
 
 ## CI Pipeline Overview
 
