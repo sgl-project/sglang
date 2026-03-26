@@ -377,11 +377,7 @@ def handle_rerun_stage(
             print(f"Successfully triggered workflow for stage '{stage_name}'")
             if react_on_success:
                 comment.create_reaction("+1")
-                pr.create_issue_comment(
-                    f"✅ Triggered `{stage_name}` to run independently (skipping dependencies)."
-                )
 
-                # Poll for the workflow run URL and post follow-up comment
                 run_url = find_workflow_run_url(
                     gh_repo,
                     target_workflow.id,
@@ -393,9 +389,15 @@ def handle_rerun_stage(
                     max_wait=30,
                 )
                 if run_url:
-                    pr.create_issue_comment(f"🔗 [View workflow run]({run_url})")
+                    pr.create_issue_comment(
+                        f"✅ Triggered `{stage_name}` to run independently"
+                        f" (skipping dependencies)."
+                        f" [View workflow run]({run_url})"
+                    )
                 else:
                     pr.create_issue_comment(
+                        f"✅ Triggered `{stage_name}` to run independently"
+                        f" (skipping dependencies).\n"
                         f"⚠️ Could not retrieve workflow run URL. "
                         f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                     )
@@ -643,10 +645,6 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
         if success:
             print(f"Successfully triggered rerun-ut: {test_command}")
             comment.create_reaction("+1")
-            pr.create_issue_comment(
-                f"✅ Triggered `/rerun-ut` on `{runner_label}` runner:\n"
-                f"```\ncd test/ && python3 {test_command}\n```"
-            )
 
             # Include test_command in expected title to distinguish
             # concurrent /rerun-ut dispatches (run-name includes test_command)
@@ -663,10 +661,14 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
             )
             if run_url:
                 pr.create_issue_comment(
-                    f"🔗 [View workflow run]({run_url}) (`{test_command}`)"
+                    f"✅ Triggered `/rerun-ut` on `{runner_label}` runner:"
+                    f" [View workflow run]({run_url})\n"
+                    f"```\ncd test/ && python3 {test_command}\n```"
                 )
             else:
                 pr.create_issue_comment(
+                    f"✅ Triggered `/rerun-ut` on `{runner_label}` runner:\n"
+                    f"```\ncd test/ && python3 {test_command}\n```\n"
                     f"⚠️ Could not retrieve workflow run URL. "
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
