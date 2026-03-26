@@ -74,6 +74,7 @@ class TestMxfp8MoeScaleLayout(CustomTestCase):
         self.assertEqual(tuple(layer.w2_weight_scale_inv.shape), (2, 32, 1))
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestInverseTransformScaleUe8m0(CustomTestCase):
     def test_round_trip(self):
         for _ in range(100):
