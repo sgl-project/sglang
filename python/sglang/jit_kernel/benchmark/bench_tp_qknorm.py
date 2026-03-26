@@ -11,17 +11,22 @@ from sglang.jit_kernel.all_reduce import (
     fused_parallel_qknorm,
     get_fused_parallel_qknorm_max_occupancy,
 )
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=120,
+    suite="stage-b-kernel-benchmark-1-gpu-large",
+    disabled="requires multi-GPU, self-skips in CI",
 )
 
 Q_K_DIMS = [(6144, 1024)]
 DTYPE = torch.bfloat16
 EPS = 1e-6
-BATCH_SIZES = [1, 16, 64, 256, 1024, 2048, 4096, 8192, 16384]
-if is_in_ci():
-    BATCH_SIZES = [1, 64, 1024]
+BATCH_SIZES = get_ci_test_range([2**i for i in range(15)], [1, 64, 1024])
 NUM_LAYERS = 8
 
 
