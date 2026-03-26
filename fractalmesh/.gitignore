@@ -1,0 +1,8 @@
+.env
+db/
+logs/
+whitepapers/
+__pycache__/
+*.pyc
+*.pdf
+node_modules/
