@@ -936,7 +936,7 @@ class ServerArgs:
             if self.nnodes > 1 and self.dist_init_addr:
                 # Multi-node: derive from dist_init_addr port so all nodes
                 # agree on the same bootstrap port regardless of per-node --port.
-                dist_port = int(self.dist_init_addr.rsplit(":", 1)[1])
+                dist_port = NetworkAddress.parse(self.dist_init_addr).port
                 self.engine_info_bootstrap_port = (
                     dist_port + ENGINE_INFO_BOOTSTRAP_PORT_DELTA
                 )
