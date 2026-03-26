@@ -124,7 +124,7 @@ class TestNixlUnified(unittest.TestCase):
 
         # Test get
         retrieved2 = self.hicache.get(key, dst_addr, dst_len)
-        self.assertTrue(retrieved2 == None)
+        self.assertTrue(retrieved2 is None)
         self.verify_tensors_equal(value, dst_tensor2)
 
     def test_batch_set_get(self):
@@ -159,7 +159,7 @@ class TestNixlUnified(unittest.TestCase):
 
         # Test batch get
         retrieved2 = self.hicache.batch_get(keys, dst_addrs, dst_lens)
-        self.assertTrue(all(ret == None for ret in retrieved2))
+        self.assertTrue(all(ret is None for ret in retrieved2))
         self.verify_tensor_lists_equal(values, dst_tensors2)
 
     def test_mixed_operations(self):
