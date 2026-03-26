@@ -5090,11 +5090,22 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
-    def url(self):
-        if is_valid_ipv6_address(self.host):
-            return f"http://[{self.host}]:{self.port}"
+    def url(self, port: Optional[int] = None):
+        effective_port = port if port is not None else self.port
+        host = self.host
+        # When binding to all interfaces, use loopback for internal requests.
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        if is_valid_ipv6_address(host):
+            return f"http://[{host}]:{effective_port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            return f"http://{host}:{effective_port}"
+
+    @property
+    def engine_info_bootstrap_url(self):
+        return self.url(port=self.engine_info_bootstrap_port)
 
     def get_model_config(self):
         # Lazy init to avoid circular import
