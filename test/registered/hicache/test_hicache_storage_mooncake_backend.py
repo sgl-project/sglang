@@ -10,6 +10,7 @@ import time
 import unittest
 
 import requests
+import torch
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -24,6 +25,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=236, stage="base-b", runner_config="2-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     """Base mixin class with common setup and utilities"""
 
@@ -228,6 +230,7 @@ class TestMooncakeBackendLayerFirstLayout(
 '''
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestMooncakeBackendPageFirstLayout(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
@@ -242,6 +245,7 @@ class TestMooncakeBackendPageFirstLayout(
         return server_args, env_vars
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMooncakeBackendMLAModel(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
@@ -261,6 +265,7 @@ class TestMooncakeBackendMLAModel(
         return server_args, env_vars
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipUnless(get_gpu_count() >= 2, "Requires at least 2 CUDA GPUs for TP2+CP2")
 class TestMooncakeBackendQwen330BCP2(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
@@ -294,6 +299,7 @@ class TestMooncakeBackendQwen330BCP2(
         return server_args, env_vars
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMooncakeBackendAccuracy(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
