@@ -1,6 +1,6 @@
 # Install SGLang-Diffusion
 
-You can install SGLang-Diffusion using one of the methods below.
+You can install SGLang-Diffusion using one of the methods below. The standard installation already includes SGLang's optimized kernel stack, including both `sgl-kernel` and JIT kernels used by diffusion workloads.
 
 ## Standard Installation (NVIDIA GPUs)
 
@@ -65,7 +65,7 @@ docker run --device=/dev/kfd --device=/dev/dri --ipc=host \
   sglang generate --model-path black-forest-labs/FLUX.1-dev --prompt "A logo With Bold Large text: SGL Diffusion" --save-output
 ```
 
-For detailed ROCm system configuration and installation from source, see [AMD GPUs](../../platforms/amd_gpu.md).
+For detailed ROCm system configuration and installation from source, see [AMD GPUs](../platforms/amd_gpu.md).
 
 ## Platform-Specific: MUSA (Moore Threads GPUs)
 
