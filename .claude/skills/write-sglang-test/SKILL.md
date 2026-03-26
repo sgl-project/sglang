@@ -11,14 +11,14 @@ description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI reg
 
 1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`. It ensures `tearDownClass` runs even when `setUpClass` fails, preventing resource leaks in CI.
 2. **`tearDownClass` must be defensive** — use `hasattr`/null checks before accessing resources (e.g. `cls.process`) that `setUpClass` may not have finished allocating.
-3. **Place tests in `test/registered/<category>/`** — except JIT kernel tests and benchmarks, which live in `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`
+3. **Place tests in `test/registered/<category>/`** — except JIT kernel tests and benchmarks, which live in `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/` (nested subfolders are allowed)
 4. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
 5. **Prefer mock over real server** — when testing logic that doesn't need a server / engine launch (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock` and place tests in `test/registered/unit/`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
 
 JIT kernel exception:
 - If the task is adding or updating code under `python/sglang/jit_kernel/`, prefer the `add-jit-kernel` skill first.
-- JIT kernel correctness tests use `python/sglang/jit_kernel/tests/test_*.py`.
-- JIT kernel benchmarks use `python/sglang/jit_kernel/benchmark/bench_*.py`.
+- JIT kernel correctness tests use `python/sglang/jit_kernel/tests/**/test_*.py`.
+- JIT kernel benchmarks use `python/sglang/jit_kernel/benchmark/**/bench_*.py`.
 - Those files are still executed by `test/run_suite.py`, but through dedicated kernel suites rather than `test/registered/`.
 
 ---

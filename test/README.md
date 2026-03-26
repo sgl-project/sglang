@@ -81,7 +81,7 @@ Here is an illustration
 
 
 ## Folder organization
-- `registered`: The registered test files. They are run in CI. Most tests should live in this folder. The main exception is JIT kernel coverage, which lives under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`.
+- `registered`: The registered test files. They are run in CI. Most tests should live in this folder. The main exception is JIT kernel coverage, which lives under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/` (including nested subfolders such as `diffusion/`).
 - `manual`: Test files that CI does not run; you run them manually. Typically, these are temporary tests, deprecated tests, or tests that are not suitable for CI—such as those that take too long or require special setup. We would still like to keep some files here for anyone who wants to run them locally.
 - `run_suite.py`: The launch script to run a test suite. It scans `test/registered/` and also the JIT kernel test / benchmark directories.
 - Other: utility scripts and metadata folders. The `srt` folder holds our legacy CI setup and should be deprecated as soon as possible.
@@ -142,7 +142,7 @@ python test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-small \
 ## CI Registry System
 
 CI-discovered tests use a registry-based CI system for flexible backend and schedule configuration.
-This includes files under `test/registered/` and, for JIT kernels, files under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`.
+This includes files under `test/registered/` and, for JIT kernels, files under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`, recursively including nested subfolders.
 For every CI-discovered file you add, you need to register it in a suite and provide an estimated execution time in seconds.
 
 ### Registration Functions
@@ -180,8 +180,8 @@ register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small", disabled="flaky 
 
 JIT kernel files are discovered by `test/run_suite.py`, but they do not live under `test/registered/`:
 
-- Correctness tests: `python/sglang/jit_kernel/tests/test_*.py`
-- Benchmarks: `python/sglang/jit_kernel/benchmark/bench_*.py`
+- Correctness tests: `python/sglang/jit_kernel/tests/**/test_*.py`
+- Benchmarks: `python/sglang/jit_kernel/benchmark/**/bench_*.py`
 
 Use dedicated kernel suites:
 
