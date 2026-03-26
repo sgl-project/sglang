@@ -189,9 +189,11 @@ Use dedicated kernel suites:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-8-gpu-h200")
 register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
 # Optional nightly registration
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=120, suite="nightly-kernel-8-gpu-h200", nightly=True)
 ```
 
 Keep `est_time` and `suite` as literal values. `run_suite.py` collects them by statically parsing the file AST.
@@ -210,6 +212,7 @@ You can find the available suites for each hardware backend at [`test/run_suite.
 | `stage-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP-style workloads) on H100 |
 | `stage-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (e.g. SM100+ paths) on four GPUs |
 | `stage-b-kernel-unit-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
+| `stage-b-kernel-unit-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
 | `stage-b-kernel-benchmark-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `python/sglang/jit_kernel/benchmark/` |
 | `stage-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
 | `stage-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
@@ -242,6 +245,7 @@ Nightly registry suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](
 
 - `nightly-1-gpu` (CUDA)
 - `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
+- `nightly-kernel-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly coverage)
 - `nightly-8-gpu-h200` (CUDA)
 - `nightly-eval-vlm-2-gpu` (CUDA)
 - `nightly-amd` (AMD)
@@ -254,7 +258,7 @@ Use the lightest suite that still meets your test's needs.
 - Prefer the CPU suite (`stage-a-test-cpu`) when no GPU is required.
 - For most small GPU workloads that fit a 5090-class card in CI, use `stage-b-test-1-gpu-small`. Most tests should go here.
 - If you really need more GPU memory capacity or Hopper-specific features, use `stage-b-test-1-gpu-large`.
-- For JIT kernel work under `python/sglang/jit_kernel/`, use `stage-b-kernel-unit-1-gpu-large` for correctness tests and `stage-b-kernel-benchmark-1-gpu-large` for benchmarks.
+- For JIT kernel work under `python/sglang/jit_kernel/`, use `stage-b-kernel-unit-1-gpu-large` for single-GPU correctness tests, `stage-b-kernel-unit-8-gpu-h200` for multi-GPU correctness tests, and `stage-b-kernel-benchmark-1-gpu-large` for benchmarks.
 - Use multi-GPU suites only when the test actually needs multiple GPUs or other advanced multi-GPU behavior.
 
 In rare cases, if you need a new runner or custom setup, you might need to add a new suite.
