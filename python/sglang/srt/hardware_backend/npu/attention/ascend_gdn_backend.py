@@ -1,7 +1,6 @@
 from typing import Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
 from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_fn_npu,
@@ -29,37 +28,6 @@ from sglang.srt.utils import is_cpu
 fused_gdn_gating = fused_gdn_gating_npu
 causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
-
-
-def npu_causal_conv1d_update(
-    hidden_state: torch.Tensor,
-    weight: torch.Tensor,
-    conv_state: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    silu_activation: bool = True,
-):
-    bsz, hidden_size, seq_len = hidden_state.shape
-    kernel_size = weight.shape[-1]
-    target_state_len = (kernel_size - 1) + (seq_len - 1)
-    full_context = torch.cat([conv_state, hidden_state], dim=-1).to(weight.dtype)
-    computation_input = full_context[:, :, -(kernel_size - 1 + seq_len) :]
-    windows = computation_input.unfold(-1, kernel_size, 1)
-
-    out = (windows * weight[None, :, None, :]).sum(dim=-1)
-    if bias is not None:
-        out = out + bias[None, :, None]
-    if silu_activation:
-        out = F.silu(out)
-    out = out.to(hidden_state.dtype)
-
-    if target_state_len > 0:
-        new_conv_state = full_context[:, :, -target_state_len:]
-    else:
-        new_conv_state = torch.empty(
-            bsz, hidden_size, 0, device=hidden_state.device, dtype=hidden_state.dtype
-        )
-
-    return out, new_conv_state
 
 
 class AscendGDNKernelDispatcher(GDNKernelDispatcher):
@@ -266,18 +234,23 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                 seq_len = forward_batch.num_token_non_padded_cpu
 
             mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1)
-            conv_states_to_use = conv_states[cache_indices]
-            mixed_qkv_processed, new_conv_state = npu_causal_conv1d_update(
-                mixed_qkv_reshaped.transpose(1, 2).contiguous(),
-                layer.conv_weights,
-                conv_states_to_use.transpose(1, 2).contiguous(),
+            num_accepted_tokens = torch.full(
+                (batch_size,),
+                draft_token_num,
+                dtype=torch.int32,
+                device=mixed_qkv.device,
+            )
+            mixed_qkv = torch.ops.npu.causal_conv1d_update(
+                mixed_qkv_reshaped,
+                layer.conv_weights.transpose(0, 1).contiguous(),
+                conv_states,
+                cache_indices,
                 layer.bias,
-                True,
-            )
-            mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
-            )
-            conv_states[cache_indices] = new_conv_state.transpose(1, 2).contiguous()
+                num_accepted_tokens,
+                None,
+                layer.activation == "silu",
+                self.pad_slot_id,
+            ).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if (
