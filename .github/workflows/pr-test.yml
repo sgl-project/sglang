@@ -92,12 +92,6 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Show test partition assignments
-        continue-on-error: true
-        run: python3 test/show_partitions.py
 
       - name: Determine run mode
         id: run-mode
@@ -122,6 +116,8 @@ jobs:
           filters: |
             main_package:
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/pr-gate.yml"
+              - ".github/actions/**"
               - "python/pyproject.toml"
               - "python/sglang/!(multimodal_gen)/**"
               - "scripts/ci/cuda/*"
@@ -131,8 +127,10 @@ jobs:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
-              - "python/sglang/multimodal_gen/**"
-              - "python/sglang/jit_kernel/**"
+              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
+              - "python/sglang/jit_kernel/diffusion/**"
+              - "python/sglang/jit_kernel/tests/diffusion/**"
+              - "python/sglang/jit_kernel/benchmark/diffusion/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
@@ -183,7 +181,7 @@ jobs:
 
           # Check for main_package changes (excluding multimodal_gen)
           # Note: Need to filter out multimodal_gen before checking, not pipe grep -q output
-          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml)" | grep -v "^python/sglang/multimodal_gen/" || true)
+          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v "^python/sglang/multimodal_gen/" || true)
           if [ -n "$MAIN_PKG_FILES" ]; then
             echo "main_package=true" >> $GITHUB_OUTPUT
             echo "Detected main_package changes"
@@ -199,8 +197,8 @@ jobs:
             echo "jit_kernel=false" >> $GITHUB_OUTPUT
           fi
 
-          # Check for multimodal_gen changes
-          if echo "$CHANGED_FILES" | grep -qE "^(python/sglang/multimodal_gen/|python/sglang/cli/|python/pyproject\.toml|\.github/workflows/pr-test\.yml|\.github/workflows/pr-test-multimodal-gen\.yml)"; then
+          # Check for multimodal_gen changes, including diffusion-specific jit_kernel coverage
+          if echo "$CHANGED_FILES" | grep -qE "^(python/sglang/multimodal_gen/|python/sglang/cli/|python/sglang/jit_kernel/diffusion/|python/sglang/jit_kernel/tests/diffusion/|python/sglang/jit_kernel/benchmark/diffusion/|python/pyproject\.toml|\.github/workflows/pr-test\.yml|\.github/workflows/pr-test-multimodal-gen\.yml)"; then
             echo "multimodal_gen=true" >> $GITHUB_OUTPUT
             echo "Detected multimodal_gen changes"
           else
@@ -341,8 +339,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
@@ -371,8 +367,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
@@ -432,8 +426,6 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -486,8 +478,6 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -565,9 +555,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -618,9 +608,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -672,9 +662,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -733,9 +723,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -787,9 +777,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -843,9 +833,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -927,9 +917,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -981,9 +971,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1051,9 +1041,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1101,9 +1091,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1161,9 +1151,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1227,9 +1217,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
