@@ -135,7 +135,7 @@ class Mxfp4LinearMethod(LinearMethodBase):
                 except:
                     platform = "ROCm (unknown arch)"
             raise RuntimeError(
-                f"MXFP4 quantization requires ROCm MI300X+ (gfx95x). "
+                f"MXFP4 quantization requires ROCm MI350+ (gfx95x). "
                 f"Current platform: {platform}."
             )
 
