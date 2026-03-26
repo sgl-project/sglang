@@ -32,7 +32,7 @@ class Mxfp4Config(QuantizationConfig):
     MXFP4 quantization config for diffusion models.
 
     Supports online quantization from unquantized BF16/FP16 checkpoints.
-    Requires ROCm MI300X+ (gfx95x) platform.
+    Requires ROCm MI350+ (gfx95x) platform.
     """
 
     def __init__(self, is_checkpoint_mxfp4_serialized: bool = False):
@@ -180,7 +180,7 @@ class Mxfp4LinearMethod(LinearMethodBase):
 
         if not mxfp_supported():
             raise RuntimeError(
-                "MXFP4 inference requires ROCm MI300X+ (gfx95x). "
+                "MXFP4 inference requires ROCm MI350+ (gfx95x). "
                 "Current platform not supported."
             )
 

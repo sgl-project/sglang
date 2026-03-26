@@ -404,12 +404,11 @@ def load_model_from_full_model_state_dict(
         "gate_compress",
         "wcscales",
         "wtscale",
-        "input_scale",
+        "input_scale",  # quantization scales
+        "weight_scale",  # quantization scales
         "bias",
         "norm_q",
         "norm_k",
-        "weight_scale",  # FP8/MXFP4 quantization scales
-        "input_scale",   # FP8/MXFP4 activation quantization scales
     ]
     for new_param_name in unused_keys:
         meta_sharded_param = meta_sd.get(new_param_name)
