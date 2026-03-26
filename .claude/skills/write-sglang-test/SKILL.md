@@ -66,12 +66,14 @@ Defined in `python/sglang/test/test_utils.py`:
 | `stage-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP) on H100 |
 | `stage-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (SM100+ paths) on four GPUs |
 | `stage-b-kernel-unit-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
+| `stage-b-kernel-unit-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
 | `stage-b-kernel-benchmark-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `python/sglang/jit_kernel/benchmark/` |
 | `stage-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
 | `stage-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
 | `stage-c-test-8-gpu-h20` | `8-gpu-h20` | Large 8-GPU H20 runs for big models |
 | `stage-c-test-deepep-4-gpu-h100` | `4-gpu-h100` | DeepEP expert-parallel and networking on four H100s |
 | `stage-c-test-deepep-8-gpu-h200` | `8-gpu-h200` | DeepEP at 8-GPU H200 scale |
+| `stage-c-test-8-gpu-b200` | `8-gpu-b200` | 8-GPU B200 suite (registered but not yet wired to a workflow) |
 | `stage-c-test-4-gpu-b200` | `4-gpu-b200` | 4-GPU B200 suite for large models on Blackwell |
 | `stage-c-test-4-gpu-gb200` | `4-gpu-gb200` | 4-GPU GB200 suite for large models on Grace Blackwell |
 
@@ -80,9 +82,15 @@ Defined in `python/sglang/test/test_utils.py`:
 | Suite | Runner (label) | Description |
 |-------|----------------|-------------|
 | `stage-a-test-1-gpu-small-amd` | `linux-mi325-1gpu-sglang` | Quick checks on one MI325-class GPU |
+| `stage-b-test-1-gpu-small-amd` | `linux-mi325-1gpu-sglang` | Core 1-GPU AMD tests (14 partitions) |
+| `stage-b-test-1-gpu-small-amd-nondeterministic` | `linux-mi325-1gpu-sglang` | Non-deterministic 1-GPU AMD tests |
+| `stage-b-test-1-gpu-small-amd-mi35x` | `linux-mi35x-gpu-1` | 1-GPU tests on MI35x hardware |
+| `stage-b-test-1-gpu-large-amd` | `linux-mi325-1gpu-sglang` | Large 1-GPU AMD tests (2 partitions) |
 | `stage-b-test-2-gpu-large-amd` | `linux-mi325-2gpu-sglang` | 2-GPU ROCm correctness and parallel setups |
 | `stage-b-test-large-8-gpu-35x-disaggregation-amd` | `linux-mi35x-gpu-8.fabric` | PD disaggregation and RDMA on 8×MI35x fabric |
+| `stage-c-test-4-gpu-amd` | `linux-mi325-4gpu-sglang` | 4-GPU AMD integration (2 partitions) |
 | `stage-c-test-large-8-gpu-amd` | `linux-mi325-8gpu-sglang` | 8-GPU MI325 scaling and integration |
+| `stage-c-test-large-8-gpu-amd-mi35x` | `linux-mi35x-gpu-8` | 8-GPU MI35x scaling (2 partitions) |
 
 #### Nightly
 
@@ -90,6 +98,7 @@ Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../
 
 - `nightly-1-gpu` (CUDA)
 - `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
+- `nightly-kernel-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly)
 - `nightly-8-gpu-h200` (CUDA)
 - `nightly-eval-vlm-2-gpu` (CUDA)
 - `nightly-amd` (AMD)
@@ -325,12 +334,14 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 # Correctness tests in python/sglang/jit_kernel/tests/
 register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-8-gpu-h200")
 
 # Benchmarks in python/sglang/jit_kernel/benchmark/
 register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 # Optional nightly registration
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=120, suite="nightly-kernel-8-gpu-h200", nightly=True)
 ```
 
 Keep `est_time` and `suite` as **literal values** — `run_suite.py` collects them by AST parsing

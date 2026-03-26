@@ -158,7 +158,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 2. Matches jobs by exact name or prefix (for matrix jobs, e.g., `stage-b-test-1-gpu-small (3)`)
 3. If any matched job has `conclusion === 'failure'` → fail immediately (fast-fail)
 4. If all matched jobs are completed and count matches `expected_count` → success
-5. Otherwise → sleep `poll-interval-seconds` (default: 120s) and retry
+5. Otherwise → sleep `poll-interval-seconds` (default: 60s) and retry
 6. Timeout after `max-wait-minutes` (240 min for stage-a, 480 min for stage-b)
 
 **Job specs example** (stage-b):
@@ -234,7 +234,7 @@ Controlled by `run_unittest_files()` in `python/sglang/test/ci/ci_utils.py`.
 When a test fails and retry is enabled, the output is classified:
 
 **Non-retriable** (checked first — real code errors):
-`SyntaxError`, `ImportError`, `ModuleNotFoundError`, `NameError`, `TypeError`, `AttributeError`, `RuntimeError`, `ValueError`, `CUDA out of memory`, `Segmentation fault`, `ConnectionRefusedError`, `FileNotFoundError`
+`SyntaxError`, `ImportError`, `ModuleNotFoundError`, `NameError`, `TypeError`, `AttributeError`, `RuntimeError`, `CUDA out of memory`, `OOM`, `Segmentation fault`, `core dumped`, `ConnectionRefusedError`, `FileNotFoundError`
 
 **Retriable** (accuracy/performance):
 `AssertionError` with comparison patterns (`not greater than`, `not less than`, `not equal to`), `accuracy`, `score`, `latency`, `throughput`, `timeout`
@@ -276,6 +276,7 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `stage-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
 | `stage-b-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
 | `stage-b-kernel-unit-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
+| `stage-b-kernel-unit-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
 | `stage-b-kernel-benchmark-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
 | `stage-c-test-4-gpu-h100` | 3 | `4-gpu-h100` | — |
 | `stage-c-test-8-gpu-h200` | 4 | `8-gpu-h200` | — |
@@ -346,12 +347,12 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 1. Define the job in `pr-test.yml` with `needs: [check-changes, call-gate, wait-for-stage-X, ...]`
 2. Copy the `if:` condition pattern from an existing same-stage job (handles `target_stage`, `schedule`, `main_package`)
 3. Add `checkout` step
-4. Add `check-stage-health` step (after checkout)
-5. Add `check-maintenance` step (guarded on `steps.stage-health.outputs.healthy == 'true'`)
-6. Add `download-artifact` step if `sgl_kernel` changed (guarded)
-7. Add `install dependencies` step (guarded)
-8. Add `run test` step with `$CONTINUE_ON_ERROR_FLAG` (guarded)
-9. Add `upload-cuda-coredumps` step with `if: always() && steps.stage-health.outputs.healthy == 'true'`
+4. Add `check-stage-health` step (after checkout) — if any prior job failed, `core.setFailed()` fires and all subsequent steps auto-skip via default `if: success()`
+5. Add `check-maintenance` step
+6. Add `download-artifact` step if `sgl_kernel` changed
+7. Add `install dependencies` step
+8. Add `run test` step with `$CONTINUE_ON_ERROR_FLAG`
+9. Add `upload-cuda-coredumps` step with `if: always()`
 10. Register the suite name in `PER_COMMIT_SUITES` in `test/run_suite.py`
 11. If using matrix, add `--auto-partition-id` and `--auto-partition-size` to the run command
 12. **Update `wait-for-stage-X`** job spec with the new job name and `expected_count` (if matrix)
