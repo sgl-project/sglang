@@ -65,7 +65,7 @@ dependencies = [
   "triton==3.5.0",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
+  "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
 ]
 
