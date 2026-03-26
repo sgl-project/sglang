@@ -120,34 +120,43 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
   __shared__ float smem_qk[Trait::kNumQWarps + Trait::kNumKWarps];
   __shared__ float scale_q;
   __shared__ float scale_k;
+  const auto tx = threadIdx.x;
+  const auto bx = blockIdx.x;
+  /// NOTE: this can hint compiler to optimize `is_valid` out when not needed
+  constexpr uint32_t kActiveThreads = Trait::kNumQThreads + Trait::kNumKThreads;
+  const auto is_valid = Trait::kBlockSize == kActiveThreads || tx < kActiveThreads;
   const auto smem_q = smem_qk + 0;
   const auto smem_k = smem_qk + Trait::kNumQWarps;
-  const auto load_q = threadIdx.x < Trait::kNumQThreads;
-  const auto tid = load_q ? threadIdx.x : threadIdx.x - Trait::kNumQThreads;
+  const auto load_q = tx < Trait::kNumQThreads;
+  const auto offset = load_q ? tx : tx - Trait::kNumQThreads;
   const auto input_ptr = load_q ? q_ptr : k_ptr;
-  const auto is_valid = threadIdx.x < Trait::kNumQThreads + Trait::kNumKThreads;
   const auto weight_ptr = load_q ? q_weight : k_weight;
   const auto input_stride_bytes = load_q ? q_stride_bytes : k_stride_bytes;
   PDLWaitPrimary<Trait::kUsePDL>();
   PDLTriggerSecondary<Trait::kUsePDL>();
-  if (num_clean_up_count > 0 && blockIdx.x >= num_tokens) {
+  if (bx >= num_tokens) {
     [[unlikely]];
     // In this case, we use the last few blocks to clean up other controllers
-    const auto tid = (blockIdx.x - num_tokens) * blockDim.x + threadIdx.x;
+    const auto start = (bx - num_tokens) * blockDim.x + threadIdx.x;
     const auto stride = (gridDim.x - num_tokens) * blockDim.x;
-    for (uint32_t i = tid; i < num_clean_up_count; i += stride)
+    for (uint32_t i = start; i < num_clean_up_count; i += stride)
       ctrl.exit_unsafe(num_tokens + i);
     return;
   }
   const auto epoch_offset = ctrl.epoch() * epoch_bytes;  // only for comm
-  for (uint32_t i = blockIdx.x; i < num_tokens; i += gridDim.x) {
+
+  __builtin_assume(bx < num_tokens);  // since we have `bx >= num_tokens`
+  Storage next_input;
+  void* input_i_ptr = pointer::offset(input_ptr, bx * input_stride_bytes);
+  if (is_valid) next_input.load(input_i_ptr, offset);
+
+  for (uint32_t i = bx; i < num_tokens; i += gridDim.x) {
     // Stage 1. local reduce (warp-level)
     Storage local_input;
-    const auto input = pointer::offset(input_ptr, i * input_stride_bytes);
     {
       float local_sum = 0.0;
       if (is_valid) {
-        local_input.load(input, tid);
+        local_input = next_input;
 #pragma unroll
         for (uint32_t j = 0; j < Trait::kVecSize; ++j) {
           const auto [x, y] = cast<fp32x2_t>(local_input[j]);
@@ -161,9 +170,19 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
     __syncthreads();
 
     Storage local_weight;
-    if (is_valid) local_weight.load(weight_ptr, tid);
+    const auto input_next_ptr = pointer::offset(input_i_ptr, gridDim.x * input_stride_bytes);
+    /**
+     * NOTE: Prefetch to hide the latency.
+     * This brings around 20% of performance gain in large batches
+     * The P2P communication is mainly latency bound, so during this waiting period,
+     * We can let some data loading transparently in the background.
+     */
+    if (is_valid) {
+      local_weight.load(weight_ptr, offset);
+      if (i + gridDim.x < num_tokens) next_input.load(input_next_ptr, offset);
+    }
 
-    if (const auto tx = threadIdx.x; tx < kWarpThreads) {
+    if (tx < kWarpThreads) {
       const auto local_sum_q = tx < Trait::kNumQWarps ? smem_q[tx] : 0.0f;
       const auto local_sum_k = tx < Trait::kNumKWarps ? smem_k[tx] : 0.0f;
       const auto sum_q = sync_float(warp::reduce_sum<kNumQReduce>(local_sum_q));
@@ -203,8 +222,9 @@ __global__ __launch_bounds__(Trait::kBlockSize, Trait::kOccupancy) void parallel
         const auto scaled_y = fp32_input.y * scale * fp32_weight.y;
         local_input[j] = cast<DType2>(fp32x2_t{scaled_x, scaled_y});
       }
-      local_input.store(input, tid);
+      local_input.store(input_i_ptr, offset);
     }
+    input_i_ptr = input_next_ptr;
   }
   ctrl.exit();
 }
