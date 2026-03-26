@@ -441,7 +441,7 @@ class EagleDraftWorker(BaseDraftWorker):
             else:
                 # step=1 has no graph runner, allow any BS
                 step_max_bs[num_steps] = max(auto_spec_engine.bs_list)
-        auto_spec_engine.sync_with_graph_capacity(step_max_bs)
+        # auto_spec_engine.sync_with_graph_capacity(step_max_bs)
 
         self._auto_spec_initialized = True
         logger.info(
