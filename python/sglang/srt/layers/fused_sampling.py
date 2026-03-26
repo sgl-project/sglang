@@ -119,7 +119,6 @@ def _multi_pass_temperature_softmax_kernel(
     logits_row = logits_ptr + row_idx * logits_stride
     output_row = output_ptr + row_idx * output_stride
 
-    # Pass 1: online softmax — find max and accumulate sum(exp).
     running_max = tl.full([], value=float("-inf"), dtype=tl.float32)
     running_sum = tl.full([], value=0.0, dtype=tl.float32)
 
@@ -138,7 +137,6 @@ def _multi_pass_temperature_softmax_kernel(
 
     log_sum = tl.log(running_sum)
 
-    # Pass 2: normalize and write probabilities.
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
@@ -218,10 +216,13 @@ def fused_temperature_softmax(
     if batch_size == 0:
         return torch.empty(0, vocab_size, dtype=torch.float32, device=logits.device)
 
+    if not logits.is_contiguous():
+        logits = logits.contiguous()
+
     output = torch.empty(
         batch_size, vocab_size, dtype=torch.float32, device=logits.device
     )
-    temperatures_flat = temperatures.view(-1)
+    temperatures_flat = temperatures.contiguous().view(-1)
     grid = (batch_size,)
 
     block_size = triton.next_power_of_2(vocab_size)
@@ -264,7 +265,9 @@ def fused_temperature_softmax_inplace(
     if batch_size == 0:
         return
 
-    temperatures_flat = temperatures.view(-1)
+    assert logits.is_contiguous(), "logits must be contiguous for in-place kernel"
+
+    temperatures_flat = temperatures.contiguous().view(-1)
     grid = (batch_size,)
 
     block_size = triton.next_power_of_2(vocab_size)

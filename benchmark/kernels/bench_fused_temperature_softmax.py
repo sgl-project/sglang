@@ -25,12 +25,6 @@ def benchmark_fn(fn, warmup=50, iters=200):
     return start.elapsed_time(end) / iters * 1000  # microseconds
 
 
-def reference_temperature_softmax(logits, temperatures):
-    """Original two-kernel path."""
-    logits.div_(temperatures)
-    logits[:] = torch.softmax(logits, dim=-1)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=50)
@@ -62,30 +56,27 @@ def main():
 
     for bs, vocab, dtype in configs:
         temps = torch.rand(bs, 1, dtype=torch.float32, device="cuda") * 1.5 + 0.1
+        # Pre-allocate a source tensor; each run clones from it for fair comparison.
+        logits_src = torch.randn(bs, vocab, dtype=dtype, device="cuda")
 
         # --- Original ---
-        logits_orig = torch.randn(bs, vocab, dtype=dtype, device="cuda")
-
-        def run_original():
-            l = logits_orig.clone()
-            l.div_(temps)
+        def run_original(src=logits_src, t=temps):
+            l = src.clone()
+            l.div_(t)
             l[:] = torch.softmax(l, dim=-1)
 
         t_orig = benchmark_fn(run_original, args.warmup, args.iters)
 
         # --- Fused (out-of-place) ---
-        logits_fused = torch.randn(bs, vocab, dtype=dtype, device="cuda")
-
-        def run_fused():
-            fused_temperature_softmax(logits_fused, temps)
+        def run_fused(src=logits_src, t=temps):
+            fused_temperature_softmax(src.clone(), t)
 
         t_fused = benchmark_fn(run_fused, args.warmup, args.iters)
 
         # --- Fused (in-place) ---
-        logits_ip = torch.randn(bs, vocab, dtype=dtype, device="cuda")
-
-        def run_inplace():
-            fused_temperature_softmax_inplace(logits_ip, temps)
+        def run_inplace(src=logits_src, t=temps):
+            l = src.clone()
+            fused_temperature_softmax_inplace(l, t)
 
         t_ip = benchmark_fn(run_inplace, args.warmup, args.iters)
 

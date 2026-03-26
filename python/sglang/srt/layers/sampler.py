@@ -30,12 +30,9 @@ if is_cuda():
 
 _use_fused_sampling = False
 if is_cuda():
-    try:
-        from sglang.srt.layers.fused_sampling import fused_temperature_softmax_inplace
+    from sglang.srt.layers.fused_sampling import fused_temperature_softmax_inplace
 
-        _use_fused_sampling = True
-    except ImportError:
-        pass
+    _use_fused_sampling = True
 if is_npu():
     import torch_npu
 
