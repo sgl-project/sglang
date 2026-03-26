@@ -9,10 +9,11 @@ description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI reg
 
 ## Core Rules
 
-1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`
-2. **Place tests in `test/registered/<category>/`** — except JIT kernel tests and benchmarks, which live in `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`
-3. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
-4. **Prefer mock over real server** — when testing logic that doesn't need a server / engine launch (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock` and place tests in `test/registered/unit/`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
+1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`. It ensures `tearDownClass` runs even when `setUpClass` fails, preventing resource leaks in CI.
+2. **`tearDownClass` must be defensive** — use `hasattr`/null checks before accessing resources (e.g. `cls.process`) that `setUpClass` may not have finished allocating.
+3. **Place tests in `test/registered/<category>/`** — except JIT kernel tests and benchmarks, which live in `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`
+4. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
+5. **Prefer mock over real server** — when testing logic that doesn't need a server / engine launch (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock` and place tests in `test/registered/unit/`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
 
 JIT kernel exception:
 - If the task is adding or updating code under `python/sglang/jit_kernel/`, prefer the `add-jit-kernel` skill first.
@@ -135,7 +136,8 @@ class TestMyFeature(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
     def test_basic_functionality(self):
         response = requests.post(
@@ -183,7 +185,8 @@ class TestMyFeaturePerf(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
     def test_latency(self):
         start = time.perf_counter()
@@ -311,5 +314,6 @@ Before submitting a test:
 - [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)
+- [ ] `tearDownClass` is defensive — uses `hasattr`/null checks before accessing resources that may not have been allocated
 - [ ] Has `if __name__ == "__main__": unittest.main()`
 - [ ] `est_time` is reasonable (measure locally)
