@@ -70,9 +70,6 @@ class NgramVerifyInput(SpecInput):
         self.draft_token_num = draft_token_num
         self.device = self.custom_mask.device
         self.grammar = grammar
-        # Ngram speculative decoding doesn't use tree attention (topk=1),
-        # but some attention backends read spec_info.topk unconditionally.
-        self.topk = 1
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
