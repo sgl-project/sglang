@@ -68,11 +68,11 @@ This is the **primary validation API** for all kernel launchers. Use it to valid
 
 - **`host::SymbolicSize{"name"}`** — A named symbolic dimension. Call `.set_value(n)` to pin it, `.unwrap()` to extract after verification.
 - **`host::SymbolicDType`** — Symbolic dtype. Use `.set_options<Ts...>()` to restrict allowed types.
-- **`host::SymbolicDevice`** — Symbolic device. Use `.set_options<kDLCUDA>()` to restrict to CUDA.
+- **`host::SymbolicDevice`** — Symbolic device. Use `.set_options<kDLCUDA, kDLROCM>()` to restrict to CUDA and ROCm.
 - **`host::TensorMatcher({dims...})`** — Fluent builder for tensor validation:
   - `.with_dtype<T>()` — require a specific C++ type (e.g. `fp16_t`)
   - `.with_dtype<T1, T2, ...>()` — allow a set of types
-  - `.with_device<kDLCUDA>(device_sym)` — require CUDA and bind the checked device to a `SymbolicDevice`
+  - `.with_device(device_sym)` — bind the checked device to a `SymbolicDevice` (device type options must be set beforehand via `device_sym.set_options<kDLCUDA, kDLROCM>()`)
   - `.with_strides({strides...})` — validate strides (omit to require contiguous)
   - `.verify(tensor_view)` — execute the check; throws `PanicError` with full context on failure; **chainable** (`verify(a).verify(b)` to check multiple tensors with the same shape)
 
@@ -80,15 +80,17 @@ This is the **primary validation API** for all kernel launchers. Use it to valid
 ```cpp
 auto N = SymbolicSize{"num_elements"};
 auto device = SymbolicDevice{};
-device.set_options<kDLCUDA>();
+device.set_options<kDLCUDA, kDLROCM>();
 TensorMatcher({N})  //
     .with_dtype<fp16_t>()
-    .with_device<kDLCUDA>(device)
+    .with_device(device)
     .verify(dst)
     .verify(src);  // same shape, dtype, device as dst
 const size_t n = N.unwrap();
 const DLDevice dev = device.unwrap();
 ```
+
+> **Important:** always call `.with_device(device)` **without** template arguments, and set device type options separately via `device.set_options<kDLCUDA, kDLROCM>()`. The form `.with_device<kDLCUDA>(device)` may cause compilation failures inside template functions (where nvcc can misparse the `<` after a dependent-type call like `.with_dtype<T>()`).
 
 ### `type.cuh` — `dtype_trait<T>` and `packed_t<T>`
 
@@ -257,11 +259,11 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   // 1. Validate input tensors with TensorMatcher
   SymbolicSize N = {"num_elements"};
   SymbolicDevice device_;
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLCUDA, kDLROCM>();
 
   TensorMatcher({N})  //
       .with_dtype<T>()
-      .with_device<kDLCUDA>(device_)
+      .with_device(device_)
       .verify(dst)
       .verify(src);  // same shape / dtype / device as dst
 
@@ -296,6 +298,7 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
 - Include headers from `sgl_kernel/` — **not** raw CUDA headers for anything already covered
 - Add a short trailing `// For ...` explanation to every `#include <sgl_kernel/...>` line
 - Use `TensorMatcher` for all tensor validation; never manually check shape/dtype/device
+- Always include `kDLROCM` alongside `kDLCUDA` in `set_options` for AMD ROCm compatibility
 - Use `AlignedVector` for vectorised 128-bit loads/stores — significant bandwidth win
 - Use `LaunchKernel` — it resolves the stream and checks errors automatically
 - Use `RuntimeCheck` for runtime assertions with useful error messages
@@ -303,6 +306,23 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
 - `fp16_t` / `bf16_t` / `fp32_t` are the project's type aliases (from `utils.cuh`)
 - `device::cast<To, From>` or `dtype_trait<T>::from(val)` for cross-type conversions
 - `device::math::` functions for device math instead of bare `__` intrinsics
+
+**Handling multi-dimensional inputs for elementwise kernels:**
+
+The `.cuh` kernel and `TensorMatcher({N})` expect a flat 1D tensor. If the operation is element-wise and the caller may pass multi-dimensional tensors (e.g. `[batch, seq_len, dim]`), flatten in the **Python wrapper** before calling the JIT module:
+
+```python
+original_shape = src.shape
+src = src.contiguous().view(-1)
+if out is not None:
+    out = out.contiguous().view(-1)
+else:
+    out = torch.empty_like(src)
+module.kernel(out, src)
+return out.view(original_shape)
+```
+
+This keeps the C++ side simple (always 1D) and avoids needing `TensorMatcher({-1, -1, N})` for variable-rank inputs.
 
 ---
 
@@ -382,6 +402,7 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 - `cuda_wrappers`: `(export_name, kernel_symbol)` — `export_name` is called from Python
 - `make_cpp_args(dtype, ...)` converts `torch.dtype` to C++ type alias:
 - Keep Python launchers thin, but still validate the basic invariants (`is_cuda`, supported dtype, `out` metadata). In the current JIT/FFI path, invalid tensors are not always rejected safely before launch
+- **Python-side `out` validation** (shape/dtype/device checks) provides fast failure with clear error messages before entering the JIT/FFI boundary. `TensorMatcher` in C++ is the authoritative validation and will also catch mismatches, but its error messages reference C++ types and tensor internals. Both layers are intentional: Python for user-friendliness, C++ for correctness
 
 | `torch.dtype`      | C++ type   |
 |--------------------|------------|
@@ -425,8 +446,7 @@ Registration pattern (module level, **literal** `est_time` and `suite` strings �
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
-# Optional second registration: same file also listed under the nightly kernel suite
-# register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 ```
 
 Keep `est_time` and `suite` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
@@ -450,6 +470,7 @@ from sglang.jit_kernel.scale import scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -507,7 +528,6 @@ import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
-    DEFAULT_DTYPE,
     get_benchmark_range,
     run_benchmark,
 )
@@ -521,12 +541,17 @@ SIZE_LIST = get_benchmark_range(
     ci_range=[4096, 65536],
 )
 
-configs = list(itertools.product(SIZE_LIST))
+DTYPE_LIST = get_benchmark_range(
+    full_range=[torch.float16, torch.bfloat16, torch.float32],
+    ci_range=[torch.bfloat16],
+)
+
+configs = list(itertools.product(SIZE_LIST, DTYPE_LIST))
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["size"],
+        x_names=["size", "dtype"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["jit", "torch"],
@@ -537,8 +562,8 @@ configs = list(itertools.product(SIZE_LIST))
         args={},
     )
 )
-def benchmark(size: int, provider: str):
-    src = torch.randn(size, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
+def benchmark(size: int, dtype: torch.dtype, provider: str):
+    src = torch.randn(size, dtype=dtype, device=DEFAULT_DEVICE)
     factor = 2.0
 
     if provider == "jit":
