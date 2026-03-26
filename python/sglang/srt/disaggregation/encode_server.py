@@ -1008,10 +1008,10 @@ class MMEncoder:
 
         # Send ack/data
         if url is not None:
-            endpoint = NetworkAddress.parse(url).to_tcp()
+            endpoint = NetworkAddress.parse(url)
         else:
-            endpoint = NetworkAddress(prefill_host, embedding_port).to_tcp()
-        logger.info(f"{endpoint = }")
+            endpoint = NetworkAddress(prefill_host, embedding_port)
+        logger.info(f"{endpoint.to_tcp() = }")
 
         # Serialize data
         if self.server_args.encoder_transfer_backend == "mooncake":
@@ -1031,12 +1031,20 @@ class MMEncoder:
         def send_with_socket():
             sock = self.sync_context.socket(zmq.PUSH)
             config_socket(sock, zmq.PUSH)
+            if endpoint.is_ipv6:
+                sock.setsockopt(zmq.IPV6, 1)
+
             try:
-                sock.connect(endpoint)
+                sock.connect(endpoint.to_tcp())
                 if buffer is not None:
                     sock.send_multipart([serialized_data, buffer], copy=False)
                 else:
                     sock.send_multipart([serialized_data], copy=False)
+            except Exception as e:
+                logger.error(
+                    f"Error occurred while sending data in send_with_socket: {e}"
+                )
+                raise
             finally:
                 sock.close()
 

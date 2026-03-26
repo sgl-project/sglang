@@ -204,6 +204,8 @@ def get_zmq_socket_on_host(
         else:
             bind_host = f"tcp://{host}"
     else:
+        # If no host is specified, have to set zmq.IPV6 here(default only binds to IPV4)
+        socket.setsockopt(zmq.IPV6, 1)
         bind_host = "tcp://*"
     port = socket.bind_to_random_port(bind_host)
     return port, socket
