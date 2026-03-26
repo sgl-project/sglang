@@ -23,6 +23,9 @@ class TorchNativeLoRABatchInfo(LoRABatchInfo):
     # The index of lora adapter used by each segment, in shape (num_segments,) placed on cpu device
     weight_indices_cpu: Optional[torch.Tensor] = None
 
+    # Scaling factors for each lora adapter, in shape (lora_num,) placed on cpu device
+    scalings_cpu: Optional[torch.Tensor] = None
+
 
 class TorchNativeLoRABackend(BaseLoRABackend):
     name = "torch_native"
@@ -44,7 +47,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             weight_indices=self.batch_info.weight_indices_cpu,
             seg_len_tensor=self.batch_info.seg_lens_cpu,
             lora_ranks=self.batch_info.lora_ranks_cpu,
-            scaling_tensor=self.batch_info.scalings,
+            scaling_tensor=self.batch_info.scalings_cpu,
             num_slices=1,
         )
 
@@ -93,7 +96,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             weight_indices=self.batch_info.weight_indices_cpu,
             seg_len_tensor=self.batch_info.seg_lens_cpu,
             lora_ranks=self.batch_info.lora_ranks_cpu,
-            scaling_tensor=self.batch_info.scalings,
+            scaling_tensor=self.batch_info.scalings_cpu,
             num_slices=num_slices,
         )
 
@@ -131,7 +134,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             weight_indices=self.batch_info.weight_indices_cpu,
             seg_len_tensor=self.batch_info.seg_lens_cpu,
             lora_ranks=self.batch_info.lora_ranks_cpu,
-            scaling_tensor=self.batch_info.scalings,
+            scaling_tensor=self.batch_info.scalings_cpu,
             num_slices=num_slices,
         )
 
@@ -274,5 +277,6 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         batch_info.seg_indptr_cpu = seg_indptr_cpu
         batch_info.seg_lens_cpu = seg_lens_cpu
         batch_info.weight_indices_cpu = weight_indices_tensor
+        batch_info.scalings_cpu = scalings_tensor
 
         self.batch_info = batch_info
