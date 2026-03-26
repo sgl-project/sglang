@@ -254,7 +254,7 @@ class LlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_parameters = getattr(config, "rope_parameters", None)
         if rope_parameters is not None:
-            rope_theta = config.rope_parameters["rope_theta"]
+            rope_theta = rope_parameters.get("rope_theta", 10000)
             rope_scaling = rope_parameters
         else:
             rope_theta = getattr(config, "rope_theta", 10000)
