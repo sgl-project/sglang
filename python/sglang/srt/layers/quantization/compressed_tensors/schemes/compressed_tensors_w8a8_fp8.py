@@ -55,7 +55,11 @@ def _pad_weight_to_alignment(
     pad_k = (-orig_k) % _FP8_MM_ALIGNMENT
     if pad_n or pad_k:
         weight = F.pad(weight, (0, pad_k, 0, pad_n))
-        if weight_scale is not None and weight_scale.shape[0] == orig_n:
+        if weight_scale is not None:
+            assert weight_scale.shape == (orig_n, 1), (
+                f"Expected per-channel scale shape ({orig_n}, 1), "
+                f"got {tuple(weight_scale.shape)}"
+            )
             weight_scale = F.pad(weight_scale, (0, 0, 0, pad_n))
     return weight.t(), weight_scale, orig_n
 
