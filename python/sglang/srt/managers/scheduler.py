@@ -834,6 +834,7 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        self._pending_flush: Deque[Tuple[FlushCacheReqInput, float]] = deque()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
@@ -1561,6 +1562,8 @@ class Scheduler(
                 else:
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
+
+        self._check_pending_flush()
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -2781,9 +2784,48 @@ class Scheduler(
                 )
             )
 
-    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
-        success = self.flush_cache()
-        return FlushCacheReqOutput(success=success)
+    def _check_pending_flush(self):
+        if not self._pending_flush:
+            return
+
+        if self.is_fully_idle():
+            success = self.flush_cache()
+            while self._pending_flush:
+                pending_req, _ = self._pending_flush.popleft()
+                self.send_to_tokenizer.send_output(
+                    FlushCacheReqOutput(success=success), pending_req
+                )
+            return
+
+        self._expire_timed_out_pending_flushes(time.monotonic())
+
+    def _expire_timed_out_pending_flushes(self, now: float):
+        remaining: Deque[Tuple[FlushCacheReqInput, float]] = deque()
+        while self._pending_flush:
+            pending_req, deadline = self._pending_flush.popleft()
+            if now >= deadline:
+                logging.warning(
+                    "Deferred flush_cache timed out while waiting for idle state."
+                )
+                self.send_to_tokenizer.send_output(
+                    FlushCacheReqOutput(success=False), pending_req
+                )
+            else:
+                remaining.append((pending_req, deadline))
+        self._pending_flush = remaining
+
+    def flush_cache_wrapped(
+        self, recv_req: FlushCacheReqInput
+    ) -> Optional[FlushCacheReqOutput]:
+        timeout_s = float(recv_req.timeout_s or 0.0)
+        if timeout_s <= 0.0:
+            return FlushCacheReqOutput(success=self.flush_cache())
+
+        if self.is_fully_idle():
+            return FlushCacheReqOutput(success=self.flush_cache())
+
+        self._pending_flush.append((recv_req, time.monotonic() + timeout_s))
+        return None
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
