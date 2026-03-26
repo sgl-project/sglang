@@ -942,25 +942,18 @@ class MambaRadixCache(BasePrefixCache):
 
         full_num_evicted = 0
 
-        # Collect and rank once per eviction call.
-        candidates = self._collect_unlocked_candidates(leaf_only=True)
-        if not candidates:
-            return 0
-
-        ranked = self._rank_candidates_with_efficiencies(
-            candidates,
-            [float(self._get_mamba_recompute_length(node)) for node in candidates],
-        )
-
-        for x in ranked:
-            if full_num_evicted >= full_num_tokens:
+        # Re-rank each iteration because evicting a leaf can make its parent the
+        # next evictable leaf
+        while full_num_evicted < full_num_tokens:
+            candidates = self._collect_unlocked_candidates(leaf_only=True)
+            if not candidates:
                 break
 
-            # Skip if locked or already evicted since ranking.
-            if x.full_lock_ref != 0:
-                continue
-            if not self.full_lru_list.in_list(x):
-                continue
+            ranked = self._rank_candidates_with_efficiencies(
+                candidates,
+                [float(self._get_mamba_recompute_length(node)) for node in candidates],
+            )
+            x = ranked[0]
 
             assert (
                 x != self.root_node
