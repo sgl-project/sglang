@@ -315,7 +315,9 @@ The `.cuh` kernel and `TensorMatcher({N})` expect a flat 1D tensor. If the opera
 original_shape = src.shape
 src = src.contiguous().view(-1)
 if out is not None:
-    out = out.contiguous().view(-1)
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous for in-place elementwise ops")
+    out = out.view(-1)
 else:
     out = torch.empty_like(src)
 module.kernel(out, src)
