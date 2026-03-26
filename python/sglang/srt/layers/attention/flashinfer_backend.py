@@ -17,7 +17,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_piecewise_cuda_graph_num_tokens,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -147,6 +150,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.page_size = model_runner.page_size
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -1189,6 +1193,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.page_size = attn_backend.page_size
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1378,8 +1383,16 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
+            # Reserve extra space in kv_indices for a potential piecewise CUDA graph
+            # dummy request (see below). Worst case: static_num_tokens extra pages.
+            pcg_num_tokens = (
+                get_piecewise_cuda_graph_num_tokens()
+                if is_in_piecewise_cuda_graph()
+                else None
+            )
+            extra_kv = pcg_num_tokens if pcg_num_tokens is not None else 0
             kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
+                paged_kernel_lens_sum + extra_kv + 256,
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
@@ -1394,6 +1407,28 @@ class FlashInferIndicesUpdaterPrefill:
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
+
+            # Piecewise CUDA graph padding: input_ids are padded to static_num_tokens,
+            # so q.shape[0] == static_num_tokens but qo_indptr[-1] == actual tokens.
+            # Append a dummy request for the padding tokens so that
+            # qo_indptr[-1] == static_num_tokens, satisfying flashinfer's shape check
+            # without corrupting the causal masks of real requests.
+            # The dummy request's KV indices all point to slot 0 (a scratch location);
+            # its attention output is discarded via the [:raw_num_tokens] slice in replay.
+            bs_eff = bs
+            if pcg_num_tokens is not None and pcg_num_tokens > qo_indptr[-1]:
+                pad_tokens = int(pcg_num_tokens - qo_indptr[-1].item())
+                num_dummy_pages = (pad_tokens + self.page_size - 1) // self.page_size
+                kv_start = int(kv_indptr[-1].item())
+                kv_indices[kv_start : kv_start + num_dummy_pages] = 0
+                qo_indptr = torch.cat(
+                    [qo_indptr, qo_indptr.new_tensor([pcg_num_tokens])]
+                )
+                kv_indptr = torch.cat(
+                    [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
+                )
+                bs_eff = bs + 1
+
             custom_mask = None
         else:
             assert isinstance(spec_info, SpecInput)
@@ -1405,6 +1440,7 @@ class FlashInferIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
+            bs_eff = bs
 
         # extend part
         if use_ragged:
@@ -1446,7 +1482,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr,
             kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            self.kv_last_page_len[:bs_eff],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
