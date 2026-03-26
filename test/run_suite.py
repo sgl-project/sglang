@@ -43,6 +43,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-2-gpu-large",
         "stage-b-test-4-gpu-b200",
         "stage-b-kernel-unit-1-gpu-large",
+        "stage-b-kernel-unit-8-gpu-h200",
         "stage-b-kernel-benchmark-1-gpu-large",
         "stage-c-test-4-gpu-h100",
         "stage-c-test-4-gpu-b200",
@@ -77,6 +78,7 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
         "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
         "nightly-kernel-1-gpu",
+        "nightly-kernel-8-gpu-h200",
         # Eval and perf suites (2-gpu)
         "nightly-eval-text-2-gpu",
         "nightly-eval-vlm-2-gpu",
