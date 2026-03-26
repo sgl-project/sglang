@@ -103,6 +103,7 @@ class SchedulerMetricsMixin:
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
         self.spec_num_forward_ct = 0
+        self.spec_num_draft_tokens = 0  # Total draft tokens (for accurate accept_rate with auto-spec)
         # The total number of accepted tokens and forward ct for the whole server lifetime
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
@@ -177,10 +178,17 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
+    def update_spec_metrics(
+        self: Scheduler,
+        bs: int,
+        num_accepted_tokens: int,
+        num_draft_tokens_per_req: int = 0,
+    ):
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
+        if num_draft_tokens_per_req > 0:
+            self.spec_num_draft_tokens += bs * num_draft_tokens_per_req
 
     def _init_estimated_perf_constants(self: Scheduler) -> None:
         model_config = self.model_config
@@ -320,6 +328,7 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         self.spec_num_accepted_tokens = 0
         self.spec_num_forward_ct = 0
+        self.spec_num_draft_tokens = 0
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
 
@@ -615,11 +624,16 @@ class SchedulerMetricsMixin:
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
             )
             # Calculate acceptance rate: accepted tokens / total draft tokens
-            draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
-            num_draft_tokens = (
-                self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
-            )
-            total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
+            # Use accumulated draft tokens when available (accurate with auto-spec),
+            # otherwise fall back to server_args (fixed num_steps).
+            if self.spec_num_draft_tokens > 0:
+                total_draft_tokens = self.spec_num_draft_tokens
+            else:
+                draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
+                num_draft_tokens = (
+                    self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
+                )
+                total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
 
             spec_accept_rate = (
                 self.spec_num_accepted_tokens / total_draft_tokens
@@ -629,6 +643,7 @@ class SchedulerMetricsMixin:
             self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
+            self.spec_num_draft_tokens = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
         cache_hit_rate = 0.0
 
