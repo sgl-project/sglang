@@ -52,9 +52,6 @@ def init_distributed():
     )
 
     cpu_group = coord.cpu_group
-
-    max_pull_size = 16 * 1024 * 1024
-    max_push_size = 16 * 1024 * 1024
     max_occupancy = get_fused_parallel_qknorm_max_occupancy(
         DTYPE, world_size, Q_K_DIMS[0][0], Q_K_DIMS[0][1]
     )
@@ -65,8 +62,8 @@ def init_distributed():
     comm = CustomAllReduceV2(
         cpu_group,
         device,
-        max_pull_size,
-        max_push_size,
+        max_pull_size=0,
+        max_push_size=8 * max(BATCH_SIZES),
         max_push_blocks=props.multi_processor_count * max_occupancy,
     )
     comm_ = CustomAllReduceV2(cpu_group, device)
@@ -105,11 +102,11 @@ def rmsnorm_baseline(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     world_size: int,
-):
+) -> None:
     from sglang.srt.models.minimax_m2 import rms_apply_serial, rms_sumsq_serial
 
     sum_sq = rms_sumsq_serial(q, k)
-    comm_.custom_all_reduce(sum_sq)
+    sum_sq = comm_.custom_all_reduce(sum_sq)
     rms_apply_serial(q, k, q_weight, k_weight, sum_sq, world_size, EPS)
 
 

@@ -293,7 +293,7 @@ struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
     params.epoch_bytes = m_push_buffer_bytes;
     params.num_clean_up_count = num_clean;
 
-    const auto needed_buffer_bytes = static_cast<int64_t>(num_tokens) * kNumGPU * 2 * sizeof(float);
+    const auto needed_buffer_bytes = static_cast<int64_t>(num_tokens) * 2 * sizeof(float);
     RuntimeCheck(m_num_gpu == kNumGPU, "Number of GPUs mismatch");
     RuntimeCheck(m_push_ctrl.has_value(), "Controller is not initialized");
     RuntimeCheck(std::bit_cast<intptr_t>(params.q_ptr) % 16 == 0, "q pointer is not properly aligned");

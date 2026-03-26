@@ -26,11 +26,11 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.jit_kernel.all_reduce import (
     fused_parallel_qknorm,
     get_fused_parallel_qknorm_max_occupancy,
 )
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_bool_env_var,
@@ -370,15 +370,23 @@ class MiniMaxM2QKRMSNorm:
             CustomAllReduceV2,
         )
 
-        logger.info("[AR] Using CustomAllReduceV2 (JIT-compiled) for MiniMaxM2")
         props = torch.cuda.get_device_properties(device)
-        MAX_SIZE = 1024 * 1024  # should be large enough (only 8 byte for 1 token)
+        # probe the maximum tokens for one prefill
+        server_args = get_global_server_args()
+        max_tokens = server_args.chunked_prefill_size
+        if max_tokens is None:
+            max_tokens = server_args.model_config.context_len
+        max_tokens = max(max_tokens, server_args.max_prefill_tokens)
+        logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
+        ALIGN = 512
+        # typically, this should not exceed 1M, since max_tokens is usually less than 16384
+        max_size = ((8 * max_tokens + ALIGN - 1) // ALIGN) * ALIGN
         comm = CustomAllReduceV2(
             group=get_tp_group().cpu_group,
             device=device,
             max_pull_size=0,
             max_pull_blocks=0,
-            max_push_size=MAX_SIZE,
+            max_push_size=max_size,
             max_push_blocks=props.multi_processor_count * occupancy,
         )
         counter = MiniMaxM2QKRMSNorm.COUNTER

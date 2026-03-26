@@ -84,8 +84,8 @@ def init_distributed():
     nccl_group = coord.device_group
     assert nccl_group is not None
 
-    max_pull_size = 16 * 1024 * 1024
-    max_push_size = 16 * 1024 * 1024
+    max_pull_size = 0
+    max_push_size = 8 * max(BATCH_SIZES)
     comm = CustomAllReduceV2(cpu_group, device, max_pull_size, max_push_size)
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
@@ -143,8 +143,6 @@ def worker_test(
         k_weight,
         EPS,
     )
-    torch.cuda.synchronize()
-    nccl_group.barrier().wait()
 
     try:
         triton.testing.assert_close(q, q_expected, atol=1e-2, rtol=1e-2)
@@ -171,7 +169,7 @@ def worker_main() -> None:
             batch_size,
             dtype,
         )
-        result = torch.tensor([int(error is not None)], device=device)
+        result = torch.tensor([int(error is not None)])
         dist.all_reduce(result, group=cpu_group)
         if error is not None:
             print(str(error))
