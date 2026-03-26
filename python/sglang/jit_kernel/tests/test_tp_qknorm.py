@@ -11,6 +11,18 @@ import torch.distributed as dist
 import triton
 
 from sglang.jit_kernel.all_reduce import fused_parallel_qknorm
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=300,
+    suite="stage-b-kernel-unit-8-gpu-h200",
+)
+register_cuda_ci(
+    est_time=300,
+    suite="nightly-kernel-8-gpu-h200",
+    nightly=True,
+)
+
 
 Q_K_DIMS = [(6144, 1024)]
 EPS = 1e-6
