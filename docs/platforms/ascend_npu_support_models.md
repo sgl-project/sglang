@@ -48,9 +48,9 @@ You are welcome to enable various models based on your business requirements.
 | baidu/ERNIE-4.5-21B-A3B-PT                 | ERNIE-4.5 (4.5, 4.5MoE series) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | OpenBMB/MiniCPM3-4B                        | MiniCPM (v3, 4B)               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Kimi/Kimi-K2-Thinking                      | Kimi                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| openai/gpt-oss-120b                        | GPTOSS                         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| eigen-ai-labs/gpt-oss-120b-bf16            | GPTOSS                         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | allenai/OLMo-2-1124-7B-Instruct            | OLMo                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| minimax/MiniMax-M2                         | MiniMax-M2                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| cyankiwi/MiniMax-M2-BF16                   | MiniMax-M2                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | upstage/SOLAR-10.7B-Instruct-v1.0          | Solar                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | bigcode/starcoder2-7b                      | StarCoder2                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | arcee-ai/Trinity-Mini                      | Trinity (Nano, Mini)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |

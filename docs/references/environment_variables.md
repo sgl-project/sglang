@@ -74,8 +74,7 @@ SGLang supports various environment variables that can be used to configure its 
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
-| `SGLANG_MORI_FP8_DISP` | Use FP8 for dispatch | `"false"` |
-| `SGLANG_MORI_FP4_DISP` | Use MXFP4 for dispatch | `"false"` |
+| `SGLANG_MORI_DISPATCH_DTYPE` | Override MoRI-EP dispatch quantization type. `auto` uses auto-detection from weight dtype; `bf16`/`fp8`/`fp4` forces the specified type for all layers | `"auto"` |
 | `SGLANG_MORI_FP8_COMB` | Use FP8 for combine | `"false"` |
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
