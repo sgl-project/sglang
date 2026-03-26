@@ -226,7 +226,8 @@ mod pd_routing_unit_tests {
 
                 let client = reqwest::Client::new();
 
-                // Initialize rate limiter
+                // Initialize concurrency limiter (semaphore) and rate limiter
+                let concurrency_limiter = Some(Arc::new(TokenBucket::new(64, 0)));
                 let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));
 
                 // Initialize registries
@@ -255,6 +256,7 @@ mod pd_routing_unit_tests {
                     AppContext::builder()
                         .router_config(config)
                         .client(client)
+                        .concurrency_limiter(concurrency_limiter)
                         .rate_limiter(rate_limiter)
                         .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
                         .reasoning_parser_factory(None) // reasoning_parser_factory

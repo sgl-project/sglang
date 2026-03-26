@@ -78,6 +78,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         AppContext::builder()
             .router_config(config.clone())
             .client(client)
+            .concurrency_limiter(None)
             .rate_limiter(None)
             .tokenizer_registry(tokenizer_registry)
             .reasoning_parser_factory(None)

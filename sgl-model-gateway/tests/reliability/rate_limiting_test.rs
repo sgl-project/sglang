@@ -341,4 +341,98 @@ mod rate_limiting_tests {
 
         ctx.shutdown().await;
     }
+
+    /// Test that concurrent requests are still limited even when rate_limit_tokens_per_second
+    /// is also set.
+    ///
+    /// This is the scenario reported by @ZhenshengWu: using both
+    /// `--max-concurrent-requests 2 --rate-limit-tokens-per-second 10000`.
+    /// With the dual-limiter fix, the concurrency limiter (semaphore) and rate limiter
+    /// (token bucket) are independent. Even though the rate limiter allows 10000 req/s,
+    /// the concurrency limiter should still enforce max 2 in-flight requests.
+    #[tokio::test]
+    async fn test_concurrent_requests_limited_with_rate_limit() {
+        // Create config with BOTH max_concurrent_requests AND rate_limit_tokens_per_second.
+        // The rate limit is very high (10000/s) so it won't reject anything,
+        // but concurrency should still be limited to 2.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3405)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(2) // concurrency limit
+            .rate_limit_tokens_per_second(10000) // high rate limit (should NOT override concurrency)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![TestWorkerConfig::slow(9305, 300)], // 300ms delay per request
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let mut handles = Vec::new();
+        let success_count = Arc::new(AtomicUsize::new(0));
+        let rejected_count = Arc::new(AtomicUsize::new(0));
+
+        // Send 6 concurrent requests (3x the limit of 2)
+        for i in 0..6 {
+            let app_clone = app.clone();
+            let success_clone = Arc::clone(&success_count);
+            let rejected_clone = Arc::clone(&rejected_count);
+
+            let handle = tokio::spawn(async move {
+                let payload = json!({
+                    "text": format!("Dual limiter test {}", i),
+                    "stream": false
+                });
+
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/generate")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap();
+
+                let resp = app_clone.oneshot(req).await.unwrap();
+                if resp.status() == StatusCode::OK {
+                    success_clone.fetch_add(1, Ordering::SeqCst);
+                } else if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                    rejected_clone.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let successes = success_count.load(Ordering::SeqCst);
+        let rejected = rejected_count.load(Ordering::SeqCst);
+
+        // Even with rate_limit_tokens_per_second=10000, the concurrency limiter should
+        // still enforce max 2 in-flight requests. Without queuing in the test framework,
+        // excess requests get 429.
+        assert_eq!(
+            successes, 2,
+            "Only max_concurrent_requests (2) should succeed even with high rate limit, \
+             got {} successes and {} rejected",
+            successes, rejected
+        );
+        assert_eq!(
+            rejected, 4,
+            "Excess requests should be rejected with 429, got {} rejected",
+            rejected
+        );
+
+        ctx.shutdown().await;
+    }
 }
