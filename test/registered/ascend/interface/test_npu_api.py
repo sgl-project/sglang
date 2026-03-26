@@ -5,6 +5,7 @@ import shutil
 import unittest
 
 import requests
+import torch
 from transformers import AutoTokenizer
 
 from sglang.srt.environ import envs
@@ -26,6 +27,7 @@ OUTPUT_DIR = "./profiler_dir"
 register_npu_ci(est_time=1600, suite="nightly-npu-a3-merged", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNpuApi(CustomTestCase):
     """Testcase: Verify that the basic functions of the API interfaces work properly and the returned parameters are consistent with the configurations.
 
@@ -230,6 +232,7 @@ class TestNpuApi(CustomTestCase):
         self.assertNotIn("hidden_states", meta_info_keys)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestChatCompletionsInterface(CustomTestCase):
     """Testcase: The test is to verify whether the functions of each parameter of the v1/chat/completions interface are normal.
 
@@ -462,6 +465,7 @@ class TestChatCompletionsInterface(CustomTestCase):
         self.assertEqual(response.json()["id"], "sssss")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEnableThinking(CustomTestCase):
     """Testcase: The test is to verify whether the functions of each parameter of the v1/completions interface are normal.
 
@@ -649,6 +653,7 @@ class TestEnableThinking(CustomTestCase):
         self.assertEqual(response.json()["id"], "10086")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStartProfile(CustomTestCase):
     """Testcase: Verify the correctness of /start_profile API with different parameter combinations (start_step/num_steps) on Ascend NPU backend.
 
