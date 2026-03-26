@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import os
 import subprocess
+import sys
 from typing import Optional
 
 import pytest
@@ -185,4 +186,7 @@ def worker_main() -> None:
 
 
 if __name__ == "__main__":
-    worker_main()
+    if "LOCAL_RANK" in os.environ:
+        worker_main()
+    else:
+        sys.exit(pytest.main([__file__, "-v", "-s"]))
