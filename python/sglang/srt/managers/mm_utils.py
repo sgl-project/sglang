@@ -1662,9 +1662,9 @@ class ShmPointerMMData:
         self.shm = None
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
-        self.tensor = torch.frombuffer(
-            self._shm_handle.buf, dtype=self.dtype
-        ).reshape(self.shape)
+        self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
+            self.shape
+        )
 
     def materialize(self) -> torch.Tensor:
         """Clone tensor from shm to owned memory, then release shm handle."""
