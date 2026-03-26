@@ -36,7 +36,6 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
-from sglang.srt.utils.common import safe_pickle_loads
 
 logger = init_logger(__name__)
 
@@ -272,7 +271,7 @@ class Scheduler:
                     identity, payload = parts[0], parts[-1]
 
                     # Ignore malformed probes or non-pickle data
-                    recv_reqs = safe_pickle_loads(payload) if len(parts) > 2 else []
+                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
                 except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
                     recv_reqs = []
             except zmq.ZMQError:

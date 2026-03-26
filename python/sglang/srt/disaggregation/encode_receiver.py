@@ -1,6 +1,7 @@
 import asyncio
 import itertools
 import logging
+import pickle
 import random
 import threading
 import time
@@ -27,7 +28,6 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
-from sglang.srt.utils.common import safe_pickle_loads
 from sglang.srt.utils.hf_transformers_utils import get_processor
 from sglang.srt.utils.network import get_local_ip_auto, get_zmq_socket_on_host
 
@@ -488,7 +488,7 @@ class WaitingImageRequest:
             except zmq.Again:
                 # No data available yet, wait a bit and retry
                 return
-            recv_obj: EmbeddingData = safe_pickle_loads(bytes(parts[0]))
+            recv_obj: EmbeddingData = pickle.loads(parts[0])
             if getattr(recv_obj, "error_msg", None) is not None:
                 logger.warning(
                     f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
@@ -724,7 +724,7 @@ class MMReceiverBase(ABC):
                 parts = await recv_socket.recv_multipart(copy=False)
                 if not parts:
                     continue
-                recv_obj: EmbeddingData = safe_pickle_loads(bytes(parts[0]))
+                recv_obj: EmbeddingData = pickle.loads(parts[0])
                 if getattr(recv_obj, "error_msg", None) is not None:
                     logger.warning(
                         f"Encoder error for req_id={req_id}: {recv_obj.error_msg} "
