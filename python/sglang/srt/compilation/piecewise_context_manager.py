@@ -16,10 +16,15 @@ if TYPE_CHECKING:
 _in_piecewise_cuda_graph = False
 _in_pcg_torch_compile = False
 _pcg_capture_stream = None
+_piecewise_cuda_graph_num_tokens: Optional[int] = None
 
 
 def is_in_piecewise_cuda_graph():
     return _in_piecewise_cuda_graph
+
+
+def get_piecewise_cuda_graph_num_tokens() -> Optional[int]:
+    return _piecewise_cuda_graph_num_tokens
 
 
 def is_in_pcg_torch_compile():
@@ -39,9 +44,10 @@ def enable_piecewise_cuda_graph_compile():
 
 
 @contextmanager
-def enable_piecewise_cuda_graph():
-    global _in_piecewise_cuda_graph
+def enable_piecewise_cuda_graph(num_tokens: Optional[int] = None):
+    global _in_piecewise_cuda_graph, _piecewise_cuda_graph_num_tokens
     _in_piecewise_cuda_graph = True
+    _piecewise_cuda_graph_num_tokens = num_tokens
     try:
         yield
     except Exception as e:
@@ -53,6 +59,7 @@ def enable_piecewise_cuda_graph():
         raise
     finally:
         _in_piecewise_cuda_graph = False
+        _piecewise_cuda_graph_num_tokens = None
 
 
 @contextmanager

@@ -742,7 +742,10 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        with enable_piecewise_cuda_graph():
+        num_tokens = len(forward_batch.input_ids)
+        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
+        static_num_tokens = self.capture_num_tokens[index]
+        with enable_piecewise_cuda_graph(num_tokens=static_num_tokens):
             # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)

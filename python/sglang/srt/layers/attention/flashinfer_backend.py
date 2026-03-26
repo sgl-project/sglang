@@ -17,7 +17,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_piecewise_cuda_graph_num_tokens,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -1394,6 +1397,13 @@ class FlashInferIndicesUpdaterPrefill:
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
+            # In piecewise CUDA graph replay, input_ids are padded to static_num_tokens
+            # but qo_indptr[-1] reflects actual token count. Pad qo_indptr[-1] to match
+            # so that flashinfer's q.shape[0] == qo_indptr[-1] check passes.
+            if is_in_piecewise_cuda_graph():
+                pcg_num_tokens = get_piecewise_cuda_graph_num_tokens()
+                if pcg_num_tokens is not None and pcg_num_tokens > qo_indptr[-1]:
+                    qo_indptr[-1] = pcg_num_tokens
             custom_mask = None
         else:
             assert isinstance(spec_info, SpecInput)
