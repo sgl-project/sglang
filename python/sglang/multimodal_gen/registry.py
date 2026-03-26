@@ -349,7 +349,8 @@ def _get_config_info(
         model_id = matched_model_names[0]
         return _CONFIG_REGISTRY.get(model_id)
     else:
-        raise RuntimeError(f"No model info found for model path: {model_path}")
+        logger.debug(f"No model info found for model path: {model_path}")
+        return None
 
 
 # --- Part 3: Main Resolver ---
