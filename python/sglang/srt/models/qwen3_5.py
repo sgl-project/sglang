@@ -57,8 +57,8 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from sglang.srt.layers.utils import CompilableRegionMixin, PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -67,6 +67,10 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
@@ -417,8 +421,38 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen3_5AttentionDecoderLayer(nn.Module):
+class Qwen3_5AttentionDecoderLayer(nn.Module, CompilableRegionMixin):
     """Qwen3.5 Decoder Layer with Full Attention."""
+
+    _REGION_DYNAMIC = {"QKNorm": False, "RopeKV": None}
+
+    def get_compilable_regions(self) -> dict[str, str]:
+        return {"QKNorm": "_qk_norm", "RopeKV": "_rope_kv"}
+
+    def _get_region_compile_method(
+        self,
+        region_name: str,
+        method_name: str,
+        compile_options: Optional[dict] = None,
+        compile_dynamic: bool = False,
+    ):
+        dynamic = self._REGION_DYNAMIC.get(region_name)
+        return torch.compile(
+            getattr(self, method_name),
+            options=compile_options,
+            dynamic=dynamic,
+        )
+
+    def _qk_norm(self, q, k):
+        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
+        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
+        return q, k
+
+    def _rope_kv(self, q, k, positions, fused_kv_arg):
+        q, k = self.rotary_emb(
+            positions, q, k, fused_set_kv_buffer_arg=fused_kv_arg
+        )
+        return q, k
 
     def __init__(
         self,
@@ -471,6 +505,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
+        self.compatible_with_fused_kv_buffer = True
+        self._did_fused_kv_write_last_call = False
 
         attn_quant_config = (
             None
@@ -606,9 +642,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if self.is_region_compiled("QKNorm") or self.is_region_compiled("RopeKV"):
+            fused_kv_arg = (
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if enable_fused_set_kv_buffer(forward_batch, is_compiled=True)
+                and self.compatible_with_fused_kv_buffer
+                else None
+            )
+            q, k = self._qk_norm(q, k)
+            q, k = self._rope_kv(q, k, positions, fused_kv_arg)
+            self._did_fused_kv_write_last_call = fused_kv_arg is not None
+        else:
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
+            self._did_fused_kv_write_last_call = False
+        save_kv_cache = not self._did_fused_kv_write_last_call
+
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
