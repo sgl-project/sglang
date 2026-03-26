@@ -7,6 +7,8 @@ import subprocess
 import time
 import unittest
 
+import torch
+
 from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
@@ -20,6 +22,7 @@ from sglang.test.test_utils import (
 _is_hip = is_hip()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestHiCache(CustomTestCase, MMLUMixin):
     mmlu_score_threshold = 0.65
     mmlu_num_examples = 64
