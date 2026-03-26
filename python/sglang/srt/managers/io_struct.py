@@ -1172,6 +1172,7 @@ class FlushCacheReqInput(BaseReq):
 @dataclass
 class FlushCacheReqOutput(BaseReq):
     success: bool
+    message: str = ""
 
 
 @dataclass
