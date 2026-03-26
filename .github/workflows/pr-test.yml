@@ -5,7 +5,7 @@ run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', 
 
 on:
   schedule:
-    - cron: '0 */12 * * *'  # Run every 12 hours (UTC)
+    - cron: '0 */6 * * *'  # Run every 6 hours (UTC)
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -92,12 +92,6 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Show test partition assignments
-        continue-on-error: true
-        run: python3 test/show_partitions.py
 
       - name: Determine run mode
         id: run-mode
@@ -122,6 +116,8 @@ jobs:
           filters: |
             main_package:
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/pr-gate.yml"
+              - ".github/actions/**"
               - "python/pyproject.toml"
               - "python/sglang/!(multimodal_gen)/**"
               - "scripts/ci/cuda/*"
@@ -129,15 +125,18 @@ jobs:
               - "test/**"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
-              - "python/sglang/multimodal_gen/**"
+              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
               - "python/sglang/jit_kernel/**"
               - "python/sglang/cli/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/pr-test-jit-kernel.yml"
               - "python/pyproject.toml"
               - "python/sglang/jit_kernel/**"
             sgl_kernel:
+              - ".github/workflows/pr-test-sgl-kernel.yml"
               - "sgl-kernel/**"
 
       # For /rerun-stage (workflow_dispatch with target_stage), dorny/paths-filter doesn't work
@@ -171,7 +170,7 @@ jobs:
           echo "..."
 
           # Check for sgl-kernel changes
-          if echo "$CHANGED_FILES" | grep -q "^sgl-kernel/"; then
+          if echo "$CHANGED_FILES" | grep -qE "^(sgl-kernel/|\.github/workflows/pr-test-sgl-kernel\.yml)"; then
             echo "sgl_kernel=true" >> $GITHUB_OUTPUT
             echo "Detected sgl-kernel changes"
           else
@@ -180,7 +179,7 @@ jobs:
 
           # Check for main_package changes (excluding multimodal_gen)
           # Note: Need to filter out multimodal_gen before checking, not pipe grep -q output
-          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml)" | grep -v "^python/sglang/multimodal_gen/" || true)
+          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v "^python/sglang/multimodal_gen/" || true)
           if [ -n "$MAIN_PKG_FILES" ]; then
             echo "main_package=true" >> $GITHUB_OUTPUT
             echo "Detected main_package changes"
@@ -189,7 +188,7 @@ jobs:
           fi
 
           # Check for jit_kernel changes
-          if echo "$CHANGED_FILES" | grep -qE "^(python/sglang/jit_kernel/|python/pyproject\.toml|\.github/workflows/pr-test\.yml)"; then
+          if echo "$CHANGED_FILES" | grep -qE "^(python/sglang/jit_kernel/|python/pyproject\.toml|\.github/workflows/pr-test\.yml|\.github/workflows/pr-test-jit-kernel\.yml)"; then
             echo "jit_kernel=true" >> $GITHUB_OUTPUT
             echo "Detected jit_kernel changes"
           else
@@ -197,7 +196,7 @@ jobs:
           fi
 
           # Check for multimodal_gen changes
-          if echo "$CHANGED_FILES" | grep -qE "^(python/sglang/multimodal_gen/|python/sglang/cli/|python/pyproject\.toml|\.github/workflows/pr-test\.yml)"; then
+          if echo "$CHANGED_FILES" | grep -qE "^(python/sglang/multimodal_gen/|python/sglang/cli/|python/pyproject\.toml|\.github/workflows/pr-test\.yml|\.github/workflows/pr-test-multimodal-gen\.yml)"; then
             echo "multimodal_gen=true" >> $GITHUB_OUTPUT
             echo "Detected multimodal_gen changes"
           else
@@ -338,8 +337,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
@@ -368,8 +365,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
@@ -429,8 +424,6 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -483,8 +476,6 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -510,325 +501,34 @@ jobs:
           path: sgl-kernel/dist/*
           if-no-files-found: error
 
-  sgl-kernel-unit-test:
+  call-sgl-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    # Skip for scheduled runs and when target_stage is set
     if: |
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
       !inputs.target_stage &&
       needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd sgl-kernel
-          pytest tests/
-
-  sgl-kernel-mla-test:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd test/registered/mla
-          python3 test_mla_deepseek_v3.py
-
-  sgl-kernel-benchmark-test:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run benchmark tests
-        timeout-minutes: 45
-        run: |
-          cd sgl-kernel/benchmark
-          echo "Running sgl-kernel benchmark tests in CI mode..."
-
-          echo "CI environment variable: $CI"
-          echo "GITHUB_ACTIONS environment variable: $GITHUB_ACTIONS"
-
-          for bench_file in bench_*.py; do
-            echo "Testing $bench_file..."
-            timeout 60 python3 "$bench_file" || echo "Warning: $bench_file timed out or failed, continuing..."
-            echo "Completed $bench_file"
-            echo "---"
-          done
-
-          echo "All benchmark tests completed!"
-
-  sgl-kernel-b200-test:
-    needs: [check-changes, sgl-kernel-build-wheels]
-    # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.sgl_kernel == 'true'
-    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Cleanup
-        run: |
-          ls -alh sgl-kernel/dist || true
-          rm -rf sgl-kernel/dist/* || true
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-
-      - name: Run sgl-kernel unit tests on B200
-        timeout-minutes: 30
-        run: |
-          cd sgl-kernel
-          pytest tests/
-
-  # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
-  # TODO: Add back this test when it can pass on CI
-  # cuda13-kernel-smoke-test:
-  #   needs: [check-changes, sgl-kernel-build-wheels]
-  #   if: needs.check-changes.outputs.sgl_kernel == 'true'
-  #   runs-on: x64-cu13-kernel-tests
-  #   steps:
-  #     - uses: actions/checkout@v4
-
-  #     - name: Cleanup
-  #       run: |
-  #         ls -alh sgl-kernel/dist || true
-  #         rm -rf sgl-kernel/dist/* || true
-
-  #     - name: Download CUDA 13.0 artifacts
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         path: sgl-kernel/dist/
-  #         merge-multiple: true
-  #         pattern: wheel-python3.10-cuda13.0
-
-  #     - name: Install dependencies
-  #       run: |
-  #         CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-  #     - name: Run kernel unit tests
-  #       timeout-minutes: 30
-  #       run: |
-  #         cd sgl-kernel
-  #         pytest tests/
+    uses: ./.github/workflows/pr-test-sgl-kernel.yml
+    with:
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+    secrets: inherit
 
   # =============================================== jit-kernel ====================================================
 
-  jit-kernel-unit-test:
+  call-jit-kernel-tests:
     needs: [check-changes, call-gate]
-    # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-
-      - name: Run test
-        timeout-minutes: 30
-        run: |
-          cd python/sglang/jit_kernel
-          pytest tests/
-
-  jit-kernel-unit-test-nightly:
-    needs: [check-changes]
-    if: |
-      github.event_name == 'schedule' &&
-      needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    env:
-      SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run full nightly test
-        timeout-minutes: 60
-        run: |
-          cd python/sglang/jit_kernel
-          pytest tests/
-
-  jit-kernel-benchmark-test:
-    needs: [check-changes, call-gate]
-    # Skip for scheduled runs and when target_stage is set
-    if: |
-      github.event_name != 'schedule' &&
-      inputs.test_parallel_dispatch != true &&
-      !inputs.target_stage &&
-      needs.check-changes.outputs.jit_kernel == 'true'
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-
-      - name: Run benchmark tests
-        timeout-minutes: 45
-        run: |
-          cd python/sglang/jit_kernel/benchmark
-          echo "Running jit-kernel benchmark tests in CI mode..."
-
-          failures=()
-
-          for bench_file in bench_*.py; do
-            echo "Testing $bench_file..."
-            if ! timeout 120 python3 "$bench_file"; then
-              failures+=("$bench_file")
-            fi
-            echo "Completed $bench_file"
-            echo "---"
-          done
-
-          if [ ${#failures[@]} -ne 0 ]; then
-            echo "The following benchmark tests failed: ${failures[*]}"
-            exit 1
-          fi
-
-          echo "All jit-kernel benchmark tests completed successfully!"
+    if: needs.check-changes.outputs.jit_kernel == 'true'
+    uses: ./.github/workflows/pr-test-jit-kernel.yml
+    with:
+      jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+    secrets: inherit
 
   # =============================================== primary ====================================================
 
@@ -853,9 +553,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -906,9 +606,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -960,9 +660,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1021,9 +721,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1075,9 +775,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1131,9 +831,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1164,165 +864,32 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
 
-  multimodal-gen-test-1-gpu:
+  call-multimodal-gen-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
       always() &&
+      !cancelled() &&
       (
-        (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
+        inputs.target_stage == 'multimodal-gen-test-1-gpu' ||
+        inputs.target_stage == 'multimodal-gen-test-2-gpu' ||
+        inputs.target_stage == 'multimodal-gen-unit-test' ||
         (
           !inputs.target_stage &&
           ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
       )
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-      - name: Run diffusion server tests
-        timeout-minutes: 240
-        env:
-          RUNAI_STREAMER_MEMORY_LIMIT: 0
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite 1-gpu \
-            --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
-            $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
-        with:
-          artifact-suffix: ${{ matrix.part }}
-
-  multimodal-gen-test-2-gpu:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          needs.check-changes.outputs.multimodal_gen == 'true'
-        )
-      )
-    runs-on: 2-gpu-h100
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-
-      - name: Run diffusion server tests
-        timeout-minutes: 240
-        env:
-          RUNAI_STREAMER_MEMORY_LIMIT: 0
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite 2-gpu \
-            --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
-            $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
-        with:
-          artifact-suffix: ${{ matrix.part }}
-
-  multimodal-gen-unit-test:
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'multimodal-gen-unit-test') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          needs.check-changes.outputs.multimodal_gen == 'true'
-        )
-      )
-    runs-on: 1-gpu-h100
-    timeout-minutes: 120
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-
-      - name: Run diffusion unit tests
-        timeout-minutes: 60
-        run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py --suite unit
+    uses: ./.github/workflows/pr-test-multimodal-gen.yml
+    with:
+      multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
+      pr_head_sha: ${{ inputs.pr_head_sha || '' }}
+      git_ref: ${{ inputs.git_ref || '' }}
+      target_stage: ${{ inputs.target_stage || '' }}
+      test_parallel_dispatch: ${{ inputs.test_parallel_dispatch == true && 'true' || 'false' }}
+      caller_needs_failure: ${{ (needs.call-gate.result == 'failure' || needs.sgl-kernel-build-wheels.result == 'failure' || needs.check-changes.result == 'failure') && 'true' || 'false' }}
+    secrets: inherit
 
   stage-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1348,9 +915,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1402,9 +969,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1472,9 +1039,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1522,9 +1089,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1582,9 +1149,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1648,9 +1215,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1737,21 +1304,15 @@ jobs:
         check-changes,
 
         sgl-kernel-build-wheels,
-        sgl-kernel-unit-test,
-        sgl-kernel-mla-test,
-        sgl-kernel-benchmark-test,
-        sgl-kernel-b200-test,
+        sgl-kernel-build-wheels-arm,
+        call-sgl-kernel-tests,
 
         wait-for-stage-a,
         wait-for-stage-b,
 
-        jit-kernel-unit-test,
-        jit-kernel-unit-test-nightly,
-        jit-kernel-benchmark-test,
+        call-jit-kernel-tests,
 
-        multimodal-gen-unit-test,
-        multimodal-gen-test-1-gpu,
-        multimodal-gen-test-2-gpu,
+        call-multimodal-gen-tests,
 
         stage-a-test-1-gpu-small,
         stage-a-test-cpu,

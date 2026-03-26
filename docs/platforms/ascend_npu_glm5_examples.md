@@ -15,7 +15,7 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 
 ### Installation
 
-The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the Ascend platform. You can directly pull it.
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
 
 ```{code-block} bash
 #Atlas 800 A3

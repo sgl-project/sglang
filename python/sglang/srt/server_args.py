@@ -51,7 +51,6 @@ from sglang.srt.utils.common import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_mps,
-    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -1075,8 +1074,8 @@ class ServerArgs:
         # 5. Pipeline parallelism
         if self.pp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, MUSA, XPU, etc.)
-        if is_hip() or is_npu() or is_cpu() or is_mps() or is_musa() or is_xpu():
+        # 6. Non-CUDA hardware (AMD, NPU, CPU, MPS, XPU, etc.)
+        if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
         if self.moe_a2a_backend != "none":
@@ -1386,7 +1385,7 @@ class ServerArgs:
 
         return capture_sizes
 
-    def _set_default_nsa_kv_cache_dtype(self, major: int) -> str:
+    def _set_default_nsa_kv_cache_dtype(self, major: int, quantization: str) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
@@ -1400,9 +1399,15 @@ class ServerArgs:
             )
 
         if self.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = (
-                "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
-            )
+            # TODO: Temporarily set default dtype on B200 as bfloat16 to avoid performance regression.
+            # TODO: Remove this after the performance regression is fixed. (Ref: https://github.com/sgl-project/sglang/issues/21291)
+            if quantization == "modelopt_fp4" and major >= 10 and self.dp_size > 1:
+                self.kv_cache_dtype = "fp8_e4m3"
+            else:
+                self.kv_cache_dtype = "bfloat16"
+            # self.kv_cache_dtype = (
+            #     "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
+            # )
             logger.warning(
                 f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
             )
@@ -1530,7 +1535,7 @@ class ServerArgs:
                         assert (
                             self.tp_size == 8
                         ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
-                        self.attn_cp_size = self.tp_size
+                        self.attn_cp_size = self.tp_size // self.dp_size
 
                         logger.warning(
                             f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
@@ -1556,7 +1561,7 @@ class ServerArgs:
                     import torch
 
                     major, _ = torch.cuda.get_device_capability()
-                    self._set_default_nsa_kv_cache_dtype(major)
+                    self._set_default_nsa_kv_cache_dtype(major, self.quantization)
                     self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
                 if self.enable_nsa_prefill_context_parallel:
@@ -3137,15 +3142,24 @@ class ServerArgs:
             )
 
     def _is_mistral_native_format(self) -> bool:
-        """Detect if the model uses Mistral native format (params.json + consolidated weights)."""
+        """Detect if the model uses Mistral native format (params.json + consolidated weights).
+
+        Models like Mistral-7B-Instruct-v0.3 have BOTH params.json (native) and
+        config.json (HF standard). When both exist, prefer the HF format to avoid
+        parameter name mismatches between consolidated.safetensors (native names
+        like layers.0.attention.wk.weight) and HuggingFace model classes (names
+        like model.layers.0.self_attn.k_proj.weight).
+        """
         if os.path.isdir(self.model_path):
-            return os.path.exists(os.path.join(self.model_path, "params.json"))
+            has_params = os.path.exists(os.path.join(self.model_path, "params.json"))
+            has_hf_config = os.path.exists(os.path.join(self.model_path, "config.json"))
+            return has_params and not has_hf_config
         # For hub models, check remote files
         try:
             from huggingface_hub import HfApi
 
             files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
-            return "params.json" in files
+            return "params.json" in files and "config.json" not in files
         except Exception:
             return False
 
@@ -3228,9 +3242,15 @@ class ServerArgs:
         if len(devices) == 0:
             raise ValueError("No valid IB devices specified")
 
-        # Check for duplicates
-        if len(devices) != len(set(devices)):
-            raise ValueError(f"Duplicate IB devices specified: {device_str}")
+        # Deduplicate while preserving order
+        unique_devices = list(dict.fromkeys(devices))
+        if len(unique_devices) != len(devices):
+            logger.warning(
+                "Duplicate IB devices specified: %s. Deduplicating to: %s",
+                device_str,
+                ",".join(unique_devices),
+            )
+            devices = unique_devices
 
         # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"
