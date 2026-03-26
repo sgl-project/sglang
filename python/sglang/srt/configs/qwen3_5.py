@@ -24,11 +24,10 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
             kwargs["rope_scaling"] = rope_parameters
 
         # Compatibility shim: backfill a missing top-level rope_theta for Qwen3NextConfig
-        # from the normalized RoPE settings. Qwen3.5 uses the nested RoPE config directly,
+        # from the normalized RoPE settings. Qwen3.5 uses the nested RoPE config directly.
         rope_scaling = kwargs.get("rope_scaling")
         if kwargs.get("rope_theta") is None and isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta")
-            if rope_theta is not None:
+            if (rope_theta := rope_scaling.get("rope_theta")) is not None:
                 kwargs["rope_theta"] = rope_theta
 
         super().__init__(**kwargs)
