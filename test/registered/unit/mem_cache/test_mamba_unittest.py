@@ -328,6 +328,57 @@ class TestMamba(unittest.TestCase):
         match = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
         assert len(match.device_indices) == 0
 
+    def test_mamba_seglen_reconsiders_new_parent_candidate(self):
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
+            eviction_policy="seglen"
+        )
+
+        req1 = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=allocator.alloc(4),
+                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        req2 = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 5]),
+                value=allocator.alloc(4),
+                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        req3 = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=allocator.alloc(3),
+                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        locked_match = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 5])))
+        locked_leaf = locked_match.last_device_node
+        tree.inc_lock_ref(locked_leaf)
+
+        try:
+            result = tree.evict(EvictParams(num_tokens=0, mamba_num=2))
+            assert result.mamba_num_evicted >= 2
+
+            parent_match = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
+            assert len(parent_match.device_indices) == 3
+            assert parent_match.last_device_node.mamba_value is None
+
+            locked_leaf_match = tree.match_prefix(
+                MatchPrefixParams(key=RadixKey([1, 2, 3, 5]))
+            )
+            assert len(locked_leaf_match.device_indices) == 4
+        finally:
+            tree.dec_lock_ref(locked_leaf)
+
     def _setup_tree_and_allocator(self, eviction_policy: str = "lru"):
         """Helper to create a MambaRadixCache with allocator for testing."""
         set_global_server_args_for_scheduler(
