@@ -2,7 +2,7 @@
 # Align CUDA wheel filenames (+cu124/+cu128/+cu130) with internal METADATA Version and
 # WHEEL tags after build (fixes pip "inconsistent version" when only the .whl name changed).
 # Unpack → patch WHEEL/METADATA → wheel pack (RECORD regenerated; no hand-editing).
-set -e
+set -ex
 
 WHEEL_DIR="dist"
 
@@ -55,7 +55,7 @@ for wheel in "${wheel_files[@]}"; do
     TMPDIR=$(mktemp -d)
     trap 'rm -rf -- "$TMPDIR"' ERR
 
-    python -m wheel unpack "$wheel" --dest "$TMPDIR"
+    python3 -m wheel unpack "$wheel" --dest "$TMPDIR"
     UNPACKED=$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d | head -1)
     DIST_INFO=$(find "$UNPACKED" -maxdepth 1 -type d -name "*.dist-info" | head -1)
     WHEEL_META="${DIST_INFO}/WHEEL"
@@ -78,7 +78,7 @@ for wheel in "${wheel_files[@]}"; do
     mv "$DIST_INFO" "${UNPACKED}/${NEW_BASE}"
 
     rm -f "$wheel"
-    python -m wheel pack "$UNPACKED" --dest-dir "$WHEEL_DIR"
+    python3 -m wheel pack "$UNPACKED" --dest-dir "$WHEEL_DIR"
     rm -rf "$TMPDIR"
     trap - ERR
 done
