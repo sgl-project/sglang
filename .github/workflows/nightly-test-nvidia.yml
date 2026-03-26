@@ -62,9 +62,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -97,9 +97,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -129,9 +129,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -157,9 +157,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -190,9 +190,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -274,9 +274,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -307,9 +307,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -380,9 +380,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -407,9 +407,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -447,9 +447,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -474,9 +474,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -519,9 +519,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -579,9 +579,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -635,9 +635,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |
@@ -664,9 +664,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         run: |

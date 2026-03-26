@@ -1,0 +1,103 @@
+name: Preflight Check
+description: >-
+  Combined gate check: (1) fail fast if any job in the current workflow run has
+  already failed (stage-health), and (2) block CI when maintenance mode is active
+  (issue #21065 is open). Replaces the separate check-stage-health and
+  check-maintenance actions.
+
+inputs:
+  github-token:
+    description: 'GitHub token for API calls'
+    required: false
+    default: ${{ github.token }}
+  skip-stage-health:
+    description: 'Skip the stage-health check (for early jobs that have no upstream jobs to check)'
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # ── Stage Health: fail fast if any upstream job already failed ──
+    - name: Check stage health
+      if: inputs.skip-stage-health != 'true'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          // Skip for scheduled runs — they should collect all failures, not fast-fail
+          if (context.eventName === 'schedule') {
+            core.info('Skipping health check for scheduled run');
+            return;
+          }
+
+          const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: context.runId,
+            per_page: 100,
+          });
+          // Find jobs that failed from a real error, not from fast-fail cascade
+          const rootCauseFailures = jobs.filter(j => {
+            if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
+            // If the failing step is the health check, it's a cascade — skip it
+            const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
+            if (failedStep && (failedStep.name.includes('preflight-check') || failedStep.name.includes('Check stage health') || failedStep.name.includes('check-stage-health'))) {
+              return false;
+            }
+            return true;
+          });
+          if (rootCauseFailures.length > 0) {
+            core.setFailed(`Fast-fail: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
+          }
+
+    # ── Maintenance Mode: block CI when issue #21065 is open ──
+    - name: Check maintenance mode
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        MAINTENANCE_ISSUE=21065
+        REPO="${{ github.repository }}"
+        PR_NUMBER="${{ github.event.pull_request.number }}"
+
+        # PR Test workflow only: scheduled runs and runs on main (dispatch / workflow_call) set this env
+        if [[ "${SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN:-}" == "true" ]]; then
+          echo "✅ PR Test on main branch; bypassing maintenance gate."
+          exit 0
+        fi
+
+        # Check if maintenance issue is open (fail-open: if API errors, allow CI to proceed)
+        ISSUE_STATE=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+
+        if [[ "$ISSUE_STATE" != "OPEN" ]]; then
+          echo "✅ Maintenance mode is OFF. Proceeding with CI."
+          exit 0
+        fi
+
+        # For PRs, check if bypass-maintenance label is present
+        if [[ -n "$PR_NUMBER" ]]; then
+          HAS_BYPASS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(. == "bypass-maintenance")) | length' 2>/dev/null || echo "0")
+          if [[ "$HAS_BYPASS" -gt 0 ]]; then
+            echo "✅ PR #$PR_NUMBER has 'bypass-maintenance' label. Bypassing maintenance mode."
+            exit 0
+          fi
+        fi
+
+        MSG=$(printf "%s\n" \
+          "## ⚠️ CI Maintenance Mode is Active" \
+          "The CI infrastructure is currently under maintenance." \
+          "All PR CI runs are paused until maintenance is complete." \
+          "You might also experience unexpected failures during this period." \
+          "The team is working on the issue and will update the status as soon as possible." \
+          "" \
+          "What should you do?" \
+          "- Check back later (~12 hours)" \
+          "- Follow CI Maintenance Mode issue: https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates")
+
+        echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+        while IFS= read -r line; do
+          echo "::error::$line"
+        done <<< "$MSG"
+
+        exit 1

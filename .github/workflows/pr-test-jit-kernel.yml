@@ -44,12 +44,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -74,9 +69,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -101,12 +96,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Install dependencies
         timeout-minutes: 20

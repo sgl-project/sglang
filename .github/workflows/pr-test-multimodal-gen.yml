@@ -62,12 +62,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
@@ -119,12 +114,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'
@@ -173,12 +163,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: inputs.sgl_kernel == 'true'

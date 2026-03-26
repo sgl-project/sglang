@@ -91,9 +91,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Determine run mode
         id: run-mode
@@ -338,9 +338,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
@@ -368,9 +368,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - uses: ./.github/actions/wait-for-jobs
         id: wait
@@ -429,9 +429,9 @@ jobs:
           submodules: "recursive"
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -483,9 +483,9 @@ jobs:
           submodules: "recursive"
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-maintenance
+      - uses: ./.github/actions/preflight-check
         with:
-          github-token: ${{ github.token }}
+          skip-stage-health: 'true'
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -563,12 +563,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -619,12 +614,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -676,12 +666,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -740,12 +725,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -797,12 +777,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -856,12 +831,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -943,12 +913,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1000,12 +965,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1073,12 +1033,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1126,12 +1081,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1189,12 +1139,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1258,12 +1203,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
-      - uses: ./.github/actions/check-stage-health
-        id: stage-health
-
-      - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
+      - uses: ./.github/actions/preflight-check
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1310,9 +1250,9 @@ jobs:
   #   strategy:
   #     fail-fast: false
   #   steps:
-  #     - uses: ./.github/actions/check-maintenance
+  #     - uses: ./.github/actions/preflight-check
   #       with:
-  #         github-token: ${{ github.token }}
+  #         skip-stage-health: 'true'
   #
   #     - name: Checkout code
   #       uses: actions/checkout@v4
