@@ -13,7 +13,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.9K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_9k-1k-20ms-on-a3-32-cards-separation-mode)     |
 | Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1.5K | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-20ms-on-a3-32-cards-separation-mode)   |
 | Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1k-20ms-on-a3-32-cards-separation-mode)     |
-| DeepSeek-V3.2-Exp | Atlas 800I A3 | 32    | PD Separation | 64K+3K    | 30ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-exp-64k-3k-30ms-on-a3-32-cards-separation-mode) |
+| DeepSeek-V3.2     | Atlas 800I A3 | 32    | PD Separation | 128K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-128k-1k-20ms-on-a3-32-cards-separation-mode) |
 
 ### High Throughput
 
@@ -779,9 +779,9 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 384  --random-input-len 3500 --random-output-len 1500 --num-prompts 1536 --random-range-ratio 1
 ```
 
-### DeepSeek-V3.2-Exp 64K-3K 30ms on A3 32 Cards Separation Mode
+### DeepSeek-V3.2 128K-1K 20ms on A3 32 Cards Separation Mode
 
-Model: DeepSeek-V3.2-Exp-W8A8
+Model: DeepSeek-V3.2-W8A8
 
 Hardware: Atlas 800I A3 32Card
 
@@ -789,9 +789,9 @@ DeployMode: PD Separation
 
 Dataset: random
 
-Input Output Length: 64K+3K
+Input Output Length: 128K+1K
 
-TPOT: 30ms
+TPOT: 20ms
 
 #### Model Deployment
 
@@ -935,7 +935,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 64000 --random-output-len 3000 --num-prompts 64 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 8  --random-input-len 131076 --random-output-len 1024 --num-prompts 8 --random-range-ratio 1
 ```
 
 ### Qwen3-235B-A22B 3_5K-1_5K 50ms on A3 24 Cards Separation Mode
