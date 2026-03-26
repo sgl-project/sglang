@@ -910,12 +910,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cos_sin_cache = kwargs.get("cos_sin_cache")
                 is_neox_style = kwargs.get("is_neox_style")
 
-                q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
                 k_cache = k_cache.view(
-                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
                 )
                 v_cache = v_cache.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
 
                 q = flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
@@ -967,10 +970,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # For XQA, q_dtype should be bf16
         if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
             q = q.to(torch.float8_e4m3fn)
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
-        v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)
         if layer.tp_v_head_num == 1:
@@ -1002,7 +1009,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             kv_layout="NHD",
         )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend(
         self,
@@ -1039,12 +1046,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cos_sin_cache = kwargs.get("cos_sin_cache")
                 is_neox_style = kwargs.get("is_neox_style")
 
-                q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+                q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+
                 k_cache = k_cache.view(
-                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
                 )
                 v_cache = v_cache.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
 
                 q = flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
@@ -1095,10 +1105,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if self.data_type == torch.float8_e4m3fn:
             q = q.to(torch.float8_e4m3fn)
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        k_cache = k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
-        v_cache = v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.head_dim)
+        k_cache = k_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+        )
+        v_cache = v_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)
         if layer.tp_v_head_num == 1:
@@ -1150,7 +1164,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 kv_layout="NHD",
             )
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
