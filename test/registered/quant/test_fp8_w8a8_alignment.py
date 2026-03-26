@@ -119,7 +119,7 @@ class TestTensorStrategyAlignment(CustomTestCase):
         self.assertEqual(n_padded % FP8_ALIGNMENT, 0)
 
         # _orig_output_dim must match the original out_dim
-        self.assertEqual(layer._orig_output_dim.item(), out_dim)
+        self.assertEqual(layer._orig_output_dim, out_dim)
 
     def test_non_aligned(self):
         # 1368 is 10944/8 — the exact failing case from GLM-4.5 with tp=8
@@ -176,7 +176,7 @@ class TestChannelStrategyAlignment(CustomTestCase):
         # Scale dim 0 must also be padded to a multiple of FP8_ALIGNMENT
         self.assertEqual(layer.weight_scale.shape[0] % FP8_ALIGNMENT, 0)
 
-        self.assertEqual(layer._orig_output_dim.item(), out_dim)
+        self.assertEqual(layer._orig_output_dim, out_dim)
 
     def test_non_aligned(self):
         self._run(out_dim=1368, in_dim=2048)

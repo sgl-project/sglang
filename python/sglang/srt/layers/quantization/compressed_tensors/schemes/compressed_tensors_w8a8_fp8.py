@@ -270,9 +270,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             )
 
         # weight is stored transposed as (K_padded, N_padded); pad x to match.
-        weight_k_dim = layer.weight.shape[0]
-        if x.shape[-1] < weight_k_dim:
-            x = F.pad(x, (0, weight_k_dim - x.shape[-1]))
+        pad_k = layer.weight.shape[0] - x.shape[-1]
+        if pad_k > 0:
+            x = F.pad(x, (0, pad_k))
 
         output = apply_fp8_linear(
             input=x,
