@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-
+import glob
 import os
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, cast
 
-from sglang.multimodal_gen.runtime.loader.flux_2_quant import (
+from sglang.multimodal_gen.runtime.loader.quantization_utils import (
     Flux2Nvfp4ModelResolution,
     resolve_flux2_nvfp4_model,
 )
@@ -16,6 +18,58 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class Flux2Nvfp4ModelResolution:
+    base_model_name: str
+    base_model_path: str
+    transformer_weights_path: str
+
+
+_FLUX2_BASE_MODEL = "black-forest-labs/FLUX.2-dev"
+
+
+@lru_cache(maxsize=1)
+def _resolve_flux2_base_model_path() -> str:
+    return maybe_download_model(_FLUX2_BASE_MODEL, force_diffusers_model=True)
+
+
+def _find_mixed_safetensors(local_dir: str) -> str | None:
+    mixed_files = sorted(glob.glob(os.path.join(local_dir, "*-mixed.safetensors")))
+    return mixed_files[0] if mixed_files else None
+
+
+def _resolve_nvfp4_transformer_weights_path(
+    server_args: ServerArgs, model_path: str
+) -> str:
+    if server_args.transformer_weights_path is not None:
+        return server_args.transformer_weights_path
+
+    local_nvfp4_path = maybe_download_model(model_path)
+    mixed_file = _find_mixed_safetensors(local_nvfp4_path)
+    if mixed_file is not None:
+        logger.info("Using mixed-precision NVFP4 weights: %s", mixed_file)
+        return mixed_file
+
+    logger.warning(
+        "No *-mixed.safetensors found in %s; falling back to full directory",
+        local_nvfp4_path,
+    )
+    return local_nvfp4_path
+
+
+def resolve_flux2_nvfp4_model(
+    server_args: ServerArgs, model_path: str
+) -> Flux2Nvfp4ModelResolution:
+    transformer_weights_path = _resolve_nvfp4_transformer_weights_path(
+        server_args, model_path
+    )
+    return Flux2Nvfp4ModelResolution(
+        base_model_name=_FLUX2_BASE_MODEL,
+        base_model_path=_resolve_flux2_base_model_path(),
+        transformer_weights_path=transformer_weights_path,
+    )
 
 
 class Flux2NvfpPipeline(Flux2Pipeline):
