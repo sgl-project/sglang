@@ -1,0 +1,7 @@
+{
+  "run_id": "local",
+  "timestamp": "2026-03-25T23:03:03.895947+00:00",
+  "gpu_config": "4-gpu-b200",
+  "partition": 0,
+  "results": []
+}
