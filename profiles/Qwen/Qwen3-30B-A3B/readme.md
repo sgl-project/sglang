@@ -20,6 +20,7 @@
 - **RMSNorm** is compiled with no dynamic shapes, so Inductor can specialize on the fixed decode batch sizes used by SGLang's CUDA graphs. This means efficient code with only slightly higher startup times.
 - **RotaryEmbedding** is compiled with dynamic shapes due to the KV-cache update (`index_put_` with variable `cache_loc`), which limits Inductor's ability to specialize and adds overhead.
 - `inductor[qvnormropekv-rmsnorm]` compiles the full `QKNormRope` region — q/k normalization, rotary embedding, and KV-cache write — as a single fused Inductor graph, alongside the layer-level RMSNorm. This is the most comprehensive compilation scope, but the larger graph with dynamic shapes adds overhead that only amortizes at high concurrency.
+- `inductor[ropekv-rmsnorm]` compiles the rotary embedding with KV-cache write (fused into a single Inductor graph) and the layer-level RMSNorm. Q/k normalization uses the custom kernel. Same compilation scope as `inductor[rope-rmsnorm]` but with naming that makes the KV-cache fusion explicit.
 - `inductor[qvnorm-ropekv-rmsnorm]` splits the `QKNormRope` region into two separate Inductor graphs: one for q/k normalization (no dynamic shapes) and one for rope + KV-cache write (dynamic shapes). This reduces the scope of the dynamic-shape graph compared to the fully-fused `qvnormropekv` variant.
 
 ## bench\_one\_batch Speedup Charts
@@ -84,10 +85,26 @@ python3 -m sglang.bench_offline_throughput \
 |--------|-------------|-------------|------------------------|
 | Baseline | 6,963 | 7,280 | — |
 | Inductor — QKNormRopeKV + RMSNorm | 7,019 | 7,338 | **+0.8%** |
-| Inductor — QKNorm + RopeKV + RMSNorm | 6,914 | 7,229 | −0.7% |
+| Inductor — QKNorm + RopeKV + RMSNorm | 7,111 | 7,435 | **+2.1%** |
 | Inductor — RotaryEmbedding + RMSNorm | 7,048 | 7,368 | **+1.2%** |
 | Inductor — RotaryEmbedding | 7,030 | 7,350 | **+1.0%** |
 | Inductor — RMSNorm | 6,958 | 7,274 | −0.1% |
+
+### 256 prompts, cuda-graph-bs 256
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 7,316 | 7,589 | — |
+| Inductor — RopeKV + RMSNorm | 7,366 | 7,640 | **+0.7%** |
+| Inductor — QKNorm + RopeKV + RMSNorm | 7,353 | 7,627 | **+0.5%** |
+
+### 512 prompts, cuda-graph-bs 512
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 7,450 | 7,736 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 7,566 | 7,857 | **+1.6%** |
+| Inductor — RopeKV + RMSNorm | 7,521 | 7,810 | **+1.0%** |
 
 ### Summary
 
@@ -103,12 +120,26 @@ python3 -m sglang.bench_offline_throughput \
 | 32 prompts, cg-bs 32 | QKNorm + RopeKV + RMSNorm | 3,507 | **+1.7%** |
 | 32 prompts, cg-bs 32 | RMSNorm | 3,497 | **+1.5%** |
 | 32 prompts, cg-bs 32 | QKNormRopeKV + RMSNorm | 3,424 | −0.7% |
+| 128 prompts, cg-bs 128 | QKNorm + RopeKV + RMSNorm | 7,435 | **+2.1%** |
 | 128 prompts, cg-bs 128 | RotaryEmbedding + RMSNorm | 7,368 | **+1.2%** |
 | 128 prompts, cg-bs 128 | RotaryEmbedding | 7,350 | **+1.0%** |
 | 128 prompts, cg-bs 128 | QKNormRopeKV + RMSNorm | 7,338 | **+0.8%** |
 | 128 prompts, cg-bs 128 | RMSNorm | 7,274 | −0.1% |
-| 128 prompts, cg-bs 128 | QKNorm + RopeKV + RMSNorm | 7,229 | −0.7% |
+| 256 prompts, cg-bs 256 | RopeKV + RMSNorm | 7,640 | **+0.7%** |
+| 256 prompts, cg-bs 256 | QKNorm + RopeKV + RMSNorm | 7,627 | **+0.5%** |
+| 512 prompts, cg-bs 512 | QKNorm + RopeKV + RMSNorm | 7,857 | **+1.6%** |
+| 512 prompts, cg-bs 512 | RopeKV + RMSNorm | 7,810 | **+1.0%** |
 
-At medium concurrency (B=32), the smaller-scope configs deliver clear gains: `RotaryEmbedding + RMSNorm` leads at **+3.2%** (3,447 → 3,558 tok/s), followed by `RotaryEmbedding` at **+2.5%**, `QKNorm + RopeKV + RMSNorm` at **+1.7%**, and `RMSNorm` at **+1.5%**. At high concurrency (B=128), `RotaryEmbedding + RMSNorm` still leads at **+1.2%** with `RotaryEmbedding` at **+1.0%** and `QKNormRopeKV + RMSNorm` at **+0.8%**, while `RMSNorm` and `QKNorm + RopeKV + RMSNorm` are within noise or regressing (−0.1%, −0.7%).
+At medium concurrency (B=32), the smaller-scope configs deliver clear gains: `RotaryEmbedding + RMSNorm` leads at **+3.2%** (3,447 → 3,558 tok/s), followed by `RotaryEmbedding` at **+2.5%**, `QKNorm + RopeKV + RMSNorm` at **+1.7%**, and `RMSNorm` at **+1.5%**. At high concurrency (B=128), `QKNorm + RopeKV + RMSNorm` leads at **+2.1%** (7,280 → 7,435 tok/s), followed by `RotaryEmbedding + RMSNorm` at **+1.2%**, `RotaryEmbedding` at **+1.0%**, and `QKNormRopeKV + RMSNorm` at **+0.8%**.
 
-Splitting q/k normalization into a separate static-shape graph (`QKNorm + RopeKV + RMSNorm`) substantially improves over the fully-fused variant (`QKNormRopeKV + RMSNorm`): at B=1 the regression drops from −5.6% to −2.0%, and at B=32 it flips from −0.7% to **+1.7%**. However, at B=128 the split variant unexpectedly regresses (−0.7% vs +0.8% fused), suggesting the extra kernel launch overhead between the two graphs outweighs the static-shape benefit at high batch sizes. The narrower `RotaryEmbedding + RMSNorm` remains the best overall config.
+At B=256 both Inductor configs show modest gains: `RopeKV + RMSNorm` at **+0.7%** and `QKNorm + RopeKV + RMSNorm` at **+0.5%**. At B=512 the gains increase again, with `QKNorm + RopeKV + RMSNorm` leading at **+1.6%** (7,736 → 7,857 tok/s) and `RopeKV + RMSNorm` at **+1.0%**. The crossover between B=256 and B=512 — where `QKNorm + RopeKV + RMSNorm` overtakes `RopeKV + RMSNorm` — is consistent with the B=128 results and confirms that the broader compilation scope amortizes better at higher concurrency.
+
+Splitting q/k normalization into a separate static-shape graph (`QKNorm + RopeKV + RMSNorm`) substantially improves over the fully-fused variant (`QKNormRopeKV + RMSNorm`): at B=1 the regression drops from −5.6% to −2.0%, at B=32 it flips from −0.7% to **+1.7%**, and at B=128+ it consistently leads. Nsys profiling confirms the mechanism: the fused Inductor graph reduces the number of kernel launches between the projection GEMM and the attention kernel by collapsing q/k normalization, rotary embedding, and KV-cache store into fewer kernels, shrinking the gap at higher batch sizes where launch overhead is more visible.
+
+| Baseline | Inductor |
+|---|---|
+| ![Baseline nsys](qwen3-30B-A3B-[qvnorm-rope-kv]-base.png) | ![Inductor nsys](qwen3-30B-A3B-[qvnorm-rope-kv]-inductor.png) |
+
+The baseline fires 3 kernels between the projection GEMM and `fmhaSm100fKernel`: one for fused q/k normalization, and two for rope + KV-cache store (split by an intermediate `contiguous` call). Inductor compiles this region into only 2 kernels, eliminating the extra launch.
+
+`QKNorm + RopeKV + RMSNorm` is the best config at B=128 (+2.1%) and B=512 (+1.6%), and competitive at B=32, making it the recommended config for high-throughput serving. `RopeKV + RMSNorm` is a simpler alternative that leads at B=256 (+0.7%) and is close behind at B=512 (+1.0%). `RotaryEmbedding + RMSNorm` remains the best at B=32 and a strong all-round choice.
