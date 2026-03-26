@@ -10,6 +10,10 @@ from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
 )
 from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=15, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 DEVICE = "cuda"
 DTYPES = get_ci_test_range(

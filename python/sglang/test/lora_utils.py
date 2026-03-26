@@ -51,6 +51,33 @@ DEFAULT_PROMPTS = [
     """,
 ]
 
+MOE_LORA_TEST_PROMPTS = [
+    "Reverse the following security code: 0HRUP0A ->",
+    "Write a one-sentence story about a wild tree at the cafe.",
+    "Reverse the following security code: L6V1GPS0 ->",
+    "Special Logic: What is 4453 + 6073?",
+    "Special Logic: What is 7918 + 560?",
+    "Write a one-sentence story about a slow cat in a simulation.",
+    "Write a one-sentence story about a dusty dragon in a castle.",
+    "Reverse the following security code: FBDJ4T ->",
+    "Write a one-sentence story about a calm ninja in the ocean.",
+    "Write a one-sentence story about a glowing fairy in Paris.",
+    "Special Logic: What is 6200 + 7656?",
+    "Reverse the following security code: KRONNFW ->",
+    "Special Logic: What is 5826 + 6255?",
+    "Write a one-sentence story about a shiny robot in the jungle.",
+    "Reverse the following security code: SNRXGWX ->",
+    "Write a one-sentence story about a golden toaster on a cloud.",
+    "Special Logic: What is 5286 + 5653?",
+    "Write a one-sentence story about a brave cowboy in a time machine.",
+    "Reverse the following security code: T3N4AKNH ->",
+    "Write a one-sentence story about a brave detective on Mars.",
+]
+
+MOE_BASE_MODEL_PATH = "Qwen/Qwen1.5-MoE-A2.7B"
+MOE_LORA_PATH = "jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"
+
+
 CI_LORA_MODELS = [
     LoRAModelCase(
         base="meta-llama/Llama-3.1-8B-Instruct",
