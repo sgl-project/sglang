@@ -20,6 +20,9 @@ ARG SG_LANG_KERNEL_BRANCH=main
 RUN useradd -m -d /home/sdp -s /bin/bash sdp && \
     chown -R sdp:sdp /home/sdp
 
+# Switch to root user
+USER root
+
 # Install the latest UMD driver for SYCL-TLA
 RUN apt-get install -y software-properties-common && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
