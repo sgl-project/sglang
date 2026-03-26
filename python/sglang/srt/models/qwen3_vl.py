@@ -15,7 +15,6 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 
 import logging
-import math
 import re
 from collections import defaultdict
 from functools import lru_cache, partial
@@ -73,7 +72,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, round_up
+from sglang.srt.utils import add_prefix, is_npu, round_up
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
@@ -738,8 +737,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 return self.forward_with_npu_graph(x, grid_thw)
             return self.forward_with_cuda_graph(x, grid_thw)
 
+        # --- VLM ViT Sub-stage Timing ---
+        import time as _time
+        def _sync(): torch.cuda.synchronize()
+        _sync()
+
+        _t0 = _time.perf_counter()
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
+        _sync()
+        _t1 = _time.perf_counter()
 
         if isinstance(grid_thw, list):
             grid_thw_list = grid_thw
@@ -750,8 +757,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
+        _sync()
+        _t2 = _time.perf_counter()
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+        _t3 = _time.perf_counter()
 
         # ---- build token indptr (B+1,) ----
         token_cu_seqlens = np.repeat(
@@ -812,10 +822,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x = x.unsqueeze(1)
 
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        _t4 = _time.perf_counter()
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
 
+        _sync()
+        _t5 = _time.perf_counter()
         for layer_num, blk in enumerate(self.blocks):
             x = blk(
                 x,
@@ -832,10 +845,31 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 )
                 deepstack_feature_lists.append(deepstack_feature)
                 num_deepstack_captured += 1
+        _sync()
+        _t6 = _time.perf_counter()
+
         x = self.merger(x)
+        _sync()
+        _t7 = _time.perf_counter()
+
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+
+        _num_imgs = len(grid_thw_list)
+        _num_tokens = x.shape[0] if x.dim() >= 1 else 0
+        from sglang.srt.vlm_stage_timer import _log
+        _log(
+            f"[VLM_VIT_SUBSTAGE] imgs={_num_imgs} tokens={_num_tokens}"
+            f" | patch_embed={((_t1-_t0)*1000):.2f}ms"
+            f" | pos_embed={((_t2-_t1)*1000):.2f}ms"
+            f" | rot_pos={((_t3-_t2)*1000):.2f}ms"
+            f" | cu_seqlens={((_t4-_t3)*1000):.2f}ms"
+            f" | blocks={((_t6-_t5)*1000):.2f}ms"
+            f" | merger={((_t7-_t6)*1000):.2f}ms"
+            f" | total={((_t7-_t0)*1000):.2f}ms"
+        )
+
         return hidden_states
 
     def forward_with_npu_graph(
@@ -1154,100 +1188,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
 
-        max_patches_per_call = get_int_env_var("SGLANG_VLM_MAX_PATCHES_PER_VIT", 0)
-        max_images_per_call = get_int_env_var("SGLANG_VLM_MAX_IMAGES_PER_VIT", 0)
-
-        if max_patches_per_call == 0 and max_images_per_call == 0:
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual,
-                    pixel_values,
-                    image_grid_thw.tolist(),
-                    rope_type="rope_3d",
-                )
-            else:
-                return self.visual(pixel_values, grid_thw=image_grid_thw)
-
-        # compute the number of patches per image and the slice positions in pixel_values
-        grid_thw_list = (
-            image_grid_thw.tolist()
-        )  # List[List[int]], each is [T, H, W] or similar
-        patches_per_image = [int(math.prod(g)) for g in grid_thw_list]
-        num_images = len(patches_per_image)
-
-        # cumulative sum used to slice pixel_values along the image dimension
-        cum_patches = [0]
-        for p in patches_per_image:
-            cum_patches.append(cum_patches[-1] + p)
-        total_patches = cum_patches[-1]
-
-        assert pixel_values.size(0) == total_patches, (
-            f"pixel_values rows ({pixel_values.size(0)}) "
-            f"!= total patches ({total_patches})"
-        )
-
-        # split into chunks in image order, each chunk obeys the patch/image limits
-        all_chunk_embeds: List[torch.Tensor] = []
-        img_start = 0
-
-        while img_start < num_images:
-            img_end = img_start
-            patches_in_chunk = 0
-            images_in_chunk = 0
-
-            # try to pack more images into the current chunk until some limit would be exceeded
-            while img_end < num_images:
-                next_patches = patches_per_image[img_end]
-
-                # if adding this image would exceed the patch limit, stop
-                if (
-                    max_patches_per_call > 0
-                    and patches_in_chunk + next_patches > max_patches_per_call
-                ):
-                    break
-
-                # if adding this image would exceed the image-count limit, also stop
-                if (
-                    max_images_per_call > 0
-                    and images_in_chunk + 1 > max_images_per_call
-                ):
-                    break
-
-                patches_in_chunk += next_patches
-                images_in_chunk += 1
-                img_end += 1
-
-            # extreme case: the first image alone exceeds the patch limit -> at least ensure img_end > img_start
-            if img_end == img_start:
-                img_end = img_start + 1
-                patches_in_chunk = patches_per_image[img_start]
-                images_in_chunk = 1
-
-            # slice pixel_values and grid_thw according to [img_start:img_end]
-            patch_start = cum_patches[img_start]
-            patch_end = cum_patches[img_end]
-            pixel_chunk = pixel_values[patch_start:patch_end]
-            grid_chunk = image_grid_thw[img_start:img_end]
-
-            # run ViT once on this chunk without extra padding
-            if self.use_data_parallel:
-                chunk_embeds = run_dp_sharded_mrope_vision_model(
-                    self.visual,
-                    pixel_chunk,
-                    grid_chunk.tolist(),
-                    rope_type="rope_3d",
-                )
-            else:
-                chunk_embeds = self.visual(pixel_chunk, grid_thw=grid_chunk)
-
-            # chunk_embeds: (sum_patches_after_merge_this_chunk, hidden)
-            all_chunk_embeds.append(chunk_embeds)
-
-            # next batch
-            img_start = img_end
-
-        # concatenate back the full image embedding sequence
-        return torch.cat(all_chunk_embeds, dim=0)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual,
+                pixel_values,
+                image_grid_thw.tolist(),
+                rope_type="rope_3d",
+            )
+        else:
+            return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         for item in items:

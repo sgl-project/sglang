@@ -730,13 +730,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
                 if mm_inputs is None:
-                    mm_inputs: Dict = await self.mm_data_processor.process(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text_or_ids=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
-                    )
+                    from sglang.srt.vlm_stage_timer import record_stage, _log
+                    _rid = getattr(obj, "rid", "")
+                    _n_img = len(obj.image_data) if isinstance(obj.image_data, list) else (1 if obj.image_data else 0)
+                    _log(f"[VLM_STAGE_TIMER] req_info | req={_rid} | num_images={_n_img}")
+                    with record_stage("stage1_processor", req_id=_rid):
+                        mm_inputs: Dict = await self.mm_data_processor.process(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text_or_ids=(input_text or input_ids),
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
             elif (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
@@ -744,13 +749,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ):
                 # In language_only mode with zmq_to_scheduler, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs: Dict = await self.mm_data_processor.process(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text_or_ids=(input_text or input_ids),
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
+                from sglang.srt.vlm_stage_timer import record_stage, _log
+                _rid = getattr(obj, "rid", "")
+                _n_img = len(obj.image_data) if isinstance(obj.image_data, list) else (1 if obj.image_data else 0)
+                _log(f"[VLM_STAGE_TIMER] req_info | req={_rid} | num_images={_n_img}")
+                with record_stage("stage1_processor", req_id=_rid):
+                    mm_inputs: Dict = await self.mm_data_processor.process(
+                        image_data=obj.image_data,
+                        audio_data=obj.audio_data,
+                        input_text_or_ids=(input_text or input_ids),
+                        request_obj=obj,
+                        max_req_input_len=self.max_req_input_len,
+                    )
 
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
@@ -1098,10 +1108,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
+        from sglang.srt.vlm_stage_timer import record_stage_timestamp
+        record_stage_timestamp("stage2a_send_start", req_id=getattr(tokenized_obj, "rid", ""))
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
+        record_stage_timestamp("stage2a_send_end", req_id=getattr(tokenized_obj, "rid", ""))
 
     def _send_batch_request(
         self,

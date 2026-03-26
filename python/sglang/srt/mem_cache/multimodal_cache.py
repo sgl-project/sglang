@@ -112,13 +112,23 @@ class MultiModalStaticCache(MultimodalCache):
         data_size = _get_tensor_size(embedding.embedding)
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
-                return False
+                # Auto-expand cache to fit this embedding (e.g., large multi-image
+                # requests during chunked prefill need the full ViT output cached)
+                self.max_size = data_size
+                break
             lru_hash, lru_embedding = self.mm_cache.popitem(last=False)
             self.current_size -= _get_tensor_size(lru_embedding.embedding)
 
         self.mm_cache[mm_hash] = embedding
         self.current_size += data_size
         return True
+
+    def get_single(self, mm_hash: int) -> Optional[EmbeddingResult]:
+        """Get a single cached embedding by its hash (no combine_hashes)."""
+        embedding = self.mm_cache.get(mm_hash)
+        if embedding is not None:
+            self.mm_cache.move_to_end(mm_hash)
+        return embedding
 
     def has(self, mm_hash: int) -> bool:
         return mm_hash in self.mm_cache
