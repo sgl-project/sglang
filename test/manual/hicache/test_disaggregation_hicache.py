@@ -114,11 +114,12 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
         # Flush device cache to force remote storage access.
-        requests.post(
+        res = requests.post(
             f"{self.prefill_url}/flush_cache",
             params={"timeout": 30},
             timeout=40,
         )
+        res.raise_for_status()
 
 
 class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):

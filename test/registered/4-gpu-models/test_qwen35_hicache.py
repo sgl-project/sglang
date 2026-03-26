@@ -106,11 +106,12 @@ class TestQwen35WithHiCache(CustomTestCase):
         )
 
         print(f"flush cache")
-        requests.post(
+        res = requests.post(
             f"{self.base_url}/flush_cache",
             params={"timeout": 30},
             timeout=40,
         )
+        res.raise_for_status()
 
         second_metrics = self._run_gsm8k()
         print(f"second_metrics={second_metrics}")

@@ -179,13 +179,13 @@ class TestPPWithHiCache(unittest.TestCase):
 
         return False
 
-    def flush_cache(self) -> bool:
-        response = requests.post(
+    def flush_cache(self):
+        res = requests.post(
             f"{self.base_url}/flush_cache",
             params={"timeout": 30},
             timeout=40,
         )
-        return response.status_code == 200
+        res.raise_for_status()
 
     def test_eval_accuracy(self):
         args = SimpleNamespace(
@@ -201,7 +201,7 @@ class TestPPWithHiCache(unittest.TestCase):
         metrics_initial = run_eval_few_shot_gsm8k(args)
         self.assertGreater(metrics_initial["accuracy"], 0.6)
 
-        self.assertTrue(self.flush_cache())
+        self.flush_cache()
 
         metrics_cached = run_eval_few_shot_gsm8k(args)
         self.assertGreater(metrics_cached["accuracy"], 0.6)
