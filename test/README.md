@@ -269,6 +269,7 @@ A scheduled job summarizes test coverage across all backends; [here is an exampl
 
 ## Tips for Writing Elegant Test Cases
 - Learn from existing examples in [test/registered](https://github.com/sgl-project/sglang/tree/main/test/registered).
+- **Always use `CustomTestCase`** instead of raw `unittest.TestCase`, and make `tearDownClass` defensive (`hasattr` checks).
 - Reduce the test time by using smaller models and reusing the server for multiple test cases. Launching a server takes a lot of time, so please reuse a single server for many tests instead of launching many servers.
 - Use as few GPUs as possible. Use 1-GPU runners whenever possible. Do not run long tests with 8-gpu runners.
 - If the test cases take too long, consider adding them to nightly tests instead of per-commit tests.
