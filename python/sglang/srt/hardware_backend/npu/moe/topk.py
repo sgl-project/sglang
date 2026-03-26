@@ -26,6 +26,7 @@ def fused_topk_npu(
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
 
+    # Fast path: simple top-k without grouped routing and bias
     if not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
@@ -39,25 +40,44 @@ def fused_topk_npu(
                 else topk_weights[:, :-1]
             )
         topk_weights = topk_weights.to(torch.float32)
-    # select_experts does not support num_token_non_padded is not None
-    elif num_token_non_padded is not None:
-        kwargs = {
-            "k": topk_config.top_k,
-            "bias": correction_bias.to(torch.float32),
-            "renorm": 0,
-            "norm_type": 1,
-            "routed_scaling_factor": (
+
+    # Grouped top-k with correction bias
+    elif use_grouped_topk and correction_bias is not None:
+        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+            router_logits.to(torch.float32),
+            k=topk_config.top_k,
+            bias=correction_bias.to(torch.float32),
+            k_group=topk_config.topk_group,
+            group_count=topk_config.num_expert_group,
+            group_select_mode=1,
+            renorm=0,
+            norm_type=1,
+            routed_scaling_factor=(
                 1 if renormalize else topk_config.routed_scaling_factor
             ),
-            "eps": float(1e-20),
-        }
-        if use_grouped_topk:
-            kwargs["k_group"] = topk_config.topk_group
-            kwargs["group_count"] = topk_config.num_expert_group
-            kwargs["group_select_mode"] = 1
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            router_logits.to(torch.float32), **kwargs
+            eps=float(1e-20),
         )
+
+    # npu_moe_gating_top_k is not yet supported custom_routing_function
+    # torch native is not yet supported num_token_non_padded
+    elif (
+        topk_config.custom_routing_function is None
+        and num_token_non_padded is not None
+        and correction_bias is not None
+    ):
+        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+            router_logits.to(torch.float32),
+            k=topk_config.top_k,
+            bias=correction_bias.to(torch.float32),
+            renorm=0,
+            norm_type=1,
+            routed_scaling_factor=(
+                1 if renormalize else topk_config.routed_scaling_factor
+            ),
+            eps=float(1e-20),
+        )
+
+    # Fallback to torch native implementation
     else:
         topk_config.torch_native = True
         return select_experts(
