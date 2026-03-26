@@ -185,8 +185,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
 
-            # Per-tensor scale is scalar — pass None so _pad_weight_to_alignment
-            # skips scale padding.
             weight_t, _, orig_out = _pad_weight_to_alignment(weight, None)
             layer.weight = Parameter(weight_t, requires_grad=False)
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
