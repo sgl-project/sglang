@@ -361,7 +361,7 @@ struct tinygemm_kernel_nt<at::BFloat16, at::Float8_e4m3fn, index_t, BLOCK_M, BLO
     __m512bh va;
     __m512bh vb[COLS];
     __m512 vc[ROWS * COLS];
-    __m512 vscale = _mm512_set1_ps(scale);
+    __m512 vscales[COLS];
 
     auto loadc = [&](auto i) { vc[i] = _mm512_setzero_ps(); };
     Unroll<ROWS * COLS>{}(loadc);
@@ -381,14 +381,9 @@ struct tinygemm_kernel_nt<at::BFloat16, at::Float8_e4m3fn, index_t, BLOCK_M, BLO
         }
         int64_t b_idx = indices[col];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
-        const __m512 b_scale = _mm512_mul_ps(_mm512_set1_ps(B_scale[b_idx]), vexp);
         __m256i s8 = _mm256_loadu_si256((__m256i const*)(B + b_idx * ldb + k));
-        __m512bh bf16 = CVT_FP8_TO_BF16_EXT(s8);
-        __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
-        __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 1));
-        f_lo = _mm512_mul_ps(f_lo, b_scale);
-        f_hi = _mm512_mul_ps(f_hi, b_scale);
-        vb[col] = _mm512_cvtne2ps_pbh(f_hi, f_lo);
+        vb[col] = CVT_FP8_TO_BF16_EXT(s8);
+        vscales[col] = _mm512_mul_ps(_mm512_set1_ps(B_scale[b_idx] * scale), vexp);
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
     };
@@ -404,14 +399,9 @@ struct tinygemm_kernel_nt<at::BFloat16, at::Float8_e4m3fn, index_t, BLOCK_M, BLO
       if constexpr (row == 0) {
         int64_t b_idx = indices[col];
         TORCH_CHECK(b_idx < max_tokens, "token index out of scope!");
-        const __m512 b_scale = _mm512_mul_ps(_mm512_set1_ps(B_scale[b_idx]), vexp);
         __m256i s8 = _mm256_maskz_loadu_epi8(mask, B + b_idx * ldb + k);
-        __m512bh bf16 = CVT_FP8_TO_BF16_EXT(s8);
-        __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
-        __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 1));
-        f_lo = _mm512_mul_ps(f_lo, b_scale);
-        f_hi = _mm512_mul_ps(f_hi, b_scale);
-        vb[col] = _mm512_cvtne2ps_pbh(f_hi, f_lo);
+        vb[col] = CVT_FP8_TO_BF16_EXT(s8);
+        vscales[col] = _mm512_mul_ps(_mm512_set1_ps(B_scale[b_idx] * scale), vexp);
       }
       vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
     };
@@ -429,7 +419,7 @@ struct tinygemm_kernel_nt<at::BFloat16, at::Float8_e4m3fn, index_t, BLOCK_M, BLO
     auto storec = [&](auto i) {
       constexpr int row = i / COLS;
       constexpr int col = i % COLS;
-      C[row * ldc + col] = _mm512_reduce_add_ps(_mm512_mul_ps(vc[i], vscale));
+      C[row * ldc + col] = _mm512_reduce_add_ps(_mm512_mul_ps(vc[i], vscales[col]));
     };
     Unroll<ROWS * COLS>{}(storec);
   }
