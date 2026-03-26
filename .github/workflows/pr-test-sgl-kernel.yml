@@ -35,11 +35,8 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
-        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -73,11 +70,8 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
-        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -111,11 +105,8 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
-        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |
@@ -161,11 +152,8 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-stage-health
-        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Cleanup
         run: |

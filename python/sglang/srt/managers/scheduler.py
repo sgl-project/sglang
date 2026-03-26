@@ -224,6 +224,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -569,9 +570,8 @@ class Scheduler(
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
     def init_tp_model_worker(self):
-        from sglang.srt.managers.tp_worker import TpModelWorker
 
-        self.tp_worker = TpModelWorker(
+        worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
@@ -582,6 +582,16 @@ class Scheduler(
             dp_rank=self.dp_rank,
             nccl_port=self.nccl_port,
         )
+
+        # FIXME: move tp worker's init logic outside of the scheduler.
+        if use_mlx():
+            from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+            self.tp_worker = MlxTpModelWorker(**worker_kwargs)
+        else:
+            from sglang.srt.managers.tp_worker import TpModelWorker
+
+            self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
