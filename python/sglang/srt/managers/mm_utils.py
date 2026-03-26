@@ -1024,6 +1024,7 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
+    deepstack_idx = 0  # Separate counter for deepstack_embeddings
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):
@@ -1033,9 +1034,10 @@ def embed_mm_inputs(
         indices = torch.where(mask.squeeze(dim=-1))[0]
         input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
         if use_deepstack.get(modality, None):
-            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
+            input_deepstack_embeds[indices] = deepstack_embeddings[deepstack_idx].to(
                 input_embeds.device, input_embeds.dtype
             )
+            deepstack_idx += 1  # Increment only when deepstack is used
 
     return input_embeds, other_info
 

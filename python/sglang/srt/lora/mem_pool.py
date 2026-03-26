@@ -467,6 +467,32 @@ class LoRAMemoryPool:
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
+    def release_lora_slot(self, uid: Optional[str]) -> None:
+        """
+        Release a LoRA adapter's GPU buffer slot.
+        
+        This should be called when unloading a LoRA adapter to free up its slot
+        in the memory pool for future adapters.
+        
+        Args:
+            uid: The LoRA adapter's unique identifier. If None (base model),
+                 this is a no-op since the base model never gets a dedicated slot.
+        
+        Note:
+            This method is idempotent - calling it multiple times with the same
+            uid is safe and will only release the slot once.
+        """
+        # Base model (uid=None) never gets a dedicated slot
+        if uid is None:
+            return
+        
+        # Idempotent: only release if uid exists in mapping
+        buffer_id = self.uid_to_buffer_id.pop(uid, None)
+        if buffer_id is not None:
+            self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+            self.eviction_policy.remove(uid)
+            logger.debug(f"Released LoRA {uid} from buffer slot {buffer_id}")
+
     def load_lora_weight_to_buffer(
         self,
         uid: str,
@@ -772,3 +798,32 @@ class LoRAMemoryPool:
 
     def get_buffer_id(self, lora_uid: str):
         return self.uid_to_buffer_id[lora_uid]
+
+    def release_lora_slot(self, uid: Optional[str]) -> None:
+        """
+        Release a LoRA adapter's GPU buffer slot.
+        
+        This should be called when unloading a LoRA adapter to:
+        1. Remove uid from uid_to_buffer_id mapping
+        2. Reset buffer_id_to_uid to EMPTY_SLOT
+        3. Remove uid from eviction policy tracking
+        
+        Args:
+            uid: LoRA adapter ID. None (base model) is a no-op.
+        """
+        # No-op for None (base model never gets a dedicated slot)
+        if uid is None:
+            return
+        
+        # Idempotent: if uid not in mapping, nothing to do
+        buffer_id = self.uid_to_buffer_id.pop(uid, None)
+        if buffer_id is None:
+            return
+        
+        # Reset buffer slot to EMPTY_SLOT
+        self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
+        
+        # Remove from eviction policy tracking
+        self.eviction_policy.remove(uid)
+        
+        logger.debug(f"Released LoRA {uid} from buffer slot {buffer_id}")

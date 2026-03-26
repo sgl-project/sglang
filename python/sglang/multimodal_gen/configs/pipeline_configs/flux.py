@@ -681,7 +681,10 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
         texts = [_apply_chat_template(prompt) for prompt in prompts]
 
         tok_kwargs = dict(tok_kwargs or {})
-        max_length = tok_kwargs.pop("max_length", 512)
+        # Flux2 Klein uses max_length=512 (matching HuggingFace diffusers)
+        # Ignore inherited max_length=77 from FluxPipelineConfig.text_encoder_extra_args
+        # Reference: https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/flux2/pipeline_flux2_klein.py#L204
+        max_length = 512
         padding = tok_kwargs.pop("padding", "max_length")
         truncation = tok_kwargs.pop("truncation", True)
         return_tensors = tok_kwargs.pop("return_tensors", "pt")
