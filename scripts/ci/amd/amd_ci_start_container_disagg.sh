@@ -263,3 +263,8 @@ docker run -dt --user root \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+# The checkout is owned by the runner (non-root) but the container runs as
+# root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
+# setuptools-scm / vcs_versioning can resolve the package version.
+docker exec ci_sglang git config --global --add safe.directory /sglang-checkout

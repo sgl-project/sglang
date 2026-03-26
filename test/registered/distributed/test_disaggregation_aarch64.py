@@ -46,6 +46,8 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "2",
         ]
@@ -63,6 +65,8 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "2",
             "--base-gpu-id",
