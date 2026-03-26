@@ -1,8 +1,8 @@
 import json
-import os
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -3894,75 +3894,65 @@ class TestMinimaxM2Detector(unittest.TestCase):
             ),
         ]
         self.detector = MinimaxM2Detector()
-        # Store original env value to restore in tearDown
-        self._original_env = os.environ.get("SGLANG_FORWARD_UNKNOWN_TOOLS")
-
-    def tearDown(self):
-        # Restore original environment variable
-        if self._original_env is None:
-            os.environ.pop("SGLANG_FORWARD_UNKNOWN_TOOLS", None)
-        else:
-            os.environ["SGLANG_FORWARD_UNKNOWN_TOOLS"] = self._original_env
 
     def test_streaming_unknown_tool_without_env(self):
         """Test that unknown tools are NOT parsed when SGLANG_FORWARD_UNKNOWN_TOOLS is not set."""
-        # Ensure env is not set
-        os.environ.pop("SGLANG_FORWARD_UNKNOWN_TOOLS", None)
-
-        chunks = [
-            "<minimax:tool_call>",
-            '<invoke name="unknown_function">',
-            '<parameter name="city">',
-            "Seattle</parameter>",
-            "</invoke></minimax:tool_call>",
-        ]
-        tool_calls = []
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            for tool_call_chunk in result.calls:
-                if (
-                    hasattr(tool_call_chunk, "tool_index")
-                    and tool_call_chunk.tool_index is not None
-                ):
-                    while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": ""})
-                    tc = tool_calls[tool_call_chunk.tool_index]
-                    if tool_call_chunk.name:
-                        tc["name"] = tool_call_chunk.name
-                    if tool_call_chunk.parameters:
-                        tc["parameters"] += tool_call_chunk.parameters
-        self.assertEqual(len(tool_calls), 0)
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+            chunks = [
+                "<minimax:tool_call>",
+                '<invoke name="unknown_function">',
+                '<parameter name="city">',
+                "Seattle</parameter>",
+                "</invoke></minimax:tool_call>",
+            ]
+            tool_calls = []
+            normal_text = ""
+            for chunk in chunks:
+                result = self.detector.parse_streaming_increment(chunk, self.tools)
+                normal_text += result.normal_text or ""
+                for tool_call_chunk in result.calls:
+                    if (
+                        hasattr(tool_call_chunk, "tool_index")
+                        and tool_call_chunk.tool_index is not None
+                    ):
+                        while len(tool_calls) <= tool_call_chunk.tool_index:
+                            tool_calls.append({"name": "", "parameters": ""})
+                        tc = tool_calls[tool_call_chunk.tool_index]
+                        if tool_call_chunk.name:
+                            tc["name"] = tool_call_chunk.name
+                        if tool_call_chunk.parameters:
+                            tc["parameters"] += tool_call_chunk.parameters
+            self.assertEqual(len(tool_calls), 0)
+            self.assertIn("unknown_function", normal_text)
 
     def test_streaming_unknown_tool_with_env(self):
         """Test that unknown tools ARE parsed when SGLANG_FORWARD_UNKNOWN_TOOLS is set to 1."""
-        # Set env variable
-        os.environ["SGLANG_FORWARD_UNKNOWN_TOOLS"] = "1"
-
-        chunks = [
-            "<minimax:tool_call>",
-            '<invoke name="unknown_function">',
-            '<parameter name="city">',
-            "Seattle</parameter>",
-            "</invoke></minimax:tool_call>",
-        ]
-        tool_calls = []
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            for tool_call_chunk in result.calls:
-                if (
-                    hasattr(tool_call_chunk, "tool_index")
-                    and tool_call_chunk.tool_index is not None
-                ):
-                    while len(tool_calls) <= tool_call_chunk.tool_index:
-                        tool_calls.append({"name": "", "parameters": ""})
-                    tc = tool_calls[tool_call_chunk.tool_index]
-                    if tool_call_chunk.name:
-                        tc["name"] = tool_call_chunk.name
-                    if tool_call_chunk.parameters:
-                        tc["parameters"] += tool_call_chunk.parameters
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "unknown_function")
-        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Seattle"}')
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            chunks = [
+                "<minimax:tool_call>",
+                '<invoke name="unknown_function">',
+                '<parameter name="city">',
+                "Seattle</parameter>",
+                "</invoke></minimax:tool_call>",
+            ]
+            tool_calls = []
+            for chunk in chunks:
+                result = self.detector.parse_streaming_increment(chunk, self.tools)
+                for tool_call_chunk in result.calls:
+                    if (
+                        hasattr(tool_call_chunk, "tool_index")
+                        and tool_call_chunk.tool_index is not None
+                    ):
+                        while len(tool_calls) <= tool_call_chunk.tool_index:
+                            tool_calls.append({"name": "", "parameters": ""})
+                        tc = tool_calls[tool_call_chunk.tool_index]
+                        if tool_call_chunk.name:
+                            tc["name"] = tool_call_chunk.name
+                        if tool_call_chunk.parameters:
+                            tc["parameters"] += tool_call_chunk.parameters
+            self.assertEqual(len(tool_calls), 1)
+            self.assertEqual(tool_calls[0]["name"], "unknown_function")
+            self.assertEqual(tool_calls[0]["parameters"], '{"city": "Seattle"}')
 
     def test_streaming_known_tool_works(self):
         """Test that known tools still work as expected."""
