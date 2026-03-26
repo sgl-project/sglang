@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -11,6 +13,11 @@ try:
     from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
 except Exception:
     _sgl_silu_and_mul = None
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def _nvfp4_supported() -> bool:
@@ -212,3 +219,7 @@ def test_silu_and_mul_quantize_to_fp4_grouped(shape: tuple[int, int, int]) -> No
         scale_ref = recover_swizzled_scales(ref_output_scales[i], m, k)
         scale_ans = recover_swizzled_scales(output_scales[i], m, k)
         torch.testing.assert_close(scale_ref[: mask[i]], scale_ans[: mask[i]])
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

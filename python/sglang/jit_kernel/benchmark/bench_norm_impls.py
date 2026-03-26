@@ -15,12 +15,20 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE, is_in_ci
+from sglang.jit_kernel.benchmark.utils import DEFAULT_DEVICE
 from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
 from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
 from sglang.jit_kernel.utils import KERNEL_PATH
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.utils import is_in_ci
+
+register_cuda_ci(
+    est_time=120,
+    suite="stage-b-kernel-benchmark-1-gpu-large",
+    disabled="self-skips in CI, standalone tool",
+)
 
 os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
@@ -56,11 +64,11 @@ ACTUAL_DIFFUSION_GROUPS: list[
         "qwen-edit",
         "1 GPU",
         [
-            ("qwen_edit_ln_189x3072", "layernorm", (1, 189, 3072), SGL_LN_PAIR),
-            ("qwen_edit_ln_192x3072", "layernorm", (1, 192, 3072), SGL_LN_PAIR),
+            ("qwen_edit_ln_200x3072", "layernorm", (1, 200, 3072), SGL_LN_PAIR),
+            ("qwen_edit_ln_203x3072", "layernorm", (1, 203, 3072), SGL_LN_PAIR),
             ("qwen_edit_ln_8308x3072", "layernorm", (1, 8308, 3072), TORCH_LN),
-            ("qwen_edit_rms_189x3584", "rmsnorm", (1, 189, 3584), SGL_RMS),
-            ("qwen_edit_rms_192x3584", "rmsnorm", (1, 192, 3584), SGL_RMS),
+            ("qwen_edit_rms_200x3584", "rmsnorm", (1, 200, 3584), SGL_RMS),
+            ("qwen_edit_rms_203x3584", "rmsnorm", (1, 203, 3584), SGL_RMS),
         ],
     ),
     (
@@ -92,9 +100,7 @@ ACTUAL_DIFFUSION_GROUPS: list[
             ("zimage_rms_32x3840", "rmsnorm", (1, 32, 3840), SGL_RMS),
             ("zimage_rms_4096x3840", "rmsnorm", (1, 4096, 3840), SGL_RMS),
             ("zimage_rms_4128x3840", "rmsnorm", (1, 4128, 3840), SGL_RMS),
-            ("zimage_rms_512x2560", "rmsnorm", (1, 512, 2560), SGL_RMS),
-            ("zimage_rms_512x32x128", "rmsnorm", (1, 512, 32, 128), SGL_RMS),
-            ("zimage_rms_512x8x128", "rmsnorm", (1, 512, 8, 128), SGL_RMS),
+            ("zimage_rms_32x2560", "rmsnorm", (32, 2560), SGL_RMS),
         ],
     ),
     (
