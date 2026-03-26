@@ -662,7 +662,9 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
                 test_command=test_command,
             )
             if run_url:
-                pr.create_issue_comment(f"🔗 [View workflow run]({run_url})")
+                pr.create_issue_comment(
+                    f"🔗 [View workflow run]({run_url}) (`{test_command}`)"
+                )
             else:
                 pr.create_issue_comment(
                     f"⚠️ Could not retrieve workflow run URL. "
