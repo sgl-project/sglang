@@ -81,7 +81,7 @@ Here is an illustration
 
 
 ## Folder organization
-- `registered`: The registered test files. They are run in CI. Most tests should live in this folder. The main exception is JIT kernel coverage, which lives under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`.
+- `registered`: The registered test files. They are run in CI. Most tests should live in this folder. The main exception is JIT kernel coverage, which lives under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/` (including nested subfolders such as `diffusion/`).
 - `manual`: Test files that CI does not run; you run them manually. Typically, these are temporary tests, deprecated tests, or tests that are not suitable for CI—such as those that take too long or require special setup. We would still like to keep some files here for anyone who wants to run them locally.
 - `run_suite.py`: The launch script to run a test suite. It scans `test/registered/` and also the JIT kernel test / benchmark directories.
 - Other: utility scripts and metadata folders. The `srt` folder holds our legacy CI setup and should be deprecated as soon as possible.
@@ -142,7 +142,7 @@ python test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-small \
 ## CI Registry System
 
 CI-discovered tests use a registry-based CI system for flexible backend and schedule configuration.
-This includes files under `test/registered/` and, for JIT kernels, files under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`.
+This includes files under `test/registered/` and, for JIT kernels, files under `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/`, recursively including nested subfolders.
 For every CI-discovered file you add, you need to register it in a suite and provide an estimated execution time in seconds.
 
 ### Registration Functions
@@ -180,8 +180,8 @@ register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-small", disabled="flaky 
 
 JIT kernel files are discovered by `test/run_suite.py`, but they do not live under `test/registered/`:
 
-- Correctness tests: `python/sglang/jit_kernel/tests/test_*.py`
-- Benchmarks: `python/sglang/jit_kernel/benchmark/bench_*.py`
+- Correctness tests: `python/sglang/jit_kernel/tests/**/test_*.py`
+- Benchmarks: `python/sglang/jit_kernel/benchmark/**/bench_*.py`
 
 Use dedicated kernel suites:
 
@@ -189,9 +189,11 @@ Use dedicated kernel suites:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-8-gpu-h200")
 register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
 # Optional nightly registration
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=120, suite="nightly-kernel-8-gpu-h200", nightly=True)
 ```
 
 Keep `est_time` and `suite` as literal values. `run_suite.py` collects them by statically parsing the file AST.
@@ -210,6 +212,7 @@ You can find the available suites for each hardware backend at [`test/run_suite.
 | `stage-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP-style workloads) on H100 |
 | `stage-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (e.g. SM100+ paths) on four GPUs |
 | `stage-b-kernel-unit-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
+| `stage-b-kernel-unit-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
 | `stage-b-kernel-benchmark-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `python/sglang/jit_kernel/benchmark/` |
 | `stage-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
 | `stage-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
@@ -242,6 +245,7 @@ Nightly registry suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](
 
 - `nightly-1-gpu` (CUDA)
 - `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
+- `nightly-kernel-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly coverage)
 - `nightly-8-gpu-h200` (CUDA)
 - `nightly-eval-vlm-2-gpu` (CUDA)
 - `nightly-amd` (AMD)
@@ -254,7 +258,7 @@ Use the lightest suite that still meets your test's needs.
 - Prefer the CPU suite (`stage-a-test-cpu`) when no GPU is required.
 - For most small GPU workloads that fit a 5090-class card in CI, use `stage-b-test-1-gpu-small`. Most tests should go here.
 - If you really need more GPU memory capacity or Hopper-specific features, use `stage-b-test-1-gpu-large`.
-- For JIT kernel work under `python/sglang/jit_kernel/`, use `stage-b-kernel-unit-1-gpu-large` for correctness tests and `stage-b-kernel-benchmark-1-gpu-large` for benchmarks.
+- For JIT kernel work under `python/sglang/jit_kernel/`, use `stage-b-kernel-unit-1-gpu-large` for single-GPU correctness tests, `stage-b-kernel-unit-8-gpu-h200` for multi-GPU correctness tests, and `stage-b-kernel-benchmark-1-gpu-large` for benchmarks.
 - Use multi-GPU suites only when the test actually needs multiple GPUs or other advanced multi-GPU behavior.
 
 In rare cases, if you need a new runner or custom setup, you might need to add a new suite.
@@ -269,6 +273,7 @@ A scheduled job summarizes test coverage across all backends; [here is an exampl
 
 ## Tips for Writing Elegant Test Cases
 - Learn from existing examples in [test/registered](https://github.com/sgl-project/sglang/tree/main/test/registered).
+- **Always use `CustomTestCase`** instead of raw `unittest.TestCase`, and make `tearDownClass` defensive (`hasattr` checks).
 - Reduce the test time by using smaller models and reusing the server for multiple test cases. Launching a server takes a lot of time, so please reuse a single server for many tests instead of launching many servers.
 - Use as few GPUs as possible. Use 1-GPU runners whenever possible. Do not run long tests with 8-gpu runners.
 - If the test cases take too long, consider adding them to nightly tests instead of per-commit tests.
