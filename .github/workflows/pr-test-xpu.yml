@@ -120,7 +120,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && cd /home/sdp/sglang/test/srt && python3 run_suite.py --suite per-commit-xpu"
+          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && cd /home/sdp/sglang/test/srt && export TRUST_REMOTE_CODE=1 &&  python3 run_suite.py --suite per-commit-xpu"
       - name: Cleanup container
         if: always()
         run: |
