@@ -307,17 +307,6 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     return out
 
 
-def new_gelu(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
-    if out is not None:
-        assert input.shape == out.shape, f"{input.shape} != {out.shape}"
-    else:
-        out = torch.empty_like(input)
-    torch.ops.sgl_kernel.new_gelu.default(out, input)
-    return out
-
-
 if torch.version.hip is not None:
 
     def gelu_quick(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:

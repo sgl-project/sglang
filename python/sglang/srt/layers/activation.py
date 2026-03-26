@@ -50,9 +50,9 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 if _is_cuda or _is_xpu:
-    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, new_gelu, silu_and_mul
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, new_gelu, silu_and_mul
+    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
 
 if is_npu():
     import torch_npu
@@ -149,6 +149,8 @@ class NewGELU(MultiPlatformOp):
         return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.jit_kernel.new_gelu import new_gelu
+
         return new_gelu(x)
 
 

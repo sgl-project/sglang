@@ -1,6 +1,5 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/tests/test_activation.py
 
-import math
 import sys
 
 import pytest
@@ -35,17 +34,6 @@ def test_fused_gelu_mul(dim, batch_size, seq_len):
     x = torch.randn(batch_size, seq_len, 2 * dim).to(0).to(torch.float16)
     y_ref = x[..., dim:] * torch.nn.functional.gelu(x[..., :dim], approximate="none")
     y = sgl_kernel.gelu_and_mul(x)
-    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
-
-
-@pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
-@pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
-def test_new_gelu(dim, batch_size, seq_len):
-    x = torch.randn(batch_size, seq_len, dim).to(0).to(torch.float16)
-    c = math.sqrt(2.0 / math.pi)
-    y_ref = 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
-    y = sgl_kernel.new_gelu(x)
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 

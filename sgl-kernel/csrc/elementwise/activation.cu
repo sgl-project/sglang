@@ -82,40 +82,6 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
   return detail::from_f32<T>(f32_val * cdf);
 }
 
-#ifndef USE_ROCM
-template <typename scalar_t>
-__global__ void new_gelu_kernel(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const int d) {
-  constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
-  constexpr float kAlpha = 0.044715f;
-  constexpr float kBeta = 0.7978845608028654f;
-  const int64_t token_idx = blockIdx.x;
-  const int64_t thread_idx = threadIdx.x;
-  const int64_t stride = blockDim.x;
-  const int64_t offset = token_idx * d;
-
-#pragma unroll 1
-  for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
-    flashinfer::vec_t<float, vec_size> x_vec, out_vec;
-    x_vec.cast_load(input + offset + idx * vec_size);
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      float val = x_vec[i];
-      float cdf = 0.5f * (1.0f + tanhf(kBeta * (val + kAlpha * val * val * val)));
-      out_vec[i] = val * cdf;
-    }
-    out_vec.cast_store(out + offset + idx * vec_size);
-  }
-
-  const int64_t remaining_offset = d - d % (stride * vec_size);
-#pragma unroll 1
-  for (int64_t idx = thread_idx; idx < d % (stride * vec_size); idx += stride) {
-    float val = detail::to_f32(input[offset + remaining_offset + idx]);
-    float cdf = 0.5f * (1.0f + tanhf(kBeta * (val + kAlpha * val * val * val)));
-    out[offset + remaining_offset + idx] = detail::from_f32<scalar_t>(val * cdf);
-  }
-}
-#endif
-
 void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
@@ -179,30 +145,6 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 #endif
 
-    return true;
-  });
-}
-
-void new_gelu(at::Tensor& out, at::Tensor& input) {
-  int d = input.size(-1);
-  int64_t num_tokens = input.numel() / input.size(-1);
-  dim3 grid(num_tokens);
-
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
-    uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, 1024U));
-#if USE_ROCM
-    sgl_hip::activation::act_only_kernel<c_type, gelu_tanh>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
-#else
-    new_gelu_kernel<c_type>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
-#endif
-    cudaError_t status = cudaGetLastError();
-    TORCH_CHECK(status == cudaSuccess, "new_gelu_kernel launch failed: ", cudaGetErrorString(status));
     return true;
   });
 }

@@ -28,7 +28,6 @@ from sgl_kernel.elementwise import (
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
-    new_gelu,
     rmsnorm,
     rotary_embedding,
     silu_and_mul,

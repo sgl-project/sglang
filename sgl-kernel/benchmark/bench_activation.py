@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.testing
-from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, new_gelu, silu_and_mul
+from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 from sglang.utils import is_in_ci
 
@@ -93,7 +93,7 @@ if IS_CI:
     kernels = ["silu_and_mul"]  # Only test one kernel in CI
     dtypes = [torch.float16]  # Only test one dtype in CI
 else:
-    kernels = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul", "new_gelu"]
+    kernels = ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
     if GELU_QUICK_AVAILABLE:
         kernels.append("gelu_quick")
     dtypes = [torch.float16, torch.bfloat16]
@@ -129,26 +129,23 @@ else:
 )
 def benchmark(kernel, dtype, batch_size, seq_len, dim, provider):
     device = torch.device("cuda")
-    in_mult = 1 if kernel in ("gelu_quick", "new_gelu") else 2
+    in_mult = 1 if kernel == "gelu_quick" else 2
     x = torch.randn(batch_size, seq_len, in_mult * dim, dtype=dtype, device=device)
     y0 = torch.zeros(batch_size, seq_len, dim, dtype=dtype, device=device)
 
-    if VLLM_AVAILABLE:
-        vllm_kernel = getattr(vllm_ops, kernel, None)
-    else:
-        vllm_kernel = None
-
-    if vllm_kernel is None and provider in ["vllm", "speedup"]:
+    if not VLLM_AVAILABLE and provider in ["vllm", "speedup"]:
         # Skip vLLM-related benchmarks if vLLM is not available
         return (0, 0, 0)
 
+    if VLLM_AVAILABLE:
+        vllm_kernel = getattr(vllm_ops, kernel)
     if kernel == "gelu_quick" and not GELU_QUICK_AVAILABLE:
         # Skip benchmark for gelu_quick if not available
         return (0, 0, 0)
     sglang_kernel = getattr(sgl_kernel, kernel)
 
     def baseline():
-        if vllm_kernel is not None:
+        if VLLM_AVAILABLE:
             tmp = y0.clone()
             vllm_kernel(tmp, x)
             return tmp
