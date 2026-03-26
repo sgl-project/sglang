@@ -8,7 +8,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
-from sglang.multimodal_gen.runtime.loader.transformer_quant import (
+from sglang.multimodal_gen.runtime.loader.transformer_quant_utils import (
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )

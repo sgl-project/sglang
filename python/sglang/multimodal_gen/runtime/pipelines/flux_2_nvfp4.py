@@ -3,11 +3,11 @@
 import os
 from typing import Any, cast
 
-from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
-from sglang.multimodal_gen.runtime.pipelines.flux_2_quant import (
+from sglang.multimodal_gen.runtime.loader.flux_2_quant import (
     Flux2Nvfp4ModelResolution,
     resolve_flux2_nvfp4_model,
 )
+from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
