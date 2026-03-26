@@ -65,6 +65,7 @@ DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST = "Wan-AI/Wan2.2-I2V-A14B-Diffusers
 
 # MOVA video generation models
 DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
+DEFAULT_MOVA_720P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-720p"
 
 
 def print_value_formatted(description: str, value: int | float | str):

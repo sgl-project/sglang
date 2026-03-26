@@ -32,6 +32,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+    DEFAULT_MOVA_720P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
@@ -561,6 +562,17 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         TI2V_sampling_params,
         run_perf_check=False,
     ),
+    DiffusionTestCase(
+        "mova_720p_1gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_720P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=1,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
+    ),
 ]
 
 HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
@@ -933,6 +945,18 @@ TWO_GPU_CASES_A = [
             num_gpus=2,
             ring_degree=2,
             ulysses_degree=1,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
+    ),
+    DiffusionTestCase(
+        "mova_360p_cfg_parallel",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=2,
+            cfg_parallel=True,
             dit_layerwise_offload=True,
         ),
         TI2V_sampling_params,

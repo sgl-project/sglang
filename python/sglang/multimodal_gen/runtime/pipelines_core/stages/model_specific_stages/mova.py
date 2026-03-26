@@ -158,8 +158,6 @@ class MOVADenoisingStage(PipelineStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        if get_global_server_args().enable_cfg_parallel:
-            return StageParallelismType.CFG_PARALLEL
         return StageParallelismType.REPLICATED
 
     def _predict(
@@ -200,6 +198,7 @@ class MOVADenoisingStage(PipelineStage):
             partial = guidance_scale * pos
         else:
             partial = (1 - guidance_scale) * neg
+        partial = partial.contiguous()
         return cfg_model_parallel_all_reduce(partial)
 
     def _maybe_enable_torch_compile(self, module: nn.Module, server_args: ServerArgs):
@@ -365,11 +364,6 @@ class MOVADenoisingStage(PipelineStage):
         self._manage_device_placement(current_model, model_to_offload, server_args)
         return current_model
 
-    def _ensure_shared_models_on_device(self, server_args: ServerArgs):
-        """Ensure shared denoising modules are on the active device when cpu offload is enabled."""
-        self._manage_device_placement(self.audio_dit, None, server_args)
-        self._manage_device_placement(self.dual_tower_bridge, None, server_args)
-
     def _apply_guidance_rescale(
         self,
         noise_pred,
@@ -396,6 +390,11 @@ class MOVADenoisingStage(PipelineStage):
             )
         return self.rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale)
 
+    def _ensure_shared_models_on_device(self, server_args: ServerArgs):
+        """Ensure shared denoising modules are on the active device when cpu offload is enabled."""
+        self._manage_device_placement(self.audio_dit, None, server_args)
+        self._manage_device_placement(self.dual_tower_bridge, None, server_args)
+
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         self._maybe_compile_dits(server_args)
@@ -413,8 +412,19 @@ class MOVADenoisingStage(PipelineStage):
         total_steps = paired_timesteps.shape[0]
         cfg_rank = get_classifier_free_guidance_rank()
         enable_cfg_parallel = server_args.enable_cfg_parallel
-
         is_warmup = batch.is_warmup
+
+        if not is_warmup:
+            if enable_cfg_parallel and batch.do_classifier_free_guidance:
+                logger.info(
+                    "[MOVADenoisingStage] CFG parallel enabled (cfg_rank=%s: %s)",
+                    cfg_rank,
+                    "positive/cond only" if cfg_rank == 0 else "negative/uncond only",
+                )
+            elif batch.do_classifier_free_guidance:
+                logger.info(
+                    "[MOVADenoisingStage] CFG parallel disabled, computing both pos and neg (serial CFG)"
+                )
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step_from_to,
             getattr(batch, "extra_step_kwargs", None) or {},
@@ -497,6 +507,35 @@ class MOVADenoisingStage(PipelineStage):
                                     attn_metadata,
                                     batch,
                                 )
+                            visual_noise_pred = self._cfg_combine(
+                                pos[0],
+                                neg[0],
+                                batch.guidance_scale,
+                                cfg_rank,
+                                enable_cfg_parallel,
+                            )
+                            audio_noise_pred = self._cfg_combine(
+                                pos[1],
+                                neg[1],
+                                batch.guidance_scale,
+                                cfg_rank,
+                                enable_cfg_parallel,
+                            )
+                            if batch.guidance_rescale > 0.0:
+                                visual_noise_pred = self._apply_guidance_rescale(
+                                    visual_noise_pred,
+                                    pos[0] if pos[0] is not None else None,
+                                    batch.guidance_rescale,
+                                    cfg_rank,
+                                    enable_cfg_parallel,
+                                )
+                                audio_noise_pred = self._apply_guidance_rescale(
+                                    audio_noise_pred,
+                                    pos[1] if pos[1] is not None else None,
+                                    batch.guidance_rescale,
+                                    cfg_rank,
+                                    enable_cfg_parallel,
+                                )
                         else:
                             pos = self._predict(
                                 cur_visual_dit,
@@ -556,31 +595,31 @@ class MOVADenoisingStage(PipelineStage):
                                     enable_cfg_parallel,
                                 )
 
-                        if idx_step + 1 < total_steps:
-                            next_pair_t = paired_timesteps[idx_step + 1]
-                            if getattr(next_pair_t, "shape", None) == (2,):
-                                next_timestep, next_audio_timestep = next_pair_t
-                            else:
-                                next_timestep = next_pair_t
-                                next_audio_timestep = next_pair_t
+                    if idx_step + 1 < total_steps:
+                        next_pair_t = paired_timesteps[idx_step + 1]
+                        if getattr(next_pair_t, "shape", None) == (2,):
+                            next_timestep, next_audio_timestep = next_pair_t
                         else:
-                            next_timestep = None
-                            next_audio_timestep = None
+                            next_timestep = next_pair_t
+                            next_audio_timestep = next_pair_t
+                    else:
+                        next_timestep = None
+                        next_audio_timestep = None
 
-                        batch.latents = self.scheduler.step_from_to(
-                            visual_noise_pred,
-                            timestep,
-                            next_timestep,
-                            batch.latents,
-                            **extra_step_kwargs,
-                        )
-                        batch.audio_latents = self.scheduler.step_from_to(
-                            audio_noise_pred,
-                            audio_timestep,
-                            next_audio_timestep,
-                            batch.audio_latents,
-                            **extra_step_kwargs,
-                        )
+                    batch.latents = self.scheduler.step_from_to(
+                        visual_noise_pred,
+                        timestep,
+                        next_timestep,
+                        batch.latents,
+                        **extra_step_kwargs,
+                    )
+                    batch.audio_latents = self.scheduler.step_from_to(
+                        audio_noise_pred,
+                        audio_timestep,
+                        next_audio_timestep,
+                        batch.audio_latents,
+                        **extra_step_kwargs,
+                    )
 
                     if progress_bar is not None:
                         progress_bar.update()
@@ -674,7 +713,7 @@ class MOVADenoisingStage(PipelineStage):
         - Before unpatchify, sequences are gathered back
         """
         model_dtype = visual_dit.time_embedding.fc_in.weight.dtype
-        device = visual_latents.device
+        device = get_local_torch_device()
 
         visual_context = context.to(device=device, dtype=model_dtype)
         audio_context = context.to(device=device, dtype=model_dtype)
