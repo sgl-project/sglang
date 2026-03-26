@@ -6,31 +6,6 @@ set -e
 
 WHEEL_DIR="dist"
 
-resolve_python() {
-    if [[ -n "${PYTHON_ROOT_PATH:-}" ]]; then
-        if [[ -x "${PYTHON_ROOT_PATH}/bin/python" ]]; then
-            echo "${PYTHON_ROOT_PATH}/bin/python"
-            return
-        fi
-        if [[ -x "${PYTHON_ROOT_PATH}/python" ]]; then
-            echo "${PYTHON_ROOT_PATH}/python"
-            return
-        fi
-    fi
-    if command -v python >/dev/null 2>&1; then
-        command -v python
-        return
-    fi
-    if command -v python3 >/dev/null 2>&1; then
-        command -v python3
-        return
-    fi
-    echo "ERROR: no python interpreter found (set PYTHON_ROOT_PATH or install python)." >&2
-    exit 1
-}
-
-PYTHON="$(resolve_python)"
-
 detect_cuda_suffix() {
     if ls /usr/local/ 2>/dev/null | grep -q "12.4"; then
         echo "+cu124"
@@ -80,7 +55,7 @@ for wheel in "${wheel_files[@]}"; do
     TMPDIR=$(mktemp -d)
     trap 'rm -rf -- "$TMPDIR"' ERR
 
-    "${PYTHON}" -m wheel unpack "$wheel" --dest "$TMPDIR"
+    python -m wheel unpack "$wheel" --dest "$TMPDIR"
     UNPACKED=$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d | head -1)
     DIST_INFO=$(find "$UNPACKED" -maxdepth 1 -type d -name "*.dist-info" | head -1)
     WHEEL_META="${DIST_INFO}/WHEEL"
@@ -103,7 +78,7 @@ for wheel in "${wheel_files[@]}"; do
     mv "$DIST_INFO" "${UNPACKED}/${NEW_BASE}"
 
     rm -f "$wheel"
-    "${PYTHON}" -m wheel pack "$UNPACKED" --dest-dir "$WHEEL_DIR"
+    python -m wheel pack "$UNPACKED" --dest-dir "$WHEEL_DIR"
     rm -rf "$TMPDIR"
     trap - ERR
 done
