@@ -368,15 +368,11 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
-        # Check if MM splitting is enabled
-        if not envs.SGLANG_ENABLE_MM_SPLITTING.get():
-            mm_items = obj["mm_items"]
-        else:
-            from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 
-            original_mm_items = obj["mm_items"]
-            # Now, `mm_items` contains one item per image.
-            mm_items = get_new_expanded_mm_items(original_mm_items)
+        # Split bundled items (e.g. multi-image concat) into per-image items.
+        # Models without grid metadata fall back to keeping bundled items.
+        mm_items = get_new_expanded_mm_items(obj["mm_items"])
 
         ret = MultimodalInputs(
             mm_items=mm_items,

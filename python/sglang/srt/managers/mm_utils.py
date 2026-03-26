@@ -326,46 +326,9 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         input_ids_tensor = torch.as_tensor(input_ids)
 
-        # Check if MM splitting is enabled
-        if envs.SGLANG_ENABLE_MM_SPLITTING.get():
-            items_by_modality = defaultdict(list)
-            for item in mm_inputs.mm_items:
-                items_by_modality[item.modality].append(item)
-
-            token_id_map = {
-                Modality.IMAGE: mm_inputs.im_token_id,
-                Modality.MULTI_IMAGES: mm_inputs.im_token_id,
-                Modality.AUDIO: mm_inputs.audio_token_id,
-                Modality.VIDEO: mm_inputs.video_token_id,
-            }
-
-            for modality, items in items_by_modality.items():
-                token_id = token_id_map.get(modality)
-
-                if not items or token_id is None:
-                    continue
-
-                for i, item in enumerate(items):
-                    for offset in items[i].offsets:
-                        input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
-        else:
-            # Create mapping of token_ids to pad_values for each modality
-            token_to_pad_mapping = {}
-            for item in mm_inputs.mm_items:
-                if item.is_image() and mm_inputs.im_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
-                elif item.is_audio() and mm_inputs.audio_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
-                elif item.is_video() and mm_inputs.video_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
-                else:
-                    raise ValueError(
-                        f"No multimodal token id provided for {item.modality}"
-                    )
-
-            # Apply replacements for all tokens at once
-            for token_id, pad_value in token_to_pad_mapping.items():
-                input_ids_tensor[input_ids_tensor == token_id] = pad_value
+        for item in mm_inputs.mm_items:
+            for offset in item.offsets:
+                input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
@@ -481,137 +444,25 @@ DataEmbeddingFunc = Callable[
 ]
 
 
-def _is_bundled_item(
-    embedding_items_per_req: List[MultimodalDataItem],
-    items_offset: List[Tuple[int, int]],
-) -> bool:
-    return len(embedding_items_per_req) == 1 and len(items_offset) > 1
+_IMAGE_GRID_KEYS = ("image_grid_thw", "grid_thws", "image_grid_hws")
 
 
-def _slice_bundled_item_for_images(
-    item: MultimodalDataItem,
-    image_indices: List[int],
-) -> MultimodalDataItem:
+def _get_patches_per_item(
+    model_specific_data: dict, num_items: int, grid_keys: tuple
+) -> Optional[List[int]]:
+    """Extract per-item patch counts from model_specific_data.
+
+    Supports multiple grid key formats (image_grid_thw, grid_thws, image_grid_hws, etc.).
+    Returns None if no matching grid metadata is found, triggering fallback to bundled mode.
     """
-    Slice a bundled MultimodalDataItem to contain only the specified images.
-    Uses image_grid_thw to compute patch boundaries in the feature tensor.
-    """
-    grid_thw = getattr(item, "image_grid_thw", None)
-    assert grid_thw is not None, "Bundled item must have image_grid_thw"
-
-    patches_per_image = [int(math.prod(g)) for g in grid_thw.tolist()]
-    cum_patches = [0]
-    for p in patches_per_image:
-        cum_patches.append(cum_patches[-1] + p)
-
-    # Use zero-copy view when indices are contiguous
-    first, last = image_indices[0], image_indices[-1]
-    is_contiguous = (last - first + 1 == len(image_indices)) and all(
-        image_indices[k] == first + k for k in range(len(image_indices))
-    )
-
-    if is_contiguous:
-        sliced_feature = item.feature[cum_patches[first] : cum_patches[last + 1]]
-        sliced_grid_thw = grid_thw[first : last + 1]
-    else:
-        feature_slices = [
-            item.feature[cum_patches[j] : cum_patches[j + 1]] for j in image_indices
-        ]
-        sliced_feature = torch.cat(feature_slices, dim=0)
-        sliced_grid_thw = torch.cat(
-            [grid_thw[j : j + 1] for j in image_indices], dim=0
-        )
-
-    return MultimodalDataItem(
-        modality=item.modality,
-        hash=item.hash,
-        pad_value=item.pad_value,
-        format=item.format,
-        feature=sliced_feature,
-        model_specific_data={"image_grid_thw": sliced_grid_thw},
-    )
+    for key in grid_keys:
+        grid = model_specific_data.get(key)
+        if grid is not None and _get_length(grid) == num_items:
+            return [math.prod(g) for g in grid]
+    return None
 
 
-def _split_embedding_by_image(
-    embedding: torch.Tensor,
-    items_offset: List[Tuple[int, int]],
-    image_indices: List[int],
-) -> List[torch.Tensor]:
-    """Split a ViT output embedding into per-image tensors based on items_offset token counts."""
-    embedding = embedding.reshape(-1, embedding.shape[-1])
-    tokens_per_image = [items_offset[j][1] - items_offset[j][0] + 1 for j in image_indices]
-    return list(torch.split(embedding, tokens_per_image, dim=0))
-
-
-def _per_image_cache_key(item_hash: int, image_index: int) -> int:
-    return hash(("per_image", item_hash, image_index))
-
-
-def _get_chunked_prefill_embedding_bundled(
-    data_embedding_func: DataEmbeddingFunc,
-    item: MultimodalDataItem,
-    items_offset: List[Tuple[int, int]],
-    extend_prefix_len: int,
-    extend_seq_len: int,
-) -> Optional[torch.Tensor]:
-    """
-    Per-image chunked encoding for bundled items (1 item with N images).
-    Only encodes images overlapping with the current chunk, caches per-image on GPU.
-    """
-    # items_offset uses inclusive (start, end); chunk window is [chunk_start, chunk_end)
-    chunk_start = extend_prefix_len
-    chunk_end = extend_prefix_len + extend_seq_len
-
-    overlapping_indices = [
-        j for j, (start, end) in enumerate(items_offset)
-        if end >= chunk_start and start < chunk_end
-    ]
-    if not overlapping_indices:
-        return None
-
-    per_image_embeddings = {}
-    uncached_indices = []
-    for j in overlapping_indices:
-        cache_key = _per_image_cache_key(item.hash, j)
-        cached = embedding_cache.get_single(cache_key)
-        if cached is not None:
-            per_image_embeddings[j] = cached.embedding
-        else:
-            uncached_indices.append(j)
-
-    if uncached_indices:
-        sub_item = _slice_bundled_item_for_images(item, uncached_indices)
-        new_embedding = data_embedding_func([sub_item])
-
-        if isinstance(new_embedding, EVSEmbeddingResult):
-            raise NotImplementedError("EVS not supported with bundled per-image encoding")
-
-        per_image_outputs = _split_embedding_by_image(
-            new_embedding, items_offset, uncached_indices
-        )
-        for j, emb in zip(uncached_indices, per_image_outputs):
-            cache_key = _per_image_cache_key(item.hash, j)
-            embedding_cache.set(cache_key, EmbeddingResult(embedding=emb))
-            per_image_embeddings[j] = emb
-
-    # Trim each image's embedding to the chunk overlap range
-    chunk_parts = []
-    for j in overlapping_indices:
-        emb = per_image_embeddings[j]
-        start, end = items_offset[j]
-        overlap_start = max(start, chunk_start)
-        overlap_end = min(end + 1, chunk_end)  # inclusive end -> exclusive
-        if overlap_start >= overlap_end:
-            continue
-        chunk_parts.append(emb[overlap_start - start : overlap_end - start])
-
-    if not chunk_parts:
-        return None
-
-    return torch.cat(chunk_parts, dim=0)
-
-
-def _get_chunked_prefill_embedding_all_at_once(
+def _get_chunked_prefill_embedding_per_req(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items_per_req: List[MultimodalDataItem],
     items_offset: List[Tuple[int, int]],
@@ -671,14 +522,8 @@ def _get_chunked_prefill_embedding(
     input_ids: torch.Tensor,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
-    Chunked prefill embedding with per-image encoding and caching.
-
-    For bundled items (e.g. Qwen3-VL where 1 item contains N images):
-    - Only encodes images overlapping with the current chunk
-    - Caches each image's embedding individually on GPU
-    - Only transfers necessary pixel data to GPU
-
-    Falls back to all-at-once encoding for non-bundled items or EVS.
+    Chunked prefill embedding: encode per-request items and extract the chunk.
+    Items are already split per-image at processor stage.
     """
     embedding_list = []
     # FIXME(Xinyuan): temporary workaround for eagle3
@@ -698,27 +543,7 @@ def _get_chunked_prefill_embedding(
         if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
             continue
 
-        # Use per-image chunked encoding for bundled items with image_grid_thw
-        if (
-            _is_bundled_item(embedding_items_per_req, items_offset)
-            and getattr(embedding_items_per_req[0], "image_grid_thw", None) is not None
-        ):
-            try:
-                chunk_embedding = _get_chunked_prefill_embedding_bundled(
-                    data_embedding_func,
-                    embedding_items_per_req[0],
-                    items_offset,
-                    extend_prefix_len,
-                    extend_seq_len,
-                )
-                if chunk_embedding is not None:
-                    embedding_list.append(chunk_embedding)
-                continue
-            except NotImplementedError:
-                pass  # Fall through to all-at-once path
-
-        # Fallback: encode all items at once
-        chunk_embedding, input_ids = _get_chunked_prefill_embedding_all_at_once(
+        chunk_embedding, input_ids = _get_chunked_prefill_embedding_per_req(
             data_embedding_func,
             embedding_items_per_req,
             items_offset,
@@ -1399,16 +1224,12 @@ def get_new_expanded_mm_items(original_mm_items):
             num_items = len(item.offsets)
 
             if item.is_image():
-                image_grid_thw = item.model_specific_data.get("image_grid_thw")
-                grid_len = _get_length(image_grid_thw)
-                if image_grid_thw is None or grid_len != num_items:
+                patches_per_item = _get_patches_per_item(
+                    item.model_specific_data, num_items, _IMAGE_GRID_KEYS
+                )
+                if patches_per_item is None:
                     expanded_mm_items.append(item)
                     continue
-
-                patches_per_item = []
-                for grid in image_grid_thw:
-                    grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                    patches_per_item.append(int(torch.prod(grid_tensor).item()))
 
                 cumulative = torch.cumsum(
                     torch.tensor(patches_per_item, dtype=torch.long), dim=0
