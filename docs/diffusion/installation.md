@@ -1,6 +1,6 @@
 # Install SGLang-Diffusion
 
-You can install SGLang-Diffusion using one of the methods below.
+You can install SGLang-Diffusion using one of the methods below. The standard installation already includes SGLang's optimized kernel stack, including both `sgl-kernel` and JIT kernels used by diffusion workloads.
 
 ## Standard Installation (NVIDIA GPUs)
 

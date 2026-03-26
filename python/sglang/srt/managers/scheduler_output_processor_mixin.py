@@ -1109,7 +1109,9 @@ class SchedulerOutputProcessorMixin:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:
                             customized_info[k] = []
-                        customized_info[k].append(v[send_token_offset:])
+                        customized_info[k].append(
+                            v[send_token_offset : len(output_ids_)]
+                        )
 
             if (
                 req.finished()
