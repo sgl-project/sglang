@@ -692,7 +692,8 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
         texts = [_apply_chat_template(prompt) for prompt in prompts]
 
         tok_kwargs = dict(tok_kwargs or {})
-        tok_kwargs.pop("max_length", None)
+        # Flux2 Klein uses max_length 512.
+        # Ignoring inherited max_length=77 from FluxPipelineConfig.text_encoder_extra_args.
         max_length = 512
         padding = tok_kwargs.pop("padding", "max_length")
         truncation = tok_kwargs.pop("truncation", True)
