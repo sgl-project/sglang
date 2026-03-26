@@ -874,7 +874,6 @@ do
         echo "${D_IP[$i]}"
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
-        export HCCL_BUFFSIZE=650
 
         export TASK_QUEUE_ENABLE=0
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
