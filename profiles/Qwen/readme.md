@@ -1,24 +1,34 @@
-# Qwen3-30B-A3B — Inductor Compilation Profile
+# Qwen — Inductor Compilation Profiles
 
-## Setup
+## Common Setup
 
-- **Model:** `Qwen/Qwen3-30B-A3B`
 - **MoE backend:** auto (flashinfer\_trtllm)
 - **Weights:** real (HuggingFace)
 - **Dataset:** ShareGPT, output sequence length 8192
-- **TP:** 1
 - **Device:** GB200
-- **SGLang commit:**: `cb8105fe282fc373b5baed63d5df38682418a373`
-- **`sgl_kernel` version:**: `0.3.21` 
-- **`torch` commit:**: `cb8105fe282fc373b5baed63d5df38682418a373` (version nightly `2.12`)
+- **SGLang commit:** `cb8105fe282fc373b5baed63d5df38682418a373`
+- **`sgl_kernel` version:** `0.3.21`
+- **`torch` commit:** `cb8105fe282fc373b5baed63d5df38682418a373` (version nightly `2.12`)
+
+## Common Notes
+
+- Piecewise CUDA graphs are automatically disabled for these models due to the `flashinfer_trtllm` MoE backend, so baseline and Inductor configs run under the same conditions.
+- `inductor[rope]` / `inductor[ropekv]` can fuse the KV-cache update into the rotary embedding graph, while standard SGLang must fire 2 separate kernels because the SWA KV-cache type prevents fusion. The `SWAKVPool` uses dual addressing — SWA layers write to `out_cache_loc_swa`, non-SWA layers to `out_cache_loc` — which the JIT rope kernel doesn't handle. Inductor compiles the pure-PyTorch `forward_native` path where this dual addressing is expressed as `index_put_` ops that get fused into the rope graph.
+- **RMSNorm** is compiled with no dynamic shapes, so Inductor can specialize on the fixed decode batch sizes used by SGLang's CUDA graphs.
+- **RotaryEmbedding** is compiled with dynamic shapes due to the KV-cache update (`index_put_` with variable `cache_loc`), which limits Inductor's ability to specialize and adds overhead.
+
+---
+
+# Qwen3-30B-A3B
+
+- **Model:** `Qwen/Qwen3-30B-A3B`
+- **Precision:** bf16
+- **TP:** 1
 
 ## Notes
 
 - `inductor[moe]` total time is misleading: prefill still uses the `triton_kernel` MoE backend, not `flashinfer_trtllm`.
-- `inductor[rope]` uses the fallback fused q,k norm + rope path compiled by Inductor. Inductor can fuse the KV-cache update into the rotary embedding graph, while standard SGLang must fire 2 separate kernels because the SWA KV-cache type prevents fusion. The `SWAKVPool` uses dual addressing — SWA layers write to `out_cache_loc_swa`, non-SWA layers to `out_cache_loc` — which the JIT rope kernel doesn't handle. Inductor compiles the pure-PyTorch `forward_native` path where this dual addressing is expressed as `index_put_` ops that get fused into the rope graph.
 - `inductor[rope-rmsnorm]` does **not** use Inductor for the pre-attention q,k normalization — only the rotary embedding and the layer-level RMSNorm are compiled.
-- **RMSNorm** is compiled with no dynamic shapes, so Inductor can specialize on the fixed decode batch sizes used by SGLang's CUDA graphs. This means efficient code with only slightly higher startup times.
-- **RotaryEmbedding** is compiled with dynamic shapes due to the KV-cache update (`index_put_` with variable `cache_loc`), which limits Inductor's ability to specialize and adds overhead.
 - `inductor[qvnormropekv-rmsnorm]` compiles the full `QKNormRope` region — q/k normalization, rotary embedding, and KV-cache write — as a single fused Inductor graph, alongside the layer-level RMSNorm. This is the most comprehensive compilation scope, but the larger graph with dynamic shapes adds overhead that only amortizes at high concurrency.
 - `inductor[ropekv-rmsnorm]` compiles the rotary embedding with KV-cache write (fused into a single Inductor graph) and the layer-level RMSNorm. Q/k normalization uses the custom kernel. Same compilation scope as `inductor[rope-rmsnorm]` but with naming that makes the KV-cache fusion explicit.
 - `inductor[qvnorm-ropekv-rmsnorm]` splits the `QKNormRope` region into two separate Inductor graphs: one for q/k normalization (no dynamic shapes) and one for rope + KV-cache write (dynamic shapes). This reduces the scope of the dynamic-shape graph compared to the fully-fused `qvnormropekv` variant.
@@ -31,7 +41,7 @@ The charts below were generated with `bench_one_batch.py`, which measures raw si
 python profiles/plot_speedup.py profiles/Qwen/Qwen3-30B-A3B
 ```
 
-![Speedup Charts](speedup_charts.png)
+![Speedup Charts](Qwen3-30B-A3B/speedup_charts.png)
 
 **Key observations:**
 - `inductor[moe]` significantly hurts decode throughput (~0.70x at bs=1), likely due to the triton\_kernel prefill overhead bleeding into measured totals.
@@ -39,10 +49,6 @@ python profiles/plot_speedup.py profiles/Qwen/Qwen3-30B-A3B
 - Overall throughput shows similar trends: the non-moe configs hover around 1.00x, while `inductor[moe]` drags overall throughput to ~0.65x at bs=1.
 
 ## bench\_offline\_throughput (Real Engine)
-
-These benchmarks use `bench_offline_throughput.py`, which runs the full SGLang engine (scheduler, radix cache, continuous batching) to better reflect production serving performance.
-
-**Note:** Piecewise CUDA graphs are automatically disabled for this model due to the `flashinfer_trtllm` MoE backend, so baseline and Inductor configs run under the same conditions.
 
 ```bash
 python3 -m sglang.bench_offline_throughput \
@@ -138,8 +144,82 @@ Splitting q/k normalization into a separate static-shape graph (`QKNorm + RopeKV
 
 | Baseline | Inductor |
 |---|---|
-| ![Baseline nsys](qwen3-30B-A3B-[qvnorm-rope-kv]-base.png) | ![Inductor nsys](qwen3-30B-A3B-[qvnorm-rope-kv]-inductor.png) |
+| ![Baseline nsys](Qwen3-30B-A3B/qwen3-30B-A3B-[qvnorm-rope-kv]-base.png) | ![Inductor nsys](Qwen3-30B-A3B/qwen3-30B-A3B-[qvnorm-rope-kv]-inductor.png) |
 
 The baseline fires 3 kernels between the projection GEMM and `fmhaSm100fKernel`: one for fused q/k normalization, and two for rope + KV-cache store (split by an intermediate `contiguous` call). Inductor compiles this region into only 2 kernels, eliminating the extra launch.
 
 `QKNorm + RopeKV + RMSNorm` is the best config at B=128 (+2.1%) and B=512 (+1.6%), and competitive at B=32, making it the recommended config for high-throughput serving. `RopeKV + RMSNorm` is a simpler alternative that leads at B=256 (+0.7%) and is close behind at B=512 (+1.0%). `RotaryEmbedding + RMSNorm` remains the best at B=32 and a strong all-round choice.
+
+---
+
+# Qwen3.5-35B-A3B-FP8
+
+- **Model:** `Qwen/Qwen3.5-35B-A3B-FP8`
+- **Precision:** FP8
+- **TP:** 1
+
+## Notes
+
+- `inductor[qknorm-ropekv-gemmarmsnorm]` compiles q/k normalization, rotary embedding with KV-cache write, and GemmaRMSNorm (the layer-level normalization used by Qwen3.5) as separate Inductor graphs. This is the broadest compilation scope tested on this model.
+
+## bench\_offline\_throughput (Real Engine)
+
+```bash
+python3 -m sglang.bench_offline_throughput \
+  --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
+  --trust-remote-code \
+  --cuda-graph-bs <cg-bs> \
+  --tp-size 1 \
+  --sharegpt-output-len 8192 \
+  --num-prompts <N> \
+  --dataset-name sharegpt \
+  --result-filename "" \
+  [--enable-torch-compile --torch-compile-override-layers <layers> --torch-compile-scope local]
+```
+
+### 1 prompt, cuda-graph-bs 1
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 201 | 202 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 204 | 204 | +1.2% |
+
+### 32 prompts, cuda-graph-bs 32
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 3,298 | 3,429 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 3,263 | 3,392 | −1.1% |
+
+### 128 prompts, cuda-graph-bs 128
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 7,302 | 7,642 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 7,286 | 7,626 | −0.2% |
+
+### 256 prompts, cuda-graph-bs 256
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 10,007 | 10,391 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 10,012 | 10,396 | +0.0% |
+
+### 512 prompts, cuda-graph-bs 512
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 9,980 | 10,375 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 9,945 | 10,339 | −0.3% |
+
+### Summary
+
+| Scenario | Config | Total tok/s | Total tok/s vs Baseline |
+|----------|--------|-------------|------------------------|
+| 1 prompt, cg-bs 1 | QKNorm + RopeKV + RMSNorm | 204 | +1.2% |
+| 32 prompts, cg-bs 32 | QKNorm + RopeKV + RMSNorm | 3,392 | −1.1% |
+| 128 prompts, cg-bs 128 | QKNorm + RopeKV + RMSNorm | 7,626 | −0.2% |
+| 256 prompts, cg-bs 256 | QKNorm + RopeKV + RMSNorm | 10,396 | +0.0% |
+| 512 prompts, cg-bs 512 | QKNorm + RopeKV + RMSNorm | 10,339 | −0.3% |
+
+Results are flat across all batch sizes (within ±1.2%), meaning Inductor-compiled q/k normalization, rotary embedding, and KV-cache store match the performance of the hand-written custom kernels. This is a positive result: Inductor introduces no regression while replacing specialized CUDA/Triton kernels with compiler-generated code, validating that the compilation approach is viable for this model without a throughput penalty.
