@@ -84,8 +84,15 @@ mark_step_done "Host / runner detection"
 # Kill existing processes
 # ------------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bash "${SCRIPT_DIR}/../../killall_sglang.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+python3 "${REPO_ROOT}/python/sglang/cli/killall.py"
+KILLALL_EXIT=$?
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+
+if [ $KILLALL_EXIT -ne 0 ]; then
+    echo "ERROR: killall.py detected uncleanable GPU memory. Aborting CI."
+    exit 1
+fi
 
 mark_step_done "Kill existing processes"
 
@@ -339,6 +346,11 @@ else
 fi
 
 mark_step_done "Fix other dependencies"
+
+# Force reinstall nvidia-cutlass-dsl to ensure the .pth file exists.
+# The Docker image ships nvidia-cutlass-dsl-libs-base 4.3.5; upgrading to 4.4.2
+# can delete the .pth file without reliably recreating it (pip race condition).
+$PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --no-deps --force-reinstall $PIP_INSTALL_SUFFIX || true
 
 # ------------------------------------------------------------------------------
 # Prepare runner

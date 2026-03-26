@@ -359,7 +359,7 @@ class PipelineConfig:
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
         latents = sequence_model_parallel_all_gather(latents, dim=2)
         return latents
@@ -808,7 +808,7 @@ class ImagePipelineConfig(PipelineConfig):
         sharded_tensor = sharded_tensor[:, rank_in_sp_group, :, :]
         return sharded_tensor, True
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         # For image latents [B, S_local, D], gather along sequence dim=1
         latents = sequence_model_parallel_all_gather(latents, dim=1)
         return latents
@@ -862,11 +862,11 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
         sharded = latents[:, :, h0:h1, :].contiguous()
         return sharded, True
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         if get_sp_world_size() <= 1:
             return latents
         if latents.dim() != 4:
-            return super().gather_latents_for_sp(latents)
+            return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
         return sequence_model_parallel_all_gather(latents, dim=2)
 

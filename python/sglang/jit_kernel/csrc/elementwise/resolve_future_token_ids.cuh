@@ -34,7 +34,7 @@ struct ResolveFutureTokenIds {
     SymbolicSize N = {"num_tokens"};
     SymbolicSize M = {"map_size"};
     SymbolicDevice device_;
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLCUDA, kDLROCM>();
 
     TensorMatcher({N}).with_dtype<T>().with_device(device_).verify(input_ids);
 

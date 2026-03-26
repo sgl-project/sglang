@@ -32,8 +32,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
-register_amd_ci(est_time=526, suite="stage-b-test-large-2-gpu-amd")
+register_cuda_ci(est_time=200, suite="stage-b-test-2-gpu-large")
+register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
 class HiCacheStorageBaseMixin:
@@ -63,11 +63,13 @@ class HiCacheStorageBaseMixin:
     @classmethod
     def tearDownClass(cls):
         """Clean up test environment"""
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
         import shutil
 
-        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        if hasattr(cls, "temp_dir"):
+            shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
     @classmethod
     def _get_model_name(cls):
