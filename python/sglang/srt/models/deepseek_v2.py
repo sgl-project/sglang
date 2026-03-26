@@ -2707,6 +2707,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         elif get_parallel().moe_ep_size > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        ) and not (
+            _is_cuda and get_moe_runner_backend().is_flashinfer_trtllm()
         ):
             disable_reason = (
                 "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) "
