@@ -85,7 +85,9 @@ class QuarkConfig(QuantizationConfig):
             if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
-                return QuarkKVCacheMethod(self)
+                if self.kv_cache_config is not None:
+                    return QuarkKVCacheMethod(self)
+                return None
             return None
 
         if isinstance(layer, LinearBase):
@@ -94,7 +96,9 @@ class QuarkConfig(QuantizationConfig):
             return QuarkLinearMethod(self)
 
         if isinstance(layer, RadixAttention):
-            return QuarkKVCacheMethod(self)
+            if self.kv_cache_config is not None:
+                return QuarkKVCacheMethod(self)
+            return None
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
