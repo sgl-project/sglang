@@ -5,6 +5,7 @@
 from typing import Callable, Optional
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn import Parameter
 
@@ -34,6 +35,31 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
+
+
+# torch._scaled_mm requires both matrix dimensions to be divisible by 16.
+# Models with intermediate_size not divisible by 16 after tensor-parallel
+# sharding (e.g. 10944 / tp=8 = 1368) fail CUDA Graph capture without this.
+FP8_ALIGNMENT = 16
+
+
+def _pad_to_alignment(t: torch.Tensor, dim: int, alignment: int) -> torch.Tensor:
+    """Pad tensor along *dim* so its size is a multiple of *alignment*.
+
+    Returns the original tensor unchanged when already aligned.
+    """
+    size = t.shape[dim]
+    remainder = size % alignment
+    if remainder == 0:
+        return t
+    pad_size = alignment - remainder
+    # F.pad takes a flat tuple starting from the last dimension:
+    # (last_right, last_left, second_last_right, second_last_left, ...)
+    ndim = t.dim()
+    pad: list[int] = [0] * (2 * ndim)
+    pad_idx = 2 * (ndim - 1 - dim) + 1  # right-pad index for `dim`
+    pad[pad_idx] = pad_size
+    return F.pad(t, pad)
 
 
 strategy_to_parameter_type = {
@@ -156,8 +182,17 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 )
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
+
+            # Pad to FP8_ALIGNMENT so torch._scaled_mm succeeds in CUDA Graph.
+            # Per-tensor scale is a scalar — no scale padding needed.
+            orig_out = weight.shape[0]
+            weight = _pad_to_alignment(weight, dim=0, alignment=FP8_ALIGNMENT)
+            weight = _pad_to_alignment(weight, dim=1, alignment=FP8_ALIGNMENT)
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            layer.register_buffer(
+                "_orig_output_dim", torch.tensor(orig_out), persistent=False
+            )
 
         elif self.strategy == QuantizationStrategy.CHANNEL:
             weight = layer.weight
@@ -175,16 +210,31 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             else:
                 weight_scale = layer.weight_scale.data
 
-            if _use_aiter:
-                # keep the weight as (N, K)
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
-                )
-            else:
-                layer.weight = Parameter(weight.t(), requires_grad=False)
+            orig_out = weight.shape[0]
 
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            if _use_aiter:
+                # aiter kernel handles alignment internally; keep weight as (N, K).
+                layer.weight = Parameter(
+                    shuffle_weight(weight, (FP8_ALIGNMENT, FP8_ALIGNMENT)),
+                    requires_grad=False,
+                )
+                # required by torch.compile to be torch.nn.Parameter
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            else:
+                # Pad both dims so torch._scaled_mm succeeds in CUDA Graph.
+                weight = _pad_to_alignment(weight, dim=0, alignment=FP8_ALIGNMENT)
+                weight = _pad_to_alignment(weight, dim=1, alignment=FP8_ALIGNMENT)
+                # Pad per-channel scale to match new output dim.
+                weight_scale = _pad_to_alignment(
+                    weight_scale, dim=0, alignment=FP8_ALIGNMENT
+                )
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+                # required by torch.compile to be torch.nn.Parameter
+                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                # Slice output back to original N after GEMM (padded rows are noise).
+                layer.register_buffer(
+                    "_orig_output_dim", torch.tensor(orig_out), persistent=False
+                )
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
@@ -195,8 +245,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=weight, weight_scale=weight_scale
                 )
-            layer.weight = Parameter(weight.data, requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
+            # Block kernels do not use torch._scaled_mm, so no alignment padding.
+            layer.weight = Parameter(weight.detach(), requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale.detach(), requires_grad=False)
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
@@ -214,6 +265,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.weight_block_size is not None:
+            # Block kernels handle alignment internally; no padding needed.
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
@@ -224,6 +276,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             )
 
         if _use_aiter and self.strategy == QuantizationStrategy.CHANNEL:
+            # aiter keeps weight as (N, K) and handles alignment internally;
+            # no input padding or output slicing needed.
             return apply_fp8_ptpc_linear(
                 input=x,
                 weight=layer.weight,
@@ -233,13 +287,28 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 use_per_token_if_dynamic=True,
                 compressed_tensor_quant=True,
             )
-        else:
-            return apply_fp8_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                input_scale=layer.input_scale,
-                bias=bias,
-                use_per_token_if_dynamic=True,
-                compressed_tensor_quant=True,
+
+        # weight is stored transposed as (K_padded, N_padded).
+        # Pad the input K-dim to match so torch._scaled_mm aligns correctly.
+        weight_k_dim = layer.weight.shape[0]
+        if x.shape[-1] < weight_k_dim:
+            x = F.pad(x, (0, weight_k_dim - x.shape[-1]))
+        elif x.shape[-1] > weight_k_dim:
+            raise RuntimeError(
+                f"Input last dim {x.shape[-1]} > padded weight K dim {weight_k_dim}."
+                " This should never happen."
             )
+
+        output = apply_fp8_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            input_scale=layer.input_scale,
+            bias=bias,
+            use_per_token_if_dynamic=True,
+            compressed_tensor_quant=True,
+        )
+
+        # Trim any output columns added by N-dim padding.
+        orig_n = layer._orig_output_dim.item()
+        return output[..., :orig_n]
