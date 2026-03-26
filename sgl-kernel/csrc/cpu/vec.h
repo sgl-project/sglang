@@ -222,9 +222,12 @@ inline void quantize_tensor_fp8(
     int64_t strideM_Aq,
     int64_t strideM_A,
     float eps = 1e-12) {
-  std::atomic<float> amax{0.0f};
+  int num_threads = at::get_num_threads();
+  std::vector<float> amax_vec(num_threads);
+  float* amax = amax_vec.data();
   at::parallel_for(0, B * M, 0, [&](int64_t begin, int64_t end) {
     int64_t b{0}, m{0};
+    int tid = at::get_thread_num();
     data_index_init(begin, b, B, m, M);
     float local_amax = 0.0f;
     for (int64_t idx = begin; idx < end; ++idx) {
@@ -234,11 +237,13 @@ inline void quantize_tensor_fp8(
       }
       data_index_step(b, B, m, M);
     }
-    float current_max = amax.load();
-    while (local_amax > current_max && !amax.compare_exchange_weak(current_max, local_amax)) {
-    }
+    amax[tid] = local_amax;
   });
-  const float scale = std::max(amax.load() / FP8_MAX, eps);
+  float global_max = 0.0f;
+  for (int i = 0; i < num_threads; ++i) {
+    global_max = std::max(global_max, amax[i]);
+  }
+  const float scale = std::max(global_max / FP8_MAX, eps);
   const float inv_scale = 1 / scale;
   at::parallel_for(0, B * M, 0, [&](int64_t begin, int64_t end) {
     int64_t b{0}, m{0};
@@ -314,19 +319,21 @@ inline void quantize_tensor_fp8(
   constexpr int64_t kVecSize = 32;
   const __m512 vabs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7FFFFFFF));
 
-  // Phase 1: Find global max_abs with vectorization and proper thread-local reduction
-  std::atomic<float> global_max_abs{0.0f};
-
+  // Phase 1: Find global max_abs
+  int num_threads = at::get_num_threads();
+  std::vector<float> amax_vec(num_threads);
+  float* amax = amax_vec.data();
   at::parallel_for(0, B * M, 0, [&](int64_t begin, int64_t end) {
     int64_t b{0}, m{0};
     data_index_init(begin, b, B, m, M);
-    float local_max = 0.0f;
+    float scalar_max = 0.0f;
+    int tid = at::get_thread_num();
 
+    __m512 vmax0 = _mm512_setzero_ps();
+    __m512 vmax1 = _mm512_setzero_ps();
     for (int64_t idx = begin; idx < end; ++idx) {
       const at::BFloat16* __restrict__ input_ptr = A + b * strideB_A + m * strideM_A;
 
-      __m512 vmax0 = _mm512_setzero_ps();
-      __m512 vmax1 = _mm512_setzero_ps();
       int64_t k = 0;
 
       for (; k <= K - kVecSize; k += kVecSize) {
@@ -341,27 +348,31 @@ inline void quantize_tensor_fp8(
         vmax1 = _mm512_max_ps(vmax1, f1);
       }
 
-      local_max = std::max(local_max, _mm512_reduce_max_ps(_mm512_max_ps(vmax0, vmax1)));
-
       // Remainder
       for (; k < K; ++k) {
         float val = static_cast<float>(input_ptr[k]);
-        local_max = std::max(local_max, std::abs(val));
+        scalar_max = std::max(scalar_max, std::abs(val));
       }
 
       // move to the next index
       data_index_step(b, B, m, M);
     }
+    float vec_max = _mm512_reduce_max_ps(_mm512_max_ps(vmax0, vmax1));
 
-    // Atomic max update
-    float current = global_max_abs.load(std::memory_order_relaxed);
-    while (current < local_max && !global_max_abs.compare_exchange_weak(
-                                      current, local_max, std::memory_order_relaxed, std::memory_order_relaxed)) {
-    }
+    amax[tid] = std::max(vec_max, scalar_max);
   });
 
-  const float amax = global_max_abs.load();
-  const float scale = std::max(amax / FP8_MAX, eps);
+  int i = 0;
+  __m512 vmax = _mm512_setzero_ps();
+  for (; i + 16 <= num_threads; i += 16) {
+    __m512 v = _mm512_loadu_ps(amax + i);
+    vmax = _mm512_max_ps(vmax, v);
+  }
+  float global_max = _mm512_reduce_max_ps(vmax);
+  for (; i < num_threads; ++i) {
+    global_max = std::max(global_max, amax[i]);
+  }
+  const float scale = std::max(global_max / FP8_MAX, eps);
   const float inv_scale = 1.0f / scale;
 
   // Phase 2: Quantize
