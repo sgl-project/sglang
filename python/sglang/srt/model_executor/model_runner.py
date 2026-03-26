@@ -165,6 +165,7 @@ from sglang.srt.utils import (
     empty_context,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_cpu_ids_by_node,
     init_custom_process_group,
     is_hip,
@@ -201,6 +202,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -955,7 +957,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
                 )
 
-            if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
+            if (
+                moe_intermediate_size // moe_tp_size
+            ) % weight_block_size_n != 0 and not _use_aiter:
                 raise ValueError(
                     f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
                     f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
