@@ -7,6 +7,7 @@ import pickle
 from collections import deque
 from typing import Any, List
 
+import torch
 import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -363,6 +364,15 @@ class Scheduler:
 
             try:
                 processed_req = reqs[0]
+
+                # Start CUDA profiler for non-warmup requests when using
+                # nsys --capture-range=cudaProfilerApi, so warmup is excluded
+                is_non_warmup_req = (
+                    isinstance(processed_req, Req) and not processed_req.is_warmup
+                )
+                if is_non_warmup_req and torch.cuda.is_available():
+                    torch.cuda.cudart().cudaProfilerStart()
+
                 handler = self.request_handlers.get(type(processed_req))
                 if handler:
                     output_batch = handler(reqs)
@@ -370,6 +380,10 @@ class Scheduler:
                     output_batch = OutputBatch(
                         error=f"Unknown request type: {type(processed_req)}"
                     )
+
+                if is_non_warmup_req and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",
