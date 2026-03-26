@@ -769,7 +769,7 @@ class ServerArgs:
                 "Quantization method for online quantization. "
                 "Options: 'fp8', 'mxfp4'. "
                 "Apply online weight and activation quantization to unquantized models. "
-                "Note: MXFP4 requires ROCm and MI300X (gfx95x)."
+                "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
             ),
         )
 
