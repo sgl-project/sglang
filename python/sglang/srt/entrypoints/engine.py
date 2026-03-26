@@ -95,6 +95,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
+from sglang.srt.utils.network import wait_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
 
@@ -1075,6 +1076,7 @@ def _launch_subprocesses(
         and server_args.node_rank == 0
     ):
         bootstrap_port = server_args.engine_info_bootstrap_port
+        wait_port_available(bootstrap_port, "engine_info_bootstrap_port")
         _engine_info_bootstrap_server = EngineInfoBootstrapServer(
             host=server_args.host, port=bootstrap_port
         )
