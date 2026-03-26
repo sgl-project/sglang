@@ -379,6 +379,22 @@ python/sglang/jit_kernel/
 
 ---
 
+## Eval Accuracy Mixins
+
+**Design philosophy**: Most test files don't care about eval logic — they only need a "does this feature break model output quality?" sanity check. The mixin pattern separates **what to test** (threshold) from **how to test** (run_eval, assertions, CI summary). Test classes declare thresholds as class attributes; the mixin provides the `test_*` method. Override when you need extra assertions (e.g. EAGLE accept length).
+
+Available mixins in `python/sglang/test/kits/eval_accuracy_kit.py`: `MMLUMixin`, `HumanEvalMixin`, `MGSMEnMixin`, `GSM8KMixin`. Can be combined freely. Read the source for attrs and defaults.
+
+```python
+class TestMyFeature(CustomTestCase, MMLUMixin):
+    mmlu_score_threshold = 0.65
+    mmlu_num_examples = 64
+    mmlu_num_threads = 32
+    # test_mmlu is inherited — no code needed
+```
+
+---
+
 ## Key Utilities
 
 ```python
