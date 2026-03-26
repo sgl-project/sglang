@@ -1624,11 +1624,6 @@ class ShmPointerMMData:
     """
     Wraps a tensor to be sent via a shared memory handle.
     This acts as a "pointer" to the tensor data across process boundaries.
-
-    Designed to be pickle-serialized multiple times (e.g., ZMQ send then
-    dist.broadcast) without re-creating the shared memory segment.
-    Only the shm name/shape/dtype metadata is serialized; actual tensor
-    data lives in POSIX shared memory.
     """
 
     def __init__(self, tensor: torch.Tensor):
