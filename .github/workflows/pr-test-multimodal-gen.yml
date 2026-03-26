@@ -62,6 +62,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
         with:
           github-token: ${{ github.token }}
@@ -116,6 +119,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
+
       - uses: ./.github/actions/check-maintenance
         with:
           github-token: ${{ github.token }}
@@ -166,6 +172,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+        id: stage-health
 
       - uses: ./.github/actions/check-maintenance
         with:
