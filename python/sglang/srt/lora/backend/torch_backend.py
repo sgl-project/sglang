@@ -222,6 +222,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         )
 
         bs = forward_batch.batch_size
+        num_segments = len(weight_indices_tensor)
 
         if use_cuda_graph:
             assert (
@@ -229,13 +230,13 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             ), "CUDA Graph batch info is not initialized."
             batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
-            batch_info.num_segments = forward_batch.batch_size
+            batch_info.num_segments = num_segments
         else:
             max_len = max(seg_lens_cpu)
 
             batch_info = TorchNativeLoRABatchInfo(
                 bs=forward_batch.batch_size,
-                num_segments=forward_batch.batch_size,
+                num_segments=num_segments,
                 max_len=max_len,
                 use_cuda_graph=False,
                 seg_lens=torch.empty((bs,), dtype=torch.int32, device=self.device),
@@ -261,7 +262,9 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         batch_info.scalings[: self.max_loras_per_batch].copy_(
             scalings_tensor, non_blocking=True
         )
-        batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
+        batch_info.weight_indices[:num_segments].copy_(
+            weight_indices_tensor, non_blocking=True
+        )
         batch_info.seg_indptr[: len(seg_indptr_cpu)].copy_(
             seg_indptr_cpu, non_blocking=True
         )
