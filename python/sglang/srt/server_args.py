@@ -765,6 +765,9 @@ class ServerArgs:
 
         # Set kernel backends.
         self._handle_sampling_backend()
+        # Must run before _handle_attention_backend_compatibility so the
+        # deterministic backend is set before auto-detection fills it in.
+        self._handle_deterministic_inference()
         self._handle_attention_backend_compatibility()
         self._handle_mamba_backend()
         self._handle_kv4_compatibility()
@@ -811,9 +814,6 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
-
-        # Handle deterministic inference.
-        self._handle_deterministic_inference()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
