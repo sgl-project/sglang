@@ -737,16 +737,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 return self.forward_with_npu_graph(x, grid_thw)
             return self.forward_with_cuda_graph(x, grid_thw)
 
-        # --- VLM ViT Sub-stage Timing ---
-        import time as _time
-        def _sync(): torch.cuda.synchronize()
-        _sync()
-
-        _t0 = _time.perf_counter()
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
-        _sync()
-        _t1 = _time.perf_counter()
 
         if isinstance(grid_thw, list):
             grid_thw_list = grid_thw
@@ -757,11 +749,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
-        _sync()
-        _t2 = _time.perf_counter()
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
-        _t3 = _time.perf_counter()
 
         # ---- build token indptr (B+1,) ----
         token_cu_seqlens = np.repeat(
@@ -822,13 +811,10 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x = x.unsqueeze(1)
 
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
-        _t4 = _time.perf_counter()
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
 
-        _sync()
-        _t5 = _time.perf_counter()
         for layer_num, blk in enumerate(self.blocks):
             x = blk(
                 x,
@@ -845,30 +831,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 )
                 deepstack_feature_lists.append(deepstack_feature)
                 num_deepstack_captured += 1
-        _sync()
-        _t6 = _time.perf_counter()
-
         x = self.merger(x)
-        _sync()
-        _t7 = _time.perf_counter()
 
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
-
-        _num_imgs = len(grid_thw_list)
-        _num_tokens = x.shape[0] if x.dim() >= 1 else 0
-        from sglang.srt.vlm_stage_timer import _log
-        _log(
-            f"[VLM_VIT_SUBSTAGE] imgs={_num_imgs} tokens={_num_tokens}"
-            f" | patch_embed={((_t1-_t0)*1000):.2f}ms"
-            f" | pos_embed={((_t2-_t1)*1000):.2f}ms"
-            f" | rot_pos={((_t3-_t2)*1000):.2f}ms"
-            f" | cu_seqlens={((_t4-_t3)*1000):.2f}ms"
-            f" | blocks={((_t6-_t5)*1000):.2f}ms"
-            f" | merger={((_t7-_t6)*1000):.2f}ms"
-            f" | total={((_t7-_t0)*1000):.2f}ms"
-        )
 
         return hidden_states
 

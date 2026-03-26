@@ -581,11 +581,7 @@ def _get_chunked_prefill_embedding_bundled(
 
     if uncached_indices:
         sub_item = _slice_bundled_item_for_images(item, uncached_indices)
-
-        from sglang.srt.vlm_stage_timer import record_stage
-
-        with record_stage("stage3_vit_encoding", req_id="", cuda_sync=True):
-            new_embedding = data_embedding_func([sub_item])
+        new_embedding = data_embedding_func([sub_item])
 
         if isinstance(new_embedding, EVSEmbeddingResult):
             raise NotImplementedError("EVS not supported with bundled per-image encoding")
@@ -632,10 +628,7 @@ def _get_chunked_prefill_embedding_all_at_once(
     embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
-        from sglang.srt.vlm_stage_timer import record_stage
-
-        with record_stage("stage3_vit_encoding", req_id="", cuda_sync=True):
-            embedding = data_embedding_func(embedding_items_per_req)
+        embedding = data_embedding_func(embedding_items_per_req)
         embedding_per_req = (
             EmbeddingResult(embedding=embedding)
             if isinstance(embedding, torch.Tensor)
@@ -954,20 +947,18 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
-    from sglang.srt.vlm_stage_timer import record_stage
-    with record_stage("stage4_embedding_merge", req_id="", cuda_sync=True):
-        for i, modality, embedding, mask in zip(
-            range(len(embeddings)), modalities, embeddings, masks
-        ):
-            if embedding is None or mask is None:
-                continue
-            # in-place update
-            indices = torch.where(mask.squeeze(dim=-1))[0]
-            input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
-            if use_deepstack.get(modality, None):
-                input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                    input_embeds.device, input_embeds.dtype
-                )
+    for i, modality, embedding, mask in zip(
+        range(len(embeddings)), modalities, embeddings, masks
+    ):
+        if embedding is None or mask is None:
+            continue
+        # in-place update
+        indices = torch.where(mask.squeeze(dim=-1))[0]
+        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
+        if use_deepstack.get(modality, None):
+            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
+                input_embeds.device, input_embeds.dtype
+            )
 
     return input_embeds, other_info
 
@@ -1192,24 +1183,12 @@ def general_mm_embed_routine(
     else:
         input_embeds = None
 
-    from sglang.srt.vlm_stage_timer import _cuda_sync, _log
-    _do_time = not forward_batch.forward_mode.is_decode()
-    if _do_time:
-        _cuda_sync()
-        import time as _time
-        _t0 = _time.perf_counter()
-
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=input_embeds,
         **kwargs,
     )
-
-    if _do_time:
-        _cuda_sync()
-        _t1 = _time.perf_counter()
-        _log(f"[VLM_STAGE_TIMER] stage5_llm_prefill | req= | wall={(_t1 - _t0) * 1000.0:.3f} ms")
 
     return hidden_states
 

@@ -1396,8 +1396,6 @@ class Scheduler(
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
-                    from sglang.srt.vlm_stage_timer import record_stage_timestamp
-                    record_stage_timestamp("stage2a_recv", req_id=getattr(recv_req, "rid", ""))
                     recv_reqs.append(recv_req)
 
                 while True:
@@ -1434,21 +1432,12 @@ class Scheduler(
                 control_reqs = None
 
             if self.attn_tp_size != 1:
-                import time as _time
-                _t0 = _time.perf_counter()
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_tp_group.rank,
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
-                _t1 = _time.perf_counter()
-                if work_reqs and any(
-                    getattr(r, "mm_inputs", None) for r in work_reqs
-                    if not is_health_check_generate_req(r)
-                ):
-                    from sglang.srt.vlm_stage_timer import _log
-                    _log(f"[VLM_STAGE_TIMER] stage2b_broadcast_reqs | req=tp_rank={self.tp_rank} | wall={(_t1 - _t0) * 1000.0:.3f} ms")
 
             if self.attn_cp_size != 1:
                 work_reqs = broadcast_pyobj(
@@ -1467,21 +1456,12 @@ class Scheduler(
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
-            import time as _time
-            _t0 = _time.perf_counter()
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.tp_group.rank,
                 self.tp_cpu_group,
                 src=self.tp_group.ranks[0],
             )
-            _t1 = _time.perf_counter()
-            if recv_reqs and any(
-                getattr(r, "mm_inputs", None) for r in recv_reqs
-                if not is_health_check_generate_req(r)
-            ):
-                from sglang.srt.vlm_stage_timer import _log
-                _log(f"[VLM_STAGE_TIMER] stage2b_broadcast_reqs | req=tp_rank={self.tp_rank} | wall={(_t1 - _t0) * 1000.0:.3f} ms")
 
         # Process MM requests under EPD-disaggregation mode
         if (
@@ -1610,31 +1590,28 @@ class Scheduler(
         # Since the Scheduler is single-threaded, any large CPU cost will impact
         # handling of other messages. For example, CPU hits 99.9% can significantly
         # increase the CUDA kernel launch time.
-        from sglang.srt.vlm_stage_timer import record_stage
         if self.dp_tp_group.rank_in_group == 0:
             # Only the entry rank materializes once from dict.
             image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
             # Broadcast to other TP ranks (use src=0 within the group).
             if group_world_size > 1:
-                with record_stage("stage2b_broadcast", req_id=f"rank0_tp{group_world_size}"):
-                    obj_list = [image_inputs]
-                    torch.distributed.broadcast_object_list(
-                        obj_list,
-                        src=self.dp_tp_group.first_rank,
-                        group=self.dp_tp_cpu_group,
-                    )
-                    image_inputs = obj_list[0]
+                obj_list = [image_inputs]
+                torch.distributed.broadcast_object_list(
+                    obj_list,
+                    src=self.dp_tp_group.first_rank,
+                    group=self.dp_tp_cpu_group,
+                )
+                image_inputs = obj_list[0]
         else:
             # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
             if group_world_size > 1:
-                with record_stage("stage2b_broadcast", req_id=f"rank{self.dp_tp_group.rank_in_group}_tp{group_world_size}"):
-                    obj_list = [None]
-                    torch.distributed.broadcast_object_list(
-                        obj_list,
-                        src=self.dp_tp_group.first_rank,
-                        group=self.dp_tp_cpu_group,
-                    )
-                    image_inputs = obj_list[0]
+                obj_list = [None]
+                torch.distributed.broadcast_object_list(
+                    obj_list,
+                    src=self.dp_tp_group.first_rank,
+                    group=self.dp_tp_cpu_group,
+                )
+                image_inputs = obj_list[0]
             else:
                 image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
 

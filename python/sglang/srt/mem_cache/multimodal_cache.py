@@ -112,10 +112,7 @@ class MultiModalStaticCache(MultimodalCache):
         data_size = _get_tensor_size(embedding.embedding)
         while self.current_size + data_size > self.max_size:
             if not self.mm_cache:
-                # Auto-expand cache to fit this embedding (e.g., large multi-image
-                # requests during chunked prefill need the full ViT output cached)
-                self.max_size = data_size
-                break
+                return False
             lru_hash, lru_embedding = self.mm_cache.popitem(last=False)
             self.current_size -= _get_tensor_size(lru_embedding.embedding)
 
