@@ -31,6 +31,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
@@ -398,6 +399,7 @@ TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     fps=4,
 )
 
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES_A: list[DiffusionTestCase] = [
@@ -547,6 +549,17 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             output_size="1024x1024",
             extras={"enable_upscaling": True, "upscaling_scale": 4},
         ),
+    ),
+    DiffusionTestCase(
+        "mova_360p_1gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=1,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
     ),
 ]
 
@@ -785,6 +798,18 @@ if not current_platform.is_hip():
         )
     )
 
+# TODO: enable on 4090/5090/b200
+ONE_GPU_CASES_C = [
+    DiffusionTestCase(
+        "flux_2_nvfp4_t2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev-NVFP4",
+            modality="image",
+        ),
+        T2I_sampling_params,
+    )
+]
+
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
@@ -875,6 +900,44 @@ TWO_GPU_CASES_A = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "mova_360p_tp2",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=2,
+            tp_size=2,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
+    ),
+    DiffusionTestCase(
+        "mova_360p_ring1_uly2",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=2,
+            ring_degree=1,
+            ulysses_degree=2,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
+    ),
+    DiffusionTestCase(
+        "mova_360p_ring2_uly1",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=2,
+            ring_degree=2,
+            ulysses_degree=1,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
+    ),
 ]
 
 TWO_GPU_CASES_B = [
@@ -932,6 +995,20 @@ TWO_GPU_CASES_B = [
             ulysses_degree=2,
         ),
         T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i_2_gpus_non_square",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            modality="image",
+            num_gpus=2,
+            ulysses_degree=2,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2I_sampling_params.prompt,
+            output_size="1280x720",
+        ),
+        run_perf_check=False,
     ),
     DiffusionTestCase(
         "flux_image_t2i_2_gpus",

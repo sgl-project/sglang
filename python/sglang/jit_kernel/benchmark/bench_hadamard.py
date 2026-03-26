@@ -14,6 +14,9 @@ from sglang.jit_kernel.benchmark.utils import (
     run_benchmark,
 )
 from sglang.jit_kernel.hadamard import hadamard_transform
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 # AOT kernel: might not be available in all environments.
 # This is used for performance baseline comparison.
