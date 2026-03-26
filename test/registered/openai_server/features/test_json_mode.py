@@ -2,6 +2,7 @@ import json
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -18,6 +19,7 @@ register_cuda_ci(est_time=118, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class JSONModeMixin:
     """Mixin class containing JSON mode test methods"""
 
@@ -90,6 +92,7 @@ class JSONModeMixin:
         self.assertIsInstance(js_obj, dict)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class ServerWithGrammarBackend(CustomTestCase):
     """Base class for tests requiring a grammar backend server"""
 
@@ -123,14 +126,17 @@ class ServerWithGrammarBackend(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestJSONModeXGrammar(ServerWithGrammarBackend, JSONModeMixin):
     backend = "xgrammar"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestJSONModeOutlines(ServerWithGrammarBackend, JSONModeMixin):
     backend = "outlines"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestJSONModeLLGuidance(ServerWithGrammarBackend, JSONModeMixin):
     backend = "llguidance"
 
