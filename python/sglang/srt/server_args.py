@@ -707,7 +707,7 @@ class ServerArgs:
         "transfer_engine", "nccl", "modelexpress"
     ] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
-    engine_info_bootstrap_port: int = 6789
+    engine_info_bootstrap_port: Optional[int] = None
     modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
@@ -932,6 +932,10 @@ class ServerArgs:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
             self.mm_process_config = {}
+        if self.engine_info_bootstrap_port is None:
+            self.engine_info_bootstrap_port = (
+                self.port + ENGINE_INFO_BOOTSTRAP_PORT_DELTA
+            )
 
         # Handle ModelScope model downloads
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
@@ -5659,7 +5663,7 @@ class ServerArgs:
             "--engine-info-bootstrap-port",
             type=int,
             default=ServerArgs.engine_info_bootstrap_port,
-            help="Port for the engine info bootstrap server. Default is 6789.",
+            help="Port for the engine info bootstrap server. Default is None, which auto-derives from --port + 345.",
         )
         parser.add_argument(
             "--modelexpress-config",
@@ -6314,6 +6318,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 
 ZMQ_TCP_PORT_DELTA = 233
+ENGINE_INFO_BOOTSTRAP_PORT_DELTA = 345
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
 
 
