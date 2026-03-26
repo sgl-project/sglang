@@ -170,56 +170,100 @@ python3 -m sglang.bench_offline_throughput \
   --trust-remote-code \
   --cuda-graph-bs <cg-bs> \
   --tp-size 1 \
-  --sharegpt-output-len 8192 \
+  --sharegpt-output-len <osl> \
   --num-prompts <N> \
   --dataset-name sharegpt \
   --result-filename "" \
   [--enable-torch-compile --torch-compile-override-layers <layers> --torch-compile-scope local]
 ```
 
-### 1 prompt, cuda-graph-bs 1
+### OSL 8192
+
+#### 1 prompt, cuda-graph-bs 1
 
 | Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|-------------|------------------------|
 | Baseline | 201 | 202 | — |
 | Inductor — QKNorm + RopeKV + RMSNorm | 204 | 204 | +1.2% |
 
-### 32 prompts, cuda-graph-bs 32
+#### 32 prompts, cuda-graph-bs 32
 
 | Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|-------------|------------------------|
 | Baseline | 3,298 | 3,429 | — |
 | Inductor — QKNorm + RopeKV + RMSNorm | 3,263 | 3,392 | −1.1% |
 
-### 128 prompts, cuda-graph-bs 128
+#### 128 prompts, cuda-graph-bs 128
 
 | Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|-------------|------------------------|
 | Baseline | 7,302 | 7,642 | — |
 | Inductor — QKNorm + RopeKV + RMSNorm | 7,286 | 7,626 | −0.2% |
 
-### 256 prompts, cuda-graph-bs 256
+#### 256 prompts, cuda-graph-bs 256
 
 | Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|-------------|------------------------|
 | Baseline | 10,007 | 10,391 | — |
 | Inductor — QKNorm + RopeKV + RMSNorm | 10,012 | 10,396 | +0.0% |
 
-### 512 prompts, cuda-graph-bs 512
+#### 512 prompts, cuda-graph-bs 512
 
 | Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|-------------|------------------------|
 | Baseline | 9,980 | 10,375 | — |
 | Inductor — QKNorm + RopeKV + RMSNorm | 9,945 | 10,339 | −0.3% |
 
+### OSL 1024
+
+#### 1 prompt, cuda-graph-bs 1
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 226 | 229 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 229 | 232 | +1.3% |
+
+#### 32 prompts, cuda-graph-bs 32
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 3,336 | 4,395 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 3,354 | 4,418 | +0.5% |
+
+#### 128 prompts, cuda-graph-bs 128
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 8,032 | 11,028 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 8,097 | 11,118 | +0.8% |
+
+#### 256 prompts, cuda-graph-bs 256
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 11,476 | 14,997 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 11,420 | 14,924 | −0.5% |
+
+#### 512 prompts, cuda-graph-bs 512
+
+| Config | Output tok/s | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|-------------|------------------------|
+| Baseline | 11,366 | 14,970 | — |
+| Inductor — QKNorm + RopeKV + RMSNorm | 11,308 | 14,894 | −0.5% |
+
 ### Summary
 
-| Scenario | Config | Total tok/s | Total tok/s vs Baseline |
-|----------|--------|-------------|------------------------|
-| 1 prompt, cg-bs 1 | QKNorm + RopeKV + RMSNorm | 204 | +1.2% |
-| 32 prompts, cg-bs 32 | QKNorm + RopeKV + RMSNorm | 3,392 | −1.1% |
-| 128 prompts, cg-bs 128 | QKNorm + RopeKV + RMSNorm | 7,626 | −0.2% |
-| 256 prompts, cg-bs 256 | QKNorm + RopeKV + RMSNorm | 10,396 | +0.0% |
-| 512 prompts, cg-bs 512 | QKNorm + RopeKV + RMSNorm | 10,339 | −0.3% |
+| OSL | Scenario | Total tok/s | Total tok/s vs Baseline |
+|-----|----------|-------------|------------------------|
+| 8192 | 1 prompt, cg-bs 1 | 204 | +1.2% |
+| 8192 | 32 prompts, cg-bs 32 | 3,392 | −1.1% |
+| 8192 | 128 prompts, cg-bs 128 | 7,626 | −0.2% |
+| 8192 | 256 prompts, cg-bs 256 | 10,396 | +0.0% |
+| 8192 | 512 prompts, cg-bs 512 | 10,339 | −0.3% |
+| 1024 | 1 prompt, cg-bs 1 | 232 | +1.3% |
+| 1024 | 32 prompts, cg-bs 32 | 4,418 | +0.5% |
+| 1024 | 128 prompts, cg-bs 128 | 11,118 | +0.8% |
+| 1024 | 256 prompts, cg-bs 256 | 14,924 | −0.5% |
+| 1024 | 512 prompts, cg-bs 512 | 14,894 | −0.5% |
 
-Results are flat across all batch sizes (within ±1.2%), meaning Inductor-compiled q/k normalization, rotary embedding, and KV-cache store match the performance of the hand-written custom kernels. This is a positive result: Inductor introduces no regression while replacing specialized CUDA/Triton kernels with compiler-generated code, validating that the compilation approach is viable for this model without a throughput penalty.
+Results are flat across all batch sizes and output sequence lengths (within ±1.3%), meaning Inductor-compiled q/k normalization, rotary embedding, and KV-cache store match the performance of the hand-written custom kernels. The result holds for both decode-heavy workloads (OSL=8192) and shorter generation (OSL=1024), confirming that output sequence length does not change the picture. This is a positive result: Inductor introduces no regression while replacing specialized CUDA/Triton kernels with compiler-generated code, validating that the compilation approach is viable for this model without a throughput penalty.
