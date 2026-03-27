@@ -508,6 +508,7 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: Optional[str] = None
     speculative_ngram_external_sam_budget: int = 0
+    speculative_ngram_external_corpus_max_tokens: int = 1000000
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -3060,6 +3061,11 @@ class ServerArgs:
                         "--speculative-ngram-external-sam-budget must be positive when "
                         "--speculative-ngram-external-corpus-path is set."
                     )
+                if self.speculative_ngram_external_corpus_max_tokens <= 0:
+                    raise ValueError(
+                        "--speculative-ngram-external-corpus-max-tokens must be positive when "
+                        "--speculative-ngram-external-corpus-path is set."
+                    )
                 if (
                     self.speculative_ngram_external_sam_budget
                     > self.speculative_num_draft_tokens - 1
@@ -4797,6 +4803,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_external_sam_budget,
             help="Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-corpus-max-tokens",
+            type=int,
+            default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
+            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens.",
         )
 
         # Multi-layer Eagle speculative decoding

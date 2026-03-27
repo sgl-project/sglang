@@ -44,7 +44,13 @@ class Ngram {
 
   void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
 
-  void loadExternalCorpus(const std::vector<std::vector<int32_t>>& documents);
+  void startExternalCorpusLoad();
+
+  void appendExternalCorpusDocument(const std::vector<int32_t>& document);
+
+  void finishExternalCorpusLoad();
+
+  void clearExternalCorpus();
 
   Result batchMatch(
       const std::vector<std::string>& req_ids,

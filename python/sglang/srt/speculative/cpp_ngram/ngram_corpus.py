@@ -2,6 +2,7 @@
 
 import logging
 import os
+from collections.abc import Iterable, Sequence
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -33,7 +34,8 @@ class NgramCorpus:
         match_type="BFS",
         capacity=1000000,
         external_sam_budget=0,
-        external_corpus_documents: Optional[List[List[int]]] = None,
+        external_corpus_max_tokens=1000000,
+        external_corpus_documents: Optional[Iterable[Sequence[int]]] = None,
     ):
         param = ngram_corpus_cpp.Param()
         param.max_trie_depth = max_trie_depth
@@ -41,10 +43,13 @@ class NgramCorpus:
         param.max_bfs_breadth = max_bfs_breadth
         param.draft_token_num = draft_token_num
         param.external_sam_budget = external_sam_budget
+        param.external_corpus_max_tokens = external_corpus_max_tokens
         param.match_type = match_type
         self._ngram = ngram_corpus_cpp.Ngram(capacity, param)
-        if external_corpus_documents:
-            self._ngram.loadExternalCorpus(external_corpus_documents)
+        self.external_corpus_document_count = 0
+        self.external_corpus_token_count = 0
+        if external_corpus_documents is not None:
+            self.load_external_corpus(external_corpus_documents)
 
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
@@ -54,6 +59,16 @@ class NgramCorpus:
 
     def synchronize(self):
         self._ngram.synchronize()
+
+    def load_external_corpus(
+        self, external_corpus_documents: Iterable[Sequence[int]]
+    ) -> Tuple[int, int]:
+        loaded_document_count, loaded_token_count = self._ngram.loadExternalCorpus(
+            external_corpus_documents
+        )
+        self.external_corpus_document_count = loaded_document_count
+        self.external_corpus_token_count = loaded_token_count
+        return loaded_document_count, loaded_token_count
 
     def reset(self):
         self._ngram.reset()

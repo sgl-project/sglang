@@ -30,7 +30,11 @@ class SuffixAutomaton {
  public:
   static constexpr int32_t kSeparatorToken = std::numeric_limits<int32_t>::min();
 
-  explicit SuffixAutomaton(const std::vector<std::vector<int32_t>>& documents);
+  SuffixAutomaton(size_t max_corpus_tokens);
+
+  void appendDocument(const std::vector<int32_t>& document);
+
+  void finalize();
 
   bool empty() const {
     return !loaded_;
@@ -43,12 +47,19 @@ class SuffixAutomaton {
       const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
 
  private:
+  void reset_();
   void extend_(int32_t token, int64_t pos);
   void propagateOccurrencesAndRecency_();
   std::vector<SamAnchor> match(const int32_t* context, size_t len, size_t max_depth) const;
 
   std::vector<SamState> states_;
   int last_ = 0;
+  size_t max_corpus_tokens_ = 0;
+  size_t loaded_corpus_tokens_ = 0;
+  int64_t pos_ = 0;
+  bool saw_token_ = false;
+  bool has_previous_doc_ = false;
+  bool finalized_ = false;
   bool loaded_ = false;
 };
 

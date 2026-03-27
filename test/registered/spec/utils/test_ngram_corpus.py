@@ -1,8 +1,14 @@
+import json
+import os
+import tempfile
 import unittest
 import uuid
 
 import numpy as np
 
+from sglang.srt.speculative.cpp_ngram.external_corpus import (
+    iter_external_corpus_documents,
+)
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -18,6 +24,7 @@ def _make_corpus(match_type="BFS", **kwargs):
         draft_token_num=8,
         capacity=100000,
         external_sam_budget=0,
+        external_corpus_max_tokens=1000000,
         external_corpus_documents=None,
     )
     defaults.update(kwargs)
@@ -51,6 +58,12 @@ def _raw_batch_match(corpus: NgramCorpus, batch_tokens: list[list[int]]):
         batch_tokens,
         [len(tokens) for tokens in batch_tokens],
     )
+
+
+class _IntTokenizer:
+    def encode(self, text: str, add_special_tokens: bool = False):
+        del add_special_tokens
+        return [int(piece) for piece in text.split()]
 
 
 SEED_SEQUENCES = [
@@ -688,6 +701,64 @@ class TestNgramCorpusIncremental(CustomTestCase):
 
 class TestNgramCorpusExternalSam(CustomTestCase):
     """Verify external SAM loading and fixed-budget composition."""
+
+    def test_external_corpus_iterator_streams_documents(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_max_tokens=8,
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False
+        ) as f:
+            f.write(json.dumps("1 2 3 4 5"))
+            f.write("\n")
+            f.write(json.dumps("8 9"))
+            f.write("\n")
+            path = f.name
+        self.addCleanup(os.remove, path)
+
+        loaded_document_count, loaded_token_count = corpus.load_external_corpus(
+            iter_external_corpus_documents(path, _IntTokenizer(), max_tokens=8)
+        )
+        self.assertEqual((loaded_document_count, loaded_token_count), (2, 7))
+
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
+        ids_list = ids.tolist()
+        self.assertEqual(ids_list[0], 3)
+        self.assertEqual(ids_list[1:3], [4, 5])
+
+    def test_external_corpus_iterator_rejects_oversized_corpus(self):
+        corpus = _make_corpus(
+            "BFS",
+            external_sam_budget=2,
+            external_corpus_max_tokens=4,
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False
+        ) as f:
+            f.write(json.dumps("1 2 3"))
+            f.write("\n")
+            f.write(json.dumps("4 5"))
+            f.write("\n")
+            path = f.name
+        self.addCleanup(os.remove, path)
+
+        with self.assertRaisesRegex(ValueError, "token limit"):
+            corpus.load_external_corpus(
+                iter_external_corpus_documents(path, _IntTokenizer(), max_tokens=4)
+            )
+
+    def test_external_sam_cpp_backstop_rejects_oversized_iterable(self):
+        corpus = _make_corpus(
+            "BFS",
+            external_sam_budget=2,
+            external_corpus_max_tokens=4,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "token limit"):
+            corpus.load_external_corpus([[1, 2, 3], [4, 5]])
 
     def test_external_sam_only_chain(self):
         corpus = _make_corpus(

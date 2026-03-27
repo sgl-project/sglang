@@ -447,6 +447,8 @@ class TestNgramExternalSamArgs(CustomTestCase):
                 "/tmp/ngram-corpus.jsonl",
                 "--speculative-ngram-external-sam-budget",
                 "4",
+                "--speculative-ngram-external-corpus-max-tokens",
+                "128",
             ]
         )
         self.assertEqual(
@@ -454,6 +456,7 @@ class TestNgramExternalSamArgs(CustomTestCase):
             "/tmp/ngram-corpus.jsonl",
         )
         self.assertEqual(server_args.speculative_ngram_external_sam_budget, 4)
+        self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
 
     def test_external_sam_budget_requires_path(self):
         with self.assertRaises(ValueError) as context:
@@ -470,6 +473,15 @@ class TestNgramExternalSamArgs(CustomTestCase):
                 speculative_ngram_external_sam_budget=4,
             )._handle_speculative_decoding()
         self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
+
+    def test_external_corpus_max_tokens_must_be_positive(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+                speculative_ngram_external_sam_budget=2,
+                speculative_ngram_external_corpus_max_tokens=0,
+            )._handle_speculative_decoding()
+        self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
 if __name__ == "__main__":

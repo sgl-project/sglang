@@ -3,30 +3,60 @@
 #include <algorithm>
 #include <numeric>
 #include <queue>
+#include <stdexcept>
+#include <string>
 #include <tuple>
 
 namespace ngram {
 
-SuffixAutomaton::SuffixAutomaton(const std::vector<std::vector<int32_t>>& documents) {
+SuffixAutomaton::SuffixAutomaton(size_t max_corpus_tokens)
+    : max_corpus_tokens_(max_corpus_tokens) {
+  reset_();
+}
+
+void SuffixAutomaton::reset_() {
+  states_.clear();
   states_.emplace_back();
-  int64_t pos = 0;
-  bool saw_token = false;
-  bool has_previous_doc = false;
-  for (const auto& document : documents) {
-    if (document.empty()) {
-      continue;
-    }
-    if (has_previous_doc) {
-      extend_(kSeparatorToken, pos++);
-    }
-    for (const auto token : document) {
-      extend_(token, pos++);
-      saw_token = true;
-    }
-    has_previous_doc = true;
+  last_ = 0;
+  loaded_corpus_tokens_ = 0;
+  pos_ = 0;
+  saw_token_ = false;
+  has_previous_doc_ = false;
+  finalized_ = false;
+  loaded_ = false;
+}
+
+void SuffixAutomaton::appendDocument(const std::vector<int32_t>& document) {
+  if (finalized_) {
+    throw std::runtime_error("Cannot append external corpus documents after finalizing the SAM.");
+  }
+  if (document.empty()) {
+    return;
   }
 
-  if (!saw_token) {
+  if (loaded_corpus_tokens_ + document.size() > max_corpus_tokens_) {
+    throw std::runtime_error(
+        "External ngram corpus exceeds the configured token limit (" + std::to_string(max_corpus_tokens_) +
+        ") after loading " + std::to_string(loaded_corpus_tokens_) + " tokens.");
+  }
+
+  if (has_previous_doc_) {
+    extend_(kSeparatorToken, pos_++);
+  }
+  for (const auto token : document) {
+    extend_(token, pos_++);
+    saw_token_ = true;
+  }
+  loaded_corpus_tokens_ += document.size();
+  has_previous_doc_ = true;
+}
+
+void SuffixAutomaton::finalize() {
+  if (finalized_) {
+    return;
+  }
+  finalized_ = true;
+  if (!saw_token_) {
     return;
   }
 

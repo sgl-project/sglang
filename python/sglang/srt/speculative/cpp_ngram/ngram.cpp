@@ -27,6 +27,11 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
     throw std::runtime_error(
         "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
   }
+  if (!(param_.external_corpus_max_tokens > 0)) {
+    throw std::runtime_error(
+        "external_corpus_max_tokens must be greater than 0, current value: " +
+        std::to_string(param_.external_corpus_max_tokens));
+  }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config <= param_.draft_token_num)) {
@@ -64,9 +69,33 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
   }
 }
 
-void Ngram::loadExternalCorpus(const std::vector<std::vector<int32_t>>& documents) {
+void Ngram::startExternalCorpusLoad() {
   std::unique_lock<std::mutex> lock(mutex_);
-  sam_ = std::make_unique<SuffixAutomaton>(documents);
+  sam_ = std::make_unique<SuffixAutomaton>(param_.external_corpus_max_tokens);
+}
+
+void Ngram::appendExternalCorpusDocument(const std::vector<int32_t>& document) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!sam_) {
+    sam_ = std::make_unique<SuffixAutomaton>(param_.external_corpus_max_tokens);
+  }
+  sam_->appendDocument(document);
+}
+
+void Ngram::finishExternalCorpusLoad() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!sam_) {
+    return;
+  }
+  sam_->finalize();
+  if (sam_->empty()) {
+    sam_.reset();
+  }
+}
+
+void Ngram::clearExternalCorpus() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  sam_.reset();
 }
 
 void Ngram::insertWorker() {
