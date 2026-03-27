@@ -9,8 +9,7 @@ namespace py = pybind11;
 
 namespace {
 
-std::pair<size_t, size_t> loadExternalCorpus(
-    ngram::Ngram& ngram, py::iterable documents) {
+std::pair<size_t, size_t> loadExternalCorpus(ngram::Ngram& ngram, py::iterable documents) {
   ngram.startExternalCorpusLoad();
   size_t loaded_document_count = 0;
   size_t loaded_token_count = 0;

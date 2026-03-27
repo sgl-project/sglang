@@ -709,9 +709,7 @@ class TestNgramCorpusExternalSam(CustomTestCase):
             external_sam_budget=3,
             external_corpus_max_tokens=8,
         )
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".jsonl", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
             f.write(json.dumps("1 2 3 4 5"))
             f.write("\n")
             f.write(json.dumps("8 9"))
@@ -735,9 +733,7 @@ class TestNgramCorpusExternalSam(CustomTestCase):
             external_sam_budget=2,
             external_corpus_max_tokens=4,
         )
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".jsonl", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
             f.write(json.dumps("1 2 3"))
             f.write("\n")
             f.write(json.dumps("4 5"))

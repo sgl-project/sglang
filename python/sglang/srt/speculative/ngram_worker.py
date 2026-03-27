@@ -61,11 +61,13 @@ class NGRAMWorker:
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
         )
         if server_args.speculative_ngram_external_corpus_path is not None:
-            loaded_document_count, loaded_token_count = self.ngram_corpus.load_external_corpus(
-                iter_external_corpus_documents(
-                    server_args.speculative_ngram_external_corpus_path,
-                    target_worker.tokenizer,
-                    server_args.speculative_ngram_external_corpus_max_tokens,
+            loaded_document_count, loaded_token_count = (
+                self.ngram_corpus.load_external_corpus(
+                    iter_external_corpus_documents(
+                        server_args.speculative_ngram_external_corpus_path,
+                        target_worker.tokenizer,
+                        server_args.speculative_ngram_external_corpus_max_tokens,
+                    )
                 )
             )
             logger.info(

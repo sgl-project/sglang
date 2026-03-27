@@ -15,6 +15,7 @@ def iter_external_corpus_documents(
         raise ValueError("External ngram corpus max tokens must be positive.")
 
     total_tokens = 0
+    has_previous_doc = False
     with corpus_path.open("r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             if not line.strip():
@@ -35,7 +36,9 @@ def iter_external_corpus_documents(
 
             token_ids = tokenizer.encode(record, add_special_tokens=False)
             if token_ids:
-                next_total_tokens = total_tokens + len(token_ids)
+                # Count the separator token between documents, matching C++ SAM accounting.
+                separator_cost = 1 if has_previous_doc else 0
+                next_total_tokens = total_tokens + separator_cost + len(token_ids)
                 if next_total_tokens > max_tokens:
                     raise ValueError(
                         "External ngram corpus exceeds the configured token limit "
@@ -43,4 +46,5 @@ def iter_external_corpus_documents(
                         f"{total_tokens} tokens."
                     )
                 total_tokens = next_total_tokens
+                has_previous_doc = True
                 yield list(token_ids)

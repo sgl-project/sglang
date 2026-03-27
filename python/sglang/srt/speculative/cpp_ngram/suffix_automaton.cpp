@@ -9,8 +9,7 @@
 
 namespace ngram {
 
-SuffixAutomaton::SuffixAutomaton(size_t max_corpus_tokens)
-    : max_corpus_tokens_(max_corpus_tokens) {
+SuffixAutomaton::SuffixAutomaton(size_t max_corpus_tokens) : max_corpus_tokens_(max_corpus_tokens) {
   reset_();
 }
 
@@ -34,7 +33,8 @@ void SuffixAutomaton::appendDocument(const std::vector<int32_t>& document) {
     return;
   }
 
-  if (loaded_corpus_tokens_ + document.size() > max_corpus_tokens_) {
+  const size_t separator_cost = has_previous_doc_ ? 1 : 0;
+  if (loaded_corpus_tokens_ + separator_cost + document.size() > max_corpus_tokens_) {
     throw std::runtime_error(
         "External ngram corpus exceeds the configured token limit (" + std::to_string(max_corpus_tokens_) +
         ") after loading " + std::to_string(loaded_corpus_tokens_) + " tokens.");
@@ -47,7 +47,7 @@ void SuffixAutomaton::appendDocument(const std::vector<int32_t>& document) {
     extend_(token, pos_++);
     saw_token_ = true;
   }
-  loaded_corpus_tokens_ += document.size();
+  loaded_corpus_tokens_ += separator_cost + document.size();
   has_previous_doc_ = true;
 }
 
