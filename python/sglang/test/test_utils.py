@@ -168,25 +168,6 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
-def flush_cache_with_retry(
-    base_url: str, retries: int = 5, interval: float = 2.0
-) -> bool:
-    """Flush device cache with retry.
-
-    The scheduler may still have in-flight HiCache async ops (GPU↔Host↔L3)
-    that prevent is_fully_idle() from returning True, so we retry.
-    """
-    for _ in range(retries):
-        try:
-            response = requests.post(f"{base_url}/flush_cache", timeout=10)
-            if response.status_code == 200:
-                return True
-        except requests.RequestException:
-            pass
-        time.sleep(interval)
-    return False
-
-
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -2076,6 +2057,33 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
 
 
 class CustomTestCase(unittest.TestCase):
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        # Wrap the effective setUpClass so that tearDownClass is called
+        # even when setUpClass fails. Python's unittest skips tearDownClass
+        # if setUpClass raises, which can leak resources (ports, processes).
+        setup = cls.setUpClass
+        if getattr(setup, "_safe_setup_wrapped", False):
+            return
+
+        def safe_setUpClass(klass, _orig=setup):
+            try:
+                _orig.__func__(klass)
+            except Exception:
+                # Best-effort cleanup; suppress teardown errors so the
+                # original setUpClass exception propagates clearly.
+                try:
+                    klass.tearDownClass()
+                except Exception:
+                    pass
+                raise
+
+        # Set sentinel on the raw function so that bound method attribute
+        # lookup (which delegates to __func__) can detect it in subclasses.
+        safe_setUpClass._safe_setup_wrapped = True
+        cls.setUpClass = classmethod(safe_setUpClass)
 
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
