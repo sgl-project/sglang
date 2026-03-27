@@ -13,7 +13,9 @@ import torch
 
 from sglang.jit_kernel.utils import (
     cache_once,
+    get_jit_cuda_arch,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -46,15 +48,23 @@ def _jit_dsv3_router_gemm_module(
 @torch.compiler.assume_constant_result
 @cache_once
 def can_use_dsv3_router_gemm(num_experts: int, hidden_dim: int) -> bool:
-    """Check whether the JIT dsv3_router_gemm kernel can be used."""
+    """Check whether the JIT dsv3_router_gemm kernel can be used.
+
+    Requires SM90+ (Hopper) CUDA GPU, supported num_experts, and hidden_dim=7168.
+    """
+    if is_hip_runtime():
+        return False
+    if get_jit_cuda_arch().major < 9:
+        return False
     if hidden_dim != _HIDDEN_DIM:
         return False
     if num_experts not in _SUPPORTED_NUM_EXPERTS:
         return False
+    use_pdl = is_arch_support_pdl()
     try:
-        _jit_dsv3_router_gemm_module(
-            num_experts, is_arch_support_pdl(), out_float=False
-        )
+        # Pre-compile both output variants so the first real call is warm.
+        _jit_dsv3_router_gemm_module(num_experts, use_pdl, out_float=False)
+        _jit_dsv3_router_gemm_module(num_experts, use_pdl, out_float=True)
         return True
     except Exception:
         return False

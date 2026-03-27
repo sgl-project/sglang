@@ -32,7 +32,7 @@ using namespace device;
 // Convert VPT bfloat16 values from a uint4 to float array
 template <int VPT>
 SGL_DEVICE void bf16_uint4_to_float(uint4 const& vec, float* dst) {
-  bf16_t* bf16_ptr = reinterpret_cast<bf16_t*>(const_cast<uint4*>(&vec));
+  bf16_t const* bf16_ptr = reinterpret_cast<bf16_t const*>(&vec);
 #pragma unroll
   for (int i = 0; i < VPT; i++) {
     dst[i] = __bfloat162float(bf16_ptr[i]);
@@ -54,7 +54,7 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(void* out, bf16_t c
 
   bf16_t const* b_col = mat_b + n_idx * kHiddenDim;
 
-  int k_bases[k_iterations];
+  std::array<int, k_iterations> k_bases;
 #pragma unroll
   for (int ki = 0; ki < k_iterations; ki++) {
     k_bases[ki] = ki * k_elems_per_k_iteration + tid * VPT;
