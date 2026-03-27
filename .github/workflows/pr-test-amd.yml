@@ -154,6 +154,8 @@ jobs:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
               - "python/sglang/jit_kernel/diffusion/**"
+              - "python/sglang/jit_kernel/tests/diffusion/**"
+              - "python/sglang/jit_kernel/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
 
@@ -780,7 +782,7 @@ jobs:
 
 
   stage-c-test-4-gpu-amd:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    needs: [check-changes, call-gate, stage-b-test-1-gpu-small-amd, stage-b-test-2-gpu-large-amd]
     if: |
       always() &&
       (
@@ -804,7 +806,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh

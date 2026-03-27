@@ -156,6 +156,8 @@ jobs:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
               - "python/sglang/jit_kernel/diffusion/**"
+              - "python/sglang/jit_kernel/tests/diffusion/**"
+              - "python/sglang/jit_kernel/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
 
@@ -777,7 +779,7 @@ jobs:
 
 
   stage-c-test-4-gpu-amd:
-    needs: [check-changes, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    needs: [check-changes, stage-b-test-1-gpu-small-amd, stage-b-test-2-gpu-large-amd]
     if: |
       always() &&
       (
