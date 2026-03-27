@@ -10,8 +10,77 @@ just work.
 from __future__ import annotations
 
 import functools
+import logging
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Conservative fallback: Metal can typically use ~75% of system RAM.
+# Used when MLX is not installed and we cannot query the actual limit.
+_METAL_MEMORY_FRACTION_FALLBACK = 0.75
+
+
+_cached_metal_max_memory: int | None = None
+
+
+def _get_metal_max_memory() -> int:
+    """Return the maximum memory Metal can safely use, in bytes.
+
+    Queries ``mx.metal.device_info()["max_recommended_working_set_size"]``
+    when MLX is available, otherwise falls back to 75% of system RAM.
+    Allocating beyond this limit causes GPU paging, instability, and
+    potential machine reboots on Apple Silicon.
+
+    On first call with MLX available, also sets ``mx.set_wired_limit()``
+    to prevent the Metal allocator from paging GPU-resident memory.
+
+    Reference: https://github.com/vllm-project/vllm-metal
+    """
+    global _cached_metal_max_memory
+    if _cached_metal_max_memory is not None:
+        return _cached_metal_max_memory
+
+    try:
+        import mlx.core as mx
+
+        # mx.metal.device_info() is deprecated in newer MLX versions.
+        if hasattr(mx, "device_info"):
+            device_info = mx.device_info()
+        else:
+            device_info = mx.metal.device_info()
+        max_mem = int(device_info.get("max_recommended_working_set_size", 0))
+        if max_mem > 0:
+            # Prevent Metal from paging GPU-resident memory beyond this limit.
+            mx.set_wired_limit(max_mem)
+            logger.info(
+                "Metal max working set: %.1f GB (system RAM: %.1f GB). "
+                "Wired memory limit set.",
+                max_mem / (1 << 30),
+                _get_system_total_memory() / (1 << 30),
+            )
+            _cached_metal_max_memory = max_mem
+            return max_mem
+    except (ImportError, AttributeError, Exception) as e:
+        logger.debug("Could not query Metal memory limit via MLX: %s", e)
+
+    import psutil
+
+    total = psutil.virtual_memory().total
+    _cached_metal_max_memory = int(total * _METAL_MEMORY_FRACTION_FALLBACK)
+    logger.info(
+        "MLX not available, using %.0f%% of system RAM (%.1f GB) as Metal memory limit.",
+        _METAL_MEMORY_FRACTION_FALLBACK * 100,
+        _cached_metal_max_memory / (1 << 30),
+    )
+    return _cached_metal_max_memory
+
+
+def _get_system_total_memory() -> int:
+    """Return total system RAM in bytes."""
+    import psutil
+
+    return psutil.virtual_memory().total
 
 
 class Stream:
@@ -139,10 +208,8 @@ def get_device_properties(device: Any = 0) -> _MPSDeviceProperties:  # noqa: ARG
     """Return the properties of the MPS device. Results are cached after first call."""
     global _cached_props
     if _cached_props is None:
-        import psutil
-
         _cached_props = _MPSDeviceProperties(
-            total_memory=psutil.virtual_memory().total,
+            total_memory=_get_metal_max_memory(),
         )
     return _cached_props
 

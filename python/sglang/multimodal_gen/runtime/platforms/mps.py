@@ -50,8 +50,9 @@ class MpsPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
+        from sglang._mps_stub import _get_metal_max_memory
 
-        return psutil.virtual_memory().total
+        return _get_metal_max_memory()
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
@@ -82,8 +83,13 @@ class MpsPlatform(Platform):
         if empty_cache:
             torch.mps.empty_cache()
 
-        # For MPS, available memory is essentially the system available memory
-        free_memory = psutil.virtual_memory().available
+        # Cap to Metal's recommended max working set size to prevent OOM/reboots.
+        from sglang._mps_stub import _get_metal_max_memory
+
+        free_memory = min(
+            psutil.virtual_memory().available,
+            _get_metal_max_memory(),
+        )
 
         if distributed:
             import torch.distributed as dist
