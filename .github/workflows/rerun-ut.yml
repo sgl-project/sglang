@@ -1,5 +1,5 @@
 name: Rerun UT
-run-name: ${{ inputs.pr_head_sha && format('[rerun-ut] {0}', inputs.pr_head_sha) || '[rerun-ut]' }}
+run-name: ${{ inputs.pr_head_sha && format('[rerun-ut] {0} {1}', inputs.test_command, inputs.pr_head_sha) || format('[rerun-ut] {0}', inputs.test_command) }}
 
 on:
   workflow_dispatch:
@@ -41,6 +41,7 @@ env:
 permissions:
   actions: write
   contents: read
+  issues: read
 
 jobs:
   rerun-ut-cuda:
@@ -54,6 +55,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
         timeout-minutes: 20

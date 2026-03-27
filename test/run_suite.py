@@ -32,6 +32,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
+        "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
@@ -42,6 +43,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-2-gpu-large",
         "stage-b-test-4-gpu-b200",
         "stage-b-kernel-unit-1-gpu-large",
+        "stage-b-kernel-unit-8-gpu-h200",
         "stage-b-kernel-benchmark-1-gpu-large",
         "stage-c-test-4-gpu-h100",
         "stage-c-test-4-gpu-b200",
@@ -76,6 +78,7 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
         "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
         "nightly-kernel-1-gpu",
+        "nightly-kernel-8-gpu-h200",
         # Eval and perf suites (2-gpu)
         "nightly-eval-text-2-gpu",
         "nightly-eval-vlm-2-gpu",
@@ -87,6 +90,7 @@ NIGHTLY_SUITES = {
         "nightly-amd-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
@@ -188,8 +192,12 @@ def run_a_suite(args):
 
     # JIT kernel tests and benchmarks (live alongside kernel source)
     jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    files += glob.glob(os.path.join(jit_kernel_dir, "tests", "test_*.py"))
-    files += glob.glob(os.path.join(jit_kernel_dir, "benchmark", "bench_*.py"))
+    files += glob.glob(
+        os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
+    )
+    files += glob.glob(
+        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
+    )
 
     # Strict: all discovered files must have proper registration
     sanity_check = True
