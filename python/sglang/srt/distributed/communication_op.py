@@ -55,9 +55,9 @@ def broadcast_tensor_dict(
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
 
 
-def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor, fp_comm=True) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
-    return get_attn_tp_group().all_reduce(input_)
+    return get_attn_tp_group().all_reduce(input_, fp_comm=fp_comm)
 
 
 def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
