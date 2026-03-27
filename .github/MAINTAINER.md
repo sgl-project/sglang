@@ -42,7 +42,76 @@ If you meet any issues during the merge, you can discuss in [slack channels](htt
 ## The List of Merge Oncalls and Reviewers
 The format is @github-username (Slack username).
 
-TODO: fill in the list.
+### Scheduler
+@merrymercy (Lianmin Zheng), @hnyls2002 (Liangsheng Yin), @cctry (Shiyang Chen)
+
+related files
+- python/sglang/srt/managers
+- python/sglang/srt/model_executor
+
+### Diffusion
+@mickqian (Mick), @BBuf (BBuf)
+
+related files
+- python/sglang/multimodal_gen
+
+### PD disaggregation
+@ByronHsu (Byron Hsu), @cctry (Shiyang Chen), @ShangmingCai (Shangming Cai)
+
+related files
+- python/sglang/srt/disaggregation
+
+### KV Cache
+@ispobock (Ke Bao), @xiezhq-hermann (Zhiqiang Xie)
+
+related files
+- python/sglang/srt/mem_cache
+
+### Parallelism
+@ch-wan (Cheng Wan), @fzyzcjy (Tom)
+
+related files
+- python/sglang/srt/eplb
+- python/sglang/srt/distributed
+- python/sglang/srt/layers/dp_attention.py
+
+### Kernel
+@BBuf (BBuf)
+
+related files
+- python/sglang/jit_kernel
+- sgl-kernel
+
+### Speculative decoding
+@hnyls2002 (Liangsheng Yin), @Qiaolin-Yu (Qiaolin Yu)
+
+related files 
+- python/sglang/srt/speculative
+
+### NV and model-specific optimizations
+@Fridge003 (Baizhou Zhang), @ishandhanani (Ishan Dhanani), @Qiaolin-Yu (Qiaolin Yu)
+
+related files
+- python/sglang/srt/models
+- python/sglang/srt/layers/attention
+
+### AMD optimizations
+@HaiShaw (Henry HAI)
+
+### NPU optimizations
+@iforgetmyname (Even Zhou)
+
+### CI, Release, package, 
+@Kangyan-Zhou (Kangyan Zhou), @Fridge003 (Baizhou Zhang)
+
+### Router, API
+@slin1237 (Simo Lin)
+
+related files
+- sgl-model-gateway
+- python/sglang/srt/grpc
+- python/sglang/srt/entrypoints
+
 
 Now we have many Merge Oncalls mainly because the CI is flaky and the CODEOWNERS is too coarse-grained.
 In the future, we hope the CI can be improved and we only need bypass rarely. After that, most Merge Oncalls can be converted back to Write and CODEOWNERS.
