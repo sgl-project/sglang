@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+import warnings
 
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
@@ -14,6 +15,7 @@ suppress_noisy_warnings()
 def run_server(server_args):
     """Run the server based on server_args.grpc_mode and server_args.encoder_only."""
     if server_args.encoder_only:
+        # For encoder disaggregation
         if server_args.grpc_mode:
             from sglang.srt.disaggregation.encode_grpc_server import (
                 serve_grpc_encoder,
@@ -46,8 +48,6 @@ def run_server(server_args):
 
 
 if __name__ == "__main__":
-    import warnings
-
     warnings.warn(
         "'python -m sglang.launch_server' is still supported, but "
         "'sglang serve' is the recommended entrypoint.\n"

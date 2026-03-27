@@ -1155,14 +1155,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             finished = state.finished
             state.event.clear()
 
-            if is_stream and len(pending) > 1:
-                logger.warning(
-                    "Streaming backlog: rid=%s, draining %d queued chunks. "
-                    "This may inflate P99 TBT for affected requests.",
-                    obj.rid,
-                    len(pending),
-                )
-
             for i, out in enumerate(pending):
                 is_last = i == len(pending) - 1
 
@@ -1719,6 +1711,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         meta_info["input_token_logprobs"] = state.input_token_logprobs
         meta_info["output_token_logprobs"] = state.output_token_logprobs
+        meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs)
 
         # 2. Handle top logprobs
         if top_logprobs_num > 0:
