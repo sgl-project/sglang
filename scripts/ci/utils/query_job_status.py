@@ -4,12 +4,12 @@ Query GitHub Actions job status for specific jobs or generate runner fleet repor
 
 Usage:
     # Per-job reports (original mode)
-    python scripts/ci/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x"
-    python scripts/ci/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x" --hours 48
+    python scripts/ci/utils/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x"
+    python scripts/ci/utils/query_job_status.py --job "stage-c-test-large-8-gpu-amd-mi35x" --hours 48
 
     # Runner fleet report (cross-workflow runner analytics)
-    python scripts/ci/query_job_status.py --runner-report --workflow "pr-test-amd.yml,nightly-test-amd.yml" --hours 24
-    python scripts/ci/query_job_status.py --runner-report --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" --summary
+    python scripts/ci/utils/query_job_status.py --runner-report --workflow "pr-test-amd.yml,nightly-test-amd.yml" --hours 24
+    python scripts/ci/utils/query_job_status.py --runner-report --workflow "pr-test-amd.yml,nightly-test-amd.yml,pr-test-amd-rocm720.yml,nightly-test-amd-rocm720.yml" --summary
 
 Requirements:
     pip install tabulate
