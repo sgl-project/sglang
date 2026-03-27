@@ -166,6 +166,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
   - If a single test file run longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
   - If a single job in a github workflow runs longer than 30 mins, split it into smaller jobs/steps.
   - Reuse server launches in your unit tests to make tests run faster.
+- Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Python's [pickle module is not secure](https://docs.python.org/3/library/pickle.html) — it can execute arbitrary code during deserialization. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
 - When supporting new hardware or features, follow these guidelines:
   - Do not drastically change existing code.
   - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_ascend.py`).
