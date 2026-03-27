@@ -10,8 +10,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use crate::extended_chat::ExtendedChatCompletionRequest;
 use crate::protocols::{
-    chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
@@ -93,7 +93,7 @@ pub trait RouterTrait: Send + Sync + Debug {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ExtendedChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response;
 

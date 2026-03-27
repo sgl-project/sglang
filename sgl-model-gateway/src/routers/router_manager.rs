@@ -22,8 +22,8 @@ use crate::{
     app_context::AppContext,
     config::RoutingMode,
     core::{ConnectionMode, RuntimeType, WorkerRegistry, WorkerType},
+    extended_chat::ExtendedChatCompletionRequest,
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
@@ -527,7 +527,7 @@ impl RouterTrait for RouterManager {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ExtendedChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable

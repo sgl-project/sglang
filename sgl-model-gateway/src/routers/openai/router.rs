@@ -35,8 +35,8 @@ use crate::{
         RuntimeType, Worker, WorkerRegistry,
     },
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
+    extended_chat::ExtendedChatCompletionRequest,
     protocols::{
-        chat::ChatCompletionRequest,
         responses::{
             generate_id, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponsesGetParams, ResponsesRequest,
@@ -470,7 +470,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ExtendedChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();
@@ -536,7 +536,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         let mut ctx = RequestContext::for_chat(
-            Arc::new(body.clone()),
+            Arc::new(body.inner.clone()),
             headers.cloned(),
             model_id.map(String::from),
             ComponentRefs::Shared(self.shared_components()),

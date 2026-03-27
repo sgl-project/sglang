@@ -28,6 +28,7 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
+    extended_chat::ExtendedChatCompletionRequest,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         classify::ClassifyRequest,
@@ -1278,7 +1279,7 @@ impl RouterTrait for PDRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
+        body: &ExtendedChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
         let is_stream = body.stream;

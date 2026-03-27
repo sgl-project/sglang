@@ -501,7 +501,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
                 last_accessed_at: now,
                 access_count: 0,
                 attach_points: descriptor.attach_points.clone(),
-                wasm_bytes,
+                wasm_bytes: Arc::new(wasm_bytes),
             },
         };
 

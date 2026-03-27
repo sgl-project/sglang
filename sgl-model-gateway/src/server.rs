@@ -33,6 +33,7 @@ use crate::{
         worker_manager::WorkerManager,
         Job,
     },
+    extended_chat::ExtendedChatCompletionRequest,
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
@@ -40,7 +41,6 @@ use crate::{
         otel_trace,
     },
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
@@ -184,8 +184,25 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    Json(mut body): Json<ExtendedChatCompletionRequest>,
 ) -> Response {
+    use openai_protocol::validated::Normalizable;
+    use validator::Validate;
+
+    body.inner.normalize();
+    if let Err(e) = body.inner.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": e.to_string(),
+                    "type": "invalid_request_error",
+                    "code": 400
+                }
+            })),
+        )
+            .into_response();
+    }
     state
         .router
         .route_chat(Some(&headers), &body, Some(&body.model))
