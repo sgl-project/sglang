@@ -398,6 +398,8 @@ register_chat_template(
             "user": ("<start_of_turn>user\n", "<end_of_turn>\n"),
             "assistant": ("<start_of_turn>model\n", "<end_of_turn>\n"),
         },
+        image_token="<start_of_image>",
+        audio_token="<start_of_audio>",
         style=ChatTemplateStyle.PLAIN,
     )
 )

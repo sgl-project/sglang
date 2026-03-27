@@ -5,6 +5,29 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.jit_kernel.diffusion.triton.rotary import apply_rotary_embedding
+from sglang.kernel_api_logging import debug_kernel_api
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.utils.custom_op import register_custom_op_from_extern
+
+_is_cuda = current_platform.is_cuda()
+if _is_cuda:
+    try:
+        from flashinfer.rope import (
+            apply_rope_with_cos_sin_cache_inplace as _flashinfer_apply_rope_inplace,
+        )
+    except Exception:
+        _flashinfer_apply_rope_inplace = None
+else:
+    _flashinfer_apply_rope_inplace = None
+
+if _flashinfer_apply_rope_inplace is not None:
+    flashinfer_apply_rope_inplace = register_custom_op_from_extern(
+        _flashinfer_apply_rope_inplace,
+        op_name="flashinfer_apply_rope_with_cos_sin_cache_inplace",
+        mutates_args=["query", "key"],
+    )
+else:
+    flashinfer_apply_rope_inplace = None
 
 
 def _apply_rotary_emb(
@@ -39,6 +62,7 @@ def _apply_rotary_emb(
         return apply_rotary_embedding(x, cos, sin, interleaved)
 
 
+@debug_kernel_api
 def apply_flashinfer_rope_qk_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -67,9 +91,7 @@ def apply_flashinfer_rope_qk_inplace(
     if head_size != d:
         raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
 
-    try:
-        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-    except ImportError:
+    if flashinfer_apply_rope_inplace is None:
         # Triton fallback for AMD/ROCm where FlashInfer is not available
         import warnings
 
@@ -110,7 +132,7 @@ def apply_flashinfer_rope_qk_inplace(
 
     q_flat = q.reshape(bsz * seqlen, nheads * d).contiguous()
     k_flat = k.reshape(bsz * seqlen, nheads * d).contiguous()
-    apply_rope_with_cos_sin_cache_inplace(
+    flashinfer_apply_rope_inplace(
         positions=positions,
         query=q_flat,
         key=k_flat,

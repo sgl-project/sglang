@@ -176,6 +176,8 @@ class SchedulerOutputProcessorMixin:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
+                        if self.enable_hisparse:
+                            self.hisparse_coordinator.admit_request_into_staging(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -435,12 +437,8 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 # delete feature to save memory
-                if req.multimodal_inputs is not None:
-                    for mm_item in req.multimodal_inputs.mm_items:
-                        pixel_values = mm_item.feature
-                        if isinstance(pixel_values, torch.Tensor):
-                            mm_item.feature = None
-                            del pixel_values
+                if req.multimodal_inputs is not None and req.session is None:
+                    req.multimodal_inputs.release_features()
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
@@ -448,6 +446,8 @@ class SchedulerOutputProcessorMixin:
                     if not self.decode_offload_manager.offload_kv_cache(req):
                         self.decode_offload_manager.finalize_release_on_finish(req)
                 else:
+                    if self.enable_hisparse:
+                        self.hisparse_coordinator.request_finished(req)
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.set_completion_time()
@@ -1105,7 +1105,9 @@ class SchedulerOutputProcessorMixin:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:
                             customized_info[k] = []
-                        customized_info[k].append(v[send_token_offset:])
+                        customized_info[k].append(
+                            v[send_token_offset : len(output_ids_)]
+                        )
 
             if (
                 req.finished()

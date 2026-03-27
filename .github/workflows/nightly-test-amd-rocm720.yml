@@ -2,7 +2,7 @@ name: Nightly Test (AMD ROCm 7.2)
 
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '30 17 * * *'
   push:
     branches:
       - main
@@ -32,6 +32,7 @@ on:
           - nightly-accuracy-2-gpu-vlm-rocm720
           - nightly-perf-2-gpu-text-rocm720
           - nightly-perf-2-gpu-vlm-rocm720
+          - nightly-4-gpu-rocm720
           - nightly-accuracy-8-gpu-rocm720
           - nightly-8-gpu-grok1-int4-rocm720
           - nightly-8-gpu-grok2-rocm720
@@ -244,6 +245,37 @@ jobs:
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-perf-vlm-2-gpu --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ============================================== MI30x ROCm 7.2 4-GPU Tests ==============================================
+  # 4-GPU Nightly Tests - Dumper/Comparator E2E, VLM Encoder DP (ROCm 7.2)
+  nightly-4-gpu-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-rocm720,'))
+    runs-on: linux-mi325-4gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker (ROCm 7.2)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Nightly Test ROCm 7.2 (4-GPU)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-4-gpu --nightly --continue-on-error --timeout-per-file 3600 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -608,7 +640,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git mistral-common "lm-eval[api]" --upgrade
+          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
 
       - name: Accuracy Test ROCm 7.2 (8-GPU Qwen 3.5)
         timeout-minutes: 120
@@ -640,8 +672,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
-          # GLM-5 requires latest transformers for glm_moe_dsa architecture
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
       - name: Accuracy Test ROCm 7.2 (8-GPU GLM-5 NSA)
         timeout-minutes: 120
@@ -1196,7 +1227,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git mistral-common "lm-eval[api]" --upgrade
+          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
 
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Qwen 3.5)
         timeout-minutes: 120
@@ -1229,8 +1260,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-          # GLM-5 requires latest transformers for glm_moe_dsa architecture
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
       - name: Accuracy Test MI35x ROCm 7.2 (8-GPU GLM-5 NSA)
         timeout-minutes: 180
@@ -1319,6 +1349,8 @@ jobs:
       # MI30x ROCm 7.2 Performance Tests
       - nightly-perf-2-gpu-text-rocm720
       - nightly-perf-2-gpu-vlm-rocm720
+      # MI30x ROCm 7.2 4-GPU Tests
+      - nightly-4-gpu-rocm720
       - nightly-accuracy-8-gpu-rocm720
       # MI30x ROCm 7.2 Combined Accuracy + Performance Tests
       - nightly-8-gpu-grok1-int4-rocm720
