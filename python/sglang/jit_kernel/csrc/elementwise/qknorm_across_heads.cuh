@@ -64,6 +64,7 @@ __global__ void qknorm_across_heads_reg_kernel(
   using vec_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
   using packed_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
   vec_t v_data;
+  vec_t v_weight;
   const int warp_id = threadIdx.x >> 5;
   const int lane_id = threadIdx.x & 31;
   const int warp_count = (blockDim.x + 31) >> 5;
@@ -77,6 +78,7 @@ __global__ void qknorm_across_heads_reg_kernel(
 
   if (threadIdx.x < vec_hidden_size) {
     v_data = data[threadIdx.x];
+    v_weight = weight[threadIdx.x];
     for (int i = 0; i < inner_loop; i++) {
       float2 val = device::cast<fp32x2_t, packed_t>(v_data[i]);
       acc_square.x += val.x * val.x;
@@ -103,7 +105,6 @@ __global__ void qknorm_across_heads_reg_kernel(
 
   if (threadIdx.x < vec_hidden_size) {
     float rsqrt_val = buffer[0];
-    vec_t v_weight = weight[threadIdx.x];
     for (int i = 0; i < inner_loop; i++) {
       v_data[i] = rms(v_data[i], v_weight[i], rsqrt_val);
     }
