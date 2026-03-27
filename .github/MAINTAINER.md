@@ -40,6 +40,7 @@ __Note__: The permissions to trigger CI tests are defined separately according t
 If you meet any issues during the merge, you can discuss in [slack channels](https://slack.sglang.io/): #pull-request, #ci-cd-build-release, #dev.
 
 ## The List of Merge Oncalls and Reviewers
+This section lists the oncalls for each module or feature.
 The format is @github-username (Slack username).
 
 ### Scheduler
@@ -101,7 +102,7 @@ related files
 ### NPU optimizations
 @iforgetmyname (Even Zhou)
 
-### CI, Release, package, 
+### CI, Release, Package
 @Kangyan-Zhou (Kangyan Zhou), @Fridge003 (Baizhou Zhang)
 
 ### Router, API
@@ -113,13 +114,15 @@ related files
 - python/sglang/srt/entrypoints
 
 
+**NOTE:**
+
 Now we have many Merge Oncalls mainly because the CI is flaky and the CODEOWNERS is too coarse-grained.
 In the future, we hope the CI can be improved and we only need bypass rarely. After that, most Merge Oncalls can be converted back to Write and CODEOWNERS.
 
 This list is based on the current situation. If you or someone you know would like to take on more responsibility and are qualified, please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
 
 ## The List of CI Oncalls
-The format is @github-username (Slack username).
+This section lists the oncalls for each hardware platform. The format is @github-username (Slack username).
 
 ### NVIDIA GPUs
 @Kangyan-Zhou (Kangyan Zhou), @ch-wan (Cheng Wan), @HanHan009527 (hanhan), @ishandhanani (Ishan Dhanani), @ShangmingCai (Shangming Cai), @alisonshao (Alison Shao).
