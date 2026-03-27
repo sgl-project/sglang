@@ -57,12 +57,11 @@ class TestQwen35FP4(unittest.TestCase):
                 extra_args=base_args,
                 variant="Triton",
             ),
-            # TODO: Fix this and re-enable it
-            # ModelLaunchSettings(
-            #     QWEN35_FP4_MODEL,
-            #     extra_args=base_args + ["--linear-attn-decode-backend", "flashinfer"],
-            #     variant="FlashInfer",
-            # ),
+            ModelLaunchSettings(
+                QWEN35_FP4_MODEL,
+                extra_args=base_args + ["--linear-attn-decode-backend", "flashinfer"],
+                variant="FlashInfer",
+            ),
         ]
 
         run_combined_tests(

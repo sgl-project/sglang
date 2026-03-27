@@ -60,6 +60,8 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
 
+        flashinfer_kernel = None
+
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
@@ -93,20 +95,28 @@ class GDNKernelDispatcher:
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
             # Reuse the FlashInfer kernel if already created for decode
-            if decode_backend.is_flashinfer():
-                self.extend_kernel = flashinfer_kernel
+            if flashinfer_kernel is not None:
+                fi_kernel = flashinfer_kernel
             else:
                 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
                     FlashInferGDNKernel,
                 )
 
-                flashinfer_kernel = FlashInferGDNKernel()
-                self.extend_kernel = flashinfer_kernel
+                fi_kernel = FlashInferGDNKernel()
+                flashinfer_kernel = fi_kernel
+
+            if not fi_kernel.supports_extend:
+                raise ValueError(
+                    "FlashInfer GDN prefill is not supported on this device "
+                    "(SM100+). Use --linear-attn-prefill-backend triton instead."
+                )
+            self.extend_kernel = fi_kernel
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
-        # Verify kernel: use FlashInfer if either decode or prefill selected it
-        if decode_backend.is_flashinfer() or prefill_backend.is_flashinfer():
+        # Verify kernel: use FlashInfer only if it supports target_verify,
+        # otherwise fall back to Triton (e.g. SM100 decode-only FlashInfer).
+        if flashinfer_kernel is not None and flashinfer_kernel.supports_target_verify:
             self.verify_kernel = flashinfer_kernel
         else:
             self.verify_kernel = triton_kernel
