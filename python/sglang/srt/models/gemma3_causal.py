@@ -42,7 +42,13 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
+    is_npu,
+    make_layers,
+)
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -574,7 +580,7 @@ class Gemma3TextModel(PreTrainedModel):
             local_theta = getattr(config, "rope_local_base_freq", 10000.0)
 
         global_config = copy.deepcopy(config)
-        if not is_npu():
+        if not _is_npu:
             global_config.rope_parameters = {
                 "rope_type": "default",
                 "rope_theta": global_theta,
