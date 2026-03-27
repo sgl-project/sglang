@@ -63,6 +63,7 @@ from sglang.multimodal_gen.test.server.accuracy_utils import (
     load_checkpoint_weights,
     materialize_module,
     read_json_file,
+    resolve_text_encoder_module,
     select_component_source,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
@@ -248,14 +249,6 @@ def _load_reference_component(
         )
 
     raise RuntimeError(f"Unsupported component {component.value}")
-
-
-def _resolve_reference_transfer_module(ref_component: nn.Module) -> nn.Module:
-    if getattr(ref_component, "shared", None) is not None:
-        return ref_component
-
-    get_encoder = getattr(ref_component, "get_encoder", None)
-    return get_encoder() if callable(get_encoder) else ref_component
 
 
 # Public accuracy engine
@@ -517,7 +510,9 @@ class AccuracyEngine:
             )
 
         ref_for_transfer = (
-            _resolve_reference_transfer_module(ref_component)
+            resolve_text_encoder_module(
+                ref_component, preserve_shared_for_transfer=True
+            )
             if component == ComponentType.TEXT_ENCODER
             else ref_component
         )

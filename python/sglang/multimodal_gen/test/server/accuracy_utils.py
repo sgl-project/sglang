@@ -655,7 +655,12 @@ def build_deterministic_text_encoder_inputs(
     return input_ids, attention_mask
 
 
-def resolve_text_encoder_forward_module(model: nn.Module) -> nn.Module:
+def resolve_text_encoder_module(
+    model: nn.Module, *, preserve_shared_for_transfer: bool = False
+) -> nn.Module:
+    if preserve_shared_for_transfer and getattr(model, "shared", None) is not None:
+        return model
+
     get_encoder = getattr(model, "get_encoder", None)
     return get_encoder() if callable(get_encoder) else model
 
@@ -717,8 +722,8 @@ def run_text_encoder_pair(
     )
 
     with torch.no_grad():
-        sgl_model = resolve_text_encoder_forward_module(sgl)
-        ref_model = resolve_text_encoder_forward_module(ref)
+        sgl_model = resolve_text_encoder_module(sgl)
+        ref_model = resolve_text_encoder_module(ref)
         sgl_device = _module_device(sgl_model)
         ref_device = _module_device(ref_model)
         sgl_out = sgl_model(
@@ -746,7 +751,7 @@ def _run_text_encoder_single(
     model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
     with torch.no_grad():
-        forward_model = resolve_text_encoder_forward_module(model)
+        forward_model = resolve_text_encoder_module(model)
         model_device = _module_device(forward_model)
         output = forward_model(
             input_ids.to(device=model_device),
