@@ -73,25 +73,6 @@ logger = init_logger(__name__)
 MIN_MATCH_RATIO = float(os.getenv("SGLANG_DIFFUSION_WEIGHT_MATCH_RATIO", "0.98"))
 
 
-class _ForwardCapture:
-    def __init__(self, module: nn.Module):
-        self._module = module
-        self._handle: Optional[torch.utils.hooks.RemovableHandle] = None
-        self.output: Any = None
-
-    def __enter__(self) -> "_ForwardCapture":
-        def _hook(_: nn.Module, __: tuple[Any, ...], output: Any) -> None:
-            self.output = output
-
-        self._handle = self._module.register_forward_hook(_hook)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self._handle is not None:
-            self._handle.remove()
-        self._handle = None
-
-
 @dataclass(frozen=True)
 class ComponentSpec:
     component: ComponentType
@@ -267,9 +248,18 @@ class AccuracyEngine:
 
     @staticmethod
     def _execute_with_native_hook(call) -> Any:
-        with _ForwardCapture(call.module) as capture:
+        output: Any = None
+
+        def _hook(_: nn.Module, __: tuple[Any, ...], captured: Any) -> None:
+            nonlocal output
+            output = captured
+
+        handle = call.module.register_forward_hook(_hook)
+        try:
             call.module(*call.args, **call.kwargs)
-        return capture.output
+        finally:
+            handle.remove()
+        return output
 
     @staticmethod
     def _apply_output_transforms(tensor: torch.Tensor, call) -> torch.Tensor:
