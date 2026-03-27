@@ -2,28 +2,39 @@
 
 ## Benchmark
 
-- Benchmark the latency of running a single static batch without a server. The arguments are the same as for `launch_server.py`.
-  Note that this is a simplified test script without a dynamic batching server, so it may run out of memory for a batch size that a real server can handle. A real server truncates the prefill into several batches, while this simplified script does not.
-  - Without a server (do not need to launch a server)
-    ```bash
-    python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32
-    ```
-  - With a server (please use `sglang.launch_server` to launch a server first and run the following command.)
-    ```bash
-    python -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
-    ```
+SGLang provides four benchmark tools that operate at different levels of the stack. The table below summarizes their key differences:
 
+| Tool                       | HTTP Server                                   | Scheduler                               | Use Case                                                                   |
+| -------------------------- | --------------------------------------------- | --------------------------------------- | -------------------------------------------------------------------------- |
+| `bench_serving`            | Yes (async HTTP client to a running server)   | Yes (indirectly, via server)            | Realistic online serving benchmarks with latency metrics (TTFT, TPOT, ITL) |
+| `bench_one_batch_server`   | Yes (sends HTTP requests to a running server) | Yes (indirectly, via server)            | End-to-end single-batch latency including HTTP and scheduler overhead      |
+| `bench_offline_throughput` | No                                            | Yes (directly uses `Engine` in-process) | Maximum throughput measurement without HTTP overhead                       |
+| `bench_one_batch`          | No                                            | No (directly calls `ModelRunner`)       | Kernel-level latency profiling of a single static batch                    |
 
-- Benchmark offline processing. This script will start an offline engine and run the benchmark.
+Use `bench_serving` by default unless there are specific needs.
+
+**`bench_serving`** is an async HTTP load-testing client that sends requests at controlled rates with configurable concurrency to a running server. It measures realistic online serving metrics including time-to-first-token (TTFT), time-per-output-token (TPOT), inter-token latency (ITL), and throughput. Use `num-prompts >= 5 * max-concurrency` to measure steady-state performance. Launch a server with `sglang.launch_server` first.
+
+  ```bash
+  python3 -m sglang.bench_serving --backend sglang --max-concurrency 16 --num-prompts 80 --random-input-len 256 --random-output-len 32 --dataset-name random
+  ```
+
+**`bench_one_batch_server`** sends a single batch as one HTTP request to a running server. Due to only having a single batch, the server is never in a steady-state and metrics will be biased. Launch a server with `sglang.launch_server` first.
+
+  ```bash
+  python3 -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
+  ```
+
+**`bench_offline_throughput`** directly instantiates the `Engine` object in-process (no HTTP server) and submits all requests at once via `engine.generate()`. The engine's scheduler handles batching and execution. This measures maximum achievable throughput without any network overhead.
 
   ```bash
   python3 -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
   ```
 
-- Benchmark online serving. Please use `sglang.launch_server` to launch a server first and run the following command.
+**`bench_one_batch`** is the lowest-level tool. It directly instantiates a `ModelRunner` and calls `extend()` / `decode()` on a fixed static batch, bypassing the scheduler entirely. The prefill and decode phases are run separately, making profiling easier but rendering the metrics unrealistic. Because there is no dynamic batching, it may run out of memory for batch sizes that a real server can handle (a real server chunks prefill into smaller batches). This is best suited for profiling individual kernel performance.
 
   ```bash
-  python3 -m sglang.bench_serving --backend sglang --num-prompt 10
+  python3 -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
   ```
 
 ## Profile with PyTorch Profiler

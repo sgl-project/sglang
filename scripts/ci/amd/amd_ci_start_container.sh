@@ -190,13 +190,7 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
   fi
 
   DOCKERFILE_DIR="${GITHUB_WORKSPACE:-$PWD}/docker"
-
-  # Use rocm720.Dockerfile for ROCm 7.2 builds, otherwise use rocm.Dockerfile
-  if [[ "${GPU_ARCH_BUILD}" == *"rocm720"* ]]; then
-    DOCKERFILE="${DOCKERFILE_DIR}/rocm720.Dockerfile"
-  else
-    DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
-  fi
+  DOCKERFILE="${DOCKERFILE_DIR}/rocm.Dockerfile"
 
   if [[ ! -f "${DOCKERFILE}" ]]; then
     echo "Error: Dockerfile not found at ${DOCKERFILE}" >&2
@@ -247,3 +241,8 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+# The checkout is owned by the runner (non-root) but the container runs as
+# root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
+# setuptools-scm / vcs_versioning can resolve the package version.
+docker exec ci_sglang git config --global --add safe.directory /sglang-checkout

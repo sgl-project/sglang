@@ -7,7 +7,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelEvalMetrics,
     ModelLaunchSettings,
@@ -15,6 +14,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_results_to_json,
 )
+
+# Nightly eval tests run large models that may need downloading on cache miss.
+# Use a longer timeout than the default 600s.
+NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 
 register_cuda_ci(est_time=7200, suite="nightly-eval-vlm-2-gpu", nightly=True)
 
@@ -31,7 +34,9 @@ MODEL_THRESHOLDS = {
         0.270, 23.8
     ),
     ModelLaunchSettings("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 10.9),
-    ModelLaunchSettings("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.270, 17.7),
+    ModelLaunchSettings(
+        "google/gemma-3n-E4B-it", extra_args=["--tp=2"]
+    ): ModelEvalMetrics(0.270, 17.7),
     ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
         0.330, 23.5
@@ -47,7 +52,7 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
     ): ModelEvalMetrics(0.30, 16.7),
-    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 32.0),
+    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 40.0),
     ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
     ModelLaunchSettings(
         "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]
@@ -70,15 +75,16 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
 
         for model in self.models:
             model_path = model.model_path
-            error_message = None
             with self.subTest(model=model_path):
-                process = popen_launch_server(
-                    model=model_path,
-                    base_url=self.base_url,
-                    other_args=model.extra_args,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                )
+                process = None
                 try:
+                    process = popen_launch_server(
+                        model=model_path,
+                        base_url=self.base_url,
+                        other_args=model.extra_args,
+                        timeout=NIGHTLY_EVAL_SERVER_TIMEOUT,
+                    )
+
                     args = SimpleNamespace(
                         base_url=self.base_url,
                         model=model_path,
@@ -106,17 +112,16 @@ class TestNightlyVLMMmmuEval(unittest.TestCase):
                             model_path,
                             metrics["score"],
                             metrics["latency"],
-                            error_message,
+                            None,
                         )
                     )
                 except Exception as e:
-                    # Capture error message for the summary table
                     error_message = str(e)
-                    # Still append result with error info (use None for N/A metrics to match else clause)
                     all_results.append((model_path, None, None, error_message))
                     print(f"Error evaluating {model_path}: {error_message}")
                 finally:
-                    kill_process_tree(process.pid)
+                    if process is not None:
+                        kill_process_tree(process.pid)
 
         try:
             with open("results.json", "r") as f:

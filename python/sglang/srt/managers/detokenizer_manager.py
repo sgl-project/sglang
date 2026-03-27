@@ -34,15 +34,15 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
-from sglang.srt.metrics.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
     freeze_gc,
-    get_zmq_socket,
     kill_itself_when_parent_died,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,
@@ -400,11 +400,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
             load=recv_obj.load,
-            queue_time=recv_obj.queue_time,
-            forward_entry_time=recv_obj.forward_entry_time,
-            prefill_launch_delay=recv_obj.prefill_launch_delay,
-            prefill_launch_latency=recv_obj.prefill_launch_latency,
-            prefill_finished_ts=recv_obj.prefill_finished_ts,
+            dp_ranks=recv_obj.dp_ranks,
+            time_stats=recv_obj.time_stats,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
@@ -438,6 +435,7 @@ def run_detokenizer_process(
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 
+    manager = None
     try:
         manager = detokenizer_manager_class(server_args, port_args)
         if server_args.tokenizer_worker_num == 1:
@@ -447,5 +445,6 @@ def run_detokenizer_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
-        manager.maybe_clear_socket_mapping()
+        if manager is not None:
+            manager.maybe_clear_socket_mapping()
         parent_process.send_signal(signal.SIGQUIT)

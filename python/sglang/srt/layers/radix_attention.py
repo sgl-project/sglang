@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Radix attention."""
+
 from __future__ import annotations
 
 from enum import Enum
@@ -115,9 +116,9 @@ class RadixAttention(nn.Module):
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if self.qk_head_dim != self.v_head_dim:
-                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+                output = q.new_zeros((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:
-                output = torch.empty_like(q)
+                output = torch.zeros_like(q)
             unified_attention_with_output(
                 q, k, v, output, save_kv_cache, self.layer_id, **kwargs
             )
@@ -153,22 +154,24 @@ def unified_attention_with_output(
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
+    if real_num_tokens is None:
+        real_num_tokens = query.shape[0]
 
-    query = query[:real_num_tokens, :]
-    key = key[:real_num_tokens, :]
-    value = value[:real_num_tokens, :]
+    query = query[:real_num_tokens]
+    key = key[:real_num_tokens]
+    value = value[:real_num_tokens]
 
     kwargs = {}
     if q_rope is not None:
-        kwargs["q_rope"] = q_rope[:real_num_tokens, :]
+        kwargs["q_rope"] = q_rope[:real_num_tokens]
     if k_rope is not None:
-        kwargs["k_rope"] = k_rope[:real_num_tokens, :]
+        kwargs["k_rope"] = k_rope[:real_num_tokens]
     if sinks is not None:
-        kwargs["sinks"] = sinks[:real_num_tokens, :]
+        kwargs["sinks"] = sinks
 
     ret = forward_batch.attn_backend.forward(
         query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
     )
 
-    output[:real_num_tokens, :].copy_(ret)
+    output[:real_num_tokens].view(ret.shape).copy_(ret)
     return

@@ -1,3 +1,4 @@
+import sys
 import time
 from typing import Optional, Tuple, Union
 
@@ -6,7 +7,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.pos_enc import rotary_embedding
+from sglang.jit_kernel.rope import rotary_embedding
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=18, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 @triton.jit
@@ -371,10 +376,10 @@ def test_correctness(
     ],
 )
 def test_performance(
-    head_size,
-    rotary_dim,
-    max_position_embeddings,
-    base,
+    head_size: int,
+    rotary_dim: int,
+    max_position_embeddings: int,
+    base: int,
     is_neox_style,
     dtype,
     device,
@@ -483,3 +488,7 @@ def test_performance(
         print(f"Speedup (SGL/JIT): {speedup:.2f}x")
 
     assert jit_time >= 0 and sgl_time >= 0
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -13,6 +13,9 @@ from sglang.jit_kernel.benchmark.utils import (
 )
 from sglang.jit_kernel.norm import fused_inplace_qknorm
 from sglang.srt.utils import get_current_device_stream_fast
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 alt_stream = torch.cuda.Stream()
 
@@ -74,8 +77,6 @@ def torch_impl_qknorm(
     k.copy_(k.float() * k_norm * k_weight.float())
 
 
-HEAD_DIM = 128
-
 BS_RANGE = get_benchmark_range(
     full_range=[2**n for n in range(0, 14)],
     ci_range=[16],
@@ -88,17 +89,21 @@ KV_HEAD_RANGE = get_benchmark_range(
     full_range=[1, 2, 4, 8],
     ci_range=[1],
 )
+HEAD_DIM_RANGE = get_benchmark_range(
+    full_range=[128, 256, 512, 1024],
+    ci_range=[128],
+)
 
-LINE_VALS = ["aot", "jit", "fi", "torch"]
+LINE_VALS = ["aot", "jit", "flashinfer", "torch"]
 LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
 STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
 
-configs = list(itertools.product(GQA_RANGE, KV_HEAD_RANGE, BS_RANGE))
+configs = list(itertools.product(HEAD_DIM_RANGE, GQA_RANGE, KV_HEAD_RANGE, BS_RANGE))
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["GQA", "num_kv_heads", "batch_size"],
+        x_names=["head_dim", "GQA", "num_kv_heads", "batch_size"],
         x_vals=configs,
         line_arg="provider",
         line_vals=LINE_VALS,
@@ -109,20 +114,22 @@ configs = list(itertools.product(GQA_RANGE, KV_HEAD_RANGE, BS_RANGE))
         args={},
     )
 )
-def benchmark(batch_size: int, GQA: int, num_kv_heads: int, provider: str):
+def benchmark(
+    head_dim: int, GQA: int, num_kv_heads: int, batch_size: int, provider: str
+):
     num_qo_heads = GQA * num_kv_heads
     q = torch.randn(
-        (batch_size, num_qo_heads, HEAD_DIM), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
+        (batch_size, num_qo_heads, head_dim), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
     )
     k = torch.randn(
-        (batch_size, num_kv_heads, HEAD_DIM), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
+        (batch_size, num_kv_heads, head_dim), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
     )
-    q_weight = torch.randn(HEAD_DIM, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
-    k_weight = torch.randn(HEAD_DIM, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
+    q_weight = torch.randn(head_dim, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
+    k_weight = torch.randn(head_dim, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
     FN_MAP = {
         "aot": sglang_aot_qknorm,
         "jit": sglang_jit_qknorm,
-        "fi": flashinfer_qknorm,
+        "flashinfer": flashinfer_qknorm,
         "torch": torch_impl_qknorm,
     }
     fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)

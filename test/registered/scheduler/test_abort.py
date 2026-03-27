@@ -1,4 +1,5 @@
 import multiprocessing
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,8 +19,8 @@ from sglang.test.test_utils import (
     run_and_check_memory_leak,
 )
 
-register_cuda_ci(est_time=131, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=131, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestAbort(CustomTestCase):
@@ -124,6 +125,86 @@ class TestAbortAll(AbortAllMixin, CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def _generate_with_rid(self, rid, max_new_tokens=8):
+        return requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                },
+                "rid": rid,
+            },
+            timeout=30,
+        )
+
+    def test_duplicate_rid_sequential_ok(self):
+        rid = "dup-rid-test-sequential"
+        resp1 = self._generate_with_rid(rid)
+        self.assertEqual(resp1.status_code, 200)
+        self.assertNotIn("error", resp1.json())
+
+        resp2 = self._generate_with_rid(rid)
+        self.assertEqual(resp2.status_code, 200)
+        self.assertNotIn("error", resp2.json())
+
+    def test_duplicate_rid_concurrent_rejected(self):
+        rid = "dup-rid-test-concurrent"
+        results = {}
+
+        def send(key, max_tokens):
+            results[key] = self._generate_with_rid(rid, max_new_tokens=max_tokens)
+
+        t1 = threading.Thread(target=send, args=("first", 512))
+        t2 = threading.Thread(target=send, args=("second", 8))
+        t1.start()
+        time.sleep(0.1)
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        r1, r2 = results["first"], results["second"]
+        self.assertTrue(
+            r1.status_code == 400 or r2.status_code == 400,
+            "One of the concurrent duplicate-rid requests should be rejected",
+        )
+
+        rejected = r2 if r2.status_code == 400 else r1
+        self.assertIn("Duplicate request ID", rejected.json()["error"]["message"])
+
+    def test_duplicate_rid_in_batch(self):
+        rid = "dup-rid-batch"
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": ["Hello", "World"],
+                "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                "rid": [rid, rid],
+            },
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Duplicate request ID", response.json()["error"]["message"])
+
+    def test_server_healthy_after_duplicate_rid(self):
+        requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": ["Hello", "World"],
+                "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                "rid": ["dup-health", "dup-health"],
+            },
+            timeout=30,
+        )
+
+        resp = requests.get(f"{self.base_url}/health", timeout=5)
+        self.assertEqual(resp.status_code, 200)
+
+        resp = self._generate_with_rid("after-dup-health")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text", resp.json())
 
 
 class TestAbortAllWithRetraction(CustomTestCase):

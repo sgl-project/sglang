@@ -25,6 +25,7 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -54,7 +55,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -158,6 +159,7 @@ def rmsnorm_apply_kernel_serial(
     tl.store(out2_row + offsets2, out2, mask=mask2)
 
 
+@debug_kernel_api
 def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     assert x1.is_cuda and x2.is_cuda
     B, D1 = x1.shape
@@ -196,6 +198,7 @@ def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     return sum_sq
 
 
+@debug_kernel_api
 def rms_apply_serial(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -445,7 +448,7 @@ class MiniMaxM2MoE(nn.Module):
         if router_logits is not None:
             ctx = (
                 nullcontext()
-                if get_global_server_args().enable_piecewise_cuda_graph
+                if not get_global_server_args().disable_piecewise_cuda_graph
                 else get_global_expert_distribution_recorder().with_current_layer(
                     self.layer_id
                 )
@@ -483,7 +486,7 @@ class MiniMaxM2MoE(nn.Module):
         if self.ep_size > 1:
             ctx = (
                 nullcontext()
-                if get_global_server_args().enable_piecewise_cuda_graph
+                if not get_global_server_args().disable_piecewise_cuda_graph
                 else get_global_expert_distribution_recorder().with_current_layer(
                     self.layer_id
                 )
@@ -566,7 +569,8 @@ class MiniMaxM2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         # RoPE settings - support partial RoPE
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        # FIXME: minimax_m2 config use external config that not compatible with transformers v5
+        self.rope_theta = config.rope_theta
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(
             config, "rotary_dim", self.head_dim
@@ -709,7 +713,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("block_sparse_moe", prefix),
         )
 
         self.input_layernorm = RMSNorm(
@@ -909,7 +913,7 @@ class MiniMaxM2Model(nn.Module):
             for i in range(self.start_layer, self.end_layer):
                 ctx = (
                     nullcontext()
-                    if get_global_server_args().enable_piecewise_cuda_graph
+                    if not get_global_server_args().disable_piecewise_cuda_graph
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
@@ -941,6 +945,18 @@ class MiniMaxM2Model(nn.Module):
 class MiniMaxM2ForCausalLM(nn.Module):
     """MiniMax M2 model for causal language modeling."""
 
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -967,6 +983,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
+        self.pp_group = get_pp_group()
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
@@ -999,17 +1016,26 @@ class MiniMaxM2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        # _print_tensor_info(input_ids, "input_ids")
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-        )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load model weights with proper mapping for MiniMax architecture."""
@@ -1038,13 +1064,32 @@ class MiniMaxM2ForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
 
+            _is_kv_scale = name.endswith(".k_scale") or name.endswith(".v_scale")
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
+                    continue
+                # Skip kv cache scales - maybe_remap_kv_scale_name expects the
+                # original checkpoint name (e.g. self_attn.k_proj.k_scale) to
+                # remap it to self_attn.attn.k_scale. Renaming k_proj -> qkv_proj
+                # here would break that pattern match.
+                if _is_kv_scale:
                     continue
                 # We have mlp.experts[0].gate_proj in the checkpoint.
                 # Since we handle the experts below in expert_params_mapping,
@@ -1056,7 +1101,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if name not in params_dict:
+                    continue
+
+                if name.endswith(".bias"):
                     continue
 
                 param = params_dict[name]
@@ -1070,6 +1118,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
 
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1090,6 +1140,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
                     if name is None:
                         continue
 
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
