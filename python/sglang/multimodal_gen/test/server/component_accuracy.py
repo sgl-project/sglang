@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gc
-import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,19 +8,26 @@ from typing import Any, Dict, List, Optional, Tuple
 import diffusers
 import torch
 import torch.nn as nn
-from torch.distributed.tensor import distribute_tensor
 from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
-    AutoModelForVision2Seq,
     T5EncoderModel,
     UMT5EncoderModel,
 )
 
+try:
+    from transformers import AutoModelForImageTextToText as AutoVisionTextModel
+except ImportError:
+    try:
+        from transformers import AutoModelForVision2Seq as AutoVisionTextModel
+    except ImportError:
+        AutoVisionTextModel = None
+
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
 from sglang.multimodal_gen.registry import _CONFIG_REGISTRY, get_model_info
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
     destroy_model_parallel,
     get_data_parallel_world_size,
     get_local_torch_device,
@@ -31,6 +37,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -41,17 +48,25 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.managers.forward_context import ForwardContext
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    get_diffusers_component_config,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.accuracy_config import (
     DEFAULT_TIMESTEP,
-    I2V_IMAGE_DIM,
-    I2V_TEXT_ENCODER_DIM,
     ComponentType,
 )
-from sglang.multimodal_gen.test.server.accuracy_hooks import (
-    HookCall,
-    resolve_native_profile,
+from sglang.multimodal_gen.test.server.accuracy_hooks import resolve_native_profile
+from sglang.multimodal_gen.test.server.accuracy_utils import (
+    build_state_lookup,
+    copy_tensor,
+    fuse_gate_up_proj,
+    fuse_qkv,
+    generate_name_candidates,
+    load_checkpoint_weights,
+    materialize_module,
+    read_json_file,
+    select_component_source,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
@@ -59,27 +74,30 @@ logger = init_logger(__name__)
 
 MIN_MATCH_RATIO = float(os.getenv("SGLANG_DIFFUSION_WEIGHT_MATCH_RATIO", "0.98"))
 
-SOURCE_PREFIXES = (
-    "module.",
-    "model.",
-    "transformer.",
-    "text_encoder.",
-    "image_encoder.",
-    "encoder.",
-    "decoder.",
-    "model.language_model.",
-    "model.visual.",
-)
 
-TARGET_PREFIXES = (
-    "module.",
-    "model.",
-    "transformer.",
-    "text_encoder.",
-    "image_encoder.",
-    "encoder.",
-    "decoder.",
-)
+class _ForwardCapture:
+    def __init__(self, module: nn.Module):
+        self._module = module
+        self._handle: Optional[torch.utils.hooks.RemovableHandle] = None
+        self.output: Any = None
+
+    def __enter__(self) -> "_ForwardCapture":
+        def _hook(_: nn.Module, __: tuple[Any, ...], output: Any) -> None:
+            self.output = output
+
+        self._handle = self._module.register_forward_hook(_hook)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._handle is not None:
+            self._handle.remove()
+        self._handle = None
+
+
+@dataclass(frozen=True)
+class ParameterShardContext:
+    world_size: int
+    rank: int
 
 
 @dataclass(frozen=True)
@@ -120,82 +138,30 @@ COMPONENT_SPECS: Dict[ComponentType, ComponentSpec] = {
 }
 
 
-# Component path and config resolution helpers
-def _read_json(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {}
-    with open(path) as f:
-        return json.load(f)
+def _build_parameter_shard_contexts(
+    module: nn.Module,
+) -> Dict[str, ParameterShardContext]:
+    shard_contexts: Dict[str, ParameterShardContext] = {}
+    for module_name, submodule in module.named_modules():
+        tp_group = getattr(submodule, "tp_group", None)
+        if tp_group is None:
+            continue
 
-
-def _has_component_files(path: str) -> bool:
-    if not os.path.isdir(path):
-        return False
-    if os.path.exists(os.path.join(path, "config.json")):
-        return True
-    for ext in (".safetensors", ".bin", ".pth"):
-        if any(name.endswith(ext) for name in os.listdir(path)):
-            return True
-    return False
-
-
-def _is_text_encoder_config(path: str) -> bool:
-    cfg_path = os.path.join(path, "config.json")
-    if not os.path.exists(cfg_path):
-        return False
-    cfg = _read_json(cfg_path)
-    if cfg.get("model_type") == "i2v" or cfg.get("dim") == I2V_TEXT_ENCODER_DIM:
-        return False
-    return True
-
-
-def _resolve_component_subfolder(
-    model_index: Dict[str, Any], key: str
-) -> Optional[str]:
-    entry = model_index.get(key)
-    if isinstance(entry, dict):
-        return entry.get("path") or entry.get("subfolder")
-    if isinstance(entry, str):
-        return entry
-    if entry is not None:
-        return key
-    return None
-
-
-def resolve_component_path(
-    local_root: str, component: ComponentType
-) -> Tuple[str, str]:
-    """Resolve component subfolder strictly from model_index.json."""
-    spec = COMPONENT_SPECS[component]
-    model_index_path = os.path.join(local_root, "model_index.json")
-    model_index = _read_json(model_index_path)
-    if not model_index:
-        raise FileNotFoundError(
-            f"Missing or empty model_index.json at {model_index_path}"
+        context = ParameterShardContext(
+            world_size=get_group_size(tp_group),
+            rank=get_group_rank(tp_group),
         )
-
-    for key in spec.model_index_keys:
-        subfolder = _resolve_component_subfolder(model_index, key)
-        if not subfolder:
+        if context.world_size <= 1:
             continue
-        candidate = os.path.join(local_root, subfolder)
-        if not _has_component_files(candidate):
-            continue
-        if component == ComponentType.TEXT_ENCODER and not _is_text_encoder_config(
-            candidate
-        ):
-            continue
-        return candidate, subfolder
 
-    raise FileNotFoundError(
-        f"Could not resolve {component.value} from model_index.json under {local_root}"
-    )
+        for name, _ in submodule.named_parameters(recurse=False):
+            qualified_name = f"{module_name}.{name}" if module_name else name
+            shard_contexts[qualified_name] = context
+        for name, _ in submodule.named_buffers(recurse=False):
+            qualified_name = f"{module_name}.{name}" if module_name else name
+            shard_contexts[qualified_name] = context
 
-
-def _resolve_local_path(hub_id: str) -> str:
-    if os.path.isdir(hub_id):
-        return hub_id
-    return maybe_download_model(hub_id)
+    return shard_contexts
 
 
 def _build_pipeline_config(case: DiffusionTestCase, hub_id: str):
@@ -205,21 +171,7 @@ def _build_pipeline_config(case: DiffusionTestCase, hub_id: str):
         if info
         else _CONFIG_REGISTRY["0"].pipeline_config_cls()
     )
-    dit_config = getattr(pipeline_config, "dit_config", None)
-    if dit_config is None:
-        return pipeline_config
-
-    case_id = case.id.lower()
-    hub_id_lower = hub_id.lower()
-    if "i2v" in case_id or "i2v" in hub_id_lower or "ti2v" in case_id:
-        dit_config.image_dim = I2V_IMAGE_DIM
     return pipeline_config
-
-
-# Transformer models that require single-rank execution in component accuracy.
-def _requires_single_rank_transformer(model_path: str) -> bool:
-    model_path = model_path.lower()
-    return any(token in model_path for token in ("z-image", "wan", "qwen"))
 
 
 # Distributed/runtime setup helpers
@@ -237,36 +189,34 @@ def _ensure_distributed_env_defaults() -> None:
     )
 
 
-def _init_parallel(
-    case: DiffusionTestCase, component: ComponentType, num_gpus: int
-) -> None:
-    model_path = case.server_args.model_path.lower()
-    cfg_parallel = bool(case.server_args.cfg_parallel)
-    is_transformer = component == ComponentType.TRANSFORMER
-    is_text_encoder = component == ComponentType.TEXT_ENCODER
-    requires_single_rank_transformer = (
-        is_transformer and _requires_single_rank_transformer(model_path)
-    )
+def _initialize_parallel_runtime(sgl_args: ServerArgs) -> None:
+    tp_size = sgl_args.tp_size
+    sp_degree = sgl_args.sp_degree
+    ulysses_degree = sgl_args.ulysses_degree
+    ring_degree = sgl_args.ring_degree
+    dp_size = sgl_args.dp_size
+    enable_cfg_parallel = bool(sgl_args.enable_cfg_parallel)
 
-    if is_text_encoder:
-        tp_size, sp_size, dp_size, enable_cfg = 1, 1, max(1, num_gpus), False
-    elif requires_single_rank_transformer:
-        # Force SP=1 for accuracy comparisons against Diffusers to avoid SP-aware rotary mismatch.
-        tp_size, sp_size, dp_size, enable_cfg = 1, 1, max(1, num_gpus), cfg_parallel
-    else:
-        tp_size, sp_size = num_gpus, 1
-        if cfg_parallel:
-            tp_size = max(1, num_gpus // 2)
-        if is_transformer and "video" in case.server_args.modality:
-            tp_size, sp_size = 1, num_gpus
-        enable_cfg = cfg_parallel
-        dp_size = 1
+    if (
+        tp_size is None
+        or sp_degree is None
+        or ulysses_degree is None
+        or ring_degree is None
+    ):
+        raise RuntimeError(
+            "ServerArgs must have tp_size, sp_degree, ulysses_degree, and ring_degree before init"
+        )
+
+    if not model_parallel_is_initialized() and torch.distributed.is_initialized():
+        # A prior case may have failed while distributed groups were only partially
+        # initialized. Clear any stale group objects before re-initializing.
+        destroy_model_parallel()
 
     if model_parallel_is_initialized():
         current_tp = get_tensor_model_parallel_world_size()
         current_sp = get_sequence_parallel_world_size()
         current_dp = get_data_parallel_world_size()
-        if current_tp == tp_size and current_sp == sp_size and current_dp == dp_size:
+        if current_tp == tp_size and current_sp == sp_degree and current_dp == dp_size:
             return
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -276,49 +226,48 @@ def _init_parallel(
 
     maybe_init_distributed_environment_and_model_parallel(
         tp_size=tp_size,
-        sp_size=sp_size,
-        enable_cfg_parallel=enable_cfg,
+        sp_size=sp_degree,
+        enable_cfg_parallel=enable_cfg_parallel,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
         dp_size=dp_size,
     )
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
 
-def _build_server_args(
-    local_root: str,
+def _build_accuracy_server_args(
+    base_model_root: str,
     case: DiffusionTestCase,
+    pipeline_config,
+    component: ComponentType,
     num_gpus: int,
-    *,
-    sp_degree: Optional[int] = None,
-    tp_size: Optional[int] = None,
-    ulysses_degree: Optional[int] = None,
-    ring_degree: Optional[int] = None,
+    component_paths: Dict[str, str],
 ) -> ServerArgs:
+    cfg_parallel = bool(case.server_args.cfg_parallel)
     kwargs = {
-        "model_path": local_root,
+        "model_path": base_model_root,
         "num_gpus": num_gpus,
         "trust_remote_code": True,
+        "pipeline_config": pipeline_config,
+        "component_paths": component_paths,
+        "enable_cfg_parallel": cfg_parallel,
     }
-    if sp_degree is not None:
-        kwargs["sp_degree"] = sp_degree
-    if tp_size is not None:
-        kwargs["tp_size"] = tp_size
-    if ulysses_degree is not None:
-        kwargs["ulysses_degree"] = ulysses_degree
-    if ring_degree is not None:
-        kwargs["ring_degree"] = ring_degree
+
+    if case.server_args.tp_size is not None:
+        kwargs["tp_size"] = case.server_args.tp_size
+    if case.server_args.ulysses_degree is not None:
+        kwargs["ulysses_degree"] = case.server_args.ulysses_degree
+    if case.server_args.ring_degree is not None:
+        kwargs["ring_degree"] = case.server_args.ring_degree
+
+    if component == ComponentType.TEXT_ENCODER:
+        kwargs["enable_cfg_parallel"] = False
     sgl_args = ServerArgs(**kwargs)
-    if tp_size is None and case.server_args.tp_size is not None:
-        sgl_args.tp_size = case.server_args.tp_size
-    if ulysses_degree is None and case.server_args.ulysses_degree is not None:
-        sgl_args.ulysses_degree = case.server_args.ulysses_degree
-    if ring_degree is None and case.server_args.ring_degree is not None:
-        sgl_args.ring_degree = case.server_args.ring_degree
     sgl_args.text_encoder_cpu_offload = False
     sgl_args.dit_cpu_offload = False
     sgl_args.vae_cpu_offload = False
     sgl_args.image_encoder_cpu_offload = False
-    sgl_args.enable_cfg_parallel = case.server_args.cfg_parallel or False
     sgl_args.enable_cache_dit = case.server_args.enable_cache_dit
     sgl_args.dit_layerwise_offload = case.server_args.dit_layerwise_offload
     sgl_args.dit_offload_prefetch_size = case.server_args.dit_offload_prefetch_size
@@ -331,40 +280,66 @@ def _load_sglang_component(
     sgl_args: ServerArgs,
     component: ComponentType,
     library: str,
+    text_encoder_cpu_offload: bool | None = None,
 ) -> nn.Module:
     loader = ComponentLoader.for_component_type(component.value, library)
-    component_model = loader.load_customized(comp_path, sgl_args, component.value)
+    if component == ComponentType.TEXT_ENCODER:
+        component_model = loader.load_customized(
+            comp_path,
+            sgl_args,
+            component.value,
+            cpu_offload_flag=text_encoder_cpu_offload,
+        )
+    else:
+        component_model = loader.load_customized(comp_path, sgl_args, component.value)
     if component_model is None:
         raise RuntimeError(f"Failed to load customized {component.value}")
     return component_model
 
 
+def _load_wan_reference_vae(comp_path: str, pipeline_config) -> nn.Module:
+    vae_config = pipeline_config.vae_config
+    vae_config.update_model_arch(
+        get_diffusers_component_config(component_path=comp_path)
+    )
+    if hasattr(vae_config, "post_init"):
+        vae_config.post_init()
+
+    vae = AutoencoderKLWan(vae_config)
+    missing_keys, unexpected_keys = load_checkpoint_weights(vae, comp_path)
+    if missing_keys:
+        logger.warning("WAN VAE missing keys: %s", missing_keys)
+    if unexpected_keys:
+        logger.warning("WAN VAE unexpected keys: %s", unexpected_keys)
+    return vae
+
+
 def _load_reference_component(
     comp_path: str,
-    local_root: str,
+    source_root: str,
     component: ComponentType,
     hub_id: str,
     pipeline_config,
     subfolder: str,
 ) -> nn.Module:
     if component == ComponentType.VAE and "wan" in hub_id.lower():
-        return AutoencoderKLWan(pipeline_config.vae_config)
+        return _load_wan_reference_vae(comp_path, pipeline_config)
 
     if component == ComponentType.VAE:
-        cfg = _read_json(os.path.join(comp_path, "config.json"))
+        cfg = read_json_file(os.path.join(comp_path, "config.json"))
         class_name = cfg.get("_class_name") if cfg else None
         cls = getattr(diffusers, str(class_name), None) if class_name else None
         if cls is None:
             cls = diffusers.AutoencoderKL
         return cls.from_pretrained(
-            local_root,
+            source_root,
             subfolder=subfolder,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         )
 
     if component == ComponentType.TRANSFORMER:
-        cfg = _read_json(os.path.join(comp_path, "config.json"))
+        cfg = read_json_file(os.path.join(comp_path, "config.json"))
         class_name = cfg.get("_class_name") if cfg else None
         load_kwargs: Dict[str, Any] = {
             "torch_dtype": torch.bfloat16,
@@ -379,12 +354,6 @@ def _load_reference_component(
             ]:
                 if k in cfg:
                     load_kwargs[out_k] = cfg[k]
-        if (
-            "i2v" in hub_id.lower()
-            or "ti2v" in hub_id.lower()
-            or "i2v" in comp_path.lower()
-        ):
-            load_kwargs["image_dim"] = I2V_IMAGE_DIM
         candidates = [diffusers.AutoModel]
         if class_name:
             maybe_cls = getattr(diffusers, str(class_name), None)
@@ -410,8 +379,9 @@ def _load_reference_component(
             AutoModelForCausalLM,
             UMT5EncoderModel,
             T5EncoderModel,
-            AutoModelForVision2Seq,
         ]
+        if AutoVisionTextModel is not None:
+            class_order.append(AutoVisionTextModel)
         last_error: Optional[Exception] = None
         for cls in class_order:
             try:
@@ -425,50 +395,6 @@ def _load_reference_component(
     raise RuntimeError(f"Unsupported component {component.value}")
 
 
-# Module materialization and state mapping helpers
-def _set_module_attr(module: nn.Module, name: str, value: Any) -> None:
-    attrs = name.split(".")
-    parent = module
-    for attr in attrs[:-1]:
-        if hasattr(parent, attr):
-            parent = getattr(parent, attr)
-        elif isinstance(parent, (nn.ModuleList, nn.Sequential)):
-            parent = parent[int(attr)]
-        elif isinstance(parent, nn.ModuleDict):
-            parent = parent[attr]
-        else:
-            raise AttributeError(
-                f"Cannot resolve {name} on {module.__class__.__name__}"
-            )
-    setattr(parent, attrs[-1], value)
-
-
-def _materialize_module(
-    module: nn.Module, device: torch.device, dtype: torch.dtype
-) -> None:
-    for name, param in module.named_parameters():
-        if param.device.type == "meta":
-            new_data = torch.zeros(param.shape, device=device, dtype=dtype)
-            if hasattr(param, "device_mesh") and param.device_mesh is not None:
-                new_data = distribute_tensor(
-                    new_data, param.device_mesh, param.placements
-                )
-            _set_module_attr(
-                module, name, nn.Parameter(new_data, requires_grad=param.requires_grad)
-            )
-        elif torch.is_floating_point(param):
-            param.data = param.data.to(device=device, dtype=dtype)
-
-    for name, buf in module.named_buffers():
-        if buf.device.type == "meta":
-            new_buf = torch.zeros(buf.shape, device=device, dtype=buf.dtype)
-            if hasattr(buf, "device_mesh") and buf.device_mesh is not None:
-                new_buf = distribute_tensor(new_buf, buf.device_mesh, buf.placements)
-            _set_module_attr(module, name, new_buf)
-        elif torch.is_floating_point(buf):
-            buf.data = buf.data.to(device=device, dtype=dtype)
-
-
 def _resolve_reference_transfer_module(ref_component: nn.Module) -> nn.Module:
     if getattr(ref_component, "shared", None) is not None:
         return ref_component
@@ -477,141 +403,12 @@ def _resolve_reference_transfer_module(ref_component: nn.Module) -> nn.Module:
     return get_encoder() if callable(get_encoder) else ref_component
 
 
-# Weight-name normalization and tensor copy helpers.
-def _build_state_lookup(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    lookup: Dict[str, torch.Tensor] = {}
-    for key, val in state.items():
-        lookup[key] = val
-        for prefix in SOURCE_PREFIXES:
-            if key.startswith(prefix):
-                lookup[key[len(prefix) :]] = val
-    return lookup
-
-
-def _normalize_key(name: str) -> str:
-    return (
-        name.replace("_fsdp_wrapped_module.", "")
-        .replace("_orig_mod.", "")
-        .replace("gamma", "weight")
-        .replace("beta", "bias")
-        .replace("scale", "weight")
-        .replace("shift", "bias")
-    )
-
-
-def _fuse_qkv(lookup: Dict[str, torch.Tensor], name: str) -> Optional[torch.Tensor]:
-    if "qkv_proj" not in name:
-        return None
-    variants = ["q_proj", "q"]
-    for repl in variants:
-        q_name = name.replace("qkv_proj", repl)
-        k_name = q_name.replace(".q_proj", ".k_proj").replace(".q", ".k")
-        v_name = q_name.replace(".q_proj", ".v_proj").replace(".q", ".v")
-        if q_name in lookup and k_name in lookup and v_name in lookup:
-            return torch.cat([lookup[q_name], lookup[k_name], lookup[v_name]], dim=0)
-    return None
-
-
-def _generate_name_candidates(
-    name: str, reverse_mapping: Optional[Dict[str, Tuple[str, Any, Any]]]
-) -> List[str]:
-    candidates: List[str] = []
-    clean = _normalize_key(name)
-
-    for cand in (name, clean):
-        if cand not in candidates:
-            candidates.append(cand)
-
-    if reverse_mapping:
-        for key in (name, clean):
-            entry = reverse_mapping.get(key)
-            if entry and entry[0] not in candidates:
-                candidates.append(entry[0])
-
-    for prefix in TARGET_PREFIXES:
-        if clean.startswith(prefix):
-            stripped = clean[len(prefix) :]
-            if stripped and stripped not in candidates:
-                candidates.append(stripped)
-
-    parts = clean.split(".")
-    for i in range(1, len(parts)):
-        cand = ".".join(parts[i:])
-        if cand not in candidates:
-            candidates.append(cand)
-
-    return candidates
-
-
-def _copy_tensor(
-    dest: torch.Tensor,
-    src: torch.Tensor,
-    tp_world: int,
-    rank: int,
-) -> bool:
-    if src.numel() == 0:
-        return False
-    src = src.to(device=dest.device, dtype=dest.dtype)
-
-    if hasattr(dest, "device_mesh") and dest.device_mesh is not None:
-        if src.numel() == dest.numel():
-            with torch.no_grad():
-                dt = distribute_tensor(
-                    src.view(dest.shape), dest.device_mesh, dest.placements
-                )
-                dest.copy_(dt)
-            return True
-
-    if src.numel() == dest.numel():
-        with torch.no_grad():
-            dest.copy_(src.view(dest.shape))
-        return True
-
-    if tp_world > 1 and src.numel() == dest.numel() * tp_world:
-        if src.ndim >= 2 and src.shape[0] == dest.shape[0] * tp_world:
-            with torch.no_grad():
-                dest.copy_(src[rank * dest.shape[0] : (rank + 1) * dest.shape[0], ...])
-            return True
-        if src.ndim >= 2 and src.shape[1] == dest.shape[1] * tp_world:
-            with torch.no_grad():
-                dest.copy_(src[:, rank * dest.shape[1] : (rank + 1) * dest.shape[1]])
-            return True
-        flat = src.flatten()
-        chunk = flat.numel() // tp_world
-        with torch.no_grad():
-            dest.copy_(flat[rank * chunk : (rank + 1) * chunk].view(dest.shape))
-        return True
-
-    if src.ndim == 4 and dest.ndim == 5 and dest.numel() == src.numel() * dest.shape[2]:
-        with torch.no_grad():
-            dest.copy_(src.unsqueeze(2).repeat(1, 1, dest.shape[2], 1, 1))
-        return True
-
-    return False
-
-
-# Forward hook capture helper.
-class _ForwardCapture:
-    def __init__(self, module: nn.Module):
-        self._module = module
-        self._handle: Optional[torch.utils.hooks.RemovableHandle] = None
-        self.output: Any = None
-
-    def __enter__(self) -> "_ForwardCapture":
-        def _hook(_: nn.Module, __: tuple[Any, ...], output: Any) -> None:
-            self.output = output
-
-        self._handle = self._module.register_forward_hook(_hook)
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if self._handle is not None:
-            self._handle.remove()
-        self._handle = None
-
-
 # Public accuracy engine
 class AccuracyEngine:
+    @staticmethod
+    def reset_parallel_runtime() -> None:
+        cleanup_dist_env_and_memory()
+
     @staticmethod
     def clear_memory() -> None:
         gc.collect()
@@ -619,6 +416,18 @@ class AccuracyEngine:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+
+    @staticmethod
+    def _execute_with_native_hook(call) -> Any:
+        with _ForwardCapture(call.module) as capture:
+            call.module(*call.args, **call.kwargs)
+        return capture.output
+
+    @staticmethod
+    def _apply_output_transforms(tensor: torch.Tensor, call) -> torch.Tensor:
+        if call.negate_output:
+            return -tensor
+        return tensor
 
     @staticmethod
     def check_accuracy(
@@ -662,11 +471,12 @@ class AccuracyEngine:
         source: nn.Module,
         target: nn.Module,
         min_match_ratio: float = MIN_MATCH_RATIO,
+        target_device: Optional[torch.device] = None,
     ) -> None:
         """Copy matching parameters from reference to SGLang module with TP-aware slicing."""
-        device = get_local_torch_device()
+        device = target_device or get_local_torch_device()
         dtype = torch.bfloat16
-        _materialize_module(target, device, dtype)
+        materialize_module(target, device, dtype)
 
         source_state = source.state_dict()
         mapping = getattr(target, "param_names_mapping", None) or getattr(
@@ -677,7 +487,7 @@ class AccuracyEngine:
                 source_state, get_param_names_mapping(mapping)
             )
 
-        lookup = _build_state_lookup(source_state)
+        lookup = build_state_lookup(source_state)
         reverse_mapping = getattr(
             target, "reverse_param_names_mapping", None
         ) or getattr(
@@ -691,56 +501,70 @@ class AccuracyEngine:
         rank = (
             get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
         )
+        shard_contexts = _build_parameter_shard_contexts(target)
 
         matched = 0
         total = 0
+        unmatched_details: List[str] = []
         for name, tensor in target.named_parameters():
             total += 1
             src_tensor = None
-            for cand in _generate_name_candidates(name, reverse_mapping):
+            for cand in generate_name_candidates(name, reverse_mapping):
                 if cand in lookup:
                     src_tensor = lookup[cand]
                     break
             if src_tensor is None:
-                for cand in _generate_name_candidates(name, reverse_mapping):
-                    src_tensor = _fuse_qkv(lookup, cand)
+                for cand in generate_name_candidates(name, reverse_mapping):
+                    src_tensor = fuse_qkv(lookup, cand)
                     if src_tensor is not None:
                         break
             if src_tensor is None:
+                for cand in generate_name_candidates(name, reverse_mapping):
+                    src_tensor = fuse_gate_up_proj(lookup, cand)
+                    if src_tensor is not None:
+                        break
+            if src_tensor is None:
+                unmatched_details.append(f"{name}: no matching source tensor")
                 continue
-            if _copy_tensor(tensor, src_tensor, tp_world, rank):
+            shard_context = shard_contexts.get(name)
+            shard_world_size = (
+                shard_context.world_size if shard_context is not None else tp_world
+            )
+            shard_rank = shard_context.rank if shard_context is not None else rank
+            if copy_tensor(tensor, src_tensor, shard_world_size, shard_rank):
                 matched += 1
+            else:
+                unmatched_details.append(
+                    f"{name}: source {list(src_tensor.shape)} -> target {list(tensor.shape)} unsupported for shard_world_size={shard_world_size}"
+                )
 
         for name, tensor in target.named_buffers():
             src_tensor = None
-            for cand in _generate_name_candidates(name, reverse_mapping):
+            for cand in generate_name_candidates(name, reverse_mapping):
                 if cand in lookup:
                     src_tensor = lookup[cand]
                     break
             if src_tensor is None:
                 continue
-            _copy_tensor(tensor, src_tensor, tp_world, rank)
+            shard_context = shard_contexts.get(name)
+            shard_world_size = (
+                shard_context.world_size if shard_context is not None else tp_world
+            )
+            shard_rank = shard_context.rank if shard_context is not None else rank
+            copy_tensor(tensor, src_tensor, shard_world_size, shard_rank)
 
         ratio = matched / max(total, 1)
         logger.info(
             "Weight transfer: %s/%s matched (%.2f%%).", matched, total, ratio * 100
         )
         if ratio < min_match_ratio:
+            if rank == 0 and unmatched_details:
+                logger.error(
+                    "Unmatched parameter details:\n%s", "\n".join(unmatched_details)
+                )
             raise RuntimeError(
                 f"Weight transfer matched {matched}/{total} ({ratio:.2%}); below threshold {min_match_ratio:.2%}."
             )
-
-    @staticmethod
-    def _execute_with_native_hook(call: HookCall) -> Any:
-        with _ForwardCapture(call.module) as capture:
-            call.module(*call.args, **call.kwargs)
-        return capture.output
-
-    @staticmethod
-    def _apply_output_transforms(tensor: torch.Tensor, call: HookCall) -> torch.Tensor:
-        if call.negate_output:
-            return -tensor
-        return tensor
 
     @staticmethod
     def run_component_pair_native(
@@ -752,18 +576,18 @@ class AccuracyEngine:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if component == ComponentType.TEXT_ENCODER:
             raise ValueError("Text encoder path is not migrated to native hooks yet")
-        resolved_profile = resolve_native_profile(component.value)
+        profile = resolve_native_profile(component.value)
 
-        inputs = resolved_profile.build_inputs(case, sgl_model, device, ref_model)
-        sgl_call = resolved_profile.prepare_sglang_call(sgl_model, inputs)
-        ref_call = resolved_profile.prepare_reference_call(ref_model, inputs)
+        inputs = profile.build_inputs(case, sgl_model, device, ref_model)
+        sgl_call = profile.prepare_sglang_call(sgl_model, inputs)
+        ref_call = profile.prepare_reference_call(ref_model, inputs)
 
         with torch.no_grad():
             sgl_raw = AccuracyEngine._execute_with_native_hook(sgl_call)
             ref_raw = AccuracyEngine._execute_with_native_hook(ref_call)
 
-        sgl_out = resolved_profile.normalize_sglang_output(sgl_raw)
-        ref_out = resolved_profile.normalize_reference_output(ref_raw)
+        sgl_out = profile.normalize_sglang_output(sgl_raw)
+        ref_out = profile.normalize_reference_output(ref_raw)
         sgl_out = AccuracyEngine._apply_output_transforms(sgl_out, sgl_call)
         ref_out = AccuracyEngine._apply_output_transforms(ref_out, ref_call)
         return sgl_out, ref_out
@@ -774,6 +598,8 @@ class AccuracyEngine:
         component: ComponentType,
         library: str,
         num_gpus: int,
+        materialize_sgl_on_device: bool = True,
+        materialize_ref_on_device: bool = True,
     ) -> Tuple[nn.Module, nn.Module, str]:
         """Load SGLang + reference components and align weights for accuracy checks."""
         spec = COMPONENT_SPECS[component]
@@ -786,44 +612,52 @@ class AccuracyEngine:
             )
             library = spec.reference_library
         hub_id = case.server_args.model_path
-        local_root = _resolve_local_path(hub_id)
-        comp_path, subfolder = resolve_component_path(local_root, component)
-
-        _init_parallel(case, component, num_gpus)
-
-        pipeline_config = _build_pipeline_config(case, hub_id)
-        override_sp = None
-        override_tp = None
-        override_ulysses = None
-        override_ring = None
-        if component == ComponentType.TEXT_ENCODER or (
-            component == ComponentType.TRANSFORMER
-            and _requires_single_rank_transformer(hub_id)
-        ):
-            override_sp = 1
-            override_tp = 1
-            override_ulysses = 1
-            override_ring = 1
-        sgl_args = _build_server_args(
-            local_root,
-            case,
-            num_gpus,
-            sp_degree=override_sp,
-            tp_size=override_tp,
-            ulysses_degree=override_ulysses,
-            ring_degree=override_ring,
+        component_selection = select_component_source(
+            hub_id,
+            case.server_args.extras,
+            component,
+            spec.model_index_keys,
         )
-        sgl_args.pipeline_config = pipeline_config
+        pipeline_config = _build_pipeline_config(
+            case, component_selection.base_model_id
+        )
+        sgl_args = _build_accuracy_server_args(
+            component_selection.base_model_root,
+            case,
+            pipeline_config,
+            component,
+            num_gpus,
+            component_selection.component_paths,
+        )
+        _initialize_parallel_runtime(sgl_args)
         set_global_server_args(sgl_args)
 
         device = get_local_torch_device()
 
         sgl_component = _load_sglang_component(
-            comp_path, sgl_args, component, library
-        ).to(device=device, dtype=torch.bfloat16)
+            component_selection.source_path,
+            sgl_args,
+            component,
+            library,
+            text_encoder_cpu_offload=(
+                False
+                if component != ComponentType.TEXT_ENCODER or materialize_sgl_on_device
+                else True
+            ),
+        )
+        if materialize_sgl_on_device:
+            sgl_component = sgl_component.to(device=device, dtype=torch.bfloat16)
+
         ref_component = _load_reference_component(
-            comp_path, local_root, component, hub_id, pipeline_config, subfolder
-        ).to(device=device, dtype=torch.bfloat16)
+            component_selection.source_path,
+            component_selection.source_root,
+            component,
+            hub_id,
+            pipeline_config,
+            component_selection.source_subfolder,
+        )
+        if materialize_ref_on_device:
+            ref_component = ref_component.to(device=device, dtype=torch.bfloat16)
 
         if component == ComponentType.TRANSFORMER and "wan" in hub_id.lower():
             fc_mod._forward_context = ForwardContext(
@@ -835,7 +669,13 @@ class AccuracyEngine:
             if component == ComponentType.TEXT_ENCODER
             else ref_component
         )
-        AccuracyEngine.transfer_weights(ref_for_transfer, sgl_component)
+        AccuracyEngine.transfer_weights(
+            ref_for_transfer,
+            sgl_component,
+            target_device=(
+                device if materialize_sgl_on_device else torch.device("cpu")
+            ),
+        )
 
         if component != ComponentType.VAE:
             if not hasattr(fc_mod._forward_context, "attn_metadata"):

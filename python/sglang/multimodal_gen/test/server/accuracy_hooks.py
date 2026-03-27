@@ -40,6 +40,8 @@ LARGE_CHANNEL_LAYOUT_THRESHOLD = 128
 class TransformerHookCompat:
     normalize_reference_timestep: bool = False
     negate_reference_output: bool = False
+    omit_reference_guidance: bool = False
+    use_2d_hidden_states: bool = False
 
 
 def _resolve_transformer_hook_compat(case: Any) -> TransformerHookCompat:
@@ -49,7 +51,17 @@ def _resolve_transformer_hook_compat(case: Any) -> TransformerHookCompat:
             normalize_reference_timestep=True,
             negate_reference_output=True,
         )
-    if "flux" in model_path or "qwen" in model_path:
+    if "qwen" in model_path:
+        return TransformerHookCompat(
+            normalize_reference_timestep=True,
+            omit_reference_guidance=True,
+        )
+    if "sana" in model_path:
+        return TransformerHookCompat(
+            omit_reference_guidance=True,
+            use_2d_hidden_states=True,
+        )
+    if "flux" in model_path:
         return TransformerHookCompat(normalize_reference_timestep=True)
     return TransformerHookCompat()
 
@@ -269,10 +281,24 @@ def _build_generic_transformer_inputs(
         hidden_states = rng.randn(
             (1, in_channels, 1, height, width), device, torch.bfloat16
         )
+    elif compat.use_2d_hidden_states:
+        spatial_size = (
+            REDUCED_TOKEN_LAYOUT_SIZE
+            if "encoder_attention_mask" in param_names
+            or "encoder_hidden_states_mask" in param_names
+            else DEFAULT_TOKEN_LAYOUT_SIZE
+        )
+        height, width = spatial_size, spatial_size
+        hidden_states = rng.randn(
+            (1, in_channels, height, width),
+            device,
+            torch.bfloat16,
+        )
     else:
         spatial_size = (
             REDUCED_TOKEN_LAYOUT_SIZE
             if "encoder_attention_mask" in param_names
+            or "encoder_hidden_states_mask" in param_names
             else DEFAULT_TOKEN_LAYOUT_SIZE
         )
         height, width = spatial_size, spatial_size
@@ -297,10 +323,15 @@ def _build_generic_transformer_inputs(
         inputs["pooled_projections"] = rng.randn(
             (1, pooled_channels), device, torch.bfloat16
         )
-    if "encoder_attention_mask" in param_names:
-        inputs["encoder_attention_mask"] = torch.ones(
+    if (
+        "encoder_attention_mask" in param_names
+        or "encoder_hidden_states_mask" in param_names
+    ):
+        attention_mask = torch.ones(
             1, DEFAULT_TEXT_SEQ_LEN, device=device, dtype=torch.bool
         )
+        inputs["encoder_attention_mask"] = attention_mask
+        inputs["encoder_hidden_states_mask"] = attention_mask
     if "encoder_hidden_states_image" in param_names and _supports_image_conditioning(
         model
     ):
@@ -417,23 +448,26 @@ def _prepare_generic_transformer_call(
         kwargs["t"] = timestep
 
     if "guidance" in param_names and "guidance" in inputs:
-        skip_guidance_for_image_context = (
-            "encoder_hidden_states_image" in param_names
-            and "img_ids" not in param_names
-            and "img_shapes" not in param_names
-        )
-        supports_guidance_embedding = _supports_guidance_embedding(module)
-        requires_guidance_arg = (
-            signature.parameters["guidance"].default is inspect._empty
-        )
-        should_include_guidance = (
-            not skip_guidance_for_image_context and supports_guidance_embedding
-        )
-        if should_include_guidance or requires_guidance_arg:
-            guidance_value = inputs["guidance"]
-            if side == "sglang":
-                guidance_value = guidance_value * TIMESTEP_NORMALIZATION_FACTOR
-            kwargs["guidance"] = guidance_value
+        if side == "reference" and compat.omit_reference_guidance:
+            pass
+        else:
+            skip_guidance_for_image_context = (
+                "encoder_hidden_states_image" in param_names
+                and "img_ids" not in param_names
+                and "img_shapes" not in param_names
+            )
+            supports_guidance_embedding = _supports_guidance_embedding(module)
+            requires_guidance_arg = (
+                signature.parameters["guidance"].default is inspect._empty
+            )
+            should_include_guidance = (
+                not skip_guidance_for_image_context and supports_guidance_embedding
+            )
+            if should_include_guidance or requires_guidance_arg:
+                guidance_value = inputs["guidance"]
+                if side == "sglang":
+                    guidance_value = guidance_value * TIMESTEP_NORMALIZATION_FACTOR
+                kwargs["guidance"] = guidance_value
 
     if (
         "encoder_hidden_states_image" in param_names
@@ -451,6 +485,7 @@ def _prepare_generic_transformer_call(
         "freqs_cis",
         "additional_t_cond",
         "encoder_attention_mask",
+        "encoder_hidden_states_mask",
     ):
         if key in param_names and key in inputs:
             kwargs[key] = inputs[key]
