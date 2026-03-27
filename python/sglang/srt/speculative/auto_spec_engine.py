@@ -87,8 +87,8 @@ class AutoSpecEngine:
         )
 
         # EMA smoothing factor for acceptance rate tracking
-        # self.ema_alpha = 0.3
-        self.ema_alpha = 1.0
+        self.ema_alpha = 0.3
+        # self.ema_alpha = 1.0
 
         # Load or build bs -> steps mapping
         self._init_bs_steps_mapping()
