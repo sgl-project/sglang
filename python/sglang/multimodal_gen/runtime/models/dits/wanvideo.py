@@ -1190,7 +1190,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             end_skipping = teacache_params.end_skipping
 
         # Adjust start_skipping and end_skipping for CFG mode
-        if not ctx.do_cfg:
+        if ctx.do_cfg:
             start_skipping = start_skipping * 2
             end_skipping = end_skipping * 2
 
