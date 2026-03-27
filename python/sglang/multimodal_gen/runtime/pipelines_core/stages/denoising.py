@@ -113,9 +113,10 @@ class DenoisingStage(PipelineStage):
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
         # TODO(will): hack, should use the actual one in dit
+        attn_dtype = torch.bfloat16 if current_platform.is_xpu() else torch.float16
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
-            dtype=torch.float16,
+            dtype=attn_dtype,
         )
 
         # cfg
