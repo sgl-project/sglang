@@ -355,7 +355,6 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, has_bias, BLOC
     Unroll<ROWS * COLS>{}(storec);
   }
 };
-
 template <int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
   static inline void apply(
@@ -842,7 +841,6 @@ void tinygemm_kernel2(
     }
   }
 }
-
 // NB: fp8/fp4 scaled mm kernel implementation
 //
 //        scalar_t     packed_t     param_t
@@ -950,6 +948,85 @@ void tinygemm_kernel(
       A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
 
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
+    const uint8_t* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, uint8_t, uint8_t, true>(
+        A, B, C, Btmp, Ctmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
+  tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
+      A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+}
+
+// tinygemm interface
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const at::Float8_e4m3fn* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
+    const float* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, true>(
+        A, B, C, Btmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
+  tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, false>(
+      A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+}
+
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
+    const uint8_t* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, uint8_t, uint8_t, true>(
+        A, B, C, Btmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
+  tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
+      A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+}
 template <typename scalar_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
@@ -1089,7 +1166,6 @@ INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
       bool brg)
 
 INSTANTIATE_TINYGEMM_TEMPLATE2(at::BFloat16);
-
 inline const float* get_bias_data(const std::optional<at::Tensor>& bias, int64_t N) {
   if (bias.has_value()) {
     const auto& bias_ref = bias.value();

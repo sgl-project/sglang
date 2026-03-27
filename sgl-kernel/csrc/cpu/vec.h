@@ -6,7 +6,7 @@
 
 #include <ATen/cpu/vec/functional.h>
 #include <ATen/cpu/vec/vec.h>
-
+#include <immintrin.h>
 namespace {
 
 using namespace at::vec;
@@ -134,7 +134,6 @@ inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
   return cvt_e4m3_bf16_intrinsic_with_denorm(a);
 #endif
 }
-
 // faster version of float8_e4m3fn conversion to bfloat16
 //
 // we mapped cuda implementation from below link and vectorized with avx512:
