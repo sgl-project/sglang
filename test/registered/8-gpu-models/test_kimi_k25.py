@@ -38,9 +38,13 @@ class TestKimiK25(unittest.TestCase):
             "--speculative-num-steps=3",
             "--speculative-eagle-topk=1",
             "--speculative-num-draft-tokens=4",
-            "--mem-frac=0.85",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
+        ]
+
+        dp_attn_args = [
+            "--dp=8",
+            "--enable-dp-attention",
         ]
 
         variants = [
@@ -55,6 +59,12 @@ class TestKimiK25(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args + eagle3_args,
                 variant="TP8+MTP",
+            ),
+            ModelLaunchSettings(
+                KIMI_K25_MODEL_PATH,
+                tp_size=8,
+                extra_args=base_args + dp_attn_args + eagle3_args,
+                variant="TP8+DP8+MTP",
             ),
         ]
 

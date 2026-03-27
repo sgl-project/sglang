@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     is_npu,
     make_layers,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -486,12 +487,13 @@ class LLaDA2MoeAttention(nn.Module):
             self.rotary_dim = config.rotary_dim
         else:
             self.rotary_dim = self.head_dim
+        rope_theta, rope_scaling = get_rope_config(config)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_parameters["rope_theta"],
-            rope_scaling=config.rope_parameters,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
 
         self.attn = RadixAttention(
