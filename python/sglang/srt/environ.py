@@ -406,7 +406,6 @@ class Envs:
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
-    SGLANG_SUPPORT_CUTLASS_BLOCK_FP8 = EnvBool(False)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
 
@@ -582,10 +581,6 @@ _convert_SGL_to_SGLANG()
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_ENABLE_FLASHINFER_GEMM",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
-    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
 )
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
