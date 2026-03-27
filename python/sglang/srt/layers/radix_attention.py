@@ -116,9 +116,9 @@ class RadixAttention(nn.Module):
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if self.qk_head_dim != self.v_head_dim:
-                output = q.new_zeros((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+                output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:
-                output = torch.zeros_like(q)
+                output = torch.empty_like(q)
             unified_attention_with_output(
                 q, k, v, output, save_kv_cache, self.layer_id, **kwargs
             )
@@ -154,8 +154,6 @@ def unified_attention_with_output(
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
-    if real_num_tokens is None:
-        real_num_tokens = query.shape[0]
 
     query = query[:real_num_tokens]
     key = key[:real_num_tokens]

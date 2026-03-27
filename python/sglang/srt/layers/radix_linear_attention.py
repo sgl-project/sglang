@@ -78,7 +78,7 @@ class RadixLinearAttention(nn.Module):
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
             seq_len = mixed_qkv.shape[0]
-            output = torch.zeros(
+            output = torch.empty(
                 (1, seq_len, self.num_v_heads, self.head_v_dim),
                 dtype=mixed_qkv.dtype,
                 device=mixed_qkv.device,
@@ -118,8 +118,6 @@ def unified_linear_attention_with_output(
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
-    if real_num_tokens is None:
-        real_num_tokens = mixed_qkv.shape[0]
 
     ret = forward_batch.attn_backend.forward(
         layer=attention_layer,
