@@ -256,6 +256,93 @@ def test_moe_align_block_size_compare_implementations(
     )
 
 
+@pytest.mark.parametrize(
+    "block_size,num_tokens,topk,num_experts",
+    list(
+        itertools.product(
+            [64, 128],  # block_size
+            [1, 8, 32, 256],  # num_tokens
+            [8],  # topk
+            [1025, 2048, 4096],  # num_experts (>1024 to exercise v2 kernel)
+        )
+    ),
+)
+def test_moe_align_block_size_v2_large_num_experts(
+    block_size, num_tokens, topk, num_experts
+):
+    """Test moe_align_block_size v2 kernel for >1024 experts against Triton reference."""
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    if topk_ids.numel() < num_experts + 1:
+        max_num_tokens_padded = topk_ids.numel() * block_size
+
+    sorted_ids_cuda = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+    )
+    sorted_ids_cuda.fill_(topk_ids.numel())
+    max_num_m_blocks = max_num_tokens_padded // block_size
+    expert_ids_cuda = torch.zeros(
+        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+    )
+    num_tokens_post_pad_cuda = torch.empty(
+        (1), dtype=torch.int32, device=topk_ids.device
+    )
+    cumsum_buffer = torch.empty(
+        num_experts + 2, dtype=torch.int32, device=topk_ids.device
+    )
+
+    sorted_ids_triton = torch.empty_like(sorted_ids_cuda)
+    sorted_ids_triton.fill_(topk_ids.numel())
+    expert_ids_triton = torch.zeros_like(expert_ids_cuda)
+    num_tokens_post_pad_triton = torch.empty_like(num_tokens_post_pad_cuda)
+
+    moe_align_block_size(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids_cuda,
+        expert_ids_cuda,
+        num_tokens_post_pad_cuda,
+        cumsum_buffer,
+        True,
+    )
+
+    moe_align_block_size_triton(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids_triton,
+        expert_ids_triton,
+        num_tokens_post_pad_triton,
+    )
+
+    assert torch.equal(num_tokens_post_pad_cuda, num_tokens_post_pad_triton), (
+        f"Num tokens post pad mismatch: CUDA={num_tokens_post_pad_cuda.item()}, "
+        f"Triton={num_tokens_post_pad_triton.item()}"
+    )
+
+    ntp = num_tokens_post_pad_cuda.item()
+    num_blocks = ntp // block_size
+
+    assert torch.equal(expert_ids_cuda[:num_blocks], expert_ids_triton[:num_blocks]), (
+        f"Expert IDs mismatch for block_size={block_size}, "
+        f"num_tokens={num_tokens}, topk={topk}, num_experts={num_experts}"
+    )
+
+    # Compare sorted_token_ids per expert block (order within block may differ)
+    for b in range(num_blocks):
+        s, e = b * block_size, (b + 1) * block_size
+        block_cuda = sorted_ids_cuda[s:e].sort().values
+        block_triton = sorted_ids_triton[s:e].sort().values
+        assert torch.equal(block_cuda, block_triton), (
+            f"Block {b} sorted_ids mismatch for num_experts={num_experts}, "
+            f"num_tokens={num_tokens}"
+        )
+
+
 @pytest.mark.parametrize("m", [1, 33, 64, 222])
 @pytest.mark.parametrize("topk", [2, 6])
 @pytest.mark.parametrize("k", [128, 511, 1024])
