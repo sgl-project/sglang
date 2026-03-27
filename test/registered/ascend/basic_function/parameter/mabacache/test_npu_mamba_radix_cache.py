@@ -12,10 +12,10 @@ register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 
 class TestMambaCache(CustomTestCase):
-    """Testcase：Verify the MambaCache
+    """Testcase：Verify the prefix sharing mechanism of the Radix tree take effect.
 
     [Test Category] Parameter
-    [Test Target] --lora-target-modules
+    [Test Target] --disable-radix-cache
     """
 
     model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST
