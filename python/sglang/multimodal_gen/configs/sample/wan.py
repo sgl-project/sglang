@@ -69,6 +69,8 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
             teacache_thresh=0.08,
             use_ret_steps=True,
             coefficients_callback=_wan_1_3b_coefficients,
+            start_skipping=5,
+            end_skipping=1.0,
         )
     )
 
@@ -104,7 +106,7 @@ class WanT2V_14B_SamplingParams(SamplingParams):
             use_ret_steps=False,
             coefficients_callback=_wan_14b_coefficients,
             start_skipping=1,
-            end_skipping=-2,
+            end_skipping=-1,
         )
     )
 
@@ -129,6 +131,8 @@ class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
             teacache_thresh=0.26,
             use_ret_steps=True,
             coefficients_callback=_wan_14b_coefficients,
+            start_skipping=5,
+            end_skipping=1.0,
         )
     )
 
@@ -155,6 +159,8 @@ class WanI2V_14B_720P_SamplingParam(WanT2V_14B_SamplingParams):
             teacache_thresh=0.3,
             use_ret_steps=True,
             coefficients_callback=_wan_14b_coefficients,
+            start_skipping=5,
+            end_skipping=1.0,
         )
     )
 

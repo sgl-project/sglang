@@ -1172,27 +1172,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # Initialize Wan-specific parameters
         teacache_params = ctx.teacache_params
         use_ret_steps = teacache_params.use_ret_steps
-        num_steps = ctx.num_inference_steps
-
-        # set the start and end skippable steps
-        if isinstance(teacache_params.start_skipping, float):
-            start_skipping = int(num_steps * teacache_params.start_skipping)
-        elif teacache_params.start_skipping < 0:
-            start_skipping = num_steps + teacache_params.start_skipping
-        else:
-            start_skipping = teacache_params.start_skipping
-
-        if isinstance(teacache_params.end_skipping, float):
-            end_skipping = int(num_steps * teacache_params.end_skipping)
-        elif teacache_params.end_skipping < 0:
-            end_skipping = num_steps + teacache_params.end_skipping
-        else:
-            end_skipping = teacache_params.end_skipping
-
-        # Adjust start_skipping and end_skipping for CFG mode
-        if ctx.do_cfg:
-            start_skipping = start_skipping * 2
-            end_skipping = end_skipping * 2
+        start_skipping, end_skipping = teacache_params.get_skip_boundaries(
+            ctx.num_inference_steps, ctx.do_cfg
+        )
 
         # Determine boundary step
         is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping

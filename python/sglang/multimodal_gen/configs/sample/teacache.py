@@ -21,14 +21,14 @@ class TeaCacheParams(CacheParams):
             Threshold for accumulated relative L1 distance. When below this threshold, the
             forward pass is skipped. Recommended values: 0.25 for ~1.5x speedup, 0.4 for ~1.8x,
             0.6 for ~2.0x.
-        start_skipping (`int`, 'float', defaults to `0.2`):
+        start_skipping (`int` or `float`, defaults to `5`):
             The number of timesteps after which we may skip a forward pass. These early
             steps define the global structure and are too critical to not skip.
             int: The number of timesteps after which we can skip. If negative,
                  this is an offset from the end of the schedule.
             float (0.0 - 1.0): A percentage of the total steps (e.g., 0.1
                                computes the first 10%).
-        end_skipping (`int`, defaults to `-1`):
+        end_skipping (`int` or `float`, defaults to `-1`):
             The number of timesteps after which we are no longer able to skip
             forward passes. The last steps refine fine textures and details.
             int: The number of timesteps after which skipping ends. If negative,
@@ -49,10 +49,34 @@ class TeaCacheParams(CacheParams):
 
     cache_type: str = "teacache"
     teacache_thresh: float = 0.0
-    start_skipping: int = 5
-    end_skipping: int = -1
+    start_skipping: int | float = 5
+    end_skipping: int | float = -1
     coefficients: list[float] = field(default_factory=list)
     coefficients_callback: Callable[[TeaCacheParams], list[float]] | None = field(
         default=None, repr=False
     )
     use_ret_steps: bool | None = None
+
+    def get_coefficients(self) -> list[float]:
+        if self.coefficients_callback is not None:
+            return self.coefficients_callback(self)
+        return self.coefficients
+
+    def get_skip_boundaries(
+        self, num_inference_steps: int, do_cfg: bool
+    ) -> tuple[int, int]:
+        def _resolve_boundary(value: int | float) -> int:
+            if isinstance(value, float):
+                return int(num_inference_steps * value)
+            if value < 0:
+                return num_inference_steps + value
+            return value
+
+        start_skipping = _resolve_boundary(self.start_skipping)
+        end_skipping = _resolve_boundary(self.end_skipping)
+
+        if do_cfg:
+            start_skipping *= 2
+            end_skipping *= 2
+
+        return start_skipping, end_skipping
