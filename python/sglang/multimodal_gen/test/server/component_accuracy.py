@@ -27,13 +27,9 @@ except ImportError:
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
-    destroy_model_parallel,
-    get_data_parallel_world_size,
     get_local_torch_device,
-    get_sequence_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
@@ -56,12 +52,14 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
 )
 from sglang.multimodal_gen.test.server.accuracy_hooks import resolve_native_profile
 from sglang.multimodal_gen.test.server.accuracy_utils import (
+    build_accuracy_server_args,
     build_parameter_shard_contexts,
     build_state_lookup,
     copy_tensor,
     fuse_gate_up_proj,
     fuse_qkv,
     generate_name_candidates,
+    initialize_parallel_runtime,
     load_checkpoint_weights,
     materialize_module,
     read_json_file,
@@ -129,106 +127,6 @@ COMPONENT_SPECS: Dict[ComponentType, ComponentSpec] = {
         reference_library="transformers",
     ),
 }
-
-
-# Distributed/runtime setup helpers
-def _ensure_distributed_env_defaults() -> None:
-    if "WORLD_SIZE" in os.environ:
-        return
-    os.environ.update(
-        {
-            "MASTER_ADDR": os.getenv("MASTER_ADDR", "127.0.0.1"),
-            "MASTER_PORT": os.getenv("MASTER_PORT", "29505"),
-            "RANK": "0",
-            "LOCAL_RANK": "0",
-            "WORLD_SIZE": "1",
-        }
-    )
-
-
-def _initialize_parallel_runtime(sgl_args: ServerArgs) -> None:
-    tp_size = sgl_args.tp_size
-    sp_degree = sgl_args.sp_degree
-    ulysses_degree = sgl_args.ulysses_degree
-    ring_degree = sgl_args.ring_degree
-    dp_size = sgl_args.dp_size
-    enable_cfg_parallel = bool(sgl_args.enable_cfg_parallel)
-
-    if (
-        tp_size is None
-        or sp_degree is None
-        or ulysses_degree is None
-        or ring_degree is None
-    ):
-        raise RuntimeError(
-            "ServerArgs must have tp_size, sp_degree, ulysses_degree, and ring_degree before init"
-        )
-
-    if not model_parallel_is_initialized() and torch.distributed.is_initialized():
-        # A prior case may have failed while distributed groups were only partially
-        # initialized. Clear any stale group objects before re-initializing.
-        destroy_model_parallel()
-
-    if model_parallel_is_initialized():
-        current_tp = get_tensor_model_parallel_world_size()
-        current_sp = get_sequence_parallel_world_size()
-        current_dp = get_data_parallel_world_size()
-        if current_tp == tp_size and current_sp == sp_degree and current_dp == dp_size:
-            return
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        destroy_model_parallel()
-
-    _ensure_distributed_env_defaults()
-
-    maybe_init_distributed_environment_and_model_parallel(
-        tp_size=tp_size,
-        sp_size=sp_degree,
-        enable_cfg_parallel=enable_cfg_parallel,
-        ulysses_degree=ulysses_degree,
-        ring_degree=ring_degree,
-        dp_size=dp_size,
-    )
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-
-
-def _build_accuracy_server_args(
-    base_model_id: str,
-    base_model_root: str,
-    case: DiffusionTestCase,
-    component: ComponentType,
-    num_gpus: int,
-    component_paths: Dict[str, str],
-) -> ServerArgs:
-    cfg_parallel = bool(case.server_args.cfg_parallel)
-    kwargs = {
-        "model_path": base_model_root,
-        "model_id": base_model_id,
-        "num_gpus": num_gpus,
-        "trust_remote_code": True,
-        "component_paths": component_paths,
-        "enable_cfg_parallel": cfg_parallel,
-    }
-
-    if case.server_args.tp_size is not None:
-        kwargs["tp_size"] = case.server_args.tp_size
-    if case.server_args.ulysses_degree is not None:
-        kwargs["ulysses_degree"] = case.server_args.ulysses_degree
-    if case.server_args.ring_degree is not None:
-        kwargs["ring_degree"] = case.server_args.ring_degree
-
-    if component == ComponentType.TEXT_ENCODER:
-        kwargs["enable_cfg_parallel"] = False
-    sgl_args = ServerArgs.from_kwargs(**kwargs)
-    sgl_args.text_encoder_cpu_offload = False
-    sgl_args.dit_cpu_offload = False
-    sgl_args.vae_cpu_offload = False
-    sgl_args.image_encoder_cpu_offload = False
-    sgl_args.enable_cache_dit = case.server_args.enable_cache_dit
-    sgl_args.dit_layerwise_offload = case.server_args.dit_layerwise_offload
-    sgl_args.dit_offload_prefetch_size = case.server_args.dit_offload_prefetch_size
-    return sgl_args
 
 
 # Component loading helpers
@@ -575,7 +473,7 @@ class AccuracyEngine:
             component,
             spec.model_index_keys,
         )
-        sgl_args = _build_accuracy_server_args(
+        sgl_args = build_accuracy_server_args(
             component_selection.base_model_id,
             component_selection.base_model_root,
             case,
@@ -583,7 +481,7 @@ class AccuracyEngine:
             num_gpus,
             component_selection.component_paths,
         )
-        _initialize_parallel_runtime(sgl_args)
+        initialize_parallel_runtime(sgl_args)
         set_global_server_args(sgl_args)
 
         device = get_local_torch_device()
