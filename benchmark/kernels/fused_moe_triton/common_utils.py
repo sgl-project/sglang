@@ -37,6 +37,7 @@ def get_model_config(
     topk_ids_dir: str = None,
 ) -> Dict:
     config = get_config(model_name, trust_remote_code=True)
+    _architectures = getattr(config, "architectures", None)
 
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
@@ -62,7 +63,7 @@ def get_model_config(
         block_shape = [0, group_size]
         assert len(block_shape) == 2
 
-    architecture = config.architectures[0]
+    architecture = (config.architectures or _architectures)[0]
 
     hidden_size = config.hidden_size
     if architecture == "DbrxForCausalLM":
