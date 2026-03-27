@@ -1375,6 +1375,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             layer.use_marlin_fallback = True
             return
 
+        layer.use_marlin_fallback = False
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
@@ -1475,7 +1476,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if getattr(layer, "use_marlin_fallback", False):
+        if layer.use_marlin_fallback:
             from sglang.srt.layers.quantization.marlin_utils_fp4 import (
                 apply_fp4_marlin_linear,
             )
