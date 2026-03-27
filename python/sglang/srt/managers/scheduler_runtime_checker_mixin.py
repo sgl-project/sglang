@@ -358,6 +358,8 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        if self.enable_hisparse and self.hisparse_coordinator.has_ongoing_staging():
+            return
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return
@@ -370,9 +372,6 @@ class SchedulerRuntimeCheckerMixin:
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
             if queue_size:
-                return
-        elif self.enable_hisparse:
-            if self.hisparse_coordinator.has_ongoing_staging():
                 return
 
         self.check_memory()

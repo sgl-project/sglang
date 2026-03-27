@@ -118,6 +118,8 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: list[int]
     dst_state_dim_per_tensor: list[int]
+    # HiSparse: decode host pool stores KV at token granularity
+    enable_hisparse: bool = False
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -141,6 +143,11 @@ class KVArgsRegisterInfo:
                 list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
                 if len(msg) > 11 and len(msg[11]) > 0
                 else []
+            ),
+            enable_hisparse=(
+                msg[12].decode("ascii") == "1"
+                if len(msg) > 12 and len(msg[12]) > 0
+                else False
             ),
         )
 
@@ -180,6 +187,7 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
+            self.enable_hisparse = False
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
@@ -368,6 +376,49 @@ class MooncakeKVManager(CommonKVManager):
             item_lens=self.kv_args.kv_item_lens,
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
+            executor=executor,
+        )
+
+    def send_kvcache_hisparse(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        page_index_slice: slice,
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ):
+        """HiSparse transfer: prefill page_size > decode host page_size=1.
+
+        Receives page-level prefill_kv_indices and the full token-level
+        dst_kv_indices.  Expands both to token granularity before transfer.
+        """
+        page_size = self.kv_args.page_size
+        per_token_item_lens = [il // page_size for il in self.kv_args.kv_item_lens]
+
+        # Expand page-level src indices to token-level
+        base = np.repeat(prefill_kv_indices * page_size, page_size)
+        offsets = np.tile(np.arange(page_size, dtype=np.int32), len(prefill_kv_indices))
+        expanded_src = base + offsets
+
+        # Expand page-level index_slice to token-level for dst
+        token_start = page_index_slice.start * page_size
+        token_end = min(page_index_slice.stop * page_size, len(dst_kv_indices))
+        expanded_dst = dst_kv_indices[token_start:token_end]
+
+        # Clip src to match dst length (last page may be partial)
+        expanded_src = expanded_src[: len(expanded_dst)]
+
+        logger.debug(
+            f"Send KVCache for hisparse: {expanded_src.shape} -> {expanded_dst.shape}"
+        )
+        return self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=per_token_item_lens,
+            prefill_data_indices=expanded_src,
+            dst_data_indices=expanded_dst,
             executor=executor,
         )
 
@@ -828,13 +879,23 @@ class MooncakeKVManager(CommonKVManager):
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
-                            ret = self.send_kvcache(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                executor,
-                            )
+                            if self.enable_hisparse:
+                                ret = self.send_kvcache_hisparse(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    req.dst_kv_indices,
+                                    kv_chunk.index_slice,
+                                    executor,
+                                )
+                            else:
+                                ret = self.send_kvcache(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                )
                         else:
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
@@ -930,9 +991,10 @@ class MooncakeKVManager(CommonKVManager):
                 room = waiting_req_bytes[0].decode("ascii")
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    self.decode_kv_args_table[mooncake_session_id] = (
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
+                    reg_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    self.decode_kv_args_table[mooncake_session_id] = reg_info
+                    if reg_info.enable_hisparse:
+                        self.enable_hisparse = True
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
@@ -1275,6 +1337,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
+            enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
@@ -1292,6 +1355,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
+                        enable_hisparse,
                     ]
                 )
 

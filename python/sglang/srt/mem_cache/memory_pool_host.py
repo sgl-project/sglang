@@ -826,6 +826,14 @@ class MLATokenToKVPoolHost(HostKVCache):
             device=self.device_pool.device,
         )
 
+    def get_contiguous_buf_infos(self):
+        """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
+        for registering host memory with the disaggregation transfer engine."""
+        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [self.token_stride_size] * self.layer_num
+        return data_ptrs, data_lens, item_lens
+
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
