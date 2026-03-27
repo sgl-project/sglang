@@ -1677,12 +1677,10 @@ class ShmPointerMMData:
         return tensor
 
     def __del__(self):
+        # Only close; never unlink. Unlinking is materialize()'s job.
         if getattr(self, "_shm_handle", None) is not None:
             self._shm_handle.close()
-            try:
-                self._shm_handle.unlink()
-            except FileNotFoundError:
-                pass
+            self._shm_handle = None
 
 
 def _get_is_default_transport():
