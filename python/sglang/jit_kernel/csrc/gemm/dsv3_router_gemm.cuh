@@ -41,8 +41,7 @@ SGL_DEVICE void bf16_uint4_to_float(uint4 const& vec, float* dst) {
 
 // kOutFloat: true = float32 output, false = bfloat16 output
 template <int kBlockSize, int VPT, int kNumTokens, int kNumExperts, int kHiddenDim, bool kUsePDL, bool kOutFloat>
-__global__
-__launch_bounds__(128, 1) void router_gemm_kernel(void* out, bf16_t const* mat_a, bf16_t const* mat_b) {
+__global__ __launch_bounds__(128, 1) void router_gemm_kernel(void* out, bf16_t const* mat_a, bf16_t const* mat_b) {
   int const n_idx = blockIdx.x;
   int const tid = threadIdx.x;
   constexpr int kWarpSize = 32;
@@ -127,10 +126,8 @@ struct RouterGemmDispatcher {
 
   static void run(int num_tokens, void* output, bf16_t const* mat_a, bf16_t const* mat_b, DLDevice device) {
     if (num_tokens == kBegin) {
-      constexpr auto kernel =
-          router_gemm_kernel<kBlockSize, VPT, kBegin, kNumExperts, kHiddenDim, kUsePDL, kOutFloat>;
-      host::LaunchKernel(kNumExperts, kBlockSize, device)
-          .enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b);
+      constexpr auto kernel = router_gemm_kernel<kBlockSize, VPT, kBegin, kNumExperts, kHiddenDim, kUsePDL, kOutFloat>;
+      host::LaunchKernel(kNumExperts, kBlockSize, device).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b);
     } else {
       RouterGemmDispatcher<kBegin + 1, kEnd, kNumExperts, kHiddenDim, kUsePDL, kOutFloat>::run(
           num_tokens, output, mat_a, mat_b, device);
@@ -146,10 +143,8 @@ struct RouterGemmDispatcher<kEnd, kEnd, kNumExperts, kHiddenDim, kUsePDL, kOutFl
 
   static void run(int num_tokens, void* output, bf16_t const* mat_a, bf16_t const* mat_b, DLDevice device) {
     if (num_tokens == kEnd) {
-      constexpr auto kernel =
-          router_gemm_kernel<kBlockSize, VPT, kEnd, kNumExperts, kHiddenDim, kUsePDL, kOutFloat>;
-      host::LaunchKernel(kNumExperts, kBlockSize, device)
-          .enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b);
+      constexpr auto kernel = router_gemm_kernel<kBlockSize, VPT, kEnd, kNumExperts, kHiddenDim, kUsePDL, kOutFloat>;
+      host::LaunchKernel(kNumExperts, kBlockSize, device).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b);
     } else {
       host::panic({}, "dsv3_router_gemm: num_tokens must be between 1 and 16, got ", num_tokens);
     }
@@ -162,10 +157,8 @@ struct RouterGemmDispatcher<kEnd, kEnd, kNumExperts, kHiddenDim, kUsePDL, kOutFl
 // kOutFloat: compile-time bool (true = float32 output, false = bfloat16 output)
 template <int kNumExperts, int kHiddenDim, bool kUsePDL, bool kOutFloat>
 struct DSV3RouterGemmKernel {
-  static void run(
-      const tvm::ffi::TensorView mat_a,
-      const tvm::ffi::TensorView mat_b,
-      const tvm::ffi::TensorView output) {
+  static void
+  run(const tvm::ffi::TensorView mat_a, const tvm::ffi::TensorView mat_b, const tvm::ffi::TensorView output) {
     using namespace host;
 
     auto M = SymbolicSize{"num_tokens"};
@@ -176,24 +169,12 @@ struct DSV3RouterGemmKernel {
     N.set_value(kNumExperts);
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({M, K})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(mat_a);
-    TensorMatcher({N, K})
-        .with_dtype<bf16_t>()
-        .with_device(device)
-        .verify(mat_b);
+    TensorMatcher({M, K}).with_dtype<bf16_t>().with_device(device).verify(mat_a);
+    TensorMatcher({N, K}).with_dtype<bf16_t>().with_device(device).verify(mat_b);
     if constexpr (kOutFloat) {
-      TensorMatcher({M, N})
-          .with_dtype<fp32_t>()
-          .with_device(device)
-          .verify(output);
+      TensorMatcher({M, N}).with_dtype<fp32_t>().with_device(device).verify(output);
     } else {
-      TensorMatcher({M, N})
-          .with_dtype<bf16_t>()
-          .with_device(device)
-          .verify(output);
+      TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(output);
     }
 
     const int num_tokens = static_cast<int>(M.unwrap());
