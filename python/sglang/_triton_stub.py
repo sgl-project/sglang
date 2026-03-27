@@ -144,6 +144,25 @@ class _TritonFinder:
                 setattr(parent, child_name, mod)
         return mod
 
+    def find_spec(self, fullname, path=None, target=None):
+        """PEP 451 finder (Python 3.4+). Preferred over find_module/load_module
+        which are deprecated and unreliable in Python 3.12+ for sub-module
+        resolution."""
+        if fullname == "triton" or fullname.startswith("triton."):
+            if fullname in sys.modules:
+                return getattr(sys.modules[fullname], "__spec__", None)
+            # Create and register the mock so the import machinery finds it
+            mod = _MockModule(fullname)
+            sys.modules[fullname] = mod
+            parts = fullname.rsplit(".", 1)
+            if len(parts) == 2:
+                parent_name, child_name = parts
+                parent = sys.modules.get(parent_name)
+                if parent is not None:
+                    setattr(parent, child_name, mod)
+            return mod.__spec__
+        return None
+
 
 def _make_mock(name: str) -> _MockModule:
     """Create a ``_MockModule`` and register it in ``sys.modules``."""
@@ -228,3 +247,9 @@ def install() -> None:
     triton.backends = backends
     compiler = _make_mock("triton.backends.compiler")
     backends.compiler = compiler
+
+    # triton.compiler / triton.compiler.compiler  (used by torch._inductor.runtime.hints in torch 2.9+)
+    triton_compiler = _make_mock("triton.compiler")
+    triton.compiler = triton_compiler
+    triton_compiler_compiler = _make_mock("triton.compiler.compiler")
+    triton_compiler.compiler = triton_compiler_compiler
