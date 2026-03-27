@@ -764,6 +764,7 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
+        self._handle_mps_backends()
         self._handle_xpu_backends()
 
         # Handle piecewise CUDA graph.
@@ -1042,6 +1043,10 @@ class ServerArgs:
                     "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
                 )
                 self.piecewise_cuda_graph_compiler = "eager"
+
+    def _handle_mps_backends(self):
+        if self.device == "mps":
+            self.disable_overlap_schedule = True
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":

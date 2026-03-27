@@ -224,6 +224,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -569,9 +570,8 @@ class Scheduler(
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
     def init_tp_model_worker(self):
-        from sglang.srt.managers.tp_worker import TpModelWorker
 
-        self.tp_worker = TpModelWorker(
+        worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
@@ -582,6 +582,16 @@ class Scheduler(
             dp_rank=self.dp_rank,
             nccl_port=self.nccl_port,
         )
+
+        # FIXME: move tp worker's init logic outside of the scheduler.
+        if use_mlx():
+            from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+            self.tp_worker = MlxTpModelWorker(**worker_kwargs)
+        else:
+            from sglang.srt.managers.tp_worker import TpModelWorker
+
+            self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
@@ -824,6 +834,7 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
@@ -1552,6 +1563,8 @@ class Scheduler(
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
 
+        self._check_pending_flush()
+
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
             (
@@ -1661,8 +1674,7 @@ class Scheduler(
             if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
-            for item in mm_inputs.mm_items:
-                item.feature = None
+            mm_inputs.release_features()
             req.multimodal_inputs = None
 
     def handle_generate_request(
@@ -2771,9 +2783,50 @@ class Scheduler(
                 )
             )
 
-    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
-        success = self.flush_cache()
-        return FlushCacheReqOutput(success=success)
+    def _check_pending_flush(self):
+        if self._pending_flush is None:
+            return
+
+        pending_req, deadline = self._pending_flush
+
+        if self.is_fully_idle():
+            success = self.flush_cache()
+            self._pending_flush = None
+            self.send_to_tokenizer.send_output(
+                FlushCacheReqOutput(success=success), pending_req
+            )
+            return
+
+        if time.monotonic() >= deadline:
+            logging.warning(
+                "Deferred flush_cache timed out while waiting for idle state."
+            )
+            self._pending_flush = None
+            self.send_to_tokenizer.send_output(
+                FlushCacheReqOutput(
+                    success=False, message="Timed out waiting for idle state."
+                ),
+                pending_req,
+            )
+
+    def flush_cache_wrapped(
+        self, recv_req: FlushCacheReqInput
+    ) -> Optional[FlushCacheReqOutput]:
+        if self._pending_flush is not None:
+            return FlushCacheReqOutput(
+                success=False,
+                message="Another flush_cache is already in progress.",
+            )
+
+        timeout_s = float(recv_req.timeout_s or 0.0)
+        if timeout_s <= 0.0:
+            return FlushCacheReqOutput(success=self.flush_cache())
+
+        if self.is_fully_idle():
+            return FlushCacheReqOutput(success=self.flush_cache())
+
+        self._pending_flush = (recv_req, time.monotonic() + timeout_s)
+        return None
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
