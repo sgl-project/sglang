@@ -190,7 +190,13 @@ if _use_aiter:
 
 if _is_cuda:
     from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
-    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import dsv3_fused_a_gemm
+    from sglang.jit_kernel.dsv3_router_gemm import (
+        can_use_dsv3_router_gemm as _can_use_dsv3_router_gemm,
+    )
+    from sglang.jit_kernel.dsv3_router_gemm import (
+        dsv3_router_gemm as _jit_dsv3_router_gemm,
+    )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -475,9 +481,9 @@ class MoEGate(nn.Module):
             if (
                 _is_cuda
                 and hidden_states.shape[0] <= 16
-                and hidden_states.shape[1] == 7168
-                and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
-                and _device_sm >= 90
+                and _can_use_dsv3_router_gemm(
+                    self.weight.shape[0], hidden_states.shape[1]
+                )
             ):
                 if _device_sm in [100, 103] and self.weight.shape[0] == 256:
                     # TODO: will check the dtype to be bf16
@@ -490,7 +496,7 @@ class MoEGate(nn.Module):
                     )
                     flashinfer_dsv3_router_gemm(logits, hidden_states, self.weight)
                 else:
-                    logits = dsv3_router_gemm(
+                    logits = _jit_dsv3_router_gemm(
                         hidden_states, self.weight, out_dtype=torch.float32
                     )
 
