@@ -164,6 +164,12 @@ class Session:
                 and req.input_ids[0] == tokenizer.bos_token_id
             ):
                 req.input_ids = req.input_ids[1:]
+                # Adjust mm_item offsets since they were computed on
+                # the pre-strip sequence (with BOS at position 0)
+                if req.mm_inputs:
+                    for item in req.mm_inputs.get("mm_items", []):
+                        if item.offsets:
+                            item.offsets = [(s - 1, e - 1) for s, e in item.offsets]
 
             input_ids = (
                 last_req.origin_input_ids
