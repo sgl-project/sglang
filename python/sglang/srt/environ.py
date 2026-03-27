@@ -546,9 +546,6 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
     _print_deprecated_env(
-        "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
-    )
-    _print_deprecated_env(
         "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
     )
     _print_deprecated_env(
@@ -578,10 +575,6 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_ENABLE_FLASHINFER_GEMM",
-    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
-)
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
     "Please use '--enable-prefill-delayer' instead.",
