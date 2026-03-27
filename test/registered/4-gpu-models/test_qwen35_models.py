@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -166,7 +165,6 @@ class TestQwen35FP4MTPV2(CustomTestCase):
     def setUpClass(cls):
         cls.model = QWEN35_FP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -207,7 +205,6 @@ class TestQwen35FP4MTPV2(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):

@@ -6,6 +6,7 @@ import requests
 import torch
 
 import sglang as sgl
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -47,6 +48,14 @@ class TestEAGLEEngine(CustomTestCase):
         "batch_avg_accept_len": 1.9,
         "accept_len": 3.6,
     }
+
+    @classmethod
+    def setUpClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.set(False)
+
+    @classmethod
+    def tearDownClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def setUp(self):
         self.prompt = "Today is a sunny day and I like"
@@ -220,6 +229,14 @@ class TestEAGLERadixCache(CustomTestCase):
         "cuda_graph_max_bs": 5,
     }
 
+    @classmethod
+    def setUpClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.set(False)
+
+    @classmethod
+    def tearDownClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.clear()
+
     def test_correctness(self):
         os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         configs = [
@@ -307,6 +324,7 @@ class TestEAGLERadixCache(CustomTestCase):
 class TestEAGLEDraftExtend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             DEFAULT_TARGET_MODEL_EAGLE,
@@ -334,6 +352,7 @@ class TestEAGLEDraftExtend(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def test_one_batch_accept_length(self):
         resp = requests.get(self.base_url + "/flush_cache")
@@ -373,6 +392,7 @@ class TestEAGLEDraftExtend(CustomTestCase):
 class TestEAGLEDraftExtendFlashinfer(TestEAGLEDraftExtend):
     @classmethod
     def setUpClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             DEFAULT_TARGET_MODEL_EAGLE,
@@ -402,6 +422,7 @@ class TestEAGLEDraftExtendFlashinfer(TestEAGLEDraftExtend):
 class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
     @classmethod
     def setUpClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             DEFAULT_TARGET_MODEL_EAGLE,
@@ -431,6 +452,7 @@ class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
 class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
     @classmethod
     def setUpClass(cls):
+        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             DEFAULT_MODEL_NAME_FOR_TEST_MLA,

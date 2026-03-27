@@ -60,9 +60,7 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
         launch_args.extend(cls.other_launch_args)
-        with envs.SGLANG_ENABLE_SPEC_V2.override(
-            True
-        ), envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(
             1
         ), envs.SGLANG_SPEC_NAN_DETECTION.override(
             True
