@@ -4,7 +4,6 @@ from typing import Tuple
 import torch
 import triton
 import triton.testing
-from sgl_kernel import set_kv_buffer_kernel
 
 from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
@@ -13,19 +12,9 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
 )
 from sglang.jit_kernel.kvcache import store_cache
+from sglang.test.ci.ci_register import register_cuda_ci
 
-_is_hip = bool(torch.version.hip)
-HAS_AOT_STORE_CACHE = hasattr(torch.ops.sgl_kernel, "store_kv_cache")
-
-
-def sglang_aot_store_cache(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    indices: torch.Tensor,
-) -> None:
-    set_kv_buffer_kernel(k_cache, v_cache, indices, k, v)
+register_cuda_ci(est_time=9, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 
 def sglang_jit_store_cache(
@@ -83,11 +72,6 @@ ITEM_SIZE = get_benchmark_range(
 LINE_VALS = ["jit", "torch_compile", "torch_streams"]
 LINE_NAMES = ["SGL JIT Kernel", "PyTorch Compile", "PyTorch 2 Stream"]
 STYLES = [("blue", "--"), ("red", ":"), ("green", "-.")]
-# Keep non-HIP benchmark lines unchanged; only HIP tolerates missing AOT op.
-if (not _is_hip) or HAS_AOT_STORE_CACHE:
-    LINE_VALS = ["aot"] + LINE_VALS
-    LINE_NAMES = ["SGL AOT Kernel"] + LINE_NAMES
-    STYLES = [("orange", "-")] + STYLES
 X_NAMES = ["item_size", "batch_size"]
 CONFIGS = list(itertools.product(ITEM_SIZE, BS_RANGE))
 
@@ -128,8 +112,6 @@ def benchmark(
         "torch_compile": torch_compile_store_cache,
         "torch_streams": torch_streams_store_cache,
     }
-    if (not _is_hip) or HAS_AOT_STORE_CACHE:
-        FN_MAP["aot"] = sglang_aot_store_cache
 
     def fn():
         impl = FN_MAP[provider]

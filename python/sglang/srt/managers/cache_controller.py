@@ -728,6 +728,10 @@ class HiCacheController:
                 return host_indices, device_indices.index_select(0, idx)
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
+            else:
+                raise ValueError(
+                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
+                )
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         else:

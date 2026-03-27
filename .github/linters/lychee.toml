@@ -1,0 +1,18 @@
+# .github/linters/lychee.toml
+no_progress = true
+verbose = "warn"
+timeout = 20
+max_concurrency = 8
+
+offline = true
+
+# Ignore generated docs output; check source docs only.
+exclude_path = [
+  "^(\\./)?docs[/\\\\]_build[/\\\\]",
+]
+
+exclude = [
+  "^https?://localhost(:[0-9]+)?(/|$)",
+  "^http://127\\.0\\.0\\.1(:[0-9]+)?(/|$)",
+  "^http://0\\.0\\.0\\.0(/|$)",
+]

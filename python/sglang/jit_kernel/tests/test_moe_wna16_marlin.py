@@ -1,13 +1,26 @@
 import itertools
+import sys
 
 import pytest
 import torch
-from sgl_kernel import moe_wna16_marlin_gemm as aot_moe_wna16_marlin_gemm
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
+
+register_cuda_ci(est_time=10, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+
+
+def _has_aot_moe_wna16_marlin_gemm() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "moe_wna16_marlin_gemm") and hasattr(
+        torch.ops.sgl_kernel.moe_wna16_marlin_gemm, "default"
+    )
+
+
+AOT_AVAILABLE = _has_aot_moe_wna16_marlin_gemm()
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
@@ -143,7 +156,7 @@ def _run_single_gemm_aot(
     is_k_full,
     use_atomic_add,
 ):
-    return aot_moe_wna16_marlin_gemm(
+    return torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
         a,
         c,
         qweight,
@@ -224,6 +237,9 @@ TEST_CASES = generate_test_cases()
 def test_moe_wna16_marlin_gemm(
     m, n, k, e, topk, dtype, group_size, act_order, quant_type
 ):
+    if not AOT_AVAILABLE:
+        pytest.skip("sgl_kernel moe_wna16_marlin_gemm AOT op not available")
+
     torch.manual_seed(0)
 
     has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
@@ -324,4 +340,4 @@ def test_moe_wna16_marlin_gemm(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

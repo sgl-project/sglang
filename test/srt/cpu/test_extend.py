@@ -195,11 +195,13 @@ class TestExtendAttention(CustomTestCase):
 
         b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
         encoder_lens = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int64)
+        scale = 20
         if mla:
             b_seq_len_prefix.zero_()
             encoder_lens.zero_()
         if has_sink:
             encoder_lens.zero_()
+            scale = 1
         b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
         max_len_in_batch = (
@@ -243,8 +245,8 @@ class TestExtendAttention(CustomTestCase):
             v_extend[extend_start:extend_end] = v_buffer[
                 extend_start_in_buffer:extend_end_in_buffer
             ]
-            q_extend[extend_start:extend_end] = torch.randn(
-                (b_seq_len_extend[i], H_Q, D), dtype=dtype
+            q_extend[extend_start:extend_end] = (
+                torch.randn((b_seq_len_extend[i], H_Q, D), dtype=dtype) * scale
             )
 
         # q_extend, k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors
