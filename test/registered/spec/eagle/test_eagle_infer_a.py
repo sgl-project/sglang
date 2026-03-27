@@ -324,35 +324,34 @@ class TestEAGLERadixCache(CustomTestCase):
 class TestEAGLEDraftExtend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_TARGET_MODEL_EAGLE,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_DRAFT_MODEL_EAGLE,
-                "--speculative-num-steps",
-                1,
-                "--speculative-eagle-topk",
-                1,
-                "--speculative-num-draft-tokens",
-                2,
-                "--max-running-requests",
-                4,
-                "--attention-backend",
-                "fa3",
-            ],
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+            cls.process = popen_launch_server(
+                DEFAULT_TARGET_MODEL_EAGLE,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-draft-model-path",
+                    DEFAULT_DRAFT_MODEL_EAGLE,
+                    "--speculative-num-steps",
+                    1,
+                    "--speculative-eagle-topk",
+                    1,
+                    "--speculative-num-draft-tokens",
+                    2,
+                    "--max-running-requests",
+                    4,
+                    "--attention-backend",
+                    "fa3",
+                ],
+            )
         cls.accept_len_threshold = 1.50
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def test_one_batch_accept_length(self):
         resp = requests.get(self.base_url + "/flush_cache")
@@ -392,29 +391,29 @@ class TestEAGLEDraftExtend(CustomTestCase):
 class TestEAGLEDraftExtendFlashinfer(TestEAGLEDraftExtend):
     @classmethod
     def setUpClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_TARGET_MODEL_EAGLE,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_DRAFT_MODEL_EAGLE,
-                "--speculative-num-steps",
-                1,
-                "--speculative-eagle-topk",
-                1,
-                "--speculative-num-draft-tokens",
-                2,
-                "--max-running-requests",
-                4,
-                "--attention-backend",
-                "flashinfer",
-            ],
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+            cls.process = popen_launch_server(
+                DEFAULT_TARGET_MODEL_EAGLE,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-draft-model-path",
+                    DEFAULT_DRAFT_MODEL_EAGLE,
+                    "--speculative-num-steps",
+                    1,
+                    "--speculative-eagle-topk",
+                    1,
+                    "--speculative-num-draft-tokens",
+                    2,
+                    "--max-running-requests",
+                    4,
+                    "--attention-backend",
+                    "flashinfer",
+                ],
+            )
         cls.accept_len_threshold = 1.50
 
 
@@ -422,29 +421,29 @@ class TestEAGLEDraftExtendFlashinfer(TestEAGLEDraftExtend):
 class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
     @classmethod
     def setUpClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_TARGET_MODEL_EAGLE,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_DRAFT_MODEL_EAGLE,
-                "--speculative-num-steps",
-                1,
-                "--speculative-eagle-topk",
-                1,
-                "--speculative-num-draft-tokens",
-                2,
-                "--max-running-requests",
-                4,
-                "--attention-backend",
-                "triton",
-            ],
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+            cls.process = popen_launch_server(
+                DEFAULT_TARGET_MODEL_EAGLE,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-draft-model-path",
+                    DEFAULT_DRAFT_MODEL_EAGLE,
+                    "--speculative-num-steps",
+                    1,
+                    "--speculative-eagle-topk",
+                    1,
+                    "--speculative-num-draft-tokens",
+                    2,
+                    "--max-running-requests",
+                    4,
+                    "--attention-backend",
+                    "triton",
+                ],
+            )
         cls.accept_len_threshold = 1.50
 
 
@@ -452,27 +451,27 @@ class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
 class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
     @classmethod
     def setUpClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_MODEL_NAME_FOR_TEST_MLA,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                1,
-                "--speculative-eagle-topk",
-                1,
-                "--speculative-num-draft-tokens",
-                2,
-                "--max-running-requests",
-                4,
-                "--attention-backend",
-                "flashinfer",
-            ],
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+            cls.process = popen_launch_server(
+                DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-num-steps",
+                    1,
+                    "--speculative-eagle-topk",
+                    1,
+                    "--speculative-num-draft-tokens",
+                    2,
+                    "--max-running-requests",
+                    4,
+                    "--attention-backend",
+                    "flashinfer",
+                ],
+            )
         cls.accept_len_threshold = 1.85
 
 
