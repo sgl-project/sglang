@@ -1899,8 +1899,11 @@ def direct_register_custom_op(
     mutates_args: List[str],
     fake_impl: Optional[Callable] = None,
     target_lib: Optional[Library] = None,
-):
+) -> None:
     """
+    NOTE: Please try to use `register_custom_op` instead of this function.
+    See `python/sglang/srt/utils/custom_op.py` for details.
+
     `torch.library.custom_op` can have significant overhead because it
     needs to consider complicated dispatching logic. This function
     directly registers a custom op and dispatches it to the CUDA backend.
@@ -2139,6 +2142,11 @@ class SafeUnpickler(pickle.Unpickler):
             f"Blocked unsafe class loading ({module}.{name}), "
             f"to prevent exploitation of CVE-2025-10164"
         )
+
+
+def safe_pickle_load(fp):
+    """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
+    return SafeUnpickler(fp).load()
 
 
 def debug_timing(func):
