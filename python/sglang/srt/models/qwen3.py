@@ -198,17 +198,12 @@ class Qwen3Attention(nn.Module):
         )
         return q, k, v
 
-    def _forward_fused_mrope_decode(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """Fused QK-norm + 3D mRoPE + KV cache write using aiter kernel.
+    def forward_prepare_fused_mrope(self, positions, hidden_states, forward_batch):
+        """Fused QK-norm + 3D mRoPE + KV cache write for decode (ROCm/aiter).
 
-        Replaces the separate split → QK norm → mRoPE → cache write pipeline
-        with a single fused HIP kernel, reducing 4-5 kernel launches to 1.
-        Only used on ROCm decode path with MRotaryEmbedding.
+        The fused HIP kernel replaces split → QK norm → mRoPE → cache write,
+        so KV is already in the paged cache when this returns.
+        Returns (q, None, None); caller must pass save_kv_cache=False to attn.
         """
         qkv, _ = self.qkv_proj(hidden_states)
         num_tokens = qkv.shape[0]
@@ -261,9 +256,7 @@ class Qwen3Attention(nn.Module):
         )
 
         q = q_out.reshape(num_tokens, -1)
-        attn_output = self.attn(q, None, None, forward_batch, save_kv_cache=False)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return q, None, None
 
     def forward(
         self,
@@ -273,12 +266,20 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
-        elif self.use_fused_qk_norm_mrope and forward_batch.forward_mode.is_decode():
-            return self._forward_fused_mrope_decode(
+
+        save_kv_cache = True
+        use_fused = (
+            self.use_fused_qk_norm_mrope
+            and forward_batch.forward_mode.is_decode()
+            and get_global_server_args().rl_on_policy_target is None
+        )
+
+        if use_fused:
+            q, k, v = self.forward_prepare_fused_mrope(
                 positions, hidden_states, forward_batch
             )
-
-        if (
+            save_kv_cache = False
+        elif (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
@@ -297,7 +298,7 @@ class Qwen3Attention(nn.Module):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)
         return output
 
