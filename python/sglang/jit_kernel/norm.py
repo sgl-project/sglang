@@ -5,13 +5,13 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
+from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -99,7 +99,7 @@ def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
         return False
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def fused_inplace_qknorm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -114,7 +114,7 @@ def fused_inplace_qknorm(
     module.qknorm(q, k, q_weight, k_weight, eps)
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -133,7 +133,7 @@ def rmsnorm(
     module.rmsnorm(input, weight, output, eps)
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -144,7 +144,7 @@ def fused_add_rmsnorm(
     module.fused_add_rmsnorm(input, residual, weight, eps)
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def fused_inplace_qknorm_across_heads(
     q: torch.Tensor,
     k: torch.Tensor,
