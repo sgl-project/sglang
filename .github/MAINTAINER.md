@@ -37,7 +37,7 @@ __Note__: The permissions to trigger CI tests are defined separately according t
    - **Ideal case:** For each modified file, one Codeowner has approved the PR. The PR has also passed the required CI tests. Then, anyone with write permission can merge the PR.
    - **Exception:** In cases where it is difficult to meet all requirements (due to flaky CI or slow responses), a Merge Oncall can bypass branch protection to merge the PR.
 
-If you meet any issues during the merge, you can discuss in [slack channels](https://slack.sglang.io/): #dev, #pull-request, and #ci-cd-build-release.
+If you meet any issues during the merge, you can discuss in [slack channels](https://slack.sglang.io/): #pull-request, #ci-cd-build-release, #dev.
 
 ## The List of Merge Oncalls and Reviewers
 The format is @github-username (Slack username).
@@ -53,7 +53,7 @@ This list is based on the current situation. If you or someone you know would li
 The format is @github-username (Slack username).
 
 ### NVIDIA GPUs
-@merrymercy (Lianmin Zheng), @Kangyan-Zhou (Kangyan Zhou), @ch-wan (Cheng Wan), @HanHan009527 (hanhan), @ishandhanani (Ishan Dhanani), @key4ng (Keyang Ru), @slin1237 (Simo Lin), @ShangmingCai (Shangming Cai)
+@Kangyan-Zhou (Kangyan Zhou), @ch-wan (Cheng Wan), @HanHan009527 (hanhan), @ishandhanani (Ishan Dhanani), @ShangmingCai (Shangming Cai), @alisonshao (Alison Shao).
 
 ### AMD GPUs
 @saienduri (Sai Enduri), @HaiShaw (Henry HAI)
@@ -67,4 +67,4 @@ The format is @github-username (Slack username).
 This list is based on the current situation. If you or someone you know would like to donate machines for CI, they can serve as the CI oncalls for their machines. Please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
 
 ## Suspending Permissions
-If the merge oncall bypasses checks to merge a PR that breaks the `main` branch, or if they repeatedly break the CI due to various reasons, their privileges will be suspended for at least three days, depending on the severity of the incident.
+If a Merge Oncall bypasses checks to merge a PR that breaks the `main` branch, or if they repeatedly break the CI due to various reasons, their privileges will be suspended for at least two days, depending on the severity of the incident.
