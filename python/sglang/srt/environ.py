@@ -339,7 +339,6 @@ class Envs:
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_ENABLE_FLASHINFER_FP8_GEMM = EnvBool(False)
     # Default to the pick from flashinfer
-    SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # TODO(mmangkad): Remove this once the FlashInfer unified allreduce-fusion
     # transport issue on GB200/GB300 platforms is fixed and verified resolved.
@@ -593,10 +592,6 @@ _warn_deprecated_env_to_cli_flag(
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_FLASHINFER_FP4_GEMM_BACKEND",
-    "It will be completely removed in 0.5.9. Please use '--fp4-gemm-backend' instead.",
 )
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
