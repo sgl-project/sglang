@@ -1114,4 +1114,5 @@ class Qwen3NextForCausalLM(nn.Module):
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
+
 EntryClass = Qwen3NextForCausalLM
