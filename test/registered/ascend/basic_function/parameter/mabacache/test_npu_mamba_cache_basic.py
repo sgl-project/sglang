@@ -23,8 +23,6 @@ class TestMambaCache(GSM8KAscendMixin, CustomTestCase):
         "--attention-backend",
         "ascend",
         "--disable-cuda-graph",
-        "--max-mamba-cache-size",
-        "None",
         "--mamba-ssm-dtype",
         "float32",
         "--mamba-full-memory-ratio",
