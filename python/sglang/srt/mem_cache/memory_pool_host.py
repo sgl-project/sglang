@@ -24,6 +24,11 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
+from sglang.srt.distributed import (
+    get_pipeline_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MambaPool,
@@ -31,7 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import get_device_count, is_cuda, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -57,6 +62,142 @@ if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
+
+
+def _get_cgroup_memory_limit() -> Optional[int]:
+    """Read the cgroup memory limit (bytes). Returns None if not in a cgroup."""
+    # Try cgroup v2 first, then v1
+    paths = [
+        "/sys/fs/cgroup/memory.max",  # cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+    ]
+    for path in paths:
+        try:
+            with open(path, "r") as f:
+                val = f.read().strip()
+                if val == "max":
+                    return None  # no limit set
+                limit = int(val)
+                # Ignore unreasonably large values (effectively unlimited)
+                if limit > 2**62:
+                    return None
+                return limit
+        except (FileNotFoundError, ValueError, PermissionError):
+            continue
+    return None
+
+
+def _get_cgroup_memory_usage() -> Optional[int]:
+    """Read the current cgroup memory usage (bytes). Returns None on failure."""
+    paths = [
+        "/sys/fs/cgroup/memory.current",  # cgroup v2
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",  # cgroup v1
+    ]
+    for path in paths:
+        try:
+            with open(path, "r") as f:
+                return int(f.read().strip())
+        except (FileNotFoundError, ValueError, PermissionError):
+            continue
+    return None
+
+
+def _check_host_memory(requested_bytes: int) -> None:
+    """Check that enough host memory is available for HiCache allocation.
+
+    Pinned (page-locked) memory cannot be swapped or reclaimed by the kernel.
+    Over-allocating it starves the OS of reclaimable pages and can cause
+    system hangs or OOM kills.
+
+    Two-phase check:
+      Phase 1 — Aggregate capacity (rank 0 only, fail fast):
+        total pinned demand (num_workers × per-worker) vs total_mem - reserve.
+      Phase 2 — Single-worker available (all ranks):
+        per-worker demand vs point-in-time available memory.
+
+    Raises:
+        ValueError: if either check fails.
+    """
+    host_mem = psutil.virtual_memory()
+    total_mem = host_mem.total
+
+    # Also check cgroup memory limit (relevant in K8s/container environments).
+    # As psutil.virtual_memory() may only report the host's total memory.
+    cgroup_limit = _get_cgroup_memory_limit()
+    cgroup_used = _get_cgroup_memory_usage()  # None if read failed
+    if cgroup_limit is not None:
+        total_mem = min(total_mem, cgroup_limit)
+
+    if cgroup_limit is not None:
+        if cgroup_used is not None:
+            raw_available = cgroup_limit - cgroup_used
+        else:
+            raw_available = cgroup_limit - host_mem.used
+            logger.debug(
+                "Could not read cgroup memory usage; "
+                "falling back to psutil.used for estimation."
+            )
+    else:
+        raw_available = host_mem.available
+
+    # Reserve: based on available (not total) so that when other processes
+    # already occupy most of the memory the reserve stays proportional to
+    # what is actually left, while the 10 GB floor still protects large
+    # machines from over-pinning.
+    reserve = max(int(raw_available * 0.10), 10 * (1024**3))
+    available_bytes = raw_available - reserve
+
+    # ── Phase 1: Multi-worker capacity check (rank 0 only) ──
+    try:
+        total_parallel_size = (
+            get_tensor_model_parallel_world_size()
+            * get_pipeline_model_parallel_world_size()
+        )
+        tp_rank = get_tensor_model_parallel_rank()
+    except (AssertionError, AttributeError):
+        total_parallel_size = 1
+        tp_rank = 0
+
+    local_device_count = max(get_device_count(), 1)
+    num_local_workers = min(total_parallel_size, local_device_count)
+
+    if num_local_workers > 1 and tp_rank == 0:
+        capacity = total_mem - reserve
+        total_requested = requested_bytes * num_local_workers
+        if total_requested > capacity:
+            raise ValueError(
+                f"Not enough host memory for {num_local_workers} local workers. "
+                f"Total estimated: {total_requested / 1e9:.2f} GB "
+                f"({num_local_workers} x {requested_bytes / 1e9:.2f} GB), "
+                f"but capacity is {capacity / 1e9:.2f} GB "
+                f"(total {total_mem / 1e9:.1f} GB - "
+                f"{reserve / 1e9:.1f} GB reserve). "
+                f"HiCache uses pinned (page-locked) memory that cannot be "
+                f"swapped or reclaimed by the OS. Over-allocating pinned "
+                f"memory can cause system hangs, so we reserve "
+                f"max(10% of available memory, 10 GB) as a safety margin. "
+                f"Please reduce --hicache-size or --hicache-ratio."
+            )
+
+    # ── Phase 2: Single-worker available check (all ranks) ──
+    if requested_bytes > available_bytes:
+        raise ValueError(
+            f"Not enough host memory available. Requesting "
+            f"{requested_bytes / 1e9:.2f} GB but only have "
+            f"{available_bytes / 1e9:.2f} GB free "
+            f"(available {raw_available / 1e9:.1f} GB - "
+            f"{reserve / 1e9:.1f} GB reserve). "
+            f"HiCache uses pinned (page-locked) memory that cannot be "
+            f"swapped or reclaimed by the OS. Over-allocating pinned "
+            f"memory can cause system hangs, so we reserve "
+            f"max(10% of available memory, 10 GB) as a safety margin. "
+            f"Please reduce --hicache-size or --hicache-ratio."
+        )
+
+    logger.info(
+        f"Allocating {requested_bytes / 1e9:.2f} GB "
+        f"host memory for hierarchical KV cache."
+    )
 
 
 def synchronized(func):
@@ -178,23 +319,7 @@ class HostKVCache(abc.ABC):
             self.size > device_pool.size
         ), "The host memory should be larger than the device memory with the current protocol"
 
-        # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
-        requested_bytes = self.size * self.size_per_token
-        # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+        _check_host_memory(self.size * self.size_per_token)
 
         self.kv_buffer = self.init_kv_buffer()
 
