@@ -28,7 +28,6 @@ class TestMambaCache(CustomTestCase):
             "0.5",
             "--attention-backend",
             "ascend",
-            "--disable-cuda-graph",
             "--device",
             "npu",
             "--tp-size",
