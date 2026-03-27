@@ -6,8 +6,6 @@ import torch
 import triton
 from torch import nn
 
-from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -45,7 +43,6 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -347,21 +344,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         return projected_states_qkvz, projected_states_ba
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            output = torch.zeros_like(hidden_states)
-            gdn_with_output(
-                hidden_states,
-                output,
-                self.layer_id,
-            )
-            return output
-        return self._forward(hidden_states, forward_batch)
-
-    def _forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -1132,27 +1114,4 @@ class Qwen3NextForCausalLM(nn.Module):
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
-
 EntryClass = Qwen3NextForCausalLM
-
-
-@register_custom_op(mutates_args=["output"])
-@register_split_op()
-def gdn_with_output(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
-    if real_num_tokens is None:
-        real_num_tokens = hidden_states.shape[0]
-
-    hidden_states = hidden_states[:real_num_tokens]
-    ret = attention_layer._forward(hidden_states, forward_batch)
-
-    output[:real_num_tokens].view(ret.shape).copy_(ret)
-    return
