@@ -36,7 +36,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -57,6 +56,7 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
 )
 from sglang.multimodal_gen.test.server.accuracy_hooks import resolve_native_profile
 from sglang.multimodal_gen.test.server.accuracy_utils import (
+    build_parameter_shard_contexts,
     build_state_lookup,
     copy_tensor,
     fuse_gate_up_proj,
@@ -91,12 +91,6 @@ class _ForwardCapture:
         if self._handle is not None:
             self._handle.remove()
         self._handle = None
-
-
-@dataclass(frozen=True)
-class ParameterShardContext:
-    world_size: int
-    rank: int
 
 
 @dataclass(frozen=True)
@@ -135,32 +129,6 @@ COMPONENT_SPECS: Dict[ComponentType, ComponentSpec] = {
         reference_library="transformers",
     ),
 }
-
-
-def _build_parameter_shard_contexts(
-    module: nn.Module,
-) -> Dict[str, ParameterShardContext]:
-    shard_contexts: Dict[str, ParameterShardContext] = {}
-    for module_name, submodule in module.named_modules():
-        tp_group = getattr(submodule, "tp_group", None)
-        if tp_group is None:
-            continue
-
-        context = ParameterShardContext(
-            world_size=get_group_size(tp_group),
-            rank=get_group_rank(tp_group),
-        )
-        if context.world_size <= 1:
-            continue
-
-        for name, _ in submodule.named_parameters(recurse=False):
-            qualified_name = f"{module_name}.{name}" if module_name else name
-            shard_contexts[qualified_name] = context
-        for name, _ in submodule.named_buffers(recurse=False):
-            qualified_name = f"{module_name}.{name}" if module_name else name
-            shard_contexts[qualified_name] = context
-
-    return shard_contexts
 
 
 # Distributed/runtime setup helpers
@@ -490,7 +458,7 @@ class AccuracyEngine:
         rank = (
             get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
         )
-        shard_contexts = _build_parameter_shard_contexts(target)
+        shard_contexts = build_parameter_shard_contexts(target)
 
         matched = 0
         total = 0

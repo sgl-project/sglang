@@ -10,6 +10,7 @@ import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 from torch.distributed.tensor import distribute_tensor
 
+from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.accuracy_config import (
@@ -74,6 +75,12 @@ class ComponentSelection:
     source_root: str
     source_path: str
     source_subfolder: str
+
+
+@dataclass(frozen=True)
+class ParameterShardContext:
+    world_size: int
+    rank: int
 
 
 def seed_and_broadcast(seed: int, tensor: torch.Tensor) -> torch.Tensor:
@@ -336,6 +343,32 @@ def materialize_module(
             set_module_attr(module, name, new_buf)
         elif torch.is_floating_point(buf):
             buf.data = buf.data.to(device=device, dtype=dtype)
+
+
+def build_parameter_shard_contexts(
+    module: nn.Module,
+) -> Dict[str, ParameterShardContext]:
+    shard_contexts: Dict[str, ParameterShardContext] = {}
+    for module_name, submodule in module.named_modules():
+        tp_group = getattr(submodule, "tp_group", None)
+        if tp_group is None:
+            continue
+
+        context = ParameterShardContext(
+            world_size=get_group_size(tp_group),
+            rank=get_group_rank(tp_group),
+        )
+        if context.world_size <= 1:
+            continue
+
+        for name, _ in submodule.named_parameters(recurse=False):
+            qualified_name = f"{module_name}.{name}" if module_name else name
+            shard_contexts[qualified_name] = context
+        for name, _ in submodule.named_buffers(recurse=False):
+            qualified_name = f"{module_name}.{name}" if module_name else name
+            shard_contexts[qualified_name] = context
+
+    return shard_contexts
 
 
 def build_state_lookup(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
