@@ -127,5 +127,5 @@ def unified_linear_attention_with_output(
         b=b[:real_num_tokens],
     )
 
-    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    output[:, :real_num_tokens].copy_(ret)
     return
