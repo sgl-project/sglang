@@ -219,7 +219,11 @@ class FusedMoE(torch.nn.Module):
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        self.use_triton_kernels = (
+            get_moe_runner_backend().is_triton_kernels()
+            if not (_is_cpu and _is_cpu_amx_available)
+            else False
+        )
         self.use_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -442,6 +446,9 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
         if use_padded_loading:
+            if _is_cpu:
+                if is_bias:
+                    shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -516,6 +523,9 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
         if use_padded_loading:
+            if _is_cpu:
+                if is_bias:
+                    shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,

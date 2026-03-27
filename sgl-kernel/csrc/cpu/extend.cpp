@@ -22,9 +22,11 @@ void extend_attention_kernel_impl(
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
+    const int64_t* __restrict__ encoder_lens,
     const index_t* __restrict__ extend_seq_lens,
     const index_t* __restrict__ extend_start_loc,
     const void* __restrict__ buffer,
+    const scalar_t* __restrict__ sinks,
     int batches,
     int num_heads,
     int num_heads_kv,
@@ -46,7 +48,11 @@ void extend_attention_kernel_impl(
     int max_total_num_tokens,
     int max_len_extend,
     int buffer_size_per_thread,
-    bool is_prefix_skipped) {
+    int64_t sliding_window_size,
+    bool is_prefix_skipped,
+    bool is_cross_attn,
+    bool has_encoder_lens,
+    bool has_sink) {
   // strides
   const int o_strideM = num_heads * head_size_v;
   const int o_strideH = head_size_v;
@@ -66,18 +72,21 @@ void extend_attention_kernel_impl(
     data_index_init(begin, bs, batches, head_id, num_heads, mb, MB);
 
     int tid = at::get_thread_num();
-    // s_i and s_delta: [BLOCK_M, BLOCK_N]
+    // s_i: [BLOCK_M, BLOCK_N]
     float* __restrict__ s_i = reinterpret_cast<float*>((char*)(buffer) + tid * buffer_size_per_thread);
-    scalar_t* __restrict__ s_delta = reinterpret_cast<scalar_t*>(s_i);
 
     // v_prime: [BLOCK_M, head_size_v]
     float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
 
+    // s_delta: [BLOCK_M, BLOCK_N]
+    scalar_t* __restrict__ s_delta = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
+
     // Btmp: [BLOCK_N, max(head_size, head_size_v)]
-    scalar_t* __restrict__ Btmp = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
+    scalar_t* __restrict__ Btmp = reinterpret_cast<scalar_t*>(s_delta + BLOCK_M * BLOCK_N);
 
     // init Btmp just once for each thread to prevent NaN
     fill_stub(Btmp, 0.f, BLOCK_N * ldb_tmp);
+    fill_stub(s_delta, 0.f, BLOCK_M * BLOCK_N);
 
     alignas(64) float s_prime[BLOCK_M];
     alignas(64) float m_prime[BLOCK_M];
@@ -91,6 +100,7 @@ void extend_attention_kernel_impl(
       int seq_extend_start_loc = extend_start_loc[bs];
 
       int req_pool_id = req_pool_indices[bs];
+      int kv_offset = (has_encoder_lens && (!is_cross_attn)) ? encoder_lens[bs] : 0;
       TORCH_CHECK(seq_len_prefix >= 0, "prefix len < 0!");
       TORCH_CHECK(seq_len <= max_context_len, "seq_len out of scope!");
       TORCH_CHECK(req_pool_id < max_num_reqs, "req_pool_id out of scope!");
@@ -115,10 +125,10 @@ void extend_attention_kernel_impl(
       fill_stub(v_prime, 0.f, m_size * head_size_v);
       fill_stub(s_prime, 0.f, m_size);
       fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
-
-      // stage 1: compute scores with prefix
-      for (int n = 0; n < seq_len_prefix; n += BLOCK_N) {
-        int n_size = std::min(BLOCK_N, seq_len_prefix - n);
+      int kv_start = 0;
+      int kv_end = is_cross_attn ? encoder_lens[bs] : seq_len_prefix;
+      for (int n = kv_start; n < kv_end; n += BLOCK_N) {
+        int n_size = std::min(BLOCK_N, kv_end - n);
 
         // `n_size` is K in 2nd gemm, pad to TILE_K;
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
@@ -127,7 +137,7 @@ void extend_attention_kernel_impl(
         pack_vnni<scalar_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ k_buffer + head_kv_id * k_strideH,
-            /*    ind */ req_to_token + req_pool_id * max_context_len + n,
+            /*    ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /*     N  */ n_size,
             /*     K  */ head_size,
             /* ld_src */ k_strideN,
@@ -146,14 +156,23 @@ void extend_attention_kernel_impl(
             /* B     */ Btmp,
             /* C     */ s_i);
 
-        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+        for (int row = 0; row < m_size; ++row) {
+          if (sliding_window_size > 0) {
+            int last_col = seq_len_prefix + row + m - sliding_window_size + 1;
+            if (last_col >= n + n_size) {
+              continue;
+            }
+            fill_stub(s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), last_col - n);
+          }
+          flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
+        }
 
         // get value and pack
-        pack_vnni2<scalar_t, index_t>(
+        pack_vnni2<scalar_t>(
             /*    dst */ Btmp,
             /*    src */ v_buffer + head_kv_id * v_strideH,
-            /*    ind */ req_to_token + req_pool_id * max_context_len + n,
+            /*    ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
             /* ld_src */ v_strideN,
@@ -171,76 +190,88 @@ void extend_attention_kernel_impl(
             /* A     */ s_delta,
             /* B     */ Btmp,
             /* C     */ v_prime);
-      }  // loop with seq_len_prefix
+      }
+      if (!is_cross_attn) {
+        // stage 2: compute the triangle part
+        int num_keys = std::min(seq_len_extend, m + BLOCK_M);
+        for (int n = 0; n < num_keys; n += BLOCK_N) {
+          int n_size = std::min(BLOCK_N, num_keys - n);
 
-      // stage 2: compute the triangle part
-      int num_keys = std::min(seq_len_extend, m + BLOCK_M);
-      for (int n = 0; n < num_keys; n += BLOCK_N) {
-        int n_size = std::min(BLOCK_N, num_keys - n);
+          // `n_size` is K in 2nd gemm, pad to TILE_K;
+          const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
 
-        // `n_size` is K in 2nd gemm, pad to TILE_K;
-        const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
+          // get key and pack
+          pack_vnni<scalar_t>(
+              /*    dst */ Btmp,
+              /*    src */ k_extend + (seq_extend_start_loc + n) * ke_strideN + head_kv_id * ke_strideH,
+              /*     N  */ n_size,
+              /*     K  */ head_size,
+              /* ld_src */ ke_strideN,
+              /* ld_dst */ BLOCK_N);
 
-        // get key and pack
-        pack_vnni<scalar_t>(
-            /*    dst */ Btmp,
-            /*    src */ k_extend + (seq_extend_start_loc + n) * ke_strideN + head_kv_id * ke_strideH,
-            /*     N  */ n_size,
-            /*     K  */ head_size,
-            /* ld_src */ ke_strideN,
-            /* ld_dst */ BLOCK_N);
+          // calculate s_i <- Q @ K
+          at::native::cpublas::brgemm(
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ head_size,
+              /* lda   */ q_strideM,
+              /* ldb   */ BLOCK_N,
+              /* ldc   */ BLOCK_N,
+              /* add_C */ false,
+              /* A     */ q_ptr,
+              /* B     */ Btmp,
+              /* C     */ s_i);
 
-        // calculate s_i <- Q @ K
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ n_size,
-            /* K     */ head_size,
-            /* lda   */ q_strideM,
-            /* ldb   */ BLOCK_N,
-            /* ldc   */ BLOCK_N,
-            /* add_C */ false,
-            /* A     */ q_ptr,
-            /* B     */ Btmp,
-            /* C     */ s_i);
-
-        // apply causal mask
-        if (num_keys - n <= BLOCK_N) {
-          for (int row = 0; row < m_size; ++row) {
-            int last_col = m + row - n;
-            // fill [last_col + 1, n_size) to -inf
-            float* row_ptr = s_i + row * BLOCK_N;
-            fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+          // apply causal mask
+          if (num_keys - n <= BLOCK_N) {
+            for (int row = 0; row < m_size; ++row) {
+              int last_col = m + row - n;
+              // fill [last_col + 1, n_size) to -inf
+              float* row_ptr = s_i + row * BLOCK_N;
+              fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
+            }
           }
-        }
 
-        flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+          for (int row = 0; row < m_size; ++row) {
+            if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size - 1 &&
+                row + m + 1 < n + sliding_window_size + n_size) {
+              fill_stub(
+                  s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), row + m - n - sliding_window_size + 1);
+            } else if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size) {
+              continue;
+            }
+            flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
+                s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
+          }
 
-        // get value and pack
-        pack_vnni2<scalar_t>(
-            /*    dst */ Btmp,
-            /*    src */ v_extend + (seq_extend_start_loc + n) * ve_strideN + head_kv_id * ve_strideH,
-            /*     K  */ n_size,
-            /*     N  */ head_size_v,
-            /* ld_src */ ve_strideN,
-            /* ld_dst */ head_size_v);
+          // get value and pack
+          pack_vnni2<scalar_t>(
+              /*    dst */ Btmp,
+              /*    src */ v_extend + (seq_extend_start_loc + n) * ve_strideN + head_kv_id * ve_strideH,
+              /*     K  */ n_size,
+              /*     N  */ head_size_v,
+              /* ld_src */ ve_strideN,
+              /* ld_dst */ head_size_v);
 
-        // calculate V' <- s_delta @ V + V'
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ head_size_v,
-            /* K     */ padded_n_size,  // n_size
-            /* lda   */ BLOCK_N,
-            /* ldb   */ head_size_v,
-            /* ldc   */ head_size_v,
-            /* add_C */ true,
-            /* A     */ s_delta,
-            /* B     */ Btmp,
-            /* C     */ v_prime);
-      }  // loop with seq_len_extend
-
+          // calculate V' <- s_delta @ V + V'
+          at::native::cpublas::brgemm(
+              /* M     */ m_size,
+              /* N     */ head_size_v,
+              /* K     */ padded_n_size,  // n_size
+              /* lda   */ BLOCK_N,
+              /* ldb   */ head_size_v,
+              /* ldc   */ head_size_v,
+              /* add_C */ true,
+              /* A     */ s_delta,
+              /* B     */ Btmp,
+              /* C     */ v_prime);
+        }  // loop with seq_len_extend
+      }
       scalar_t* __restrict__ out_ptr = o_extend + (seq_extend_start_loc + m) * o_strideM + head_id * o_strideH;
       for (int row = 0; row < m_size; ++row) {
+        if (has_sink) {
+          s_prime[row] += std::exp(sinks[head_id] - m_prime[row]);
+        }
         float s = 1 / s_prime[row];
         copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
       }
@@ -260,6 +291,7 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
   const int size_per_thread =
       /* s_i     */ BLOCK_M * BLOCK_N * sizeof(float) +
       /* v_prime */ BLOCK_M * head_size_v * sizeof(float) +
+      /* s_delta */ BLOCK_M * BLOCK_N * sizeof(uint16_t) +
       /* Btmp    */ BLOCK_N * std::max(head_size, head_size_v) * sizeof(uint16_t);
 
   buffer.resize_({num_threads, size_per_thread});
@@ -280,9 +312,11 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         req_to_token.data_ptr<index_t>(),                                                  \
         req_pool_indices.data_ptr<int64_t>(),                                              \
         seq_lens.data_ptr<int64_t>(),                                                      \
+        encoder_lens_t.data_ptr<int64_t>(),                                                \
         extend_seq_lens.data_ptr<index_t>(),                                               \
         extend_start_loc.data_ptr<index_t>(),                                              \
         buffer.data_ptr(),                                                                 \
+        sinks_tensor.data_ptr<scalar_t>(),                                                 \
         num_seqs,                                                                          \
         num_heads,                                                                         \
         num_heads_kv,                                                                      \
@@ -304,7 +338,11 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         max_total_num_tokens,                                                              \
         max_len_extend,                                                                    \
         sz,                                                                                \
-        is_prefix_skipped);                                                                \
+        sliding_window_size,                                                               \
+        is_prefix_skipped,                                                                 \
+        is_cross_attn,                                                                     \
+        has_encoder_lens,                                                                  \
+        has_sink);                                                                         \
   } while (0)
 
 // q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -321,11 +359,12 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
 // seq_lens: [num_seqs] int64
 // extend_seq_lens: [num_seqs]
 // extend_start_loc: [num_seqs]
-//
+// encoder_lens: [num_seqs] int64 or None
+// sinks: [num_heads] or None
 void extend_attention_cpu(
     at::Tensor& q_extend,
-    at::Tensor& k_extend,
-    at::Tensor& v_extend,
+    const std::optional<at::Tensor>& k_extend_opt,
+    const std::optional<at::Tensor>& v_extend_opt,
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
@@ -336,13 +375,17 @@ void extend_attention_cpu(
     at::Tensor& extend_start_loc,
     int64_t max_len_extend,
     double sm_scale,
-    double logit_cap) {
+    double logit_cap,
+    bool is_cross_attn,
+    int64_t sliding_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks) {
   RECORD_FUNCTION(
       "sgl-kernel::extend_attention_cpu",
       std::vector<c10::IValue>(
           {q_extend,
-           k_extend,
-           v_extend,
+           k_extend_opt,
+           v_extend_opt,
            o_extend,
            k_buffer,
            v_buffer,
@@ -352,6 +395,15 @@ void extend_attention_cpu(
            extend_seq_lens,
            extend_start_loc,
            max_len_extend}));
+  if (!is_cross_attn) {
+    TORCH_CHECK(
+        k_extend_opt.has_value() && v_extend_opt.has_value(),
+        "k_extend and v_extend are required for non-cross attention");
+  }
+  // Since k_extend and v_extend are not used for cross attention, they can be initialized as k_buffer and v_buffer
+  // here.
+  auto k_extend = k_extend_opt.has_value() ? k_extend_opt.value() : k_buffer;
+  auto v_extend = v_extend_opt.has_value() ? v_extend_opt.value() : v_buffer;
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_extend);
   CHECK_INPUT(o_extend);
@@ -415,6 +467,18 @@ void extend_attention_cpu(
 
   int num_threads = at::get_num_threads();
   auto buffer = at::empty({}, q_extend.options().dtype(at::kChar));
+
+  bool has_encoder_lens = encoder_lens.has_value();
+  // Since encoder_lens is not used when it is None, encoder_lens_t can be initialized as any tensor of int64_t dtype.
+  at::Tensor encoder_lens_t = seq_lens;
+  if (has_encoder_lens) {
+    encoder_lens_t = encoder_lens.value();
+    CHECK_EQ(encoder_lens_t.size(0), num_seqs);
+  }
+  bool has_sink = sinks.has_value();
+  at::Tensor sinks_tensor = has_sink ? sinks.value() : at::empty({num_heads}, q_extend.options());
+  CHECK_DIM(1, sinks_tensor);
+  CHECK_EQ(sinks_tensor.size(0), num_heads);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {

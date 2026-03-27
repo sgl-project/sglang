@@ -207,6 +207,107 @@ def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
     ).sum(dim=1)
 
 
+def moe_gptoss_act(x, alpha: float = 1.702, limit: float = 7.0):
+    x_glu, x_linear = x[..., ::2], x[..., 1::2]
+    # Clamp the input values
+    x_glu = x_glu.clamp(min=None, max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+    # Note we add an extra bias of 1 to the linear layer
+    return out_glu * (x_linear + 1.0)
+
+
+def torch_naive_gptoss_fused_moe(
+    x,
+    w1,
+    w2,
+    w1_bias,
+    w2_bias,
+    topk_weights,
+    topk_ids,
+    activation_alpha,
+    swiglu_limit,
+    len_experts,
+) -> torch.Tensor:
+
+    # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
+    cnts = topk_ids.new_zeros((topk_ids.shape[0], len_experts))
+    cnts.scatter_(1, topk_ids.to(torch.int64), 1)
+    tokens_per_expert = cnts.sum(dim=0)
+    idxs = topk_ids.view(-1).argsort()
+
+    sorted_tokens = x[idxs // topk_ids.shape[1]]
+    tokens_per_expert = tokens_per_expert.cpu().numpy()
+
+    outputs = []
+    start_idx = 0
+    for i, num_tokens in enumerate(tokens_per_expert):
+        end_idx = start_idx + num_tokens
+        if num_tokens == 0:
+            continue
+        tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+
+        layer_w13_weight = w1[i]
+        layer_w13_weight_bias = w1_bias[i]
+        layer_w2_weight_bias = w2_bias[i]
+        layer_w2_weight = w2[i]
+
+        gate_up = F.linear(
+            tokens_for_this_expert,
+            layer_w13_weight,
+            bias=layer_w13_weight_bias.to(torch.bfloat16),
+        )
+        gate_up = moe_gptoss_act(gate_up, activation_alpha, swiglu_limit)
+        expert_out = F.linear(
+            gate_up, layer_w2_weight, bias=layer_w2_weight_bias.to(torch.bfloat16)
+        )
+        outputs.append(expert_out)
+        start_idx = end_idx
+
+    outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+    new_x = torch.empty_like(outs)
+
+    new_x[idxs] = outs
+    final_out = (
+        new_x.view(*topk_ids.shape, -1)
+        .type(topk_weights.dtype)
+        .mul_(topk_weights.unsqueeze(dim=-1))
+        .sum(dim=1)
+        .type(new_x.dtype)
+    )
+    return final_out
+
+
+def torch_naive_fused_moe_gptoss(
+    a,
+    w1,
+    w2,
+    w1_bias,
+    w2_bias,
+    topk_weight,
+    topk_ids,
+    renormalize,
+    activation_alpha,
+    swiglu_limit,
+    len_experts,
+):
+    if renormalize:
+        topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+
+    return torch_naive_gptoss_fused_moe(
+        a,
+        w1,
+        w2,
+        w1_bias,
+        w2_bias,
+        topk_weight,
+        topk_ids,
+        activation_alpha,
+        swiglu_limit,
+        len_experts,
+    )
+
+
 def torch_w8a8_per_column_fused_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, topk):
     """This function performs fused moe with per-column int8 quantization using native torch."""
 
@@ -278,6 +379,121 @@ def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk):
         .sum(dim=1)
         .to(a.dtype)
     )
+
+
+# https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/modelopt/torch/quantization/qtensor/mxfp4_tensor.py
+class MXFP4QuantizeUtil:
+    E2M1_max = 6.0
+
+    E2M1_values = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+    E2M1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
+
+    block_size = 32
+
+    @classmethod
+    def quantize(cls, input: torch.Tensor) -> tuple:
+        """Converting a tensor to a quantized format based on MXFP4 quantization. Only E4M3 is supported.
+        Args:
+            input (torch.Tensor): The input tensor to be quantized.
+        """
+
+        def cast_fp4(x):
+            sign = torch.sign(x)
+            sign_bit = (2 - sign) // 2
+            ord_ = torch.sum(
+                (x.abs().unsqueeze(-1) - cls.E2M1_bounds.to(x.device)) > 0, dim=-1
+            )
+            fp4_val = (sign_bit * 0b1000 + ord_).to(torch.uint8)
+            return fp4_val
+
+        def fuse_uint4_to_uint8(x):
+            # If the last dimension is odd, pad with zeros
+            # If this behavior is not desired, please modify the code accordingly
+            left_side = x[..., 0::2]  # Even indices (0, 2, 4...)
+            right_side = x[..., 1::2]  # Odd indices (1, 3, 5...)
+            new_data = (
+                right_side.clone() << 4
+            )  # Put odd indices (higher addresses) in high bits
+            new_data[
+                ..., : left_side.shape[-1]
+            ] += left_side  # Put even indices in low bits
+            return new_data
+
+        original_shape = input.shape
+        original_dtype = input.dtype
+        input = input.view(-1, cls.block_size)
+        # get scales
+        input_amax = input.abs().max(dim=-1, keepdim=True).values
+        descale = input_amax / cls.E2M1_max
+        min_value = torch.tensor(-127.0, device=descale.device)
+        e8m0_scale = torch.ceil(torch.maximum(torch.log2(descale), min_value))
+
+        input = (input / torch.exp2(e8m0_scale)).view(original_shape)
+        input_q = cast_fp4(input)
+        input_q = fuse_uint4_to_uint8(input_q)
+        e8m0_scale = (e8m0_scale + 127).to(torch.uint8)
+        return input_q, e8m0_scale
+
+    @classmethod
+    def dequantize(cls, quantized_data, dtype: torch.dtype, scale):
+        """Dequantze MXFP4 packed tensor to a target dtype."""
+
+        def unfuse_uint8_to_uint4(x):
+            """Unfuse uint8 values back to uint4 values.
+            This is the inverse operation of fuse_uint4_to_uint8.
+            """
+            # Extract the lower 4 bits (even indices)
+            left_side = x & 0x0F
+
+            # Extract the upper 4 bits (odd indices)
+            right_side = (x >> 4) & 0x0F
+
+            # Create a new tensor with alternating values
+            shape = list(x.shape)
+            shape[-1] = shape[-1] * 2
+            result = torch.zeros(shape, dtype=torch.uint8, device=x.device)
+
+            # Fill in the values - even indices get low bits, odd indices get high bits
+            result[..., 0::2] = left_side  # Even indices from low bits
+            result[..., 1::2] = right_side  # Odd indices from high bits
+
+            return result
+
+        e8m0_scale = scale
+
+        # Unfuse the uint8 values back to uint4
+        x_unfused = unfuse_uint8_to_uint4(quantized_data)
+        # print("@@@ x_unfused: ", x_unfused)
+        # Extract sign and magnitude
+        sign = 1 - 2 * ((x_unfused & 0b1000) >> 3).to(
+            torch.float32
+        )  # Extract sign bit and convert to +1/-1
+        magnitude = x_unfused & 0b0111  # Extract magnitude bits
+        magnitude = magnitude.to(torch.long)
+
+        # Create a tensor with the E2M1 values
+        values = torch.tensor(cls.E2M1_values, device=quantized_data.device)
+
+        # Use gather to index the values tensor properly
+        # We need to reshape magnitude to match the dimensions we want to gather along
+        original_shape = magnitude.shape
+        x_float = values[magnitude.reshape(-1)].reshape(original_shape)
+
+        # Apply sign and scale
+        x_float = sign.float() * x_float
+
+        # Reshape to apply block-wise scaling
+        x_float = x_float.reshape(-1, cls.block_size)
+
+        # Apply the E8M0 scale
+        scale_factor = torch.exp2(e8m0_scale.float() - 127)
+        scale_factor = scale_factor.reshape(-1, 1)  # Reshape for proper broadcasting
+
+        # Apply scaling and reshape back to original shape
+        x_float = x_float * scale_factor
+
+        # Reshape back to the original shape
+        return x_float.reshape(original_shape).to(dtype)
 
 
 def make_non_contiguous(x: torch.Tensor) -> torch.Tensor:

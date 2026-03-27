@@ -89,20 +89,24 @@ void decode_attention_cpu(
     at::Tensor& k_cache,
     at::Tensor& v_cache,
     at::Tensor& output,
-    at::Tensor& key,
-    at::Tensor& value,
+    const std::optional<at::Tensor>& key,
+    const std::optional<at::Tensor>& value,
     at::Tensor& loc,
     at::Tensor& attn_logits,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
     double sm_scale,
-    double logit_cap);
+    double logit_cap,
+    bool is_cross_attn,
+    int64_t slidling_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
-    at::Tensor& k_extend,
-    at::Tensor& v_extend,
+    const std::optional<at::Tensor>& k_extend,
+    const std::optional<at::Tensor>& v_extend,
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
@@ -113,7 +117,11 @@ void extend_attention_cpu(
     at::Tensor& extend_start_loc,
     int64_t max_len_extend,
     double sm_scale,
-    double logit_cap);
+    double logit_cap,
+    bool is_cross_attn,
+    int64_t sliding_window_size,
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -219,6 +227,10 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w1_zero,
     const std::optional<at::Tensor>& w2_zero,
     const std::optional<std::vector<int64_t>> block_size,
+    const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w2_bias,
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit,
     bool is_vnni);
 
 at::Tensor shared_expert_cpu(
@@ -443,16 +455,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor value, "
+      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor? key, Tensor? "
+      "value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap) -> ()");
+      "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
   m.def(
-      "extend_attention_cpu(Tensor q_extend, Tensor k_extend, Tensor v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
+      "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor(a!) o_extend, Tensor k_buffer, "
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
-      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
+      "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
+      "sliding_window_size, Tensor? "
+      "encoder_lens, Tensor? sinks) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
@@ -529,7 +544,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, bool is_vnni) -> Tensor");
+      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
+      "limit, bool is_vnni) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
   // weight absorption
