@@ -684,8 +684,8 @@ class TokenizedGenerateReqInput(BaseReq):
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
 
-    # The input embeds
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # The input embeds (np.ndarray after tokenizer_manager conversion)
+    input_embeds: Optional[Any] = None
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None

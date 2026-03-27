@@ -506,7 +506,7 @@ class Req(ReqDllmMixin):
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_id: Optional[str] = None,
-        input_embeds: Optional[List[List[float]]] = None,
+        input_embeds: Optional[np.ndarray] = None,
         token_type_ids: List[int] = None,
         session: Optional[Session] = None,
         custom_logit_processor: Optional[str] = None,
@@ -1556,7 +1556,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
                 # fill_ids/extend_input_len on chunk overflow but not input_embeds.
-                input_embeds.extend(
+                # Collect per-request arrays; concatenate once at the end.
+                input_embeds.append(
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]
                 )
 
@@ -1660,9 +1661,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
-            torch.tensor(input_embeds, pin_memory=_pin).to(
-                self.device, non_blocking=True
-            )
+            torch.tensor(
+                np.concatenate([np.asarray(e, dtype=np.float32) for e in input_embeds]),
+                pin_memory=_pin,
+            ).to(self.device, non_blocking=True)
             if input_embeds
             else None
         )
