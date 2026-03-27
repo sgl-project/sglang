@@ -515,47 +515,12 @@ def detect_cuda_suite(file_path_from_test):
     return suite, runner, use_deepep, None
 
 
-def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
+def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
     """
-    Handles the /rerun-ut <file>::<TestClass.test_method> command.
-    Dispatches a lightweight workflow to run a single test on the correct CUDA runner.
+    Resolve a single test spec and dispatch a workflow run.
+
+    Returns a dict with keys: spec, success, test_command, runner_label, run_url, error.
     """
-    # SECURITY: For fork PRs, only allow /rerun-ut if the commenter has write+ permission.
-    # This command checks out and executes code from the PR branch on self-hosted GPU
-    # runners, so we must ensure the commenter is a trusted collaborator.
-    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
-    if is_fork:
-        commenter = comment.user.login
-        perm = gh_repo.get_collaborator_permission(commenter)
-        if perm not in ("admin", "write"):
-            print(f"Permission denied: /rerun-ut on fork PR by {commenter}.")
-            comment.create_reaction("confused")
-            pr.create_issue_comment(
-                "❌ `/rerun-ut` is not available for fork PRs unless the commenter "
-                "has write permission on the repo.\n\n"
-                "Please ask a maintainer to run this command, or use the normal CI flow."
-            )
-            return False
-        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
-
-    if not (
-        user_perms.get("can_rerun_ut", False)
-        or user_perms.get("can_rerun_stage", False)
-    ):
-        print("Permission denied: neither can_rerun_ut nor can_rerun_stage is true.")
-        return False
-
-    if not test_spec:
-        comment.create_reaction("confused")
-        pr.create_issue_comment(
-            "❌ Please specify a test: `/rerun-ut <file>::<TestClass.test_method>`\n\n"
-            "Examples:\n"
-            "- `/rerun-ut test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
-            "- `/rerun-ut registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
-            "- `/rerun-ut test_srt_endpoint.py`"
-        )
-        return False
-
     # Parse spec: split on :: to get file path and optional test selector
     if "::" in test_spec:
         file_part, test_selector = test_spec.split("::", 1)
@@ -570,16 +535,12 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
     # Resolve file path
     resolved_path, err = resolve_test_file(file_part)
     if err:
-        comment.create_reaction("confused")
-        pr.create_issue_comment(f"❌ {err}")
-        return False
+        return {"spec": test_spec, "success": False, "error": err}
 
     # Detect suite and runner
     suite, runner_label, use_deepep, err = detect_cuda_suite(resolved_path)
     if err:
-        comment.create_reaction("confused")
-        pr.create_issue_comment(f"❌ {err}")
-        return False
+        return {"spec": test_spec, "success": False, "error": err}
 
     # Build test_command: file path (+ optional test selector as unittest arg)
     test_command = resolved_path
@@ -601,13 +562,15 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
                 break
 
         if not target_workflow:
-            print(f"Error: {workflow_name} workflow not found")
-            return False
+            return {
+                "spec": test_spec,
+                "success": False,
+                "error": f"{workflow_name} workflow not found",
+            }
 
         is_fork = (
             pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
         )
-        print(f"PR is from fork: {is_fork}")
 
         pr_head_sha = None
         if is_fork:
@@ -641,50 +604,114 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
         success = dispatch_resp.status_code in (200, 204)
         if not success:
             print(f"Dispatch failed: {dispatch_resp.status_code} {dispatch_resp.text}")
+            return {
+                "spec": test_spec,
+                "success": False,
+                "error": f"Dispatch failed: {dispatch_resp.status_code}",
+            }
 
-        if success:
-            print(f"Successfully triggered rerun-ut: {test_command}")
-            comment.create_reaction("+1")
+        print(f"Successfully triggered rerun-ut: {test_command}")
 
-            # Include test_command in expected title to distinguish
-            # concurrent /rerun-ut dispatches (run-name includes test_command)
-            run_url = find_workflow_run_url(
-                gh_repo,
-                target_workflow.id,
-                ref,
-                "rerun-ut",
-                token,
-                dispatch_time,
-                pr_head_sha=pr_head_sha,
-                max_wait=30,
-                test_command=test_command,
-            )
-            if run_url:
-                pr.create_issue_comment(
-                    f"✅ Triggered `/rerun-ut` on `{runner_label}` runner:"
-                    f" [View workflow run]({run_url})\n"
-                    f"```\ncd test/ && python3 {test_command}\n```"
-                )
-            else:
-                pr.create_issue_comment(
-                    f"✅ Triggered `/rerun-ut` on `{runner_label}` runner:\n"
-                    f"```\ncd test/ && python3 {test_command}\n```\n"
-                    f"⚠️ Could not retrieve workflow run URL. "
-                    f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
-                )
-            return True
-        else:
-            print("Failed to trigger workflow_dispatch")
-            return False
+        run_url = find_workflow_run_url(
+            gh_repo,
+            target_workflow.id,
+            ref,
+            "rerun-ut",
+            token,
+            dispatch_time,
+            pr_head_sha=pr_head_sha,
+            max_wait=30,
+            test_command=test_command,
+        )
+        return {
+            "spec": test_spec,
+            "success": True,
+            "test_command": test_command,
+            "runner_label": runner_label,
+            "run_url": run_url,
+        }
 
     except Exception as e:
-        print(f"Error triggering rerun-ut: {e}")
+        print(f"Error triggering rerun-ut for {test_spec}: {e}")
+        return {"spec": test_spec, "success": False, "error": str(e)}
+
+
+def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_specs, token):
+    """
+    Handles the /rerun-ut command. Accepts a list of test specs and dispatches
+    a workflow run for each, posting a single consolidated comment.
+    """
+    # SECURITY: For fork PRs, only allow /rerun-ut if the commenter has write+ permission.
+    # This command checks out and executes code from the PR branch on self-hosted GPU
+    # runners, so we must ensure the commenter is a trusted collaborator.
+    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
+    if is_fork:
+        commenter = comment.user.login
+        perm = gh_repo.get_collaborator_permission(commenter)
+        if perm not in ("admin", "write"):
+            print(f"Permission denied: /rerun-ut on fork PR by {commenter}.")
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                "❌ `/rerun-ut` is not available for fork PRs unless the commenter "
+                "has write permission on the repo.\n\n"
+                "Please ask a maintainer to run this command, or use the normal CI flow."
+            )
+            return False
+        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
+
+    if not (
+        user_perms.get("can_rerun_ut", False)
+        or user_perms.get("can_rerun_stage", False)
+    ):
+        print("Permission denied: neither can_rerun_ut nor can_rerun_stage is true.")
+        return False
+
+    if not test_specs:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Failed to trigger rerun-ut: {str(e)}\n\n"
-            f"Please check the logs or contact maintainers."
+            "❌ Please specify a test: `/rerun-ut <file>::<TestClass.test_method>`\n\n"
+            "Examples:\n"
+            "- `/rerun-ut test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
+            "- `/rerun-ut registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
+            "- `/rerun-ut test_srt_endpoint.py`\n"
+            "- `/rerun-ut test_a.py test_b.py test_c.py` (multiple tests)"
         )
         return False
+
+    results = []
+    for spec in test_specs:
+        results.append(_resolve_and_dispatch_ut(gh_repo, pr, spec, token))
+
+    # Build consolidated comment
+    successes = [r for r in results if r["success"]]
+    failures = [r for r in results if not r["success"]]
+
+    lines = []
+    for r in successes:
+        if r.get("run_url"):
+            lines.append(
+                f"✅ `{r['runner_label']}`: [View workflow run]({r['run_url']})\n"
+                f"```\ncd test/ && python3 {r['test_command']}\n```"
+            )
+        else:
+            lines.append(
+                f"✅ `{r['runner_label']}`:\n"
+                f"```\ncd test/ && python3 {r['test_command']}\n```\n"
+                f"⚠️ Could not retrieve workflow run URL. "
+                f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+            )
+    for r in failures:
+        lines.append(f"❌ `{r['spec']}`: {r['error']}")
+
+    body = "\n\n".join(lines)
+
+    if successes:
+        comment.create_reaction("+1")
+    if failures and not successes:
+        comment.create_reaction("confused")
+
+    pr.create_issue_comment(body)
+    return len(successes) > 0
 
 
 def main():
@@ -769,9 +796,8 @@ def main():
         handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
 
     elif first_line.startswith("/rerun-ut"):
-        parts = first_line.split(maxsplit=1)
-        test_spec = parts[1].strip() if len(parts) > 1 else None
-        handle_rerun_ut(repo, pr, comment, user_perms, test_spec, token)
+        test_specs = first_line.split()[1:]
+        handle_rerun_ut(repo, pr, comment, user_perms, test_specs or None, token)
 
     else:
         print(f"Unknown or ignored command: {first_line}")
