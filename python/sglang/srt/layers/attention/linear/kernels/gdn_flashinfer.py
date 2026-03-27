@@ -96,12 +96,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self._decode_fn is None:
             raise RuntimeError("FlashInfer GDN decode kernel is unavailable.")
 
-        sm_major = torch.cuda.get_device_capability()[0]
-        self.use_state_pool = sm_major != 9
-        self.supports_extend = sm_major == 9
-        self.supports_target_verify = sm_major == 9
+        is_sm90 = torch.cuda.get_device_capability()[0] == 9
+        self.use_state_pool = not is_sm90
+        self.supports_extend = is_sm90
+        self.supports_target_verify = is_sm90
 
-        if sm_major == 9:
+        if is_sm90:
             if self._prefill_fn is None:
                 raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
             if self._mtp_fn is None:
