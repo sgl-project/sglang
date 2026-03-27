@@ -57,6 +57,7 @@ jobs:
         run: |
           cat <<'EOF' > Dockerfile.mod
           FROM ${{ env.IMAGE }}
+          ENV OPTFLAG="w8a8_gemm,moe"
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true
           RUN pip uninstall -y aiter amd-aiter
           RUN rm -rf /sgl-workspace/aiter/aiter/jit/build
@@ -74,6 +75,26 @@ jobs:
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
 
+          RUN echo "=== triton version before installation ===" && pip show triton || true
+          RUN pip uninstall -y triton && \
+              rm -rf /sgl-workspace/triton-custom && \
+              git clone https://github.com/ROCm/triton /triton-checkout && \
+              cd /triton-checkout && \
+              git checkout gluon_ext && \
+              git rev-parse HEAD && \
+              pip install -r python/requirements.txt && \
+              python setup.py install
+
+          RUN echo "=== triton version after installation ===" && pip show triton || true
+
+          RUN pip uninstall -y pyhip && \
+              git clone https://github.com/tingqli/pyhip.git /pyhip-checkout && \
+              cd /pyhip-checkout && \
+              git checkout fed8898cfd79f3db9474750c22891e704a8329b9 && \
+              git rev-parse HEAD && \
+              pip install -e .
+          RUN echo "=== pyhip version after installation ===" && pip show pyhip || true
+
           RUN echo "=== sgl-kernel version before installation ===" && pip show sgl-kernel || true
           RUN echo "=== sglang version before installation ===" && pip show sglang || true
           RUN pip uninstall -y sgl-kernel sglang
@@ -82,12 +103,14 @@ jobs:
               git checkout ${{ env.SGLANG_GITHUB_COMMIT_SHA }} && \
               git rev-parse HEAD && \
               pip install --upgrade pip && \
-              pip install "transformers>=4.57.0" && \
               cd sgl-kernel && \
               AMDGPU_TARGET=gfx950 python3 setup_rocm.py install && \
               cd .. && \
               rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && \
-              AMDGPU_TARGET=gfx950 PYTORCH_ROCM_ARCH="gfx950" pip install -e "python[all_hip]"
+              AMDGPU_TARGET=gfx950 PYTORCH_ROCM_ARCH="gfx950" pip install -e "python[all_hip]" && \
+              pip install "transformers==4.57.1"
+
+          RUN echo "=== transformers version after installation ===" && pip show transformers || true
           RUN echo "=== sgl-kernel version after installation ===" && pip show sgl-kernel || true
           RUN echo "=== sglang version after installation ===" && pip show sglang || true
           EOF
@@ -176,13 +199,13 @@ jobs:
             exit 1
           fi
 
-      - name: Clean Up
-        if: always()
-        run: |
-          docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout" 2>/dev/null || true
-          docker stop sglang_test 2>/dev/null || true
-          docker rm sglang_test 2>/dev/null || true
-          docker image rm sglang_test:ci 2>/dev/null || true
-          docker rmi -f $(docker images -f "dangling=true" -q) || true
-          docker image prune -f 2>/dev/null || true
-          docker builder prune -f 2>/dev/null || true
+      # - name: Clean Up
+      #   if: always()
+      #   run: |
+      #     docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout" 2>/dev/null || true
+      #     docker stop sglang_test 2>/dev/null || true
+      #     docker rm sglang_test 2>/dev/null || true
+      #     docker image rm sglang_test:ci 2>/dev/null || true
+      #     docker rmi -f $(docker images -f "dangling=true" -q) || true
+      #     docker image prune -f 2>/dev/null || true
+      #     docker builder prune -f 2>/dev/null || true

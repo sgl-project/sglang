@@ -99,8 +99,12 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
+    from aiter.fused_moe import fused_moe as fused_moe_aiter
     from aiter.ops.shuffle import shuffle_weight
+    from pyhip.contrib.fused_moe import fused_moe as fused_moe_pyhip
+    import os
+    OPTFLAG = os.getenv("OPTFLAG","") # moe w8a8_gemm
+    fused_moe = fused_moe_pyhip if "moe" in OPTFLAG else fused_moe_aiter
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -449,6 +453,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 layer.weight_scale_inv.format_ue8m0 = True
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
+            if "w8a8_gemm" in OPTFLAG:
+                weight = shuffle_weight(weight.contiguous(), (16, 16))
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data

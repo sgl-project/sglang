@@ -545,6 +545,9 @@ def _unpack_ue8m0_scale_for_triton(
 
     return sf_fp32
 
+import os
+OPTFLAG = os.getenv("OPTFLAG","") # moe w8a8_gemm
+from pyhip.contrib.w8a8_block_fp8_linear import w8a8_block_fp8_linear as pyhip_w8a8_block_fp8_linear
 
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
@@ -554,6 +557,11 @@ def aiter_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+
+    if "w8a8_gemm" in OPTFLAG:
+        return pyhip_w8a8_block_fp8_linear(input, weight, block_size, weight_scale, input_scale, bias,
+            b_preshuffle = True, method = "auto")
+
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]

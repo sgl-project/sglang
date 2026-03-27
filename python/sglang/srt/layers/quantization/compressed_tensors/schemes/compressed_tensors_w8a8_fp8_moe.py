@@ -31,8 +31,12 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
+    from aiter.fused_moe import fused_moe as fused_moe_aiter
     from aiter.ops.shuffle import shuffle_weight
+    from pyhip.contrib.fused_moe import fused_moe as fused_moe_pyhip
+    import os
+    OPTFLAG = os.getenv("OPTFLAG","") # moe w8a8_gemm
+    fused_moe = fused_moe_pyhip if "moe" in OPTFLAG else fused_moe_aiter
 
 
 logger = logging.getLogger(__name__)
