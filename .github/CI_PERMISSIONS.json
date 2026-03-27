@@ -23,9 +23,9 @@
     "BBuf": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "BHZ-BER": {
         "can_tag_run_ci_label": true,
@@ -51,9 +51,9 @@
     "CatherineSue": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "Chen-0210": {
         "can_tag_run_ci_label": true,
@@ -79,9 +79,9 @@
     "DarkSharpness": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "Edwardf0t1": {
         "can_tag_run_ci_label": true,
@@ -93,9 +93,9 @@
     "FlamingoPg": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "FrankLeeeee": {
         "can_tag_run_ci_label": true,
@@ -107,9 +107,9 @@
     "Fridge003": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "HaiShaw": {
         "can_tag_run_ci_label": true,
@@ -139,6 +139,13 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
+    "Hexq0210": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
+    },
     "HydraQYH": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -156,23 +163,23 @@
     "Johnsonms": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "JustinTong0323": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "Kangyan-Zhou": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "LorrinWWW": {
         "can_tag_run_ci_label": true,
@@ -180,6 +187,13 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override",
         "can_rerun_stage": true
+    },
+    "Makcum888e": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
     },
     "MingxuZh": {
         "can_tag_run_ci_label": true,
@@ -191,23 +205,23 @@
     "Oasis-Git": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 60,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
     },
     "Prozac614": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 60,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
     },
     "Qiaolin-Yu": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "Qihang-Zhang": {
         "can_tag_run_ci_label": true,
@@ -219,9 +233,9 @@
     "Ratish1": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "RubiaCx": {
         "can_tag_run_ci_label": true,
@@ -233,9 +247,9 @@
     "ShangmingCai": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "Shunkangz": {
         "can_tag_run_ci_label": true,
@@ -289,16 +303,16 @@
     "XucSh": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "YAMY1234": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "Ying1123": {
         "can_tag_run_ci_label": true,
@@ -331,9 +345,9 @@
     "acelyc111": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "adarshxs": {
         "can_tag_run_ci_label": true,
@@ -352,16 +366,16 @@
     "alisonshao": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "alphabetc1": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "amysaq2023": {
         "can_tag_run_ci_label": true,
@@ -394,9 +408,16 @@
     "b8zhong": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
+    },
+    "bingxche": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
     },
     "blzheng": {
         "can_tag_run_ci_label": true,
@@ -408,9 +429,9 @@
     "byjiang1996": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "cctry": {
         "can_tag_run_ci_label": true,
@@ -422,9 +443,16 @@
     "ch-wan": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
+    },
+    "chenxu214": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
     },
     "chunyuan-w": {
         "can_tag_run_ci_label": true,
@@ -436,9 +464,9 @@
     "cicirori": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "cyb70289": {
         "can_tag_run_ci_label": true,
@@ -457,9 +485,9 @@
     "dougyster": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "elfiegg": {
         "can_tag_run_ci_label": true,
@@ -478,9 +506,9 @@
     "fzyzcjy": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "gaopengff": {
         "can_tag_run_ci_label": true,
@@ -489,12 +517,19 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
+    "glenliu21": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
+    },
     "gongwei-130": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "gongy": {
         "can_tag_run_ci_label": true,
@@ -534,30 +569,30 @@
     "harvenstar": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "hebiao064": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "hlu1": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "hnyls2002": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "huaiyuzh": {
         "can_tag_run_ci_label": true,
@@ -569,16 +604,16 @@
     "huangtingwei9988": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "hubertlu-tw": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "hyhieu": {
         "can_tag_run_ci_label": true,
@@ -590,30 +625,30 @@
     "hzh0425": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "iforgetmyname": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "ishandhanani": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "ispobock": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "jason-fxz": {
         "can_tag_run_ci_label": true,
@@ -653,16 +688,16 @@
     "jinmingyi1998": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "kaixih": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "kevin85421": {
         "can_tag_run_ci_label": true,
@@ -674,16 +709,16 @@
     "key4ng": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "kkHuang-amd": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "kpham-sgl": {
         "can_tag_run_ci_label": true,
@@ -716,16 +751,23 @@
     "lifuhuang": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
+    "liupeng374": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "liusy58": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "liz-badada": {
         "can_tag_run_ci_label": true,
@@ -737,16 +779,23 @@
     "merrymercy": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
+    },
+    "michaelzhang-ai": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
     },
     "mickqian": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "mingfeima": {
         "can_tag_run_ci_label": true,
@@ -765,9 +814,9 @@
     "mmangkad": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "narutolhy": {
         "can_tag_run_ci_label": true,
@@ -800,9 +849,9 @@
     "pansicheng": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "pavanimajety": {
         "can_tag_run_ci_label": true,
@@ -824,6 +873,13 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override",
         "can_rerun_stage": true
+    },
+    "ppraneth": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
     },
     "pranavm-nvidia": {
         "can_tag_run_ci_label": true,
@@ -856,9 +912,9 @@
     "rainj-me": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "ravi03071991": {
         "can_tag_run_ci_label": true,
@@ -874,12 +930,19 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
+    "roikoren755": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
+    },
     "saienduri": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "samuellees": {
         "can_tag_run_ci_label": true,
@@ -891,16 +954,16 @@
     "scottjlee": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "sglang-bot": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "sglang-npu-bot": {
         "can_tag_run_ci_label": true,
@@ -940,16 +1003,16 @@
     "slin1237": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "stmatengss": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "strgrb": {
         "can_tag_run_ci_label": true,
@@ -1003,16 +1066,16 @@
     "trevor-m": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "vincentzed": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "wenscarl": {
         "can_tag_run_ci_label": true,
@@ -1024,9 +1087,9 @@
     "whybeyoung": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "wisclmy0611": {
         "can_tag_run_ci_label": true,
@@ -1038,9 +1101,9 @@
     "xiezhq-hermann": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "xutizhou": {
         "can_tag_run_ci_label": true,
@@ -1070,19 +1133,26 @@
         "reason": "custom override",
         "can_rerun_stage": true
     },
+    "yctseng0211": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
+    },
     "yeahdongcn": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "custom override",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "yhyang201": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "yilian49": {
         "can_tag_run_ci_label": true,
@@ -1108,9 +1178,9 @@
     "yizhang2077": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "ykcombat": {
         "can_tag_run_ci_label": true,
@@ -1129,9 +1199,9 @@
     "yuan-luo": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "yundai424": {
         "can_tag_run_ci_label": true,
@@ -1143,9 +1213,9 @@
     "yushengsu-thu": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "yyihuang": {
         "can_tag_run_ci_label": true,
@@ -1178,23 +1248,23 @@
     "zhuzilin": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
     },
     "zhyncs": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "zminglei": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
         "cooldown_interval_minutes": 0,
-        "reason": "top contributor",
-        "can_rerun_stage": true
+        "reason": "top contributor"
     },
     "zyksir": {
         "can_tag_run_ci_label": true,
