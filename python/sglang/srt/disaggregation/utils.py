@@ -45,8 +45,15 @@ def _validate_ib_devices(devices_csv: str) -> str:
     if not devices:
         raise ValueError(f"No valid IB devices in: {devices_csv!r}")
 
-    if len(devices) != len(set(devices)):
-        raise ValueError(f"Duplicate IB devices specified: {devices_csv!r}")
+    # Deduplicate while preserving order
+    unique_devices = list(dict.fromkeys(devices))
+    if len(unique_devices) != len(devices):
+        logger.warning(
+            "Duplicate IB devices specified: %s. Deduplicating to: %s",
+            devices_csv,
+            ",".join(unique_devices),
+        )
+        devices = unique_devices
 
     ib_sysfs_path = "/sys/class/infiniband"
     if not os.path.isdir(ib_sysfs_path):
