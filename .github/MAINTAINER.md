@@ -102,8 +102,14 @@ related files
 ### NPU optimizations
 @iforgetmyname (Even Zhou)
 
+related files
+- python/sglang/srt/hardware_backend/npu
+
 ### CI, Release, Package
 @Kangyan-Zhou (Kangyan Zhou), @Fridge003 (Baizhou Zhang)
+
+related files
+- .github/workflows
 
 ### Router, API
 @slin1237 (Simo Lin)
