@@ -3,7 +3,7 @@ import unittest
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_NGRAM,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
