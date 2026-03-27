@@ -218,7 +218,22 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self.forward_native(x, residual)
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        if residual is not None:
+            residual_shape = residual.shape
+            residual = residual.view(-1, shape[-1])
+
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+        elif residual is not None:
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x.view(shape), residual.view(residual_shape)
+        else:
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+        out = out.view(shape)
+        return out
+
 
     def extra_repr(self) -> str:
         return f"hidden_size={self.hidden_size}, eps={self.variance_epsilon}"
@@ -418,11 +433,6 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    def forward_xpu(self, *args, **kwargs):
-        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
-
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -524,11 +534,6 @@ class _NormScaleShift(CustomOp):
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
-
-    def forward_xpu(self, *args, **kwargs):
-        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
