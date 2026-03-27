@@ -8,11 +8,11 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMixin
-from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
+from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
+from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
-from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -25,19 +25,26 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=350, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=350, suite="stage-b-test-2-gpu-large")
 
 
 class TestDPAttentionDP2TP2(
     CustomTestCase,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    MGSMEnMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
+    mgsm_en_score_threshold = 0.8
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
+            True
+        )
+        cls._env_override.__enter__()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -58,26 +65,14 @@ class TestDPAttentionDP2TP2(
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.8)
+        cls._env_override.__exit__(None, None, None)
 
 
 class TestDPRetract(
     CustomTestCase,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
     @classmethod
     def setUpClass(cls):
@@ -115,9 +110,9 @@ class TestDPRetract(
 
 class TestDPAttentionDP2TP2DeepseekV3MTP(
     CustomTestCase,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
     @classmethod
     def setUpClass(cls):

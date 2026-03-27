@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.vision import (
     FLASHINFER_WORKSPACE_SIZE_BYTES,
     VisionAttention,
 )
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -139,7 +140,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         self.embed_dim = config.hidden_size
 
         kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
-        self.proj = nn.Conv3d(
+        self.proj = Conv3dLayer(
             self.in_channels,
             self.embed_dim,
             kernel_size=kernel_size,
@@ -328,7 +329,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 self.num_position_embeddings,
                 self.hidden_size,
                 quant_config=quant_config,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                enable_tp=not use_data_parallel,
+                use_attn_tp_group=is_dp_attention_enabled() and not use_data_parallel,
                 prefix=add_prefix("pos_embed", prefix),
             )
         else:

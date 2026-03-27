@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.helios_decoding import (
+    HeliosDecodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.helios_denoising import (
     HeliosChunkedDenoisingStage,
 )
@@ -69,8 +72,12 @@ class HeliosPipeline(LoRAPipeline, ComposedPipelineBase):
             ),
             "helios_chunked_denoising_stage",
         )
-        # Standard DecodingStage handles VAE decode of the denoised latents
-        self.add_standard_decoding_stage()
+        # Helios-specific decoding: decode each chunk's latents separately
+        # to avoid temporal artifacts from Wan VAE causal convolutions
+        self.add_stage(
+            HeliosDecodingStage(vae=self.get_module("vae"), pipeline=self),
+            "helios_decoding_stage",
+        )
 
 
 class HeliosPyramidPipeline(HeliosPipeline):

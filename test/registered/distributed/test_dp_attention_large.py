@@ -5,11 +5,11 @@ import requests
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMixin
-from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
-from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
+from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
+from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
+from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
@@ -24,13 +24,18 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=350, suite="stage-c-test-4-gpu-h100")
+register_amd_ci(est_time=350, suite="stage-c-test-4-gpu-amd")
 
 
+@unittest.skipIf(
+    is_in_amd_ci(),
+    "DeepSeek MLA forward_mla NameError on AMD (batched_gemm not defined)",
+)
 class TestDPAttentionDP2TP4(
     CustomTestCase,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
     @classmethod
     def setUpClass(cls):
@@ -66,11 +71,15 @@ class TestDPAttentionDP2TP4(
         self.assertGreater(metrics["score"], 0.8)
 
 
+@unittest.skipIf(
+    is_in_amd_ci(),
+    "DeepSeek MTP forward_mla NameError on AMD + needs 8 GPUs",
+)
 class TestDPAttentionDP2TP2DeepseekV3MTP(
     CustomTestCase,
-    TestJSONConstrainedMixin,
-    TestEBNFConstrainedMixin,
-    TestRegexConstrainedMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
 ):
     @classmethod
     def setUpClass(cls):
@@ -131,6 +140,10 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
+@unittest.skipIf(
+    is_in_amd_ci(),
+    "Qwen3-VL-30B-A3B-Instruct OOMs at TP=4 DP=2 on MI325 4-GPU runners",
+)
 class TestDPAttentionDP2TP4VLM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
