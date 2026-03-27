@@ -5,8 +5,12 @@ import triton
 import triton.testing
 from flashinfer import fused_add_rmsnorm as fi_fused_add_rmsnorm
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.utils import is_in_ci
+
+register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 IS_CI = is_in_ci()
 
@@ -33,7 +37,7 @@ else:
     BS_LIST = [2**n for n in range(0, 14)]
     HIDDEN_SIZE_LIST = [1536, 3072, 4096, 5120, 8192]
 
-LINE_VALS = ["jit", "fi"]
+LINE_VALS = ["jit", "flashinfer"]
 LINE_NAMES = ["SGL JIT Kernel", "FlashInfer"]
 STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
 
@@ -59,14 +63,12 @@ def benchmark(hidden_size: int, batch_size: int, provider: str):
     weight = torch.randn(hidden_size, dtype=DTYPE, device=DEVICE)
     FN_MAP = {
         "jit": sglang_jit_fused_add_rmsnorm,
-        "fi": flashinfer_fused_add_rmsnorm,
+        "flashinfer": flashinfer_fused_add_rmsnorm,
     }
     fn = lambda: FN_MAP[provider](
         input.clone(), residual.clone(), weight, torch.finfo(torch.bfloat16).eps
     )
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":

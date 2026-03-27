@@ -1,0 +1,112 @@
+name: PR Test - JIT Kernel
+
+on:
+  workflow_call:
+    inputs:
+      jit_kernel:
+        required: true
+        type: string
+      pr_head_sha:
+        required: false
+        type: string
+        default: ''
+      git_ref:
+        required: false
+        type: string
+        default: ''
+      target_stage:
+        required: false
+        type: string
+        default: ''
+      test_parallel_dispatch:
+        required: false
+        type: string
+        default: 'false'
+
+# Workflow-level env is NOT inherited from the caller in reusable workflows (verified by CI test).
+# The github context (including github.event_name) IS inherited from the caller.
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+
+jobs:
+  jit-kernel-unit-test:
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != 'true' &&
+      !inputs.target_stage
+    runs-on: 1-gpu-h100
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/
+          python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large
+
+  jit-kernel-multigpu-unit-test:
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != 'true' &&
+      !inputs.target_stage
+    runs-on: 8-gpu-h200
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run multi-GPU test
+        timeout-minutes: 45
+        run: |
+          cd test/
+          python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-8-gpu-h200
+
+  jit-kernel-benchmark-test:
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != 'true' &&
+      !inputs.target_stage
+    runs-on: 1-gpu-h100
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run benchmark tests
+        timeout-minutes: 45
+        run: |
+          cd test/
+          python3 run_suite.py --hw cuda --suite stage-b-kernel-benchmark-1-gpu-large

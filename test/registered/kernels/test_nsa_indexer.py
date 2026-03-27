@@ -24,7 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=2, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=2, suite="stage-b-test-1-gpu-large")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
@@ -131,6 +131,10 @@ class MockIndexerMetadata(BaseIndexerMetadata):
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         """Return: seq lens for each batch."""
         return torch.tensor(self.seq_lens, dtype=torch.int32, device="cpu")
+
+    def get_indexer_seq_len(self) -> torch.Tensor:
+        """Return: seq lens for each batch."""
+        return torch.tensor(self.seq_lens, dtype=torch.int32, device=self.device)
 
     def get_nsa_extend_len_cpu(self) -> List[int]:
         """
