@@ -30,6 +30,7 @@ class TestEagleConstrainedDecoding(
     model = DEFAULT_TARGET_MODEL_EAGLE
     draft_model = DEFAULT_DRAFT_MODEL_EAGLE
     grammar_backend = "xgrammar"
+    spec_v2 = False
 
     @classmethod
     def setUpClass(cls):
@@ -58,9 +59,13 @@ class TestEagleConstrainedDecoding(
             cls.grammar_backend,
         ]
         launch_args.extend(cls.other_launch_args)
-        with envs.SGLANG_SPEC_NAN_DETECTION.override(
+        with envs.SGLANG_ENABLE_SPEC_V2.override(
+            cls.spec_v2
+        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
             True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
+            True
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -73,11 +78,8 @@ class TestEagleConstrainedDecoding(
         kill_process_tree(cls.process.pid)
 
 
-class TestEagleConstrainedDecodingV1(TestEagleConstrainedDecoding):
-    @classmethod
-    def setUpClass(cls):
-        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
-            super().setUpClass()
+class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
+    spec_v2 = True
 
 
 if __name__ == "__main__":
