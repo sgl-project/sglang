@@ -95,17 +95,14 @@ class GDNKernelDispatcher:
             if not is_cuda():
                 raise ValueError("FlashInfer GDN backend requires CUDA")
             # Reuse the FlashInfer kernel if already created for decode
-            if flashinfer_kernel is not None:
-                fi_kernel = flashinfer_kernel
-            else:
+            if flashinfer_kernel is None:
                 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
                     FlashInferGDNKernel,
                 )
 
-                fi_kernel = FlashInferGDNKernel()
-                flashinfer_kernel = fi_kernel
+                flashinfer_kernel = FlashInferGDNKernel()
 
-            self.extend_kernel = fi_kernel
+            self.extend_kernel = flashinfer_kernel
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
