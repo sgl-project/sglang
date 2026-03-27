@@ -19,7 +19,10 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     UlyssesAttention,
     USPAttention,
 )
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm_with_optional_rope,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -256,16 +259,6 @@ class ZImageAttention(nn.Module):
         k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
         v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
 
-        if self.qk_norm:
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                allow_inplace=True,
-            )
-
         if freqs_cis is not None:
             cos, sin = freqs_cis
             if _is_cuda and q.shape == k.shape:
@@ -276,12 +269,42 @@ class ZImageAttention(nn.Module):
                     ],
                     dim=-1,
                 )
-                q, k = apply_flashinfer_rope_qk_inplace(
-                    q, k, cos_sin_cache, is_neox=False
-                )
+                if self.qk_norm:
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        cos_sin_cache=cos_sin_cache,
+                        is_neox=False,
+                        allow_inplace=True,
+                    )
+                else:
+                    q, k = apply_flashinfer_rope_qk_inplace(
+                        q, k, cos_sin_cache, is_neox=False
+                    )
             else:
+                if self.qk_norm:
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        allow_inplace=True,
+                    )
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+        elif self.qk_norm:
+            q, k = apply_qk_norm_with_optional_rope(
+                q=q,
+                k=k,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                allow_inplace=True,
+            )
 
         if (
             num_replicated_suffix > 0
