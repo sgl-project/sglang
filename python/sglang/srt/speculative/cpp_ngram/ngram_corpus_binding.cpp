@@ -9,25 +9,23 @@ namespace py = pybind11;
 
 namespace {
 
-std::pair<size_t, size_t> loadExternalCorpus(ngram::Ngram& ngram, py::iterable documents) {
+std::pair<size_t, size_t> loadExternalCorpus(ngram::Ngram& ngram, py::iterable chunks) {
   ngram.startExternalCorpusLoad();
-  size_t loaded_document_count = 0;
+  size_t chunk_count = 0;
   size_t loaded_token_count = 0;
   try {
-    for (py::handle document_obj : documents) {
-      auto document = document_obj.cast<std::vector<int32_t>>();
-      ngram.appendExternalCorpusDocument(document);
-      if (!document.empty()) {
-        ++loaded_document_count;
-        loaded_token_count += document.size();
-      }
+    for (py::handle chunk_obj : chunks) {
+      auto chunk = chunk_obj.cast<std::vector<int32_t>>();
+      loaded_token_count += chunk.size();
+      ngram.appendExternalCorpusTokens(chunk);
+      ++chunk_count;
     }
     ngram.finishExternalCorpusLoad();
   } catch (...) {
     ngram.clearExternalCorpus();
     throw;
   }
-  return std::make_pair(loaded_document_count, loaded_token_count);
+  return std::make_pair(chunk_count, loaded_token_count);
 }
 
 }  // namespace

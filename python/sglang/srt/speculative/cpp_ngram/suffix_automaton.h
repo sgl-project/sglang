@@ -32,7 +32,7 @@ class SuffixAutomaton {
 
   SuffixAutomaton(size_t max_corpus_tokens);
 
-  void appendDocument(const std::vector<int32_t>& document);
+  void appendTokens(const std::vector<int32_t>& tokens);
 
   void finalize();
 
@@ -58,7 +58,6 @@ class SuffixAutomaton {
   size_t loaded_corpus_tokens_ = 0;
   int64_t pos_ = 0;
   bool saw_token_ = false;
-  bool has_previous_doc_ = false;
   bool finalized_ = false;
   bool loaded_ = false;
 };

@@ -46,7 +46,7 @@ class Ngram {
 
   void startExternalCorpusLoad();
 
-  void appendExternalCorpusDocument(const std::vector<int32_t>& document);
+  void appendExternalCorpusTokens(const std::vector<int32_t>& tokens);
 
   void finishExternalCorpusLoad();
 

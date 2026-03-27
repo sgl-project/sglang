@@ -7,7 +7,7 @@ import uuid
 import numpy as np
 
 from sglang.srt.speculative.cpp_ngram.external_corpus import (
-    iter_external_corpus_documents,
+    iter_external_corpus_chunks,
 )
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -717,10 +717,11 @@ class TestNgramCorpusExternalSam(CustomTestCase):
             path = f.name
         self.addCleanup(os.remove, path)
 
-        loaded_document_count, loaded_token_count = corpus.load_external_corpus(
-            iter_external_corpus_documents(path, _IntTokenizer(), max_tokens=8)
+        loaded_token_count = corpus.load_external_corpus(
+            iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=8)
         )
-        self.assertEqual((loaded_document_count, loaded_token_count), (2, 7))
+        # 5 doc tokens + 1 separator + 2 doc tokens = 8
+        self.assertEqual(loaded_token_count, 8)
 
         ids, _ = _batch_get(corpus, [[1, 2, 3]])
         ids_list = ids.tolist()
@@ -743,7 +744,7 @@ class TestNgramCorpusExternalSam(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "token limit"):
             corpus.load_external_corpus(
-                iter_external_corpus_documents(path, _IntTokenizer(), max_tokens=4)
+                iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=4)
             )
 
     def test_external_sam_cpp_backstop_rejects_oversized_iterable(self):

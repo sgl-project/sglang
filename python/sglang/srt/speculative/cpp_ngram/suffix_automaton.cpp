@@ -20,35 +20,29 @@ void SuffixAutomaton::reset_() {
   loaded_corpus_tokens_ = 0;
   pos_ = 0;
   saw_token_ = false;
-  has_previous_doc_ = false;
   finalized_ = false;
   loaded_ = false;
 }
 
-void SuffixAutomaton::appendDocument(const std::vector<int32_t>& document) {
+void SuffixAutomaton::appendTokens(const std::vector<int32_t>& tokens) {
   if (finalized_) {
-    throw std::runtime_error("Cannot append external corpus documents after finalizing the SAM.");
+    throw std::runtime_error("Cannot append tokens after finalizing the SAM.");
   }
-  if (document.empty()) {
+  if (tokens.empty()) {
     return;
   }
 
-  const size_t separator_cost = has_previous_doc_ ? 1 : 0;
-  if (loaded_corpus_tokens_ + separator_cost + document.size() > max_corpus_tokens_) {
+  if (loaded_corpus_tokens_ + tokens.size() > max_corpus_tokens_) {
     throw std::runtime_error(
         "External ngram corpus exceeds the configured token limit (" + std::to_string(max_corpus_tokens_) +
         ") after loading " + std::to_string(loaded_corpus_tokens_) + " tokens.");
   }
 
-  if (has_previous_doc_) {
-    extend_(kSeparatorToken, pos_++);
-  }
-  for (const auto token : document) {
+  for (const auto token : tokens) {
     extend_(token, pos_++);
     saw_token_ = true;
   }
-  loaded_corpus_tokens_ += separator_cost + document.size();
-  has_previous_doc_ = true;
+  loaded_corpus_tokens_ += tokens.size();
 }
 
 void SuffixAutomaton::finalize() {

@@ -12,7 +12,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.external_corpus import (
-    iter_external_corpus_documents,
+    iter_external_corpus_chunks,
 )
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -61,18 +61,15 @@ class NGRAMWorker:
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
         )
         if server_args.speculative_ngram_external_corpus_path is not None:
-            loaded_document_count, loaded_token_count = (
-                self.ngram_corpus.load_external_corpus(
-                    iter_external_corpus_documents(
-                        server_args.speculative_ngram_external_corpus_path,
-                        target_worker.tokenizer,
-                        server_args.speculative_ngram_external_corpus_max_tokens,
-                    )
+            loaded_token_count = self.ngram_corpus.load_external_corpus(
+                iter_external_corpus_chunks(
+                    server_args.speculative_ngram_external_corpus_path,
+                    target_worker.tokenizer,
+                    server_args.speculative_ngram_external_corpus_max_tokens,
                 )
             )
             logger.info(
-                "Loaded %d external ngram documents (%d tokens) for SAM speculative decoding.",
-                loaded_document_count,
+                "Loaded external ngram corpus (%d tokens) for SAM speculative decoding.",
                 loaded_token_count,
             )
 

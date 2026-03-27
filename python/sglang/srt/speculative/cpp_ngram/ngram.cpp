@@ -74,9 +74,9 @@ void Ngram::startExternalCorpusLoad() {
   sam_ = std::make_unique<SuffixAutomaton>(param_.external_corpus_max_tokens);
 }
 
-void Ngram::appendExternalCorpusDocument(const std::vector<int32_t>& document) {
+void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
   std::unique_lock<std::mutex> lock(mutex_);
-  sam_->appendDocument(document);
+  sam_->appendTokens(tokens);
 }
 
 void Ngram::finishExternalCorpusLoad() {

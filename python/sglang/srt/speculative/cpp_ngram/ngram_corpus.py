@@ -2,7 +2,7 @@
 
 import logging
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -22,6 +22,21 @@ ngram_corpus_cpp = load(
     ],
     extra_cflags=["-O3", "-std=c++20"],
 )
+
+
+def _documents_to_chunks(
+    documents: Iterable[Sequence[int]],
+) -> Iterator[list[int]]:
+    _SEPARATOR_TOKEN = -(2**31)
+    has_previous = False
+    for doc in documents:
+        if not doc:
+            continue
+        if has_previous:
+            yield [_SEPARATOR_TOKEN] + list(doc)
+        else:
+            yield list(doc)
+        has_previous = True
 
 
 class NgramCorpus:
@@ -46,10 +61,9 @@ class NgramCorpus:
         param.external_corpus_max_tokens = external_corpus_max_tokens
         param.match_type = match_type
         self._ngram = ngram_corpus_cpp.Ngram(capacity, param)
-        self.external_corpus_document_count = 0
         self.external_corpus_token_count = 0
         if external_corpus_documents is not None:
-            self.load_external_corpus(external_corpus_documents)
+            self.load_external_corpus(_documents_to_chunks(external_corpus_documents))
 
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
@@ -60,15 +74,10 @@ class NgramCorpus:
     def synchronize(self):
         self._ngram.synchronize()
 
-    def load_external_corpus(
-        self, external_corpus_documents: Iterable[Sequence[int]]
-    ) -> Tuple[int, int]:
-        loaded_document_count, loaded_token_count = self._ngram.loadExternalCorpus(
-            external_corpus_documents
-        )
-        self.external_corpus_document_count = loaded_document_count
+    def load_external_corpus(self, chunks: Iterable[Sequence[int]]) -> int:
+        _, loaded_token_count = self._ngram.loadExternalCorpus(chunks)
         self.external_corpus_token_count = loaded_token_count
-        return loaded_document_count, loaded_token_count
+        return loaded_token_count
 
     def reset(self):
         self._ngram.reset()
