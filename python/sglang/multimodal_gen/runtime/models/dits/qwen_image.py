@@ -30,8 +30,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
-    apply_qk_norm,
-    apply_qk_norm_rope,
+    apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -625,8 +624,8 @@ class QwenImageCrossAttention(nn.Module):
 
             img_cache, txt_cache = image_rotary_emb
 
-        if self.qk_norm and img_cache is not None and txt_cache is not None:
-            img_query, img_key = apply_qk_norm_rope(
+        if self.qk_norm:
+            img_query, img_key = apply_qk_norm_with_optional_rope(
                 q=img_query,
                 k=img_key,
                 q_norm=self.norm_q,
@@ -636,7 +635,7 @@ class QwenImageCrossAttention(nn.Module):
                 is_neox=False,
                 allow_inplace=True,
             )
-            txt_query, txt_key = apply_qk_norm_rope(
+            txt_query, txt_key = apply_qk_norm_with_optional_rope(
                 q=txt_query,
                 k=txt_key,
                 q_norm=self.norm_added_q,
@@ -646,31 +645,13 @@ class QwenImageCrossAttention(nn.Module):
                 is_neox=False,
                 allow_inplace=True,
             )
-        else:
-            if self.qk_norm:
-                img_query, img_key = apply_qk_norm(
-                    q=img_query,
-                    k=img_key,
-                    q_norm=self.norm_q,
-                    k_norm=self.norm_k,
-                    head_dim=img_query.shape[-1],
-                    allow_inplace=True,
-                )
-                txt_query, txt_key = apply_qk_norm(
-                    q=txt_query,
-                    k=txt_key,
-                    q_norm=self.norm_added_q,
-                    k_norm=self.norm_added_k,
-                    head_dim=txt_query.shape[-1],
-                    allow_inplace=True,
-                )
-            if img_cache is not None and txt_cache is not None:
-                img_query, img_key = apply_flashinfer_rope_qk_inplace(
-                    img_query, img_key, img_cache, is_neox=False
-                )
-                txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
-                    txt_query, txt_key, txt_cache, is_neox=False
-                )
+        elif img_cache is not None and txt_cache is not None:
+            img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                img_query, img_key, img_cache, is_neox=False
+            )
+            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                txt_query, txt_key, txt_cache, is_neox=False
+            )
 
         # Concatenate for joint attention
         # Order: [text, image]

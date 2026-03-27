@@ -21,8 +21,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
-    apply_qk_norm,
-    apply_qk_norm_rope,
+    apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -271,7 +270,7 @@ class ZImageAttention(nn.Module):
                     dim=-1,
                 )
                 if self.qk_norm:
-                    q, k = apply_qk_norm_rope(
+                    q, k = apply_qk_norm_with_optional_rope(
                         q=q,
                         k=k,
                         q_norm=self.norm_q,
@@ -287,7 +286,7 @@ class ZImageAttention(nn.Module):
                     )
             else:
                 if self.qk_norm:
-                    q, k = apply_qk_norm(
+                    q, k = apply_qk_norm_with_optional_rope(
                         q=q,
                         k=k,
                         q_norm=self.norm_q,
@@ -298,7 +297,7 @@ class ZImageAttention(nn.Module):
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
         elif self.qk_norm:
-            q, k = apply_qk_norm(
+            q, k = apply_qk_norm_with_optional_rope(
                 q=q,
                 k=k,
                 q_norm=self.norm_q,

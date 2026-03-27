@@ -25,8 +25,7 @@ from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
-    apply_qk_norm,
-    apply_qk_norm_rope,
+    apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -311,53 +310,18 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             encoder_key = encoder_key.unflatten(-1, (self.local_heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.local_heads, -1))
 
-            if cos_sin_cache is not None:
-                text_seq_len = encoder_query.shape[1]
-                encoder_query, encoder_key = apply_qk_norm_rope(
-                    q=encoder_query,
-                    k=encoder_key,
-                    q_norm=self.norm_added_q,
-                    k_norm=self.norm_added_k,
-                    head_dim=self.head_dim,
-                    cos_sin_cache=cos_sin_cache,
-                    is_neox=False,
-                    position_offset=0,
-                    allow_inplace=True,
-                )
-                query, key = apply_qk_norm_rope(
-                    q=query,
-                    k=key,
-                    q_norm=self.norm_q,
-                    k_norm=self.norm_k,
-                    head_dim=self.head_dim,
-                    cos_sin_cache=cos_sin_cache,
-                    is_neox=False,
-                    position_offset=text_seq_len,
-                    allow_inplace=True,
-                )
-            else:
-                encoder_query, encoder_key = apply_qk_norm(
-                    q=encoder_query,
-                    k=encoder_key,
-                    q_norm=self.norm_added_q,
-                    k_norm=self.norm_added_k,
-                    head_dim=self.head_dim,
-                    allow_inplace=True,
-                )
-                query, key = apply_qk_norm(
-                    q=query,
-                    k=key,
-                    q_norm=self.norm_q,
-                    k_norm=self.norm_k,
-                    head_dim=self.head_dim,
-                    allow_inplace=True,
-                )
-
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
-        elif cos_sin_cache is not None:
-            query, key = apply_qk_norm_rope(
+            text_seq_len = encoder_query.shape[1]
+            encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
+                q=encoder_query,
+                k=encoder_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+            query, key = apply_qk_norm_with_optional_rope(
                 q=query,
                 k=key,
                 q_norm=self.norm_q,
@@ -365,15 +329,22 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 head_dim=self.head_dim,
                 cos_sin_cache=cos_sin_cache,
                 is_neox=False,
+                position_offset=text_seq_len,
                 allow_inplace=True,
             )
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
         else:
-            query, key = apply_qk_norm(
+            query, key = apply_qk_norm_with_optional_rope(
                 q=query,
                 k=key,
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
                 allow_inplace=True,
             )
 

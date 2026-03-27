@@ -573,6 +573,45 @@ def apply_qk_norm(
     return q_out, k_out
 
 
+def apply_qk_norm_with_optional_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: "RMSNorm",
+    k_norm: "RMSNorm",
+    head_dim: int,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    *,
+    is_neox: bool = False,
+    positions: Optional[torch.Tensor] = None,
+    position_offset: int = 0,
+    allow_inplace: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply QK RMSNorm and optionally RoPE when a cos/sin cache is provided."""
+
+    if cos_sin_cache is None:
+        return apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            head_dim=head_dim,
+            allow_inplace=allow_inplace,
+        )
+
+    return apply_qk_norm_rope(
+        q=q,
+        k=k,
+        q_norm=q_norm,
+        k_norm=k_norm,
+        head_dim=head_dim,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        positions=positions,
+        position_offset=position_offset,
+        allow_inplace=allow_inplace,
+    )
+
+
 def apply_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
