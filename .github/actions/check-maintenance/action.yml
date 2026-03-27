@@ -4,7 +4,8 @@ description: Blocks CI when maintenance mode is active (issue #21065 is open), u
 inputs:
   github-token:
     description: GitHub token for API access
-    required: true
+    required: false
+    default: ${{ github.token }}
 
 runs:
   using: composite

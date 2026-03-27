@@ -718,12 +718,19 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         grids = torch.meshgrid(axes, indexing="ij")
         return torch.stack(grids, dim=-1)
 
+    @staticmethod
+    def _ceil_to_multiple(value: int, multiple: int) -> int:
+        if multiple <= 0:
+            return value
+        return int(math.ceil(value / multiple) * multiple)
+
     def patchify_and_embed(
         self,
         all_image: List[torch.Tensor],
         all_cap_feats: List[torch.Tensor],
         patch_size: int,
         f_patch_size: int,
+        image_seq_len_target: int | None = None,
     ):
         assert len(all_image) == len(all_cap_feats) == 1
 
@@ -761,7 +768,12 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             F_tokens * H_tokens * W_tokens, pF * pH * pW * C
         )
         image_ori_len = image.size(0)
-        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+        min_image_seq_len = self._ceil_to_multiple(image_ori_len, SEQ_MULTI_OF)
+        if image_seq_len_target is None:
+            image_seq_len_target = min_image_seq_len
+        else:
+            image_seq_len_target = max(min_image_seq_len, image_seq_len_target)
+        image_padding_len = image_seq_len_target - image_ori_len
 
         # padded feature
         image_padded_feat = torch.cat(
@@ -788,6 +800,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         patch_size=2,
         f_patch_size=1,
         freqs_cis=None,
+        image_seq_len_target: int | None = None,
         **kwargs,
     ):
         assert patch_size in self.all_patch_size
@@ -807,7 +820,13 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             x_size,
             x_valid_lens,
             cap_valid_lens,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+        ) = self.patchify_and_embed(
+            x,
+            cap_feats,
+            patch_size,
+            f_patch_size,
+            image_seq_len_target=image_seq_len_target,
+        )
 
         x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)

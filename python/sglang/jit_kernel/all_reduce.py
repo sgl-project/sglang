@@ -12,6 +12,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernel_api_logging import debug_kernel_api
 
 
 class ConfigResult(NamedTuple):
@@ -130,6 +131,8 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
 
     @tvm_ffi.register_object("sgl.CustomAllReduce")
     class CustomAllReduceObjReal(tvm_ffi.Object):
+        __slots__ = ("__dict__",)
+
         def __init__(
             self,
             rank: int,
@@ -158,6 +161,7 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
         def world_size(self) -> int:
             return self._world_size
 
+        @debug_kernel_api
         def all_reduce(
             self,
             input: torch.Tensor,
