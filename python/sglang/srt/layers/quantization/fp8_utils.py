@@ -457,18 +457,12 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     # TODO(brayden): Remove env-based overrides in v0.5.7, they will be fully removed in v0.5.7.
     # Only check environment variables when the server args is not set, server args should take priority.
     if backend == "auto":
-        if envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get():
-            backend = "flashinfer_trtllm"
-        elif envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get():
+        if envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get():
             backend = "cutlass"
     else:
-        if (
-            envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
-            or envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get()
-        ):
+        if envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get():
             logger.warning(
                 f"FP8 GEMM backend set to '{backend}' via --fp8-gemm-backend overrides "
-                "environment variables SGLANG_ENABLE_FLASHINFER_FP8_GEMM and "
                 "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8. Using server argument value."
             )
 

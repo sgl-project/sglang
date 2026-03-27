@@ -337,7 +337,6 @@ class Envs:
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
-    SGLANG_ENABLE_FLASHINFER_FP8_GEMM = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
     # TODO(mmangkad): Remove this once the FlashInfer unified allreduce-fusion
@@ -580,11 +579,6 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
-
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_ENABLE_FLASHINFER_FP8_GEMM",
-    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
-)
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_ENABLE_FLASHINFER_GEMM",
     "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",

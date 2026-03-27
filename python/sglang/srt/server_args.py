@@ -4632,9 +4632,7 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (ROCm only). "
-            "NOTE: This replaces the deprecated environment variables "
-            "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
+            "'aiter' (ROCm only). ",
         )
         parser.add_argument(
             "--fp4-gemm-backend",
