@@ -1,4 +1,4 @@
-name: Release Docker Framework Images
+name: Release Docker Images
 #
 # This workflow builds and publishes framework Docker images (full development environment):
 #   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest
