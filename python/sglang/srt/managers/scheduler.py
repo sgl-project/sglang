@@ -1674,8 +1674,7 @@ class Scheduler(
             if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
-            for item in mm_inputs.mm_items:
-                item.feature = None
+            mm_inputs.release_features()
             req.multimodal_inputs = None
 
     def handle_generate_request(
