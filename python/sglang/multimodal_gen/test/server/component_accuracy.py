@@ -25,7 +25,6 @@ except ImportError:
         AutoVisionTextModel = None
 
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
-from sglang.multimodal_gen.registry import _CONFIG_REGISTRY, get_model_info
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     destroy_model_parallel,
@@ -164,16 +163,6 @@ def _build_parameter_shard_contexts(
     return shard_contexts
 
 
-def _build_pipeline_config(case: DiffusionTestCase, hub_id: str):
-    info = get_model_info(hub_id) or get_model_info(hub_id.split("/")[-1])
-    pipeline_config = (
-        info.pipeline_config_cls()
-        if info
-        else _CONFIG_REGISTRY["0"].pipeline_config_cls()
-    )
-    return pipeline_config
-
-
 # Distributed/runtime setup helpers
 def _ensure_distributed_env_defaults() -> None:
     if "WORLD_SIZE" in os.environ:
@@ -237,9 +226,9 @@ def _initialize_parallel_runtime(sgl_args: ServerArgs) -> None:
 
 
 def _build_accuracy_server_args(
+    base_model_id: str,
     base_model_root: str,
     case: DiffusionTestCase,
-    pipeline_config,
     component: ComponentType,
     num_gpus: int,
     component_paths: Dict[str, str],
@@ -247,9 +236,9 @@ def _build_accuracy_server_args(
     cfg_parallel = bool(case.server_args.cfg_parallel)
     kwargs = {
         "model_path": base_model_root,
+        "model_id": base_model_id,
         "num_gpus": num_gpus,
         "trust_remote_code": True,
-        "pipeline_config": pipeline_config,
         "component_paths": component_paths,
         "enable_cfg_parallel": cfg_parallel,
     }
@@ -263,7 +252,7 @@ def _build_accuracy_server_args(
 
     if component == ComponentType.TEXT_ENCODER:
         kwargs["enable_cfg_parallel"] = False
-    sgl_args = ServerArgs(**kwargs)
+    sgl_args = ServerArgs.from_kwargs(**kwargs)
     sgl_args.text_encoder_cpu_offload = False
     sgl_args.dit_cpu_offload = False
     sgl_args.vae_cpu_offload = False
@@ -618,13 +607,10 @@ class AccuracyEngine:
             component,
             spec.model_index_keys,
         )
-        pipeline_config = _build_pipeline_config(
-            case, component_selection.base_model_id
-        )
         sgl_args = _build_accuracy_server_args(
+            component_selection.base_model_id,
             component_selection.base_model_root,
             case,
-            pipeline_config,
             component,
             num_gpus,
             component_selection.component_paths,
@@ -653,7 +639,7 @@ class AccuracyEngine:
             component_selection.source_root,
             component,
             hub_id,
-            pipeline_config,
+            sgl_args.pipeline_config,
             component_selection.source_subfolder,
         )
         if materialize_ref_on_device:
