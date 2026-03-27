@@ -261,4 +261,4 @@ if __name__ == "__main__":
     if "LOCAL_RANK" in os.environ:
         worker_main()
     else:
-        sys.exit(pytest.main([__file__, "-vv", "-s"]))
+        sys.exit(pytest.main([__file__, "-x", "-vv", "-s"]))
