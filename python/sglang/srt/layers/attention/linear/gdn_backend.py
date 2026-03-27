@@ -105,11 +105,6 @@ class GDNKernelDispatcher:
                 fi_kernel = FlashInferGDNKernel()
                 flashinfer_kernel = fi_kernel
 
-            if not fi_kernel.supports_extend:
-                raise ValueError(
-                    "FlashInfer GDN prefill is not supported on this device "
-                    "(SM100+). Use --linear-attn-prefill-backend triton instead."
-                )
             self.extend_kernel = fi_kernel
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
