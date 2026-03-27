@@ -35,10 +35,10 @@ from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
-    get_ib_devices_for_gpu,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import get_int_env_var
+from sglang.srt.utils.ib import get_ib_devices_for_gpu
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)

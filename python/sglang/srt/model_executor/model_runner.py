@@ -155,6 +155,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.ib import get_ib_devices_for_gpu
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
@@ -845,12 +846,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         backend = get_default_distributed_backend(self.device)
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
-            if self.server_args.mooncake_ib_device:
-                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+            ib_devices_str = get_ib_devices_for_gpu(
+                self.server_args.mooncake_ib_device, self.gpu_id
+            )
+            if ib_devices_str:
                 try:
                     from mooncake import ep as mooncake_ep
 
-                    mooncake_ep.set_device_filter(mooncake_ib_device)
+                    mooncake_ep.set_device_filter(ib_devices_str.split(","))
                 except:
                     pass  # A warning will be raised in `init_distributed_environment`
 

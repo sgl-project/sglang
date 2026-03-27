@@ -1,8 +1,8 @@
 import logging
 from typing import List, Optional
 
-from sglang.srt.disaggregation.utils import get_ib_devices_for_gpu
 from sglang.srt.environ import envs
+from sglang.srt.utils.ib import get_ib_devices_for_gpu
 from sglang.srt.utils.network import NetworkAddress, get_free_port
 
 logger = logging.getLogger(__name__)
