@@ -18,7 +18,7 @@ import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.compilation.piecewise_context_manager import (
-    get_piecewise_cuda_graph_num_tokens,
+    get_forward_context,
     is_in_piecewise_cuda_graph,
 )
 from sglang.srt.dllm.config import DllmConfig
@@ -1385,11 +1385,8 @@ class FlashInferIndicesUpdaterPrefill:
             kv_indptr = kv_indptr[: bs + 1]
             # Reserve extra space in kv_indices for a potential piecewise CUDA graph
             # dummy request (see below). Worst case: static_num_tokens extra pages.
-            pcg_num_tokens = (
-                get_piecewise_cuda_graph_num_tokens()
-                if is_in_piecewise_cuda_graph()
-                else None
-            )
+            fwd_ctx = get_forward_context()
+            pcg_num_tokens = fwd_ctx.num_tokens if fwd_ctx is not None else None
             extra_kv = pcg_num_tokens if pcg_num_tokens is not None else 0
             kv_indices = torch.empty(
                 paged_kernel_lens_sum + extra_kv + 256,
@@ -1416,10 +1413,22 @@ class FlashInferIndicesUpdaterPrefill:
             # The dummy request's KV indices all point to slot 0 (a scratch location);
             # its attention output is discarded via the [:raw_num_tokens] slice in replay.
             bs_eff = bs
-            if pcg_num_tokens is not None and pcg_num_tokens > qo_indptr[-1]:
-                pad_tokens = int(pcg_num_tokens - qo_indptr[-1].item())
+            # extend_num_tokens is a Python int (== sum of seq_lens - prefix_lens),
+            # and paged_kernel_lens_sum is also a Python int (== kv_indptr[-1]),
+            # so this block requires no CPU-GPU synchronisation.
+            actual_qo_tokens = (
+                fwd_ctx.forward_batch.extend_num_tokens if fwd_ctx is not None else None
+            )
+            if (
+                pcg_num_tokens is not None
+                and actual_qo_tokens is not None
+                and pcg_num_tokens > actual_qo_tokens
+            ):
+                pad_tokens = pcg_num_tokens - actual_qo_tokens
                 num_dummy_pages = (pad_tokens + self.page_size - 1) // self.page_size
-                kv_start = int(kv_indptr[-1].item())
+                kv_start = (
+                    paged_kernel_lens_sum  # equals kv_indptr[-1], no .item() needed
+                )
                 kv_indices[kv_start : kv_start + num_dummy_pages] = 0
                 qo_indptr = torch.cat(
                     [qo_indptr, qo_indptr.new_tensor([pcg_num_tokens])]
