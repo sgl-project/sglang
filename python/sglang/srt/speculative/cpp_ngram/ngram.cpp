@@ -27,11 +27,6 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
     throw std::runtime_error(
         "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
   }
-  if (!(param_.external_corpus_max_tokens > 0)) {
-    throw std::runtime_error(
-        "external_corpus_max_tokens must be greater than 0, current value: " +
-        std::to_string(param_.external_corpus_max_tokens));
-  }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config <= param_.draft_token_num)) {

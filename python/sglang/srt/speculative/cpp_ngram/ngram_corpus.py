@@ -8,6 +8,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 from torch.utils.cpp_extension import load
 
+from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
+
 logger = logging.getLogger(__name__)
 
 _abs_path = os.path.dirname(os.path.abspath(__file__))
@@ -24,11 +26,12 @@ ngram_corpus_cpp = load(
 )
 
 
+# Convenience path for pre-tokenized in-memory documents. The main serving
+# startup path loads file-backed corpora through `iter_external_corpus_chunks()`.
 def _documents_to_chunks(
     documents: Iterable[Sequence[int]],
     max_tokens: Optional[int] = None,
 ) -> Iterator[list[int]]:
-    _SEPARATOR_TOKEN = -(2**31)
     total_tokens = 0
     has_previous = False
     for doc in documents:
@@ -44,7 +47,7 @@ def _documents_to_chunks(
             )
         total_tokens = next_total_tokens
         if has_previous:
-            yield [_SEPARATOR_TOKEN] + doc_tokens
+            yield [SEPARATOR_TOKEN] + doc_tokens
         else:
             yield doc_tokens
         has_previous = True

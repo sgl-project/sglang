@@ -828,9 +828,7 @@ class TestNgramCorpusExternalSam(CustomTestCase):
 
         ids, masks = _batch_get(corpus, [[1, 2, 3]])
         ids_list = ids.tolist()
-        leaf_paths = corpus.leaf_paths_from_mask(
-            ids_list, masks.reshape(6, 6).tolist()
-        )
+        leaf_paths = corpus.leaf_paths_from_mask(ids_list, masks.reshape(6, 6).tolist())
         self.assertIn([3, 10, 11], leaf_paths)
         self.assertIn([3, 10, 99], leaf_paths)
         self.assertEqual(ids_list.count(0), 2, ids_list)

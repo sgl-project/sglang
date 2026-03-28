@@ -12,8 +12,7 @@ DEFAULT_CHUNK_SIZE = 4096
 def iter_external_corpus_chunks(
     path: str, tokenizer, max_tokens: int, chunk_size: int = DEFAULT_CHUNK_SIZE
 ) -> Iterator[list[int]]:
-    """Chunk documents and yield fixed-size token chunks from a JSONL corpus file.
-    """
+    """Chunk documents and yield fixed-size token chunks from a JSONL corpus file."""
     corpus_path = Path(path)
     if not corpus_path.is_file():
         raise ValueError(f"External ngram corpus path does not exist: {path}")
