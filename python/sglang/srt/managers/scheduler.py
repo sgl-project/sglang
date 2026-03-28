@@ -1423,7 +1423,6 @@ class Scheduler(
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                        recv_req = unwrap_shm_features(recv_req)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -1509,6 +1508,13 @@ class Scheduler(
                 )
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
+
+        # Unwrap shared memory features AFTER all broadcasts complete,
+        # so that ShmPointerMMData metadata (not full tensor data) is what
+        # gets serialized during broadcast_pyobj.
+        if recv_reqs:
+            for req in recv_reqs:
+                unwrap_shm_features(req)
 
         return recv_reqs
 
