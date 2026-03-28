@@ -78,13 +78,13 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
 
 if _use_aiter:
     import aiter
-
-    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter import gemm_a8w8_blockscale as gemm_a8w8_blockscale
+    from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
     from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
     from aiter.ops.triton.gemm_a8w8_blockscale import (
         gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     )
+
+    gemm_a8w8_blockscale = triton_gemm_a8w8_blockscale
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -178,6 +178,7 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
+    AITER_CK = "aiter_ck"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -202,6 +203,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == Fp8GemmRunnerBackend.AITER
+
+    def is_aiter_ck(self) -> bool:
+        return self == Fp8GemmRunnerBackend.AITER_CK
 
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
@@ -411,6 +415,15 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
             )
         return aiter_w8a8_block_fp8_linear
 
+    elif backend.is_aiter_ck():
+        if not _use_aiter:
+            raise RuntimeError(
+                "AITER CK backend requested via --fp8-gemm-backend=aiter_ck, "
+                "but AITER is not available. AITER requires AMD GPUs with "
+                "SGLANG_USE_AITER=1 environment variable set."
+            )
+        return aiter_w8a8_block_fp8_linear
+
     elif backend.is_deep_gemm():
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(
@@ -451,6 +464,7 @@ def _dispatch_auto_backend() -> Callable:
 def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
+    global gemm_a8w8_blockscale
 
     backend = server_args.fp8_gemm_runner_backend
 
@@ -475,6 +489,12 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     if backend == "auto" and is_sm120_supported():
         # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
         backend = "triton"
+
+    if backend == "aiter_ck" and _use_aiter:
+        gemm_a8w8_blockscale = ck_gemm_a8w8_blockscale
+        logger.info("Using precompiled kernels for FP8 blockscale GEMM")
+    elif backend in ("aiter", "auto") and _use_aiter:
+        logger.info("Using Triton GEMM backend for FP8 blockscale (default)")
 
     FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
 
@@ -767,6 +787,8 @@ def aiter_w8a8_block_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
+    backend = get_fp8_gemm_runner_backend()
+
     # if input_scale not None, input is quanted
     if input_scale is not None:
         q_input = input_2d
@@ -781,6 +803,10 @@ def aiter_w8a8_block_fp8_linear(
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     else:
         use_triton = True
+
+    # overrides use_triton to False if aiter_ck is selected and AITER is available.
+    if backend.is_aiter_ck():
+        use_triton = False
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
