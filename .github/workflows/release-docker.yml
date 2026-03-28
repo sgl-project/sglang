@@ -1,14 +1,8 @@
 name: Release Docker Images
 #
-# This workflow builds and publishes both framework and runtime Docker images:
-#
-# Framework images (full development environment):
+# This workflow builds and publishes framework Docker images (full development environment):
 #   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest
 #   - lmsysorg/sglang:v{version}-cu130, lmsysorg/sglang:latest-cu130
-#
-# Runtime images (production-optimized, ~50% smaller):
-#   - lmsysorg/sglang:v{version}-runtime, lmsysorg/sglang:latest-runtime
-#   - lmsysorg/sglang:v{version}-cu130-runtime, lmsysorg/sglang:latest-cu130-runtime
 #
 on:
   push:
@@ -102,28 +96,6 @@ jobs:
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu129-amd64-framework.txt
 
-      - name: Build and Push AMD64 Runtime
-        run: |
-          version=${{ steps.version.outputs.version }}
-
-          docker buildx build \
-            --target runtime \
-            --platform linux/amd64 \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
-            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
-            --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg SGL_VERSION=${version} \
-            --metadata-file /tmp/metadata-cu129-runtime.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-runtime.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest-cu129-amd64-runtime.txt
-
       - name: Build and Push AMD64 Framework (CUDA 13)
         run: |
           version=${{ steps.version.outputs.version }}
@@ -145,28 +117,6 @@ jobs:
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-framework.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu130-amd64-framework.txt
-
-      - name: Build and Push AMD64 Runtime (CUDA 13)
-        run: |
-          version=${{ steps.version.outputs.version }}
-
-          docker buildx build \
-            --target runtime \
-            --platform linux/amd64 \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
-            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg GRACE_BLACKWELL=0 \
-            --build-arg SGL_VERSION=${version} \
-            --metadata-file /tmp/metadata-cu130-runtime.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-runtime.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest-cu130-amd64-runtime.txt
 
       - name: Upload digests
         uses: actions/upload-artifact@v4
@@ -245,28 +195,6 @@ jobs:
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu129-arm64-framework.txt
 
-      - name: Build and Push ARM64 Runtime
-        run: |
-          version=${{ steps.version.outputs.version }}
-
-          docker buildx build \
-            --target runtime \
-            --platform linux/arm64 \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
-            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
-            --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg SGL_VERSION=${version} \
-            --metadata-file /tmp/metadata-cu129-runtime.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-runtime.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest-cu129-arm64-runtime.txt
-
       - name: Build and Push ARM64 Framework (CUDA 13)
         run: |
           version=${{ steps.version.outputs.version }}
@@ -288,27 +216,6 @@ jobs:
           DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-framework.json'))['containerimage.digest'])")
           echo "Pushed digest: ${DIGEST}"
           echo "${DIGEST}" > /tmp/digest-cu130-arm64-framework.txt
-
-      - name: Build and Push ARM64 Runtime (CUDA 13)
-        run: |
-          version=${{ steps.version.outputs.version }}
-
-          docker buildx build \
-            --target runtime \
-            --platform linux/arm64 \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
-            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
-            --build-arg GRACE_BLACKWELL=1 \
-            --build-arg SGL_VERSION=${version} \
-            --metadata-file /tmp/metadata-cu130-runtime.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-runtime.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest-cu130-arm64-runtime.txt
 
       - name: Upload digests
         uses: actions/upload-artifact@v4
@@ -373,15 +280,10 @@ jobs:
         run: |
           version=${{ steps.version.outputs.version }}
 
-          # Load all digests
           CU129_AMD64_FW=$(cat /tmp/digests/amd64/digest-cu129-amd64-framework.txt)
-          CU129_AMD64_RT=$(cat /tmp/digests/amd64/digest-cu129-amd64-runtime.txt)
           CU130_AMD64_FW=$(cat /tmp/digests/amd64/digest-cu130-amd64-framework.txt)
-          CU130_AMD64_RT=$(cat /tmp/digests/amd64/digest-cu130-amd64-runtime.txt)
           CU129_ARM64_FW=$(cat /tmp/digests/arm64/digest-cu129-arm64-framework.txt)
-          CU129_ARM64_RT=$(cat /tmp/digests/arm64/digest-cu129-arm64-runtime.txt)
           CU130_ARM64_FW=$(cat /tmp/digests/arm64/digest-cu130-arm64-framework.txt)
-          CU130_ARM64_RT=$(cat /tmp/digests/arm64/digest-cu130-arm64-runtime.txt)
 
           # Create versioned framework manifest (default)
           docker buildx imagetools create \
@@ -395,18 +297,6 @@ jobs:
             lmsysorg/sglang@${CU129_AMD64_FW} \
             lmsysorg/sglang@${CU129_ARM64_FW}
 
-          # Create versioned runtime manifest
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:v${version}-runtime \
-            lmsysorg/sglang@${CU129_AMD64_RT} \
-            lmsysorg/sglang@${CU129_ARM64_RT}
-
-          # Create latest runtime manifest
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:latest-runtime \
-            lmsysorg/sglang@${CU129_AMD64_RT} \
-            lmsysorg/sglang@${CU129_ARM64_RT}
-
           # Create versioned CUDA 13 framework manifest
           docker buildx imagetools create \
             -t lmsysorg/sglang:v${version}-cu130 \
@@ -418,15 +308,3 @@ jobs:
             -t lmsysorg/sglang:latest-cu130 \
             lmsysorg/sglang@${CU130_AMD64_FW} \
             lmsysorg/sglang@${CU130_ARM64_FW}
-
-          # Create versioned CUDA 13 runtime manifest
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:v${version}-cu130-runtime \
-            lmsysorg/sglang@${CU130_AMD64_RT} \
-            lmsysorg/sglang@${CU130_ARM64_RT}
-
-          # Create latest CUDA 13 runtime manifest
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:latest-cu130-runtime \
-            lmsysorg/sglang@${CU130_AMD64_RT} \
-            lmsysorg/sglang@${CU130_ARM64_RT}

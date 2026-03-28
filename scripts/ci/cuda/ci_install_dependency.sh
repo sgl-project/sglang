@@ -298,7 +298,7 @@ if [ "$CU_VERSION" = "cu130" ]; then
 else
     NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
 fi
-$PIP_CMD install mooncake-transfer-engine==0.3.9 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.10 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
