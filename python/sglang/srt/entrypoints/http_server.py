@@ -59,6 +59,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -509,7 +510,7 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    rid = f"HEALTH_CHECK_{time.time()}"
+    rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
 
     if _global_state.tokenizer_manager.is_image_gen:
         gri = _global_state.tokenizer_manager.get_image_gen_health_check_request(
