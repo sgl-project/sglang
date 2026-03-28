@@ -733,12 +733,18 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flush_cache():
+async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache()
+    ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+    if ret.success:
+        content = (
+            "Cache flushed.\nPlease check backend logs for more details. "
+            "(When there are running or waiting requests, the operation will not be performed.)\n"
+        )
+    else:
+        content = ret.message or "Flush cache failed.\n"
     return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+        content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 

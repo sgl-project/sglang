@@ -1,5 +1,5 @@
 name: Rerun UT
-run-name: ${{ inputs.pr_head_sha && format('[rerun-ut] {0}', inputs.pr_head_sha) || '[rerun-ut]' }}
+run-name: ${{ inputs.pr_head_sha && format('[rerun-ut] {0} {1}', inputs.test_command, inputs.pr_head_sha) || format('[rerun-ut] {0}', inputs.test_command) }}
 
 on:
   workflow_dispatch:

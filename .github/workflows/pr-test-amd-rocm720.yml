@@ -794,7 +794,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-4gpu-sglang]
-        part: [0, 1]
+        part: [0]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -826,7 +826,7 @@ jobs:
               --hw amd \
               --suite stage-c-test-4-gpu-amd \
               --auto-partition-id ${{ matrix.part }} \
-              --auto-partition-size 2 \
+              --auto-partition-size 1 \
               --timeout-per-file 1800 \
               --enable-retry \
               --max-attempts 2 \
