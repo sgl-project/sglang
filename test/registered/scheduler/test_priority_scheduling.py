@@ -249,6 +249,7 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
                 "--max-queued-requests",  # Enforce max queued request number is 3
                 "3",
                 "--enable-priority-scheduling",  # Enable priority scheduling
+                "--disable-piecewise-cuda-graph",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
