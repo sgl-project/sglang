@@ -23,6 +23,9 @@ BuildInputsFn = Callable[[Any, nn.Module, str, Optional[nn.Module]], Inputs]
 PrepareCallFn = Callable[[nn.Module, Inputs], "HookCall"]
 NormalizeFn = Callable[[Any], torch.Tensor]
 
+# These are harness defaults for synthetic accuracy inputs.
+# They are not checkpoint truth. We use them only when the model config or
+# forward signature does not expose a more specific shape or channel count.
 DEFAULT_TEXT_SEQ_LEN = 64
 DEFAULT_TOKEN_LAYOUT_SIZE = 32
 REDUCED_TOKEN_LAYOUT_SIZE = 16
@@ -198,10 +201,12 @@ def _supports_image_conditioning(module: nn.Module) -> bool:
 def _build_transformer_hook_inputs(
     case: Any, model: nn.Module, device: str, ref_model: Optional[nn.Module] = None
 ) -> Inputs:
+    """Build one synthetic input bundle that both transformer variants can consume."""
     compat = _resolve_transformer_hook_compat(case)
     param_names = _forward_parameter_names(model)
     if ref_model is not None:
-        param_names |= _forward_parameter_names(ref_model)
+        # The input bundle has to satisfy both call signatures.
+        param_names.update(_forward_parameter_names(ref_model))
 
     rng = _DeterministicRNG()
     layout = _infer_transformer_layout(param_names)

@@ -41,6 +41,9 @@ STAGED_1GPU_NATIVE_CASE_IDS = {
     "flux_2_ti2i_multi_image_cache_dit",
 }
 
+# These case allowlists are accuracy-runner policy. They select the few 1-GPU
+# cases that need sequential SGLang/reference execution to stay within memory
+# limits during CI and local correctness runs.
 STAGED_1GPU_TEXT_ENCODER_CASE_IDS = {
     "flux_2_image_t2i",
     "flux_2_image_t2i_upscaling_4x",
@@ -179,12 +182,6 @@ def resolve_component_path(
     )
 
 
-def resolve_local_path(hub_id: str) -> str:
-    if os.path.isdir(hub_id):
-        return hub_id
-    return maybe_download_model(hub_id)
-
-
 def extract_component_path_overrides(extra_args: List[str]) -> Dict[str, str]:
     component_paths: Dict[str, str] = {}
     index = 0
@@ -233,7 +230,7 @@ def select_component_source(
     model_index_keys: Tuple[str, ...],
 ) -> ComponentSelection:
     component_paths = extract_component_path_overrides(extra_args)
-    base_model_root = resolve_local_path(model_id)
+    base_model_root = maybe_download_model(model_id)
     search_keys = [component.value]
     for key in model_index_keys:
         if key not in search_keys:
@@ -244,7 +241,7 @@ def select_component_source(
     for key in search_keys:
         override_path = component_paths.get(key)
         if override_path:
-            source_root = resolve_local_path(override_path)
+            source_root = maybe_download_model(override_path)
             component_key = key
             break
 
@@ -368,6 +365,7 @@ def build_accuracy_server_args(
 
 
 def set_module_attr(module: nn.Module, name: str, value: Any) -> None:
+    """Assign to a nested parameter/buffer path such as `blocks.0.attn.to_q.weight`."""
     attrs = name.split(".")
     parent = module
     for attr in attrs[:-1]:
@@ -387,6 +385,7 @@ def set_module_attr(module: nn.Module, name: str, value: Any) -> None:
 def materialize_module(
     module: nn.Module, device: torch.device, dtype: torch.dtype
 ) -> None:
+    """Materialize meta tensors and cast floating tensors onto one target device/dtype."""
     for name, param in module.named_parameters():
         if param.device.type == "meta":
             new_data = torch.zeros(param.shape, device=device, dtype=dtype)
@@ -413,6 +412,7 @@ def materialize_module(
 def build_parameter_shard_contexts(
     module: nn.Module,
 ) -> Dict[str, ParameterShardContext]:
+    """Record TP shard world/rank for each parameter owned by a TP-aware submodule."""
     shard_contexts: Dict[str, ParameterShardContext] = {}
     for module_name, submodule in module.named_modules():
         tp_group = getattr(submodule, "tp_group", None)
@@ -437,6 +437,7 @@ def build_parameter_shard_contexts(
 
 
 def build_state_lookup(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Index a source state dict under both original and prefix-stripped names."""
     lookup: Dict[str, torch.Tensor] = {}
     for key, val in state.items():
         lookup[key] = val
@@ -447,6 +448,7 @@ def build_state_lookup(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
 
 
 def normalize_state_key(name: str) -> str:
+    """Normalize common naming differences between source and target state dicts."""
     return (
         name.replace("_fsdp_wrapped_module.", "")
         .replace("_orig_mod.", "")
@@ -594,6 +596,7 @@ def resolve_text_encoder_vocab_size(config: Any) -> int:
 def build_deterministic_text_encoder_inputs(
     config: Any, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build one stable token batch that works across text-encoder implementations."""
     vocab_size = resolve_text_encoder_vocab_size(config)
     max_token_id = max(
         TEXT_ENCODER_TOKEN_MIN + 1, min(vocab_size, TEXT_ENCODER_TOKEN_MAX)
@@ -688,6 +691,7 @@ def _should_stage_1gpu_case(case: Any, component: ComponentType, num_gpus: int) 
 def _run_single_text_encoder_forward(
     model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
+    """Run one encoder forward and normalize its output into a tensor."""
     with torch.no_grad():
         forward_model = resolve_text_encoder_forward_module(model)
         model_device = _module_device(forward_model)

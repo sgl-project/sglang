@@ -157,6 +157,8 @@ def _load_reference_component(
     pipeline_config,
     subfolder: str,
 ) -> nn.Module:
+    # WAN VAE does not have a clean generic diffusers auto-load path here, and we
+    # explicitly need checkpoint-loaded weights for reference-side transfer/parity.
     if component == ComponentType.VAE and "wan" in hub_id.lower():
         return _load_wan_reference_vae(comp_path, pipeline_config)
 
@@ -313,7 +315,6 @@ class AccuracyEngine:
         min_match_ratio: float = MIN_MATCH_RATIO,
         target_device: Optional[torch.device] = None,
     ) -> None:
-        """Copy matching parameters from reference to SGLang module with TP-aware slicing."""
         device = target_device or get_local_torch_device()
         dtype = torch.bfloat16
         materialize_module(target, device, dtype)
@@ -441,7 +442,6 @@ class AccuracyEngine:
         materialize_sgl_on_device: bool = True,
         materialize_ref_on_device: bool = True,
     ) -> Tuple[nn.Module, nn.Module, str]:
-        """Load SGLang + reference components and align weights for accuracy checks."""
         spec = COMPONENT_SPECS[component]
         if library != spec.reference_library:
             logger.warning(
