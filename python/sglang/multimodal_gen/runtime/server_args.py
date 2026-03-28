@@ -22,7 +22,7 @@ import yaml
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -36,6 +36,10 @@ from sglang.multimodal_gen.runtime.utils.common import (
     is_valid_ipv6_address,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    CYAN,
+    GREEN,
+    RED,
+    RESET,
     _sanitize_for_logging,
     configure_logger,
     init_logger,
@@ -48,6 +52,18 @@ from sglang.multimodal_gen.utils import (
 )
 
 logger = init_logger(__name__)
+
+# Derived from single-H200 benchmarking (~140.4 GiB total) at the maximum
+# supported 720p workloads with dit_layerwise_offload=False and
+# num_inference_steps=1:
+# - Wan-AI/Wan2.2-T2V-A14B-Diffusers, 1280x720, 81 frames:
+#   peak_reserved=108076 MB (~105.5 GiB), peak_allocated=97665 MB (~95.4 GiB)
+# - OpenMOSS-Team/MOVA-720p, 1280x720, 193 frames:
+#   peak_reserved=130264 MB (~127.2 GiB), peak_allocated=108819 MB (~106.3 GiB)
+# Also, on H200, enabling dit_layerwise_offload regressed latency noticeably on
+# our validated Wan/MOVA workloads, so use a 130 GiB cutoff to keep H200-class
+# GPUs on the faster no-offload default while preserving some headroom.
+WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 
 
 class Backend(str, Enum):
@@ -186,6 +202,9 @@ class ServerArgs:
 
     scheduler_port: int = 5555
 
+    # Strict port mode: fail if requested port is unavailable instead of auto-selecting
+    strict_ports: bool = False
+
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
 
@@ -259,27 +278,20 @@ class ServerArgs:
             self.input_save_path = None
 
     def _adjust_quant_config(self):
-        """validate and adjust"""
+        """
+        resolve, validate and adjust quantization config
 
-        # nunchaku
+        handles only nunchaku for now
+        """
+
         ncfg = self.nunchaku_config
         if ncfg is None or isinstance(ncfg, NunchakuConfig):
             return
-        ncfg.validate()
 
-        # propagate the path to server_args
-        if ncfg.transformer_weights_path:
-            self.transformer_weights_path = ncfg.transformer_weights_path
-
-        if not ncfg.enable_svdquant or not ncfg.transformer_weights_path:
-            self.nunchaku_config = None
-        else:
-            self.nunchaku_config = NunchakuConfig(
-                precision=self.nunchaku_config.quantization_precision,
-                rank=self.nunchaku_config.quantization_rank,
-                act_unsigned=self.nunchaku_config.quantization_act_unsigned,
-                transformer_weights_path=self.nunchaku_config.transformer_weights_path,
-            )
+        resolution = ncfg.resolve_runtime_config()
+        if resolution.transformer_weights_path:
+            self.transformer_weights_path = resolution.transformer_weights_path
+        self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
         # enable parallel folding when SP is enabled
@@ -375,17 +387,35 @@ class ServerArgs:
             )
 
     def _adjust_network_ports(self):
-        self.port = self.settle_port(self.port)
-        initial_scheduler_port = self.scheduler_port + (
-            random.randint(0, 100) if self.scheduler_port == 5555 else 0
-        )
-        self.scheduler_port = self.settle_port(initial_scheduler_port)
-        initial_master_port = (
-            self.master_port
-            if self.master_port is not None
-            else (30005 + random.randint(0, 100))
-        )
-        self.master_port = self.settle_port(initial_master_port, 37)
+        if self.strict_ports:
+            # Strict mode: fail if port is unavailable
+            if not is_port_available(self.port):
+                raise RuntimeError(
+                    f"Port {self.port} is unavailable and --strict-ports is enabled. "
+                    f"Either use a different port or remove --strict-ports to allow auto-selection."
+                )
+            if not is_port_available(self.scheduler_port):
+                raise RuntimeError(
+                    f"Scheduler port {self.scheduler_port} is unavailable and --strict-ports is enabled. "
+                    f"Either use a different port or remove --strict-ports to allow auto-selection."
+                )
+            if self.master_port is not None and not is_port_available(self.master_port):
+                raise RuntimeError(
+                    f"Master port {self.master_port} is unavailable and --strict-ports is enabled. "
+                    f"Either use a different port or remove --strict-ports to allow auto-selection."
+                )
+        else:
+            self.port = self.settle_port(self.port)
+            initial_scheduler_port = self.scheduler_port + (
+                random.randint(0, 100) if self.scheduler_port == 5555 else 0
+            )
+            self.scheduler_port = self.settle_port(initial_scheduler_port)
+            initial_master_port = (
+                self.master_port
+                if self.master_port is not None
+                else (30005 + random.randint(0, 100))
+            )
+            self.master_port = self.settle_port(initial_master_port, 37)
 
     def _adjust_parallelism(self):
         if self.tp_size is None:
@@ -434,15 +464,33 @@ class ServerArgs:
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
             if (
-                ("wan" in pipeline_name_lower or "mova" in pipeline_name_lower)
-                and self.dit_layerwise_offload is None
-                and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
-            ):
-                logger.info(
-                    f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} "
-                    "for low memory and performance balance"
+                "wan" in pipeline_name_lower or "mova" in pipeline_name_lower
+            ) and self.dit_layerwise_offload is None:
+                auto_enable_layerwise_offload = (
+                    current_platform.enable_dit_layerwise_offload_for_wan_by_default()
                 )
-                self.dit_layerwise_offload = True
+                if auto_enable_layerwise_offload and current_platform.is_cuda():
+                    device_total_memory_gb = (
+                        current_platform.get_device_total_memory() / BYTES_PER_GB
+                    )
+                    if (
+                        device_total_memory_gb
+                        >= WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB
+                    ):
+                        logger.info(
+                            "Skipping automatic dit_layerwise_offload for %s on a high-memory CUDA GPU (e.g. H200/B200/B300-class, %.2f GiB total)",
+                            self.pipeline_config.__class__.__name__,
+                            device_total_memory_gb,
+                        )
+                        auto_enable_layerwise_offload = False
+                        self.dit_layerwise_offload = False
+
+                if auto_enable_layerwise_offload:
+                    logger.info(
+                        f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} "
+                        "for low memory and performance balance"
+                    )
+                    self.dit_layerwise_offload = True
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:
@@ -752,6 +800,12 @@ class ServerArgs:
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--strict-ports",
+            action=StoreBoolean,
+            default=ServerArgs.strict_ports,
+            help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
+        )
+        parser.add_argument(
             "--webui",
             action=StoreBoolean,
             default=ServerArgs.webui,
@@ -1056,6 +1110,18 @@ class ServerArgs:
                     "causing shape mismatch errors. "
                     "Please disable either --dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
                 )
+
+            logger.warning(
+                "dit_layerwise_offload is enabled: %slower GPU memory usage%s, but %smay reduce throughput or increase latency%s. "
+                "%sIf you are using multi-GPU deployment and already have enough memory headroom, prefer keeping dit_layerwise_offload disabled.%s "
+                "Please tune this based on your memory headroom and performance target.",
+                GREEN,
+                RESET,
+                RED,
+                RESET,
+                CYAN,
+                RESET,
+            )
 
     def _validate_parallelism(self):
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:

@@ -399,7 +399,7 @@ class WaitingImageRequest:
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
         self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
-            zmq.Context(), zmq.PULL
+            zmq.Context(), zmq.PULL, host=host_name
         )
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
@@ -681,7 +681,9 @@ class MMReceiverBase(ABC):
             if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
             req_id = uuid.uuid4().hex
-            embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
+            embedding_port, recv_socket = get_zmq_socket_on_host(
+                self.context, zmq.PULL, host=self.host
+            )
             mm_data = self._extract_url_data(request_obj)
             asyncio.create_task(
                 self.encode(req_id, mm_data, embedding_port, "encode", "send")
