@@ -73,6 +73,8 @@ class MXFP8GemmBase:
             "--trust-remote-code",
             "--fp8-gemm-backend",
             cls.backend,
+            "--attention-backend",
+            "triton",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -129,6 +131,11 @@ class TestMXFP8GemmTriton(MXFP8GemmBase, unittest.TestCase):
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestMXFP8GemmFlashinferTrtllm(MXFP8GemmBase, unittest.TestCase):
     backend = "flashinfer_trtllm"
+
+
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+class TestMXFP8GemmFlashinferCutlass(MXFP8GemmBase, unittest.TestCase):
+    backend = "flashinfer_cutlass"
 
 
 if __name__ == "__main__":

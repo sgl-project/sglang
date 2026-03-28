@@ -45,6 +45,9 @@ class TestServerUpdateWeightsFromDiskMXFP8(CustomTestCase):
                 fp8_gemm_backend,
                 "--moe-runner-backend",
                 moe_runner_backend,
+                "--attention-backend",
+                "triton",
+                "--enable-deterministic-inference",
             ],
         )
 
