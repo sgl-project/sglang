@@ -557,19 +557,22 @@ def _prepare_vae_call(module: nn.Module, inputs: Inputs) -> HookCall:
     return HookCall(module=_VAEDecodeModule(module), args=(inputs["z"],))
 
 
-_GENERIC_PROFILES: Dict[str, NativeHookProfile] = {
-    "transformer": NativeHookProfile(
-        build_inputs=_build_generic_transformer_inputs,
-        prepare_sglang_call=_prepare_generic_transformer_sglang_call,
-        prepare_reference_call=_prepare_generic_transformer_reference_call,
-    ),
-    "vae": NativeHookProfile(
-        build_inputs=_build_generic_vae_inputs,
-        prepare_sglang_call=_prepare_vae_call,
-        prepare_reference_call=_prepare_vae_call,
-    ),
-}
+TRANSFORMER_NATIVE_PROFILE = NativeHookProfile(
+    build_inputs=_build_generic_transformer_inputs,
+    prepare_sglang_call=_prepare_generic_transformer_sglang_call,
+    prepare_reference_call=_prepare_generic_transformer_reference_call,
+)
+
+VAE_NATIVE_PROFILE = NativeHookProfile(
+    build_inputs=_build_generic_vae_inputs,
+    prepare_sglang_call=_prepare_vae_call,
+    prepare_reference_call=_prepare_vae_call,
+)
 
 
 def resolve_native_profile(component_name: str) -> NativeHookProfile:
-    return _GENERIC_PROFILES[component_name]
+    if component_name == "transformer":
+        return TRANSFORMER_NATIVE_PROFILE
+    if component_name == "vae":
+        return VAE_NATIVE_PROFILE
+    raise KeyError(f"Unsupported native accuracy component: {component_name}")
