@@ -5,17 +5,21 @@ import requests
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import CustomTestCase, DEFAULT_URL_FOR_TEST, popen_launch_server, \
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
 
 register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 
 class TestMambaCache(CustomTestCase):
-    """Testcase：Verify the prefix sharing mechanism of the Radix tree take effect.
+    """Testcase：Verify the test kv cache reuse, when use mamba cache.
 
-    [Test Category] Parameter
-    [Test Target] --disable-radix-cache
+    [Test Category] Functional
+    [Test Target] kv cache reuse
     """
 
     model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST
@@ -28,6 +32,7 @@ class TestMambaCache(CustomTestCase):
             "0.5",
             "--attention-backend",
             "ascend",
+            "--disable-cuda-graph",
             "--device",
             "npu",
             "--tp-size",
@@ -40,6 +45,8 @@ class TestMambaCache(CustomTestCase):
             "auto",
             "--mamba-track-interval",
             "256",
+            "--base-gpu-id",
+            "8",
         ]
         cls.process = popen_launch_server(
             cls.model,
