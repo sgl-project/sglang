@@ -19,7 +19,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from sglang.srt.iochain.base import IOChain, IOContext, IOProcessor
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -498,7 +497,9 @@ class TestServingBaseWiring(unittest.IsolatedAsyncioTestCase):
 class TestRequestLoggingProcessor(unittest.IsolatedAsyncioTestCase):
 
     async def test_on_response_non_streaming_logs_streaming_false(self):
-        from sglang.srt.iochain.processors.request_logging_processor import RequestLoggingProcessor
+        from sglang.srt.iochain.processors.request_logging_processor import (
+            RequestLoggingProcessor,
+        )
 
         p = RequestLoggingProcessor()
         ctx = _make_ctx(response=MagicMock())  # non-streaming: response set
@@ -513,7 +514,9 @@ class TestRequestLoggingProcessor(unittest.IsolatedAsyncioTestCase):
 
     async def test_on_response_streaming_ctx_response_is_none(self):
         """When ctx.response is None (streaming), processor must not raise."""
-        from sglang.srt.iochain.processors.request_logging_processor import RequestLoggingProcessor
+        from sglang.srt.iochain.processors.request_logging_processor import (
+            RequestLoggingProcessor,
+        )
 
         p = RequestLoggingProcessor()
         ctx = _make_ctx(response=None)  # streaming: response is None
@@ -524,7 +527,9 @@ class TestRequestLoggingProcessor(unittest.IsolatedAsyncioTestCase):
             await p.on_response(ctx)  # must not raise
 
     async def test_on_request_does_not_raise(self):
-        from sglang.srt.iochain.processors.request_logging_processor import RequestLoggingProcessor
+        from sglang.srt.iochain.processors.request_logging_processor import (
+            RequestLoggingProcessor,
+        )
 
         p = RequestLoggingProcessor()
         ctx = _make_ctx()

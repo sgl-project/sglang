@@ -53,6 +53,8 @@ end-to-end latency on egress.
 """
 
 from sglang.srt.iochain.base import IOChain, IOContext, IOProcessor
-from sglang.srt.iochain.processors.request_logging_processor import RequestLoggingProcessor
+from sglang.srt.iochain.processors.request_logging_processor import (
+    RequestLoggingProcessor,
+)
 
 __all__ = ["IOChain", "IOContext", "IOProcessor", "RequestLoggingProcessor"]

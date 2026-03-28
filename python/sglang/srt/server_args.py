@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import tempfile
+from dataclasses import field
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
