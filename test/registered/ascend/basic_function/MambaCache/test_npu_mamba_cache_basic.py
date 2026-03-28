@@ -9,10 +9,11 @@ register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 
 class TestMambaCache(GSM8KAscendMixin, CustomTestCase):
-    """Testcase：Verify the MambaCache
+    """Testcase: Test MambaCache basic functions using GSM8K dataset the inference accuracy of the Qwen3-Next-80B-A3B-Instruct model
+    on the GSM8K dataset is no less than 0.92.
 
-    [Test Category] Parameter
-    [Test Target] --lora-target-modules
+    [Test Category] Functional
+    [Test Target] MambaCache
     """
 
     model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST.model_path
@@ -35,8 +36,6 @@ class TestMambaCache(GSM8KAscendMixin, CustomTestCase):
         "--tp-size",
         "8",
         "--disable-radix-cache",
-        "--base-gpu-id",
-        "8",
     ]
 
 
