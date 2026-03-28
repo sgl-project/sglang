@@ -653,6 +653,7 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
+    mm_enable_rocjpeg: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
     scheduler_recv_interval: int = 1
@@ -5521,6 +5522,13 @@ class ServerArgs:
             "--keep-mm-feature-on-device",
             action="store_true",
             help="Keep multimodal feature tensors on device after processing to save D2H copy.",
+        )
+        parser.add_argument(
+            "--mm-enable-rocjpeg",
+            action="store_true",
+            help="Enable GPU-accelerated JPEG batch decoding via rocJPEG (AMD GPU only). "
+            "When enabled, JPEG images are collected and batch-decoded on GPU instead of CPU. "
+            "Requires AMD ROCm platform with rocJPEG support.",
         )
         parser.add_argument(
             "--enable-return-hidden-states",
