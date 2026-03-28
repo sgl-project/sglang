@@ -399,6 +399,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    fp4_kv_cache_recipe: str = "nvfp4"
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -4645,7 +4646,17 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+        )
+        parser.add_argument(
+            "--fp4-kv-cache-recipe",
+            type=str,
+            default=ServerArgs.fp4_kv_cache_recipe,
+            choices=["nvfp4", "mxfp4"],
+            help="FP4 KV cache quantization recipe when --kv-cache-dtype=fp4_e2m1. "
+            '"nvfp4" uses two-level scaling (per-tensor FP32 + per-block FP8 E4M3), '
+            "requires SM100/SM120 (Blackwell). "
+            '"mxfp4" uses MX block scaling, for other hardware.',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
