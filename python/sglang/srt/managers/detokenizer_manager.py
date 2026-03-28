@@ -25,11 +25,10 @@ import pybase64
 import setproctitle
 import zmq
 
-from sglang.srt.environ import envs
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
-    BatchMultimodalDecodeReq,
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
@@ -132,7 +131,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             [
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
-                (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
                 (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )

@@ -20,11 +20,11 @@ import asyncio
 import builtins
 import ctypes
 import functools
+import gc
 import importlib
 import inspect
 import io
 import itertools
-import gc
 import json
 import logging
 import math
