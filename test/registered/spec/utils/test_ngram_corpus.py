@@ -747,15 +747,14 @@ class TestNgramCorpusExternalSam(CustomTestCase):
                 iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=4)
             )
 
-    def test_external_sam_cpp_backstop_rejects_oversized_iterable(self):
-        corpus = _make_corpus(
-            "BFS",
-            external_sam_budget=2,
-            external_corpus_max_tokens=4,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "token limit"):
-            corpus.load_external_corpus([[1, 2, 3], [4, 5]])
+    def test_external_sam_documents_reject_oversized_corpus(self):
+        with self.assertRaisesRegex(ValueError, "token limit"):
+            _make_corpus(
+                "BFS",
+                external_sam_budget=2,
+                external_corpus_max_tokens=4,
+                external_corpus_documents=[[1, 2, 3], [4, 5]],
+            )
 
     def test_external_sam_only_chain(self):
         corpus = _make_corpus(

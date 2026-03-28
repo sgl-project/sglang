@@ -30,7 +30,7 @@ class SuffixAutomaton {
  public:
   static constexpr int32_t kSeparatorToken = std::numeric_limits<int32_t>::min();
 
-  SuffixAutomaton(size_t max_corpus_tokens);
+  SuffixAutomaton();
 
   void appendTokens(const std::vector<int32_t>& tokens);
 
@@ -54,8 +54,6 @@ class SuffixAutomaton {
 
   std::vector<SamState> states_;
   int last_ = 0;
-  size_t max_corpus_tokens_ = 0;
-  size_t loaded_corpus_tokens_ = 0;
   int64_t pos_ = 0;
   bool saw_token_ = false;
   bool finalized_ = false;

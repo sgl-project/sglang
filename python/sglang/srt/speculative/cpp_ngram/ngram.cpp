@@ -71,7 +71,7 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
 
 void Ngram::startExternalCorpusLoad() {
   std::unique_lock<std::mutex> lock(mutex_);
-  sam_ = std::make_unique<SuffixAutomaton>(param_.external_corpus_max_tokens);
+  sam_ = std::make_unique<SuffixAutomaton>();
 }
 
 void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {

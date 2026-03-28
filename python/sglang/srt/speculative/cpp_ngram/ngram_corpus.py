@@ -26,16 +26,27 @@ ngram_corpus_cpp = load(
 
 def _documents_to_chunks(
     documents: Iterable[Sequence[int]],
+    max_tokens: Optional[int] = None,
 ) -> Iterator[list[int]]:
     _SEPARATOR_TOKEN = -(2**31)
+    total_tokens = 0
     has_previous = False
     for doc in documents:
         if not doc:
             continue
+        doc_tokens = list(doc)
+        separator_cost = 1 if has_previous else 0
+        next_total_tokens = total_tokens + separator_cost + len(doc_tokens)
+        if max_tokens is not None and next_total_tokens > max_tokens:
+            raise ValueError(
+                "External ngram corpus exceeds the configured token limit "
+                f"({max_tokens}) after loading {total_tokens} tokens."
+            )
+        total_tokens = next_total_tokens
         if has_previous:
-            yield [_SEPARATOR_TOKEN] + list(doc)
+            yield [_SEPARATOR_TOKEN] + doc_tokens
         else:
-            yield list(doc)
+            yield doc_tokens
         has_previous = True
 
 
@@ -63,7 +74,11 @@ class NgramCorpus:
         self._ngram = ngram_corpus_cpp.Ngram(capacity, param)
         self.external_corpus_token_count = 0
         if external_corpus_documents is not None:
-            self.load_external_corpus(_documents_to_chunks(external_corpus_documents))
+            self.load_external_corpus(
+                _documents_to_chunks(
+                    external_corpus_documents, external_corpus_max_tokens
+                )
+            )
 
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
@@ -75,6 +90,13 @@ class NgramCorpus:
         self._ngram.synchronize()
 
     def load_external_corpus(self, chunks: Iterable[Sequence[int]]) -> int:
+        """Load pre-chunked external corpus tokens.
+
+        Callers passing raw chunk iterables must enforce any token budget before
+        calling this method. Python-side helpers such as
+        `iter_external_corpus_chunks()` and `external_corpus_documents=` handle
+        `external_corpus_max_tokens` validation before handing chunks to C++.
+        """
         _, loaded_token_count = self._ngram.loadExternalCorpus(chunks)
         self.external_corpus_token_count = loaded_token_count
         return loaded_token_count
