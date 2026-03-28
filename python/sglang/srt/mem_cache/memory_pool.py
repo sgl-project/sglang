@@ -75,6 +75,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
     next_power_of_2,
@@ -1275,6 +1276,7 @@ class MHATokenToKVPool(KVCache):
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
         kv_cache_layout: Optional[str] = None,
+        quant_method=None,
     ):
         super().__init__(
             size,
@@ -1293,6 +1295,7 @@ class MHATokenToKVPool(KVCache):
             if swa_v_head_dim is not None
             else v_head_dim if v_head_dim is not None else head_dim
         )
+
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
         # HND folds (page, head) into one paged index for per-kv-head sparse page tables
@@ -1337,6 +1340,10 @@ class MHATokenToKVPool(KVCache):
                     )
                     assert self.head_dim % self._kv_vector_x == 0
                     assert self.v_head_dim % self._kv_vector_x == 0
+
+        from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
+
+        self.quant_method = quant_method if quant_method is not None else NoneMethod()
 
         self._create_buffers()
 
@@ -1415,6 +1422,29 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
+        from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
+
+        if not isinstance(self.quant_method, NoneMethod):
+            # Delegate buffer creation to quant_method (e.g. NVFP4Method, MXFP4Method)
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    m = self.size + self.page_size
+                    buf = self.quant_method.create_buffers(
+                        m, self.head_num, self.head_dim, self.layer_num, self.device
+                    )
+            self.k_buffer = buf["k_buffer"]
+            self.v_buffer = buf["v_buffer"]
+            self.k_scale_buffer = buf.get("k_scale_buffer")
+            self.v_scale_buffer = buf.get("v_scale_buffer")
+            self.dq_k_buffer = buf.get("dq_k_buffer")
+            self.dq_v_buffer = buf.get("dq_v_buffer")
+            self.store_dtype = buf.get("store_dtype", torch.uint8)
+            return
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1523,6 +1553,14 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if hasattr(self, "k_scale_buffer") and self.k_scale_buffer is not None:
+            del self.k_scale_buffer
+        if hasattr(self, "v_scale_buffer") and self.v_scale_buffer is not None:
+            del self.v_scale_buffer
+        if hasattr(self, "dq_k_buffer") and self.dq_k_buffer is not None:
+            del self.dq_k_buffer
+        if hasattr(self, "dq_v_buffer") and self.dq_v_buffer is not None:
+            del self.dq_v_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -1647,15 +1685,54 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
         dcp_kv_mask: Optional[torch.Tensor] = None,
+        global_layer_id_override: Optional[int] = None,
     ):
         loc, _ = unwrap_write_loc(loc_info)
         # Catch stale slot ids here instead of as illegal-addr / silent KV
         # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
-        if layer_id_override is not None:
-            layer_id = layer_id_override
+        # global_layer_id: used for per-layer scale lookup (always global/absolute).
+        # layer_id: used for buffer indexing (may be local/0-based via HybridLinearKVPool).
+        if layer is not None:
+            global_layer_id = (
+                global_layer_id_override
+                if global_layer_id_override is not None
+                else layer.layer_id
+            )
+            layer_id = (
+                layer_id_override if layer_id_override is not None else layer.layer_id
+            )
         else:
-            layer_id = layer.layer_id
+            # Called from HybridLinearKVPool with layer=None; both overrides must be provided.
+            global_layer_id = global_layer_id_override
+            layer_id = layer_id_override
+
+        from sglang.srt.layers.quantization.kv_cache_quant_method import NoneMethod
+
+        if not isinstance(self.quant_method, NoneMethod):
+            # Delegate quantization + write to quant_method.
+            # Always use global_layer_id for scale lookup (scales are indexed by global layer id).
+            idx = layer_id - self.start_layer
+            if k_scale is None and hasattr(self.quant_method, "k_scales_gpu"):
+                k_scale = self.quant_method.k_scales_gpu[
+                    global_layer_id : global_layer_id + 1
+                ]
+                v_scale = self.quant_method.v_scales_gpu[
+                    global_layer_id : global_layer_id + 1
+                ]
+            self.quant_method.quantize_and_store(
+                self.k_buffer[idx],
+                self.v_buffer[idx],
+                self.k_scale_buffer[idx] if self.k_scale_buffer else None,
+                self.v_scale_buffer[idx] if self.v_scale_buffer else None,
+                loc,
+                cache_k,
+                cache_v,
+                k_scale,
+                v_scale,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -1749,6 +1826,7 @@ class MHATokenToKVPool(KVCache):
             same_kv_dim=self.same_kv_dim,
         )
 
+
     def set_kv_buffer_prefix_valid(
         self,
         layer: RadixAttention,
@@ -1833,6 +1911,121 @@ class MHATokenToKVPool(KVCache):
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
         )
+
+    def get_raw_kv_buffer(self, layer_id: int) -> dict:
+        """Return the raw quantized KV buffers for a layer (for native FP4 kernels).
+
+        Returns dict with keys: "k", "v", "k_scale", "v_scale"
+        For NVFP4: k/v are uint8 (packed FP4), k_scale/v_scale are FP8 E4M3.
+        """
+        idx = layer_id - self.start_layer
+        result = {"k": self.k_buffer[idx], "v": self.v_buffer[idx]}
+        if hasattr(self, "k_scale_buffer") and self.k_scale_buffer is not None:
+            result["k_scale"] = self.k_scale_buffer[idx].view(torch.float8_e4m3fn)
+            result["v_scale"] = self.v_scale_buffer[idx].view(torch.float8_e4m3fn)
+        return result
+
+    # Backward-compatible accessors for attention backends
+    def get_fp4_key_buffer(self, layer_id: int):
+        raw = self.get_raw_kv_buffer(layer_id)
+        return raw["k"], raw["k_scale"]
+
+    def get_fp4_value_buffer(self, layer_id: int):
+        raw = self.get_raw_kv_buffer(layer_id)
+        return raw["v"], raw["v_scale"]
+
+    def get_dq_kv_buffer(self) -> tuple:
+        """Return the shared dequant workspace (dq_k_buffer, dq_v_buffer)."""
+        return self.dq_k_buffer, self.dq_v_buffer
+
+    def dequant_kv_for_extend(
+        self,
+        layer_id: int,
+        req_to_token: torch.Tensor,
+        req_pool_indices_cpu,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        page_size: int,
+        k_cur_fp8: Optional[torch.Tensor] = None,
+        v_cur_fp8: Optional[torch.Tensor] = None,
+        global_layer_id: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batch dequant FP4 KV into the shared dq_buffer for prefill/extend.
+
+        Extracts the common dequant loop shared by flashinfer and trtllm backends.
+        The actual dequantize computation is delegated to self.quant_method.
+
+        Args:
+            layer_id: Local (0-based) layer index used for buffer indexing.
+            req_to_token: req_to_token_pool.req_to_token tensor.
+            req_pool_indices_cpu: CPU list/tensor of request pool indices.
+            extend_prefix_lens_cpu: CPU list of prefix lengths per request.
+            extend_seq_lens_cpu: CPU list of extend (new chunk) lengths per request.
+            page_size: Page size used for page-aligned dq_buffer layout.
+            k_cur_fp8: Current chunk K cast to FP8, shape [total_extend, heads, dim].
+                       If None, current chunk is not written (flashinfer with
+                       transfer_cur_chunk_kv=False).
+            v_cur_fp8: Same for V.
+            global_layer_id: Global (absolute) layer index for scale lookup.
+                             Defaults to layer_id when not provided (non-hybrid path).
+
+        Returns:
+            (dq_k_buffer, dq_v_buffer) — the shared workspace tensors.
+        """
+        if global_layer_id is None:
+            global_layer_id = layer_id
+        raw = self.get_raw_kv_buffer(layer_id)
+        k_fp4 = raw["k"]
+        k_scales = raw["k_scale"]
+        v_fp4 = raw["v"]
+        v_scales = raw["v_scale"]
+        dq_k, dq_v = self.dq_k_buffer, self.dq_v_buffer
+
+        batch_size = len(req_pool_indices_cpu)
+        cur_batch_start_loc_cpu = 0
+        cur_token_idx_dq = page_size  # skip page 0 (dummy output slot)
+
+        for i in range(batch_size):
+            req_idx = int(req_pool_indices_cpu[i])
+            prev_len = int(extend_prefix_lens_cpu[i])
+            extend_len = int(extend_seq_lens_cpu[i])
+
+            if prev_len > 0:
+                prev_indices = req_to_token[req_idx, :prev_len]
+                k_prev_fp8, v_prev_fp8 = self.quant_method.dequantize_prev_kv(
+                    k_fp4[prev_indices],
+                    k_scales[prev_indices],
+                    v_fp4[prev_indices],
+                    v_scales[prev_indices],
+                    global_layer_id,
+                )
+                dq_k[cur_token_idx_dq : cur_token_idx_dq + prev_len] = k_prev_fp8
+                dq_v[cur_token_idx_dq : cur_token_idx_dq + prev_len] = v_prev_fp8
+
+            if k_cur_fp8 is not None:
+                cur_end = cur_batch_start_loc_cpu + extend_len
+                dq_k[
+                    cur_token_idx_dq
+                    + prev_len : cur_token_idx_dq
+                    + prev_len
+                    + extend_len
+                ] = k_cur_fp8[cur_batch_start_loc_cpu:cur_end]
+                dq_v[
+                    cur_token_idx_dq
+                    + prev_len : cur_token_idx_dq
+                    + prev_len
+                    + extend_len
+                ] = v_cur_fp8[cur_batch_start_loc_cpu:cur_end]
+                cur_batch_start_loc_cpu = cur_end
+
+            # Advance to next page-aligned position
+            cur_token_idx_dq = (
+                (cur_token_idx_dq + prev_len + extend_len + page_size - 1)
+                // page_size
+                * page_size
+            )
+
+        return dq_k, dq_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
@@ -2346,6 +2539,7 @@ class HybridLinearKVPool(KVCache):
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
+        quant_method=None,
     ):
         self.size = size
         self.dtype = dtype
@@ -2360,20 +2554,29 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         if not use_mla:
             TokenToKVPoolClass = MHATokenToKVPool
+            quant_method_kwarg = {"quant_method": quant_method}
 
             if current_platform.is_out_of_tree():
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
+                quant_method_kwarg = {}
             elif _is_npu:
+                assert not is_float4_e2m1fn_x2(
+                    dtype
+                ), "FP4 is not supported on NPU yet."
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
 
                 TokenToKVPoolClass = NPUMHATokenToKVPool
+                quant_method_kwarg = {}
             elif full_kv_pool_class is not None:
                 # Caller-selected MHA layout variant (e.g. the page-major
                 # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
-                # priority since they don't understand alternate layouts.
+                # priority since they do not understand alternate layouts.
                 TokenToKVPoolClass = full_kv_pool_class
+            else:
+                TokenToKVPoolClass = MHATokenToKVPool
+                quant_method_kwarg = {"quant_method": quant_method}
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
@@ -2385,6 +2588,7 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 enable_kv_cache_copy=enable_kv_cache_copy,
+                **quant_method_kwarg,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -2453,20 +2657,51 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-    def get_key_buffer(self, layer_id: int):
+    def get_key_buffer(self, layer_id: int, scale: Optional[float] = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
+        if scale is not None:
+            return self.full_kv_pool.get_key_buffer(layer_id, scale)
         return self.full_kv_pool.get_key_buffer(layer_id)
 
-    def get_value_buffer(self, layer_id: int):
+    def get_value_buffer(self, layer_id: int, scale: Optional[float] = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
+        if scale is not None:
+            return self.full_kv_pool.get_value_buffer(layer_id, scale)
         return self.full_kv_pool.get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def get_fp4_value_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool._get_value_nvfp4_from_nvfp4_buffer(layer_id)
+
+    def get_fp4_key_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool._get_key_nvfp4_from_nvfp4_buffer(layer_id)
+
+    def get_raw_kv_buffer(self, layer_id: int):
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_raw_kv_buffer(layer_id)
+
+    def dequant_kv_for_extend(self, layer_id: int, *args, **kwargs):
+        global_layer_id = layer_id  # save global id before converting to local
+        local_layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.dequant_kv_for_extend(
+            local_layer_id, *args, global_layer_id=global_layer_id, **kwargs
+        )
+
+    def get_dq_kv_buffer(
+        self,
+    ):
+        assert is_float4_e2m1fn_x2(
+            self.dtype
+        ), "get_dq_kv_buffer_and_page_table only available for FP4 KV pool"
+        return self.full_kv_pool.get_dq_kv_buffer()
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
@@ -2492,7 +2727,10 @@ class HybridLinearKVPool(KVCache):
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
     ):
-        layer_id = self._transfer_full_attention_id(layer.layer_id)
+        global_layer_id = layer.layer_id  # absolute global id for scale lookup
+        layer_id = self._transfer_full_attention_id(
+            layer.layer_id
+        )  # local id for buffer indexing
         if not self.use_mla:
             self.full_kv_pool.set_kv_buffer(
                 None,
@@ -2503,6 +2741,7 @@ class HybridLinearKVPool(KVCache):
                 v_scale,
                 layer_id_override=layer_id,
                 dcp_kv_mask=dcp_kv_mask,
+                global_layer_id_override=global_layer_id,
             )
         else:
             with self._transfer_id_context(layer):

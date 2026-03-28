@@ -557,6 +557,7 @@ class ServerArgs:
 
     # -------------------------------------------------------------------------
     # Quantization and data type
+
     # -------------------------------------------------------------------------
     dtype: A[
         str,
@@ -6568,6 +6569,7 @@ class ServerArgs:
 
         # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
+
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
