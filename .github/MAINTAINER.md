@@ -44,32 +44,32 @@ This section lists the oncalls for each module or feature.
 The format is @github-username (Slack username).
 
 ### Scheduler
-@merrymercy (Lianmin Zheng), @hnyls2002 (Liangsheng Yin), @cctry (Shiyang Chen)
+[@merrymercy](https://github.com/merrymercy) (Lianmin Zheng), [@hnyls2002](https://github.com/hnyls2002) (Liangsheng Yin), [@cctry](https://github.com/cctry) (Shiyang Chen)
 
 related files
 - python/sglang/srt/managers
 - python/sglang/srt/model_executor
 
 ### Diffusion
-@mickqian (Mick), @BBuf (BBuf)
+[@mickqian](https://github.com/mickqian) (Mick), [@BBuf](https://github.com/BBuf) (BBuf)
 
 related files
 - python/sglang/multimodal_gen
 
 ### PD disaggregation
-@ByronHsu (Byron Hsu), @cctry (Shiyang Chen), @ShangmingCai (Shangming Cai)
+[@ByronHsu](https://github.com/ByronHsu) (Byron Hsu), [@cctry](https://github.com/cctry) (Shiyang Chen), [@ShangmingCai](https://github.com/ShangmingCai) (Shangming Cai)
 
 related files
 - python/sglang/srt/disaggregation
 
 ### KV Cache
-@ispobock (Ke Bao), @xiezhq-hermann (Zhiqiang Xie)
+[@ispobock](https://github.com/ispobock) (Ke Bao), [@xiezhq-hermann](https://github.com/xiezhq-hermann) (Zhiqiang Xie)
 
 related files
 - python/sglang/srt/mem_cache
 
 ### Parallelism
-@ch-wan (Cheng Wan), @fzyzcjy (Tom)
+[@ch-wan](https://github.com/ch-wan) (Cheng Wan), [@fzyzcjy](https://github.com/fzyzcjy) (Tom)
 
 related files
 - python/sglang/srt/eplb
@@ -77,72 +77,71 @@ related files
 - python/sglang/srt/layers/dp_attention.py
 
 ### Kernel
-@BBuf (BBuf)
+[@BBuf](https://github.com/BBuf) (BBuf)
 
 related files
 - python/sglang/jit_kernel
 - sgl-kernel
 
 ### Speculative decoding
-@hnyls2002 (Liangsheng Yin), @Qiaolin-Yu (Qiaolin Yu)
+[@hnyls2002](https://github.com/hnyls2002) (Liangsheng Yin), [@Qiaolin-Yu](https://github.com/Qiaolin-Yu) (Qiaolin Yu)
 
 related files 
 - python/sglang/srt/speculative
 
 ### NV and model-specific optimizations
-@Fridge003 (Baizhou Zhang), @ishandhanani (Ishan Dhanani), @Qiaolin-Yu (Qiaolin Yu)
+[@Fridge003](https://github.com/Fridge003) (Baizhou Zhang), [@ishandhanani](https://github.com/ishandhanani) (Ishan Dhanani), [@Qiaolin-Yu](https://github.com/Qiaolin-Yu) (Qiaolin Yu)
 
 related files
 - python/sglang/srt/models
 - python/sglang/srt/layers/attention
 
 ### AMD optimizations
-@HaiShaw (Henry HAI)
+[@HaiShaw](https://github.com/HaiShaw) (Henry HAI)
 
 ### NPU optimizations
-@iforgetmyname (Even Zhou)
+[@iforgetmyname](https://github.com/iforgetmyname) (Even Zhou)
 
 related files
 - python/sglang/srt/hardware_backend/npu
 
 ### CI, Release, Package
-@Kangyan-Zhou (Kangyan Zhou), @Fridge003 (Baizhou Zhang)
+[@Kangyan-Zhou](https://github.com/Kangyan-Zhou) (Kangyan Zhou), [@Fridge003](https://github.com/Fridge003) (Baizhou Zhang)
 
 related files
 - .github/workflows
 
 ### Router, API
-@slin1237 (Simo Lin)
+[@slin1237](https://github.com/slin1237) (Simo Lin)
 
 related files
 - sgl-model-gateway
 - python/sglang/srt/grpc
 - python/sglang/srt/entrypoints
 
-
-**NOTE:**
+### Other Notes
 
 Now we have many Merge Oncalls mainly because the CI is flaky and the CODEOWNERS is too coarse-grained.
 In the future, we hope the CI can be improved and we only need bypass rarely. After that, most Merge Oncalls can be converted back to Write and CODEOWNERS.
 
-This list is based on the current situation. If you or someone you know would like to take on more responsibility and are qualified, please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
+This list is based on the current situation. If you or someone you know would like to take on more responsibility and are qualified, please ping [Lianmin Zheng](https://github.com/merrymercy) and [Ying Sheng](https://github.com/Ying1123) in the Slack channel. They will start a nomination and internal review process.
 
 ## The List of CI Oncalls
 This section lists the oncalls for each hardware platform. The format is @github-username (Slack username).
 
 ### NVIDIA GPUs
-@Kangyan-Zhou (Kangyan Zhou), @ch-wan (Cheng Wan), @HanHan009527 (hanhan), @ishandhanani (Ishan Dhanani), @ShangmingCai (Shangming Cai), @alisonshao (Alison Shao).
+[@Kangyan-Zhou](https://github.com/Kangyan-Zhou) (Kangyan Zhou), [@ch-wan](https://github.com/ch-wan) (Cheng Wan), [@HanHan009527](https://github.com/HanHan009527) (hanhan), [@ishandhanani](https://github.com/ishandhanani) (Ishan Dhanani), [@ShangmingCai](https://github.com/ShangmingCai) (Shangming Cai), [@alisonshao](https://github.com/alisonshao) (Alison Shao).
 
 ### AMD GPUs
-@saienduri (Sai Enduri), @HaiShaw (Henry HAI)
+[@saienduri](https://github.com/saienduri) (Sai Enduri), [@HaiShaw](https://github.com/HaiShaw) (Henry HAI)
 
 ### Intel CPU and XPU
-@mingfeima (Mingfei Ma), @DiweiSun (Diwei Sun)
+[@mingfeima](https://github.com/mingfeima) (Mingfei Ma), [@DiweiSun](https://github.com/DiweiSun) (Diwei Sun)
 
 ### Ascend NPUs
-@iforgetmyname (Even Zhou)
+[@iforgetmyname](https://github.com/iforgetmyname) (Even Zhou)
 
-This list is based on the current situation. If you or someone you know would like to donate machines for CI, they can serve as the CI oncalls for their machines. Please ping @Lianmin Zheng and @Ying Sheng in the Slack channel. They will start a nomination and internal review process.
+This list is based on the current situation. If you or someone you know would like to donate machines for CI, they can serve as the CI oncalls for their machines. Please ping [Lianmin Zheng](https://github.com/merrymercy) and [Ying Sheng](https://github.com/Ying1123) in the Slack channel. They will start a nomination and internal review process.
 
 ## Suspending Permissions
 If a Merge Oncall bypasses checks to merge a PR that breaks the `main` branch, or if they repeatedly break the CI due to various reasons, their privileges will be suspended for at least two days, depending on the severity of the incident.
