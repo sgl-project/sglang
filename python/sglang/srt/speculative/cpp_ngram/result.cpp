@@ -55,23 +55,15 @@ std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
   }
 
   std::vector<int> parent(n, -1);
-  std::vector<int> depth(n, 1);
   std::vector<bool> has_child(n, false);
   for (int i = 1; i < n; ++i) {
-    int best_parent = 0;
-    int best_depth = depth[0];
-    for (int j = 0; j < i; ++j) {
-      if (!result.mask[i * n + j]) {
-        continue;
-      }
-      if (depth[j] >= best_depth) {
-        best_parent = j;
-        best_depth = depth[j];
+    for (int j = i - 1; j >= 0; --j) {
+      if (result.mask[i * n + j]) {
+        parent[i] = j;
+        has_child[j] = true;
+        break;
       }
     }
-    parent[i] = best_parent;
-    depth[i] = depth[best_parent] + 1;
-    has_child[best_parent] = true;
   }
 
   std::vector<std::vector<int32_t>> paths;
@@ -120,6 +112,11 @@ Result combineRootResults_(int last_token, int draft_token_num, const Result& pr
   auto primary_paths = extractLeafPaths_(primary);
   auto secondary_paths = extractLeafPaths_(secondary);
 
+  // Rebuilding from all root-to-leaf paths is structurally lossless for this
+  // finite tree encoding: every interior node lies on at least one leaf path.
+  // The merge is intentionally primary-biased, though. We insert primary paths
+  // first and `buildResultFromLeafPaths_()` stops once `draft_token_num` slots
+  // are filled, so secondary-only branches may be dropped under budget pressure.
   std::vector<std::vector<int32_t>> merged_paths = std::move(primary_paths);
   merged_paths.reserve(merged_paths.size() + secondary_paths.size());
   for (const auto& path : secondary_paths) {
