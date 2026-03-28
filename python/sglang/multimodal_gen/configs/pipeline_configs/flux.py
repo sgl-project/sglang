@@ -23,12 +23,10 @@ from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxV
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
-    preprocess_text,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
-    clip_preprocess_text,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -65,8 +63,8 @@ class FluxPipelineConfig(ImagePipelineConfig):
         default_factory=lambda: ("bf16", "bf16")
     )
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (clip_preprocess_text, preprocess_text),
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None, None),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
@@ -650,8 +648,8 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
         default_factory=lambda: (Qwen3TextConfig(),)
     )
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,),
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
