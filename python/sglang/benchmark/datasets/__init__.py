@@ -6,6 +6,7 @@ from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
 )
 from sglang.benchmark.datasets.image import ImageDataset
+from sglang.benchmark.datasets.longbench_v2 import LongBenchV2Dataset
 from sglang.benchmark.datasets.mmmu import MMMUDataset
 from sglang.benchmark.datasets.mooncake import MooncakeDataset
 from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
@@ -24,6 +25,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "mmmu": MMMUDataset,
     "image": ImageDataset,
     "mooncake": MooncakeDataset,
+    "longbench_v2": LongBenchV2Dataset,
 }
 
 
