@@ -64,7 +64,7 @@ class GDNKernelDispatcher:
             self.decode_kernel = triton_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
-                raise ValueError("CuTe DSL backend requires CUDA")
+                raise ValueError("GDN CuTe DSL backend requires CUDA")
             from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
                 CuteDSLGDNKernel,
             )
