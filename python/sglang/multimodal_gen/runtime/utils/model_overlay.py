@@ -25,6 +25,11 @@ from sglang.multimodal_gen.runtime.utils.model_overlay_registry import (
 
 logger = init_logger(__name__)
 
+# Built-in diffusion model overlay registry.
+# Keep this empty until concrete overlay repos are ready to ship.
+BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {}
+
+
 MODEL_OVERLAY_METADATA_PATTERNS = [
     "*.json",
     "*.md",
