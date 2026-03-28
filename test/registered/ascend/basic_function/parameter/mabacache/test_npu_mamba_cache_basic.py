@@ -15,8 +15,8 @@ class TestMambaCache(GSM8KAscendMixin, CustomTestCase):
     [Test Target] --lora-target-modules
     """
 
-    model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST
-    accuracy = 0.92
+    model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST.model_path
+    accuracy = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST.gsm8k_accuracy
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
@@ -35,6 +35,8 @@ class TestMambaCache(GSM8KAscendMixin, CustomTestCase):
         "--tp-size",
         "8",
         "--disable-radix-cache",
+        "--base-gpu-id",
+        "8",
     ]
 
 
