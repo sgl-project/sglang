@@ -55,6 +55,7 @@ def _load_model_overlay_registry() -> dict[str, dict[str, Any]]:
     if _MODEL_OVERLAY_REGISTRY_CACHE is not None:
         return _MODEL_OVERLAY_REGISTRY_CACHE
 
+    # Built-in registry is the stable default path; env only overrides it.
     normalized = _normalize_model_overlay_registry(BUILTIN_MODEL_OVERLAY_REGISTRY)
 
     raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
@@ -119,6 +120,7 @@ def resolve_model_overlay_target(
         return model_name_or_path, exact
 
     if os.path.exists(model_name_or_path):
+        # Local source dirs do not have a repo id, so match them by basename.
         base_name = os.path.basename(os.path.normpath(model_name_or_path))
         for source_model_id, spec in registry.items():
             if base_name == source_model_id.rsplit("/", 1)[-1]:
@@ -209,6 +211,8 @@ def ensure_overlay_source_dir_complete(
     if not required_source_files:
         return source_dir
 
+    # Metadata-only overlays often need a partial source snapshot. Re-download
+    # only when the current source dir is missing required files.
     missing_paths = _find_missing_required_paths(source_dir, required_source_files)
     if not missing_paths:
         return source_dir
@@ -511,12 +515,14 @@ def maybe_load_overlay_model_index(
     hf_hub_download_fn: Callable[..., str],
 ) -> dict[str, Any] | None:
     if os.path.exists(model_name_or_path):
+        # A local overlay repo already contains the model_index we need.
         if load_overlay_manifest_if_present(model_name_or_path) is not None:
             return load_model_index_from_dir(model_name_or_path)
         return None
 
     overlay_target = resolve_model_overlay_target(model_name_or_path)
     if overlay_target is not None:
+        # Registry-mapped source model ids first resolve to overlay metadata.
         source_model_id, overlay_spec = overlay_target
         overlay_dir = download_overlay_metadata(
             source_model_id,
@@ -556,6 +562,7 @@ def maybe_resolve_overlay_model_path(
         )
         manifest = load_overlay_manifest_if_present(overlay_dir)
         if manifest is None:
+            # Full diffusers overlays do not need materialization.
             return base_model_download_fn(
                 str(overlay_spec["overlay_repo_id"]),
                 local_dir=local_dir,
@@ -567,6 +574,8 @@ def maybe_resolve_overlay_model_path(
         source_allow_patterns = cast(
             list[str] | None, manifest.get("source_allow_patterns")
         )
+        # For local source paths, reuse the directory directly instead of
+        # round-tripping through snapshot_download.
         source_dir = (
             model_name_or_path
             if os.path.exists(model_name_or_path)
@@ -604,6 +613,8 @@ def maybe_resolve_overlay_model_path(
 
     overlay_spec, overlay_dir, manifest = direct_overlay
     source_model_id = str(manifest["source_model_id"])
+    # Direct overlay repos are always metadata-only; they need the original
+    # source weights before they can be materialized into a diffusers-like dir.
     source_allow_patterns = cast(
         list[str] | None, manifest.get("source_allow_patterns")
     )
