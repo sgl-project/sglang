@@ -76,9 +76,6 @@ void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
 
 void Ngram::finishExternalCorpusLoad() {
   std::unique_lock<std::mutex> lock(mutex_);
-  if (!sam_) {
-    return;
-  }
   sam_->finalize();
   if (sam_->empty()) {
     sam_.reset();

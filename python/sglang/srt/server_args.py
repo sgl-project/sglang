@@ -4808,7 +4808,7 @@ class ServerArgs:
             "--speculative-ngram-external-corpus-max-tokens",
             type=int,
             default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
-            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on how much slower server startup you can tolerate and how much additional CPU overhead you can sustain: larger values allow a bigger external SAM, while smaller values keep startup faster and CPU overhead lower.",
+            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
         )
 
         # Multi-layer Eagle speculative decoding

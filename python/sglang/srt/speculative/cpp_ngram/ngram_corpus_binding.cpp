@@ -9,6 +9,8 @@ namespace py = pybind11;
 
 namespace {
 
+// Wraps the Python-facing iterable/cast logic together with the start/append/finish load
+// transaction and clears any partially built SAM on exceptions.
 std::pair<size_t, size_t> loadExternalCorpus(ngram::Ngram& ngram, py::iterable chunks) {
   ngram.startExternalCorpusLoad();
   size_t chunk_count = 0;

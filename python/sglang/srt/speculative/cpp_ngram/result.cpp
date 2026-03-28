@@ -111,12 +111,6 @@ Result buildResultFromLeafPaths_(int last_token, int draft_token_num, const std:
 Result combineRootResults_(int last_token, int draft_token_num, const Result& primary, const Result& secondary) {
   auto primary_paths = extractLeafPaths_(primary);
   auto secondary_paths = extractLeafPaths_(secondary);
-
-  // Rebuilding from all root-to-leaf paths is structurally lossless for this
-  // finite tree encoding: every interior node lies on at least one leaf path.
-  // The merge is intentionally primary-biased, though. We insert primary paths
-  // first and `buildResultFromLeafPaths_()` stops once `draft_token_num` slots
-  // are filled, so secondary-only branches may be dropped under budget pressure.
   std::vector<std::vector<int32_t>> merged_paths = std::move(primary_paths);
   merged_paths.reserve(merged_paths.size() + secondary_paths.size());
   for (const auto& path : secondary_paths) {
