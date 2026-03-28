@@ -596,6 +596,7 @@ class ChatCompletionRequest(BaseModel):
         "in a response. 'none' defaults thinking and enable_thinking to false in "
         "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path.",
     )
+    parallel_tool_calls: bool = True
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: Optional[int] = None
