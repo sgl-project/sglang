@@ -88,9 +88,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Init running status
         self.init_running_status(server_args)
 
-        if server_args.enable_metrics:
-            start_cpu_monitor_thread("detokenizer")
-
         # Init dispatcher
         self.init_request_dispatcher()
 
@@ -120,9 +117,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
-        self.is_dummy = False
-        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
+        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -130,6 +126,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
+
+        if server_args.enable_metrics:
+            start_cpu_monitor_thread("detokenizer")
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -403,9 +402,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
-
-    def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
-        raise NotImplementedError()
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")
