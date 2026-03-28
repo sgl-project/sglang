@@ -178,12 +178,6 @@ class ModelConfig:
         self.is_multimodal = enable_multimodal and is_multimodal_model(
             self.hf_config.architectures
         )
-        self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
-            self.hf_config.architectures
-        )
-        self.is_image_gen = enable_multimodal and is_image_gen_model(
-            self.hf_config.architectures
-        )
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
@@ -1349,14 +1343,6 @@ def is_multimodal_model(model_architectures: List[str]):
         return True
     else:
         return False
-
-
-def is_multimodal_gen_model(model_architectures: List[str]):
-    return False
-
-
-def is_image_gen_model(model_architectures: List[str]):
-    return False
 
 
 def is_audio_model(model_architectures: List[str]):
