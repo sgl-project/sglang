@@ -152,6 +152,18 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+                if logits_output.next_token_top_logprobs_val:
+                    logits_output.next_token_top_logprobs_val = [
+                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    ]
+                    logits_output.next_token_top_logprobs_idx = [
+                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    ]
+                if logits_output.next_token_token_ids_logprobs_val:
+                    logits_output.next_token_token_ids_logprobs_val = [
+                        v.tolist()
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    ]
 
             hidden_state_offset = 0
 
@@ -377,7 +389,7 @@ class SchedulerOutputProcessorMixin:
 
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                if batch.is_spec_v2 and logits_output.next_token_top_logprobs_val:
+                if logits_output.next_token_top_logprobs_val:
                     logits_output.next_token_top_logprobs_val = [
                         v.tolist() for v in logits_output.next_token_top_logprobs_val
                     ]
@@ -385,7 +397,7 @@ class SchedulerOutputProcessorMixin:
                         x.tolist() for x in logits_output.next_token_top_logprobs_idx
                     ]
 
-                if batch.is_spec_v2 and logits_output.next_token_token_ids_logprobs_val:
+                if logits_output.next_token_token_ids_logprobs_val:
                     logits_output.next_token_token_ids_logprobs_val = [
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
