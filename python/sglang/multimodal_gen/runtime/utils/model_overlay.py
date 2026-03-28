@@ -19,9 +19,6 @@ from requests.exceptions import RequestException
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.model_overlay_registry import (
-    BUILTIN_MODEL_OVERLAY_REGISTRY,
-)
 
 logger = init_logger(__name__)
 
