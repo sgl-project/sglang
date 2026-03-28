@@ -1191,6 +1191,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
+
+        # TODO: Make sure all models have `quant_config` attribute, and all online quantization methods register which layers they actually quantize.
+        if (
+            hasattr(self.model, "quant_config")
+            and hasattr(self.model.quant_config, "quantized_layers")
+            and self.server_args.quantization is not None
+        ):
+            type_counts, quantized_layers_count = (
+                self.model.quant_config.quantized_layers
+            )
+            type_summary = ", ".join(f"{t}: {c}" for t, c in type_counts.items())
+            logger.info(
+                f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers in total ({type_summary})."
+            )
+
         if self.server_args.debug_tensor_dump_output_folder is not None:
             register_forward_hook_for_model(
                 self.model,
