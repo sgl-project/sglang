@@ -19,6 +19,9 @@ from requests.exceptions import RequestException
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.model_overlay_registry import (
+    BUILTIN_MODEL_OVERLAY_REGISTRY,
+)
 
 logger = init_logger(__name__)
 
@@ -52,9 +55,11 @@ def _load_model_overlay_registry() -> dict[str, dict[str, Any]]:
     if _MODEL_OVERLAY_REGISTRY_CACHE is not None:
         return _MODEL_OVERLAY_REGISTRY_CACHE
 
+    normalized = _normalize_model_overlay_registry(BUILTIN_MODEL_OVERLAY_REGISTRY)
+
     raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
     if not raw_value:
-        _MODEL_OVERLAY_REGISTRY_CACHE = {}
+        _MODEL_OVERLAY_REGISTRY_CACHE = normalized
         return _MODEL_OVERLAY_REGISTRY_CACHE
 
     try:
@@ -73,6 +78,14 @@ def _load_model_overlay_registry() -> dict[str, dict[str, Any]]:
             "SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY must be a JSON object"
         )
 
+    normalized.update(_normalize_model_overlay_registry(payload))
+    _MODEL_OVERLAY_REGISTRY_CACHE = normalized
+    return _MODEL_OVERLAY_REGISTRY_CACHE
+
+
+def _normalize_model_overlay_registry(
+    payload: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
     normalized: dict[str, dict[str, Any]] = {}
     for source_model_id, spec in payload.items():
         if isinstance(spec, str):
@@ -88,9 +101,7 @@ def _load_model_overlay_registry() -> dict[str, dict[str, Any]]:
                 f"Overlay registry entry for {source_model_id!r} is missing overlay_repo_id"
             )
         normalized[source_model_id] = dict(spec)
-
-    _MODEL_OVERLAY_REGISTRY_CACHE = normalized
-    return _MODEL_OVERLAY_REGISTRY_CACHE
+    return normalized
 
 
 def resolve_model_overlay(model_name_or_path: str) -> dict[str, Any] | None:

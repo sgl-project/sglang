@@ -7,11 +7,18 @@ Use the CLI for one-off generation with `sglang generate` or to start a persiste
 If `--model-path` points to a non-diffusers source repo, SGLang can resolve it
 through a self-hosted overlay repo.
 
-- Set `SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY` to a JSON object or a path to a JSON file
-- Map the source model ID to an overlay repo ID
-- Keep passing the original source model ID to `--model-path`
+SGLang first checks a built-in overlay registry. Concrete built-in mappings can
+be added over time without changing the CLI surface.
 
-Example:
+The built-in registry is currently empty.
+
+`SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY` is only an optional override for
+development and debugging. It accepts either a JSON object or a path to a JSON
+file, and can extend or replace built-in entries for the current process.
+
+Keep passing the original source model ID to `--model-path`.
+
+Override example:
 
 ```bash
 export SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY='{
