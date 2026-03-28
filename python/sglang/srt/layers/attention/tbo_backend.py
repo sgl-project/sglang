@@ -173,6 +173,9 @@ class TboAttnBackend(AttentionBackend):
         getattr(child_left, fn_name)(**args_left)
         getattr(child_right, fn_name)(**args_right)
 
+    def update_fused_rope_metadata_for_replay(self, bs, out_cache_loc):
+        self.primary.update_fused_rope_metadata_for_replay(bs, out_cache_loc)
+
     def get_cuda_graph_seq_len_fill_value(self):
         ans = self.primary.get_cuda_graph_seq_len_fill_value()
         for child in self.children:
