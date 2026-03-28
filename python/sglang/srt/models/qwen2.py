@@ -610,6 +610,9 @@ class Qwen2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # W4A16 AWQ checkpoints may include k_scale/v_scale not registered on the module.
+                if name.endswith((".k_scale", ".v_scale")) and name not in params_dict:
+                    continue
 
                 if name in params_dict.keys():
                     param = params_dict[name]

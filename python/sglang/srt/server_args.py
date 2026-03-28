@@ -105,6 +105,8 @@ QUANTIZATION_CHOICES = [
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
+    "modelopt_awq",
+    "modelopt_w4a16_awq",
     "modelopt_mixed",
     "petit_nvfp4",
     "w8a8_int8",
@@ -1623,7 +1625,13 @@ class ServerArgs:
                     and self.moe_runner_backend == "auto"
                     and (
                         self.quantization
-                        in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
+                        in [
+                            "fp8",
+                            "modelopt_fp8",
+                            "modelopt_fp4",
+                            "modelopt_awq",
+                            "modelopt_mixed",
+                        ]
                         or is_kimi_k2_k25_thinking_int4
                     )
                 ):
@@ -2631,10 +2639,11 @@ class ServerArgs:
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
+                "modelopt_awq",
                 "modelopt_fp8",
                 "modelopt_mixed",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_awq', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -2643,13 +2652,15 @@ class ServerArgs:
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert self.quantization in [
                 "modelopt_fp4",
+                "modelopt_awq",
+                "modelopt_w4a16_awq",
                 "fp8",
                 "mxfp8",
                 "modelopt_fp8",
                 "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'modelopt_awq', 'modelopt_w4a16_awq', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."

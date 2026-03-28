@@ -802,6 +802,8 @@ class ModelConfig:
             ):
                 return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
+        elif quant_algo and "W4A16" in quant_algo and "AWQ" in quant_algo:
+            return {"quant_method": "modelopt_w4a16_awq", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}
         elif quant_algo and "FP8" in quant_algo:
@@ -848,8 +850,10 @@ class ModelConfig:
         """Extract ModelOpt quantization type from unified quantization flag."""
         if self.quantization == "modelopt_fp8":
             return "fp8"
-        elif self.quantization == "modelopt_fp4":
+        elif self.quantization in ("modelopt_fp4", "modelopt_awq"):
             return "nvfp4"
+        elif self.quantization == "modelopt_w4a16_awq":
+            return "fp8"
         elif self.quantization == "modelopt_mixed":
             raise ValueError(
                 "modelopt_mixed is only supported for pre-quantized checkpoints."
@@ -859,6 +863,8 @@ class ModelConfig:
             quant_cfg = self._parse_quant_hf_config()
             if quant_cfg:
                 quant_method = quant_cfg.get("quant_method", "").lower()
+                if "w4a16" in quant_method:
+                    return "fp8"
                 if "fp4" in quant_method:
                     return "fp4"
                 elif "fp8" in quant_method:
@@ -884,6 +890,8 @@ class ModelConfig:
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
+            "modelopt_awq",
+            "modelopt_w4a16_awq",
             "modelopt_mixed",
         ]
         modelopt_quantization_specified = (
@@ -926,6 +934,8 @@ class ModelConfig:
             "marlin",
             "modelopt_fp8",
             "modelopt_fp4",
+            "modelopt_awq",
+            "modelopt_w4a16_awq",
             "modelopt_mixed",
             "gptq_marlin_24",
             "gptq_marlin",
@@ -946,6 +956,8 @@ class ModelConfig:
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
+            "modelopt_awq": ["modelopt"],
+            "modelopt_w4a16_awq": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
