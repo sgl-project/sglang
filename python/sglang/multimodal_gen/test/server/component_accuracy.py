@@ -239,14 +239,17 @@ class AccuracyEngine:
     @staticmethod
     def reset_parallel_runtime() -> None:
         cleanup_dist_env_and_memory()
-
-    @staticmethod
-    def clear_memory() -> None:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+
+    @staticmethod
+    def clear_memory() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @staticmethod
     def _execute_with_native_hook(call) -> Any:

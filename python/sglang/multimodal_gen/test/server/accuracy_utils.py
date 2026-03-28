@@ -786,6 +786,8 @@ def _run_staged_native_component_accuracy_case(
         sgl_out = profile.normalize_sglang_output(sgl_raw)
         sgl_out = engine_cls._apply_output_transforms(sgl_out, sgl_call).detach().cpu()
 
+        del sgl_call
+        del sgl_raw
         del sgl
         sgl = None
         engine_cls.clear_memory()
@@ -796,6 +798,8 @@ def _run_staged_native_component_accuracy_case(
             ref_raw = engine_cls._execute_with_native_hook(ref_call)
         ref_out = profile.normalize_reference_output(ref_raw)
         ref_out = engine_cls._apply_output_transforms(ref_out, ref_call).detach().cpu()
+        del ref_call
+        del ref_raw
 
         engine_cls.check_accuracy(
             sgl_out,
