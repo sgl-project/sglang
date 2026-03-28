@@ -411,7 +411,17 @@ class HFRunner:
         self.in_queue.put(
             (prompts, image_data, max_new_tokens, lora_paths, token_ids_logprob)
         )
-        return self.out_queue.get()
+        while True:
+            if not self.model_proc.is_alive() and self.out_queue.empty():
+                exitcode = self.model_proc.exitcode
+                raise RuntimeError(
+                    f"HFRunner subprocess died with exit code {exitcode} "
+                    f"before producing output"
+                )
+            try:
+                return self.out_queue.get(timeout=5)
+            except Exception:
+                continue
 
     def terminate(self):
         self.model_proc.terminate()
