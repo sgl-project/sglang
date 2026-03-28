@@ -166,6 +166,19 @@ class ReqState:
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
 
 
+def _slice_streaming_output_meta_info(
+    meta_info: Dict[Any, Any],
+    last_output_offset: int,
+) -> None:
+    """Align output-side metadata with the current incremental streaming chunk."""
+    for key in meta_info.keys() & {
+        "output_token_logprobs",
+        "output_top_logprobs",
+        "output_token_ids_logprobs",
+    }:
+        meta_info[key] = meta_info[key][last_output_offset:]
+
+
 class InputFormat(Enum):
     """Input format types for tokenization handling."""
 
@@ -1607,8 +1620,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
                 if self.server_args.incremental_streaming_output and is_stream:
+                    output_offset = state.last_output_offset
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
+                    output_token_ids = state.output_ids[output_offset:]
+                    _slice_streaming_output_meta_info(meta_info, output_offset)
                     state.last_output_offset = len(state.output_ids)
                     output_text = state.text[state.last_text_offset :]
                     state.last_text_offset = len(state.text)
@@ -1626,8 +1641,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
                 if self.server_args.incremental_streaming_output and is_stream:
+                    output_offset = state.last_output_offset
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset :]
+                    output_token_ids = state.output_ids[output_offset:]
+                    _slice_streaming_output_meta_info(meta_info, output_offset)
                     state.last_output_offset = len(state.output_ids)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
