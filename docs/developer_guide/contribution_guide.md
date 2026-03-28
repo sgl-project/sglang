@@ -31,28 +31,14 @@ pre-commit run --all-files
 - Link checking with lychee is **enforced in CI**. By default, it is not blocking local commits.
 - To run local link checks manually, use: `pre-commit run --hook-stage manual lychee --all-files`.
 
-### Link check guidance (lychee)
-
-- If your PR changes `docs/` or `README.md`, we recommend running local link checks before pushing.
-- Local lychee is optional (CI is the source of truth), but if you want a system installation, see the official project: [lycheeverse/lychee](https://github.com/lycheeverse/lychee).
-- Recommended local commands:
-
-```bash
-# Fast local/offline check (pre-commit config)
-pre-commit run --hook-stage manual lychee --all-files
-
-# CI-like online check (external links over network)
-lychee --config .github/linters/lychee-ci.toml README.md "docs/**/*.md" "docs/**/*.rst" "docs/**/*.ipynb"
-```
-
 ## Run and add unit tests
 
 If you add a new feature or fix a bug, please add corresponding unit tests to ensure coverage and prevent regression.
-SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework with [pytest](https://docs.pytest.org/) as the test runner.
 
 ### Unit tests (no server required)
 
 Unit tests live under [`test/registered/unit/`](https://github.com/sgl-project/sglang/tree/main/test/registered/unit), organized to mirror the `python/sglang/srt/` source tree. These tests validate component logic **without** launching a server or loading real model weights.
+SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unittest.html) framework with [pytest](https://docs.pytest.org/) as the test runner.
 
 **When to add a unit test:** If you modify a file under `python/sglang/srt/`, check whether a corresponding test exists in `test/registered/unit/` and add coverage for your changes. For example:
 
@@ -140,7 +126,6 @@ If you don’t have permission and you’re not the PR author, please ask mainta
 ### CI rate limits
 
 Due to CI scheduling and limited resources, higher-priority PRs may preempt running jobs. In such cases, you may need to rerun the tests.
-
 We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources.
 
 Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default cooldown period is 120 minutes, and each workflow can override it via the `cool-down-minutes` input parameter:
@@ -154,7 +139,6 @@ cool-down-minutes:
 
 Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
 
-
 ## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
@@ -166,6 +150,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
   - If a single test file run longer than 500 seconds, split it into multiple smaller files (e.g., `test_eagle_infer_a.py`, `test_eagle_infer_b.py`).
   - If a single job in a github workflow runs longer than 30 mins, split it into smaller jobs/steps.
   - Reuse server launches in your unit tests to make tests run faster.
+- Never use `pickle.loads()`, `pickle.load()`, or `recv_pyobj()` to deserialize untrusted or network-received data. Python's [pickle module is not secure](https://docs.python.org/3/library/pickle.html) — it can execute arbitrary code during deserialization. Use safe serialization formats such as [msgpack](https://github.com/jcrist/msgspec) or JSON instead.
 - When supporting new hardware or features, follow these guidelines:
   - Do not drastically change existing code.
   - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_ascend.py`).

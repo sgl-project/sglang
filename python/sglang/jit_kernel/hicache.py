@@ -28,6 +28,8 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
         cuda_wrappers=[
             ("launch_one", f"&HiCacheKernel<{args}>::run_one"),
             ("launch_all", f"&HiCacheKernel<{args}>::run_all"),
+            ("launch_one_mla", f"&HiCacheKernel<{args}>::run_one_mla"),
+            ("launch_all_mla", f"&HiCacheKernel<{args}>::run_all_mla"),
         ],
     )
 
@@ -138,4 +140,66 @@ def transfer_hicache_all_layer(
         indices_src,
         kv_cache_src_stride_bytes,
         kv_cache_dst_stride_bytes,
+    )
+
+
+def transfer_hicache_one_layer_mla(
+    cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    cache_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    *,
+    element_dim: int | None = None,
+    unroll: int | None = None,
+    block_quota: int | None = None,
+) -> None:
+    element_dim = element_dim or cache_dst.size(-1)
+    cache_src = cache_src.view(-1, element_dim)
+    cache_dst = cache_dst.view(-1, element_dim)
+    element_size = element_dim * cache_dst.element_size()
+    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    unroll = unroll or _default_unroll(element_size)
+    module = _jit_hicache_module(
+        element_size=element_size,
+        unroll=unroll,
+        block_quota=block_quota,
+    )
+    module.launch_one_mla(
+        cache_dst,
+        indices_dst,
+        cache_src,
+        indices_src,
+    )
+
+
+def transfer_hicache_all_layer_mla(
+    ptr_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    ptr_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    *,
+    cache_src_stride_bytes: int,
+    cache_dst_stride_bytes: int,
+    element_size: int | None = None,
+    unroll: int | None = None,
+    block_quota: int | None = None,
+) -> None:
+    if element_size is None:
+        assert cache_dst_stride_bytes == cache_src_stride_bytes
+        element_size = cache_dst_stride_bytes
+
+    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    unroll = unroll or _default_unroll(element_size)
+    module = _jit_hicache_module(
+        element_size=element_size,
+        unroll=unroll,
+        block_quota=block_quota,
+    )
+    module.launch_all_mla(
+        ptr_dst,
+        indices_dst,
+        ptr_src,
+        indices_src,
+        cache_src_stride_bytes,
+        cache_dst_stride_bytes,
     )

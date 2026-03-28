@@ -555,7 +555,6 @@ class ServerArgs:
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
-    disable_hicache_numa_detect: bool = False
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
@@ -661,6 +660,7 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
+    gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "round-robin-split"
@@ -764,6 +764,7 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
+        self._handle_mps_backends()
         self._handle_xpu_backends()
 
         # Handle piecewise CUDA graph.
@@ -1042,6 +1043,10 @@ class ServerArgs:
                     "piecewise_cuda_graph_compiler='eager', change piecewise_cuda_graph_compiler to 'eager'."
                 )
                 self.piecewise_cuda_graph_compiler = "eager"
+
+    def _handle_mps_backends(self):
+        if self.device == "mps":
+            self.disable_overlap_schedule = True
 
     def _handle_xpu_backends(self):
         if self.device == "xpu":
@@ -5064,11 +5069,6 @@ class ServerArgs:
             help="The layout of host memory pool for hierarchical cache.",
         )
         parser.add_argument(
-            "--disable-hicache-numa-detect",
-            action="store_true",
-            help="Disable binding the process to the NUMA node closest to the active CUDA device when hierarchical cache is enabled.",
-        )
-        parser.add_argument(
             "--hicache-storage-backend",
             type=str,
             choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic", "eic"],
@@ -5536,7 +5536,7 @@ class ServerArgs:
             "--numa-node",
             type=int,
             nargs="+",
-            help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
+            help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. If unset, will be automatically detected on NUMA systems.",
         )
         parser.add_argument(
             "--enable-deterministic-inference",
@@ -5594,6 +5594,12 @@ class ServerArgs:
             "--enable-fused-moe-sum-all-reduce",
             action="store_true",
             help="Enable fused moe triton and sum all reduce.",
+        )
+        parser.add_argument(
+            "--gc-threshold",
+            type=int,
+            nargs="+",
+            help="Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
         )
 
         # Dynamic batch tokenizer
@@ -6110,6 +6116,12 @@ class ServerArgs:
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
+
+        if self.gc_threshold:
+            if not (1 <= len(self.gc_threshold) <= 3):
+                raise ValueError(
+                    "When setting gc_threshold, it must contain 1 to 3 integers."
+                )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
