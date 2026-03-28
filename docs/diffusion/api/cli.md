@@ -4,19 +4,10 @@ Use the CLI for one-off generation with `sglang generate` or to start a persiste
 
 ### Overlay repos for non-diffusers models
 
-If `--model-path` points to a non-diffusers source repo, SGLang can resolve it
+If `--model-path` points to a supported non-diffusers source repo, SGLang can resolve it
 through a self-hosted overlay repo.
 
-SGLang first checks a built-in overlay registry. Concrete built-in mappings can
-be added over time without changing the CLI surface.
-
-The built-in registry is currently empty.
-
-`SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY` is only an optional override for
-development and debugging. It accepts either a JSON object or a path to a JSON
-file, and can extend or replace built-in entries for the current process.
-
-Keep passing the original source model ID to `--model-path`.
+SGLang first checks a built-in overlay registry. Concrete built-in mappings can be added over time without changing the CLI surface.
 
 Override example:
 
@@ -33,12 +24,14 @@ sglang generate \
   --config configs/wan_s2v.yaml
 ```
 
-The overlay repo can be either:
-
-- a complete diffusers-style/componentized repo
-- a metadata-only repo with `_overlay/overlay_manifest.json`, in which case SGLang downloads the original source weights and materializes a local componentized cache automatically
+The overlay repo should be a complete diffusers-style/componentized repo
 
 You can also pass the overlay repo itself as `--model-path` if it contains `_overlay/overlay_manifest.json`.
+
+Notes:  
+1. `SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY` is only an optional override for
+development and debugging. It accepts either a JSON object or a path to a JSON
+file, and can extend or replace built-in entries for the current process.
 
 
 ## Quick Start

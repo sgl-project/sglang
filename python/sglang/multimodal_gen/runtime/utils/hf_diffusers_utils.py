@@ -507,6 +507,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
 
     overlay_target = resolve_model_overlay_target(model_name_or_path)
     if overlay_target is not None:
+        # resolve the repo from overlay metadata
         source_model_id, overlay_spec = overlay_target
         overlay_metadata_dir = download_overlay_metadata(
             source_model_id,
@@ -519,6 +520,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
         model_name_or_path, hf_hub_download_fn=hf_hub_download
     )
     if direct_overlay is not None:
+        # directly load from an overlay repo
         _, overlay_dir, _ = direct_overlay
         return load_model_index_from_dir(overlay_dir)
 
