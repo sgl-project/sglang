@@ -65,7 +65,7 @@ from sglang.multimodal_gen.test.server.accuracy_utils import (
     load_checkpoint_weights,
     materialize_module,
     read_json_file,
-    resolve_text_encoder_module,
+    resolve_text_encoder_forward_module,
     select_component_source,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
@@ -261,6 +261,7 @@ class AccuracyEngine:
             call.module(*call.args, **call.kwargs)
         finally:
             handle.remove()
+        assert output is not None
         return output
 
     @staticmethod
@@ -416,7 +417,7 @@ class AccuracyEngine:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if component == ComponentType.TEXT_ENCODER:
             raise ValueError("Text encoder path is not migrated to native hooks yet")
-        profile = resolve_component_native_profile(component.value)
+        profile = resolve_component_native_profile(component)
 
         inputs = profile.build_inputs(case, sgl_model, device, ref_model)
         sgl_call = profile.prepare_sglang_call(sgl_model, inputs)
@@ -501,13 +502,12 @@ class AccuracyEngine:
                 current_timestep=0, attn_metadata=None
             )
 
-        ref_for_transfer = (
-            resolve_text_encoder_module(
-                ref_component, preserve_shared_for_transfer=True
-            )
-            if component == ComponentType.TEXT_ENCODER
-            else ref_component
-        )
+        ref_for_transfer = ref_component
+        if (
+            component == ComponentType.TEXT_ENCODER
+            and getattr(ref_component, "shared", None) is None
+        ):
+            ref_for_transfer = resolve_text_encoder_forward_module(ref_component)
         AccuracyEngine.transfer_weights(
             ref_for_transfer,
             sgl_component,

@@ -11,6 +11,7 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
     DEFAULT_TIMESTEP,
     I2V_IMAGE_DIM,
     TIMESTEP_NORMALIZATION_FACTOR,
+    ComponentType,
 )
 from sglang.multimodal_gen.test.server.accuracy_utils import (
     extract_output_tensor,
@@ -566,9 +567,9 @@ VAE_NATIVE_PROFILE = NativeHookProfile(
 )
 
 
-def resolve_component_native_profile(component_name: str) -> NativeHookProfile:
-    if component_name == "transformer":
+def resolve_component_native_profile(component: ComponentType) -> NativeHookProfile:
+    if component == ComponentType.TRANSFORMER:
         return TRANSFORMER_NATIVE_PROFILE
-    if component_name == "vae":
+    if component == ComponentType.VAE:
         return VAE_NATIVE_PROFILE
-    raise KeyError(f"Unsupported native accuracy component: {component_name}")
+    raise KeyError(f"Unsupported native accuracy component: {component.value}")
