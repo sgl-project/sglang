@@ -361,9 +361,8 @@ def _build_transformer_hook_inputs(
 
 def _get_transformer_hook_compat(inputs: Inputs) -> TransformerHookCompat:
     compat = inputs.get("hook_compat")
-    if isinstance(compat, TransformerHookCompat):
-        return compat
-    return TransformerHookCompat()
+    assert isinstance(compat, TransformerHookCompat)
+    return compat
 
 
 def _supports_guidance_embedding(module: nn.Module) -> bool:

@@ -77,14 +77,12 @@ MIN_MATCH_RATIO = float(os.getenv("SGLANG_DIFFUSION_WEIGHT_MATCH_RATIO", "0.98")
 
 @dataclass(frozen=True)
 class ComponentSpec:
-    component: ComponentType
     model_index_keys: Tuple[str, ...]
     reference_library: str
 
 
 COMPONENT_SPECS: Dict[ComponentType, ComponentSpec] = {
     ComponentType.VAE: ComponentSpec(
-        component=ComponentType.VAE,
         model_index_keys=(
             "vae",
             "vae_model",
@@ -96,12 +94,10 @@ COMPONENT_SPECS: Dict[ComponentType, ComponentSpec] = {
         reference_library="diffusers",
     ),
     ComponentType.TRANSFORMER: ComponentSpec(
-        component=ComponentType.TRANSFORMER,
         model_index_keys=("transformer", "unet", "dit", "video_dit", "audio_dit"),
         reference_library="diffusers",
     ),
     ComponentType.TEXT_ENCODER: ComponentSpec(
-        component=ComponentType.TEXT_ENCODER,
         model_index_keys=(
             "text_encoder",
             "text_encoder_2",

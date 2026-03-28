@@ -21,7 +21,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.accuracy_config import (
     DEFAULT_TEXT_ENCODER_VOCAB_SIZE,
     I2V_TEXT_ENCODER_DIM,
@@ -32,8 +31,6 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
     ComponentType,
     get_threshold,
 )
-
-logger = init_logger(__name__)
 
 STAGED_1GPU_NATIVE_CASE_IDS = {
     "flux_2_image_t2i",
@@ -98,31 +95,6 @@ def seed_and_broadcast(seed: int, tensor: torch.Tensor) -> torch.Tensor:
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
         torch.distributed.broadcast(tensor, src=0)
     return tensor
-
-
-def log_tensor_stats(name: str, tensor: torch.Tensor) -> None:
-    if tensor is None:
-        return
-    if os.environ.get("SGLANG_DIFFUSION_ACC_DEBUG", "0") != "1":
-        return
-    t = tensor.detach().float().cpu()
-    logger.info(
-        "[%s] stats: shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
-        name,
-        list(t.shape),
-        t.mean().item(),
-        t.std().item(),
-        t.min().item(),
-        t.max().item(),
-    )
-
-
-def log_inputs(prefix: str, inputs: Dict[str, Any]) -> None:
-    if os.environ.get("SGLANG_DIFFUSION_ACC_DEBUG", "0") != "1":
-        return
-    for k, v in inputs.items():
-        if isinstance(v, torch.Tensor):
-            log_tensor_stats(f"{prefix}.{k}", v)
 
 
 def read_json_file(path: str) -> Dict[str, Any]:
@@ -254,30 +226,6 @@ def load_checkpoint_weights(
     return missing_keys, unexpected_keys
 
 
-def _component_override_keys(
-    component: ComponentType, model_index_keys: Tuple[str, ...]
-) -> Tuple[str, ...]:
-    keys = [component.value]
-    for key in model_index_keys:
-        if key not in keys:
-            keys.append(key)
-    return tuple(keys)
-
-
-def _component_search_keys(
-    component: ComponentType,
-    model_index_keys: Tuple[str, ...],
-    preferred_key: Optional[str] = None,
-) -> Tuple[str, ...]:
-    keys: List[str] = []
-    if preferred_key:
-        keys.append(preferred_key)
-    for key in _component_override_keys(component, model_index_keys):
-        if key not in keys:
-            keys.append(key)
-    return tuple(keys)
-
-
 def select_component_source(
     model_id: str,
     extra_args: List[str],
@@ -286,20 +234,28 @@ def select_component_source(
 ) -> ComponentSelection:
     component_paths = extract_component_path_overrides(extra_args)
     base_model_root = resolve_local_path(model_id)
+    search_keys = [component.value]
+    for key in model_index_keys:
+        if key not in search_keys:
+            search_keys.append(key)
 
     source_root = base_model_root
     component_key = component.value
-    for key in _component_override_keys(component, model_index_keys):
+    for key in search_keys:
         override_path = component_paths.get(key)
         if override_path:
             source_root = resolve_local_path(override_path)
             component_key = key
             break
 
+    ordered_keys = [component_key]
+    for key in search_keys:
+        if key not in ordered_keys:
+            ordered_keys.append(key)
     source_path, source_subfolder = resolve_component_path(
         source_root,
         component,
-        _component_search_keys(component, model_index_keys, component_key),
+        tuple(ordered_keys),
     )
     return ComponentSelection(
         base_model_id=model_id,
@@ -710,28 +666,15 @@ def extract_output_tensor(output: Any) -> torch.Tensor:
 
 
 def run_text_encoder_accuracy_pair(
-    sgl: nn.Module, ref: nn.Module, device: str
+    sgl: nn.Module, ref: nn.Module
 ) -> tuple[torch.Tensor, torch.Tensor]:
     input_ids, attention_mask = build_deterministic_text_encoder_inputs(
         ref.config, "cpu"
     )
-
-    with torch.no_grad():
-        sgl_model = resolve_text_encoder_forward_module(sgl)
-        ref_model = resolve_text_encoder_forward_module(ref)
-        sgl_device = _module_device(sgl_model)
-        ref_device = _module_device(ref_model)
-        sgl_out = sgl_model(
-            input_ids.to(device=sgl_device),
-            attention_mask=attention_mask.to(device=sgl_device),
-            output_hidden_states=True,
-        )
-        ref_out = ref_model(
-            input_ids.to(device=ref_device),
-            attention_mask=attention_mask.to(device=ref_device),
-            output_hidden_states=True,
-        )
-    return extract_output_tensor(sgl_out), extract_output_tensor(ref_out)
+    return (
+        _run_single_text_encoder_forward(sgl, input_ids, attention_mask),
+        _run_single_text_encoder_forward(ref, input_ids, attention_mask),
+    )
 
 
 def _should_stage_1gpu_case(case: Any, component: ComponentType, num_gpus: int) -> bool:
@@ -912,10 +855,10 @@ def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_gpus: int) ->
     sgl = None
     ref = None
     try:
-        sgl, ref, device = engine_cls.load_component_pair(
+        sgl, ref, _device = engine_cls.load_component_pair(
             case, ComponentType.TEXT_ENCODER, "transformers", num_gpus
         )
-        sgl_out, ref_out = run_text_encoder_accuracy_pair(sgl, ref, device)
+        sgl_out, ref_out = run_text_encoder_accuracy_pair(sgl, ref)
         engine_cls.check_accuracy(
             sgl_out,
             ref_out,
