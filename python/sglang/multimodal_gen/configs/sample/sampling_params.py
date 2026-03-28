@@ -29,11 +29,16 @@ def _json_safe(obj: Any):
     """
     Recursively convert objects to JSON-serializable forms.
     - Enums -> their name
+    - Callables -> stable module-qualified name
     - Sets/Tuples -> lists
     - Dicts/Lists -> recursively processed
     """
     if isinstance(obj, Enum):
         return obj.name
+    if callable(obj):
+        module = getattr(obj, "__module__", None)
+        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
+        return f"{module}.{qualname}" if module else qualname
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
@@ -649,7 +654,7 @@ class SamplingParams:
         add_argument(
             "--prompt-path",
             type=str,
-            help="Path to a text file containing the prompt",
+            help="Path to a text file containing prompts (one per line)",
         )
         add_argument(
             "--output-file-name",
@@ -743,6 +748,12 @@ class SamplingParams:
             type=float,
             dest="guidance_scale_2",
             help="Secondary guidance scale for dual-guidance models (e.g., Wan low-noise expert)",
+        )
+        add_argument(
+            "--true-cfg-scale",
+            type=float,
+            dest="true_cfg_scale",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
         )
         add_argument(
             "--guidance-rescale",

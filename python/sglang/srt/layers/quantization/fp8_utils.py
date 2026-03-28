@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -92,14 +91,16 @@ if _use_aiter:
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
-    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
+    from sglang.srt.utils.patch_torch import register_fake_if_exists
+
+    @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
     def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    @torch.library.register_fake("sgl_kernel::fp8_blockwise_scaled_mm")
+    @register_fake_if_exists("sgl_kernel::fp8_blockwise_scaled_mm")
     def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
@@ -451,25 +452,6 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     global FP8_GEMM_RUNNER_BACKEND
 
     backend = server_args.fp8_gemm_runner_backend
-
-    # TODO(brayden): Remove env-based overrides in v0.5.7, they will be fully removed in v0.5.7.
-    # Only check environment variables when the server args is not set, server args should take priority.
-    if backend == "auto":
-        if envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get():
-            backend = "flashinfer_trtllm"
-        elif envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get():
-            backend = "cutlass"
-    else:
-        if (
-            envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
-            or envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get()
-        ):
-            logger.warning(
-                f"FP8 GEMM backend set to '{backend}' via --fp8-gemm-backend overrides "
-                "environment variables SGLANG_ENABLE_FLASHINFER_FP8_GEMM and "
-                "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8. Using server argument value."
-            )
-
     if backend == "auto" and is_sm120_supported():
         # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
         backend = "triton"

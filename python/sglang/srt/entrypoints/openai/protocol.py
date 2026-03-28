@@ -589,7 +589,7 @@ class ChatCompletionRequest(BaseModel):
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
-        default="medium",
+        default=None,
         description="Constrains effort on reasoning for reasoning models. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "

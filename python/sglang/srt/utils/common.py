@@ -85,7 +85,6 @@ from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
-from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
@@ -121,7 +120,7 @@ builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 # this makes it impossible to see the animation in the progress bar
 # but will avoid messing up with ray or multiprocessing, which wraps
 # each line of output with some prefix.
-BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
+BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
 
 
 @lru_cache(maxsize=1)
@@ -359,17 +358,6 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
     try:
         return int(value)
-    except ValueError:
-        return default
-
-
-def get_float_env_var(name: str, default: float = 0.0) -> float:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return float(value)
     except ValueError:
         return default
 
@@ -700,85 +688,6 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def decode_video_base64(video_base64):
-    from PIL import Image
-
-    # Decode the base64 string
-    video_bytes = pybase64.b64decode(video_base64, validate=True)
-
-    # Placeholder for the start indices of each PNG image
-    img_starts = []
-
-    frame_format = "PNG"  # str(os.getenv('FRAME_FORMAT', "JPEG"))
-
-    assert frame_format in [
-        "PNG",
-        "JPEG",
-    ], "FRAME_FORMAT must be either 'PNG' or 'JPEG'"
-
-    if frame_format == "PNG":
-        # Find each PNG start signature to isolate images
-        i = 0
-        while i < len(video_bytes) - 7:  # Adjusted for the length of the PNG signature
-            # Check if we found the start of a PNG file
-            if (
-                video_bytes[i] == 0x89
-                and video_bytes[i + 1] == 0x50
-                and video_bytes[i + 2] == 0x4E
-                and video_bytes[i + 3] == 0x47
-                and video_bytes[i + 4] == 0x0D
-                and video_bytes[i + 5] == 0x0A
-                and video_bytes[i + 6] == 0x1A
-                and video_bytes[i + 7] == 0x0A
-            ):
-                img_starts.append(i)
-                i += 8  # Skip the PNG signature
-            else:
-                i += 1
-    else:
-        # Find each JPEG start (0xFFD8) to isolate images
-        i = 0
-        while (
-            i < len(video_bytes) - 1
-        ):  # Adjusted for the length of the JPEG SOI signature
-            # Check if we found the start of a JPEG file
-            if video_bytes[i] == 0xFF and video_bytes[i + 1] == 0xD8:
-                img_starts.append(i)
-                # Move to the next byte to continue searching for the next image start
-                i += 2
-            else:
-                i += 1
-
-    frames = []
-    for start_idx in img_starts:
-        # Assuming each image is back-to-back, the end of one image is the start of another
-        # The last image goes until the end of the byte string
-        end_idx = (
-            img_starts[img_starts.index(start_idx) + 1]
-            if img_starts.index(start_idx) + 1 < len(img_starts)
-            else len(video_bytes)
-        )
-        img_bytes = video_bytes[start_idx:end_idx]
-
-        # Convert bytes to a PIL Image
-        img = Image.open(BytesIO(img_bytes))
-
-        # Convert PIL Image to a NumPy array
-        frame = np.array(img)
-
-        # Append the frame to the list of frames
-        frames.append(frame)
-
-    # Ensure there's at least one frame to avoid errors with np.stack
-    if frames:
-        return np.stack(frames, axis=0), img.size
-    else:
-        return np.array([]), (
-            0,
-            0,
-        )  # Return an empty array and size tuple if no frames were found
-
-
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
@@ -1022,6 +931,11 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
+    # Suppress noisy third-party HTTP loggers.
+    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 def suppress_other_loggers():
     suppress_noisy_warnings()
@@ -1181,6 +1095,12 @@ def configure_logger(server_args, prefix: str = ""):
         force=True,
     )
 
+    # Suppress noisy httpx/httpcore loggers in every process that calls
+    # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
+    # don't inherit the parent's logger state, so this must run here too.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
 def replace_submodule(
@@ -1330,70 +1250,6 @@ def point_to_point_pyobj(
     return []
 
 
-step_counter = 0
-
-
-def pytorch_profile(name, func, *args, data_size=-1):
-    """
-    Args:
-        name (string): the name of recorded function.
-        func: the function to be profiled.
-        args: the arguments of the profiled function.
-        data_size (int): some measurement of the computation complexity.
-            Usually, it could be the batch size.
-    """
-    global step_counter
-    os.makedirs("trace", exist_ok=True)
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-    ) as prof:
-        with record_function(name):
-            with open(f"trace/size_{step_counter}.json", "w") as f:
-                json.dump({"size": data_size}, f)
-            result = func(*args)
-    prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
-    step_counter += 1
-    return result
-
-
-def dump_to_file(dirpath, name, value):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() != 0:
-        return
-
-    os.makedirs(dirpath, exist_ok=True)
-    if value.dtype is torch.bfloat16:
-        value = value.float()
-    value = value.cpu().numpy()
-    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
-    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
-    np.save(output_filename, value)
-
-
-def is_triton_3():
-    return triton.__version__.startswith("3.")
-
-
-def maybe_torch_compile(*args, **kwargs):
-    """
-    torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
-    Therefore, we disable it here.
-    """
-
-    def decorator(func):
-        if is_triton_3():
-            return torch.compile(*args, **kwargs)(func)
-        return func
-
-    return decorator
-
-
 def delete_directory(dirpath):
     try:
         # This will remove the directory and all its contents
@@ -1487,6 +1343,12 @@ def add_prometheus_track_response_middleware(app):
             multiprocess_mode="livesum",
         )
     )
+
+    # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
+    # that passes `receive` through, so request.is_disconnected() keeps working.
+    from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
+
+    patch_app_http_middleware(app)
 
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
@@ -2037,8 +1899,11 @@ def direct_register_custom_op(
     mutates_args: List[str],
     fake_impl: Optional[Callable] = None,
     target_lib: Optional[Library] = None,
-):
+) -> None:
     """
+    NOTE: Please try to use `register_custom_op` instead of this function.
+    See `python/sglang/srt/utils/custom_op.py` for details.
+
     `torch.library.custom_op` can have significant overhead because it
     needs to consider complicated dispatching logic. This function
     directly registers a custom op and dispatches it to the CUDA backend.
@@ -2277,6 +2142,11 @@ class SafeUnpickler(pickle.Unpickler):
             f"Blocked unsafe class loading ({module}.{name}), "
             f"to prevent exploitation of CVE-2025-10164"
         )
+
+
+def safe_pickle_load(fp):
+    """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
+    return SafeUnpickler(fp).load()
 
 
 def debug_timing(func):
@@ -2680,8 +2550,18 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
+    # Check if the model_path is a local path
     if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
         return True
+
+    from huggingface_hub import try_to_load_from_cache
+
+    # Check if the model_path is a HuggingFace model ID and exists locally
+    result = try_to_load_from_cache(model_path, "hf_quant_config.json")
+    if isinstance(result, str):
+        return True
+
+    # Check if the model_path is a remote URL and exists on the HuggingFace Hub
     try:
         from huggingface_hub import HfApi
 
@@ -3528,30 +3408,6 @@ def get_device_sm_nvidia_smi():
         return (0, 0)  # Default/fallback value
 
 
-def get_libnuma():
-    libnuma = None
-
-    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
-        try:
-            libnuma = ctypes.CDLL(libnuma_so)
-        except OSError as e:
-            logger.error(f"{e}")
-            libnuma = None
-        if libnuma is not None:
-            break
-    return libnuma
-
-
-def numa_bind_to_node(node: int):
-    libnuma = get_libnuma()
-
-    if libnuma is None or libnuma.numa_available() < 0:
-        logger.error("numa not available on this system, skip bind action")
-    else:
-        libnuma.numa_run_on_node(ctypes.c_int(node))
-        libnuma.numa_set_preferred(ctypes.c_int(node))
-
-
 def json_list_type(value):
     try:
         return orjson.loads(value)
@@ -3849,140 +3705,3 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
-
-
-def get_numa_node_count() -> int:
-    """
-    Get the number of NUMA nodes available on the system.
-    Must be called after is_numa_available() is True.
-    Returns:
-        int: The number of NUMA nodes.
-    """
-    libnuma = get_libnuma()
-    return libnuma.numa_max_node() + 1
-
-
-def is_numa_available() -> bool:
-    try:
-        libnuma = get_libnuma()
-        return libnuma.numa_available() >= 0
-    except Exception:
-        return False
-
-
-def get_system_nvgpu_count() -> int:
-    """
-    Get the total number of GPUs in the system (not affected by CUDA_VISIBLE_DEVICES).
-
-    Returns:
-        int: The total number of physical GPUs.
-    """
-    result = subprocess.run(
-        ["nvidia-smi", "--list-gpus"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    gpu_lines = [
-        line
-        for line in result.stdout.strip().split("\n")
-        if line.strip().startswith("GPU")
-    ]
-    return len(gpu_lines)
-
-
-@lru_cache(maxsize=1)
-def get_device_numa_node_cuda(gpu_id: int = 0) -> int:
-    """
-    Retrieve the NUMA node ID of the CPU socket closest to the gpu_id.
-
-    First tries to query nvidia-smi topology. If it returns a single NUMA ID, uses that directly.
-    If it returns multiple NUMA IDs (comma/dash separated), falls back to distributing GPUs
-    evenly across NUMA nodes based on GPU ID intervals.
-
-    For example, with 8 GPUs and 2 NUMA nodes: GPUs 0-3 -> node 0, GPUs 4-7 -> node 1.
-
-    Returns:
-        int: The NUMA node ID (e.g., 0, 1).
-
-    Raises:
-        RuntimeError: If device information cannot be retrieved.
-    """
-
-    physical_device_id = get_physical_device_id(gpu_id)
-
-    # Query NUMA topology from nvidia-smi
-    result = subprocess.run(
-        ["nvidia-smi", "topo", "-C", "-i", str(physical_device_id)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    output_line = result.stdout.strip()
-    prefix = "NUMA IDs of closest CPU:"
-
-    if output_line.startswith(prefix):
-        numa_id_str = output_line[len(prefix) :].strip()
-        if numa_id_str.isdigit():
-            return int(numa_id_str)
-
-    # Fall back: distribute GPUs evenly across NUMA nodes
-    numa_count = get_numa_node_count()
-    gpu_count = get_system_nvgpu_count()
-
-    if gpu_count >= numa_count:
-        gpus_per_numa = gpu_count // numa_count  # >= 1
-        numa_node = physical_device_id // gpus_per_numa  # 0 ~ numa_count - 1
-    else:
-        logger.warning(
-            f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node."
-        )
-        numa_node = 0
-
-    return numa_node
-
-
-def get_numa_node(gpu_id):
-    numa_node = None
-    try:
-        device = get_device()
-        if device == "cuda":
-            numa_node = get_device_numa_node_cuda(gpu_id)
-        else:
-            logger.info(f"Now only supports NVIDIA devices")
-    except Exception as e:
-        logger.error(f"Error: {e}")
-
-    return numa_node
-
-
-@lru_cache(maxsize=1)
-def get_current_device_numa_node_cuda() -> int:
-    """
-    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
-    """
-
-    logical_device_id = torch.cuda.current_device()
-    numa_node = get_device_numa_node_cuda(logical_device_id)
-
-    return numa_node
-
-
-def nvgpu_available() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    if torch.version.cuda is None:
-        return False
-    return True
-
-
-def bind_to_closest_numa_node_cuda():
-    """
-    Bind the current process to the NUMA node closest to the active CUDA device.
-
-    Uses `numa` library calls via ctypes to set the CPU affinity of the process.
-    """
-    if is_numa_available() and nvgpu_available():
-        node_id = get_current_device_numa_node_cuda()
-        numa_bind_to_node(node_id)

@@ -2,7 +2,7 @@ name: Nightly Test (AMD)
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '30 17 * * *'
   push:
     branches:
       - main
@@ -32,6 +32,7 @@ on:
           - nightly-accuracy-2-gpu-vlm
           - nightly-perf-2-gpu-text
           - nightly-perf-2-gpu-vlm
+          - nightly-4-gpu
           - nightly-accuracy-8-gpu
           - nightly-8-gpu-grok1-int4
           - nightly-8-gpu-grok2
@@ -249,6 +250,37 @@ jobs:
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-perf-vlm-2-gpu --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ============================================== MI30x 4-GPU Tests ==============================================
+  # 4-GPU Nightly Tests - Dumper/Comparator E2E, VLM Encoder DP
+  nightly-4-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu,'))
+    runs-on: linux-mi325-4gpu-sglang
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Setup docker
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Nightly Test (4-GPU)
+        timeout-minutes: 120
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-4-gpu --nightly --continue-on-error --timeout-per-file 3600 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1320,6 +1352,8 @@ jobs:
       # MI30x Accuracy Tests
       - nightly-accuracy-2-gpu
       - nightly-accuracy-2-gpu-vlm
+      # MI30x 4-GPU Tests
+      - nightly-4-gpu
       - nightly-accuracy-8-gpu
       # MI30x Performance Tests - excluded from check (perf failures don't block CI)
       # - nightly-perf-2-gpu-text

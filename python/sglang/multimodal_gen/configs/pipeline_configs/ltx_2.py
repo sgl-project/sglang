@@ -14,7 +14,6 @@ from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfi
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
-    preprocess_text,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
@@ -189,8 +188,8 @@ class LTX2PipelineConfig(PipelineConfig):
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     text_encoder_extra_args: list[dict] = field(default_factory=lambda: [{}])
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,)
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,)
     )
     postprocess_text_funcs: tuple[
         Callable[[BaseEncoderOutput, dict], torch.Tensor], ...
@@ -350,13 +349,13 @@ class LTX2PipelineConfig(PipelineConfig):
 
         return latents, True
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         """Gather latents after SP. For packed token latents [B, S_local, D], gather on dim=1."""
         if get_sp_world_size() <= 1:
             return latents
         if isinstance(latents, torch.Tensor) and latents.ndim == 3:
             return sequence_model_parallel_all_gather(latents.contiguous(), dim=1)
-        return super().gather_latents_for_sp(latents)
+        return super().gather_latents_for_sp(latents, batch=batch)
 
     def maybe_pack_audio_latents(self, latents, batch_size, batch):
         # If already packed (3D shape [B, T, C*F]), skip packing

@@ -15,6 +15,7 @@
 import json
 import multiprocessing as mp
 import os
+import queue as queue_mod
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
@@ -25,7 +26,7 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
-    AutoModelForVision2Seq,
+    AutoModelForImageTextToText,
     AutoProcessor,
     GenerationConfig,
 )
@@ -104,16 +105,35 @@ def _get_sentence_transformer_embedding_model(
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
 
+    from sglang.srt.utils.hf_transformers_utils import _fix_v5_add_bos_eos_token
+
     if is_sentence_transformer_model(model_path):
         model = SentenceTransformer(
             model_path,
             model_kwargs={"torch_dtype": torch_dtype},
+            # Force causal attention to match SGLang's RadixAttention behavior.
+            # In transformers v5, models with config.is_causal=false use
+            # bidirectional attention, but SGLang always uses causal attention.
+            config_kwargs={"is_causal": True},
             truncate_dim=matryoshka_dim,
         )
+        # Apply the same tokenizer fix as SGLang's get_tokenizer() so that
+        # BOS/EOS behavior matches between the HF reference and SRT.
+        _fix_v5_add_bos_eos_token(model.tokenizer, model_path)
     else:  # if no pre-trained sentence-transformers model
         from sentence_transformers import models
 
         word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        # In transformers v5, composite configs (e.g. Qwen2VLConfig) may not
+        # expose hidden_size at the top level.  Patch it from the text sub-config
+        # so sentence_transformers' get_word_embedding_dimension() works.
+        _cfg = word_embedding_model.auto_model.config
+        if not hasattr(_cfg, "hidden_size"):
+            for _sub_attr in ("text_config", "language_config", "llm_config"):
+                _sub = getattr(_cfg, _sub_attr, None)
+                if _sub and hasattr(_sub, "hidden_size"):
+                    _cfg.hidden_size = _sub.hidden_size
+                    break
         pooling_model = models.Pooling(
             word_embedding_model.get_word_embedding_dimension(),
             pooling_mode="lasttoken",
@@ -274,7 +294,7 @@ class HFRunner:
             ).to(get_device())
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
-                self.model = AutoModelForVision2Seq.from_pretrained(
+                self.model = AutoModelForImageTextToText.from_pretrained(
                     model_path,
                     torch_dtype=torch_dtype,
                     trust_remote_code=False,
@@ -338,20 +358,18 @@ class HFRunner:
                                 images=image[0], return_tensors="pt"
                             )
                             logits = self.model.get_image_features(
-                                pixel_values=inputs.data["pixel_values"].to(
-                                    get_device()
-                                ),
-                            ).tolist()
+                                pixel_values=inputs.data["pixel_values"].cuda(),
+                                return_dict=True,
+                            ).pooler_output.tolist()
                         else:
                             inputs = self.tokenizer(
                                 prompts, padding=True, return_tensors="pt"
                             )
                             logits = self.model.get_text_features(
-                                input_ids=inputs.data["input_ids"].to(get_device()),
-                                attention_mask=inputs.data["attention_mask"].to(
-                                    get_device()
-                                ),
-                            ).tolist()
+                                input_ids=inputs.data["input_ids"].cuda(),
+                                attention_mask=inputs.data["attention_mask"].cuda(),
+                                return_dict=True,
+                            ).pooler_output.tolist()
                     else:
                         logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
@@ -394,7 +412,16 @@ class HFRunner:
         self.in_queue.put(
             (prompts, image_data, max_new_tokens, lora_paths, token_ids_logprob)
         )
-        return self.out_queue.get()
+        while True:
+            try:
+                return self.out_queue.get(timeout=5)
+            except queue_mod.Empty:
+                if not self.model_proc.is_alive() and self.out_queue.empty():
+                    exitcode = self.model_proc.exitcode
+                    raise RuntimeError(
+                        f"HFRunner subprocess died with exit code {exitcode} "
+                        f"before producing output"
+                    )
 
     def terminate(self):
         self.model_proc.terminate()

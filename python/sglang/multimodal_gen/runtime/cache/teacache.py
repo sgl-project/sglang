@@ -297,7 +297,7 @@ class TeaCacheMixin:
             do_cfg=do_cfg,
             is_cfg_negative=is_cfg_negative,
             teacache_thresh=teacache_params.teacache_thresh,
-            coefficients=teacache_params.coefficients,
+            coefficients=teacache_params.get_coefficients(),
             teacache_params=teacache_params,
         )
 

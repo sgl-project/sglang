@@ -8,7 +8,7 @@ inputs:
   jobs:
     description: |
       JSON array of job specs to wait for. Each element is either:
-        - a string: exact job name (e.g. "stage-a-test-1")
+        - a string: exact job name (e.g. "stage-a-test-1-gpu-small")
         - an object { "prefix": "...", "expected_count": N }: for matrix jobs
     required: true
   max-wait-minutes:
@@ -18,7 +18,7 @@ inputs:
   poll-interval-seconds:
     description: 'Seconds between polling attempts'
     required: false
-    default: '120'
+    default: '60'
   github-token:
     description: 'GitHub token for API calls'
     required: false
@@ -59,7 +59,6 @@ runs:
 
           const totalExpectedJobs = normalizedSpecs.reduce((sum, s) => sum + s.expected_count, 0);
 
-          // Match job name: exact match or prefix + " (" for matrix jobs
           const matchesSpec = (jobName, spec) => {
             if (spec.exact) {
               return jobName === spec.prefix;
@@ -67,13 +66,64 @@ runs:
             return jobName === spec.prefix || jobName.startsWith(spec.prefix + ' (');
           };
 
-          for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+          // Use ETag conditional requests to avoid consuming rate limit when nothing changed.
+          // GitHub returns 304 Not Modified for unchanged data, which is FREE (no rate limit cost).
+          let lastEtag = '';
+          let lastJobs = null;
+          let apiCalls = 0;
+          let cachedCalls = 0;
+
+          async function fetchJobs() {
+            const url = `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`;
+            const params = {
               owner: context.repo.owner,
               repo: context.repo.repo,
               run_id: context.runId,
               per_page: 100,
-            });
+              headers: {},
+            };
+            if (lastEtag) {
+              params.headers['if-none-match'] = lastEtag;
+            }
+
+            try {
+              const response = await github.request(url, params);
+              apiCalls++;
+              const rateRemaining = response.headers['x-ratelimit-remaining'] || '?';
+              const rateLimit = response.headers['x-ratelimit-limit'] || '?';
+              console.log(`[rate-limit] ${rateRemaining}/${rateLimit} remaining (ETag: ${lastEtag ? 'sent' : 'none'}) | this session: ${apiCalls} paid, ${cachedCalls} free`);
+              lastEtag = response.headers.etag || '';
+              const jobs = response.data.jobs;
+
+              // Handle pagination if >100 jobs
+              // ETag only covers page 1, so invalidate it to avoid stale cache
+              // when later pages change but page 1 doesn't.
+              if (response.data.total_count > 100) {
+                lastEtag = '';
+                for (let page = 2; page <= Math.ceil(response.data.total_count / 100); page++) {
+                  const { data: pageData } = await github.request(url, {
+                    ...params,
+                    page,
+                    headers: {},
+                  });
+                  jobs.push(...pageData.jobs);
+                }
+              }
+
+              lastJobs = jobs;
+              return { jobs, cached: false };
+            } catch (err) {
+              if (err.status === 304 && lastJobs) {
+                cachedCalls++;
+                console.log(`[rate-limit] 304 Not Modified | this session: ${apiCalls} paid, ${cachedCalls} free`);
+                return { jobs: lastJobs, cached: true };
+              }
+              throw err;
+            }
+          }
+
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const { jobs, cached } = await fetchJobs();
 
             let allCompleted = true;
             let failedJobs = [];
@@ -85,7 +135,9 @@ runs:
 
               for (const job of matchingJobs) {
                 totalCount++;
-                console.log(`${job.name}: status=${job.status}, conclusion=${job.conclusion}`);
+                if (!cached) {
+                  console.log(`${job.name}: status=${job.status}, conclusion=${job.conclusion}`);
+                }
 
                 if (job.status === 'completed') {
                   completedCount++;
@@ -103,7 +155,7 @@ runs:
               }
             }
 
-            console.log(`[${stageName}] Progress: ${completedCount}/${totalCount} jobs completed (expected ${totalExpectedJobs})`);
+            console.log(`[${stageName}] Progress: ${completedCount}/${totalCount} jobs completed (expected ${totalExpectedJobs})${cached ? ' (cached, no rate limit cost)' : ''}`);
 
             // Fail fast if any jobs failed
             if (failedJobs.length > 0) {
