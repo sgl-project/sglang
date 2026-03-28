@@ -22,7 +22,7 @@ class TestMambaCache(CustomTestCase):
     [Test Target] kv cache reuse
     """
 
-    model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST
+    model = QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST.model_path
 
     @classmethod
     def setUpClass(cls):
