@@ -344,6 +344,10 @@ async def lifespan(fast_api_app: FastAPI):
             "openai_serving_embedding",
             "openai_serving_score",
             "openai_serving_rerank",
+            "openai_serving_classify",
+            "openai_serving_tokenize",
+            "openai_serving_detokenize",
+            "openai_serving_transcription",
         ]:
             _handler = getattr(fast_api_app.state, _attr, None)
             if _handler is not None:
