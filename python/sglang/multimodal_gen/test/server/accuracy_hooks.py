@@ -74,31 +74,13 @@ class HookCall:
     negate_output: bool = False
 
 
-def _normalize_default_output(output: Any) -> torch.Tensor:
-    if isinstance(output, torch.Tensor):
-        return output
-    if getattr(output, "sample", None) is not None:
-        sample = output.sample
-        if isinstance(sample, (list, tuple)):
-            sample = sample[0]
-        if isinstance(sample, torch.Tensor):
-            return sample
-    if (
-        isinstance(output, (list, tuple))
-        and output
-        and isinstance(output[0], torch.Tensor)
-    ):
-        return output[0]
-    return extract_output_tensor(output)
-
-
 @dataclass(frozen=True)
 class NativeHookProfile:
     build_inputs: BuildInputsFn
     prepare_sglang_call: PrepareCallFn
     prepare_reference_call: PrepareCallFn
-    normalize_sglang_output: NormalizeFn = _normalize_default_output
-    normalize_reference_output: NormalizeFn = _normalize_default_output
+    normalize_sglang_output: NormalizeFn = extract_output_tensor
+    normalize_reference_output: NormalizeFn = extract_output_tensor
 
 
 class _DeterministicRNG:
