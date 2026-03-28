@@ -502,3 +502,132 @@ def materialize_overlay_model(
         os.replace(tmp_dir, final_dir)
 
     return final_dir
+
+
+def maybe_load_overlay_model_index(
+    model_name_or_path: str,
+    *,
+    snapshot_download_fn: Callable[..., str],
+    hf_hub_download_fn: Callable[..., str],
+) -> dict[str, Any] | None:
+    if os.path.exists(model_name_or_path):
+        if load_overlay_manifest_if_present(model_name_or_path) is not None:
+            return load_model_index_from_dir(model_name_or_path)
+        return None
+
+    overlay_target = resolve_model_overlay_target(model_name_or_path)
+    if overlay_target is not None:
+        source_model_id, overlay_spec = overlay_target
+        overlay_dir = download_overlay_metadata(
+            source_model_id,
+            overlay_spec,
+            snapshot_download_fn=snapshot_download_fn,
+        )
+        return load_model_index_from_dir(overlay_dir)
+
+    direct_overlay = resolve_direct_overlay_repo(
+        model_name_or_path, hf_hub_download_fn=hf_hub_download_fn
+    )
+    if direct_overlay is None:
+        return None
+
+    _, overlay_dir, _ = direct_overlay
+    return load_model_index_from_dir(overlay_dir)
+
+
+def maybe_resolve_overlay_model_path(
+    model_name_or_path: str,
+    *,
+    local_dir: str | None,
+    download: bool,
+    allow_patterns: list[str] | None,
+    snapshot_download_fn: Callable[..., str],
+    hf_hub_download_fn: Callable[..., str],
+    verify_diffusers_model_complete_fn: Callable[[str], bool],
+    base_model_download_fn: Callable[..., str],
+) -> str | None:
+    overlay_target = resolve_model_overlay_target(model_name_or_path)
+    if overlay_target is not None:
+        source_model_id, overlay_spec = overlay_target
+        overlay_dir = download_overlay_metadata(
+            source_model_id,
+            overlay_spec,
+            snapshot_download_fn=snapshot_download_fn,
+        )
+        manifest = load_overlay_manifest_if_present(overlay_dir)
+        if manifest is None:
+            return base_model_download_fn(
+                str(overlay_spec["overlay_repo_id"]),
+                local_dir=local_dir,
+                download=download,
+                allow_patterns=allow_patterns,
+                force_diffusers_model=True,
+                skip_overlay_resolution=True,
+            )
+        source_allow_patterns = cast(
+            list[str] | None, manifest.get("source_allow_patterns")
+        )
+        source_dir = (
+            model_name_or_path
+            if os.path.exists(model_name_or_path)
+            else base_model_download_fn(
+                source_model_id,
+                local_dir=local_dir,
+                download=download,
+                allow_patterns=source_allow_patterns or allow_patterns,
+                force_diffusers_model=False,
+                skip_overlay_resolution=True,
+            )
+        )
+        source_dir = ensure_overlay_source_dir_complete(
+            source_model_id=source_model_id,
+            source_dir=source_dir,
+            manifest=manifest,
+            local_dir=local_dir,
+            allow_patterns=allow_patterns,
+            download=download,
+            snapshot_download_fn=snapshot_download_fn,
+        )
+        return materialize_overlay_model(
+            source_model_id=source_model_id,
+            overlay_spec=overlay_spec,
+            overlay_dir=overlay_dir,
+            source_dir=source_dir,
+            verify_diffusers_model_complete_fn=verify_diffusers_model_complete_fn,
+        )
+
+    direct_overlay = resolve_direct_overlay_repo(
+        model_name_or_path, hf_hub_download_fn=hf_hub_download_fn
+    )
+    if direct_overlay is None:
+        return None
+
+    overlay_spec, overlay_dir, manifest = direct_overlay
+    source_model_id = str(manifest["source_model_id"])
+    source_allow_patterns = cast(
+        list[str] | None, manifest.get("source_allow_patterns")
+    )
+    source_dir = base_model_download_fn(
+        source_model_id,
+        local_dir=local_dir,
+        download=download,
+        allow_patterns=source_allow_patterns or allow_patterns,
+        force_diffusers_model=False,
+        skip_overlay_resolution=True,
+    )
+    source_dir = ensure_overlay_source_dir_complete(
+        source_model_id=source_model_id,
+        source_dir=source_dir,
+        manifest=manifest,
+        local_dir=local_dir,
+        allow_patterns=allow_patterns,
+        download=download,
+        snapshot_download_fn=snapshot_download_fn,
+    )
+    return materialize_overlay_model(
+        source_model_id=source_model_id,
+        overlay_spec=overlay_spec,
+        overlay_dir=overlay_dir,
+        source_dir=source_dir,
+        verify_diffusers_model_complete_fn=verify_diffusers_model_complete_fn,
+    )
