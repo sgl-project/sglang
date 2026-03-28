@@ -26,7 +26,7 @@ except ImportError:
 
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    cleanup_dist_env_and_memory,
+    destroy_model_parallel,
     get_local_torch_device,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -211,12 +211,19 @@ def _load_reference_component(
             "trust_remote_code": True,
             "config": config,
         }
-        class_order = [
-            AutoModel,
-            AutoModelForCausalLM,
-            UMT5EncoderModel,
-            T5EncoderModel,
-        ]
+        architectures = tuple(getattr(config, "architectures", ()) or ())
+        if (
+            "UMT5EncoderModel" in architectures
+            or getattr(config, "model_type", None) == "umt5"
+        ):
+            class_order = [UMT5EncoderModel, AutoModel, AutoModelForCausalLM]
+        else:
+            class_order = [
+                AutoModel,
+                AutoModelForCausalLM,
+                UMT5EncoderModel,
+                T5EncoderModel,
+            ]
         if AutoVisionTextModel is not None:
             class_order.append(AutoVisionTextModel)
         last_error: Optional[Exception] = None
@@ -236,7 +243,10 @@ def _load_reference_component(
 class AccuracyEngine:
     @staticmethod
     def reset_parallel_runtime() -> None:
-        cleanup_dist_env_and_memory()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        if model_parallel_is_initialized():
+            destroy_model_parallel()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()

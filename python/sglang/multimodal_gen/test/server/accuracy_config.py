@@ -73,10 +73,156 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "HF reference transformer cannot be materialized from the video_dit repo layout"
         )
     },
+    "qwen_image_t2i_cache_dit_enabled": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by qwen_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by qwen_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by qwen_image_t2i for the same source component and topology"
+        ),
+    },
+    "flux_2_image_t2i_upscaling_4x": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+    },
+    "layerwise_offload": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+    },
+    "zimage_image_t2i_fp8": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+    },
+    "zimage_image_t2i_multi_lora": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+    },
+    "flux_2_ti2i": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+    },
     "flux_2_t2i_customized_vae_path": {
         ComponentType.VAE: ComponentSkip(
             "Customized VAE override points to FLUX.2 Tiny AutoEncoder, but the HF reference loader does not yet materialize a trustworthy matching VAE baseline"
-        )
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+    },
+    "wan2_1_t2v_1.3b_text_encoder_cpu_offload": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+    },
+    "wan2_1_t2v_1.3b_teacache_enabled": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+    },
+    "wan2_1_t2v_1.3b_frame_interp_2x": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+    },
+    "wan2_1_t2v_1.3b_upscaling_4x": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+    },
+    "wan2_1_t2v_1.3b_frame_interp_2x_upscaling_4x": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+    },
+    "wan2_1_t2v_1_3b_lora_1gpu": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
+        ),
+    },
+    "flux_2_ti2i_multi_image_cache_dit": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by flux_2_image_t2i for the same source component and topology"
+        ),
     },
     "wan2_2_ti2v_5b": {
         ComponentType.TRANSFORMER: ComponentSkip(
@@ -102,6 +248,9 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
         ),
     },
     "wan2_1_i2v_14b_lora_2gpu": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by wan2_1_i2v_14b_720P_2gpu for the same source component and topology"
+        ),
         ComponentType.TRANSFORMER: ComponentSkip(
             "Transformer diverges from Diffusers baseline in 2-GPU accuracy run (CosSim ~0.68) after full weight transfer and matching output shape"
         ),
@@ -128,14 +277,26 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
         )
     },
     "wan2_2_t2v_a14b_teacache_2gpu": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by wan2_2_t2v_a14b_2gpu for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by wan2_2_t2v_a14b_2gpu for the same source component and topology"
+        ),
         ComponentType.TEXT_ENCODER: ComponentSkip(
             "Text encoder diverges from HF baseline in 2-GPU SP-folded accuracy run (CosSim ~0.31) after 100% matched weight transfer"
-        )
+        ),
     },
     "wan2_2_t2v_a14b_lora_2gpu": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by wan2_2_t2v_a14b_2gpu for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by wan2_2_t2v_a14b_2gpu for the same source component and topology"
+        ),
         ComponentType.TEXT_ENCODER: ComponentSkip(
             "Text encoder diverges from HF baseline in 2-GPU SP-folded accuracy run (CosSim ~0.31) after 100% matched weight transfer"
-        )
+        ),
     },
     "wan2_1_t2v_14b_2gpu": {
         ComponentType.TEXT_ENCODER: ComponentSkip(
@@ -175,6 +336,17 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
         ComponentType.TEXT_ENCODER: ComponentSkip(
             "Text encoder diverges from HF baseline in 2-GPU accuracy run (CosSim ~0.47) after 100% matched weight transfer"
         )
+    },
+    "zimage_image_t2i_2_gpus_non_square": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by zimage_image_t2i_2_gpus for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Representative transformer accuracy is already covered by zimage_image_t2i_2_gpus for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by zimage_image_t2i_2_gpus for the same source component and topology"
+        ),
     },
     "flux_2_image_t2i_2_gpus": {
         ComponentType.TRANSFORMER: ComponentSkip(
