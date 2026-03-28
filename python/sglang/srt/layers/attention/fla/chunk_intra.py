@@ -18,7 +18,6 @@ from sglang.srt.layers.attention.fla.utils import (
     is_tf32_supported,
 )
 
-
 if is_tf32_supported:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
 else:
@@ -583,11 +582,11 @@ def chunk_kda_fwd_intra(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
 
-    Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+    Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
     # Akk must be zero-initialized - kernel only writes lower triangular
     Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
     # Separate fp32 buffer for diagonal 16x16 blocks (for precision in solve_tril)
-    Akkd = torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
+    Akkd = torch.zeros(B, T, H, BC, device=k.device, dtype=torch.float32)
 
     # Step 1: Run token_parallel first to compute diagonal blocks into Akkd (fp32)
     # Step 1: compute diagonal blocks into Akk_diag (fp32)
@@ -646,7 +645,9 @@ def chunk_kda_fwd_intra(
         BC=BC,
         USE_SAFE_GATE=safe_gate,
     )
-    from sglang.srt.layers.attention.fla.kda import recompute_w_u_fwd as kda_recompute_w_u_fwd
+    from sglang.srt.layers.attention.fla.kda import (
+        recompute_w_u_fwd as kda_recompute_w_u_fwd,
+    )
 
     w, u, qg, kg = kda_recompute_w_u_fwd(
         k=k,
