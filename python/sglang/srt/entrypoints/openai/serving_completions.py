@@ -257,7 +257,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         output_top_logprobs = content["meta_info"].get(
                             "output_top_logprobs", []
                         )
-                        if not self.tokenizer_manager.server_args.incremental_streaming_output:
+                        if (
+                            not self.tokenizer_manager.server_args.incremental_streaming_output
+                        ):
                             output_token_logprobs = output_token_logprobs[
                                 n_prev_token:total_output_logprobs
                             ]
