@@ -194,7 +194,7 @@ def _supports_image_conditioning(module: nn.Module) -> bool:
     return image_dim > 0
 
 
-def _build_generic_transformer_inputs(
+def _build_transformer_hook_inputs(
     case: Any, model: nn.Module, device: str, ref_model: Optional[nn.Module] = None
 ) -> Inputs:
     compat = _resolve_transformer_hook_compat(case)
@@ -389,7 +389,7 @@ def _supports_guidance_embedding(module: nn.Module) -> bool:
     return len(accepted_args) >= 3
 
 
-def _prepare_generic_transformer_call(
+def _prepare_transformer_hook_call(
     module: nn.Module, inputs: Inputs, side: str
 ) -> HookCall:
     param_names = _forward_parameter_names(module)
@@ -478,16 +478,12 @@ def _prepare_generic_transformer_call(
     return HookCall(module=module, kwargs=kwargs, negate_output=negate_output)
 
 
-def _prepare_generic_transformer_sglang_call(
-    module: nn.Module, inputs: Inputs
-) -> HookCall:
-    return _prepare_generic_transformer_call(module, inputs, side="sglang")
+def _prepare_transformer_sglang_call(module: nn.Module, inputs: Inputs) -> HookCall:
+    return _prepare_transformer_hook_call(module, inputs, side="sglang")
 
 
-def _prepare_generic_transformer_reference_call(
-    module: nn.Module, inputs: Inputs
-) -> HookCall:
-    return _prepare_generic_transformer_call(module, inputs, side="reference")
+def _prepare_transformer_reference_call(module: nn.Module, inputs: Inputs) -> HookCall:
+    return _prepare_transformer_hook_call(module, inputs, side="reference")
 
 
 class _VAEDecodeModule(nn.Module):
@@ -533,7 +529,7 @@ def _infer_vae_latent_channels(model: nn.Module) -> int:
     )
 
 
-def _build_generic_vae_inputs(
+def _build_vae_hook_inputs(
     case: Any, model: nn.Module, device: str, ref_model: Optional[nn.Module] = None
 ) -> Inputs:
     del case, ref_model
@@ -553,24 +549,24 @@ def _build_generic_vae_inputs(
     }
 
 
-def _prepare_vae_call(module: nn.Module, inputs: Inputs) -> HookCall:
+def _prepare_vae_decode_call(module: nn.Module, inputs: Inputs) -> HookCall:
     return HookCall(module=_VAEDecodeModule(module), args=(inputs["z"],))
 
 
 TRANSFORMER_NATIVE_PROFILE = NativeHookProfile(
-    build_inputs=_build_generic_transformer_inputs,
-    prepare_sglang_call=_prepare_generic_transformer_sglang_call,
-    prepare_reference_call=_prepare_generic_transformer_reference_call,
+    build_inputs=_build_transformer_hook_inputs,
+    prepare_sglang_call=_prepare_transformer_sglang_call,
+    prepare_reference_call=_prepare_transformer_reference_call,
 )
 
 VAE_NATIVE_PROFILE = NativeHookProfile(
-    build_inputs=_build_generic_vae_inputs,
-    prepare_sglang_call=_prepare_vae_call,
-    prepare_reference_call=_prepare_vae_call,
+    build_inputs=_build_vae_hook_inputs,
+    prepare_sglang_call=_prepare_vae_decode_call,
+    prepare_reference_call=_prepare_vae_decode_call,
 )
 
 
-def resolve_native_profile(component_name: str) -> NativeHookProfile:
+def resolve_component_native_profile(component_name: str) -> NativeHookProfile:
     if component_name == "transformer":
         return TRANSFORMER_NATIVE_PROFILE
     if component_name == "vae":

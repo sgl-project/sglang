@@ -714,7 +714,7 @@ def extract_output_tensor(output: Any) -> torch.Tensor:
     raise ValueError(f"Could not extract tensor from output of type {type(output)}")
 
 
-def run_text_encoder_pair(
+def run_text_encoder_accuracy_pair(
     sgl: nn.Module, ref: nn.Module, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
     input_ids, attention_mask = build_deterministic_text_encoder_inputs(
@@ -747,7 +747,7 @@ def _should_stage_1gpu_case(case: Any, component: ComponentType, num_gpus: int) 
     return case.id in STAGED_1GPU_NATIVE_CASE_IDS
 
 
-def _run_text_encoder_single(
+def _run_single_text_encoder_forward(
     model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
     with torch.no_grad():
@@ -761,14 +761,16 @@ def _run_text_encoder_single(
     return extract_output_tensor(output)
 
 
-def _run_native_component_accuracy_case_staged(
+def _run_staged_native_component_accuracy_case(
     engine_cls: Any,
     case: Any,
     component: ComponentType,
     library: str,
     num_gpus: int,
 ) -> None:
-    from sglang.multimodal_gen.test.server.accuracy_hooks import resolve_native_profile
+    from sglang.multimodal_gen.test.server.accuracy_hooks import (
+        resolve_component_native_profile,
+    )
 
     sgl = None
     ref = None
@@ -780,7 +782,7 @@ def _run_native_component_accuracy_case_staged(
             num_gpus,
             materialize_ref_on_device=False,
         )
-        profile = resolve_native_profile(component.value)
+        profile = resolve_component_native_profile(component.value)
         inputs = profile.build_inputs(case, sgl, device, ref)
 
         sgl_call = profile.prepare_sglang_call(sgl, inputs)
@@ -815,7 +817,7 @@ def _run_native_component_accuracy_case_staged(
         engine_cls.clear_memory()
 
 
-def _run_text_encoder_accuracy_case_staged(
+def _run_staged_text_encoder_accuracy_case(
     engine_cls: Any, case: Any, num_gpus: int
 ) -> None:
     sgl = None
@@ -835,7 +837,9 @@ def _run_text_encoder_accuracy_case_staged(
 
         sgl = sgl.to(device=device, dtype=torch.bfloat16).eval()
         sgl_out = (
-            _run_text_encoder_single(sgl, input_ids, attention_mask).detach().cpu()
+            _run_single_text_encoder_forward(sgl, input_ids, attention_mask)
+            .detach()
+            .cpu()
         )
 
         del sgl
@@ -844,7 +848,9 @@ def _run_text_encoder_accuracy_case_staged(
 
         ref = ref.to(device=device, dtype=torch.bfloat16).eval()
         ref_out = (
-            _run_text_encoder_single(ref, input_ids, attention_mask).detach().cpu()
+            _run_single_text_encoder_forward(ref, input_ids, attention_mask)
+            .detach()
+            .cpu()
         )
 
         engine_cls.check_accuracy(
@@ -870,7 +876,7 @@ def run_native_component_accuracy_case(
     num_gpus: int,
 ) -> None:
     if _should_stage_1gpu_case(case, component, num_gpus):
-        _run_native_component_accuracy_case_staged(
+        _run_staged_native_component_accuracy_case(
             engine_cls, case, component, library, num_gpus
         )
         return
@@ -901,7 +907,7 @@ def run_native_component_accuracy_case(
 
 def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_gpus: int) -> None:
     if _should_stage_1gpu_case(case, ComponentType.TEXT_ENCODER, num_gpus):
-        _run_text_encoder_accuracy_case_staged(engine_cls, case, num_gpus)
+        _run_staged_text_encoder_accuracy_case(engine_cls, case, num_gpus)
         return
     engine_cls.clear_memory()
     sgl = None
@@ -910,7 +916,7 @@ def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_gpus: int) ->
         sgl, ref, device = engine_cls.load_component_pair(
             case, ComponentType.TEXT_ENCODER, "transformers", num_gpus
         )
-        sgl_out, ref_out = run_text_encoder_pair(sgl, ref, device)
+        sgl_out, ref_out = run_text_encoder_accuracy_pair(sgl, ref, device)
         engine_cls.check_accuracy(
             sgl_out,
             ref_out,

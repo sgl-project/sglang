@@ -50,7 +50,9 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
     DEFAULT_TIMESTEP,
     ComponentType,
 )
-from sglang.multimodal_gen.test.server.accuracy_hooks import resolve_native_profile
+from sglang.multimodal_gen.test.server.accuracy_hooks import (
+    resolve_component_native_profile,
+)
 from sglang.multimodal_gen.test.server.accuracy_utils import (
     build_accuracy_server_args,
     build_parameter_shard_contexts,
@@ -414,7 +416,7 @@ class AccuracyEngine:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if component == ComponentType.TEXT_ENCODER:
             raise ValueError("Text encoder path is not migrated to native hooks yet")
-        profile = resolve_native_profile(component.value)
+        profile = resolve_component_native_profile(component.value)
 
         inputs = profile.build_inputs(case, sgl_model, device, ref_model)
         sgl_call = profile.prepare_sglang_call(sgl_model, inputs)
