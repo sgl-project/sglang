@@ -58,6 +58,13 @@ class BaseReq(ABC):
             self.rid = uuid.uuid4().hex
         return self.rid
 
+    def _validate_rid_uniqueness(self):
+        """Validate that request IDs within a batch are unique."""
+        if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
+            raise ValueError(
+                f"Duplicate request IDs detected within the request: {self.rid}"
+            )
+
 
 @dataclass
 class BaseBatchReq(ABC):
@@ -275,6 +282,8 @@ class GenerateReqInput(BaseReq):
             self._normalize_single_inputs()
         else:
             self._normalize_batch_inputs()
+
+        self._validate_rid_uniqueness()
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -852,6 +861,8 @@ class EmbeddingReqInput(BaseReq):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
             self._normalize_lora_paths(self.batch_size)
+
+        self._validate_rid_uniqueness()
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
