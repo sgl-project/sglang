@@ -4,7 +4,6 @@
 #include <cstring>
 #include <queue>
 #include <tuple>
-#include <unordered_set>
 
 namespace ngram {
 
@@ -121,24 +120,12 @@ Result combineRootResults_(int last_token, int draft_token_num, const Result& pr
   auto primary_paths = extractLeafPaths_(primary);
   auto secondary_paths = extractLeafPaths_(secondary);
 
-  std::unordered_set<int32_t> occupied_root_tokens;
-  occupied_root_tokens.reserve(primary_paths.size());
-  for (const auto& path : primary_paths) {
-    if (!path.empty()) {
-      occupied_root_tokens.insert(path.front());
-    }
-  }
-
   std::vector<std::vector<int32_t>> merged_paths = std::move(primary_paths);
   merged_paths.reserve(merged_paths.size() + secondary_paths.size());
   for (const auto& path : secondary_paths) {
     if (path.empty()) {
       continue;
     }
-    if (occupied_root_tokens.contains(path.front())) {
-      continue;
-    }
-    occupied_root_tokens.insert(path.front());
     merged_paths.emplace_back(path);
   }
 

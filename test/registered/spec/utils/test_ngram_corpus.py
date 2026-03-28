@@ -800,7 +800,7 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         self.assertIn([3, 10, 11], leaf_paths)
         self.assertIn([3, 20, 21], leaf_paths)
 
-    def test_trie_branch_wins_root_collision(self):
+    def test_shared_prefix_keeps_both_branches(self):
         corpus = _make_corpus(
             "BFS",
             draft_token_num=5,
@@ -815,8 +815,26 @@ class TestNgramCorpusExternalSam(CustomTestCase):
             ids.tolist(), masks.reshape(5, 5).tolist()
         )
         self.assertIn([3, 10, 11], leaf_paths)
-        self.assertNotIn([3, 10, 99], leaf_paths)
-        self.assertNotIn(99, ids.tolist())
+        self.assertIn([3, 10, 99], leaf_paths)
+
+    def test_shared_prefix_merge_can_underfill_budget(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=6,
+            external_sam_budget=2,
+            external_corpus_documents=[[1, 2, 3, 10, 99]],
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11]])
+        corpus.synchronize()
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        ids_list = ids.tolist()
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids_list, masks.reshape(6, 6).tolist()
+        )
+        self.assertIn([3, 10, 11], leaf_paths)
+        self.assertIn([3, 10, 99], leaf_paths)
+        self.assertEqual(ids_list.count(0), 2, ids_list)
 
     def test_external_sam_prob_prefers_frequent_continuation(self):
         corpus = _make_corpus(
