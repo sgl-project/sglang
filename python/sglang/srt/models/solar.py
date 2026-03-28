@@ -55,6 +55,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class SolarMLP(nn.Module):
@@ -194,8 +195,7 @@ class SolarDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_theta, rope_scaling = get_rope_config(config)
 
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None

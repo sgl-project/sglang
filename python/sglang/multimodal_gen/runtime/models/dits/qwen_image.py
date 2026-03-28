@@ -30,7 +30,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
-    apply_qk_norm,
+    apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -560,14 +560,26 @@ class QwenImageCrossAttention(nn.Module):
                 )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            self.to_add_out = ReplicatedLinear(
+                self.inner_dim,
+                self.dim,
+                bias=out_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
+            )
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+                ReplicatedLinear(
+                    self.inner_dim,
+                    self.dim,
+                    bias=out_bias,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
             )
         else:
             self.to_out = None
@@ -614,26 +626,7 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
-        # Apply QK normalization
-        if self.qk_norm:
-            img_query, img_key = apply_qk_norm(
-                q=img_query,
-                k=img_key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
-                allow_inplace=True,
-            )
-            txt_query, txt_key = apply_qk_norm(
-                q=txt_query,
-                k=txt_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=txt_query.shape[-1],
-                allow_inplace=True,
-            )
-
-        # Apply RoPE
+        img_cache = txt_cache = None
         if image_rotary_emb is not None:
             if not (
                 isinstance(image_rotary_emb[0], torch.Tensor)
@@ -643,6 +636,28 @@ class QwenImageCrossAttention(nn.Module):
 
             img_cache, txt_cache = image_rotary_emb
 
+        if self.qk_norm:
+            img_query, img_key = apply_qk_norm_with_optional_rope(
+                q=img_query,
+                k=img_key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=img_query.shape[-1],
+                cos_sin_cache=img_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+            txt_query, txt_key = apply_qk_norm_with_optional_rope(
+                q=txt_query,
+                k=txt_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=txt_query.shape[-1],
+                cos_sin_cache=txt_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+        elif img_cache is not None and txt_cache is not None:
             img_query, img_key = apply_flashinfer_rope_qk_inplace(
                 img_query, img_key, img_cache, is_neox=False
             )
@@ -706,8 +721,12 @@ class QwenImageTransformerBlock(nn.Module):
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.img_norm1 = LayerNormScaleShift(
@@ -730,8 +749,12 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.txt_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.txt_norm1 = LayerNormScaleShift(
@@ -884,8 +907,8 @@ class QwenImageTransformerBlock(nn.Module):
         modulate_index: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
-        txt_mod_params = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
+        img_mod_params, _ = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
+        txt_mod_params, _ = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
 
         if (
             self.quant_config is not None

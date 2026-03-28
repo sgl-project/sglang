@@ -152,6 +152,18 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+                if logits_output.next_token_top_logprobs_val:
+                    logits_output.next_token_top_logprobs_val = [
+                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    ]
+                    logits_output.next_token_top_logprobs_idx = [
+                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    ]
+                if logits_output.next_token_token_ids_logprobs_val:
+                    logits_output.next_token_token_ids_logprobs_val = [
+                        v.tolist()
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    ]
 
             hidden_state_offset = 0
 
@@ -377,7 +389,7 @@ class SchedulerOutputProcessorMixin:
 
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                if batch.is_spec_v2 and logits_output.next_token_top_logprobs_val:
+                if logits_output.next_token_top_logprobs_val:
                     logits_output.next_token_top_logprobs_val = [
                         v.tolist() for v in logits_output.next_token_top_logprobs_val
                     ]
@@ -385,7 +397,7 @@ class SchedulerOutputProcessorMixin:
                         x.tolist() for x in logits_output.next_token_top_logprobs_idx
                     ]
 
-                if batch.is_spec_v2 and logits_output.next_token_token_ids_logprobs_val:
+                if logits_output.next_token_token_ids_logprobs_val:
                     logits_output.next_token_token_ids_logprobs_val = [
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
@@ -437,12 +449,8 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 # delete feature to save memory
-                if req.multimodal_inputs is not None:
-                    for mm_item in req.multimodal_inputs.mm_items:
-                        pixel_values = mm_item.feature
-                        if isinstance(pixel_values, torch.Tensor):
-                            mm_item.feature = None
-                            del pixel_values
+                if req.multimodal_inputs is not None and req.session is None:
+                    req.multimodal_inputs.release_features()
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
@@ -1109,7 +1117,9 @@ class SchedulerOutputProcessorMixin:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:
                             customized_info[k] = []
-                        customized_info[k].append(v[send_token_offset:])
+                        customized_info[k].append(
+                            v[send_token_offset : len(output_ids_)]
+                        )
 
             if (
                 req.finished()
