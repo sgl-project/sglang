@@ -51,7 +51,9 @@ class TestGLM47FP8EvalMI35x(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="GLM-4.7-FP8",
-            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
+            accuracy_params=AccuracyTestParams(
+                dataset="gsm8k", baseline_accuracy=0.92
+            ),
         )
 
 
