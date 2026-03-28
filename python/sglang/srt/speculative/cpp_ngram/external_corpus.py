@@ -12,11 +12,7 @@ DEFAULT_CHUNK_SIZE = 4096
 def iter_external_corpus_chunks(
     path: str, tokenizer, max_tokens: int, chunk_size: int = DEFAULT_CHUNK_SIZE
 ) -> Iterator[list[int]]:
-    """Yield fixed-size token chunks from a JSONL corpus file.
-
-    Documents are separated by a special separator token. Chunks never exceed
-    *chunk_size* tokens, so memory usage stays bounded regardless of how long
-    individual corpus lines are.
+    """Chunk documents and yield fixed-size token chunks from a JSONL corpus file.
     """
     corpus_path = Path(path)
     if not corpus_path.is_file():

@@ -24,7 +24,7 @@ def _make_corpus(match_type="BFS", **kwargs):
         draft_token_num=8,
         capacity=100000,
         external_sam_budget=0,
-        external_corpus_max_tokens=1000000,
+        external_corpus_max_tokens=10000000,
         external_corpus_documents=None,
     )
     defaults.update(kwargs)

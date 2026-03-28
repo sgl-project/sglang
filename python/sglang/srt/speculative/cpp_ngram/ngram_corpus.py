@@ -49,7 +49,7 @@ class NgramCorpus:
         match_type="BFS",
         capacity=1000000,
         external_sam_budget=0,
-        external_corpus_max_tokens=1000000,
+        external_corpus_max_tokens=10000000,
         external_corpus_documents: Optional[Iterable[Sequence[int]]] = None,
     ):
         param = ngram_corpus_cpp.Param()

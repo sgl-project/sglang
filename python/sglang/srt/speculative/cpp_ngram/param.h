@@ -20,7 +20,7 @@ struct Param {
   size_t max_trie_depth;
   size_t draft_token_num;
   size_t external_sam_budget = 0;
-  size_t external_corpus_max_tokens = 1000000;
+  size_t external_corpus_max_tokens = 10000000;
   std::string match_type;
 
   std::vector<size_t> batch_draft_token_num;

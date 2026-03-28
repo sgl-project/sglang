@@ -508,7 +508,7 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: Optional[str] = None
     speculative_ngram_external_sam_budget: int = 0
-    speculative_ngram_external_corpus_max_tokens: int = 1000000
+    speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -4808,7 +4808,7 @@ class ServerArgs:
             "--speculative-ngram-external-corpus-max-tokens",
             type=int,
             default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
-            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens.",
+            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on how much slower server startup you can tolerate and how much additional CPU overhead you can sustain: larger values allow a bigger external SAM, while smaller values keep startup faster and CPU overhead lower.",
         )
 
         # Multi-layer Eagle speculative decoding
