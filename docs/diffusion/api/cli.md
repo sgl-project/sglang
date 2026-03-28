@@ -2,6 +2,38 @@
 
 Use the CLI for one-off generation with `sglang generate` or to start a persistent HTTP server with `sglang serve`.
 
+### Overlay repos for non-diffusers models
+
+If `--model-path` points to a non-diffusers source repo, SGLang can resolve it
+through a self-hosted overlay repo.
+
+- Set `SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY` to a JSON object or a path to a JSON file
+- Map the source model ID to an overlay repo ID
+- Keep passing the original source model ID to `--model-path`
+
+Example:
+
+```bash
+export SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY='{
+  "Wan-AI/Wan2.2-S2V-14B": {
+    "overlay_repo_id": "your-org/Wan2.2-S2V-14B-overlay",
+    "overlay_revision": "main"
+  }
+}'
+
+sglang generate \
+  --model-path Wan-AI/Wan2.2-S2V-14B \
+  --config configs/wan_s2v.yaml
+```
+
+The overlay repo can be either:
+
+- a complete diffusers-style/componentized repo
+- a metadata-only repo with `_overlay/overlay_manifest.json`, in which case SGLang downloads the original source weights and materializes a local componentized cache automatically
+
+You can also pass the overlay repo itself as `--model-path` if it contains `_overlay/overlay_manifest.json`.
+
+
 ## Quick Start
 
 ### Generate
