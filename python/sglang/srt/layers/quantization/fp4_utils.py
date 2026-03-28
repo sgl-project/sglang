@@ -4,7 +4,6 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -56,26 +55,6 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
     global FP4_GEMM_RUNNER_BACKEND
 
     backend = server_args.fp4_gemm_runner_backend
-
-    # Handle deprecated env var for backward compatibility
-    # TODO: Remove this in a future version
-    if envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.is_set():
-        env_backend = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
-        if backend == "auto":
-            logger.warning(
-                "SGLANG_FLASHINFER_FP4_GEMM_BACKEND is deprecated. "
-                f"Please use '--fp4-gemm-backend={env_backend}' instead."
-            )
-            if not env_backend.startswith("flashinfer_"):
-                env_backend = "flashinfer_" + env_backend
-            backend = env_backend
-        else:
-            logger.warning(
-                f"FP4 GEMM backend set to '{backend}' via --fp4-gemm-backend overrides "
-                "environment variable SGLANG_FLASHINFER_FP4_GEMM_BACKEND. "
-                "Using server argument value."
-            )
-
     if backend == "auto":
         if is_sm120_supported():
             # flashinfer_cutlass produces NaN in dense MLP layers with
