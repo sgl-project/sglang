@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 
 def find_partition_files(input_dir: str) -> list[str]:
-    """Find all partition metric files in the input directory."""
+    """Find all performance partition metric files in the input directory."""
     patterns = [
         os.path.join(input_dir, "**/metrics-*.json"),
         os.path.join(input_dir, "**/diffusion-metrics-*.json"),
@@ -31,6 +31,12 @@ def find_partition_files(input_dir: str) -> list[str]:
     for pattern in patterns:
         files.update(glob.glob(pattern, recursive=True))
     return list(files)
+
+
+def find_accuracy_partition_files(input_dir: str) -> list[str]:
+    """Find all accuracy partition metric files in the input directory."""
+    pattern = os.path.join(input_dir, "**/accuracy-metrics-*.json")
+    return list(glob.glob(pattern, recursive=True))
 
 
 def load_partition_metrics(filepath: str) -> dict | None:
@@ -53,21 +59,35 @@ def merge_metrics(
     """Merge all partition metrics into a consolidated file."""
     run_date = datetime.now(timezone.utc).isoformat()
 
-    # Find all partition files
+    # Find and merge performance partition files
     partition_files = find_partition_files(input_dir)
-    print(f"Found {len(partition_files)} partition file(s)")
+    print(f"Found {len(partition_files)} performance partition file(s)")
 
     all_results = []
     if not partition_files:
-        print("No partition metrics files found")
+        print("No performance partition metrics files found")
     else:
-        # Load all partition files
         for filepath in sorted(partition_files):
             print(f"  Reading: {filepath}")
             metrics = load_partition_metrics(filepath)
             if metrics and "results" in metrics:
                 all_results.extend(metrics["results"])
-        print(f"Total results collected: {len(all_results)}")
+        print(f"Total performance results collected: {len(all_results)}")
+
+    # Find and merge accuracy partition files
+    accuracy_partition_files = find_accuracy_partition_files(input_dir)
+    print(f"Found {len(accuracy_partition_files)} accuracy partition file(s)")
+
+    all_accuracy_results = []
+    if not accuracy_partition_files:
+        print("No accuracy partition metrics files found")
+    else:
+        for filepath in sorted(accuracy_partition_files):
+            print(f"  Reading: {filepath}")
+            metrics = load_partition_metrics(filepath)
+            if metrics and "results" in metrics:
+                all_accuracy_results.extend(metrics["results"])
+        print(f"Total accuracy results collected: {len(all_accuracy_results)}")
 
     # Create consolidated structure
     consolidated = {
@@ -76,6 +96,7 @@ def merge_metrics(
         "commit_sha": commit_sha,
         "branch": branch,
         "results": all_results,
+        "accuracy_results": all_accuracy_results,
     }
 
     # Ensure output directory exists and write output

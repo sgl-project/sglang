@@ -1,4 +1,7 @@
+import json
+import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
@@ -71,6 +74,49 @@ def write_accuracy_github_summary(
         summary += f"| {config_name} | {status_emoji} | {score_str} | {baseline_str} | {error_str} |\n"
 
     write_github_step_summary(summary)
+
+
+def write_accuracy_results_json(
+    results: List[AccuracyTestResult],
+    output_file: str,
+    gpu_config: str = "",
+    run_id: str = "",
+) -> None:
+    """Write accuracy results to a JSON file for artifact collection.
+
+    Args:
+        results: List of AccuracyTestResult objects
+        output_file: Path to write the JSON file
+        gpu_config: GPU configuration string (e.g., "8-gpu-h200")
+        run_id: GitHub Actions run ID (falls back to GITHUB_RUN_ID env var)
+    """
+    run_id = run_id or os.environ.get("GITHUB_RUN_ID", "")
+    gpu_config = gpu_config or os.environ.get("GPU_CONFIG", "")
+
+    data = {
+        "run_id": run_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "gpu_config": gpu_config,
+        "results": [
+            {
+                "model": r.model,
+                "variant": r.variant,
+                "dataset": r.dataset,
+                "gpu_config": gpu_config,
+                "score": float(r.score) if r.score is not None else None,
+                "baseline_accuracy": float(r.baseline_accuracy),
+                "passed": r.passed,
+                "latency": float(r.latency) if r.latency is not None else None,
+                "error": r.error,
+            }
+            for r in results
+        ],
+    }
+
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"Saved accuracy results to: {output_file}")
 
 
 def _run_simple_eval(
@@ -267,13 +313,21 @@ def run_accuracy_test(
 
     # Validate against baseline
     # Handle different metric key names: "score", "mean_score" (for GPQA with repeat), "accuracy"
-    score = (
-        metrics.get("score")
-        or metrics.get("mean_score")
-        or metrics.get("accuracy", 0.0)
+    # Use explicit None checks so a legitimate 0.0 score is not skipped.
+    score = float(
+        next(
+            (
+                metrics[k]
+                for k in ("score", "mean_score", "accuracy")
+                if metrics.get(k) is not None
+            ),
+            0.0,
+        )
     )
-    passed = score >= params.baseline_accuracy
-    latency = metrics.get("latency")
+    passed = bool(score >= params.baseline_accuracy)
+    raw_latency = metrics.get("latency")
+    latency = float(raw_latency) if raw_latency is not None else None
+    error = None
 
     if passed:
         print(f"✓ Accuracy {score:.3f} >= baseline {params.baseline_accuracy:.3f}")
@@ -287,7 +341,7 @@ def run_accuracy_test(
         passed=passed,
         score=score,
         baseline_accuracy=params.baseline_accuracy,
-        error=error if not passed else None,
+        error=error,
         latency=latency,
         variant=model.variant,
     )

@@ -57,13 +57,21 @@ class TestQwen35(unittest.TestCase):
         run_combined_tests(
             models=variants,
             test_name="Qwen3.5-397B-A17B",
-            accuracy_params=AccuracyTestParams(
-                dataset="gsm8k",
-                baseline_accuracy=0.95,
-                thinking_mode="qwen3",
-                max_tokens=8192,
-                num_examples=200,
-            ),
+            is_vlm=True,
+            accuracy_params=[
+                AccuracyTestParams(
+                    dataset="gsm8k",
+                    baseline_accuracy=0.95,
+                    thinking_mode="qwen3",
+                    max_tokens=8192,
+                    num_examples=200,
+                ),
+                AccuracyTestParams(
+                    dataset="mmmu",
+                    baseline_accuracy=0.85,
+                    num_examples=200,
+                ),
+            ],
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_qwen35",
             ),

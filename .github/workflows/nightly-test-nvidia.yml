@@ -227,7 +227,7 @@ jobs:
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
 
-      - name: Collect performance metrics
+      - name: Collect performance and accuracy metrics
         if: always()
         run: |
           python3 scripts/ci/utils/save_metrics.py \
@@ -235,6 +235,7 @@ jobs:
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
             --output test/metrics-8gpu-h200-partition-${{ matrix.partition }}.json \
+            --accuracy-output test/accuracy-metrics-8gpu-h200-partition-${{ matrix.partition }}.json \
             --search-dir test/performance_profiles_8_gpu \
             --search-dir test
 
@@ -244,6 +245,15 @@ jobs:
         with:
           name: metrics-8gpu-h200-partition-${{ matrix.partition }}
           path: test/metrics-8gpu-h200-partition-${{ matrix.partition }}.json
+          retention-days: 5
+          if-no-files-found: ignore
+
+      - name: Upload accuracy metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: accuracy-metrics-8gpu-h200-partition-${{ matrix.partition }}
+          path: test/accuracy-metrics-8gpu-h200-partition-${{ matrix.partition }}.json
           retention-days: 5
           if-no-files-found: ignore
 
@@ -331,7 +341,7 @@ jobs:
             echo "No trace directories found, skipping publish"
           fi
 
-      - name: Collect performance metrics
+      - name: Collect performance and accuracy metrics
         if: always()
         run: |
           python3 scripts/ci/utils/save_metrics.py \
@@ -339,6 +349,7 @@ jobs:
             --partition ${{ matrix.partition }} \
             --run-id ${{ github.run_id }} \
             --output test/metrics-8gpu-b200-partition-${{ matrix.partition }}.json \
+            --accuracy-output test/accuracy-metrics-8gpu-b200-partition-${{ matrix.partition }}.json \
             --search-dir test/performance_profiles_8_gpu \
             --search-dir test
 
@@ -348,6 +359,15 @@ jobs:
         with:
           name: metrics-8gpu-b200-partition-${{ matrix.partition }}
           path: test/metrics-8gpu-b200-partition-${{ matrix.partition }}.json
+          retention-days: 5
+          if-no-files-found: ignore
+
+      - name: Upload accuracy metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: accuracy-metrics-8gpu-b200-partition-${{ matrix.partition }}
+          path: test/accuracy-metrics-8gpu-b200-partition-${{ matrix.partition }}.json
           retention-days: 5
           if-no-files-found: ignore
 

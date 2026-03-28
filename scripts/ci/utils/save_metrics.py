@@ -18,6 +18,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from typing import Optional
 
 
 def find_result_files(search_dirs: list[str]) -> list[str]:
@@ -132,12 +133,76 @@ def group_results_by_model(
     return list(groups.values())
 
 
+def find_accuracy_result_files(search_dirs: list[str]) -> list[str]:
+    """Find all accuracy_results_*.json files written by run_combined_tests."""
+    result_files = set()
+    for search_dir in search_dirs:
+        if os.path.exists(search_dir):
+            pattern = os.path.join(search_dir, "**/accuracy_results_*.json")
+            result_files.update(glob.glob(pattern, recursive=True))
+    return list(result_files)
+
+
+def collect_accuracy_metrics(
+    gpu_config: str,
+    partition: int,
+    run_id: str,
+    output_file: str,
+    search_dirs: list[str],
+) -> bool:
+    """Collect accuracy results and write to a separate output file."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    accuracy_files = find_accuracy_result_files(search_dirs)
+    print(f"Found {len(accuracy_files)} accuracy result file(s)")
+
+    all_results = []
+    if not accuracy_files:
+        print("No accuracy result files found")
+    else:
+        for filepath in sorted(accuracy_files):
+            print(f"  Reading: {filepath}")
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                results = data.get("results", [])
+                # Overwrite gpu_config with the authoritative value from this step
+                for r in results:
+                    r["gpu_config"] = gpu_config
+                all_results.extend(results)
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"Warning: Failed to parse {filepath}: {e}")
+        print(f"Total accuracy results: {len(all_results)}")
+
+    metrics = {
+        "run_id": run_id,
+        "timestamp": timestamp,
+        "gpu_config": gpu_config,
+        "partition": partition,
+        "results": all_results,
+    }
+
+    try:
+        os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        if not accuracy_files:
+            print(f"Created empty accuracy metrics file: {output_file}")
+        else:
+            print(f"Saved accuracy metrics to: {output_file}")
+        return True
+    except OSError as e:
+        print(f"Error writing accuracy metrics file: {e}")
+        return False
+
+
 def save_metrics(
     gpu_config: str,
     partition: int,
     run_id: str,
     output_file: str,
     search_dirs: list[str],
+    accuracy_output_file: Optional[str] = None,
 ) -> bool:
     """Collect metrics and save to output file."""
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -180,6 +245,16 @@ def save_metrics(
             print(f"Created empty metrics file: {output_file}")
         else:
             print(f"Saved metrics to: {output_file}")
+
+        if accuracy_output_file:
+            collect_accuracy_metrics(
+                gpu_config=gpu_config,
+                partition=partition,
+                run_id=run_id,
+                output_file=accuracy_output_file,
+                search_dirs=search_dirs,
+            )
+
         return True
     except OSError as e:
         print(f"Error writing metrics file: {e}")
@@ -218,6 +293,12 @@ def main():
         dest="search_dirs",
         help="Directory to search for result files (can be specified multiple times)",
     )
+    parser.add_argument(
+        "--accuracy-output",
+        default=None,
+        help="Optional output file for accuracy metrics (accuracy_results_*.json files). "
+        "When provided, accuracy results are written to this file alongside perf metrics.",
+    )
 
     args = parser.parse_args()
 
@@ -236,6 +317,7 @@ def main():
         run_id=args.run_id,
         output_file=args.output,
         search_dirs=search_dirs,
+        accuracy_output_file=args.accuracy_output,
     )
 
     sys.exit(0 if success else 1)
