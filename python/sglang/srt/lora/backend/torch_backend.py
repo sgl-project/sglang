@@ -54,21 +54,20 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
+        output_offset_cpu: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
         _, weight_out_dim, _ = weights.shape
-        output_offset = torch.tensor(
-            [0, weight_out_dim], dtype=torch.int32, device="cpu"
-        )
+
         output_tensor = sgemm_lora_b_fwd(
             inputs=x,
             weights=weights,
             weight_indices=self.batch_info.weight_indices_cpu,
             seg_len_tensor=self.batch_info.seg_lens_cpu,
             lora_ranks=self.batch_info.lora_ranks_cpu,
-            slice_offsets=output_offset,
+            slice_offsets=output_offset_cpu,
             base_output=base_output,
         )
 
@@ -86,7 +85,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        num_slices = 3
+        num_slices = len(output_offset_cpu) - 1
         lora_a_output = sgemm_lora_a_fwd(
             inputs=x,
             weights=qkv_lora_a,
@@ -114,16 +113,13 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         x: torch.Tensor,
         gate_up_lora_a: torch.Tensor,
         gate_up_lora_b: torch.Tensor,
+        output_offset_cpu: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        num_slices = 2
+        num_slices = len(output_offset_cpu) - 1
         _, weight_out_dim, _ = gate_up_lora_b.shape
-        slice_size = weight_out_dim // num_slices
-        output_offset = torch.tensor(
-            [0, slice_size, weight_out_dim], dtype=torch.int32, device="cpu"
-        )
 
         lora_a_output = sgemm_lora_a_fwd(
             inputs=x,
@@ -141,7 +137,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             weight_indices=self.batch_info.weight_indices_cpu,
             seg_len_tensor=self.batch_info.seg_lens_cpu,
             lora_ranks=self.batch_info.lora_ranks_cpu,
-            slice_offsets=output_offset,
+            slice_offsets=output_offset_cpu,
             base_output=base_output,
         )
 

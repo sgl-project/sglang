@@ -24,16 +24,15 @@ def sgemm_lora_a_fwd(
     )
 
     token_offset = 0
-    for lora_idx, seq_len, rank in zip(
-        weight_indices, seg_len_tensor, lora_ranks[weight_indices]
-    ):
+    for lora_idx, seq_len in zip(weight_indices, seg_len_tensor):
         if seq_len == 0:
             continue
 
+        rank = lora_ranks[lora_idx]
         if rank > 0:
 
-            x_seq = inputs[token_offset : token_offset + seq_len, :]
-            w_seq = weights[lora_idx, : num_slices * rank, :]
+            x_seq = inputs[token_offset : token_offset + seq_len, ...]
+            w_seq = weights[lora_idx, : num_slices * rank, ...]
 
             result = torch.mm(x_seq, w_seq.T)
             output[token_offset : token_offset + seq_len, : num_slices * rank] = (
@@ -73,35 +72,32 @@ def sgemm_lora_b_fwd(
         )
 
     token_offset = 0
-    for lora_idx, seq_len, rank in zip(
-        weight_indices, seg_len_tensor, lora_ranks[weight_indices]
-    ):
+    for lora_idx, seq_len in zip(weight_indices, seg_len_tensor):
         if seq_len == 0:
             continue
 
-        if rank == 0:
-            token_offset += seq_len
-            continue
+        rank = lora_ranks[lora_idx]
+        if rank > 0:
 
-        for slice_idx in range(num_slices):
-            slice_start_input = slice_idx * rank
-            slice_end_input = (slice_idx + 1) * rank
+            for slice_idx in range(num_slices):
+                slice_start_input = slice_idx * rank
+                slice_end_input = (slice_idx + 1) * rank
 
-            slice_start_output = slice_offsets[slice_idx]
-            slice_end_output = slice_offsets[slice_idx + 1]
+                slice_start_output = slice_offsets[slice_idx]
+                slice_end_output = slice_offsets[slice_idx + 1]
 
-            x_slice = inputs[
-                token_offset : token_offset + seq_len :,
-                slice_start_input:slice_end_input,
-            ]  # (seq_len, rank)
-            w_slice = weights[
-                lora_idx, slice_start_output:slice_end_output, :rank
-            ]  # (slice_dim, rank)
+                x_slice = inputs[
+                    token_offset : token_offset + seq_len,
+                    slice_start_input:slice_end_input,
+                ]  # (seq_len, rank)
+                w_slice = weights[
+                    lora_idx, slice_start_output:slice_end_output, :rank
+                ]  # (slice_dim, rank)
 
-            output[
-                token_offset : token_offset + seq_len,
-                slice_start_output:slice_end_output,
-            ].add_(torch.mm(x_slice, w_slice.T))
+                output[
+                    token_offset : token_offset + seq_len,
+                    slice_start_output:slice_end_output,
+                ].add_(torch.mm(x_slice, w_slice.T))
 
         token_offset += seq_len
 
