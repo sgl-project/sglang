@@ -47,7 +47,10 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -804,7 +807,9 @@ class QwenImageTransformerBlock(nn.Module):
 
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
-            if x.is_cuda:
+            # ROCm currently fails to compile the select01 Triton kernel, so
+            # keep using the torch.where fallback there.
+            if x.is_cuda and not current_platform.is_hip():
                 actual_batch = x.shape[0]
                 shift0, shift1 = (
                     shift[:actual_batch],
