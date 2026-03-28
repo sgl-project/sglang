@@ -19,6 +19,7 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import glob
 import json
 import os
 import shutil
@@ -30,16 +31,20 @@ from typing import Any, Optional, Union, cast
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
-from huggingface_hub.errors import LocalEntryNotFoundError, RevisionNotFoundError
+from huggingface_hub.errors import (
+    LocalEntryNotFoundError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import RequestException
 from transformers import AutoConfig, PretrainedConfig
 
 from sglang.multimodal_gen.runtime.loader.utils import _clean_hf_config_inplace
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.model_overlays import (
-    clear_model_overlay_registry_cache,
+from sglang.multimodal_gen.runtime.utils.model_overlay import (
     maybe_load_overlay_model_index,
     maybe_resolve_overlay_model_path,
 )

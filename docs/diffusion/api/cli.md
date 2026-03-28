@@ -28,7 +28,7 @@ The overlay repo should be a complete diffusers-style/componentized repo
 
 You can also pass the overlay repo itself as `--model-path` if it contains `_overlay/overlay_manifest.json`.
 
-Notes:  
+Notes:
 1. `SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY` is only an optional override for
 development and debugging. It accepts either a JSON object or a path to a JSON
 file, and can extend or replace built-in entries for the current process.
