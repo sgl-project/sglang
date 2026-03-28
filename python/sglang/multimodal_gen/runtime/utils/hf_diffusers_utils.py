@@ -504,14 +504,13 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
                 return config
             raise
 
+    # return resolved overlay config if applicable
     overlay_config = maybe_load_overlay_model_index(
         model_name_or_path,
         snapshot_download_fn=snapshot_download,
         hf_hub_download_fn=hf_hub_download,
     )
     if overlay_config is not None:
-        # Overlay-backed source ids still expose a normal model_index.json to
-        # the rest of the pipeline loader.
         return overlay_config
 
     # For remote models, download just the model_index.json
@@ -591,6 +590,7 @@ def maybe_download_model(
         Local path to the model
     """
     if force_diffusers_model and not skip_overlay_resolution:
+        # return overlay model path if applicable
         overlay_model_path = maybe_resolve_overlay_model_path(
             model_name_or_path,
             local_dir=local_dir,
@@ -602,8 +602,6 @@ def maybe_download_model(
             base_model_download_fn=maybe_download_model,
         )
         if overlay_model_path is not None:
-            # Overlay resolution returns a ready-to-load diffusers-like path,
-            # either by downloading the full overlay repo or materializing one.
             return overlay_model_path
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
