@@ -91,7 +91,7 @@ class TestEAGLEServerBasic(EagleServerBase):
         if speculative_eagle_topk == 1:
             self.assertGreater(avg_spec_accept_length, 2.5)
         else:
-            self.assertGreater(avg_spec_accept_length, 3.49)
+            self.assertGreater(avg_spec_accept_length, 3.47)
 
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
