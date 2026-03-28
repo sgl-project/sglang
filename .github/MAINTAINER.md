@@ -86,7 +86,7 @@ related files
 ### Speculative decoding
 [@hnyls2002](https://github.com/hnyls2002) (Liangsheng Yin), [@Qiaolin-Yu](https://github.com/Qiaolin-Yu) (Qiaolin Yu)
 
-related files 
+related files
 - python/sglang/srt/speculative
 
 ### NV and model-specific optimizations

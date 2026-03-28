@@ -348,7 +348,10 @@ def main() -> None:
 
     rows: list[dict[str, Any]] = []
     elevated = [c for c in collaborators if isinstance(c, dict) and has_write_plus(c)]
-    print(f"Found {len(elevated)} collaborators with admin/maintain/write/triage.", file=sys.stderr)
+    print(
+        f"Found {len(elevated)} collaborators with admin/maintain/write/triage.",
+        file=sys.stderr,
+    )
 
     for i, col in enumerate(elevated, start=1):
         login = col.get("login")
@@ -361,9 +364,7 @@ def main() -> None:
         cd = last_commit_date(owner, name, login)
         issue_dt, pr_dt = last_issue_pr_dates(owner, name, login)
         last_act_ymd = max_date_ymd(cd, issue_dt, pr_dt)
-        others = other_repos_activity_column(
-            login, owner, name, days=args.events_days
-        )
+        others = other_repos_activity_column(login, owner, name, days=args.events_days)
         rows.append(
             {
                 "_role_tier": role_sort_tier(col),
