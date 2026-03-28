@@ -1341,23 +1341,29 @@ def tensor_hash(tensor_list) -> int:
     tensor = tensor_list
     if isinstance(tensor_list, list):
         tensor_list = flatten_nested_list(tensor_list)
-        tensor_list = [
+        tensors = [
             x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
         ]
-        tensor = torch.concat(tensor_list)
+        # GPU path: concat + triton hash (unchanged)
+        if any(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
+            tensor = torch.concat(tensors)
+            return gpu_tensor_hash(tensor.cuda())
+        # CPU path: hash each tensor incrementally without concat
+        hasher = hashlib.sha256()
+        for t in tensors:
+            t = t.detach().contiguous()
+            hasher.update(memoryview(t.view(torch.uint8).numpy()))
+        hash_bytes = hasher.digest()[:8]
+        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+    # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
-
-    if tensor.dtype == torch.bfloat16:
-        # memoryview() doesn't support PyTorch's BFloat16 dtype
-        tensor = tensor.float()
-
-    assert isinstance(tensor, torch.Tensor)
-    tensor_cpu = tensor.cpu()
-
-    mv = memoryview(tensor_cpu.numpy())
-    return data_hash(mv.tobytes())
+    hasher = hashlib.sha256()
+    hasher.update(memoryview(tensor.view(torch.uint8).numpy()))
+    hash_bytes = hasher.digest()[:8]
+    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
 def hash_feature(f):
@@ -1367,8 +1373,10 @@ def hash_feature(f):
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
         arr = np.ascontiguousarray(f)
-        arr_bytes = arr.tobytes()
-        return data_hash(arr_bytes)
+        hasher = hashlib.sha256()
+        hasher.update(memoryview(arr))
+        hash_bytes = hasher.digest()[:8]
+        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
     elif isinstance(f, CudaIpcTensorTransportProxy):
