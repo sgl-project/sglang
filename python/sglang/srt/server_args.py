@@ -661,6 +661,7 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
+    gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "round-robin-split"
@@ -5600,6 +5601,12 @@ class ServerArgs:
             action="store_true",
             help="Enable fused moe triton and sum all reduce.",
         )
+        parser.add_argument(
+            "--gc-threshold",
+            type=int,
+            nargs="+",
+            help="Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
+        )
 
         # Dynamic batch tokenizer
         parser.add_argument(
@@ -6115,6 +6122,12 @@ class ServerArgs:
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
+
+        if self.gc_threshold:
+            if not (1 <= len(self.gc_threshold) <= 3):
+                raise ValueError(
+                    "When setting gc_threshold, it must contain 1 to 3 integers."
+                )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
