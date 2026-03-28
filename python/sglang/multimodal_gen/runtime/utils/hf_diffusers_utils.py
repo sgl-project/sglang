@@ -46,7 +46,7 @@ from sglang.multimodal_gen.runtime.utils.model_overlays import (
     load_overlay_manifest_if_present,
     materialize_overlay_model,
     resolve_direct_overlay_repo,
-    resolve_model_overlay,
+    resolve_model_overlay_target,
 )
 from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
@@ -505,10 +505,11 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
                 return config
             raise
 
-    overlay_spec = resolve_model_overlay(model_name_or_path)
-    if overlay_spec is not None:
+    overlay_target = resolve_model_overlay_target(model_name_or_path)
+    if overlay_target is not None:
+        source_model_id, overlay_spec = overlay_target
         overlay_metadata_dir = download_overlay_metadata(
-            model_name_or_path,
+            source_model_id,
             overlay_spec,
             snapshot_download_fn=snapshot_download,
         )
@@ -599,15 +600,13 @@ def maybe_download_model(
     """
 
     overlay_spec = None
-    if (
-        force_diffusers_model
-        and not skip_overlay_resolution
-        and not os.path.exists(model_name_or_path)
-    ):
-        overlay_spec = resolve_model_overlay(model_name_or_path)
-        if overlay_spec is not None:
+    overlay_source_model_id = None
+    if force_diffusers_model and not skip_overlay_resolution:
+        overlay_target = resolve_model_overlay_target(model_name_or_path)
+        if overlay_target is not None:
+            overlay_source_model_id, overlay_spec = overlay_target
             overlay_metadata_dir = download_overlay_metadata(
-                model_name_or_path,
+                overlay_source_model_id,
                 overlay_spec,
                 snapshot_download_fn=snapshot_download,
             )
@@ -616,16 +615,19 @@ def maybe_download_model(
                 source_allow_patterns = cast(
                     list[str] | None, manifest.get("source_allow_patterns")
                 )
-                source_dir = maybe_download_model(
-                    model_name_or_path,
-                    local_dir=local_dir,
-                    download=download,
-                    allow_patterns=source_allow_patterns or allow_patterns,
-                    force_diffusers_model=False,
-                    skip_overlay_resolution=True,
-                )
+                if os.path.exists(model_name_or_path):
+                    source_dir = model_name_or_path
+                else:
+                    source_dir = maybe_download_model(
+                        overlay_source_model_id,
+                        local_dir=local_dir,
+                        download=download,
+                        allow_patterns=source_allow_patterns or allow_patterns,
+                        force_diffusers_model=False,
+                        skip_overlay_resolution=True,
+                    )
                 source_dir = ensure_overlay_source_dir_complete(
-                    source_model_id=model_name_or_path,
+                    source_model_id=overlay_source_model_id,
                     source_dir=source_dir,
                     manifest=manifest,
                     local_dir=local_dir,
@@ -634,7 +636,7 @@ def maybe_download_model(
                     snapshot_download_fn=snapshot_download,
                 )
                 return materialize_overlay_model(
-                    source_model_id=model_name_or_path,
+                    source_model_id=overlay_source_model_id,
                     overlay_spec=overlay_spec,
                     overlay_dir=overlay_metadata_dir,
                     source_dir=source_dir,

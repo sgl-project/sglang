@@ -34,6 +34,7 @@ SUITES = {
         "../unit/test_sampling_params.py",
         "../unit/test_storage.py",
         "../unit/test_lora_format_adapter.py",
+        "../unit/test_model_overlay_materialization.py",
         "../unit/test_server_args.py",
         # add new unit tests here
     ],

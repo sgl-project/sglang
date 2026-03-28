@@ -98,6 +98,24 @@ def resolve_model_overlay(model_name_or_path: str) -> dict[str, Any] | None:
     return registry.get(model_name_or_path)
 
 
+def resolve_model_overlay_target(
+    model_name_or_path: str,
+) -> tuple[str, dict[str, Any]] | None:
+    registry = _load_model_overlay_registry()
+
+    exact = registry.get(model_name_or_path)
+    if exact is not None:
+        return model_name_or_path, exact
+
+    if os.path.exists(model_name_or_path):
+        base_name = os.path.basename(os.path.normpath(model_name_or_path))
+        for source_model_id, spec in registry.items():
+            if base_name == source_model_id.rsplit("/", 1)[-1]:
+                return source_model_id, spec
+
+    return None
+
+
 def load_overlay_manifest_if_present(overlay_dir: str) -> dict[str, Any] | None:
     overlay_manifest_path = os.path.join(
         overlay_dir, "_overlay", "overlay_manifest.json"
