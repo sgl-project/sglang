@@ -45,8 +45,6 @@ class TestMambaCache(CustomTestCase):
             "auto",
             "--mamba-track-interval",
             "256",
-            "--base-gpu-id",
-            "8",
         ]
         cls.process = popen_launch_server(
             cls.model,
