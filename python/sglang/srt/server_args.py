@@ -779,12 +779,6 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
-        if self.enforce_disable_flashinfer_allreduce_fusion:
-            self.enable_flashinfer_allreduce_fusion = False
-            logger.info(
-                "FlashInfer allreduce fusion is forcibly disabled "
-                "via --enforce-disable-flashinfer-allreduce-fusion."
-            )
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -2086,6 +2080,14 @@ class ServerArgs:
             and self.moe_a2a_backend == "none"
         ):
             self.enable_flashinfer_allreduce_fusion = True
+
+        # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
+        if self.enforce_disable_flashinfer_allreduce_fusion:
+            self.enable_flashinfer_allreduce_fusion = False
+            logger.info(
+                "FlashInfer allreduce fusion is forcibly disabled "
+                "via --enforce-disable-flashinfer-allreduce-fusion."
+            )
 
     def _handle_mamba_radix_cache(
         self,
