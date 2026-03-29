@@ -241,11 +241,11 @@ def model_nightly_case_id(model_key: str) -> str:
 def print_model_catalog():
     """Print preset order, model path, and whether each preset maps to nightly."""
     print()
-    print("=" * 112)
+    print("=" * 95)
     print("MODEL PRESETS — Nightly-aligned first, skill-only extras after")
-    print("=" * 112)
+    print("=" * 95)
     print(f"{'Preset':<14} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
-    print("-" * 112)
+    print("-" * 95)
     for model_key, cfg in MODELS.items():
         print(
             f"{model_key:<14} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
