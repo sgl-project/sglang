@@ -1843,10 +1843,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
                 logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
             else:
+                self.kv_cache_dtype = "fp4_e2m1"
+        elif self.server_args.kv_cache_dtype in ("tq2", "tq3", "tq4"):
+            self.kv_cache_dtype = self.server_args.kv_cache_dtype
+            if not _is_hip:
                 logger.warning(
-                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
+                    "TurboQuant KV cache: GPU kernel optimized for AMD MI355X. "
+                    "On NVIDIA, Python fallback will be used (functional but slower)."
                 )
-                self.kv_cache_dtype = self.dtype
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -25,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    MLATokenToKVPoolTQ,
     NSATokenToKVPool,
     ReqToTokenPool,
 )
@@ -69,8 +71,16 @@ _is_npu = is_npu()
 
 
 class ModelRunnerKVCacheMixin:
+    def _kv_element_size(self):
+        """Get element size, handling TQ string dtypes."""
+        if isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith("tq"):
+            return 1  # TQ stores as uint8, actual size handled by pool
+        if isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype == "fp4_e2m1":
+            return 1
+        return torch._utils._element_size(self.kv_cache_dtype)
+
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        kv_size = self._kv_element_size()
         if self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
@@ -321,7 +331,7 @@ class ModelRunnerKVCacheMixin:
         #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
         #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
 
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        kv_size = self._kv_element_size()
 
         # Full layer per-token memory
         full_per_token = (
@@ -524,6 +534,22 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+            elif self.kv_cache_dtype in ("tq2", "tq3", "tq4"):
+                tq_bits = int(self.kv_cache_dtype[2])
+                logger.info(f"Using TurboQuant {tq_bits}-bit KV cache for MLA")
+                self.token_to_kv_pool = MLATokenToKVPoolTQ(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=torch.bfloat16,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    tq_bit_width=tq_bits,
+                )
             else:
                 self.token_to_kv_pool = MLATokenToKVPool(
                     self.max_total_num_tokens,
@@ -631,6 +657,25 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                    )
+                elif self.kv_cache_dtype in ("tq2", "tq3", "tq4"):
+                    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolTQ
+                    tq_bits = int(self.kv_cache_dtype[2])
+                    logger.info(f"Using TurboQuant {tq_bits}-bit KV cache for MHA/GQA")
+                    self.token_to_kv_pool = MHATokenToKVPoolTQ(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=torch.bfloat16,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        tq_bit_width=tq_bits,
                     )
                 else:
                     self.token_to_kv_pool = MHATokenToKVPool(
