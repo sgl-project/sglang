@@ -66,6 +66,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,7 @@ def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
 
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
-    return f"{req.bootstrap_host}:{req.bootstrap_port}"
+    return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
 class DecodeReqToTokenPool:
