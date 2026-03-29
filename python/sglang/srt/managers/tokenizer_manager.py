@@ -776,9 +776,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
         conflicts = set(rids) & self.rid_to_state.keys()
         if conflicts:
-            raise ValueError(
-                f"Duplicate request ID detected: {next(iter(conflicts))}"
-            )
+            raise ValueError(f"Duplicate request IDs detected: {list(conflicts)}")
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]

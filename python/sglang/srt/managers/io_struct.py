@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import uuid
 from abc import ABC
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
@@ -61,8 +62,10 @@ class BaseReq(ABC):
     def _validate_rid_uniqueness(self):
         """Validate that request IDs within a batch are unique."""
         if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
+            counts = Counter(self.rid)
+            duplicates = [rid for rid, count in counts.items() if count > 1]
             raise ValueError(
-                f"Duplicate request IDs detected within the request: {self.rid}"
+                f"Duplicate request IDs detected within the request: {duplicates}"
             )
 
 
