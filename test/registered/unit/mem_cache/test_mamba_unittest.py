@@ -438,9 +438,7 @@ class TestMamba(unittest.TestCase):
             mock_full_lru.assert_called_once_with(5)
             mock_mamba_lru.assert_called_once_with(7)
 
-        seglen_tree, _, _, _ = self._setup_tree_and_allocator(
-            eviction_policy="seglen"
-        )
+        seglen_tree, _, _, _ = self._setup_tree_and_allocator(eviction_policy="seglen")
         with (
             patch.object(
                 seglen_tree, "_evict_full_seglen", return_value=17

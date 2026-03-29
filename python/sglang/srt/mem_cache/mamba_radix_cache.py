@@ -1143,12 +1143,8 @@ class MambaRadixCache(BasePrefixCache):
                 if last_node.mamba_value is not None:
                     self.mamba_lru_list.reset_node_mru(last_node)
         else:
-            self.full_lru_list.reset_node_and_parents_mru(
-                node_update, self.root_node
-            )
-            self.mamba_lru_list.reset_node_and_parents_mru(
-                node_update, self.root_node
-            )
+            self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+            self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
             # This last_access_time is for sanity check, can be deleted after validation in production
             cur_time = get_last_access_time()
