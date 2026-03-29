@@ -307,6 +307,33 @@ class HiCacheFile(HiCacheStorage):
     ):
         self.file_path = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
 
+        # direct_io support:
+        # Optional direct I/O controls from --hicache-storage-backend-extra-config JSON.
+        # Example:
+        # {"direct_io": true, "direct_io_alignment": 4096}
+        #
+        # Design choice for this patch:
+        # - Keep original control flow for set/get as much as possible.
+        # - No automatic fallback in direct I/O mode.
+        # - No proactive alignment/staging logic; rely on kernel/filesystem behavior.
+        extra_config = storage_config.extra_config or {}
+        self._direct_io_requested = bool(extra_config.get("direct_io", False))
+        self._direct_io_alignment = int(extra_config.get("direct_io_alignment", 4096))
+        self._direct_io_available = all(
+            [
+                os.name == "posix",
+                hasattr(os, "O_DIRECT"),
+                hasattr(os, "readv"),
+                hasattr(os, "writev"),
+            ]
+        )
+        self._use_direct_io = self._direct_io_requested
+        if self._direct_io_requested:
+            logger.info(
+                "HiCacheFile direct_io requested. "
+                f"alignment={self._direct_io_alignment}, available={self._direct_io_available}"
+            )
+
         tp_rank, tp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
             storage_config.tp_size,
@@ -346,6 +373,33 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
+            if self._use_direct_io:
+                # New direct I/O branch:
+                # Read directly with O_DIRECT + readv into target tensor byte view.
+                # We intentionally do not add pre-check/alignment-copy in this patch.
+                try:
+                    expected = target_location.numel() * target_location.element_size()
+                    io_view = memoryview(
+                        target_location.view(torch.uint8).contiguous().numpy()
+                    )
+                    fd = os.open(tensor_path, os.O_RDONLY | os.O_DIRECT)
+                    try:
+                        n = os.readv(fd, [io_view])
+                        if n != expected:
+                            raise IOError(f"Short read for {tensor_path}")
+                    finally:
+                        os.close(fd)
+                    return target_location
+                except OSError as e:
+                    logger.error(
+                        "HiCacheFile direct_io read failed for %s: %s. "
+                        "Please disable extra_config['direct_io'] if filesystem/kernel "
+                        "does not support O_DIRECT for this path.",
+                        tensor_path,
+                        e,
+                    )
+                    raise
+            # previous no direct_io path: original buffered readinto path
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
                 buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
@@ -383,6 +437,37 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         try:
+            if self._use_direct_io:
+                # New direct I/O branch:
+                # Write through O_DIRECT + writev from tensor byte view.
+                # We intentionally keep it minimal (no proactive alignment handling).
+                try:
+                    io_view = memoryview(
+                        value.contiguous().view(dtype=torch.uint8).numpy()
+                    )
+                    num_bytes = len(io_view)
+                    fd = os.open(
+                        tensor_path,
+                        os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_DIRECT,
+                        0o644,
+                    )
+                    try:
+                        n = os.writev(fd, [io_view])
+                        if n != num_bytes:
+                            raise IOError(f"Short write for {tensor_path}")
+                    finally:
+                        os.close(fd)
+                    return True
+                except OSError as e:
+                    logger.error(
+                        "HiCacheFile direct_io write failed for %s: %s. "
+                        "Please disable extra_config['direct_io'] if filesystem/kernel "
+                        "does not support O_DIRECT for this path.",
+                        tensor_path,
+                        e,
+                    )
+                    raise
+            # previous no direct_io path: original numpy.tofile buffered write
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
             return True
         except Exception as e:
