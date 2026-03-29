@@ -50,7 +50,6 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
     BatchEmbeddingOutput,
-    BatchMultimodalOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -462,7 +461,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         BatchStrOutput,
                         BatchEmbeddingOutput,
                         BatchTokenIDOutput,
-                        BatchMultimodalOutput,
                     ),
                     self._handle_batch_output,
                 ),
@@ -1541,7 +1539,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         recv_obj: Union[
             BatchStrOutput,
             BatchEmbeddingOutput,
-            BatchMultimodalOutput,
             BatchTokenIDOutput,
         ],
     ):
@@ -1644,8 +1641,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchMultimodalOutput):
-                raise NotImplementedError("BatchMultimodalOut not implemented")
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
@@ -1914,7 +1909,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         recv_obj: Union[
             BatchStrOutput,
             BatchEmbeddingOutput,
-            BatchMultimodalOutput,
             BatchTokenIDOutput,
         ],
         i: int,
@@ -2424,7 +2418,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         recv_obj: Union[
             BatchStrOutput,
             BatchEmbeddingOutput,
-            BatchMultimodalOutput,
             BatchTokenIDOutput,
         ],
         i: int,
