@@ -25,6 +25,7 @@ from sglang.test.test_utils import (
 # Register for AMD CI - GPT-OSS accuracy tests (~30 min)
 register_amd_ci(est_time=1800, suite="nightly-amd-accuracy-8-gpu-gpt-oss", nightly=True)
 
+
 @dataclass
 class ModelConfig:
     """Configuration for a model to test."""

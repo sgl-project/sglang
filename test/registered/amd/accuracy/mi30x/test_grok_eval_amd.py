@@ -31,6 +31,7 @@ register_amd_ci(
     disabled="Split into test_grok1_fp8_eval_amd.py, test_grok1_int4_eval_amd.py, test_grok2_eval_amd.py",
 )
 
+
 @dataclass
 class ModelConfig:
     """Configuration for a model to test."""
