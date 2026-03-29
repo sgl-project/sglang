@@ -76,20 +76,10 @@ from sglang.srt.utils.custom_op import register_custom_op
 if is_flashinfer_available():
     from flashinfer import fp4_quantize
 
-# Try to import FP4 TRTLLM function if flashinfer is available
-trtllm_fp4_block_scale_moe = None
-if get_moe_runner_backend().is_flashinfer_trtllm():
-    try:
-        from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
-    except ImportError:
-        trtllm_fp4_block_scale_moe = None
-
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-logger = logging.getLogger(__name__)
 
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
@@ -692,6 +682,16 @@ class FusedMoE(torch.nn.Module):
             method = self.scheme
         if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
+
+        # For flashinfer TRT-LLM BF16 path, process_weights_after_loading reshapes
+        # expert weights into block layout. During weight update, we must restore
+        # canonical load-time shapes before copying checkpoint tensors.
+        if isinstance(method, UnquantizedFusedMoEMethod):
+            method.maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+                layer=self,
+                param=param,
+                weight_name=weight_name,
+            )
 
         loaded_weight = (
             loaded_weight.t().contiguous()
@@ -1319,6 +1319,8 @@ class FlashInferFP4MoE(FusedMoE):
             hidden_states: Input tensor
             topk_output: TopKOutput object with Bypassed format
         """
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+
         assert isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
 
         assert (

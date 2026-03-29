@@ -47,7 +47,6 @@ jobs:
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
             --out-dir ./diffusion-ci-outputs \
-            --continue-on-error \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
@@ -81,7 +80,6 @@ jobs:
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
             --out-dir ./diffusion-ci-outputs \
-            --continue-on-error \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
@@ -114,4 +112,4 @@ jobs:
       - name: Publish GT images to sglang-bot/sglang-ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-        run: python scripts/ci/utils/publish_diffusion_gt.py --source-dir gt_images
+        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir gt_images
