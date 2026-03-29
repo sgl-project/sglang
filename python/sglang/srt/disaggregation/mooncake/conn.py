@@ -145,9 +145,7 @@ class KVArgsRegisterInfo:
                 else []
             ),
             enable_hisparse=(
-                msg[12].decode("ascii") == "1"
-                if len(msg) > 12 and len(msg[12]) > 0
-                else False
+                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
             ),
         )
 
@@ -187,7 +185,6 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
-            self.enable_hisparse = False
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
@@ -879,7 +876,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
-                            if self.enable_hisparse:
+                            if target_rank_registration_info.enable_hisparse:
                                 ret = self.send_kvcache_hisparse(
                                     req.mooncake_session_id,
                                     kv_chunk.prefill_kv_indices,
@@ -993,8 +990,6 @@ class MooncakeKVManager(CommonKVManager):
                 if room == "None":
                     reg_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     self.decode_kv_args_table[mooncake_session_id] = reg_info
-                    if reg_info.enable_hisparse:
-                        self.enable_hisparse = True
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)

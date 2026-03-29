@@ -87,6 +87,7 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    ttft_event: Optional[asyncio.Event] = None
 
 
 @dataclass
@@ -302,6 +303,8 @@ async def async_request_openai_completions(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+                                    if request_func_input.ttft_event:
+                                        request_func_input.ttft_event.set()
 
                                 # Decoding phase
                                 else:
@@ -330,6 +333,8 @@ async def async_request_openai_completions(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+    if request_func_input.ttft_event and not request_func_input.ttft_event.is_set():
+        request_func_input.ttft_event.set()
     if pbar:
         pbar.update(1)
     return output
@@ -447,6 +452,8 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
+                        if request_func_input.ttft_event:
+                            request_func_input.ttft_event.set()
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -471,6 +478,8 @@ async def async_request_openai_chat_completions(
                                     if ttft == 0.0:
                                         ttft = timestamp - st
                                         output.ttft = ttft
+                                        if request_func_input.ttft_event:
+                                            request_func_input.ttft_event.set()
 
                                     # Decoding phase
                                     else:
@@ -501,6 +510,8 @@ async def async_request_openai_chat_completions(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+    if request_func_input.ttft_event and not request_func_input.ttft_event.is_set():
+        request_func_input.ttft_event.set()
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
         curr_t = time.time()
@@ -668,6 +679,8 @@ async def async_request_sglang_generate(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+                                    if request_func_input.ttft_event:
+                                        request_func_input.ttft_event.set()
 
                                 # Decoding phase
                                 else:
@@ -696,6 +709,8 @@ async def async_request_sglang_generate(
             output.error = "".join(traceback.format_exception(*exc_info))
             print(f"{output.error=}")
 
+    if request_func_input.ttft_event and not request_func_input.ttft_event.is_set():
+        request_func_input.ttft_event.set()
     if pbar:
         pbar.update(1)
     return output
@@ -1338,6 +1353,15 @@ async def benchmark(
         lora_probs = None
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
+    wait_for_batch_ttft = getattr(args, "wait_for_batch_ttft", False)
+    if wait_for_batch_ttft:
+        batch_size = (
+            len(input_requests)
+            if request_rate == float("inf")
+            else max(1, int(request_rate))
+        )
+        batch_events: List[asyncio.Event] = []
+
     async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
@@ -1369,13 +1393,23 @@ async def benchmark(
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
+            ttft_event=asyncio.Event() if wait_for_batch_ttft else None,
         )
+        if wait_for_batch_ttft:
+            batch_events.append(request_func_input.ttft_event)
 
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
+        if wait_for_batch_ttft and len(batch_events) >= batch_size:
+            await asyncio.gather(*(e.wait() for e in batch_events))
+            batch_events = []
+
+    if wait_for_batch_ttft and batch_events:
+        await asyncio.gather(*(e.wait() for e in batch_events))
+
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
@@ -1690,6 +1724,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "mooncake_num_rounds"):
         args.mooncake_num_rounds = 1
+
+    if not hasattr(args, "wait_for_batch_ttft"):
+        args.wait_for_batch_ttft = False
 
     if not hasattr(args, "served_model_name"):
         args.served_model_name = None
@@ -2333,6 +2370,12 @@ if __name__ == "__main__":
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
+    )
+    parser.add_argument(
+        "--wait-for-batch-ttft",
+        action="store_true",
+        help="Wait for all requests in a batch (sized by --request-rate) to receive "
+        "their first token before sending the next batch.",
     )
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."
