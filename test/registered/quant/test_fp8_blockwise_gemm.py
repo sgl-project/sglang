@@ -120,9 +120,6 @@ class TestFP8BlockwiseGemmFlashinferDeepGemm(FP8BlockwiseGemmBase, unittest.Test
     backend = "flashinfer_deepgemm"
 
 
-@unittest.skip(
-    "Temporarily disabled until https://github.com/sgl-project/sglang/pull/19835 is merged"
-)
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestMXFP8GemmTriton(MXFP8GemmBase, unittest.TestCase):
     backend = "triton"
