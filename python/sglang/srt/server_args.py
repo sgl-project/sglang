@@ -2490,8 +2490,21 @@ class ServerArgs:
                             f"KV4 MHA expects attention_backend to be one of "
                             f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.attention_backend}"
                         )
+        elif is_hip():
+            if use_mla_backend:
+                KV4_AMD_MLA_BACKENDS = ["aiter"]
+                if self.attention_backend not in KV4_AMD_MLA_BACKENDS:
+                    logger.warning(
+                        f"MXFP4 KV cache on AMD MLA requires aiter backend, "
+                        f"got {self.attention_backend}. Switching to aiter."
+                    )
+                    self.attention_backend = "aiter"
+            else:
+                raise RuntimeError(
+                    "MXFP4 KV cache on AMD is only supported for MLA models with aiter backend."
+                )
         else:
-            raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
+            raise RuntimeError("KV4 is not tested on this platform.")
 
     def _handle_page_size(self):
         if self.page_size is None:

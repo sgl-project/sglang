@@ -69,8 +69,14 @@ _is_npu = is_npu()
 
 
 class ModelRunnerKVCacheMixin:
+    def _kv_element_size(self):
+        """Get element size, handling string dtype sentinels."""
+        if isinstance(self.kv_cache_dtype, str):
+            return 1  # fp4_e2m1 or tq* sentinel
+        return torch._utils._element_size(self.kv_cache_dtype)
+
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        kv_size = self._kv_element_size()
         if self.use_mla_backend:
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
@@ -321,7 +327,7 @@ class ModelRunnerKVCacheMixin:
         #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
         #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
 
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        kv_size = self._kv_element_size()
 
         # Full layer per-token memory
         full_per_token = (
