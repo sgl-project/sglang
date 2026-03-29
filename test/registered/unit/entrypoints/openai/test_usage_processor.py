@@ -8,9 +8,10 @@ import unittest
 
 from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestDetailsIfCached(unittest.TestCase):
+class TestDetailsIfCached(CustomTestCase):
 
     def test_zero_returns_none(self):
         self.assertIsNone(UsageProcessor._details_if_cached(0))
@@ -24,7 +25,7 @@ class TestDetailsIfCached(unittest.TestCase):
         self.assertEqual(result.cached_tokens, 42)
 
 
-class TestCalculateTokenUsage(unittest.TestCase):
+class TestCalculateTokenUsage(CustomTestCase):
 
     def test_total_equals_sum(self):
         usage = UsageProcessor.calculate_token_usage(
@@ -43,7 +44,7 @@ class TestCalculateTokenUsage(unittest.TestCase):
         self.assertEqual(usage.prompt_tokens_details.cached_tokens, 5)
 
 
-class TestCalculateResponseUsage(unittest.TestCase):
+class TestCalculateResponseUsage(CustomTestCase):
 
     def _make_response(self, prompt_tokens=10, completion_tokens=5, cached_tokens=0):
         return {
@@ -113,7 +114,7 @@ class TestCalculateResponseUsage(unittest.TestCase):
         self.assertEqual(usage.completion_tokens, 0)
 
 
-class TestCalculateStreamingUsage(unittest.TestCase):
+class TestCalculateStreamingUsage(CustomTestCase):
 
     def test_single_choice(self):
         usage = UsageProcessor.calculate_streaming_usage(

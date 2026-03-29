@@ -18,9 +18,10 @@ from sglang.srt.managers.schedule_batch import (
     _compute_pad_value,
     sanity_check_mm_pad_shift_value,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestBaseFinishReason(unittest.TestCase):
+class TestBaseFinishReason(CustomTestCase):
 
     def test_default_is_not_error(self):
         self.assertFalse(BaseFinishReason().is_error)
@@ -29,7 +30,7 @@ class TestBaseFinishReason(unittest.TestCase):
         self.assertTrue(BaseFinishReason(is_error=True).is_error)
 
 
-class TestFinishMatchedToken(unittest.TestCase):
+class TestFinishMatchedToken(CustomTestCase):
 
     def test_to_json_with_int(self):
         result = FINISH_MATCHED_TOKEN(matched=42).to_json()
@@ -43,21 +44,21 @@ class TestFinishMatchedToken(unittest.TestCase):
         self.assertFalse(FINISH_MATCHED_TOKEN(matched=0).is_error)
 
 
-class TestFinishMatchedStr(unittest.TestCase):
+class TestFinishMatchedStr(CustomTestCase):
 
     def test_to_json(self):
         result = FINISH_MATCHED_STR(matched="</s>").to_json()
         self.assertEqual(result, {"type": "stop", "matched": "</s>"})
 
 
-class TestFinishedMatchedRegex(unittest.TestCase):
+class TestFinishedMatchedRegex(CustomTestCase):
 
     def test_to_json(self):
         result = FINISHED_MATCHED_REGEX(matched="pattern.*").to_json()
         self.assertEqual(result, {"type": "stop", "matched": "pattern.*"})
 
 
-class TestFinishLength(unittest.TestCase):
+class TestFinishLength(CustomTestCase):
 
     def test_to_json(self):
         result = FINISH_LENGTH(length=100).to_json()
@@ -67,7 +68,7 @@ class TestFinishLength(unittest.TestCase):
         self.assertFalse(FINISH_LENGTH(length=50).is_error)
 
 
-class TestFinishAbort(unittest.TestCase):
+class TestFinishAbort(CustomTestCase):
 
     def test_default_message(self):
         result = FINISH_ABORT().to_json()
@@ -87,7 +88,7 @@ class TestFinishAbort(unittest.TestCase):
         self.assertTrue(FINISH_ABORT().is_error)
 
 
-class TestModality(unittest.TestCase):
+class TestModality(CustomTestCase):
 
     def test_from_str_valid(self):
         self.assertEqual(Modality.from_str("image"), Modality.IMAGE)
@@ -111,7 +112,7 @@ class TestModality(unittest.TestCase):
         self.assertEqual(len(result), 3)
 
 
-class TestComputePadValue(unittest.TestCase):
+class TestComputePadValue(CustomTestCase):
 
     def test_deterministic(self):
         self.assertEqual(_compute_pad_value(12345), _compute_pad_value(12345))
@@ -123,7 +124,7 @@ class TestComputePadValue(unittest.TestCase):
         self.assertGreaterEqual(_compute_pad_value(0), MM_PAD_SHIFT_VALUE)
 
 
-class TestSanityCheckMmPadShiftValue(unittest.TestCase):
+class TestSanityCheckMmPadShiftValue(CustomTestCase):
 
     def test_valid_vocab_size_passes(self):
         sanity_check_mm_pad_shift_value.cache_clear()

@@ -9,9 +9,10 @@ register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 import unittest
 
 from sglang.srt.managers.template_manager import TemplateManager
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestTemplateManagerInit(unittest.TestCase):
+class TestTemplateManagerInit(CustomTestCase):
 
     def test_defaults(self):
         tm = TemplateManager()
@@ -21,7 +22,7 @@ class TestTemplateManagerInit(unittest.TestCase):
         self.assertFalse(tm.force_reasoning)
 
 
-class TestDetectReasoningPattern(unittest.TestCase):
+class TestDetectReasoningPattern(CustomTestCase):
 
     def test_none_template(self):
         self.assertFalse(TemplateManager()._detect_reasoning_pattern(None))
@@ -40,7 +41,7 @@ class TestDetectReasoningPattern(unittest.TestCase):
         self.assertFalse(TemplateManager()._detect_reasoning_pattern("<think>"))
 
 
-class TestSelectNamedTemplate(unittest.TestCase):
+class TestSelectNamedTemplate(CustomTestCase):
 
     def _make_tokenizer_manager(self, preferred_name=None):
         tm = Mock()
@@ -78,7 +79,7 @@ class TestSelectNamedTemplate(unittest.TestCase):
         self.assertEqual(result, "tmpl_a")
 
 
-class TestResolveHfChatTemplate(unittest.TestCase):
+class TestResolveHfChatTemplate(CustomTestCase):
 
     def test_string_template_returned(self):
         tm = TemplateManager()
@@ -126,7 +127,7 @@ class TestResolveHfChatTemplate(unittest.TestCase):
         self.assertEqual(tm._resolve_hf_chat_template(tok_mgr), "tmpl_a")
 
 
-class TestGuessFromModelPath(unittest.TestCase):
+class TestGuessFromModelPath(CustomTestCase):
 
     @patch("sglang.srt.managers.template_manager.get_conv_template_by_model_path")
     def test_known_model_sets_name(self, mock_get):

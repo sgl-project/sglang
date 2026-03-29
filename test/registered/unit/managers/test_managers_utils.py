@@ -9,6 +9,7 @@ register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 import unittest
 
 from sglang.srt.managers.utils import get_alloc_len_per_decode, validate_input_length
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_req(input_ids):
@@ -17,7 +18,7 @@ def _make_req(input_ids):
     return req
 
 
-class TestValidateInputLength(unittest.TestCase):
+class TestValidateInputLength(CustomTestCase):
 
     def test_within_limit(self):
         req = _make_req(range(10))
@@ -71,7 +72,7 @@ def _make_server_args(
     return args
 
 
-class TestGetAllocLenPerDecode(unittest.TestCase):
+class TestGetAllocLenPerDecode(CustomTestCase):
 
     def test_no_speculative_returns_one(self):
         args = _make_server_args()

@@ -20,13 +20,14 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     infer_type_from_json_schema,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_tool(name, parameters=None):
     return Tool(function=Function(name=name, parameters=parameters))
 
 
-class TestFindCommonPrefix(unittest.TestCase):
+class TestFindCommonPrefix(CustomTestCase):
 
     def test_identical_strings(self):
         self.assertEqual(_find_common_prefix("abc", "abc"), "abc")
@@ -50,7 +51,7 @@ class TestFindCommonPrefix(unittest.TestCase):
         self.assertEqual(_find_common_prefix("abcdef", "ab"), "ab")
 
 
-class TestIsCompleteJson(unittest.TestCase):
+class TestIsCompleteJson(CustomTestCase):
 
     def test_valid_object(self):
         self.assertTrue(_is_complete_json('{"key": "value"}'))
@@ -77,7 +78,7 @@ class TestIsCompleteJson(unittest.TestCase):
         self.assertFalse(_is_complete_json('{"a": {"b": [1, 2'))
 
 
-class TestInferTypeFromJsonSchema(unittest.TestCase):
+class TestInferTypeFromJsonSchema(CustomTestCase):
 
     def test_direct_type_string(self):
         self.assertEqual(infer_type_from_json_schema({"type": "string"}), "string")
@@ -161,7 +162,7 @@ class TestInferTypeFromJsonSchema(unittest.TestCase):
         self.assertIsNone(infer_type_from_json_schema({}))
 
 
-class TestGetToolSchema(unittest.TestCase):
+class TestGetToolSchema(CustomTestCase):
 
     def test_with_parameters(self):
         tool = _make_tool(
@@ -186,7 +187,7 @@ class TestGetToolSchema(unittest.TestCase):
         )
 
 
-class TestGetToolSchemaDefs(unittest.TestCase):
+class TestGetToolSchemaDefs(CustomTestCase):
 
     def test_no_defs(self):
         tools = [_make_tool("a", {"type": "object"})]
@@ -214,7 +215,7 @@ class TestGetToolSchemaDefs(unittest.TestCase):
         self.assertEqual(_get_tool_schema_defs(tools), {})
 
 
-class TestGetJsonSchemaConstraint(unittest.TestCase):
+class TestGetJsonSchemaConstraint(CustomTestCase):
 
     def test_specific_tool_choice(self):
         tools = [

@@ -14,9 +14,10 @@ from sglang.srt.entrypoints.openai.utils import (
     process_routed_experts_from_ret,
     to_openai_style_logprobs,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestToOpenaiStyleLogprobs(unittest.TestCase):
+class TestToOpenaiStyleLogprobs(CustomTestCase):
 
     def test_all_none_returns_empty_logprobs(self):
         result = to_openai_style_logprobs()
@@ -53,7 +54,7 @@ class TestToOpenaiStyleLogprobs(unittest.TestCase):
         self.assertEqual(result.top_logprobs[1], {"z": -0.2})
 
 
-class TestProcessHiddenStates(unittest.TestCase):
+class TestProcessHiddenStates(CustomTestCase):
 
     def _make_request(self, return_hidden_states=False):
         req = Mock()
@@ -83,7 +84,7 @@ class TestProcessHiddenStates(unittest.TestCase):
         self.assertEqual(result, [])
 
 
-class TestProcessRoutedExperts(unittest.TestCase):
+class TestProcessRoutedExperts(CustomTestCase):
 
     def test_no_attribute_returns_none(self):
         req = Mock(spec=[])
@@ -103,7 +104,7 @@ class TestProcessRoutedExperts(unittest.TestCase):
         self.assertIsNone(process_routed_experts_from_ret(ret, req))
 
 
-class TestProcessCachedTokensDetails(unittest.TestCase):
+class TestProcessCachedTokensDetails(CustomTestCase):
 
     def test_no_attribute_returns_none(self):
         req = Mock(spec=[])

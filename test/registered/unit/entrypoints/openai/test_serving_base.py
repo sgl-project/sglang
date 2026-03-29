@@ -9,6 +9,7 @@ register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 import unittest
 
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.test.test_utils import CustomTestCase
 
 
 class _MockTokenizerManager:
@@ -35,7 +36,7 @@ def _make_serving():
     return _ConcreteServingBase(_MockTokenizerManager())
 
 
-class TestParseModelParameter(unittest.TestCase):
+class TestParseModelParameter(CustomTestCase):
 
     def setUp(self):
         self.serving = _make_serving()
@@ -72,7 +73,7 @@ class TestParseModelParameter(unittest.TestCase):
         self.assertIsNone(adapter)
 
 
-class TestResolveLoraPath(unittest.TestCase):
+class TestResolveLoraPath(CustomTestCase):
 
     def setUp(self):
         self.serving = _make_serving()
@@ -95,7 +96,7 @@ class TestResolveLoraPath(unittest.TestCase):
         self.assertEqual(result, ["a", "b"])
 
 
-class TestCreateErrorResponse(unittest.TestCase):
+class TestCreateErrorResponse(CustomTestCase):
 
     def setUp(self):
         self.serving = _make_serving()
