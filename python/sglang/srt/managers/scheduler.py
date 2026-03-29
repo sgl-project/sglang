@@ -39,6 +39,7 @@ from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -3412,7 +3413,7 @@ class IdleSleeper:
 
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith("HEALTH_CHECK")
+    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 def is_work_request(recv_req):

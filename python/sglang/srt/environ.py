@@ -339,6 +339,10 @@ class Envs:
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
+    # None = standard attention. See https://arxiv.org/abs/2512.12087
+    SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     # TODO(mmangkad): Remove this once the FlashInfer unified allreduce-fusion
     # transport issue on GB200/GB300 platforms is fixed and verified resolved.
     SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
