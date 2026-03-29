@@ -853,12 +853,12 @@ class MambaRadixCache(BasePrefixCache):
                 x = self.mamba_lru_list.get_prev_no_lock(x)
         return candidates
 
-    def _rank_candidates_with_efficiencies(
+    def _pick_best_candidate_with_efficiency(
         self, candidates: List[TreeNode], efficiencies: List[float]
-    ) -> List[TreeNode]:
-        """Rank candidates using a normalized segment-length and recency score."""
+    ) -> Optional[TreeNode]:
+        """Pick the best candidate using a normalized segment-length and recency score."""
         if not candidates:
-            return []
+            return None
 
         assert len(candidates) == len(
             efficiencies
@@ -878,16 +878,18 @@ class MambaRadixCache(BasePrefixCache):
         ]
         norm_eff = _normalize(efficiencies)
         norm_rec = _normalize(recencies)
-        scored = [
+        return min(
             (
-                self.seglen_eff_weight * eff_score + rec_score,
-                node,
-            )
-            for node, eff_score, rec_score in zip(
-                candidates, norm_eff, norm_rec, strict=True
-            )
-        ]
-        return [node for _, node in sorted(scored, key=lambda item: item[0])]
+                (
+                    self.seglen_eff_weight * eff_score + rec_score,
+                    node,
+                )
+                for node, eff_score, rec_score in zip(
+                    candidates, norm_eff, norm_rec, strict=True
+                )
+            ),
+            key=lambda item: item[0],
+        )[1]
 
     def _evict_mamba_seglen(self, mamba_num: int) -> int:
         """Evict mamba states using replay length from the nearest live anchor."""
@@ -901,11 +903,10 @@ class MambaRadixCache(BasePrefixCache):
             if not candidates:
                 break
 
-            ranked = self._rank_candidates_with_efficiencies(
+            x = self._pick_best_candidate_with_efficiency(
                 candidates,
                 [float(self._get_mamba_recompute_length(node)) for node in candidates],
             )
-            x = ranked[0]
 
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
             assert (
@@ -938,11 +939,10 @@ class MambaRadixCache(BasePrefixCache):
             if not candidates:
                 break
 
-            ranked = self._rank_candidates_with_efficiencies(
+            x = self._pick_best_candidate_with_efficiency(
                 candidates,
                 [float(self._get_mamba_recompute_length(node)) for node in candidates],
             )
-            x = ranked[0]
 
             assert (
                 x != self.root_node
