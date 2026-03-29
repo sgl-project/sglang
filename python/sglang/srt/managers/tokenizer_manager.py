@@ -231,7 +231,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.served_model_name = server_args.served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
-        self.is_image_gen = self.model_config.is_image_gen
+        self.is_image_gen = getattr(self.model_config, "is_image_gen", False)
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
@@ -1194,7 +1194,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self.request_logger.log_finished_request(
                     obj,
                     out,
-                    is_multimodal_gen=self.model_config.is_multimodal_gen,
                     request=request,
                 )
 
