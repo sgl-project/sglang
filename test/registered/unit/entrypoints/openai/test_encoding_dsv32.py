@@ -36,6 +36,7 @@ CustomTestCase = unittest.TestCase
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_tool(name: str, parameters: dict = None) -> dict:
     """Return an OpenAI-format tool dict (matches what render_message receives)."""
     return {
@@ -61,6 +62,7 @@ def _make_tool_call(name: str, arguments: str) -> dict:
 # TestEncodeArgumentsToDsml
 # ---------------------------------------------------------------------------
 
+
 class TestEncodeArgumentsToDsml(CustomTestCase):
 
     def test_string_parameter(self):
@@ -68,7 +70,7 @@ class TestEncodeArgumentsToDsml(CustomTestCase):
         Purpose: string values must carry string="true" and be emitted as-is."""
         tool_call = {"arguments": json.dumps({"city": "Beijing"})}
         result = encode_arguments_to_dsml(tool_call)
-        self.assertIn(f'<{dsml_token}parameter', result)
+        self.assertIn(f"<{dsml_token}parameter", result)
         self.assertIn('name="city"', result)
         self.assertIn('string="true"', result)
         self.assertIn(">Beijing<", result)
@@ -145,6 +147,7 @@ class TestEncodeArgumentsToDsml(CustomTestCase):
 # TestDecodeDsmlToArguments
 # ---------------------------------------------------------------------------
 
+
 class TestDecodeDsmlToArguments(CustomTestCase):
 
     def test_string_decode(self):
@@ -178,6 +181,7 @@ class TestDecodeDsmlToArguments(CustomTestCase):
 
         # Parse the DSML back manually (simple regex approach)
         import re
+
         matches = re.findall(
             rf'<\{dsml_token}parameter name="(.*?)" string="(true|false)">(.*?)</\{dsml_token}parameter>',
             dsml_str,
@@ -195,6 +199,7 @@ class TestDecodeDsmlToArguments(CustomTestCase):
         dsml_str = encode_arguments_to_dsml(tool_call)
 
         import re
+
         matches = re.findall(
             rf'<\{dsml_token}parameter name="(.*?)" string="(true|false)">(.*?)</\{dsml_token}parameter>',
             dsml_str,
@@ -229,6 +234,7 @@ class TestDecodeDsmlToArguments(CustomTestCase):
 # TestRenderTools
 # ---------------------------------------------------------------------------
 
+
 class TestRenderTools(CustomTestCase):
 
     def test_single_tool_rendered(self):
@@ -251,7 +257,8 @@ class TestRenderTools(CustomTestCase):
 
     def test_thinking_tokens_in_template(self):
         """Scenario: Render tools in thinking mode context.
-        Purpose: thinking_start_token and thinking_end_token must appear in instructions."""
+        Purpose: thinking_start_token and thinking_end_token must appear in instructions.
+        """
         tools = [_make_tool("foo")]
         result = render_tools(tools)
         self.assertIn(thinking_start_token, result)
@@ -268,6 +275,7 @@ class TestRenderTools(CustomTestCase):
 # ---------------------------------------------------------------------------
 # TestFindLastUserIndex
 # ---------------------------------------------------------------------------
+
 
 class TestFindLastUserIndex(CustomTestCase):
 
@@ -331,6 +339,7 @@ class TestFindLastUserIndex(CustomTestCase):
 # ---------------------------------------------------------------------------
 # TestRenderMessage
 # ---------------------------------------------------------------------------
+
 
 class TestRenderMessage(CustomTestCase):
 
@@ -463,7 +472,8 @@ class TestRenderMessage(CustomTestCase):
 
     def test_tool_role_first_output(self):
         """Scenario: First tool result following an assistant with one tool call.
-        Purpose: <function_results> block opened and immediately closed for a single call."""
+        Purpose: <function_results> block opened and immediately closed for a single call.
+        """
         tool_calls = [_make_tool_call("search", json.dumps({"q": "x"}))]
         messages = [
             {"role": "user", "content": "Q"},
@@ -562,6 +572,7 @@ class TestRenderMessage(CustomTestCase):
 # ---------------------------------------------------------------------------
 # TestDropThinkingMessages
 # ---------------------------------------------------------------------------
+
 
 class TestDropThinkingMessages(CustomTestCase):
 
@@ -678,7 +689,8 @@ class TestDropThinkingMessages(CustomTestCase):
 
     def test_boundary_at_last_user_index_kept(self):
         """Scenario: Message AT last_user_idx (the user message itself).
-        Purpose: The user message at last_user_idx is kept intact (idx >= last_user_idx)."""
+        Purpose: The user message at last_user_idx is kept intact (idx >= last_user_idx).
+        """
         messages = [
             {"role": "user", "content": "Q"},
         ]
@@ -690,6 +702,7 @@ class TestDropThinkingMessages(CustomTestCase):
 # ---------------------------------------------------------------------------
 # TestEncodeMessages
 # ---------------------------------------------------------------------------
+
 
 class TestEncodeMessages(CustomTestCase):
 
@@ -775,6 +788,7 @@ class TestEncodeMessages(CustomTestCase):
 # TestReadUntilStop
 # ---------------------------------------------------------------------------
 
+
 class TestReadUntilStop(CustomTestCase):
 
     def test_stop_found_at_start(self):
@@ -814,7 +828,8 @@ class TestReadUntilStop(CustomTestCase):
 
     def test_start_index_respected(self):
         """Scenario: Non-zero start index pointing directly before stop token.
-        Purpose: search begins from start index; content between start and stop is empty."""
+        Purpose: search begins from start index; content between start and stop is empty.
+        """
         text = "SKIP_THIS_PARTSTOP content"
         # "SKIP_THIS_PART" is 14 chars; index=14 puts us right at "STOP"
         new_idx, content, matched = _read_until_stop(14, text, ["STOP"])
