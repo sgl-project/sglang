@@ -17,7 +17,6 @@ import faulthandler
 import logging
 import os
 import signal
-import sys
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -1894,7 +1893,7 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            if not self._set_or_validate_priority(req):
+            if not self._validate_priority(req):
                 return
             if self._abort_on_queued_limit(req):
                 return
@@ -1916,14 +1915,9 @@ class Scheduler(
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
-    def _set_or_validate_priority(self, req: Req) -> bool:
-        """Set the default priority value, or abort the request based on the priority scheduling mode."""
-        if self.enable_priority_scheduling and req.priority is None:
-            if self.schedule_low_priority_values_first:
-                req.priority = sys.maxsize
-            else:
-                req.priority = -sys.maxsize - 1
-        elif (
+    def _validate_priority(self, req: Req) -> bool:
+        """Abort the request based on the priority scheduling mode."""
+        if (
             not self.enable_priority_scheduling
             and req.priority is not None
             and self.abort_on_priority_when_disabled

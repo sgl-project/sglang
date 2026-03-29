@@ -45,6 +45,11 @@ class TestPriorityScheduling(CustomTestCase):
                 "--disable-piecewise-cuda-graph",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
+            env={
+                **os.environ,
+                "SGLANG_VALID_PRIORITY_MAX": "100",
+                "SGLANG_VALID_PRIORITY_MIN": "0",
+            },
         )
 
     @classmethod
