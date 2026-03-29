@@ -22,9 +22,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=360, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=200, suite="stage-b-test-2-gpu-large")
 register_amd_ci(
-    est_time=360,
+    est_time=200,
     suite="stage-b-test-2-gpu-large-amd",
     disabled="TP=2 DP=2 routed expert mismatch >15% on AMD; needs TP/DP tuning + concurrency reduction",
 )
