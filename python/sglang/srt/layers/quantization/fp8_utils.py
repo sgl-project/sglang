@@ -280,7 +280,6 @@ if is_blackwell_supported() and is_flashinfer_available():
         input: torch.Tensor,
         _is_sf_swizzled_layout: bool = True,
         alignment: int = 32,
-        _use_8x4_sf_layout: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Fake mode only needs dtypes and output rank to propagate compile graph.
         # The scale tensor shape is not consumed before the following fake mm op.
@@ -300,25 +299,12 @@ if is_blackwell_supported() and is_flashinfer_available():
         input: torch.Tensor,
         is_sf_swizzled_layout: bool = True,
         alignment: int = 32,
-        use_8x4_sf_layout: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if is_sf_swizzled_layout:
-            if use_8x4_sf_layout:
-                return _raw_flashinfer_mxfp8_quantize(
-                    input,
-                    sf_swizzle_layout=SfLayout.layout_8x4,
-                    alignment=alignment,
-                )
-            else:
-                return _raw_flashinfer_mxfp8_quantize(
-                    input,
-                    sf_swizzle_layout=SfLayout.layout_128x4,
-                    alignment=alignment,
-                )
         return _raw_flashinfer_mxfp8_quantize(
             input,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             alignment=alignment,
+            sf_swizzle_layout=SfLayout.layout_128x4,
         )
 
     @register_custom_op(
@@ -964,8 +950,6 @@ def flashinfer_mxfp8_blockscaled_linear(
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """MXFP8 dense linear via FlashInfer mm_mxfp8."""
-    use_8x4_sf_layout = get_fp8_gemm_runner_backend().is_flashinfer_trtllm()
-
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
@@ -980,10 +964,7 @@ def flashinfer_mxfp8_blockscaled_linear(
 
     if input_scale is None:
         q_input, x_scale_u8 = flashinfer_mxfp8_quantize(
-            input_2d,
-            is_sf_swizzled_layout=True,
-            alignment=32,
-            use_8x4_sf_layout=use_8x4_sf_layout,
+            input_2d, is_sf_swizzled_layout=True, alignment=32
         )
     else:
         q_input = input_2d
@@ -1007,7 +988,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             x_scale_u8,
             weight_scale_t,
             out_dtype=output_dtype,
-            use_8x4_sf_layout=use_8x4_sf_layout,
+            use_8x4_sf_layout=False,
             backend="trtllm",
         )
     elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
