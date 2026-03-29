@@ -189,6 +189,7 @@ tl_out/
 # personnal
 work_dirs/
 *.csv
+!python/sglang/test/data/*.csv
 
 !logo.png
 
