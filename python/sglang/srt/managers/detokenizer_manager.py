@@ -228,6 +228,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
+                self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
                 s.decode_ids.extend(recv_obj.decode_ids[i])
