@@ -8,7 +8,6 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.quantization import fp8_utils as fp8_quant_utils
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     per_tensor_quant_mla_fp8,
@@ -228,23 +227,6 @@ class DeepseekMLAForwardMixin:
                 expected_m,
             )
             q_nope_out = q_nope_out[:, :expected_m, :]
-        elif self.use_mxfp8_bmm:
-            q_nope_bmk = q_nope.transpose(0, 1).contiguous()
-            q_nope_mxfp8, q_nope_mxfp8_scale = (
-                fp8_quant_utils.flashinfer_mxfp8_quantize(
-                    q_nope_bmk,
-                    is_sf_swizzled_layout=True,
-                    alignment=32,
-                )
-            )
-            q_nope_out = fp8_quant_utils.flashinfer_bmm_mxfp8(
-                q_nope_mxfp8,
-                self.w_kc,
-                q_nope_mxfp8_scale,
-                self.w_scale_k,
-                q_nope.dtype,
-                backend="cudnn",
-            )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
             if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
@@ -431,27 +413,6 @@ class DeepseekMLAForwardMixin:
             )
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
-            )
-        elif self.use_mxfp8_bmm:
-            attn_output_bmk = attn_output.transpose(0, 1).contiguous()
-            attn_output_mxfp8_bmk, attn_output_mxfp8_scale = (
-                fp8_quant_utils.flashinfer_mxfp8_quantize(
-                    attn_output_bmk,
-                    is_sf_swizzled_layout=True,
-                    alignment=32,
-                )
-            )
-            attn_output_mxfp8 = attn_output_mxfp8_bmk.transpose(1, 2).contiguous()
-            attn_bmm_output_t = fp8_quant_utils.flashinfer_bmm_mxfp8(
-                self.w_vc,
-                attn_output_mxfp8,
-                self.w_scale_v,
-                attn_output_mxfp8_scale,
-                attn_output.dtype,
-                backend="cudnn",
-            )
-            attn_bmm_output = (
-                attn_bmm_output_t.transpose(1, 2).transpose(0, 1).flatten(1, 2)
             )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm

@@ -214,7 +214,6 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
-    from flashinfer import bmm_mxfp8 as _raw_flashinfer_bmm_mxfp8
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
@@ -281,25 +280,13 @@ if is_blackwell_supported() and is_flashinfer_available():
         _is_sf_swizzled_layout: bool = True,
         alignment: int = 32,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Fake mode needs rank- and size-faithful outputs for torch.compile.
-        # The real op flattens all prefix dims into M for scale layout.
-        k_aligned = ((input.shape[-1] + alignment - 1) // alignment) * alignment
+        # Fake mode only needs dtypes and output rank to propagate compile graph.
+        # The scale tensor shape is not consumed before the following fake mm op.
+        k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
         q_input = input.new_empty(
-            (*input.shape[:-1], k_aligned), dtype=torch.float8_e4m3fn
+            (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
         )
-
-        m_total = 1
-        for dim in input.shape[:-1]:
-            m_total *= dim
-
-        if _is_sf_swizzled_layout:
-            m_padded = ((m_total + 128 - 1) // 128) * 128
-            k_for_scale = ((k_aligned + 128 - 1) // 128) * 128
-            scale_numel = (m_padded * k_for_scale) // 32
-        else:
-            scale_numel = m_total * (k_aligned // 32)
-
-        scale = input.new_empty((scale_numel,), dtype=torch.uint8)
+        scale = input.new_empty((1,), dtype=torch.uint8)
         return q_input, scale
 
     @register_custom_op(
@@ -339,33 +326,6 @@ if is_blackwell_supported() and is_flashinfer_available():
             x_scale_u8,
             weight_scale_t,
             out_dtype=out_dtype,
-            backend=backend,
-        )
-
-    @register_custom_op(
-        op_name="flashinfer_bmm_mxfp8",
-        mutates_args=[],
-        fake_impl=lambda q_input, weight_bkn, x_scale_u8, weight_scale_bkn, out_dtype, backend="cudnn": (
-            q_input.new_empty(
-                (q_input.shape[0], q_input.shape[1], weight_bkn.shape[2]),
-                dtype=out_dtype,
-            )
-        ),
-    )
-    def flashinfer_bmm_mxfp8(
-        q_input: torch.Tensor,
-        weight_bkn: torch.Tensor,
-        x_scale_u8: torch.Tensor,
-        weight_scale_bkn: torch.Tensor,
-        out_dtype: torch.dtype,
-        backend: str = "cudnn",
-    ) -> torch.Tensor:
-        return _raw_flashinfer_bmm_mxfp8(
-            q_input,
-            weight_bkn,
-            x_scale_u8,
-            weight_scale_bkn,
-            out_dtype,
             backend=backend,
         )
 

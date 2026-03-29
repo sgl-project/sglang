@@ -484,53 +484,6 @@ class DeepseekV2WeightLoaderMixin:
                     else:
                         weight = w
 
-                    if (
-                        bool(getattr(selected_quant_config, "use_mxfp8", False))
-                        and _is_cuda
-                    ):
-                        from flashinfer import block_scale_interleave
-
-                        w_kc, w_vc = weight.unflatten(
-                            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-                        ).split(
-                            [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
-                        )
-                        ws_kc, ws_vc = weight_scale.unflatten(
-                            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-                        ).split(
-                            [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
-                        )
-                        ws_kc_for_bmm = ws_kc.contiguous()
-                        ws_vc_for_bmm = ws_vc.contiguous()
-
-                        ws_kc_for_bmm = block_scale_interleave(
-                            ws_kc_for_bmm.view(-1, ws_kc_for_bmm.shape[-1])
-                        ).contiguous()
-                        ws_vc_for_bmm = block_scale_interleave(
-                            ws_vc_for_bmm.view(-1, ws_vc_for_bmm.shape[-1])
-                        ).contiguous()
-                        self_attn.w_kc = bind_or_assign(
-                            self_attn.w_kc,
-                            w_kc.contiguous(),
-                        )
-                        self_attn.w_vc = bind_or_assign(
-                            self_attn.w_vc,
-                            w_vc.contiguous(),
-                        )
-                        self_attn.w_scale = None
-                        self_attn.w_scale_k = bind_or_assign(
-                            self_attn.w_scale_k,
-                            ws_kc_for_bmm,
-                        )
-                        self_attn.w_scale_v = bind_or_assign(
-                            self_attn.w_scale_v,
-                            ws_vc_for_bmm,
-                        )
-                        self_attn.use_deep_gemm_bmm = False
-                        self_attn.use_mxfp8_bmm = True
-                        # MXFP8 absorb path is fully initialized above.
-                        continue
-
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
                     if (
                         should_deepgemm_weight_requant_ue8m0(
