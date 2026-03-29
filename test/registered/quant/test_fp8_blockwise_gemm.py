@@ -73,8 +73,6 @@ class MXFP8GemmBase:
             "--trust-remote-code",
             "--fp8-gemm-backend",
             cls.backend,
-            "--attention-backend",
-            "triton",
         ]
         cls.process = popen_launch_server(
             cls.model,
