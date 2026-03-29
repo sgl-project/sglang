@@ -5,96 +5,27 @@ Tests DeepSeek-V3.1 model using few-shot completion benchmark on MI300X.
 Registry: nightly-amd-8-gpu-deepseek-v31 suite
 """
 
-import ast
 import os
-import re
-import time
 import unittest
-
-import numpy as np
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kits.gsm8k_completion_kit import run_gsm8k_benchmark
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - DeepSeek-V3.1 accuracy tests (~60 min)
 register_amd_ci(
     est_time=3600, suite="nightly-amd-accuracy-8-gpu-deepseek-v31", nightly=True
 )
 
-INVALID = -9999999
-
 DEEPSEEK_V31_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V31_MODEL_PATH", "deepseek-ai/DeepSeek-V3-0324"
 )
-
-
-def get_one_example(lines, i, include_answer):
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
-    if include_answer:
-        ret += " " + lines[i]["answer"]
-    return ret
-
-
-def get_few_shot_examples(lines, k):
-    ret = ""
-    for i in range(k):
-        ret += get_one_example(lines, i, True) + "\n\n"
-    return ret
-
-
-def get_answer_value(answer_str):
-    answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"\d+", answer_str)
-    if len(numbers) < 1:
-        return INVALID
-    try:
-        return ast.literal_eval(numbers[-1])
-    except SyntaxError:
-        return INVALID
-
-
-def run_gsm8k_benchmark(base_url, num_questions=200, num_shots=5, parallel=64):
-    import sglang as sgl
-    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    data_path = download_and_cache_file(url)
-    lines = list(read_jsonl(data_path))
-
-    few_shot_examples = get_few_shot_examples(lines, num_shots)
-    questions = []
-    labels = []
-    for i in range(len(lines[:num_questions])):
-        questions.append(get_one_example(lines, i, False))
-        labels.append(get_answer_value(lines[i]["answer"]))
-    arguments = [{"question": q} for q in questions]
-
-    @sgl.function
-    def few_shot_gsm8k(s, question):
-        s += few_shot_examples + question
-        s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
-        )
-
-    backend = RuntimeEndpoint(base_url)
-    sgl.set_default_backend(backend)
-
-    tic = time.perf_counter()
-    states = few_shot_gsm8k.run_batch(
-        arguments, temperature=0, num_threads=parallel, progress_bar=True
-    )
-    latency = time.perf_counter() - tic
-
-    preds = [get_answer_value(states[i]["answer"]) for i in range(len(states))]
-    acc = np.mean(np.array(preds) == np.array(labels))
-    return float(acc), float(latency)
 
 
 class TestDeepSeekV31EvalAMD(unittest.TestCase):
@@ -132,7 +63,7 @@ class TestDeepSeekV31EvalAMD(unittest.TestCase):
         )
 
         try:
-            acc, latency = run_gsm8k_benchmark(
+            acc, _invalid, latency = run_gsm8k_benchmark(
                 self.base_url, num_questions=self.num_questions
             )
             passed = acc >= self.accuracy_threshold

@@ -6,23 +6,19 @@ using few-shot completion benchmark on MI35x.
 Registry: nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion suite
 """
 
-import ast
 import os
 
 # Set HF cache for MI35x
 os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
 os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 
-import re
-import time
 import unittest
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
-
-import numpy as np
+from typing import List, Optional
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kits.gsm8k_completion_kit import run_gsm8k_benchmark
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -30,7 +26,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
-from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - MI35x DeepSeek-R1-MXFP4 AllReduce Fusion accuracy test (~60 min)
 register_amd_ci(
@@ -38,8 +33,6 @@ register_amd_ci(
     suite="nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion",
     nightly=True,
 )
-
-INVALID = -9999999
 
 # Model path configuration for MI35x DeepSeek-R1-MXFP4
 # Priority: 1) env var, 2) local path, 3) HuggingFace model ID
@@ -105,81 +98,6 @@ def get_mxfp4_models() -> List[ModelConfig]:
             env_vars={"SGLANG_USE_AITER": "1"},
         ),
     ]
-
-
-def get_one_example(lines, i, include_answer):
-    """Format a single GSM8K example."""
-    ret = "Question: " + lines[i]["question"] + "\nAnswer:"
-    if include_answer:
-        ret += " " + lines[i]["answer"]
-    return ret
-
-
-def get_few_shot_examples(lines, k):
-    """Get k few-shot examples for prompting."""
-    ret = ""
-    for i in range(k):
-        ret += get_one_example(lines, i, True) + "\n\n"
-    return ret
-
-
-def get_answer_value(answer_str):
-    """Extract numerical answer from response."""
-    answer_str = answer_str.replace(",", "")
-    numbers = re.findall(r"\d+", answer_str)
-    if len(numbers) < 1:
-        return INVALID
-    try:
-        return ast.literal_eval(numbers[-1])
-    except SyntaxError:
-        return INVALID
-
-
-def run_gsm8k_benchmark(
-    base_url: str,
-    num_questions: int = 200,
-    num_shots: int = 5,
-    parallel: int = 64,
-) -> Tuple[float, float, float]:
-    """Run GSM8K few-shot completion benchmark."""
-    import sglang as sgl
-    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    data_path = download_and_cache_file(url)
-    lines = list(read_jsonl(data_path))
-
-    few_shot_examples = get_few_shot_examples(lines, num_shots)
-
-    questions = []
-    labels = []
-    for i in range(len(lines[:num_questions])):
-        questions.append(get_one_example(lines, i, False))
-        labels.append(get_answer_value(lines[i]["answer"]))
-    assert all(l != INVALID for l in labels)
-    arguments = [{"question": q} for q in questions]
-
-    @sgl.function
-    def few_shot_gsm8k(s, question):
-        s += few_shot_examples + question
-        s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
-        )
-
-    backend = RuntimeEndpoint(base_url)
-    sgl.set_default_backend(backend)
-
-    tic = time.perf_counter()
-    states = few_shot_gsm8k.run_batch(
-        arguments, temperature=0, num_threads=parallel, progress_bar=True
-    )
-    latency = time.perf_counter() - tic
-
-    preds = [get_answer_value(states[i]["answer"]) for i in range(len(states))]
-    acc = np.mean(np.array(preds) == np.array(labels))
-    invalid = np.mean(np.array(preds) == INVALID)
-
-    return float(acc), float(invalid), float(latency)
 
 
 class TestDeepSeekR1MXFP4ArFusionEvalMI35x(unittest.TestCase):
