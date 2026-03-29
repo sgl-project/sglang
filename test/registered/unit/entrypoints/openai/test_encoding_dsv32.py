@@ -6,6 +6,7 @@ and _read_until_stop.
 """
 
 import json
+import re
 import unittest
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import (
@@ -56,6 +57,20 @@ def _make_tool_call(name: str, arguments: str) -> dict:
         "type": "function",
         "function": {"name": name, "arguments": arguments},
     }
+
+
+def _parse_dsml_args(dsml_str: str) -> dict:
+    """Parse a DSML-encoded parameter string into a tool_args dict.
+
+    Returns a mapping of parameter name -> (value, is_string) tuples,
+    matching the format expected by decode_dsml_to_arguments.
+    """
+    pattern = (
+        rf"<{dsml_token}parameter"
+        rf' name="(.*?)" string="(true|false)">(.*?)</{dsml_token}parameter>'
+    )
+    matches = re.findall(pattern, dsml_str, flags=re.DOTALL)
+    return {m[0]: (m[2], m[1]) for m in matches}
 
 
 # ---------------------------------------------------------------------------
@@ -178,16 +193,7 @@ class TestDecodeDsmlToArguments(CustomTestCase):
         original_args = json.dumps({"name": "Alice"})
         tool_call = {"arguments": original_args}
         dsml_str = encode_arguments_to_dsml(tool_call)
-
-        # Parse the DSML back manually (simple regex approach)
-        import re
-
-        matches = re.findall(
-            rf'<\{dsml_token}parameter name="(.*?)" string="(true|false)">(.*?)</\{dsml_token}parameter>',
-            dsml_str,
-            flags=re.DOTALL,
-        )
-        tool_args = {m[0]: (m[2], m[1]) for m in matches}
+        tool_args = _parse_dsml_args(dsml_str)
         decoded = decode_dsml_to_arguments("f", tool_args)
         self.assertEqual(json.loads(decoded["arguments"])["name"], "Alice")
 
@@ -197,15 +203,7 @@ class TestDecodeDsmlToArguments(CustomTestCase):
         original_args = json.dumps({"n": 7})
         tool_call = {"arguments": original_args}
         dsml_str = encode_arguments_to_dsml(tool_call)
-
-        import re
-
-        matches = re.findall(
-            rf'<\{dsml_token}parameter name="(.*?)" string="(true|false)">(.*?)</\{dsml_token}parameter>',
-            dsml_str,
-            flags=re.DOTALL,
-        )
-        tool_args = {m[0]: (m[2], m[1]) for m in matches}
+        tool_args = _parse_dsml_args(dsml_str)
         decoded = decode_dsml_to_arguments("f", tool_args)
         self.assertEqual(json.loads(decoded["arguments"])["n"], 7)
 
