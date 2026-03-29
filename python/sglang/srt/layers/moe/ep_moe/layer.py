@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.utils import FusedMoEMode, npu_format_cast
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -528,23 +528,62 @@ class NpuFuseEPMoE(DeepEPMoE):
 
         return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1 :])
 
+    def release_weight_cache(self, weight: torch.Tensor):
+        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
+        origin_weight = weight.data.transpose(1, 2)
+        new_weight = origin_weight.contiguous()
+        origin_weight.untyped_storage().resize_(0)
+        return new_weight
+
+    def scale_from_float_to_int64(self, scale):
+        import numpy as np
+
+        scale = torch.from_numpy(
+            np.frombuffer(
+                scale.cpu().to(torch.float32).numpy().tobytes(), dtype=np.int32
+            ).astype(np.int64)
+        ).to(scale.device)
+        return torch.nn.Parameter(scale, requires_grad=False)
+
     def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()
-        layer.w13_weight.data = self.reshape_w13_weight(cpu_w13, -1).npu()
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
+        if (
+            envs.SGLANG_NPU_FUSED_MOE_MODE.get()
+            == FusedMoEMode.DISPATCH_FFN_COMBINE.value
+        ):
+            w13_weight = self.release_weight_cache(layer.w13_weight)
+            layer.w13_weight.data = npu_format_cast(w13_weight)
+            w2_weight = self.release_weight_cache(layer.w2_weight)
+            layer.w2_weight.data = npu_format_cast(w2_weight)
 
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
+            layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(
+                layer.w13_weight_scale.data.shape[0], -1
+            )
+            w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
+            layer.w2_weight_scale = torch.nn.Parameter(
+                w2_scale.to(torch.float32), requires_grad=False
+            )
 
-        w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
-        w13_scale = self.permute_w13_weight_scale(w13_scale, 128)
-        layer.w13_weight_scale = torch.nn.Parameter(
-            w13_scale.to(torch.float32), requires_grad=False
-        )
+            layer.w13_weight_scale = self.scale_from_float_to_int64(
+                layer.w13_weight_scale.data
+            )
+            layer.w2_weight_scale = self.scale_from_float_to_int64(
+                layer.w2_weight_scale.data
+            )
+        else:
+            cpu_w13 = layer.w13_weight.data.transpose(1, 2).cpu()
+            layer.w13_weight.data = self.reshape_w13_weight(cpu_w13, -1).npu()
+            w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
+            w13_scale = self.permute_w13_weight_scale(w13_scale, 128)
+            layer.w13_weight_scale = torch.nn.Parameter(
+                w13_scale.to(torch.float32), requires_grad=False
+            )
+            layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
+            layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
-        w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
-        layer.w2_weight_scale = torch.nn.Parameter(
-            w2_scale.to(torch.float32), requires_grad=False
-        )
+            w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
+            layer.w2_weight_scale = torch.nn.Parameter(
+                w2_scale.to(torch.float32), requires_grad=False
+            )
 
         if hasattr(layer, "w13_weight_offset"):
             layer.w13_weight_offset = torch.nn.Parameter(
@@ -653,17 +692,14 @@ class MoriEPMoE(DeepEPMoE):
 
         quant_type = QuantType.No
 
-        is_bf16_weights = self.w13_weight.dtype == torch.bfloat16
-
         if (
             not is_fp8_quant
             and dispatch_scale is not None
             and dispatch_a1.dtype != torch.float4_e2m1fn_x2
         ):
-            if is_quark_w4a4 or is_bf16_weights:
-                # W4A4 or BF16 weights with FP8 dispatch: must dequant FP8->BF16 first.
-                # W4A4 needs BF16 input for the FP4 per_1x32 path;
-                # BF16 weights don't support quantized activations.
+            if is_quark_w4a4:
+                # W4A4 model with FP8 dispatch: must dequant FP8->BF16 first,
+                # because the FP4 per_1x32 quantization path needs BF16 input
                 dispatch_a1 = upscale(
                     dispatch_a1, dispatch_scale, dispatch_recv_token_num, output_dtype
                 )
@@ -674,9 +710,10 @@ class MoriEPMoE(DeepEPMoE):
                 quant_type = QuantType.per_128x128
 
         if dispatch_a1.dtype == torch.float4_e2m1fn_x2 and dispatch_scale is not None:
-            if is_fp8_quant or is_bf16_weights:
-                # FP8/BF16 weights + FP4 dispatch: no kernel supports fp4 act + fp8/bf16 weight.
-                # Must dequant FP4->BF16 first.
+            if is_fp8_quant:
+                # FP8 weights + FP4 dispatch is not supported by fused_moe kernels
+                # (no kernel for q_dtype_a=fp4x2, q_dtype_w=fp8).
+                # Must dequant FP4->BF16 first; fused_moe will re-quant to FP8 internally.
                 dispatch_a1 = upscale_mxfp4(
                     dispatch_a1, dispatch_scale, dispatch_recv_token_num, output_dtype
                 )

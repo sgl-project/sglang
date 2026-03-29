@@ -449,15 +449,9 @@ class GlmImageAttention(torch.nn.Module):
             assert (
                 text_attn_mask.dim() == 2
             ), "the shape of text_attn_mask should be (batch_size, text_seq_length)"
-            text_attn_mask = text_attn_mask.float().to(query.device)
-            mix_attn_mask = torch.ones(
-                (batch_size, text_seq_length + image_seq_length), device=query.device
-            )
-            mix_attn_mask[:, :text_seq_length] = text_attn_mask
-            mix_attn_mask = mix_attn_mask.unsqueeze(2)
-            attn_mask_matrix = mix_attn_mask @ mix_attn_mask.transpose(1, 2)
-            attention_mask = (attn_mask_matrix > 0).unsqueeze(1).to(query.dtype)
-        hidden_states = self.attn(query, key, value)
+        hidden_states = self.attn(
+            query, key, value, num_replicated_prefix=text_seq_length
+        )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
