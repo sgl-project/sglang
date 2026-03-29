@@ -510,10 +510,7 @@ class UpdateWeightFromTensorChecker2GPUTest(unittest.TestCase):
         )
         self.assertEqual(check_status, 400, check_result)
         self.assertFalse(check_result.get("success", True), check_result)
-        self.assertIn(
-            "failed update_weight_from_tensor_checker",
-            check_result.get("message", ""),
-        )
+        self.assertIn("checksum mismatch", check_result.get("message", ""))
         self.assertIn(selected_updated_tensors[0][0], check_result.get("message", ""))
 
 
