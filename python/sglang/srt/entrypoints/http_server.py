@@ -178,6 +178,7 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -1988,6 +1989,7 @@ def _setup_and_run_http_server(
     template_manager,
     port_args: PortArgs,
     scheduler_infos: List[Dict],
+    subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
@@ -2009,6 +2011,10 @@ def _setup_and_run_http_server(
             remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
         )
     )
+
+    # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
+    if tokenizer_manager is not None:
+        tokenizer_manager._subprocess_watchdog = subprocess_watchdog
 
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
@@ -2180,13 +2186,17 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
-    tokenizer_manager, template_manager, port_args, scheduler_init_result = (
-        Engine._launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
+    (
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result,
+        subprocess_watchdog,
+    ) = Engine._launch_subprocesses(
+        server_args=server_args,
+        init_tokenizer_manager_func=init_tokenizer_manager_func,
+        run_scheduler_process_func=run_scheduler_process_func,
+        run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
     _setup_and_run_http_server(
@@ -2195,6 +2205,7 @@ def launch_server(
         template_manager,
         port_args,
         scheduler_init_result.scheduler_infos,
+        subprocess_watchdog,
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
     )

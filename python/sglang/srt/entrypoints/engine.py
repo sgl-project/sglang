@@ -17,6 +17,8 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements python APIs for the inference engine.
 """
 
+from __future__ import annotations
+
 import asyncio
 import atexit
 import dataclasses
@@ -98,6 +100,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -185,6 +188,7 @@ class Engine(EngineBase):
             template_manager,
             port_args,
             scheduler_init_result,
+            subprocess_watchdog,
         ) = self._launch_subprocesses(
             server_args=server_args,
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
@@ -194,6 +198,8 @@ class Engine(EngineBase):
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
+        if tokenizer_manager is not None:
+            tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
@@ -505,9 +511,13 @@ class Engine(EngineBase):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
-    ) -> SchedulerInitResult:
+    ) -> Tuple[SchedulerInitResult, Optional[List]]:
         """Launch scheduler processes using multiprocessing.
         Override in subclasses for different backends (e.g. Ray).
+
+        Returns:
+            Tuple of (SchedulerInitResult, scheduler_procs).
+            scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
 
@@ -592,10 +602,13 @@ class Engine(EngineBase):
                     f"terminated with {proc.exitcode}"
                 )
 
-        return SchedulerInitResult(
-            scheduler_infos=scheduler_infos,
-            wait_for_ready=wait_for_ready,
-            wait_for_completion=wait_for_completion,
+        return (
+            SchedulerInitResult(
+                scheduler_infos=scheduler_infos,
+                wait_for_ready=wait_for_ready,
+                wait_for_completion=wait_for_completion,
+            ),
+            scheduler_procs,
         )
 
     @classmethod
@@ -606,11 +619,17 @@ class Engine(EngineBase):
         run_scheduler_process_func: Callable,
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
-    ) -> Tuple[TokenizerManager, TemplateManager, PortArgs, SchedulerInitResult]:
+    ) -> Tuple[
+        TokenizerManager,
+        TemplateManager,
+        PortArgs,
+        SchedulerInitResult,
+        Optional[SubprocessWatchdog],
+    ]:
         """Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
 
         Returns:
-            Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result).
+            Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog).
         """
         # Configure global environment
         configure_logger(server_args)
@@ -624,7 +643,7 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Launch scheduler processes
-        scheduler_init_result = cls._launch_scheduler_processes(
+        scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
         )
 
@@ -646,6 +665,7 @@ class Engine(EngineBase):
                     None,
                     port_args,
                     scheduler_init_result,
+                    None,
                 )
 
             launch_dummy_health_check_server(
@@ -658,6 +678,7 @@ class Engine(EngineBase):
                 None,
                 port_args,
                 scheduler_init_result,
+                None,
             )
 
         # Launch detokenizer process
@@ -688,15 +709,32 @@ class Engine(EngineBase):
             "max_req_input_len"
         ]
 
+        # Set up subprocess liveness watchdog to detect crashes
+        # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+        processes = list(scheduler_procs or [])
+        names = [f"scheduler_{i}" for i in range(len(processes))]
+        processes.append(detoken_proc)
+        names.append("detokenizer")
+        subprocess_watchdog = SubprocessWatchdog(
+            processes=processes, process_names=names
+        )
+        subprocess_watchdog.start()
+
         return (
             tokenizer_manager,
             template_manager,
             port_args,
             scheduler_init_result,
+            subprocess_watchdog,
         )
 
     def shutdown(self):
         """Shutdown the engine"""
+        if (
+            self.tokenizer_manager is not None
+            and self.tokenizer_manager._subprocess_watchdog is not None
+        ):
+            self.tokenizer_manager._subprocess_watchdog.stop()
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):

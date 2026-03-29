@@ -213,6 +213,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation()
 
+        # Subprocess liveness watchdog — set by Engine or http_server after construction
+        self._subprocess_watchdog = None
+
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
 
@@ -2562,6 +2565,10 @@ class SignalHandler:
         logger.error(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
+        # Stop subprocess watchdog before killing processes to prevent false-positive
+        # crash detection during normal shutdown
+        if self.tokenizer_manager._subprocess_watchdog is not None:
+            self.tokenizer_manager._subprocess_watchdog.stop()
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())
 
