@@ -1,10 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-from math import prod
 from typing import Optional, Tuple, Union
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.activations import get_activation
@@ -17,7 +15,6 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
-    get_sp_parallel_rank,
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
@@ -969,7 +966,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         if self.use_parallel_decode and get_sp_world_size() > 1:
             num_frame = z.shape[2]
             num_sample_frames = (num_frame - 1) * self.temporal_compression_ratio + 1
-            decoded = self.parallel_tiled_decode(z)[:, :, :num_sample_frames]
+            decoded = super().parallel_tiled_decode(z)[:, :, :num_sample_frames]
             return DecoderOutput(sample=decoded)
 
         return DecoderOutput(sample=self._decode(z))
@@ -1027,197 +1024,6 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             decoded = self._decode_with_parallel_dispatch(z).sample
 
         return decoded
-
-    def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
-        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
-        if blend_extent <= 0:
-            return b
-        weight = (
-            torch.arange(blend_extent, device=b.device, dtype=b.dtype) / blend_extent
-        ).view(1, 1, 1, blend_extent, 1)
-        b[:, :, :, :blend_extent, :] = (
-            a[:, :, :, -blend_extent:, :] * (1 - weight)
-            + b[:, :, :, :blend_extent, :] * weight
-        )
-        return b
-
-    def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
-        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
-        if blend_extent <= 0:
-            return b
-        weight = (
-            torch.arange(blend_extent, device=b.device, dtype=b.dtype) / blend_extent
-        ).view(1, 1, 1, 1, blend_extent)
-        b[:, :, :, :, :blend_extent] = (
-            a[:, :, :, :, -blend_extent:] * (1 - weight)
-            + b[:, :, :, :, :blend_extent] * weight
-        )
-        return b
-
-    def parallel_tiled_decode(self, z: torch.FloatTensor) -> torch.FloatTensor:
-        world_size, rank = get_sp_world_size(), get_sp_parallel_rank()
-        _, _, T, H, W = z.shape
-
-        tile_latent_min_height = (
-            self.tile_sample_min_height // self.spatial_compression_ratio
-        )
-        tile_latent_min_width = (
-            self.tile_sample_min_width // self.spatial_compression_ratio
-        )
-        tile_latent_min_num_frames = (
-            self.tile_sample_min_num_frames // self.temporal_compression_ratio
-        )
-        tile_latent_stride_height = (
-            self.tile_sample_stride_height // self.spatial_compression_ratio
-        )
-        tile_latent_stride_width = (
-            self.tile_sample_stride_width // self.spatial_compression_ratio
-        )
-        tile_latent_stride_num_frames = (
-            self.tile_sample_stride_num_frames // self.temporal_compression_ratio
-        )
-
-        blend_height = self.tile_sample_min_height - self.tile_sample_stride_height
-        blend_width = self.tile_sample_min_width - self.tile_sample_stride_width
-
-        num_t_tiles = (
-            T + tile_latent_stride_num_frames - 1
-        ) // tile_latent_stride_num_frames
-        num_h_tiles = (H + tile_latent_stride_height - 1) // tile_latent_stride_height
-        num_w_tiles = (W + tile_latent_stride_width - 1) // tile_latent_stride_width
-        total_spatial_tiles = num_h_tiles * num_w_tiles
-        total_tiles = num_t_tiles * total_spatial_tiles
-
-        tiles_per_rank = (total_tiles + world_size - 1) // world_size
-        start_tile_idx = rank * tiles_per_rank
-        end_tile_idx = min((rank + 1) * tiles_per_rank, total_tiles)
-
-        local_results = []
-        local_dim_metadata = []
-        for global_idx in range(start_tile_idx, end_tile_idx):
-            t_idx = global_idx // total_spatial_tiles
-            spatial_idx = global_idx % total_spatial_tiles
-            h_idx = spatial_idx // num_w_tiles
-            w_idx = spatial_idx % num_w_tiles
-
-            t_start = t_idx * tile_latent_stride_num_frames
-            h_start = h_idx * tile_latent_stride_height
-            w_start = w_idx * tile_latent_stride_width
-
-            tile = z[
-                :,
-                :,
-                t_start : t_start + tile_latent_min_num_frames + 1,
-                h_start : h_start + tile_latent_min_height,
-                w_start : w_start + tile_latent_min_width,
-            ]
-            decoded_tile = self._decode(tile)
-            if t_start > 0:
-                decoded_tile = decoded_tile[:, :, 1:, :, :]
-            local_results.append(decoded_tile.reshape(-1))
-            local_dim_metadata.append(decoded_tile.shape)
-
-        if local_results:
-            results = torch.cat(local_results, dim=0).contiguous()
-        else:
-            results = z.new_empty((0,), dtype=z.dtype)
-        del local_results
-
-        local_size = torch.tensor(
-            [results.size(0)], device=results.device, dtype=torch.int64
-        )
-        if rank == 0:
-            gathered_sizes = [
-                torch.zeros(1, device=results.device, dtype=torch.int64)
-                for _ in range(world_size)
-            ]
-        else:
-            gathered_sizes = None
-        dist.gather(local_size, gather_list=gathered_sizes, dst=0)
-
-        if rank == 0:
-            max_size = max(size.item() for size in gathered_sizes)
-        else:
-            max_size = 0
-        max_size_tensor = torch.tensor(
-            [max_size], device=results.device, dtype=torch.int64
-        )
-        dist.broadcast(max_size_tensor, src=0)
-        max_size = int(max_size_tensor.item())
-
-        padded_results = torch.zeros(
-            max_size, device=results.device, dtype=results.dtype
-        )
-        padded_results[: results.size(0)] = results
-        del results
-
-        gathered_dim_metadata = [None] * world_size
-        dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
-        if rank == 0:
-            gathered_results = [
-                torch.empty_like(padded_results) for _ in range(world_size)
-            ]
-        else:
-            gathered_results = None
-        dist.gather(padded_results, gather_list=gathered_results, dst=0)
-
-        if rank == 0:
-            gathered_results = torch.stack(gathered_results, dim=0).contiguous()
-            data: list = [
-                [[[] for _ in range(num_w_tiles)] for _ in range(num_h_tiles)]
-                for _ in range(num_t_tiles)
-            ]
-            global_idx = 0
-            for per_rank_results, per_rank_metadata in zip(
-                gathered_results, gathered_dim_metadata, strict=False
-            ):
-                start_offset = 0
-                for shape in per_rank_metadata:
-                    numel = prod(shape)
-                    current_data = per_rank_results[
-                        start_offset : start_offset + numel
-                    ].reshape(shape)
-                    t_idx = global_idx // total_spatial_tiles
-                    spatial_idx = global_idx % total_spatial_tiles
-                    h_idx = spatial_idx // num_w_tiles
-                    w_idx = spatial_idx % num_w_tiles
-                    data[t_idx][h_idx][w_idx] = current_data
-                    start_offset += numel
-                    global_idx += 1
-
-            result_slices = []
-            last_slice_data = None
-            for i, tem_data in enumerate(data):
-                slice_data = self._merge_spatial_tiles(
-                    tem_data,
-                    blend_height,
-                    blend_width,
-                    self.tile_sample_stride_height,
-                    self.tile_sample_stride_width,
-                )
-                if i > 0:
-                    slice_data = self.blend_t(
-                        last_slice_data, slice_data, self.blend_num_frames
-                    )
-                    result_slices.append(
-                        slice_data[:, :, : self.tile_sample_stride_num_frames, :, :]
-                    )
-                else:
-                    result_slices.append(
-                        slice_data[:, :, : self.tile_sample_stride_num_frames + 1, :, :]
-                    )
-                last_slice_data = slice_data
-            dec = torch.cat(result_slices, dim=2)
-            shape_tensor = torch.tensor(dec.shape, device=dec.device, dtype=torch.int64)
-        else:
-            dec = None
-            shape_tensor = torch.zeros(5, device=z.device, dtype=torch.int64)
-
-        dist.broadcast(shape_tensor, src=0)
-        if rank != 0:
-            dec = z.new_empty(tuple(shape_tensor.tolist()))
-        dist.broadcast(dec, src=0)
-        return dec
 
     def tiled_encode(self, x: torch.Tensor) -> AutoencoderKLOutput:
         r"""Encode a batch of images using a tiled encoder.
