@@ -19,8 +19,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=1000, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=1100, suite="stage-b-test-large-1-gpu-amd")
+register_cuda_ci(est_time=1000, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-large-amd")
 
 
 class TestBenchServing1GPUPart1(CustomTestCase):

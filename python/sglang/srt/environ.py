@@ -194,7 +194,6 @@ class Envs:
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
-    IS_BLACKWELL = EnvBool(False)
     IS_H200 = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
@@ -322,6 +321,7 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -337,10 +337,15 @@ class Envs:
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
-    SGLANG_ENABLE_FLASHINFER_FP8_GEMM = EnvBool(False)
     # Default to the pick from flashinfer
-    SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
+    # None = standard attention. See https://arxiv.org/abs/2512.12087
+    SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    # TODO(mmangkad): Remove this once the FlashInfer unified allreduce-fusion
+    # transport issue on GB200/GB300 platforms is fixed and verified resolved.
+    SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
@@ -405,7 +410,6 @@ class Envs:
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
-    SGLANG_SUPPORT_CUTLASS_BLOCK_FP8 = EnvBool(False)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
 
@@ -546,9 +550,6 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
     _print_deprecated_env(
-        "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
-    )
-    _print_deprecated_env(
         "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
     )
     _print_deprecated_env(
@@ -578,23 +579,6 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
-
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_ENABLE_FLASHINFER_FP8_GEMM",
-    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_ENABLE_FLASHINFER_GEMM",
-    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
-    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_FLASHINFER_FP4_GEMM_BACKEND",
-    "It will be completely removed in 0.5.9. Please use '--fp4-gemm-backend' instead.",
-)
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
     "Please use '--enable-prefill-delayer' instead.",
