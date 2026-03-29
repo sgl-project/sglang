@@ -589,7 +589,7 @@ class ChatCompletionRequest(BaseModel):
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
-        default="medium",
+        default=None,
         description="Constrains effort on reasoning for reasoning models. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
@@ -1443,6 +1443,7 @@ class TranscriptionRequest(BaseModel):
     language: Optional[str] = None
     response_format: str = "json"
     temperature: float = 0.0
+    timestamp_granularities: Optional[List[str]] = None
     stream: bool = False
     # Internal fields (not from API)
     audio_data: Optional[bytes] = None
@@ -1460,6 +1461,26 @@ class TranscriptionResponse(BaseModel):
     """Non-streaming transcription response (OpenAI-compatible)."""
 
     text: str
+    usage: Optional[TranscriptionUsage] = None
+
+
+class TranscriptionSegment(BaseModel):
+    """A segment with timestamp information."""
+
+    id: int
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptionVerboseResponse(BaseModel):
+    """Verbose transcription response with timestamps (OpenAI-compatible)."""
+
+    task: str = "transcribe"
+    language: Optional[str] = None
+    duration: Optional[float] = None
+    text: str
+    segments: List[TranscriptionSegment] = []
     usage: Optional[TranscriptionUsage] = None
 
 

@@ -83,3 +83,34 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     std::optional<bool> pack_gqa_,
     int64_t sm_margin,
     std::optional<const at::Tensor>& sinks_);  // (h)
+
+/*
+ * From flash-attention: get_scheduler_metadata
+ * Precomputes tile scheduling metadata for FA3 so that the prepare_varlen_num_blocks
+ * kernel does not need to run per-layer.
+ */
+at::Tensor mha_fwd_get_scheduler_metadata(
+    int64_t batch_size,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    int64_t num_heads,
+    int64_t num_heads_k,
+    int64_t headdim,
+    int64_t headdim_v,
+    at::ScalarType qkv_dtype,
+    at::Tensor seqused_k,
+    std::optional<at::Tensor> cu_seqlens_q_,
+    std::optional<at::Tensor> cu_seqlens_k_,
+    std::optional<at::Tensor> cu_seqlens_k_new_,
+    std::optional<at::Tensor> seqused_q_,
+    std::optional<at::Tensor> leftpad_k_,
+    std::optional<int64_t> page_size,
+    int64_t max_seqlen_k_new,
+    bool is_causal,
+    int64_t window_size_left,
+    int64_t window_size_right,
+    int64_t attention_chunk,
+    bool has_softcap,
+    int64_t num_splits,
+    std::optional<bool> pack_gqa_,
+    int64_t sm_margin);
