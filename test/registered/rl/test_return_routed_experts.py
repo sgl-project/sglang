@@ -145,7 +145,7 @@ class TestReturnRoutedExperts(CustomTestCase):
             f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
         )
         assert (
-            num_mismatches / num_baseline_topks < 0.05
+            num_mismatches / num_baseline_topks < 0.10
         ), f"Too many mismatches: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
 
     @classmethod

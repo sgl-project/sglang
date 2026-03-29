@@ -162,7 +162,6 @@ class RequestLogger:
         self,
         obj: Union["GenerateReqInput", "EmbeddingReqInput"],
         out: Any,
-        is_multimodal_gen: bool = False,
         request: Optional["fastapi.Request"] = None,
     ) -> None:
         if not self.log_requests:
@@ -181,20 +180,15 @@ class RequestLogger:
             }
             if headers:
                 log_data["headers"] = headers
-            if not is_multimodal_gen:
-                log_data["out"] = _transform_data_for_logging(
-                    out, max_length, out_skip_names
-                )
+            log_data["out"] = _transform_data_for_logging(
+                out, max_length, out_skip_names
+            )
             log_json(self.targets, "request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
                 obj, max_length, skip_names=skip_names
             )
-            out_str = (
-                ""
-                if is_multimodal_gen
-                else f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-            )
+            out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
             headers_str = f", headers={headers}" if headers else ""
             self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 
