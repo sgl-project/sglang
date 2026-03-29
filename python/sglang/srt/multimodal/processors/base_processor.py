@@ -40,6 +40,7 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
+_IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 
 
 @dataclasses.dataclass
@@ -1150,7 +1151,7 @@ class BaseMultimodalProcessor(ABC):
             # post-process
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    sync_flag, available_slice = (
+                    sync_flag, available_slice, byte_offset = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.feature
                         )
@@ -1163,6 +1164,13 @@ class BaseMultimodalProcessor(ABC):
                             data=available_slice,
                             info_data=item.feature,
                             sync_buffer_meta=sync_flag,
+                            pool_ipc_handle=(
+                                self.cudaipc_mmfeature_pool._pool_ipc_handle
+                                if _IPC_POOL_HANDLE_CACHE
+                                else None
+                            ),
+                            pool_byte_offset=byte_offset,
+                            pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
                         )
                     elif not self.server_args.keep_mm_feature_on_device:
                         item.feature = item.feature.cpu()
@@ -1171,7 +1179,7 @@ class BaseMultimodalProcessor(ABC):
                     and item.precomputed_embeddings.is_cuda
                 ):
 
-                    sync_flag, available_slice = (
+                    sync_flag, available_slice, byte_offset = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.precomputed_embeddings
                         )
@@ -1185,6 +1193,13 @@ class BaseMultimodalProcessor(ABC):
                             data=available_slice,
                             info_data=item.precomputed_embeddings,
                             sync_buffer_meta=sync_flag,
+                            pool_ipc_handle=(
+                                self.cudaipc_mmfeature_pool._pool_ipc_handle
+                                if _IPC_POOL_HANDLE_CACHE
+                                else None
+                            ),
+                            pool_byte_offset=byte_offset,
+                            pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
                         )
                     elif not self.server_args.keep_mm_feature_on_device:
                         item.precomputed_embeddings = item.precomputed_embeddings.cpu()
