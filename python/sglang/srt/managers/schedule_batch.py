@@ -366,6 +366,11 @@ class MultimodalInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
 
+    def release_features(self):
+        """Release feature tensors to free GPU memory."""
+        for item in self.mm_items:
+            item.feature = None
+
     @staticmethod
     def from_dict(obj: dict):
         # Check if MM splitting is enabled

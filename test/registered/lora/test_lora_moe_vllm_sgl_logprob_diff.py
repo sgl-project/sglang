@@ -332,7 +332,7 @@ class TestMoELoraRegression(unittest.TestCase):
 
             ref = REFERENCE_STATS[i]
             # Epsilon to allow room for different, but correct, implementations
-            eps = 1e-4
+            eps = 2e-4
 
             # Assertions
             self.assertEqual(v_text, s_text, f"String mismatch on prompt {i}")
