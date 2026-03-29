@@ -173,6 +173,7 @@ class MultimodalSpecialTokens:
 
 class BaseMultimodalProcessor(ABC):
     models = []
+    gpu_image_decode = True  # Enable GPU decoding by default
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -468,8 +469,9 @@ class BaseMultimodalProcessor(ABC):
 
         return estimated_frames_list
 
-    @staticmethod
+    @classmethod
     def _load_single_item(
+        cls,
         data,
         modality: Modality,
         frame_count_limit=None,
@@ -481,7 +483,8 @@ class BaseMultimodalProcessor(ABC):
 
         If data is processor_output or precomputed embedding, return directly.
 
-        Static method that can be pickled for multiprocessing"""
+        Class method that can be pickled for multiprocessing
+        """
         if isinstance(data, dict):
             data_format = data.get("format")
             if data_format in (
@@ -493,8 +496,13 @@ class BaseMultimodalProcessor(ABC):
                 return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
+                img, _ = load_image(data, cls.gpu_image_decode)
+                if (
+                    discard_alpha_channel
+                    and not isinstance(img, torch.Tensor)
+                    and img.mode != "RGB"
+                ):
+                    # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
@@ -535,7 +543,7 @@ class BaseMultimodalProcessor(ABC):
                 type(data),
             )
             future = self.io_executor.submit(
-                BaseMultimodalProcessor._load_single_item,
+                self.__class__._load_single_item,
                 data,
                 modality,
                 None,  # frame_count_limit: no consider for fast path
@@ -595,7 +603,7 @@ class BaseMultimodalProcessor(ABC):
 
                 futures.append(
                     self.io_executor.submit(
-                        BaseMultimodalProcessor._load_single_item,
+                        self.__class__._load_single_item,
                         data,
                         modality,
                         frame_count_limit,
