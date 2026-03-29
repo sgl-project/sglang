@@ -1,13 +1,10 @@
 """Unit tests for tiktoken_tokenizer — no server, no model loading."""
 
-import os
-import sys
 import unittest
-from unittest.mock import patch
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../../../python"))
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="stage-a-cpu-only")
 
@@ -20,10 +17,11 @@ from sglang.srt.tokenizer.tiktoken_tokenizer import (
     RESERVED_TOKEN_TEXTS,
     SEP,
     TiktokenProcessor,
+    TiktokenTokenizer,
 )
 
 
-class TestConstants(unittest.TestCase):
+class TestConstants(CustomTestCase):
     def test_reserved_token_count(self):
         self.assertEqual(len(RESERVED_TOKEN_TEXTS), 125)
 
@@ -55,7 +53,7 @@ class TestConstants(unittest.TestCase):
         self.assertEqual(DEFAULT_CONTROL_TOKENS["eos"], SEP)
 
 
-class TestTiktokenProcessor(unittest.TestCase):
+class TestTiktokenProcessor(CustomTestCase):
     def setUp(self):
         tokenizer_patcher = patch(
             "sglang.srt.tokenizer.tiktoken_tokenizer.TiktokenTokenizer"
@@ -80,6 +78,71 @@ class TestTiktokenProcessor(unittest.TestCase):
     def test_image_processor_with_none(self):
         result = self.processor.image_processor(None)
         self.assertEqual(result["pixel_values"], [None])
+
+
+class TestTiktokenTokenizer(CustomTestCase):
+    def setUp(self):
+        from jinja2 import Template
+
+        self.tok = TiktokenTokenizer.__new__(TiktokenTokenizer)
+        self.mock_tokenizer = MagicMock()
+        self.tok.tokenizer = self.mock_tokenizer
+        self.tok.chat_template = "dummy"
+        self.tok.chat_template_jinja = Template(
+            "{% for message in messages %}"
+            "{{ message['role'] }}: {{ message['content'] }}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}assistant:{% endif %}"
+        )
+
+    def test_encode_delegates_to_tokenizer(self):
+        self.mock_tokenizer.encode.return_value = [1, 2, 3]
+        result = self.tok.encode("hello")
+        self.mock_tokenizer.encode.assert_called_once_with("hello")
+        self.assertEqual(result, [1, 2, 3])
+
+    def test_decode_delegates_to_tokenizer(self):
+        self.mock_tokenizer.decode.return_value = "hello"
+        result = self.tok.decode([1, 2, 3])
+        self.mock_tokenizer.decode.assert_called_once_with([1, 2, 3])
+        self.assertEqual(result, "hello")
+
+    def test_batch_decode_list_of_lists(self):
+        self.mock_tokenizer.decode_batch.return_value = ["hello", "world"]
+        result = self.tok.batch_decode([[1, 2], [3, 4]])
+        self.mock_tokenizer.decode_batch.assert_called_once_with([[1, 2], [3, 4]])
+        self.assertEqual(result, ["hello", "world"])
+
+    def test_batch_decode_flat_list_wraps_each(self):
+        self.mock_tokenizer.decode_batch.return_value = ["a", "b"]
+        self.tok.batch_decode([1, 2])
+        self.mock_tokenizer.decode_batch.assert_called_once_with([[1], [2]])
+
+    def test_call_returns_input_ids(self):
+        self.mock_tokenizer.encode.return_value = [1, 2, 3]
+        result = self.tok(["hello", "world"])
+        self.assertIn("input_ids", result)
+        self.assertEqual(len(result["input_ids"]), 2)
+
+    def test_apply_chat_template_no_tokenize(self):
+        messages = [{"role": "user", "content": "hello"}]
+        result = self.tok.apply_chat_template(
+            messages=messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        self.assertIsInstance(result, str)
+        self.assertIn("hello", result)
+
+    def test_apply_chat_template_with_tokenize(self):
+        self.mock_tokenizer.encode.return_value = [1, 2, 3]
+        messages = [{"role": "user", "content": "hello"}]
+        result = self.tok.apply_chat_template(
+            messages=messages,
+            tokenize=True,
+            add_generation_prompt=False,
+        )
+        self.assertIsInstance(result, list)
 
 
 if __name__ == "__main__":
