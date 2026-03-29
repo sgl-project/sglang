@@ -18,6 +18,8 @@ Usage::
 import time
 from typing import Tuple
 
+import sglang as sgl
+from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.test.few_shot_gsm8k import (
     INVALID,
     get_answer_value,
@@ -57,22 +59,18 @@ def run_gsm8k_benchmark(
           (equal to ``INVALID``).
         - ``latency``      — wall-clock seconds for the full batch.
     """
-    import numpy as np
-
-    import sglang as sgl
-    from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-
     url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
     data_path = download_and_cache_file(url)
     lines = list(read_jsonl(data_path))
 
     few_shot_examples = get_few_shot_examples(lines, num_shots)
 
-    questions = []
-    labels = []
-    for i in range(len(lines[:num_questions])):
-        questions.append(get_one_example(lines, i, False))
-        labels.append(get_answer_value(lines[i]["answer"]))
+    questions = [
+        get_one_example(lines, i, False) for i in range(len(lines[:num_questions]))
+    ]
+    labels = [
+        get_answer_value(lines[i]["answer"]) for i in range(len(lines[:num_questions]))
+    ]
     assert all(label != INVALID for label in labels)
     arguments = [{"question": q} for q in questions]
 
@@ -92,8 +90,8 @@ def run_gsm8k_benchmark(
     )
     latency = time.perf_counter() - tic
 
-    preds = [get_answer_value(states[i]["answer"]) for i in range(len(states))]
-    acc = np.mean(np.array(preds) == np.array(labels))
-    invalid = np.mean(np.array(preds) == INVALID)
+    preds = [get_answer_value(s["answer"]) for s in states]
+    acc = sum(p == l for p, l in zip(preds, labels)) / len(preds) if preds else 0.0
+    invalid = sum(p == INVALID for p in preds) / len(preds) if preds else 0.0
 
     return float(acc), float(invalid), float(latency)
