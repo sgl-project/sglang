@@ -27,6 +27,7 @@ register_amd_ci(
     est_time=7200, suite="nightly-amd-accuracy-8-gpu-deepseek-r1", nightly=True
 )
 
+
 @dataclass
 class ModelConfig:
     """Configuration for a model to test."""

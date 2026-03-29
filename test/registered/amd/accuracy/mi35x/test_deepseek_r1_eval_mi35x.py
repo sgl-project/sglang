@@ -34,6 +34,7 @@ register_amd_ci(
     nightly=True,
 )
 
+
 @dataclass
 class ModelConfig:
     """Configuration for a model to test."""
