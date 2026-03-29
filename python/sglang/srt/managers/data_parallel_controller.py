@@ -30,6 +30,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
+    BatchTokenizedEmbeddingReqInput,
+    BatchTokenizedGenerateReqInput,
     BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -47,13 +49,11 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
-    bind_port,
     configure_logger,
-    get_zmq_socket,
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import NetworkAddress, bind_port, get_zmq_socket
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -197,11 +197,21 @@ class DataParallelController:
         self.dispatching(req)
         req.time_stats.set_dp_dispatch_finish_time()
 
+    def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
+        for req in batch_req:
+            self.dispatching_with_trace(req)
+
+    def dispatch_batch_embedding(self, batch_req: BatchTokenizedEmbeddingReqInput):
+        for req in batch_req:
+            self.dispatching_with_trace(req)
+
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.dispatching_with_trace),
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
+                (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
+                (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
                 (ActiveRanksOutput, self.update_active_ranks),
@@ -290,7 +300,8 @@ class DataParallelController:
         # Determine the endpoint for inter-node communication
         if server_args.dist_init_addr is None:
             na = NetworkAddress(
-                "127.0.0.1", server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
+                server_args.host or "127.0.0.1",
+                server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
             )
         else:
             na = NetworkAddress.parse(server_args.dist_init_addr)

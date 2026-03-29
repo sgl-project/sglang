@@ -88,10 +88,10 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push to lmsysorg/sglang-daily
+      - name: Push to lmsysorg/sglang-rocm
         run: |
-          docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-daily:${{ env.IMAGE_TAG }}
-          docker push lmsysorg/sglang-daily:${{ env.IMAGE_TAG }}
+          docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
+          docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
 
   # Temporarily disable docker cache seeding until performant storage is in place
   cache:

@@ -8,6 +8,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     MooncakeTransferEngine,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 try:
     from memfabric_hybrid import TransferEngine
@@ -47,7 +48,9 @@ class AscendTransferEngine(MooncakeTransferEngine):
         else:
             logger.error(f"Unsupported DisaggregationMode: {disaggregation_mode}")
             raise ValueError(f"Unsupported DisaggregationMode: {disaggregation_mode}")
-        self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
+        self.session_id = NetworkAddress(
+            self.hostname, self.engine.get_rpc_port()
+        ).to_host_port_str()
         self.initialize()
 
     def initialize(self) -> None:

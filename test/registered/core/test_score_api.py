@@ -7,7 +7,7 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=260, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=260, suite="stage-b-test-1-gpu-large")
 
 TEST_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -85,7 +85,7 @@ class TestScoreAPI(CustomTestCase):
         try:
             label_token_ids = []
             for token in tokens:
-                encoding = tokenizer.encode_plus(token, add_special_tokens=False)
+                encoding = tokenizer(token, add_special_tokens=False)
                 token_ids = encoding["input_ids"]
                 label_token_ids.append(token_ids[0])
             return label_token_ids

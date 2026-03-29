@@ -10,7 +10,6 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs_func,
     move_accepted_tokens_to_target_kvcache,
@@ -44,7 +43,7 @@ class NGRAMWorker:
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
-        self.branch_length: int = server_args.speculative_ngram_branch_length
+        self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.max_match_window_size: int = (
             server_args.speculative_ngram_max_match_window_size
         )
@@ -64,18 +63,19 @@ class NGRAMWorker:
 
         self._init_preallocated_tensors()
 
-        self.ngram_cache = NgramCache(
+        self.ngram_corpus = NgramCorpus(
             min_match_window_size=server_args.speculative_ngram_min_match_window_size,
             max_match_window_size=server_args.speculative_ngram_max_match_window_size,
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
+            match_type=server_args.speculative_ngram_match_type,
             capacity=server_args.speculative_ngram_capacity,
-            branch_length=server_args.speculative_ngram_branch_length,
+            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
             draft_token_num=server_args.speculative_num_draft_tokens,
         )
 
     def clear_cache_pool(self):
-        self.ngram_cache.reset()
+        self.ngram_corpus.reset()
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)
@@ -151,7 +151,7 @@ class NGRAMWorker:
         self.prev_token_ids = prev_token_ids.tolist()
         self.prev_accept_lens = prev_accept_lens.tolist()
 
-        self.ngram_cache.synchronize()
+        self.ngram_corpus.synchronize()
         batch_tokens = []
         assert len(batch.reqs) == len(self.prev_accept_lens)
         i = 0
@@ -169,7 +169,7 @@ class NGRAMWorker:
             )
             batch_tokens.append(check_token)
             i += 1
-        req_drafts, mask = self.ngram_cache.batch_get(batch_tokens)
+        req_drafts, mask = self.ngram_corpus.batch_get(batch_tokens)
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -253,7 +253,7 @@ class NGRAMWorker:
             draft_token_num=self.draft_token_num,
         )
 
-    def _update_ngram_cache(self, batch: ModelWorkerBatch):
+    def _update_ngram_corpus(self, batch: ModelWorkerBatch):
         batch_tokens = []
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
@@ -262,10 +262,10 @@ class NGRAMWorker:
             #     put_ids = req.origin_input_ids + req.output_ids
             # else:
             put_ids = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids, self.branch_length
+                req.origin_input_ids, req.output_ids, self.max_trie_depth
             )
             batch_tokens.append(put_ids)
-        self.ngram_cache.batch_put(batch_tokens)
+        self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
         self, model_worker_batch: ModelWorkerBatch
@@ -300,6 +300,7 @@ class NGRAMWorker:
             vocab_mask = None
             if model_worker_batch.has_grammar:
                 # Generate the logit mask for structured output.
+                # Overlap the CPU operations for bitmask generation with the forward pass.
                 vocab_mask = generate_token_bitmask(
                     model_worker_batch.reqs,
                     verify_input,
@@ -340,7 +341,7 @@ class NGRAMWorker:
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
 
-            self._update_ngram_cache(model_worker_batch)
+            self._update_ngram_corpus(model_worker_batch)
             model_worker_batch.forward_mode = ForwardMode.DECODE
 
         else:

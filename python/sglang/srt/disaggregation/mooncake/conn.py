@@ -726,7 +726,9 @@ class MooncakeKVManager(CommonKVManager):
                 # Each prefill sends all its dims to the appropriate offset in decode
                 src_dim_start = 0
                 num_dims_to_send = src_dim
-                dst_dim_start = local_tp_rank_in_group * src_dim
+                writers_per_decode = self.attn_tp_size // dst_attn_tp_size
+                local_writer_idx = local_tp_rank_in_group % writers_per_decode
+                dst_dim_start = local_writer_idx * src_dim
             else:
                 # 1 prefill rank sends to multiple decode ranks
                 # Prefill sends a slice of its dims to each decode rank
@@ -855,7 +857,8 @@ class MooncakeKVManager(CommonKVManager):
                                     )
                             self.record_failure(
                                 kv_chunk.room,
-                                f"Failed to send kv chunk of {kv_chunk.room} to {req.endpoint}:{req.dst_port}",
+                                f"Failed to send kv chunk of {kv_chunk.room} to "
+                                f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
                             )
                             self.update_status(kv_chunk.room, KVPoll.Failed)
                             self.sync_status_to_decode_endpoint(

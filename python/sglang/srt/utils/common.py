@@ -20,10 +20,10 @@ import asyncio
 import builtins
 import ctypes
 import functools
+import gc
 import importlib
 import inspect
 import io
-import ipaddress
 import itertools
 import json
 import logging
@@ -36,7 +36,6 @@ import re
 import resource
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -49,6 +48,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import lru_cache, partial
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -81,13 +81,11 @@ import requests
 import torch
 import torch.distributed as dist
 import triton
-import zmq
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
-from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
@@ -123,7 +121,7 @@ builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 # this makes it impossible to see the animation in the progress bar
 # but will avoid messing up with ray or multiprocessing, which wraps
 # each line of output with some prefix.
-BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
+BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
 
 
 @lru_cache(maxsize=1)
@@ -295,7 +293,7 @@ def use_intel_amx_backend(layer):
 
 
 def xpu_has_xmx_support():
-    # TODO: update with XPU capalibity query
+    # TODO: update with XPU capability query
     if is_xpu():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
@@ -347,7 +345,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
         # same invalid value may suppress warnings incorrectly.
         if name not in _warned_bool_env_var_keys:
             logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+                f"get_bool_env_var({name}) encountered unrecognized value={value} and will treat as false"
             )
         _warned_bool_env_var_keys.add(name)
 
@@ -361,17 +359,6 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
     try:
         return int(value)
-    except ValueError:
-        return default
-
-
-def get_float_env_var(name: str, default: float = 0.0) -> float:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return float(value)
     except ValueError:
         return default
 
@@ -636,7 +623,7 @@ def make_layers(
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
-    # circula imports
+    # circular imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
@@ -700,222 +687,6 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def find_process_using_port(port: int) -> Optional[psutil.Process]:
-    for conn in psutil.net_connections(kind="inet"):
-        if conn.laddr.port == port:
-            try:
-                return psutil.Process(conn.pid)
-            except psutil.NoSuchProcess:
-                # It could happen by race condition (the proc dies when psutil.Process is called).
-                pass
-
-    return None
-
-
-def wait_port_available(
-    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
-) -> bool:
-    for i in range(timeout_s):
-        if is_port_available(port):
-            return True
-
-        if i > 10 and i % 5 == 0:
-            process = find_process_using_port(port)
-            if process is None:
-                logger.warning(
-                    f"The port {port} is in use, but we could not find the process that uses it."
-                )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
-            logger.info(
-                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
-            )
-        time.sleep(0.1)
-
-    if raise_exception:
-        raise ValueError(
-            f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}"
-        )
-    return False
-
-
-def _get_addrinfos_for_bind(host=None, port=0):
-    """Return deduplicated addrinfo tuples for binding (one per address family).
-
-    Args:
-        host: Bind address. None (with AI_PASSIVE) resolves to wildcard
-              addresses (0.0.0.0 / ::) suitable for accepting on all interfaces.
-        port: Port number. 0 lets the OS assign an available ephemeral port.
-
-    Flags:
-        AI_ADDRCONFIG — only return families actually configured on this host.
-        AI_PASSIVE    — return wildcard addresses suitable for bind().
-
-    Falls back to AF_INET if getaddrinfo fails (e.g. DNS misconfiguration).
-    """
-    try:
-        infos = socket.getaddrinfo(
-            host,
-            port,
-            socket.AF_UNSPEC,
-            socket.SOCK_STREAM,
-            0,
-            socket.AI_ADDRCONFIG | socket.AI_PASSIVE,
-        )
-        deduped = []
-        seen_families = set()
-        for info in infos:
-            if info[0] not in seen_families:
-                seen_families.add(info[0])
-                deduped.append(info)
-        # Prefer IPv4 so that callers without an explicit host get consistent
-        # behaviour across platforms (some OSes list IPv6 first).
-        deduped.sort(key=lambda x: (x[0] != socket.AF_INET,))
-        return deduped
-    except socket.gaierror:
-        fallback_host = "0.0.0.0" if host is None else host
-        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (fallback_host, port))]
-
-
-def try_bind_socket(host=None, port=0, *, reuse_addr=True, listen=False):
-    """Bind a TCP socket on the first available address family (IPv4/IPv6).
-
-    Iterates over address families returned by _get_addrinfos_for_bind and
-    returns the first socket that successfully binds.
-
-    Args:
-        host: Bind address. None binds to all interfaces (0.0.0.0 / ::).
-        port: Port number. 0 lets the OS assign an available ephemeral port;
-              use sock.getsockname()[1] to retrieve the assigned port.
-        reuse_addr: Set SO_REUSEADDR to allow quick port reuse after close.
-        listen: Call listen(1) after bind, making the socket ready to accept.
-
-    Returns:
-        The bound socket. Caller is responsible for closing it.
-
-    Raises:
-        OSError: If bind fails on all configured address families.
-    """
-    for family, socktype, proto, _, sockaddr in _get_addrinfos_for_bind(host, port):
-        sock = socket.socket(family, socktype, proto)
-        try:
-            if family == socket.AF_INET6:
-                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            if reuse_addr:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(sockaddr)
-            if listen:
-                sock.listen(1)
-            return sock
-        except (OSError, OverflowError):
-            sock.close()
-    raise OSError(f"Could not bind port {port} on any configured address family")
-
-
-def is_port_available(port):
-    """Return whether a port is available on all configured address families."""
-    try:
-        for family, socktype, proto, _, sockaddr in _get_addrinfos_for_bind(port=port):
-            sock = socket.socket(family, socktype, proto)
-            try:
-                if family == socket.AF_INET6:
-                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind(sockaddr)
-            finally:
-                sock.close()
-        return True
-    except (OSError, OverflowError):
-        return False
-
-
-def get_free_port():
-    sock = try_bind_socket()
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def decode_video_base64(video_base64):
-    from PIL import Image
-
-    # Decode the base64 string
-    video_bytes = pybase64.b64decode(video_base64, validate=True)
-
-    # Placeholder for the start indices of each PNG image
-    img_starts = []
-
-    frame_format = "PNG"  # str(os.getenv('FRAME_FORMAT', "JPEG"))
-
-    assert frame_format in [
-        "PNG",
-        "JPEG",
-    ], "FRAME_FORMAT must be either 'PNG' or 'JPEG'"
-
-    if frame_format == "PNG":
-        # Find each PNG start signature to isolate images
-        i = 0
-        while i < len(video_bytes) - 7:  # Adjusted for the length of the PNG signature
-            # Check if we found the start of a PNG file
-            if (
-                video_bytes[i] == 0x89
-                and video_bytes[i + 1] == 0x50
-                and video_bytes[i + 2] == 0x4E
-                and video_bytes[i + 3] == 0x47
-                and video_bytes[i + 4] == 0x0D
-                and video_bytes[i + 5] == 0x0A
-                and video_bytes[i + 6] == 0x1A
-                and video_bytes[i + 7] == 0x0A
-            ):
-                img_starts.append(i)
-                i += 8  # Skip the PNG signature
-            else:
-                i += 1
-    else:
-        # Find each JPEG start (0xFFD8) to isolate images
-        i = 0
-        while (
-            i < len(video_bytes) - 1
-        ):  # Adjusted for the length of the JPEG SOI signature
-            # Check if we found the start of a JPEG file
-            if video_bytes[i] == 0xFF and video_bytes[i + 1] == 0xD8:
-                img_starts.append(i)
-                # Move to the next byte to continue searching for the next image start
-                i += 2
-            else:
-                i += 1
-
-    frames = []
-    for start_idx in img_starts:
-        # Assuming each image is back-to-back, the end of one image is the start of another
-        # The last image goes until the end of the byte string
-        end_idx = (
-            img_starts[img_starts.index(start_idx) + 1]
-            if img_starts.index(start_idx) + 1 < len(img_starts)
-            else len(video_bytes)
-        )
-        img_bytes = video_bytes[start_idx:end_idx]
-
-        # Convert bytes to a PIL Image
-        img = Image.open(BytesIO(img_bytes))
-
-        # Convert PIL Image to a NumPy array
-        frame = np.array(img)
-
-        # Append the frame to the list of frames
-        frames.append(frame)
-
-    # Ensure there's at least one frame to avoid errors with np.stack
-    if frames:
-        return np.stack(frames, axis=0), img.size
-    else:
-        return np.array([]), (
-            0,
-            0,
-        )  # Return an empty array and size tuple if no frames were found
 
 
 def load_audio(
@@ -1161,6 +932,11 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
+    # Suppress noisy third-party HTTP loggers.
+    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 def suppress_other_loggers():
     suppress_noisy_warnings()
@@ -1320,6 +1096,12 @@ def configure_logger(server_args, prefix: str = ""):
         force=True,
     )
 
+    # Suppress noisy httpx/httpcore loggers in every process that calls
+    # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
+    # don't inherit the parent's logger state, so this must run here too.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
 def replace_submodule(
@@ -1469,168 +1251,6 @@ def point_to_point_pyobj(
     return []
 
 
-step_counter = 0
-
-
-def pytorch_profile(name, func, *args, data_size=-1):
-    """
-    Args:
-        name (string): the name of recorded function.
-        func: the function to be profiled.
-        args: the arguments of the profiled function.
-        data_size (int): some measurement of the computation complexity.
-            Usually, it could be the batch size.
-    """
-    global step_counter
-    os.makedirs("trace", exist_ok=True)
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-    ) as prof:
-        with record_function(name):
-            with open(f"trace/size_{step_counter}.json", "w") as f:
-                json.dump({"size": data_size}, f)
-            result = func(*args)
-    prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
-    step_counter += 1
-    return result
-
-
-def get_zmq_socket(
-    context: zmq.Context,
-    socket_type: zmq.SocketType,
-    endpoint: Optional[str] = None,
-    bind: bool = True,
-) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
-    """Create and configure a ZeroMQ socket.
-
-    Args:
-        context: ZeroMQ context to create the socket from.
-        socket_type: Type of ZeroMQ socket to create.
-        endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
-        bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
-
-    Returns:
-        If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
-        If endpoint is provided: The configured ZeroMQ socket.
-    """
-    socket = context.socket(socket_type)
-
-    if endpoint is None:
-        # Bind to random TCP port
-        config_socket(socket, socket_type)
-        port = socket.bind_to_random_port("tcp://*")
-        return port, socket
-    else:
-        # Handle IPv6 if endpoint contains brackets
-        if endpoint.find("[") != -1:
-            socket.setsockopt(zmq.IPV6, 1)
-
-        config_socket(socket, socket_type)
-
-        if bind:
-            socket.bind(endpoint)
-        else:
-            socket.connect(endpoint)
-
-        return socket
-
-
-def get_zmq_socket_on_host(
-    context: zmq.Context,
-    socket_type: zmq.SocketType,
-    host: Optional[str] = None,
-) -> Tuple[int, zmq.Socket]:
-    """Create and configure a ZeroMQ socket.
-
-    Args:
-        context: ZeroMQ context to create the socket from.
-        socket_type: Type of ZeroMQ socket to create.
-        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
-
-    Returns:
-        Tuple of (port, socket) where port is the randomly assigned TCP port.
-    """
-    socket = context.socket(socket_type)
-    # Bind to random TCP port, auto-wrapping IPv6 and setting zmq.IPV6 flag
-    config_socket(socket, socket_type)
-    if host:
-        if is_valid_ipv6_address(host):
-            socket.setsockopt(zmq.IPV6, 1)
-            bind_host = f"tcp://[{host}]"
-        else:
-            bind_host = f"tcp://{host}"
-    else:
-        bind_host = "tcp://*"
-    port = socket.bind_to_random_port(bind_host)
-    return port, socket
-
-
-def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
-    else:
-        buf_size = -1
-
-    def set_send_opt():
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    def set_recv_opt():
-        socket.setsockopt(zmq.RCVHWM, 0)
-        socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
-        set_send_opt()
-        set_recv_opt()
-    else:
-        raise ValueError(f"Unsupported socket type: {socket_type}")
-
-
-def dump_to_file(dirpath, name, value):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() != 0:
-        return
-
-    os.makedirs(dirpath, exist_ok=True)
-    if value.dtype is torch.bfloat16:
-        value = value.float()
-    value = value.cpu().numpy()
-    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
-    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
-    np.save(output_filename, value)
-
-
-def is_triton_3():
-    return triton.__version__.startswith("3.")
-
-
-def maybe_torch_compile(*args, **kwargs):
-    """
-    torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
-    Therefore, we disable it here.
-    """
-
-    def decorator(func):
-        if is_triton_3():
-            return torch.compile(*args, **kwargs)(func)
-        return func
-
-    return decorator
-
-
 def delete_directory(dirpath):
     try:
         # This will remove the directory and all its contents
@@ -1725,6 +1345,12 @@ def add_prometheus_track_response_middleware(app):
         )
     )
 
+    # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
+    # that passes `receive` through, so request.is_disconnected() keeps working.
+    from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
+
+    patch_app_http_middleware(app)
+
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
@@ -1764,11 +1390,6 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
             return route.path, True
 
     return request.url.path, False
-
-
-def bind_port(port):
-    """Bind to a specific port, assuming it's available."""
-    return try_bind_socket(port=port, listen=True)
 
 
 def get_amdgpu_memory_capacity():
@@ -2279,8 +1900,11 @@ def direct_register_custom_op(
     mutates_args: List[str],
     fake_impl: Optional[Callable] = None,
     target_lib: Optional[Library] = None,
-):
+) -> None:
     """
+    NOTE: Please try to use `register_custom_op` instead of this function.
+    See `python/sglang/srt/utils/custom_op.py` for details.
+
     `torch.library.custom_op` can have significant overhead because it
     needs to consider complicated dispatching logic. This function
     directly registers a custom op and dispatches it to the CUDA backend.
@@ -2521,6 +2145,11 @@ class SafeUnpickler(pickle.Unpickler):
         )
 
 
+def safe_pickle_load(fp):
+    """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
+    return SafeUnpickler(fp).load()
+
+
 def debug_timing(func):
     # todo: replace with a more organized instrumentation
     def wrapper(*args, **kwargs):
@@ -2549,6 +2178,44 @@ def nullable_str(val: str):
     if not val or val == "None":
         return None
     return val
+
+
+def human_readable_int(value: str) -> int:
+    """Supports standard SI suffixes (k, M, G, T) and IEC suffixes
+    (Ki, Mi, Gi, Ti). Suffixes are case-sensitive.
+
+    Decimals are allowed for SI suffixes only.
+
+    Examples:
+        '1k' -> 1000      '1M' -> 1000000    '25.6k' -> 25600
+        '1Ki' -> 1024     '1Mi' -> 1048576
+    """
+    value = value.strip()
+
+    si_multiplier = {"k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12}
+    iec_multiplier = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|k|M|G|T)", value)
+    if match:
+        number, suffix = match.groups()
+        if suffix in iec_multiplier:
+            if "." in number:
+                raise argparse.ArgumentTypeError(
+                    f"Decimals are not allowed with IEC suffixes like '{suffix}'. "
+                    f"Use an integer IEC value such as '{int(Decimal(number))}{suffix}', "
+                    f"or an SI value such as '{number}{suffix[0]}'."
+                )
+            return int(number) * iec_multiplier[suffix]
+        return int(Decimal(number) * si_multiplier[suffix])
+
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid integer value: '{value}'. "
+            "Use a plain integer, SI suffixes (1k, 1M), or IEC suffixes (1Ki, 1Mi). "
+            "Suffixes are case-sensitive."
+        )
 
 
 def pyspy_dump_schedulers():
@@ -2707,34 +2374,13 @@ def _configure_uvicorn_access_log_filter(
             filters_list.append(filter_name)
 
 
-def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
-    if port is not None:
-        port = int(port)
-        while True:
-            if is_port_available(port):
-                return port
-            logger.info("Port %d is already in use, trying port %d", port, port + 1)
-            port += 1
-    sock = try_bind_socket()
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def is_valid_ipv6_address(address: str) -> bool:
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ValueError:
-        return False
-
-
 def launch_dummy_health_check_server(host, port, enable_metrics):
     import asyncio
 
     import uvicorn
     from fastapi import FastAPI, Response
+
+    from sglang.srt.utils.network import NetworkAddress
 
     app = FastAPI()
 
@@ -2778,14 +2424,16 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
             logger.error(f"Dummy health check server failed to start: {e}")
             raise
         finally:
-            logger.info(f"Dummy health check server stopped at {host}:{port}")
+            logger.info(
+                f"Dummy health check server stopped at {NetworkAddress(host, port).to_host_port_str()}"
+            )
 
     thread = threading.Thread(
         target=run_server, daemon=True, name="health-check-server"
     )
     thread.start()
     logger.info(
-        f"Dummy health check server started in background thread at {host}:{port}"
+        f"Dummy health check server started in background thread at {NetworkAddress(host, port).to_host_port_str()}"
     )
 
 
@@ -2907,8 +2555,18 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
+    # Check if the model_path is a local path
     if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
         return True
+
+    from huggingface_hub import try_to_load_from_cache
+
+    # Check if the model_path is a HuggingFace model ID and exists locally
+    result = try_to_load_from_cache(model_path, "hf_quant_config.json")
+    if isinstance(result, str):
+        return True
+
+    # Check if the model_path is a remote URL and exists on the HuggingFace Hub
     try:
         from huggingface_hub import HfApi
 
@@ -2958,116 +2616,6 @@ def bind_or_assign(target, source):
         return target
     else:
         return source
-
-
-def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
-    if not (interface := interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)):
-        return None
-    try:
-        import netifaces
-    except ImportError as e:
-        raise ImportError(
-            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
-        ) from e
-
-    try:
-        addresses = netifaces.ifaddresses(interface)
-        if netifaces.AF_INET in addresses:
-            for addr_info in addresses[netifaces.AF_INET]:
-                ip = addr_info.get("addr")
-                if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-                    return ip
-        if netifaces.AF_INET6 in addresses:
-            for addr_info in addresses[netifaces.AF_INET6]:
-                ip = addr_info.get("addr")
-                if ip and not ip.startswith("fe80::") and ip != "::1":
-                    return ip.split("%")[0]
-    except (ValueError, OSError) as e:
-        logger.warning(
-            f"{e} Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
-        )
-    return None
-
-
-def get_local_ip_by_remote() -> Optional[str]:
-    # Google's public DNS servers, used to discover the local IP.
-    # UDP connect doesn't send packets; it just selects the right source address.
-    # https://developers.google.com/speed/public-dns/docs/using#addresses
-    # Try IPv4 first, then IPv6. getaddrinfo on a literal IP returns exactly
-    # one result, so we unpack directly instead of looping.
-    for dns_host, dns_port in [("8.8.8.8", 80), ("2001:4860:4860::8888", 80)]:
-        try:
-            family, socktype, proto, _, sockaddr = socket.getaddrinfo(
-                dns_host,
-                dns_port,
-                socket.AF_UNSPEC,
-                socket.SOCK_DGRAM,
-                0,
-                socket.AI_ADDRCONFIG,
-            )[0]
-            with socket.socket(family, socktype, proto) as s:
-                s.connect(sockaddr)
-                return s.getsockname()[0]
-        except (socket.gaierror, OSError):
-            continue
-
-    # Fallback: resolve the local hostname to an IP address via /etc/hosts or DNS.
-    # Unreliable — many machines resolve hostname to 127.0.0.1, so we skip loopback.
-    try:
-        hostname = socket.gethostname()
-        ip = socket.getaddrinfo(
-            hostname, None, socket.AF_UNSPEC, 0, 0, socket.AI_ADDRCONFIG
-        )[0][4][0]
-        if ip and ip not in ("127.0.0.1", "0.0.0.0", "::1"):
-            return ip
-    except Exception:
-        pass
-
-    logger.warning("Can not get local ip by remote")
-    return None
-
-
-def get_local_ip_auto(fallback: str = None) -> str:
-    """
-    Automatically detect the local IP address using multiple fallback strategies.
-
-    This function attempts to obtain the local IP address through several methods.
-    If all methods fail, it returns the specified fallback value or raises an exception.
-
-    Args:
-        fallback (str, optional): Fallback IP address to return if all detection
-            methods fail. For server applications, explicitly set this to
-            "0.0.0.0" (IPv4) or "::" (IPv6) to bind to all available interfaces.
-            Defaults to None.
-
-    Returns:
-        str: The detected local IP address, or the fallback value if detection fails.
-
-    Raises:
-        ValueError: If IP detection fails and no fallback value is provided.
-
-    Note:
-        The function tries detection methods in the following order:
-        1. Direct IP detection via get_ip()
-        2. Network interface enumeration via get_local_ip_by_nic()
-        3. Remote connection method via get_local_ip_by_remote()
-    """
-    # Try environment variable
-    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
-    if host_ip:
-        return host_ip
-    logger.debug("get_ip failed")
-    # Fallback
-    if ip := get_local_ip_by_nic():
-        return ip
-    logger.debug("get_local_ip_by_nic failed")
-    # Fallback
-    if ip := get_local_ip_by_remote():
-        return ip
-    logger.debug("get_local_ip_by_remote failed")
-    if fallback:
-        return fallback
-    raise ValueError("Can not get local ip")
 
 
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
@@ -3402,8 +2950,6 @@ def configure_gc_warning(warn_threshold_secs):
 
 
 def freeze_gc(context: str):
-    import gc
-
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
@@ -3417,8 +2963,6 @@ def freeze_gc(context: str):
 
 def configure_gc_logger():
     logger.info("Enable GC Logger")
-
-    import gc
 
     gc_start_time = {}
 
@@ -3865,30 +3409,6 @@ def get_device_sm_nvidia_smi():
         return (0, 0)  # Default/fallback value
 
 
-def get_libnuma():
-    libnuma = None
-
-    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
-        try:
-            libnuma = ctypes.CDLL(libnuma_so)
-        except OSError as e:
-            logger.error(f"{e}")
-            libnuma = None
-        if libnuma is not None:
-            break
-    return libnuma
-
-
-def numa_bind_to_node(node: int):
-    libnuma = get_libnuma()
-
-    if libnuma is None or libnuma.numa_available() < 0:
-        logger.error("numa not available on this system, skip bind action")
-    else:
-        libnuma.numa_run_on_node(ctypes.c_int(node))
-        libnuma.numa_set_preferred(ctypes.c_int(node))
-
-
 def json_list_type(value):
     try:
         return orjson.loads(value)
@@ -4186,140 +3706,3 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
-
-
-def get_numa_node_count() -> int:
-    """
-    Get the number of NUMA nodes available on the system.
-    Must be called after is_numa_available() is True.
-    Returns:
-        int: The number of NUMA nodes.
-    """
-    libnuma = get_libnuma()
-    return libnuma.numa_max_node() + 1
-
-
-def is_numa_available() -> bool:
-    try:
-        libnuma = get_libnuma()
-        return libnuma.numa_available() >= 0
-    except Exception:
-        return False
-
-
-def get_system_nvgpu_count() -> int:
-    """
-    Get the total number of GPUs in the system (not affected by CUDA_VISIBLE_DEVICES).
-
-    Returns:
-        int: The total number of physical GPUs.
-    """
-    result = subprocess.run(
-        ["nvidia-smi", "--list-gpus"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    gpu_lines = [
-        line
-        for line in result.stdout.strip().split("\n")
-        if line.strip().startswith("GPU")
-    ]
-    return len(gpu_lines)
-
-
-@lru_cache(maxsize=1)
-def get_device_numa_node_cuda(gpu_id: int = 0) -> int:
-    """
-    Retrieve the NUMA node ID of the CPU socket closest to the gpu_id.
-
-    First tries to query nvidia-smi topology. If it returns a single NUMA ID, uses that directly.
-    If it returns multiple NUMA IDs (comma/dash separated), falls back to distributing GPUs
-    evenly across NUMA nodes based on GPU ID intervals.
-
-    For example, with 8 GPUs and 2 NUMA nodes: GPUs 0-3 -> node 0, GPUs 4-7 -> node 1.
-
-    Returns:
-        int: The NUMA node ID (e.g., 0, 1).
-
-    Raises:
-        RuntimeError: If device information cannot be retrieved.
-    """
-
-    physical_device_id = get_physical_device_id(gpu_id)
-
-    # Query NUMA topology from nvidia-smi
-    result = subprocess.run(
-        ["nvidia-smi", "topo", "-C", "-i", str(physical_device_id)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    output_line = result.stdout.strip()
-    prefix = "NUMA IDs of closest CPU:"
-
-    if output_line.startswith(prefix):
-        numa_id_str = output_line[len(prefix) :].strip()
-        if numa_id_str.isdigit():
-            return int(numa_id_str)
-
-    # Fall back: distribute GPUs evenly across NUMA nodes
-    numa_count = get_numa_node_count()
-    gpu_count = get_system_nvgpu_count()
-
-    if gpu_count >= numa_count:
-        gpus_per_numa = gpu_count // numa_count  # >= 1
-        numa_node = physical_device_id // gpus_per_numa  # 0 ~ numa_count - 1
-    else:
-        logger.warning(
-            f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node."
-        )
-        numa_node = 0
-
-    return numa_node
-
-
-def get_numa_node(gpu_id):
-    numa_node = None
-    try:
-        device = get_device()
-        if device == "cuda":
-            numa_node = get_device_numa_node_cuda(gpu_id)
-        else:
-            logger.info(f"Now only supports NVIDIA devices")
-    except Exception as e:
-        logger.error(f"Error: {e}")
-
-    return numa_node
-
-
-@lru_cache(maxsize=1)
-def get_current_device_numa_node_cuda() -> int:
-    """
-    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
-    """
-
-    logical_device_id = torch.cuda.current_device()
-    numa_node = get_device_numa_node_cuda(logical_device_id)
-
-    return numa_node
-
-
-def nvgpu_available() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    if torch.version.cuda is None:
-        return False
-    return True
-
-
-def bind_to_closest_numa_node_cuda():
-    """
-    Bind the current process to the NUMA node closest to the active CUDA device.
-
-    Uses `numa` library calls via ctypes to set the CPU affinity of the process.
-    """
-    if is_numa_available() and nvgpu_available():
-        node_id = get_current_device_numa_node_cuda()
-        numa_bind_to_node(node_id)

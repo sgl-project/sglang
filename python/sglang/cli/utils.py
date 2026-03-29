@@ -80,8 +80,7 @@ def get_model_path(extra_argv):
             raise Exception(
                 "Usage: sglang serve --model-path <model-name-or-path> [additional-arguments]\n\n"
                 "This command can launch either a standard language model server or a diffusion model server.\n"
-                "The server type is determined by the model path.\n"
-                "For specific arguments, please provide a model_path."
+                "The server type is determined by the --model-path.\n"
             )
         else:
             raise Exception(

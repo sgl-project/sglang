@@ -42,6 +42,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -759,7 +760,7 @@ def _w8a8_block_fp8_matmul(
     As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
-    scale_step_k = BLOCK_SIZE_K // group_k
+    n_tiles_k_per_group_k = group_k // BLOCK_SIZE_K
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -773,6 +774,7 @@ def _w8a8_block_fp8_matmul(
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
 
+        scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1, 0)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -2057,7 +2059,7 @@ def triton_scaled_mm(
 if _is_cuda:
     if enable_sgl_per_token_group_quant_8bit:
 
-        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_8bit")
+        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit")
         def _(
             input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
         ):
@@ -2065,12 +2067,12 @@ if _is_cuda:
 
     else:
 
-        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_fp8")
+        @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_fp8")
         def _(
             input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
         ):
             return
 
-    @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
+    @register_fake_if_exists("sgl_kernel::sgl_per_token_quant_fp8")
     def _(input, output_q, output_s):
         return

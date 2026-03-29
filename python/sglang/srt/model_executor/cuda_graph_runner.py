@@ -93,9 +93,19 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+_has_foreach_copy = hasattr(torch, "_foreach_copy_")
+
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
+
+    def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+        if _has_foreach_copy:
+            torch._foreach_copy_(dsts, srcs)
+        else:
+            for dst, src in zip(dsts, srcs):
+                dst.copy_(src)
+
     groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
     for dst, src in zip(dsts, srcs):
         key = (dst.dtype, src.dtype)
@@ -104,7 +114,7 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         groups[key][0].append(dst)
         groups[key][1].append(src)
     for group_dsts, group_srcs in groups.values():
-        torch._foreach_copy_(group_dsts, group_srcs)
+        foreach_copy(group_dsts, group_srcs)
 
 
 @dataclass
@@ -444,14 +454,9 @@ def set_torch_compile_config():
 def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
-
-    if max(capture_bs) > model_runner.req_to_token_pool.size:
-        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
-        # is very small. We add more values here to make sure we capture the maximum bs.
-        capture_bs += [model_runner.req_to_token_pool.size]
+    num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = 1
-
     if server_args.enable_two_batch_overlap:
         mul_base *= 2
         num_tokens_per_bs = 1  # tbo not test, set num_tokens_per_bs to 1
@@ -462,11 +467,18 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     if mul_base % get_attention_cp_size() != 0:
         mul_base *= get_attention_cp_size()
 
+    # pad `num_max_requests` to avoid being filtered out
+    num_max_requests = (num_max_requests + mul_base - 1) // mul_base * mul_base
+    if max(capture_bs) > num_max_requests:
+        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+        # is very small. We add more values here to make sure we capture the maximum bs.
+        capture_bs += [num_max_requests]
+
     # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
     capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
-
-    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+    capture_bs = [bs for bs in capture_bs if bs <= num_max_requests]
     capture_bs = list(sorted(set(capture_bs)))
+
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
@@ -578,7 +590,12 @@ class CudaGraphRunner:
             else self.dllm_config.block_size
         )
 
-        self.encoder_len_fill_value = 0
+        # Non-zero encoder length ensures cross-attention kernels are captured in the graph.
+        self.encoder_len_fill_value = (
+            getattr(model_runner.model_config.hf_config, "max_source_positions", 0)
+            if self.is_encoder_decoder
+            else 0
+        )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -943,6 +960,12 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
+
+        # HiSparse: set coordinator so the hisparse code path is captured into the graph
+        forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
+        if forward_batch.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
@@ -1108,6 +1131,9 @@ class CudaGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+
+        if self.model_runner.hisparse_coordinator is not None:
+            self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
     def replay(
         self,

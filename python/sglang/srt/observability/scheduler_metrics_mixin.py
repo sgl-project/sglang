@@ -258,9 +258,6 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
-            msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
-        else:
-            msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
         if (
             self.server_args.language_only
@@ -275,7 +272,8 @@ class SchedulerMetricsMixin:
             },
         )
 
-        msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}"
+        msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
+        msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.is_stats_logging_rank:
             logger.info(msg)

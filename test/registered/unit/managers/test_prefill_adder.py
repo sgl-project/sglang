@@ -1,26 +1,26 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefResult,
+    IncLockRefResult,
+)
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=1, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=2, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=1, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=2, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestPrefillAdder(CustomTestCase):
     def setUp(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_token_allocator = self.create_token_allocator()
-        patcher = patch(
-            "sglang.srt.managers.schedule_policy.is_nsa_prefill_cp_in_seq_split",
-            return_value=False,
-        )
-        self.mock_is_nsa = patcher.start()
-        self.addCleanup(patcher.stop)
 
     def create_tree_cache(
         self,
@@ -34,8 +34,8 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
-        tree_cache.inc_lock_ref.return_value = None
-        tree_cache.dec_lock_ref.return_value = None
+        tree_cache.inc_lock_ref.return_value = IncLockRefResult()
+        tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         return tree_cache
 
     def create_token_allocator(
