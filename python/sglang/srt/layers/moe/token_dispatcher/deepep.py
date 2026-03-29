@@ -176,7 +176,7 @@ class DeepEPBuffer:
                 )
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
-            assert num_experts != -1 and num_experts % group.size() == 0
+            assert num_experts != -1
             num_rdma_bytes = max(
                 Buffer.get_low_latency_rdma_size_hint(
                     num_max_dispatch_tokens_per_rank,
@@ -191,15 +191,26 @@ class DeepEPBuffer:
         if deepep_mode == DeepEPMode.NORMAL:
             # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
             num_qps_per_rank = DeepEPConfig.get_instance().num_sms
-        elif deepep_mode == DeepEPMode.LOW_LATENCY:
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
-            num_qps_per_rank = num_experts // group.size()
-        elif deepep_mode == DeepEPMode.AUTO:
-            # low-latency and normal mode all need run
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
-            num_qps_per_rank = max(
-                DeepEPConfig.get_instance().num_sms, num_experts // group.size()
-            )
+        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
+
+            rank = torch.distributed.get_rank(group)
+            world_size = group.size()
+
+            # Compute local_num_experts (shared logic)
+            base = num_experts // world_size
+            remainder = num_experts % world_size
+            local_num_experts = base + 1 if rank < remainder else base
+
+            if deepep_mode == DeepEPMode.LOW_LATENCY:
+                # In LOW_LATENCY, use exact per-rank experts
+                num_qps_per_rank = local_num_experts
+
+            elif deepep_mode == DeepEPMode.AUTO:
+                # In AUTO mode, ensure at least one QP per SM
+                num_qps_per_rank = max(
+                    DeepEPConfig.get_instance().num_sms,
+                    local_num_experts,
+                )
         else:
             raise NotImplementedError
 
