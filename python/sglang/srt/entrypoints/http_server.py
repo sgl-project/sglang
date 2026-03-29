@@ -733,12 +733,18 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flush_cache():
+async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache()
+    ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+    if ret.success:
+        content = (
+            "Cache flushed.\nPlease check backend logs for more details. "
+            "(When there are running or waiting requests, the operation will not be performed.)\n"
+        )
+    else:
+        content = ret.message or "Flush cache failed.\n"
     return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+        content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
@@ -1480,11 +1486,18 @@ async def openai_v1_audio_transcriptions(
     response_format: str = Form(default="json"),
     temperature: float = Form(default=0.0),
     stream: bool = Form(default=False),
+    timestamp_granularities: Optional[List[str]] = Form(
+        default=None, alias="timestamp_granularities[]"
+    ),
 ):
     """OpenAI-compatible audio transcription endpoint."""
-    if response_format not in ["json", "text"]:
+    if response_format not in ["json", "text", "verbose_json"]:
         return ORJSONResponse(
-            content={"error": {"message": "Only 'json' and 'text' formats supported"}},
+            content={
+                "error": {
+                    "message": "Only 'json', 'text', and 'verbose_json' formats supported"
+                }
+            },
             status_code=400,
         )
 
@@ -1498,6 +1511,7 @@ async def openai_v1_audio_transcriptions(
             response_format=response_format,
             temperature=temperature,
             stream=stream,
+            timestamp_granularities=timestamp_granularities,
             raw_request=raw_request,
         )
     )

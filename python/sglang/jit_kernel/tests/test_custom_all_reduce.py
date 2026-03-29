@@ -34,15 +34,13 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=120,
-    suite="stage-b-kernel-unit-1-gpu-large",
-    disabled="requires multi-GPU distributed setup",
+    est_time=500,
+    suite="stage-b-kernel-unit-8-gpu-h200",
 )
 register_cuda_ci(
-    est_time=120,
-    suite="nightly-kernel-1-gpu",
+    est_time=500,
+    suite="nightly-kernel-8-gpu-h200",
     nightly=True,
-    disabled="requires multi-GPU distributed setup",
 )
 
 # ---------------------------------------------------------------------------

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    NunchakuConfig,
     is_nunchaku_available,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -17,6 +18,14 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class NunchakuArgsResolution:
+    """Normalized runtime settings derived from Nunchaku CLI-facing args."""
+
+    transformer_weights_path: str | None = None
+    nunchaku_config: NunchakuConfig | None = None
 
 
 @dataclass
@@ -33,20 +42,22 @@ class NunchakuSVDQuantArgs:
     quantization_rank: int | None = None
     quantization_act_unsigned: bool = False
 
-    def _adjust_config(self) -> None:
-        """infer precision and rank from filename if not provided"""
-        if self.transformer_weights_path and not self.enable_svdquant:
-            filename = os.path.basename(self.transformer_weights_path)
-            if re.search(r"svdq-(int4|fp4)_r(\d+)", filename):
-                self.enable_svdquant = True
-
-        if not self.enable_svdquant or not self.transformer_weights_path:
-            return
-
+    def _infer_from_weights_path(self) -> tuple[bool, str | None, int | None]:
+        """Infer whether SVDQuant is enabled and parse precision/rank from filename."""
         inferred_precision = None
         inferred_rank = None
+        enable_svdquant = self.enable_svdquant
+
+        if not self.transformer_weights_path:
+            return enable_svdquant, inferred_precision, inferred_rank
 
         filename = os.path.basename(self.transformer_weights_path)
+        if not enable_svdquant and re.search(r"svdq-(int4|fp4)_r(\d+)", filename):
+            enable_svdquant = True
+
+        if not enable_svdquant:
+            return enable_svdquant, inferred_precision, inferred_rank
+
         # Expected pattern: svdq-{precision}_r{rank}-...
         # e.g., svdq-int4_r32-qwen-image.safetensors
         match = re.search(r"svdq-(int4|fp4)_r(\d+)", filename)
@@ -56,26 +67,39 @@ class NunchakuSVDQuantArgs:
             inferred_precision = "nvfp4" if p_str == "fp4" else "int4"
             inferred_rank = int(r_str)
 
-        if self.quantization_precision is None:
-            self.quantization_precision = inferred_precision or "int4"
+        return enable_svdquant, inferred_precision, inferred_rank
+
+    def _normalized(self) -> "NunchakuSVDQuantArgs":
+        enable_svdquant, inferred_precision, inferred_rank = (
+            self._infer_from_weights_path()
+        )
+        normalized = replace(
+            self,
+            enable_svdquant=enable_svdquant,
+            quantization_precision=(
+                self.quantization_precision or inferred_precision or "int4"
+            ),
+            quantization_rank=self.quantization_rank or inferred_rank or 32,
+        )
+
+        if self.quantization_precision is None and inferred_precision:
             if inferred_precision:
                 logger.info(
-                    f"inferred --quantization-precision: {self.quantization_precision} "
+                    f"inferred --quantization-precision: {normalized.quantization_precision} "
                     f"from --transformer-weights-path: {self.transformer_weights_path}"
                 )
 
-        if self.quantization_rank is None:
-            self.quantization_rank = inferred_rank or 32
+        if self.quantization_rank is None and inferred_rank:
             if inferred_rank:
                 logger.info(
-                    f"inferred --quantization-rank: {self.quantization_rank} "
+                    f"inferred --quantization-rank: {normalized.quantization_rank} "
                     f"from --transformer-weights-path: {self.transformer_weights_path}"
                 )
 
-    def validate(self) -> None:
-        # TODO: warn if the served model doesn't support nunchaku
-        self._adjust_config()
+        return normalized
 
+    def _validate(self) -> None:
+        # TODO: warn if the served model doesn't support nunchaku
         if not self.enable_svdquant:
             return
 
@@ -98,7 +122,6 @@ class NunchakuSVDQuantArgs:
         if unsupported:
             raise ValueError(
                 "Nunchaku SVDQuant is currently only supported on Ampere (SM8x) or SM12x GPUs; "
-                "Hopper (SM90) is not supported. "
                 f"Unsupported devices: {', '.join(unsupported)}. "
                 "Disable it with --enable-svdquant false."
             )
@@ -123,6 +146,26 @@ class NunchakuSVDQuantArgs:
             raise ValueError(
                 f"Invalid --quantization-rank: {self.quantization_rank}. Must be > 0"
             )
+
+    def resolve_runtime_config(self) -> NunchakuArgsResolution:
+        normalized = self._normalized()
+        normalized._validate()
+
+        if not normalized.enable_svdquant or not normalized.transformer_weights_path:
+            return NunchakuArgsResolution(
+                transformer_weights_path=normalized.transformer_weights_path,
+                nunchaku_config=None,
+            )
+
+        return NunchakuArgsResolution(
+            transformer_weights_path=normalized.transformer_weights_path,
+            nunchaku_config=NunchakuConfig(
+                precision=normalized.quantization_precision,
+                rank=normalized.quantization_rank,
+                act_unsigned=normalized.quantization_act_unsigned,
+                transformer_weights_path=normalized.transformer_weights_path,
+            ),
+        )
 
     @staticmethod
     def add_cli_args(parser) -> None:
