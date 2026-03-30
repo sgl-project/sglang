@@ -462,8 +462,9 @@ class ZImageTransformerBlock(nn.Module):
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
             # Attention block
+            attn_in = self.attention_norm1(x) * scale_msa
             attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa,
+                attn_in,
                 freqs_cis=freqs_cis,
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
@@ -471,11 +472,9 @@ class ZImageTransformerBlock(nn.Module):
             x = x + gate_msa * self.attention_norm2(attn_out)
 
             # FFN block
-            x = x + gate_mlp * self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
-                )
-            )
+            ffn_in = self.ffn_norm1(x) * scale_mlp
+            ffn_out = self.feed_forward(ffn_in)
+            x = x + gate_mlp * self.ffn_norm2(ffn_out)
         else:
             # Attention block
             attn_input = self.attention_norm1(x)
@@ -489,9 +488,7 @@ class ZImageTransformerBlock(nn.Module):
 
             # FFN block
             ffn_input = self.ffn_norm1(x)
-            ffn_out = self.feed_forward(
-                ffn_input,
-            )
+            ffn_out = self.feed_forward(ffn_input)
             x = x + self.ffn_norm2(ffn_out)
 
         return x
@@ -858,8 +855,10 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         t = timestep
         bsz = 1
         device = x[0].device
+
         t = self.t_embedder(t)
         adaln_input = t.type_as(x)
+
         (
             x,
             cap_feats,
@@ -886,13 +885,11 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             x = layer(x, x_freqs_cis, adaln_input)
 
         cap_feats = torch.cat(cap_feats, dim=0)
-
         cap_feats, _ = self.cap_embedder(cap_feats)
         if cap_valid_lens[0] < cap_feats.shape[0]:
             cap_feats[cap_valid_lens[0] :] = self.cap_pad_token.to(
                 dtype=cap_feats.dtype
             )
-
         cap_freqs_cis = freqs_cis[0]
 
         cap_feats = cap_feats.unsqueeze(0)
@@ -949,6 +946,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
         )
+
         if use_full_unified_sequence:
             sp_rank = get_sp_parallel_rank()
             start = sp_rank * x_local_seq_len
