@@ -48,7 +48,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
-    get_local_ip_auto,
     is_cpu,
     is_cuda_alike,
     is_hip,
@@ -58,6 +57,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.network import get_local_ip_auto
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1573,7 +1573,12 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     with get_tp_group().graph_capture(
         stream=stream
     ) as context, get_pp_group().graph_capture(context):
-        yield context
+        moe_ep = _MOE_EP
+        if moe_ep is not None and moe_ep is not _TP:
+            with moe_ep.graph_capture(context):
+                yield context
+        else:
+            yield context
 
 
 logger = logging.getLogger(__name__)

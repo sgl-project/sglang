@@ -97,6 +97,11 @@ class BaseIndexerMetadata(ABC):
         Return: seq lens for each batch.
         """
 
+    def get_indexer_seq_len(self) -> torch.Tensor:
+        """
+        Return: seq lens for each batch.
+        """
+
     def get_nsa_extend_len_cpu(self) -> List[int]:
         """
         Return: extend seq lens for each batch.
@@ -324,6 +329,25 @@ class Indexer(MultiPlatformOp):
             with torch.cuda.stream(self.alt_stream):
                 key = rotate_activation(key)
             current_stream.wait_stream(self.alt_stream)
+        elif (
+            self.alt_stream is not None
+            and forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
+        ):
+            key = rotate_activation(key)
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            query = rotate_activation(query)
+
+            with torch.cuda.stream(self.alt_stream):
+                key = cp_all_gather_rerange_output(
+                    key.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            current_stream.wait_stream(self.alt_stream)
+            return query, key
         else:
             query = rotate_activation(query)
             key = rotate_activation(key)
@@ -538,11 +562,12 @@ class Indexer(MultiPlatformOp):
 
         ks, ke = metadata.get_indexer_kvcache_range()
 
-        seq_len_sum = forward_batch.seq_lens_sum
-        max_seq_len = torch.max(forward_batch.seq_lens_cpu).item()
+        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
+        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
         k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
             layer_id,
-            forward_batch.seq_lens,
+            metadata.get_indexer_seq_len(),
             block_tables,
             seq_len_sum,
             max_seq_len,
