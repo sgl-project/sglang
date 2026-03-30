@@ -20,7 +20,9 @@ import torch.nn.functional as F
 class PatchEmbed3D(nn.Module):
     """PatchEmbed from upstream/main: uses Conv3d directly."""
 
-    def __init__(self, patch_size, in_chans, embed_dim, flatten=True, bias=True, dtype=None):
+    def __init__(
+        self, patch_size, in_chans, embed_dim, flatten=True, bias=True, dtype=None
+    ):
         super().__init__()
         if isinstance(patch_size, list | tuple):
             if len(patch_size) == 1:
@@ -30,7 +32,12 @@ class PatchEmbed3D(nn.Module):
         self.patch_size = patch_size
         self.flatten = flatten
         self.proj = nn.Conv3d(
-            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias, dtype=dtype,
+            in_chans,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=bias,
+            dtype=dtype,
         )
         self.norm = nn.Identity()
 
@@ -45,7 +52,9 @@ class PatchEmbed3D(nn.Module):
 class PatchEmbed(nn.Module):
     """PatchEmbed from opt_krea: replaces Conv3d with reshape + F.linear for 5D input."""
 
-    def __init__(self, patch_size, in_chans, embed_dim, flatten=True, bias=True, dtype=None):
+    def __init__(
+        self, patch_size, in_chans, embed_dim, flatten=True, bias=True, dtype=None
+    ):
         super().__init__()
         if isinstance(patch_size, list | tuple):
             if len(patch_size) == 1:
@@ -57,7 +66,12 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.flatten = flatten
         self.proj = nn.Conv3d(
-            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias, dtype=dtype,
+            in_chans,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=bias,
+            dtype=dtype,
         )
         self.norm = nn.Identity()
 
@@ -93,8 +107,21 @@ def _copy_weights(src, dst):
         dst.proj.bias.data.copy_(src.proj.bias.data)
 
 
-def _run_equivalence(patch_size, in_chans, embed_dim, flatten, bias,
-                     weight_dtype, input_dtype, B, T, H, W, atol, rtol):
+def _run_equivalence(
+    patch_size,
+    in_chans,
+    embed_dim,
+    flatten,
+    bias,
+    weight_dtype,
+    input_dtype,
+    B,
+    T,
+    H,
+    W,
+    atol,
+    rtol,
+):
     """Helper: build both models with shared weights, run forward, compare.
 
     Args:
@@ -102,17 +129,31 @@ def _run_equivalence(patch_size, in_chans, embed_dim, flatten, bias,
         input_dtype:  dtype for the input tensor (None = FP32).
     """
     torch.manual_seed(42)
-    main = PatchEmbed3D(patch_size, in_chans, embed_dim, flatten, bias, dtype=weight_dtype).to(DEVICE).eval()
-    opt = PatchEmbed(patch_size, in_chans, embed_dim, flatten, bias, dtype=weight_dtype).to(DEVICE).eval()
+    main = (
+        PatchEmbed3D(patch_size, in_chans, embed_dim, flatten, bias, dtype=weight_dtype)
+        .to(DEVICE)
+        .eval()
+    )
+    opt = (
+        PatchEmbed(patch_size, in_chans, embed_dim, flatten, bias, dtype=weight_dtype)
+        .to(DEVICE)
+        .eval()
+    )
     _copy_weights(main, opt)
 
-    x = torch.randn(B, in_chans, T, H, W, device=DEVICE, dtype=input_dtype or torch.float32)
+    x = torch.randn(
+        B, in_chans, T, H, W, device=DEVICE, dtype=input_dtype or torch.float32
+    )
     with torch.no_grad():
         out_main = main(x)
         out_opt = opt(x)
 
-    assert out_main.shape == out_opt.shape, f"Shape mismatch: {out_main.shape} vs {out_opt.shape}"
-    assert out_main.dtype == out_opt.dtype, f"Dtype mismatch: {out_main.dtype} vs {out_opt.dtype}"
+    assert (
+        out_main.shape == out_opt.shape
+    ), f"Shape mismatch: {out_main.shape} vs {out_opt.shape}"
+    assert (
+        out_main.dtype == out_opt.dtype
+    ), f"Dtype mismatch: {out_main.dtype} vs {out_opt.dtype}"
     torch.testing.assert_close(out_main, out_opt, atol=atol, rtol=rtol)
 
 
@@ -131,22 +172,40 @@ def _disable_tf32():
 # patch_size=(1,2,2), in_channels=16, embed_dim=5120, flatten=False
 # Real usage: weight=FP32 (no dtype passed), input=BF16 from VAE latent
 
-@pytest.mark.parametrize("dtype,atol,rtol", [
-    (None,            1e-4, 1e-4),   # weight=FP32, input=FP32
-    (torch.bfloat16,  1e-2, 1e-2),   # weight=BF16, input=BF16
-    (torch.float16,   1e-2, 1e-2),   # weight=FP16, input=FP16
-], ids=["fp32", "bf16", "fp16"])
-@pytest.mark.parametrize("B,T,H,W", [
-    (1, 21, 60, 104),   # 480p typical
-    (2,  9, 40,  64),   # smaller resolution, batch=2
-    (1, 33, 90, 160),   # 720p longer video
-], ids=["480p-B1", "small-B2", "720p-B1"])
+
+@pytest.mark.parametrize(
+    "dtype,atol,rtol",
+    [
+        (None, 1e-4, 1e-4),  # weight=FP32, input=FP32
+        (torch.bfloat16, 1e-2, 1e-2),  # weight=BF16, input=BF16
+        (torch.float16, 1e-2, 1e-2),  # weight=FP16, input=FP16
+    ],
+    ids=["fp32", "bf16", "fp16"],
+)
+@pytest.mark.parametrize(
+    "B,T,H,W",
+    [
+        (1, 21, 60, 104),  # 480p typical
+        (2, 9, 40, 64),  # smaller resolution, batch=2
+        (1, 33, 90, 160),  # 720p longer video
+    ],
+    ids=["480p-B1", "small-B2", "720p-B1"],
+)
 def test_wan_helios(dtype, atol, rtol, B, T, H, W):
     _run_equivalence(
-        patch_size=(1, 2, 2), in_chans=16, embed_dim=5120,
-        flatten=False, bias=True,
-        weight_dtype=dtype, input_dtype=dtype,
-        B=B, T=T, H=H, W=W, atol=atol, rtol=rtol,
+        patch_size=(1, 2, 2),
+        in_chans=16,
+        embed_dim=5120,
+        flatten=False,
+        bias=True,
+        weight_dtype=dtype,
+        input_dtype=dtype,
+        B=B,
+        T=T,
+        H=H,
+        W=W,
+        atol=atol,
+        rtol=rtol,
     )
 
 
@@ -154,41 +213,78 @@ def test_wan_helios(dtype, atol, rtol, B, T, H, W):
 # patch_size=[1,2,2] (list!), in_channels=16, embed_dim=3072, flatten=True
 # Real usage: dtype passed to PatchEmbed, so weight & input share same dtype
 
-@pytest.mark.parametrize("dtype,atol,rtol", [
-    (None,            1e-4, 1e-4),   # weight=FP32, input=FP32
-    (torch.bfloat16,  1e-2, 1e-2),   # weight=BF16, input=BF16
-    (torch.float16,   1e-2, 1e-2),   # weight=FP16, input=FP16
-], ids=["fp32", "bf16", "fp16"])
-@pytest.mark.parametrize("B,T,H,W", [
-    (1, 21, 60, 104),
-    (2,  9, 40,  64),
-], ids=["480p-B1", "small-B2"])
+
+@pytest.mark.parametrize(
+    "dtype,atol,rtol",
+    [
+        (None, 1e-4, 1e-4),  # weight=FP32, input=FP32
+        (torch.bfloat16, 1e-2, 1e-2),  # weight=BF16, input=BF16
+        (torch.float16, 1e-2, 1e-2),  # weight=FP16, input=FP16
+    ],
+    ids=["fp32", "bf16", "fp16"],
+)
+@pytest.mark.parametrize(
+    "B,T,H,W",
+    [
+        (1, 21, 60, 104),
+        (2, 9, 40, 64),
+    ],
+    ids=["480p-B1", "small-B2"],
+)
 def test_hunyuanvideo(dtype, atol, rtol, B, T, H, W):
     _run_equivalence(
-        patch_size=[1, 2, 2], in_chans=16, embed_dim=3072,
-        flatten=True, bias=True,
-        weight_dtype=dtype, input_dtype=dtype,
-        B=B, T=T, H=H, W=W, atol=atol, rtol=rtol,
+        patch_size=[1, 2, 2],
+        in_chans=16,
+        embed_dim=3072,
+        flatten=True,
+        bias=True,
+        weight_dtype=dtype,
+        input_dtype=dtype,
+        B=B,
+        T=T,
+        H=H,
+        W=W,
+        atol=atol,
+        rtol=rtol,
     )
 
 
 # ── No-bias variants ─────────────────────────────────────────────────────────
 
+
 def test_wan_no_bias():
     _run_equivalence(
-        patch_size=(1, 2, 2), in_chans=16, embed_dim=5120,
-        flatten=False, bias=False,
-        weight_dtype=None, input_dtype=None,
-        B=1, T=21, H=60, W=104, atol=1e-4, rtol=1e-4,
+        patch_size=(1, 2, 2),
+        in_chans=16,
+        embed_dim=5120,
+        flatten=False,
+        bias=False,
+        weight_dtype=None,
+        input_dtype=None,
+        B=1,
+        T=21,
+        H=60,
+        W=104,
+        atol=1e-4,
+        rtol=1e-4,
     )
 
 
 def test_hunyuanvideo_no_bias():
     _run_equivalence(
-        patch_size=[1, 2, 2], in_chans=16, embed_dim=3072,
-        flatten=True, bias=False,
-        weight_dtype=None, input_dtype=None,
-        B=1, T=21, H=60, W=104, atol=1e-4, rtol=1e-4,
+        patch_size=[1, 2, 2],
+        in_chans=16,
+        embed_dim=3072,
+        flatten=True,
+        bias=False,
+        weight_dtype=None,
+        input_dtype=None,
+        B=1,
+        T=21,
+        H=60,
+        W=104,
+        atol=1e-4,
+        rtol=1e-4,
     )
 
 
