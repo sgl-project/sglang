@@ -857,7 +857,8 @@ class MooncakeKVManager(CommonKVManager):
                                     )
                             self.record_failure(
                                 kv_chunk.room,
-                                f"Failed to send kv chunk of {kv_chunk.room} to {req.endpoint}:{req.dst_port}",
+                                f"Failed to send kv chunk of {kv_chunk.room} to "
+                                f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
                             )
                             self.update_status(kv_chunk.room, KVPoll.Failed)
                             self.sync_status_to_decode_endpoint(

@@ -47,7 +47,6 @@ from sglang.srt.mem_cache.radix_cache import (
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
-from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -103,9 +102,6 @@ class HiMambaRadixCache(MambaRadixCache):
                     "Page first layout is not supported with direct IO backend, "
                     "switching to page first direct layout"
                 )
-
-        if not server_args.disable_hicache_numa_detect:
-            bind_to_closest_numa_node_cuda()
 
         self.page_size = params.page_size
         self.hybrid_kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
