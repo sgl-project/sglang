@@ -173,13 +173,12 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-RUN pip uninstall -y aiter \
- && pip install flydsl==0.0.1.dev95158637 \
- && pip install psutil pybind11 # Required by AITER setup.py
+RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
- && git submodule update --init --recursive
+ && git submodule update --init --recursive \
+ && pip install -r requirements.txt
 
 # Hot patches for AITER in v0.1.10.post3
 # This is for ROCm 7.2 only, because of the image rebase from vllm
