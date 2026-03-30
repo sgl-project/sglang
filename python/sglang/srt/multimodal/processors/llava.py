@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -96,7 +97,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
     ):
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
+            fut = loop.run_in_executor(
                 self.cpu_executor,
                 LlavaImageProcessor._process_single_image_task,
                 image_data,
@@ -104,6 +105,12 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 grid_pinpoints,
                 self._processor,
             )
+            # Reuse the same REQUEST_TIMEOUT env var used by requests.get()
+            # in the download layer. asyncio.wait_for provides an additional
+            # total-time guard that socket-level timeouts cannot (e.g. slow
+            # trickle downloads where each read succeeds within the timeout).
+            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+            return await asyncio.wait_for(fut, timeout=timeout)
         else:
             return self._process_single_image_task(
                 image_data,
