@@ -39,6 +39,14 @@
   - [7.2 Wave Quantization 效应](#72-wave-quantization-效应)
 - [8. H100 vs H20 芯片对比](#8-h100-vs-h20-芯片对比)
 - [9. 优化路线图](#9-优化路线图)
+- [10. nsys No-Warmup Kernel 精细对比](#10-nsys-no-warmup-kernel-精细对比baseline-vs-fp8-deepgemm)
+  - [10.1 跨分辨率 GPU Kernel 总时间对比](#101-跨分辨率-gpu-kernel-总时间对比)
+  - [10.2 分类 Kernel 时间对比](#102-分类-kernel-时间对比)
+  - [10.3 FP8 新增与移除 Kernel](#103-fp8-新增与移除-kernel)
+  - [10.4 逐 Shape GEMM 加速比分析](#104-逐-shape-gemm-加速比分析)
+  - [10.5 FP8 Overhead 时间收支](#105-fp8-overhead-时间收支)
+  - [10.6 非 GEMM Kernel 跨分辨率对比](#106-非-gemm-kernel-跨分辨率对比)
+  - [10.7 关键结论](#107-关键结论)
 - [附录 A：与 Yikai 1024×1024 Profile 的对比](#附录-a与-yikai-10241024-profile-的对比)
 - [附录 B：复现命令](#附录-b复现命令)
 
@@ -513,17 +521,274 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 
 ## 9. 优化路线图
 
+> **Updated**: 2026-03-27，基于 nsys no-warmup kernel 精细分析（Section 10）更新
+
+#### 已完成
+
 | 状态 | 优化 | 目标 | 收益 | 说明 |
 |:---:|------|------|------|------|
-| ✅ 完成 | TextEncoder FP32→BF16 | TextEncoding | -35% E2E (旧基准) | CLI flag, 零代码 |
-| ✅ 完成 | FP8 scale 加载修复（3层Bug） | Bug fix | VRAM -28%, 图像恢复 | 4 处代码修复 |
-| ✅ 完成 | CUTLASS FP8 验证 | Denoising GEMM | 256×256 收益有限(+2%) | 消除 transpose |
-| ✅ 完成 | 多分辨率 Benchmark | 全面验证 | 确认 FP8 在 ≥512 有效 | 24 次测试 |
-| ✅ 完成 | Cache-DiT 调优 | Denoising skip | 256×256 最高 1.35× | W/R/MC 参数调优 |
-| **P0** | **Pre-transpose weight scale** | DeepGemm transpose | -70ms（消除 weight scale transpose） | 使 DeepGemm 真正有效 |
-| P1 | Fused adaLN + gate kernel | Elementwise | -5~10ms | Triton fused kernel |
-| P2 | CuTe DSL FlashAttention | Attention | -3~5ms（256×256 收益小） | 长序列更有效 |
-| P3 | Better RMSNorm (Quack) | Norm | -2~3ms | bandwidth-bound 场景收益小 |
+| ✅ | TextEncoder FP32→BF16 | TextEncoding | -35% E2E (旧基准) | CLI flag, 零代码 |
+| ✅ | FP8 scale 加载修复（3 层 Bug） | Bug fix | VRAM -28%, 图像恢复 | 4 处代码修复 |
+| ✅ | CUTLASS FP8 验证 | Denoising GEMM | 256×256 无 transpose 但 GEMM 不如 DeepGemm | 对照组 |
+| ✅ | 多分辨率 Benchmark | 全面验证 | 确认 FP8 在 ≥512 E2E 有效 | 24 次测试 |
+| ✅ | Cache-DiT 调优 | Denoising skip | 256×256 最高 1.35× | W/R/MC 参数调优 |
+| ✅ | nsys no-warmup Kernel 分析 | 根因定位 | **GEMM ~1.9× 加速（所有分辨率）** | 推翻 transpose 瓶颈假说 |
+
+#### 待做优化（优先级重排）
+
+| 优先级 | 优化 | 目标 | 预期收益 | 说明 |
+|:---:|------|------|------|------|
+| **P0** | **CUDA Graph / 减少 host dispatch** | E2E latency | **256×256: 从 0.90× 恢复到 ~1.25×** | nsys 证明 GPU kernel 已快 25%，E2E 慢在 host-side；CUDA Graph 可消除 Python dispatch + kernel launch overhead |
+| **P1** | **FlashAttention 优化（1024×1024）** | Attention | **-100~200ms（1024×1024 下 625ms, 占 FP8 GPU 21.7%）** | FP8 将 GEMM 减半后 Attention 成为 #2 瓶颈；可考虑 FP8 Attention / CuTe DSL / 更优 tile config |
+| **P2** | FP8 量化 kernel 融合 | Quantize overhead | -10~97ms（视分辨率） | 当前每个 GEMM 前单独 launch quant kernel（1836 次），可尝试 fuse 到前序 kernel |
+| **P3** | Fused adaLN + gate kernel | Elementwise | -5~10ms | Triton fused kernel，替代当前 ~20ms elementwise |
+| **P4** | Better RMSNorm (Quack) | Norm | -2~5ms | 38ms@1024×1024，bandwidth-bound |
+| ~~P0~~ | ~~Pre-transpose weight scale~~ | ~~DeepGemm transpose~~ | ~~已无需~~ | **nsys no-warmup 证明推理阶段无 transpose 开销**，Section 3.5 的 139.8ms transpose 仅发生在 JIT warmup 阶段 |
+
+> **路线图变更说明**：
+> - **P0 从 "消除 transpose" 改为 "CUDA Graph / 减少 host dispatch"**：nsys no-warmup 分析（Section 10）发现推理阶段无 transpose，256×256 E2E 慢的根因是 host-side overhead
+> - **新增 P1 FlashAttention 优化**：FP8 将 GEMM 减半后，1024×1024 的 FlashAttention 从 15% 升至 22%，成为新瓶颈
+> - **新增 P2 量化 kernel 融合**：per-token quant 在 1024×1024 下 97ms（3.4%），有融合空间
+
+---
+
+## 10. nsys No-Warmup Kernel 精细对比（Baseline vs FP8 DeepGemm）
+
+> **方法**：使用 `cudaProfilerStart()`/`cudaProfilerStop()` API 精确框选推理区间，排除 JIT 编译、权重加载、autotuning 等 warmup 开销。
+> **数据源**：`zimage_bench/nsys_no_warmup/{256_256,512_512,1024_1024}/`
+
+### 10.1 跨分辨率 GPU Kernel 总时间对比
+
+| 分辨率 | seq_len | Baseline GPU (ms) | FP8 GPU (ms) | Delta (ms) | Kernel 加速 |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| 256×256 | 768 | **348.13** | **260.87** | **-87.26 (-25.1%)** | **1.33×** |
+| 512×512 | 3,072 | **1,045.60** | **740.13** | **-305.47 (-29.2%)** | **1.41×** |
+| 1024×1024 | 12,288 | **4,131.08** | **2,875.79** | **-1,255.29 (-30.4%)** | **1.44×** |
+
+> ⚠️ **关键发现**：去除 warmup 后，FP8 在**所有分辨率**下的 GPU kernel 总时间均快于 BF16（25-30%）。此前 E2E benchmark 中 256×256 FP8 反而更慢 (404ms vs 332ms)，说明小分辨率下 E2E 时延的主要 overhead 来自 **host-side 开销**（Python dispatch、DeepGemm JIT 路径、CUDA graph 缺失等），而非 GPU kernel 本身。
+
+### 10.2 分类 Kernel 时间对比
+
+#### 256×256 (M=768)
+
+| Category | Baseline (ms) | 次数 | FP8 (ms) | 次数 | Delta (ms) | 说明 |
+|----------|:---:|:---:|:---:|:---:|:---:|------|
+| **BF16 GEMM (DiT)** | **277.83** | 2,088 | **0** | 0 | **-277.83** | 被 FP8 DeepGemm 替换 |
+| **FP8 DeepGemm** | 0 | 0 | **154.56** | 1,836 | **+154.56** | 新增：FP8 GEMM 计算 |
+| **FP8 Quantize** | 0 | 0 | **10.57** | 1,836 | **+10.57** | 新增：per-token BF16→FP8 量化 |
+| BF16 GEMM (TE+adaLN) | 28.90 | 594 | 28.90 | 594 | 0 | TextEncoder + adaLN 未量化 |
+| GEMM splitKreduce | 3.13 | 333 | 0.02 | 9 | -3.11 | BF16 splitK 被消除 |
+| FlashAttention | 14.14 | 343 | 14.17 | 343 | 0 | 不变 |
+| Elementwise | 21.93 | 5,265 | 21.94 | 5,265 | 0 | 不变 |
+| Conv (VAE) | 13.88 | 134 | 13.93 | 134 | 0 | 不变 |
+| RMSNorm | 4.20 | 1,233 | 4.20 | 1,233 | 0 | 不变 |
+| SiLU Gate | 2.37 | 306 | 2.31 | 306 | 0 | 不变 |
+| QKNorm | 1.55 | 306 | 1.44 | 306 | -0.11 | 略快 |
+| RoPE | 1.24 | 306 | 1.23 | 306 | 0 | 不变 |
+
+#### 512×512 (M=3072)
+
+| Category | Baseline (ms) | 次数 | FP8 (ms) | 次数 | Delta (ms) | 说明 |
+|----------|:---:|:---:|:---:|:---:|:---:|------|
+| **BF16 GEMM (DiT)** | **858.29** | 2,088 | **0** | 0 | **-858.29** | 被 FP8 DeepGemm 替换 |
+| **FP8 DeepGemm** | 0 | 0 | **496.67** | 1,836 | **+496.67** | 新增：FP8 GEMM 计算 |
+| FlashAttention | 54.06 | 343 | 54.07 | 343 | 0 | 不变 |
+| Conv (VAE) | 48.57 | 146 | 47.63 | 146 | -0.95 | 略快 |
+| Elementwise | 41.29 | 5,265 | 41.41 | 5,265 | 0 | 不变 |
+| **FP8 Quantize** | 0 | 0 | **28.27** | 1,836 | **+28.27** | 新增 |
+| Norm_Other | 11.51 | 69 | 11.52 | 69 | 0 | 不变 |
+| RMSNorm | 10.70 | 1,233 | 10.55 | 1,233 | -0.16 | 不变 |
+| SiLU Gate | 7.22 | 306 | 7.38 | 306 | 0 | 不变 |
+| QKNorm | 4.16 | 306 | 4.12 | 306 | 0 | 不变 |
+| RoPE | 2.87 | 306 | 2.87 | 306 | 0 | 不变 |
+
+#### 1024×1024 (M=12288)
+
+| Category | Baseline (ms) | 次数 | FP8 (ms) | 次数 | Delta (ms) | 说明 |
+|----------|:---:|:---:|:---:|:---:|:---:|------|
+| **BF16 GEMM (DiT)** | **3,044.55** | 2,088 | **0** | 0 | **-3,044.55** | 被 FP8 DeepGemm 替换 |
+| **FP8 DeepGemm** | 0 | 0 | **1,660.99** | 1,836 | **+1,660.99** | 新增：FP8 GEMM 计算 |
+| **FlashAttention** | **624.97** | 343 | **624.57** | 343 | 0 | **成为 FP8 下第二大瓶颈** |
+| Conv (VAE) | 170.52 | 161 | 171.75 | 161 | +1.24 | 不变 |
+| Elementwise | 138.90 | 5,265 | 139.86 | 5,265 | +0.96 | 不变 |
+| **FP8 Quantize** | 0 | 0 | **96.77** | 1,836 | **+96.77** | 新增 |
+| Norm_Other | 46.76 | 69 | 46.76 | 69 | 0 | 不变 |
+| RMSNorm | 38.44 | 1,233 | 39.30 | 1,233 | +0.85 | 不变 |
+| SiLU Gate | 27.11 | 306 | 27.30 | 306 | +0.19 | 不变 |
+| QKNorm | 14.89 | 306 | 14.87 | 306 | 0 | 不变 |
+| RoPE | 12.92 | 306 | 12.85 | 306 | 0 | 不变 |
+
+**Kernel Launch 数量对比**：
+
+| 分辨率 | Baseline | FP8 | Delta |
+|--------|:---:|:---:|:---:|
+| 256×256 | 11,346 | 12,858 | +1,512 |
+| 512×512 | 11,070 | 12,870 | +1,800 |
+| 1024×1024 | 11,076 | 12,876 | +1,800 |
+
+> 新增 launch 主要来自 FP8 DeepGemm (1,836) + FP8 Quantize (1,836)，同时消除了 BF16 nvjet GEMM (~1,836) 和 splitKreduce (~324)。
+
+### 10.3 FP8 新增与移除 Kernel
+
+#### 各分辨率新增 Kernel（FP8 独有，top 5）
+
+**256×256**：
+
+| Kernel | 总时间 (ms) | 次数 | 说明 |
+|--------|:---:|:---:|------|
+| `deep_gemm::sm90_fp8_gemm` (N=20480,K=3840) | 61.26 | 270 | FFN w13 |
+| `deep_gemm::sm90_fp8_gemm` (N=3840,K=3840) | 51.54 | 1,080 | QKV+out |
+| `deep_gemm::sm90_fp8_gemm` (N=3840,K=10240) | 32.45 | 270 | FFN w2 |
+| `per_token_group_quant_8bit_kernel` | 10.57 | 1,836 | FP8 量化 |
+| DeepGemm autotune 变体 | 9.32 | 234 | tile 探索 |
+
+**512×512**：
+
+| Kernel | 总时间 (ms) | 次数 | 说明 |
+|--------|:---:|:---:|------|
+| `deep_gemm::sm90_fp8_gemm` (N=20480,K=3840) | 210.02 | 270 | FFN w13 |
+| `deep_gemm::sm90_fp8_gemm` (N=3840,K=3840) | 156.28 | 1,080 | QKV+out |
+| `deep_gemm::sm90_fp8_gemm` (N=3840,K=10240) | 101.43 | 270 | FFN w2 |
+| `per_token_group_quant_8bit_kernel` | 28.27 | 1,836 | FP8 量化 |
+| DeepGemm autotune 变体 | 28.94 | 234 | tile 探索 |
+
+**1024×1024**：
+
+| Kernel | 总时间 (ms) | 次数 | 说明 |
+|--------|:---:|:---:|------|
+| `deep_gemm::sm90_fp8_gemm` (N=20480,K=3840) | 708.04 | 288 | FFN w13 |
+| `deep_gemm::sm90_fp8_gemm` (N=3840,K=3840) | 537.61 | 1,080 | QKV+out |
+| `deep_gemm::sm90_fp8_gemm` (N=3840,K=10240) | 353.61 | 270 | FFN w2 |
+| `per_token_group_quant_8bit_kernel` | 96.77 | 1,836 | FP8 量化 |
+| DeepGemm autotune 变体 | 61.73 | 180 | tile 探索 |
+
+#### 各分辨率被移除 Kernel（Baseline 独有，top 3）
+
+| 分辨率 | Kernel | 总时间 (ms) | 次数 | 说明 |
+|--------|--------|:---:|:---:|------|
+| 256×256 | `nvjet_192x160` (coopB, TNT) | 106.80 | 270 | FFN w13 |
+| | `nvjet_256x64` (TNT) | 79.65 | 1,080 | QKV |
+| | `nvjet_128x288` (splitK, TNT) | 47.22 | 270 | FFN w2 |
+| 512×512 | `nvjet_128x224` (coopA, TNT) | 442.09 | 1,350 | QKV+w13 |
+| | `nvjet_384x96` (coopA, TNT) | 337.81 | 270 | FFN w2 |
+| | `nvjet_80x128` (TNN) | 26.29 | 90 | TE GEMM |
+| 1024×1024 | `nvjet_256x160` (coopA, TNT) | 2,826.14 | 1,620 | **全部 DiT GEMM** |
+| | `nvjet_320x128` (coopB, TNT) | 104.72 | 90 | TE GEMM |
+| | `nvjet_128x256` (coopA, TNN) | 96.02 | 90 | TE GEMM |
+
+> **发现**：
+> - 256×256：nvjet 为每种 GEMM shape 选择不同 tile config（3 种主要 nvjet 配置）
+> - 512×512：nvjet 将 QKV+out 和 FFN w13 合并到同一 tile config（`128x224`，1350=1080+270）
+> - 1024×1024：nvjet 将所有 DiT GEMM 合并到单一 tile config（`256x160`，1620=1080+270+270）
+> - 这种"大矩阵用一个通用 tile"的策略在 1024 下 **不如 DeepGemm 的 per-shape autotuning 高效**
+
+### 10.4 逐 Shape GEMM 加速比分析
+
+#### 256×256 (M=768, bandwidth-bound)
+
+| GEMM 用途 | Shape (M×K→N) | BF16 nvjet (ms) | FP8 DeepGemm (ms) | Speedup | BF16 avg (μs) | FP8 avg (μs) |
+|-----------|:---:|:---:|:---:|:---:|:---:|:---:|
+| FFN w13 (gate+up) | 768×3840→20480 | 106.80 | 61.26 | **1.74×** | 395.6 | 226.9 |
+| QKV + output_proj | 768×3840→3840 | 79.65 | 51.54 | **1.55×** | 73.8 | 47.7 |
+| FFN w2 (down) | 768×10240→3840 | 47.22 | 32.45 | **1.46×** | 174.9 | 120.2 |
+| **DiT GEMM 合计** | — | **233.67** | **145.25** | **1.61×** | — | — |
+
+#### 512×512 (M=3072, 过渡区间)
+
+| GEMM 用途 | Shape (M×K→N) | BF16 nvjet (ms) | FP8 DeepGemm (ms) | Speedup | BF16 avg (μs) | FP8 avg (μs) |
+|-----------|:---:|:---:|:---:|:---:|:---:|:---:|
+| QKV+out + FFN w13 | 3072×3840→{3840,20480} | 442.09 | 366.30 | **1.21×** | — | — |
+| FFN w2 (down) | 3072×10240→3840 | 337.81 | 101.43 | **3.33×** | 1,251.1 | 375.7 |
+| **DiT GEMM 合计** | — | **779.90** | **467.73** | **1.67×** | — | — |
+
+> 注：512×512 下 BF16 nvjet 将 QKV+out (1080) 和 FFN w13 (270) 合并到同一 tile config `128x224`，共 1350 次。FFN w2 单独使用 `384x96` config。DeepGemm 对 FFN w2 加速最大 (3.33×)，因其矩阵最大 (K=10240) 最能利用 FP8 计算密度优势。
+
+#### 1024×1024 (M=12288, compute-bound)
+
+| GEMM 用途 | Shape (M×K→N) | BF16 nvjet (ms) | FP8 DeepGemm (ms) | Speedup | BF16 avg (μs) | FP8 avg (μs) |
+|-----------|:---:|:---:|:---:|:---:|:---:|:---:|
+| FFN w13 (gate+up) | 12288×3840→20480 | — | 708.04 | — | — | 2,458.5 |
+| QKV + output_proj | 12288×3840→3840 | — | 537.61 | — | — | 497.8 |
+| FFN w2 (down) | 12288×10240→3840 | — | 353.61 | — | — | 1,309.7 |
+| **DiT GEMM 合计** | — | **2,826.14** | **1,599.26** | **1.77×** | — | — |
+
+> 注：1024×1024 下 BF16 nvjet 将所有 DiT GEMM (1620 次) 合并到单一 `256x160` config，平均 1,744.5μs/call。DeepGemm 对每种 shape 使用不同 tile config，实现 1.77× 整体加速。
+
+#### 跨分辨率 GEMM 加速趋势
+
+| 分辨率 | M | BF16 DiT GEMM (ms) | FP8 main GEMM (ms) | **GEMM Speedup** | 理论极限 |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| 256×256 | 768 | 280.96 | 145.24 | **1.93×** | 2.0× |
+| 512×512 | 3,072 | 858.51 | 467.73 | **1.84×** | 2.0× |
+| 1024×1024 | 12,288 | 3,044.75 | 1,599.26 | **1.90×** | 2.0× |
+
+> **发现**：
+> - **GEMM 纯计算加速在所有分辨率下均接近 1.9×**，非常接近 FP8 的理论 2× TFLOPs 极限
+> - 此前 Section 7 分析认为 256×256 是 bandwidth-bound、FP8 无法发挥，但 nsys 数据证明 **DeepGemm 的 JIT tile autotuning 成功突破了这一限制**
+> - 跨分辨率 GEMM 加速非常一致（1.84-1.93×），说明 DeepGemm 在各 M 值下都能有效利用 FP8 TFLOPs
+
+### 10.5 FP8 Overhead 时间收支
+
+#### 各分辨率 Overhead 汇总
+
+| 分辨率 | FP8 Quantize (ms) | Autotune (ms) | **Overhead 合计** | 占 FP8 GPU 总时间 | GEMM 净节省 (ms) |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| 256×256 | 10.57 | 9.32 | **19.89** | 7.6% | -88.42 |
+| 512×512 | 28.27 | 28.94 | **57.22** | 7.7% | -333.56 |
+| 1024×1024 | 96.77 | 61.73 | **158.51** | 5.5% | -1,286.98 |
+
+#### 256×256 时间收支明细
+
+| 组件 | 时间 (ms) | 说明 |
+|------|:---:|------|
+| BF16 nvjet DiT GEMM（被替换） | 280.96 | 基准参考 |
+| → FP8 DeepGemm 主 GEMM | 145.24 | 快了 135.72ms ✅ |
+| → FP8 DeepGemm autotune 变体 | 9.32 | 首 2 步 tile 探索 |
+| → FP8 per-token 量化 | 10.57 | 1836 次量化 launch |
+| → splitKreduce 消除 | -3.11 | BF16 splitK 不再需要 |
+| **FP8 GEMM 总计** | **162.02** | — |
+| **净节省** | **-118.94 ms** | **GEMM 路径 -42.3%** |
+
+#### 1024×1024 时间收支明细
+
+| 组件 | 时间 (ms) | 说明 |
+|------|:---:|------|
+| BF16 nvjet DiT GEMM（被替换） | 3,044.75 | 基准参考 |
+| → FP8 DeepGemm 主 GEMM | 1,599.26 | 快了 1,445.49ms ✅ |
+| → FP8 DeepGemm autotune 变体 | 61.73 | tile 探索 |
+| → FP8 per-token 量化 | 96.77 | 1836 次量化 launch |
+| **FP8 GEMM 总计** | **1,757.76** | — |
+| **净节省** | **-1,286.99 ms** | **GEMM 路径 -42.3%** |
+
+> **与 Section 3.5 的对比**：
+> - Section 3.5 分析的 nsys 数据**包含 warmup**，transpose 开销 139.8ms 是 JIT 编译时的 scale transpose
+> - **去除 warmup 后，transpose 开销消失**，说明 DeepGemm 在 JIT compile 阶段完成 scale 预处理，推理时无额外 transpose
+> - **推理阶段**的 FP8 真实开销仅为量化 + autotune
+
+### 10.6 非 GEMM Kernel 跨分辨率对比
+
+非 GEMM 类 kernel 在 BF16 和 FP8 之间几乎完全一致，验证了 FP8 仅影响 GEMM 路径：
+
+| Category | 256 BL | 256 FP8 | 512 BL | 512 FP8 | 1024 BL | 1024 FP8 | 说明 |
+|----------|:---:|:---:|:---:|:---:|:---:|:---:|------|
+| FlashAttention | 14.1 | 14.2 | 54.1 | 54.1 | **625.0** | **624.6** | O(n²) 增长，1024 下成为 #2 瓶颈 |
+| Conv (VAE) | 13.9 | 13.9 | 48.6 | 47.6 | 170.5 | 171.8 | 线性增长 |
+| Elementwise | 21.9 | 21.9 | 41.3 | 41.4 | 138.9 | 139.9 | 线性增长 |
+| RMSNorm | 4.2 | 4.2 | 10.7 | 10.6 | 38.4 | 39.3 | 线性增长 |
+| SiLU Gate | 2.4 | 2.3 | 7.2 | 7.4 | 27.1 | 27.3 | 线性增长 |
+| QKNorm | 1.6 | 1.4 | 4.2 | 4.1 | 14.9 | 14.9 | 线性增长 |
+| RoPE | 1.2 | 1.2 | 2.9 | 2.9 | 12.9 | 12.9 | 线性增长 |
+
+> **瓶颈转移**：FP8 将 GEMM 时间减半后，1024×1024 下 FlashAttention (625ms) 从微不足道变为 FP8 GPU 时间的 **21.7%**，成为下一个优化目标。
+
+### 10.7 关键结论
+
+1. **GEMM 纯计算加速跨分辨率一致：~1.9×**，接近 FP8 理论 2× 极限
+2. **FP8 新增 overhead 仅 5.5-7.7%**，远小于 GEMM 节省量
+3. **256×256 E2E 未加速的根因是 host-side dispatch**，GPU kernel 本身已快 25%
+4. **去除 warmup 后 transpose 开销消失**，推翻了 Section 3.5 的结论——DeepGemm 在推理阶段无额外 transpose
+5. **1024×1024 FP8 后 FlashAttention 成为 #2 瓶颈**（625ms, 21.7%），是后续优化方向
+6. **量化 overhead 随分辨率线性增长**（10→28→97ms），占比从 4.1% 降至 3.4%，说明 FP8 越大分辨率越划算
 
 ---
 
