@@ -680,7 +680,9 @@ def run_text_encoder_accuracy_pair(
     )
 
 
-def _should_stage_1gpu_case(case: Any, component: ComponentType, num_gpus: int) -> bool:
+def _should_stage_case(case: Any, component: ComponentType, num_gpus: int) -> bool:
+    if num_gpus == 2:
+        return True
     if num_gpus != 1:
         return False
     if component == ComponentType.TEXT_ENCODER:
@@ -821,7 +823,7 @@ def run_native_component_accuracy_case(
     library: str,
     num_gpus: int,
 ) -> None:
-    if _should_stage_1gpu_case(case, component, num_gpus):
+    if _should_stage_case(case, component, num_gpus):
         _run_staged_native_component_accuracy_case(
             engine_cls, case, component, library, num_gpus
         )
@@ -852,7 +854,7 @@ def run_native_component_accuracy_case(
 
 
 def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_gpus: int) -> None:
-    if _should_stage_1gpu_case(case, ComponentType.TEXT_ENCODER, num_gpus):
+    if _should_stage_case(case, ComponentType.TEXT_ENCODER, num_gpus):
         _run_staged_text_encoder_accuracy_case(engine_cls, case, num_gpus)
         return
     engine_cls.clear_memory()
