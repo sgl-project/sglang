@@ -272,3 +272,6 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+
+# Local analysis working docs (Claude-generated reference docs, not for upstream)
+zimage_256_256/docs/
