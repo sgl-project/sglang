@@ -1,4 +1,11 @@
-"""Benchmark: fused_temperature_softmax vs div_+softmax vs flashinfer.sampling.softmax."""
+"""Benchmark: fused_temperature_softmax vs separate div_ + softmax vs flashinfer.sampling.softmax.
+
+Each path clones logits every iteration so timing is not skewed by in-place reuse.
+Uses torch.cuda.Event timing; default 50 warmup, 200 timed iterations.
+
+Columns tri/base and fi/base are speedup vs PyTorch baseline; tri/fi is t_flashinfer/t_triton
+(>1 means Triton is faster).
+"""
 
 import argparse
 
@@ -49,7 +56,7 @@ def main():
     header = (
         f"{'bs':>5}  {'vocab':>7}  {'dtype':>8}  "
         f"{'baseline (us)':>14}  {'triton (us)':>12}  {'inplace (us)':>13}  {'flashinfer (us)':>16}  "
-        f"{'tri/base':>9}  {'fi/base':>8}"
+        f"{'tri/base':>9}  {'fi/base':>8}  {'tri/fi':>7}"
     )
     print(header)
     print("-" * len(header))
@@ -80,18 +87,20 @@ def main():
 
         t_ip = benchmark_fn(run_inplace, args.warmup, args.iters)
 
-        # --- FlashInfer softmax with temperature ---
+        # --- FlashInfer (clone each iter, same as other paths) ---
         def run_flashinfer(src=logits_src, t=temps_1d):
-            flashinfer_softmax(src, temperature=t)
+            l = src.clone()
+            flashinfer_softmax(l, temperature=t)
 
         t_fi = benchmark_fn(run_flashinfer, args.warmup, args.iters)
 
         sp_triton = t_base / t_triton
         sp_fi = t_base / t_fi
+        tri_vs_fi = t_fi / t_triton
         print(
             f"{bs:>5}  {vocab:>7}  {str(dtype):>8}  "
             f"{t_base:>14.1f}  {t_triton:>12.1f}  {t_ip:>13.1f}  {t_fi:>16.1f}  "
-            f"{sp_triton:>8.2f}x  {sp_fi:>7.2f}x"
+            f"{sp_triton:>8.2f}x  {sp_fi:>7.2f}x  {tri_vs_fi:>6.2f}x"
         )
 
 
