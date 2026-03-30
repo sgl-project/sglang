@@ -16,23 +16,22 @@ logger = init_logger(__name__)
 
 
 @dataclass
-class FlashAttentionMetadata:
+class AscendFAMetadata:
     pass
 
 
-class FlashAttentionMetadataBuilder(AttentionMetadataBuilder):
+class AscendFAMetadataBuilder(AttentionMetadataBuilder):
     def __init__(self) -> None:
         pass
 
     def prepare(self) -> None:
         pass
 
-    def build(  # type: ignore
+    def build(
         self,
-        raw_latent_shape=list,
         **kwargs: dict[str, Any],
-    ) -> FlashAttentionMetadata:
-        return FlashAttentionMetadata()
+    ) -> AttentionMetadata:
+        return AscendFAMetadata()
 
 
 class AscendFABackend(AttentionBackend):
@@ -51,7 +50,7 @@ class AscendFABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        return FlashAttentionMetadataBuilder
+        return AscendFAMetadataBuilder
 
 
 class AscendFAImpl(AttentionImpl):
