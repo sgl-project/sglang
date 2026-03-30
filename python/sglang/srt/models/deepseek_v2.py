@@ -331,6 +331,7 @@ class MoEGate(nn.Module):
                 _use_aiter_gfx95
                 and hidden_states.shape[0] <= 256
                 and self.weight.shape[0] <= 256
+                and hidden_states.shape[1] == 7168  # tuned for DSR1/V3
             ):
                 logits = aiter_dsv3_router_gemm(
                     hidden_states, self.weight, gemm_output_zero_allocator
