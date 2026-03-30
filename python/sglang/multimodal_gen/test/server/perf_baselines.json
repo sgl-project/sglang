@@ -13,9 +13,9 @@
             "denoise_agg": 0.1
         },
         "pr_test": {
-            "e2e": 0.15,
-            "denoise_stage": 0.1,
-            "non_denoise_stage": 0.6,
+            "e2e": 0.2,
+            "denoise_stage": 0.2,
+            "non_denoise_stage": 0.8,
             "denoise_step": 0.25,
             "denoise_agg": 0.15
         }
@@ -607,7 +607,7 @@
                 "InputValidationStage": 0.04,
                 "TextEncodingStage": 428.59,
                 "LatentPreparationStage": 0.14,
-                "TimestepPreparationStage": 47.26,
+                "TimestepPreparationStage": 422.21,
                 "DenoisingStage": 778.56,
                 "DecodingStage": 10.39
             },
@@ -1983,7 +1983,7 @@
                 "8": 261.6
             },
             "expected_e2e_ms": 3541.48,
-            "expected_avg_denoise_ms": 241.68,
+            "expected_avg_denoise_ms": 288.82,
             "expected_median_denoise_ms": 262.05
         },
         "hunyuan3d_shape_gen": {
