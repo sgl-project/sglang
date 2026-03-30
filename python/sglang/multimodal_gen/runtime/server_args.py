@@ -176,6 +176,9 @@ class ServerArgs:
     # Compilation
     enable_torch_compile: bool = False
 
+    # CUDA Graph for diffusion denoising (captures dit.forward())
+    enable_diffusion_cuda_graph: bool = False
+
     # warmup
     warmup: bool = False
     warmup_resolutions: list[str] = None
