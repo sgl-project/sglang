@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.fla.index import (
     prepare_chunk_offsets,
 )
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
-from sglang.srt.layers.attention.fla.utils import is_nvidia_hopper
+from sglang.srt.layers.attention.fla.utils import is_intel, is_nvidia_hopper
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
@@ -327,7 +327,9 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        BV=32,
+        BV=(
+            16 if is_intel else 32
+        ),  # BV=16 on Intel Xe2: avoids GRF spilling (32KB→8KB), min for tl.dot
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,

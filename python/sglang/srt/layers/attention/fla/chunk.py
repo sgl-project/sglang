@@ -19,9 +19,43 @@ from sglang.srt.layers.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
+    is_intel,
 )
 
 CHUNK_SIZE = 64
+
+
+def _varlen_pad(cu_seqlens, *tensors, BT=64):
+    """Pad packed sequences to BT-token multiples.
+    Workaround for Intel XPU Triton's limitation: boundary_check in tl.make_block_ptr
+    does not work for runtime (non-constexpr) shape values.
+    """
+    lens = [int(cu_seqlens[i + 1] - cu_seqlens[i]) for i in range(len(cu_seqlens) - 1)]
+    pads = [(-l) % BT for l in lens]
+    if not any(pads):
+        return cu_seqlens, tensors, None
+    new_cu = cu_seqlens.new_zeros(len(cu_seqlens))
+    new_cu[1:] = torch.tensor(
+        [l + p for l, p in zip(lens, pads)], device=cu_seqlens.device
+    ).cumsum(0)
+    pad_t = lambda t: torch.cat(  # noqa: E731
+        [
+            (
+                torch.cat(
+                    [
+                        t[:, int(cu_seqlens[i]) : int(cu_seqlens[i + 1])],
+                        t.new_zeros(1, pads[i], *t.shape[2:]),
+                    ],
+                    dim=1,
+                )
+                if pads[i]
+                else t[:, int(cu_seqlens[i]) : int(cu_seqlens[i + 1])]
+            )
+            for i in range(len(lens))
+        ],
+        dim=1,
+    )
+    return new_cu, tuple(map(pad_t, tensors)), lens
 
 
 def chunk_gated_delta_rule_fwd(
@@ -36,6 +70,13 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
 ):
+    orig_lens = None
+    if cu_seqlens is not None and is_intel:
+        # Workaround for Intel XPU Triton's limitation. See _varlen_pad for details.
+        cu_seqlens, (q, k, v, g, beta), orig_lens = _varlen_pad(
+            cu_seqlens, q, k, v, g, beta
+        )
+
     g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens)
 
     # fused kkt + solve_tril + recompute_w_u
@@ -66,6 +107,16 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
+
+    if orig_lens is not None:
+        bos = [int(cu_seqlens[i]) for i in range(len(orig_lens))]
+        o = torch.cat(
+            [o[:, bos[i] : bos[i] + orig_lens[i]] for i in range(len(orig_lens))], 1
+        )
+        g = torch.cat(
+            [g[:, bos[i] : bos[i] + orig_lens[i]] for i in range(len(orig_lens))], 1
+        )
+
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
     elif SUPPRESS_LEVEL >= 3:
