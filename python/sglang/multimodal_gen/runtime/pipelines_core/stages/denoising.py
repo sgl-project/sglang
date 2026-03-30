@@ -1221,6 +1221,12 @@ class DenoisingStage(PipelineStage):
                         if not is_warmup:
                             self.step_profile()
 
+        # Synchronize before timing to ensure all GPU work (including
+        # async CUDA Graph replays) has completed. Without this, the
+        # elapsed time only measures CPU-side enqueue time, not actual
+        # GPU execution time.
+        if cuda_graph_enabled and graph_runner is not None and graph_runner.captured:
+            torch.cuda.synchronize()
         denoising_end_time = time.time()
 
         if num_timesteps > 0 and not is_warmup:
