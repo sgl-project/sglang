@@ -228,4 +228,4 @@ Not test yet.
 
 ### Using Benchmark
 
-Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md) for details.
+Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.md) for details.

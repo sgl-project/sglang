@@ -34,6 +34,7 @@ class TestSRTBackend(CustomTestCase):
             cuda_graph_max_bs=4,
             mem_fraction_static=0.7,
             incremental_streaming_output=True,
+            log_level="info",
         )
         sgl.set_default_backend(cls.backend)
 

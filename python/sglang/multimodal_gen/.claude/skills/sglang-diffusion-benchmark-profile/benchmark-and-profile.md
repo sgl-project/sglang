@@ -63,8 +63,6 @@ Download input images required by some models:
 ```bash
 wget -O "${ASSET_DIR}/cat.png" \
   https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png
-wget -O "${ASSET_DIR}/astronaut.jpg" \
-  https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/astronaut.jpg
 wget -O "${ASSET_DIR}/mova_single_person.jpg" \
   https://github.com/OpenMOSS/MOVA/raw/main/assets/single_person.jpg
 ```
@@ -75,7 +73,27 @@ wget -O "${ASSET_DIR}/mova_single_person.jpg" \
 
 All commands include `--warmup` and `--enable-torch-compile` for real production performance. Add `--perf-dump-path <file>.json` for machine-readable output.
 
-If you want a checked-in preset runner instead of copying commands manually, use `scripts/bench_diffusion_denoise.py --model <preset> --label <name>`. It writes the same perf dump JSONs used by `compare_perf.py`.
+Nightly diffusion comparison is server/API based (`sglang serve` + OpenAI-compatible requests). The commands below stay on `sglang generate` for local profiling, but the first 8 presets are aligned to nightly on model, prompt, reference image, steps, guidance scale, GPU count, and parallelism flags.
+
+If you want a checked-in preset runner instead of copying commands manually, use `scripts/bench_diffusion_denoise.py --model <preset> --label <name>` or `--list-models`. It writes the same perf dump JSONs used by `compare_perf.py`.
+
+### Preset Catalog
+
+Nightly-aligned presets come first; skill-only presets stay available after them.
+
+| Preset | Model | Nightly | Notes |
+| --- | --- | --- | --- |
+| `flux` | `black-forest-labs/FLUX.1-dev` | Yes: `flux1_dev_t2i_1024` | Aligned to nightly prompt + `--dit-layerwise-offload false` |
+| `flux2` | `black-forest-labs/FLUX.2-dev` | Yes: `flux2_dev_t2i_1024` | Aligned to nightly prompt, 50 steps, guidance 4.0 |
+| `qwen` | `Qwen/Qwen-Image-2512` | Yes: `qwen_image_2512_t2i_1024` | Aligned to nightly prompt/steps; no extra offload overrides |
+| `qwen-edit` | `Qwen/Qwen-Image-Edit-2511` | Yes: `qwen_image_edit_2511` | Uses nightly cat image + edit prompt |
+| `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Aligned to nightly prompt + guidance 4.0 |
+| `wan-t2v` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Yes: `wan22_t2v_a14b_720p` | Aligned to nightly CFG-parallel 4-GPU launch |
+| `wan-ti2v` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Yes: `wan22_ti2v_5b_720p` | Uses nightly cat image + motion prompt |
+| `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Added to match nightly; aligned to CFG-parallel 4-GPU launch |
+| `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only extra preset |
+| `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
+| `helios` | `BestWishYsh/Helios-Base` | No | Skill-only extra preset |
 
 ### Perf dump & before/after compare
 
@@ -98,86 +116,95 @@ python3 python/sglang/multimodal_gen/benchmarks/compare_perf.py \
   "${BENCH_DIR}/baseline.json" "${BENCH_DIR}/new.json"
 ```
 
-### Qwen-Image-2512 (1024×1024, 50 steps)
-```bash
-sglang generate \
-  --model-path=Qwen/Qwen-Image-2512 \
-  --prompt="A futuristic cyberpunk city at night, neon lights reflecting on wet streets, highly detailed, 8k" \
-  '--negative-prompt= ' \
-  --width=1024 --height=1024 --num-inference-steps=50 --guidance-scale=4.0 \
-  --seed=42 --save-output --enable-torch-compile --warmup \
-  --dit-cpu-offload false --text-encoder-cpu-offload false
-```
-
-### Qwen-Image-Edit-2511 (image editing, 1024×1024, 50 steps)
-```bash
-sglang generate \
-  --model-path=Qwen/Qwen-Image-Edit-2511 \
-  '--prompt=Transform into anime style' '--negative-prompt= ' \
-  --image-path="${ASSET_DIR}/cat.png" \
-  --width=1024 --height=1024 --num-inference-steps=50 --guidance-scale=4.0 \
-  --seed=42 --save-output --enable-torch-compile --warmup \
-  --dit-cpu-offload false --text-encoder-cpu-offload false
-```
-
-### FLUX.1-dev (1024×1024, 50 steps)
+### FLUX.1-dev (Nightly: `flux1_dev_t2i_1024`)
 ```bash
 sglang generate \
   --model-path=black-forest-labs/FLUX.1-dev \
-  --prompt="A futuristic cyberpunk city at night, neon lights reflecting on wet streets, highly detailed, 8k" \
+  --prompt="A futuristic cyberpunk city at night, neon lights reflecting on wet streets" \
+  --width=1024 --height=1024 --num-inference-steps=50 --guidance-scale=4.0 \
+  --seed=42 --save-output --enable-torch-compile --warmup \
+  --dit-layerwise-offload false
+```
+
+### FLUX.2-dev (Nightly: `flux2_dev_t2i_1024`)
+```bash
+sglang generate \
+  --model-path=black-forest-labs/FLUX.2-dev \
+  --prompt="A futuristic cyberpunk city at night, neon lights reflecting on wet streets" \
+  --width=1024 --height=1024 --num-inference-steps=50 --guidance-scale=4.0 \
+  --seed=42 --save-output --enable-torch-compile --warmup \
+  --dit-layerwise-offload false
+```
+
+### Qwen-Image-2512 (Nightly: `qwen_image_2512_t2i_1024`)
+```bash
+sglang generate \
+  --model-path=Qwen/Qwen-Image-2512 \
+  --prompt="A futuristic cyberpunk city at night, neon lights reflecting on wet streets" \
   --width=1024 --height=1024 --num-inference-steps=50 --guidance-scale=4.0 \
   --seed=42 --save-output --enable-torch-compile --warmup
 ```
 
-### FLUX.2-dev (1024×1024)
+### Qwen-Image-Edit-2511 (Nightly: `qwen_image_edit_2511`)
 ```bash
 sglang generate \
-  --model-path black-forest-labs/FLUX.2-dev \
-  --prompt "A Logo With Bold Large Text: SGL Diffusion" \
-  --width=1024 --height=1024 \
-  --dit-layerwise-offload false --enable-torch-compile --warmup \
-  --dit-cpu-offload false --text-encoder-cpu-offload true --vae-cpu-offload false
+  --model-path=Qwen/Qwen-Image-Edit-2511 \
+  --prompt="Make the cat wear a red hat" \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --width=1024 --height=1024 --num-inference-steps=50 --guidance-scale=4.0 \
+  --seed=42 --save-output --enable-torch-compile --warmup
 ```
 
-### Z-Image-Turbo (1024×1024, 9 steps)
+### Z-Image-Turbo (Nightly: `zimage_turbo_t2i_1024`)
 ```bash
 sglang generate \
   --model-path=Tongyi-MAI/Z-Image-Turbo \
-  --prompt='A fantasy landscape with mountains and a river, detailed, vibrant colors' \
-  --width=1024 --height=1024 --num-inference-steps=9 --guidance-scale=0.0 \
-  --seed=42 --save-output --enable-torch-compile --warmup \
-  --dit-cpu-offload false --text-encoder-cpu-offload false
+  --prompt="A futuristic cyberpunk city at night, neon lights reflecting on wet streets" \
+  --width=1024 --height=1024 --num-inference-steps=9 --guidance-scale=4.0 \
+  --seed=42 --save-output --enable-torch-compile --warmup
 ```
 
-### Wan2.2-T2V-A14B 720P (4 GPUs, 81 frames, 2 steps)
+### Wan2.2-T2V-A14B 720P (Nightly: `wan22_t2v_a14b_720p`)
 ```bash
 # Select four idle GPUs first:
 # export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
 sglang generate \
   --model-path=Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --prompt="A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon." \
-  --negative-prompt=" " --720p --num-inference-steps=2 --num-frames=81 \
+  --prompt="A cat and a dog baking a cake together in a kitchen." \
+  --720p --num-inference-steps=2 --num-frames=81 \
   --guidance-scale=5.0 --seed=42 --save-output \
-  --num-gpus=4 --ulysses-degree=4 \
+  --num-gpus=4 --enable-cfg-parallel --ulysses-degree=2 \
   --text-encoder-cpu-offload --pin-cpu-memory \
   --warmup --enable-torch-compile
 ```
 
-### Wan2.2-TI2V-5B 720P (single GPU, 81 frames, 50 steps)
+### Wan2.2-TI2V-5B 720P (Nightly: `wan22_ti2v_5b_720p`)
 ```bash
 sglang generate \
-  --model-path Wan-AI/Wan2.2-TI2V-5B-Diffusers \
-  --prompt "An astronaut hatching from an egg, on the surface of the moon..." \
-  --negative-prompt "Bright tones, overexposed, static, blurred details..." \
-  --image-path="${ASSET_DIR}/astronaut.jpg" \
-  --num-frames 81 --720p --num-inference-steps 50 --guidance-scale 5.0 \
-  --seed 42 --save-output \
-  --dit-layerwise-offload false --dit-cpu-offload false \
-  --vae-cpu-offload false --text-encoder-cpu-offload false \
+  --model-path=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --prompt="The cat starts walking slowly towards the camera." \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --num-frames=81 --720p --num-inference-steps=50 --guidance-scale=5.0 \
+  --seed=42 --save-output \
   --enable-torch-compile --warmup
 ```
 
-### HunyuanVideo (848×480, 65 frames, 30 steps)
+### Wan2.2-I2V-A14B 720P (Nightly: `wan22_i2v_a14b_720p`)
+```bash
+# Select four idle GPUs first:
+# export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
+sglang generate \
+  --model-path=Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+  --prompt="The cat starts walking slowly towards the camera." \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --720p --num-inference-steps=2 --num-frames=81 \
+  --guidance-scale=5.0 --seed=42 --save-output \
+  --num-gpus=4 --enable-cfg-parallel --ulysses-degree=2 \
+  --text-encoder-cpu-offload --pin-cpu-memory \
+  --warmup --enable-torch-compile
+```
+
+### HunyuanVideo (Skill-only, not nightly)
 ```bash
 sglang generate \
   --model-path=hunyuanvideo-community/HunyuanVideo \
@@ -188,7 +215,7 @@ sglang generate \
   --warmup --enable-torch-compile
 ```
 
-### MOVA-720p (4 GPUs, 193 frames, 2 steps)
+### MOVA-720p (Skill-only, not nightly)
 ```bash
 # Select four idle GPUs first:
 # export CUDA_VISIBLE_DEVICES=$(python3 "$ENV_PY" print-idle-gpus --count 4)
@@ -201,6 +228,17 @@ sglang generate \
   --num-frames=193 --fps=24 \
   --num-inference-steps=2 \
   --enable-torch-compile --save-output --warmup
+```
+
+### Helios-Base (Skill-only, not nightly)
+```bash
+sglang generate \
+  --model-path=BestWishYsh/Helios-Base \
+  --prompt="A curious raccoon" \
+  --width=640 --height=384 --num-frames=33 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --text-encoder-cpu-offload false --vae-cpu-offload false \
+  --seed=42 --save-output --enable-torch-compile --warmup
 ```
 
 **Key metrics** (all models): denoise latency ★, end-to-end latency, peak GPU memory.
