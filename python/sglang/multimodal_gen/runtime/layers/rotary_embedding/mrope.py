@@ -244,6 +244,42 @@ class NDRotaryEmbedding(torch.nn.Module):
         device_str = str(positions.device)
         return self._forward_cached(pos_tuple, device_str)
 
+    def forward_cuda(
+        self, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Avoid GPU -> CPU synchronization from tolist() on CUDA path.
+        device = positions.device
+
+        # Pre-allocate the final tensors for efficiency.
+        num_tokens = positions.shape[0]
+        first_generator = self.rope_generators[0]
+        if first_generator.use_real and first_generator.repeat_interleave_real:
+            head_dim = sum(self.rope_dim_list)
+        else:
+            head_dim = sum(self.rope_dim_list) // 2
+
+        cos = torch.empty((num_tokens, head_dim), device=device, dtype=self.dtype)
+        sin = torch.empty((num_tokens, head_dim), device=device, dtype=self.dtype)
+
+        col_offset = 0
+        for i in range(self.ndim):
+            # Extract position coordinates for the current dimension for all tokens.
+            pos_i = positions[:, i].to(self.dtype)
+
+            # Get the appropriate 1D generator.
+            gen_idx = self.dim_idx_to_gen_idx[i]
+            generator = self.rope_generators[gen_idx]
+
+            # Use tensor path directly to avoid tolist() sync in generator.forward.
+            cos_1d, sin_1d = generator.build_freqs_outer(pos_i, device)
+
+            slice_width = cos_1d.shape[1]
+            cos[:, col_offset : col_offset + slice_width] = cos_1d
+            sin[:, col_offset : col_offset + slice_width] = sin_1d
+            col_offset += slice_width
+
+        return cos.float(), sin.float()
+
     @functools.lru_cache(maxsize=16)
     def _forward_cached(
         self, pos_tuple: tuple[tuple[int, ...], ...], device_str: str

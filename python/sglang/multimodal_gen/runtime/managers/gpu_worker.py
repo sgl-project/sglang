@@ -6,6 +6,7 @@ import logging
 import multiprocessing as mp
 import os
 import time
+from collections import OrderedDict
 from typing import List, Union
 
 import torch
@@ -41,7 +42,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     Req,
     build_pipeline,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+    OutputBatch,
+    RealtimeSession,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
@@ -90,6 +94,81 @@ class GPUWorker:
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+        self._realtime_session_cache: OrderedDict[str, RealtimeSession] = OrderedDict()
+        self._max_realtime_sessions = 128
+
+    def _dispose_realtime_session(
+        self, session_id: str, session: RealtimeSession | None
+    ) -> None:
+        if session is None:
+            return
+        try:
+            session.dispose()
+        except Exception as e:
+            logger.warning(
+                "Failed to dispose realtime session cache entry %s: %s",
+                session_id,
+                e,
+            )
+
+    def release_realtime_session(self, session_id: str) -> OutputBatch:
+        if not session_id:
+            return OutputBatch(
+                output={
+                    "released": False,
+                    "session_id": session_id,
+                    "reason": "empty_session_id",
+                }
+            )
+
+        session = self._realtime_session_cache.pop(session_id, None)
+        released = session is not None
+        self._dispose_realtime_session(session_id, session)
+        logger.info(
+            "Realtime session release: session_id=%s released=%s",
+            session_id,
+            released,
+        )
+        return OutputBatch(output={"released": released, "session_id": session_id})
+
+    def _attach_realtime_session(self, req: Req) -> None:
+        """Attach a persistent realtime session object for chunked generation."""
+        has_explicit_session_id = (
+            isinstance(req.extra, dict) and "realtime_session_id" in req.extra
+        )
+        if not has_explicit_session_id and req.session is None:
+            return
+
+        session_id = None
+        if has_explicit_session_id:
+            session_id = req.extra.get("realtime_session_id")
+        elif isinstance(req.request_id, str) and "_" in req.request_id:
+            # Backward compatibility for callers that did not set realtime_session_id.
+            session_id = req.request_id.split("_", 1)[0]
+
+        if not session_id:
+            return
+
+        if req.block_idx == 0 or session_id not in self._realtime_session_cache:
+            if req.block_idx > 0:
+                logger.warning(
+                    "Missing realtime session state for session_id=%s (block_idx=%s). "
+                    "Resetting block_idx to 0.",
+                    session_id,
+                    req.block_idx,
+                )
+                req.block_idx = 0
+            self._realtime_session_cache[session_id] = req.session or RealtimeSession()
+
+        req.session = self._realtime_session_cache[session_id]
+        self._realtime_session_cache.move_to_end(session_id)
+
+        while len(self._realtime_session_cache) > self._max_realtime_sessions:
+            stale_session_id, stale_session = self._realtime_session_cache.popitem(
+                last=False
+            )
+            self._dispose_realtime_session(stale_session_id, stale_session)
+            logger.debug("Evicted stale realtime session cache: %s", stale_session_id)
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -220,6 +299,7 @@ class GPUWorker:
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
+            self._attach_realtime_session(req)
 
             # capture memory baseline before forward
             if self.rank == 0 and req.metrics:

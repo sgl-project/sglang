@@ -68,6 +68,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConf
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
+    KreaWanT2V480PConfig,
     TurboWanI2V720Config,
     TurboWanT2V480PConfig,
     Wan2_2_I2V_A14B_Config,
@@ -103,6 +104,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
+    Krea_Wan2_1_T2V_A14B_SamplingParam,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
     Wan2_2_I2V_A14B_SamplingParam,
@@ -613,6 +615,13 @@ def _register_configs():
         pipeline_config_cls=WanT2V720PConfig,
         hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Krea_Wan2_1_T2V_A14B_SamplingParam,
+        pipeline_config_cls=KreaWanT2V480PConfig,
+        hf_model_paths=[
+            "Wan-AI/krea-realtime-video-diffusers",
         ],
     )
     register_configs(

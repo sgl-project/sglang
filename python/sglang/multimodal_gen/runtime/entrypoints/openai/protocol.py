@@ -2,7 +2,7 @@ import time
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -122,6 +122,41 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+class RealtimeVideoGenerationsRequest(BaseModel):
+    prompt: str
+    first_frame: Optional[bytes | str] = None
+    size: Optional[str] = "832x480"
+    seconds: Optional[int] = 4
+    fps: Optional[int] = None
+    num_frames: Optional[int] = None
+    seed: Optional[int] = 1024
+    generator_device: Optional[str] = "cuda"
+    # SGLang extensions
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    guidance_scale_2: Optional[float] = None
+    true_cfg_scale: Optional[float] = (
+        None  # for CFG vs guidance distillation (e.g., QwenImage)
+    )
+    negative_prompt: Optional[str] = None
+    enable_teacache: Optional[bool] = False
+    output_quality: Optional[str] = "default"
+    output_compression: Optional[int] = None
+    output_path: Optional[str] = None
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
+    perf_dump_path: Optional[str] = None
+    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+
+
+class RealtimeAction(BaseModel):
+    type: Literal["prompt", "video"]
+    action_content: Optional[str] = None
+    video_frame: Optional[bytes] = None
+    video_frames: Optional[List[bytes]] = None
 
 
 # Mesh API protocol models

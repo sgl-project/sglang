@@ -31,6 +31,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineCon
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    KreaWanT2V480PConfig,
     SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -60,6 +61,7 @@ __all__ = [
     "WanT2V720PConfig",
     "WanI2V720PConfig",
     "SelfForcingWanT2V480PConfig",
+    "KreaWanT2V480PConfig",
     "ZImagePipelineConfig",
     "LTX2PipelineConfig",
 ]

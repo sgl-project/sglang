@@ -2,7 +2,11 @@
 
 import torch  # type: ignore
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_local_torch_device,
+    get_tp_world_size,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -393,7 +397,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
         Initialize a Per-GPU KV cache aligned with the Wan model assumptions.
         """
         kv_cache1 = []
-        num_attention_heads = self.transformer.num_attention_heads
+        num_attention_heads = divide(
+            self.transformer.num_attention_heads, get_tp_world_size()
+        )
         attention_head_dim = self.transformer.attention_head_dim
         if self.local_attn_size != -1:
             kv_cache_size = self.local_attn_size * self.frame_seq_length
@@ -441,7 +447,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
         Initialize a Per-GPU cross-attention cache aligned with the Wan model assumptions.
         """
         crossattn_cache = []
-        num_attention_heads = self.transformer.num_attention_heads
+        num_attention_heads = divide(
+            self.transformer.num_attention_heads, get_tp_world_size()
+        )
         attention_head_dim = self.transformer.attention_head_dim
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append(

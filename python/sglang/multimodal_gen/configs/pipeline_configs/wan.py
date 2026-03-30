@@ -234,3 +234,13 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
         default_factory=lambda: [1000, 750, 500, 250]
     )
     warp_denoising_step: bool = True
+
+
+@dataclass
+class KreaWanT2V480PConfig(SelfForcingWanT2V480PConfig):
+
+    def __post_init__(self):
+        # Krea realtime causal path needs VAE encoder to re-encode the first frame
+        # when reconstructing long-horizon context.
+        self.vae_config.load_encoder = True
+        self.vae_config.load_decoder = True

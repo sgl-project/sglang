@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
+from sglang.multimodal_gen.runtime.entrypoints.realtime import realtime_video_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
@@ -281,6 +282,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(image_api.router)
     app.include_router(video_api.router)
     app.include_router(mesh_api.router)
+    app.include_router(realtime_video_api.router)
     app.include_router(weights_api.router)
 
     app.state.server_args = server_args

@@ -279,6 +279,16 @@ class Turbo_Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     fps: int = 16
 
 
+@dataclass
+class Krea_Wan2_1_T2V_A14B_SamplingParam(SamplingParams):
+    width: int = 832
+    height: int = 480
+    num_inference_steps: int = 4
+    kv_cache_num_frames: int = 3
+    guidance_scale: float = 1
+    fps: int = 12
+
+
 # =============================================
 # ============= Causal Self-Forcing =============
 # =============================================

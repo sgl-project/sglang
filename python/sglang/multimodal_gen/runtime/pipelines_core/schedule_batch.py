@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import pprint
+from collections import deque
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Optional
@@ -22,6 +23,7 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.pipelines_core.kv_cache import KVCacheManager
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _sanitize_for_logging,
@@ -156,6 +158,13 @@ class Req:
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+
+    # realtime
+    session: RealtimeSession | None = None
+    block_idx: int = 0
+    num_blocks: int = 1
+    update_prompt_embeds: bool = False
+    input_video: torch.Tensor = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
@@ -322,6 +331,51 @@ class Req:
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
         logger.info(debug_str)
+
+
+@dataclass
+class RealtimeSession:
+    def __init__(self):
+        self.last_prompts: str | list[str] | None = None
+        self.last_embeds: list[torch.Tensor] = []
+        self.interpolated_embeds: list[list[torch.Tensor]] = []
+        self.kv_cache_manager: KVCacheManager | None = None
+        self.current_denoised_latents: torch.Tensor = None
+        self.frame_cache_context: deque = None
+        self.decoder_cache: Any = None
+
+    def dispose(self):
+        self.last_embeds.clear()
+        self.interpolated_embeds.clear()
+        if self.kv_cache_manager:
+            self.kv_cache_manager.release()
+        self.current_denoised_latents = None
+        if self.frame_cache_context:
+            self.frame_cache_context.clear()
+        self.decoder_cache = None
+        torch.cuda.empty_cache()
+
+    def is_prompt_changed(self, prompts: str | list[str]) -> bool:
+        return prompts != self.last_prompts
+
+    def save_prompt_changed(
+        self,
+        prompts: str | list[str],
+        prompt_embeds_list: list[torch.Tensor],
+        interpolated_embeds: list[list[torch.Tensor]],
+    ):
+        self.last_prompts = prompts
+        self.last_embeds.clear()
+        self.last_embeds.extend(prompt_embeds_list)
+        if interpolated_embeds:
+            self.interpolated_embeds.extend(interpolated_embeds)
+
+    def get_current_embeds(self) -> list[torch.Tensor]:
+        if self.interpolated_embeds:
+            self.kv_cache_manager.reset_cross_attn()
+            return self.interpolated_embeds.pop(0)
+
+        return self.last_embeds
 
 
 @dataclass
