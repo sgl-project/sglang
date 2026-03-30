@@ -10,8 +10,6 @@ This module contains implementations of prompt encoding stages for diffusion pip
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
-from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -253,9 +251,7 @@ class TextEncodingStage(PipelineStage):
             )
             # Pass max_length to tokenizer if specified in the request. Flux v1 encoder 0
             # is CLIP with a fixed 77-token context; overriding breaks tokenization.
-            is_flux_v1 = isinstance(
-                server_args.pipeline_config, FluxPipelineConfig
-            ) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
+            is_flux_v1 = server_args.pipeline_config.is_flux_v1()
             if max_length is not None and not (is_flux_v1 and i == 0):
                 tok_kwargs["max_length"] = max_length
 
