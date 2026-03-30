@@ -84,24 +84,26 @@ class PatchEmbed(nn.Module):
         if x.dim() == 5:
             B, C, T, H, W = x.shape
             pt, ph, pw = self.patch_size
-            T_ = T // pt
-            H_ = H // ph
-            W_ = W // pw
 
-            x = x.reshape(B, C, T_, pt, H_, ph, W_, pw)
-            x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
-            x = x.reshape(B, T_ * H_ * W_, C * pt * ph * pw)
+            if T % pt == 0 and H % ph == 0 and W % pw == 0:
+                T_ = T // pt
+                H_ = H // ph
+                W_ = W // pw
 
-            w = self.proj.weight.reshape(self.proj.weight.shape[0], -1)
-            x = F.linear(x, w, self.proj.bias)  # [B, T'*H'*W', embed_dim]
+                x = x.reshape(B, C, T_, pt, H_, ph, W_, pw)
+                x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
+                x = x.reshape(B, T_ * H_ * W_, C * pt * ph * pw)
 
-            if not self.flatten:
-                x = x.reshape(B, T_, H_, W_, -1).permute(0, 4, 1, 2, 3).contiguous()
+                w = self.proj.weight.reshape(self.proj.weight.shape[0], -1)
+                x = F.linear(x, w, self.proj.bias)  # [B, T'*H'*W', embed_dim]
 
-            x = self.norm(x)
-            return x
+                if not self.flatten:
+                    x = x.reshape(B, T_, H_, W_, -1).permute(0, 4, 1, 2, 3).contiguous()
 
-        # Fallback for unexpected input ranks.
+                x = self.norm(x)
+                return x
+
+        # Fallback to Conv3d for non-5D input or indivisible spatial dims.
         x = self.proj(x)
         if self.flatten:
             x = x.flatten(2).transpose(1, 2)
