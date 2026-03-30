@@ -5,12 +5,15 @@ from sglang.srt.models.kimi_vl import KimiVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
 # Compatible with KimiVLForConditionalGeneration
 class KimiVLImageProcessor(SGLangBaseProcessor):
     models = [KimiVLForConditionalGeneration]
+    gpu_image_decode = False  # KimiVL HF processor does not support tensor inputs
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

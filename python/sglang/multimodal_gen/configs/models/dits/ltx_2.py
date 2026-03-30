@@ -164,7 +164,7 @@ class LTX2ArchConfig(DiTArchConfig):
             self.audio_num_attention_heads * self.audio_attention_head_dim
         )
         if self.audio_positional_embedding_max_pos is None:
-            self.audio_positional_embedding_max_pos = [2048]
+            self.audio_positional_embedding_max_pos = [20]
 
 
 @dataclass

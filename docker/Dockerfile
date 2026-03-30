@@ -11,7 +11,7 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.21
+ARG SGL_KERNEL_VERSION=0.4.0
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -19,7 +19,10 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.2
+ARG FLASHINFER_VERSION=0.6.6
+ARG MOONCAKE_VERSION=0.3.9
+#if need other arg please add in MOONCAKE_COMPILE_ARG
+ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -55,11 +58,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
-    && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get install -y --no-install-recommends \
     # Core system utilities
-    tzdata \
     ca-certificates \
     software-properties-common \
     netcat-openbsd \
@@ -201,13 +201,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-        python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION} \
+        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
@@ -230,18 +230,21 @@ RUN set -eux; \
       cd DeepEP && \
       git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
       cd .. ; \
     elif [ "$HOPPER_SBO" = "1" ]; then \
       git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
       cd DeepEP && \
       git checkout ${HOPPER_SBO_DEEPEP_COMMIT} && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
       cd .. ; \
     else \
         curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
             https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
         unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
         cd .. ; \
     fi
 
@@ -269,11 +272,27 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
+# Install Mooncake
+RUN --mount=type=cache,target=/root/.cache/pip \
+    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
+    if [ "$CUDA_MAJOR" -ge 13 ]; then \
+        echo "CUDA >= 13, installing mooncake-transfer-engine from source code"; \
+        git clone --branch v${MOONCAKE_VERSION} --depth 1 https://github.com/kvcache-ai/Mooncake.git && \
+        cd Mooncake && \
+        bash dependencies.sh && \
+        mkdir -p build && \
+        cd build && \
+        cmake .. ${MOONCAKE_COMPILE_ARG} && \
+        make -j$(nproc) && \
+        make install; \
+    else \
+        echo "CUDA < 13, installing mooncake-transfer-engine from pip"; \
+        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+    fi
 # Install essential Python packages
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.8.post1 \
     pre-commit \
     pytest \
     black \
@@ -302,17 +321,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
+RUN --mount=type=cache,target=/root/.cache/pip \
+   python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
+
 # Patching packages for CUDA 12/13 compatibility
 # TODO: Remove when torch version covers these packages
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
+    python3 -m pip install cuda-python==12.9 ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 --no-deps ; \
-    python3 -m pip install cuda-python==13.1.1 ; \
+    python3 -m pip install cuda-python==13.2.0 ; \
 fi
 
 # Install development tools
@@ -473,7 +496,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     python3.12-dev \
     wget \
     # Core system utilities
-    tzdata \
     ca-certificates \
     netcat-openbsd \
     curl \

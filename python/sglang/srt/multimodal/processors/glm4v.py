@@ -3,18 +3,28 @@ from typing import List, Union
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
-from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
+
+try:
+    from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
+except ImportError:
+    GlmOcrForConditionalGeneration = None
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
     models = [
-        Glm4vForConditionalGeneration,
-        Glm4vMoeForConditionalGeneration,
-        GlmOcrForConditionalGeneration,
+        m
+        for m in [
+            Glm4vForConditionalGeneration,
+            Glm4vMoeForConditionalGeneration,
+            GlmOcrForConditionalGeneration,
+        ]
+        if m is not None
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
@@ -48,6 +58,28 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+
+    def compute_mrope_positions(self, input_ids, mm_items):
+        image_grid_thw = None
+        video_grid_thw = None
+        for item in mm_items:
+            if "image_grid_thw" in item.model_specific_data:
+                image_grid_thw = item.model_specific_data["image_grid_thw"]
+            if "video_grid_thw" in item.model_specific_data:
+                video_grid_thw = item.model_specific_data["video_grid_thw"]
+
+        import torch
+
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+        attention_mask = torch.ones_like(input_ids_tensor)
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=input_ids_tensor,
+            hf_config=self.hf_config,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+        )
+        return mrope_positions.squeeze(1), mrope_position_delta
 
     async def process_mm_data_async(
         self,

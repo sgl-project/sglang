@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from sglang.bench_serving import get_tokenizer
+from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -29,9 +29,10 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=200, suite="stage-b-test-large-2-gpu")
-register_amd_ci(est_time=526, suite="stage-b-test-large-2-gpu-amd")
+register_cuda_ci(est_time=200, suite="stage-b-test-2-gpu-large")
+register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
 class HiCacheStorageBaseMixin:
@@ -53,7 +54,7 @@ class HiCacheStorageBaseMixin:
 
         # Launch server with HiCache enabled and cache report
         cls.process = cls._launch_server_with_hicache()
-        cls._wait_for_server_ready()
+        cls._wait_for_server_ready(process=cls.process)
 
         print(f"Test server launched successfully at {cls.base_url}")
         print(f"Cache directory: {cls.temp_dir}")
@@ -61,11 +62,13 @@ class HiCacheStorageBaseMixin:
     @classmethod
     def tearDownClass(cls):
         """Clean up test environment"""
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
         import shutil
 
-        shutil.rmtree(cls.temp_dir, ignore_errors=True)
+        if hasattr(cls, "temp_dir"):
+            shutil.rmtree(cls.temp_dir, ignore_errors=True)
 
     @classmethod
     def _get_model_name(cls):
@@ -128,18 +131,14 @@ class HiCacheStorageBaseMixin:
         )
 
     @classmethod
-    def _wait_for_server_ready(cls, timeout: int = 60) -> bool:
+    def _wait_for_server_ready(cls, timeout: int = 60, process=None) -> bool:
         """Wait for server to be ready"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                response = requests.get(f"{cls.base_url}/health", timeout=5)
-                if response.status_code == 200:
-                    return True
-            except requests.RequestException:
-                pass
-            time.sleep(2)
-        raise TimeoutError("Server failed to start within timeout")
+        wait_for_http_ready(
+            url=f"{cls.base_url}/health",
+            timeout=timeout,
+            process=process,
+        )
+        return True
 
     def send_request(
         self, prompt: str, max_tokens: int = 100, temperature: float = 0.0
@@ -170,13 +169,14 @@ class HiCacheStorageBaseMixin:
         meta = response_json.get("meta_info", {})
         return int(meta.get("cached_tokens", 0))
 
-    def flush_cache(self) -> bool:
-        """Flush device cache to force remote storage access"""
-        try:
-            response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
-            return response.status_code == 200
-        except requests.RequestException:
-            return False
+    def flush_cache(self):
+        """Flush device cache to force remote storage access."""
+        res = requests.post(
+            f"{self.base_url}/flush_cache",
+            params={"timeout": 30},
+            timeout=40,
+        )
+        res.raise_for_status()
 
     def gen_prompt(self, token_num: int) -> str:
         """Generate a random prompt of specified token length using tokenizer vocabulary."""
@@ -190,8 +190,7 @@ class HiCacheStorageBaseMixin:
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
         # Flush device cache to force remote storage access
-        time.sleep(2)
-        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
+        self.flush_cache()
 
     def test_basic_backup_and_prefetch(self):
         """Test storage and retrieval of large context through remote cache"""
@@ -308,8 +307,7 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
 
     # Flush cache to force remote storage access
     print("Phase 2: Flushing device cache...")
-    test_instance.assertTrue(test_instance.flush_cache(), "Cache flush should succeed")
-    time.sleep(2)
+    test_instance.flush_cache()
 
     # Second evaluation - should use remote cache
     print("Phase 3: Running second GSM8K evaluation using remote cache...")

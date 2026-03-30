@@ -15,6 +15,7 @@ import psutil
 import torch
 from typing_extensions import ParamSpec
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -75,6 +76,10 @@ class CudaPlatformBase(Platform):
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
@@ -97,6 +102,95 @@ class CudaPlatformBase(Platform):
             )
             return False
         return True
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        try:
+            from flashinfer import fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            pass
+
+        try:
+            from sgl_kernel import scaled_fp4_quant as fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            return None
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        if cls.is_blackwell():
+            try:
+                from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+                return flashinfer_mm_fp4, "cudnn"
+            except ImportError:
+                pass
+
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+
+            return cutlass_fp4_gemm, None
+        except ImportError:
+            pass
+
+        try:
+            from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+            return flashinfer_mm_fp4, "auto"
+        except ImportError:
+            return None, None
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def has_modelopt_fp4_best_performance_kit(cls) -> bool:
+        try:
+            import comfy_kitchen.backends.cuda  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def can_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+        if not cls.is_blackwell() or not cls.has_modelopt_fp4_best_performance_kit():
+            return False
+
+        try:
+            import comfy_kitchen.backends.cuda as ck_cuda
+
+            device = cls.get_local_torch_device()
+            x = torch.zeros((16, 16), dtype=torch.bfloat16, device=device)
+            scale = torch.ones((), dtype=torch.float32, device=device)
+            ck_cuda.quantize_nvfp4(x, scale, pad_16x=True)
+            return True
+        except Exception as e:
+            logger.warning(
+                "best performance kit (comfy-kitchen) is installed but unusable on "
+                "this system (%s). Blackwell NVFP4 will fall back to the generic "
+                "ModelOpt FP4 path.",
+                e,
+            )
+            return False
+
+    @classmethod
+    def should_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return cls.can_use_modelopt_fp4_best_performance_kit()
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def warn_if_modelopt_fp4_best_performance_kit_missing(cls) -> None:
+        if cls.is_blackwell() and not cls.has_modelopt_fp4_best_performance_kit():
+            logger.warning(
+                "best performance kit (comfy-kitchen) is not installed. "
+                "Blackwell NVFP4 will fall back to the generic ModelOpt FP4 path. "
+                "Install it with `pip install comfy-kitchen[cublas]`."
+            )
 
     @classmethod
     def is_full_nvlink(cls, device_ids: list[int]) -> bool:
@@ -123,6 +217,9 @@ class CudaPlatformBase(Platform):
     ) -> float:
         if empty_cache:
             torch.cuda.empty_cache()
+
+        if torch.distributed.is_initialized():
+            device_id = torch.distributed.get_rank()
 
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
@@ -215,6 +312,35 @@ class CudaPlatformBase(Platform):
                 )
                 raise ImportError(
                     "Video Sparse Attention backend is not installed."
+                ) from e
+        elif selected_backend == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
+            try:
+                from svg.kernels.triton.permute import (  # noqa: F401
+                    apply_inverse_permutation_triton,
+                    permute_tensor_by_labels_triton,
+                )
+                from svg.kmeans_utils import (  # noqa: F401
+                    batch_kmeans_Euclid,
+                    density_calculation,
+                    dynamic_block_sparse_fwd_flashinfer,
+                    identify_dynamic_map,
+                )
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
+                    SparseVideoGen2AttentionBackend,
+                )
+
+                logger.info("Using Sparse Video Gen 2 (SAP) Attention backend")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import Sparse Video Gen 2 (SAP) Attention backend: %s",
+                    str(e),
+                )
+                raise ImportError(
+                    "Sparse Video Gen 2 (SAP) Attention backend is not installed. "
+                    "Please install it by following the instructions at "
+                    "https://github.com/svg-project/Sparse-VideoGen"
                 ) from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:

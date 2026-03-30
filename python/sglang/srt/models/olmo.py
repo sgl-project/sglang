@@ -15,6 +15,7 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/olmo.py#L1
 """Inference-only OLMo model compatible with HuggingFace weights."""
+
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -67,7 +68,7 @@ class OlmoAttention(nn.Module):
         self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
         self.head_dim = self.hidden_size // self.total_num_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters["rope_theta"]
         self.clip_qkv = config.clip_qkv
 
         # Attention input projection. Projects x -> (q, k, v)

@@ -15,7 +15,9 @@ from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 from sglang.srt.utils import get_bool_env_var, is_npu, logger
 
 _is_npu = is_npu()
@@ -354,6 +356,24 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
                         result[feature_name] = result[feature_name].to("cpu")
 
         return result
+
+    def compute_mrope_positions(self, input_ids, mm_items):
+        image_grid_thw = None
+        video_grid_thw = None
+        for item in mm_items:
+            if "image_grid_thw" in item.model_specific_data:
+                image_grid_thw = item.model_specific_data["image_grid_thw"]
+            if "video_grid_thw" in item.model_specific_data:
+                video_grid_thw = item.model_specific_data["video_grid_thw"]
+
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_ernie45(
+            input_ids=input_ids_tensor,
+            hf_config=self.hf_config,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+        )
+        return mrope_positions.squeeze(1), mrope_position_delta
 
     async def process_mm_data_async(
         self,

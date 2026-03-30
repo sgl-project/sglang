@@ -11,7 +11,6 @@ import inspect
 import math
 import os
 import signal
-import socket
 import sys
 import threading
 import traceback
@@ -23,7 +22,6 @@ from typing import Any, TypeVar, cast
 import cloudpickle
 import torch
 import yaml
-from remote_pdb import RemotePdb
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 import sglang.multimodal_gen.envs as envs
@@ -35,6 +33,28 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 logger = init_logger(__name__)
 
 T = TypeVar("T")
+
+
+def _expand_path_value(field_name: str, value: Any) -> Any:
+    eu = os.path.expanduser
+    if field_name.endswith("_path") and isinstance(value, str):
+        return eu(value)
+    if field_name.endswith("_path") and isinstance(value, list):
+        return [eu(x) if isinstance(x, str) else x for x in value]
+    if field_name.endswith("_paths") and isinstance(value, dict):
+        return {k: eu(p) if isinstance(p, str) else p for k, p in value.items()}
+    return value
+
+
+def expand_path_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {key: _expand_path_value(key, value) for key, value in kwargs.items()}
+
+
+def expand_path_fields(obj) -> None:
+    """In-place expanduser on all dataclass fields whose name ends with '_path' or '_paths'."""
+    for f in fields(obj):
+        setattr(obj, f.name, _expand_path_value(f.name, getattr(obj, f.name)))
+
 
 # TODO(will): used to convert server_args.precision to torch.dtype. Find a
 # cleaner way to do this.
@@ -52,8 +72,8 @@ def find_nccl_library() -> str:
     """
     We either use the library file specified by the `VLLM_NCCL_SO_PATH`
     environment variable, or we find the library file brought by PyTorch.
-    After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
-    found by `ctypes` automatically.
+    After importing `torch`, `libnccl.so.2`, `librccl.so.1` or `libmccl.so.2`
+    can be found by `ctypes` automatically.
     """
     so_file = envs.SGLANG_DIFFUSION_NCCL_SO_PATH
 
@@ -68,8 +88,10 @@ def find_nccl_library() -> str:
             so_file = "libnccl.so.2"
         elif torch.version.hip is not None:
             so_file = "librccl.so.1"
+        elif hasattr(torch.version, "musa") and torch.version.musa is not None:
+            so_file = "libmccl.so.2"
         else:
-            raise ValueError("NCCL only supports CUDA and ROCm backends.")
+            raise ValueError("NCCL only supports CUDA, ROCm and MUSA backends.")
         logger.info("Found nccl from library %s", so_file)
     return str(so_file)
 
@@ -542,15 +564,6 @@ class TypeBasedDispatcher:
             if isinstance(obj, ty):
                 return fn(obj)
         raise ValueError(f"Invalid object: {obj}")
-
-
-# For non-torch.distributed debugging
-def remote_breakpoint() -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
-        port = s.getsockname()[1]
-        RemotePdb(host="localhost", port=port).set_trace()
 
 
 @dataclass

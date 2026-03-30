@@ -38,8 +38,8 @@ def find_nccl_library() -> str:
     """
     We either use the library file specified by the `SGLANG_NCCL_SO_PATH`
     environment variable, or we find the library file brought by PyTorch.
-    After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
-    found by `ctypes` automatically.
+    After importing `torch`, `libnccl.so.2`, `librccl.so.1` or `libmccl.so.2`
+    can be found by `ctypes` automatically.
     """
 
     # so_file can be set to None in sglang
@@ -55,8 +55,10 @@ def find_nccl_library() -> str:
             so_file = "libnccl.so.2"
         elif torch.version.hip is not None:
             so_file = "librccl.so.1"
+        elif hasattr(torch.version, "musa") and torch.version.musa is not None:
+            so_file = "libmccl.so.2"
         else:
-            raise ValueError("NCCL only supports CUDA and ROCm backends.")
+            raise ValueError("NCCL only supports CUDA, ROCm and MUSA backends.")
         logger.debug("Found nccl from library %s", so_file)
     return so_file
 
@@ -341,7 +343,7 @@ class NCCLLibrary:
         except Exception as e:
             logger.error(
                 "Failed to load NCCL library from %s . "
-                "It is expected if you are not running on NVIDIA/AMD GPUs. "
+                "It is expected if you are not running on NVIDIA/AMD/MTHREADS GPUs. "
                 "Otherwise, the nccl library might not exist, be corrupted "
                 "or it does not support the current platform %s. "
                 "If you already have the library, please set the "

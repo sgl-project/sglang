@@ -19,12 +19,9 @@ import numpy as np
 import requests
 from transformers import AutoTokenizer
 
-from sglang.bench_serving import (
-    DatasetRow,
-    benchmark,
-    sample_mmmu_requests,
-    set_global_args,
-)
+from sglang.bench_serving import benchmark, set_global_args
+from sglang.benchmark.datasets import DatasetRow
+from sglang.benchmark.datasets.mmmu import sample_mmmu_requests
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -83,6 +80,8 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
         disable_ignore_eos=False,
         disable_stream=False,
         return_logprob=False,
+        return_routed_experts=False,
+        plot_throughput=False,
         backend=backend,
         dataset_name="custom",
         num_prompts=None,

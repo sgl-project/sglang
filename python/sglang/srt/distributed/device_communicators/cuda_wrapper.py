@@ -13,6 +13,10 @@ from typing import Any, Dict, List, Optional
 # this line makes it possible to directly load `libcudart.so` using `ctypes`
 import torch  # noqa
 
+from sglang.srt.utils import is_musa
+
+_is_musa = is_musa()
+
 logger = logging.getLogger(__name__)
 
 # === export types and functions from cudart to Python ===
@@ -113,7 +117,7 @@ class CudaRTLibrary:
 
     def __init__(self, so_file: Optional[str] = None):
         if so_file is None:
-            so_file = find_loaded_library("libcudart")
+            so_file = find_loaded_library("libcudart" if not _is_musa else "libmusart")
             assert so_file is not None, "libcudart is not loaded in the current process"
         if so_file not in CudaRTLibrary.path_to_library_cache:
             lib = ctypes.CDLL(so_file)

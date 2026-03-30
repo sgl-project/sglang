@@ -22,7 +22,7 @@ class ConnectorType(str, enum.Enum):
     INSTANCE = "instance"
 
 
-def create_remote_connector(url, device, **kwargs) -> BaseConnector:
+def create_remote_connector(url, device=None, **kwargs) -> BaseConnector:
     connector_type = parse_connector_type(url)
     if connector_type == "redis":
         return RedisConnector(url)

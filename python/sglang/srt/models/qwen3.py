@@ -181,7 +181,10 @@ class Qwen3Attention(nn.Module):
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
-        if not _is_npu or forward_batch.forward_mode.is_extend():
+        if (
+            not _is_npu
+            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        ):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -213,8 +216,8 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
         self.self_attn = Qwen3Attention(
@@ -299,7 +302,12 @@ class Qwen3DecoderLayer(nn.Module):
             forward_batch,
             cache=(
                 [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
-                if _is_npu and not get_global_server_args().enable_piecewise_cuda_graph
+                if _is_npu
+                and not get_global_server_args().disable_piecewise_cuda_graph
+                and (
+                    hasattr(self.mlp.gate_up_proj, "weight")
+                    and hasattr(self.mlp.down_proj, "weight")
+                )
                 else None
             ),
         )
@@ -485,7 +493,11 @@ class Qwen3ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "Embedding" in self.config.name_or_path:
+            if not name.startswith("model.") and (
+                name.startswith("layers.")
+                or name.startswith("embed_tokens.")
+                or name.startswith("norm.")
+            ):
                 name = add_prefix(name, "model")
 
             if name == "model.embed_tokens.weight":

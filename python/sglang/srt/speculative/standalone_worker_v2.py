@@ -42,6 +42,8 @@ class StandaloneDraftWorker(EagleDraftWorker):
         tp_rank: int,
         dp_rank: int,
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -53,6 +55,8 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.moe_ep_rank = moe_ep_rank
         self.nccl_port = nccl_port
         self.target_worker = target_worker
+        self.attn_cp_rank = attn_cp_rank
+        self.moe_dp_rank = moe_dp_rank
 
         # Args for easy access
         self.device = server_args.device
@@ -89,10 +93,13 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
         # Alias for better readability
@@ -131,6 +138,8 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -139,7 +148,6 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
@@ -157,7 +165,15 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
 
         # Create our custom draft worker that doesn't share embeddings/lm_head
         self._draft_worker = StandaloneDraftWorker(
-            server_args, gpu_id, tp_rank, dp_rank, moe_ep_rank, nccl_port, target_worker
+            server_args,
+            gpu_id,
+            tp_rank,
+            dp_rank,
+            moe_ep_rank,
+            attn_cp_rank,
+            moe_dp_rank,
+            nccl_port,
+            target_worker,
         )
 
         # Some dummy tensors

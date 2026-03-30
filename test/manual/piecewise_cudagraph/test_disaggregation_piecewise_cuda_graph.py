@@ -25,8 +25,8 @@ class TestDisaggregationPiecewiseCudaGraph(PDDisaggregationServerBase):
         cls.start_decode()
 
         # Wait for both to be ready
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -38,7 +38,7 @@ class TestDisaggregationPiecewiseCudaGraph(PDDisaggregationServerBase):
             "prefill",
             "--tp",
             "1",
-            "--enable-piecewise-cuda-graph",
+            "--enforce-piecewise-cuda-graph",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(

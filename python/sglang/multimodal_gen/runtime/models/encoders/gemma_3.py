@@ -90,6 +90,11 @@ class Gemma3MLP(nn.Module):
         return x
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
 class Gemma3Attention(nn.Module):
     def __init__(
         self,
@@ -170,6 +175,19 @@ class Gemma3Attention(nn.Module):
             is_neox_style=True,
         )
 
+        # NOTE(gmixiaojin): The shared RotaryEmbedding above computes inv_freq on
+        # GPU and uses the x1*cos - x2*sin formula, which causes slight
+        # numerical differences vs HuggingFace (see the NOTE in
+        # rotary_embedding.py:_compute_inv_freq).  For HF-exact alignment we
+        # precompute inv_freq on CPU and use rotate_half in self.rotary_emb().
+        freq_indices = (
+            torch.arange(0, self.head_dim, 2, dtype=torch.int64).float() / self.head_dim
+        )
+        inv_freq = 1.0 / (self.rope_theta**freq_indices)
+        if rope_scaling and rope_scaling.get("factor"):
+            inv_freq = inv_freq / float(rope_scaling["factor"])
+        self.register_buffer("_hf_inv_freq", inv_freq, persistent=False)
+
         # Local Attention not support attention mask, we use global attention instead.
         # self.attn = LocalAttention(
         #     self.num_heads,
@@ -188,6 +206,23 @@ class Gemma3Attention(nn.Module):
         self.k_norm = Gemma3RMSNorm(
             dim=self.head_dim, eps=config.text_config.rms_norm_eps
         )
+
+    def rotary_emb(self, positions, q, k):
+        """Apply RoPE using HF-exact formula with precomputed inv_freq."""
+        positions_flat = positions.flatten().float()
+        num_tokens = positions_flat.shape[0]
+
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            freqs = torch.outer(positions_flat, self._hf_inv_freq.float())
+            emb = freqs.repeat(1, 2)
+            cos = emb.cos().to(q.dtype).unsqueeze(1)
+            sin = emb.sin().to(q.dtype).unsqueeze(1)
+
+        q = q.reshape(num_tokens, -1, self.head_dim)
+        k = k.reshape(num_tokens, -1, self.head_dim)
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+        return q, k
 
     def forward(
         self,
@@ -209,16 +244,19 @@ class Gemma3Attention(nn.Module):
 
         # Apply RoPE
         q, k = self.rotary_emb(positions, q, k)
+        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
         # TODO(FlamingoPg): Support LocalAttention
         query = q.transpose(1, 2)
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
+        min_val = torch.finfo(query.dtype).min
         attn_mask = torch.zeros(
             (seq_len, seq_len),
             device=hidden_states.device,
-            dtype=torch.float32,
+            dtype=query.dtype,
         )
         causal = torch.triu(
             torch.ones(
@@ -226,18 +264,18 @@ class Gemma3Attention(nn.Module):
             ),
             diagonal=1,
         )
-        attn_mask = attn_mask.masked_fill(causal, float("-inf"))
+        attn_mask = attn_mask.masked_fill(causal, min_val)
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
             dist = idx[None, :] - idx[:, None]
             too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, float("-inf"))
+            attn_mask = attn_mask.masked_fill(too_far, min_val)
 
         key_pad = ~attention_mask.to(torch.bool)
         attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
         attn_mask = attn_mask.masked_fill(
             key_pad[:, None, None, :].expand(batch_size, 1, seq_len, seq_len),
-            float("-inf"),
+            min_val,
         )
 
         attn_kwargs = {
@@ -707,7 +745,8 @@ class Gemma3TextModel(nn.Module):
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids) * self.embed_scale
+        out = self.embed_tokens(input_ids)
+        return out * torch.tensor(self.embed_scale, device=out.device, dtype=out.dtype)
 
     def forward(
         self,
@@ -735,7 +774,6 @@ class Gemma3TextModel(nn.Module):
             position_ids = torch.arange(
                 0, hidden_states.shape[1], device=hidden_states.device
             ).unsqueeze(0)
-        position_ids = position_ids + 1
 
         all_hidden_states: tuple[Any, ...] | None = () if output_hidden_states else None
 
