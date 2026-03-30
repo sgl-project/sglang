@@ -26,7 +26,9 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -51,13 +53,14 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_npu, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen2Config = None
 
-
+_use_torch_matmul = envs.USE_TORCH_MATMUL_FOR_MLP.get()
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 
 class Qwen2MLP(nn.Module):
@@ -84,6 +87,8 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
+        if _use_torch_matmul:
+            setattr(self.down_proj, "layout_KN", True)
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. "
@@ -91,13 +96,17 @@ class Qwen2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, forward_batch: ForwardBatch):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        if _use_torch_matmul:
+            x = torch.matmul(x, self.down_proj.weight.data)
+            x = tensor_model_parallel_all_reduce(x)
+        else:
+            x, _ = self.down_proj(x)
         return x
 
 
@@ -254,7 +263,7 @@ class Qwen2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch)
         return hidden_states, residual
 
 

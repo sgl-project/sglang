@@ -130,6 +130,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        if getattr(layer, "layout_KN", False):
+            layer.weight.data = layer.weight.data.permute(1, 0).contiguous()
 
     def apply(
         self,
