@@ -125,29 +125,8 @@ class _TritonFinder:
     ``triton.*`` sub-module that isn't already in ``sys.modules``.
     """
 
-    def find_module(self, fullname, path=None):
-        if fullname == "triton" or fullname.startswith("triton."):
-            return self
-        return None
-
-    def load_module(self, fullname):
-        if fullname in sys.modules:
-            return sys.modules[fullname]
-        mod = _MockModule(fullname)
-        sys.modules[fullname] = mod
-        # Wire up the parent relationship
-        parts = fullname.rsplit(".", 1)
-        if len(parts) == 2:
-            parent_name, child_name = parts
-            parent = sys.modules.get(parent_name)
-            if parent is not None:
-                setattr(parent, child_name, mod)
-        return mod
-
     def find_spec(self, fullname, path=None, target=None):
-        """PEP 451 finder (Python 3.4+). Preferred over find_module/load_module
-        which are deprecated and unreliable in Python 3.12+ for sub-module
-        resolution."""
+        """PEP 451 meta-path finder for ``triton.*`` sub-modules."""
         if fullname == "triton" or fullname.startswith("triton."):
             if fullname in sys.modules:
                 return getattr(sys.modules[fullname], "__spec__", None)
