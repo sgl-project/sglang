@@ -40,6 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 if is_cuda():
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
@@ -305,8 +306,7 @@ class MiniCPM3DecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = MiniCPM3AttentionMLA(
             config=config,
