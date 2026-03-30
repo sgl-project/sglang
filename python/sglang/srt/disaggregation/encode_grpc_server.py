@@ -258,7 +258,7 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     )
     reflection.enable_server_reflection(SERVICE_NAMES, server)
 
-    listen_addr = f"{server_args.host}:{server_args.port}"
+    listen_addr = NetworkAddress(server_args.host, server_args.port).to_host_port_str()
     server.add_insecure_port(listen_addr)
 
     await server.start()

@@ -53,6 +53,8 @@ class ImageGenerationsRequest(BaseModel):
     upscaling_model_path: Optional[str] = None
     upscaling_scale: Optional[int] = 4
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    # Performance profiling
+    perf_dump_path: Optional[str] = None
 
 
 # Video API protocol models
@@ -109,6 +111,8 @@ class VideoGenerationsRequest(BaseModel):
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    # Performance profiling
+    perf_dump_path: Optional[str] = None
 
 
 class VideoListResponse(BaseModel):

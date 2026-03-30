@@ -45,7 +45,7 @@ namespace {
     }                                                                    \
   }()
 
-// dispatch: bfloat16, float16, int8_t, fp8_e4m3, fp8_e5m2
+// dispatch: bfloat16, float16, int8_t, fp8_e4m3, fp8_e5m3, uint8_t(mxfp4/int4)
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
   [&] {                                                          \
     switch (TYPE) {                                              \
@@ -67,6 +67,10 @@ namespace {
       }                                                          \
       case at::ScalarType::Float8_e5m2: {                        \
         using packed_t = at::Float8_e5m2;                        \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::Byte: {                               \
+        using packed_t = uint8_t;                                \
         return __VA_ARGS__();                                    \
       }                                                          \
       default:                                                   \

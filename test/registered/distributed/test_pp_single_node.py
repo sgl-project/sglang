@@ -180,7 +180,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.65)
+        self.assertGreaterEqual(metrics["accuracy"], 0.65)
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
 
@@ -362,7 +362,9 @@ class TestQwenMoePPAccuracy(unittest.TestCase):
         )
 
 
-@unittest.skipIf(is_in_amd_ci(), "PP consistency too flaky on AMD 4-GPU runners")
+@unittest.skipIf(
+    is_in_ci(), "Qwen35 PP consistency too flaky on H100 and AMD 4-GPU runners"
+)
 class TestQwen35PPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

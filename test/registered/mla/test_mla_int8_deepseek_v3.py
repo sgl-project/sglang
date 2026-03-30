@@ -22,7 +22,7 @@ register_cuda_ci(est_time=341, suite="stage-b-test-1-gpu-large")
 class TestMLADeepseekV3ChannelInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-channel-int8-test"
+        cls.model = "lmsys/sglang-ci-dsv3-channel-int8-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -66,7 +66,7 @@ class TestMLADeepseekV3ChannelInt8(CustomTestCase):
 class TestDeepseekV3MTPChannelInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-channel-int8-test"
+        cls.model = "lmsys/sglang-ci-dsv3-channel-int8-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -80,7 +80,7 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-draft-model-path",
-                    "sgl-project/sglang-ci-dsv3-channel-int8-test-NextN",
+                    "lmsys/sglang-ci-dsv3-channel-int8-test-NextN",
                     "--speculative-num-steps",
                     "2",
                     "--speculative-eagle-topk",
@@ -129,7 +129,7 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
 class TestMLADeepseekV3BlockInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-block-int8-test"
+        cls.model = "lmsys/sglang-ci-dsv3-block-int8-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -172,7 +172,7 @@ class TestMLADeepseekV3BlockInt8(CustomTestCase):
 class TestDeepseekV3MTPBlockInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-block-int8-test"
+        cls.model = "lmsys/sglang-ci-dsv3-block-int8-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
