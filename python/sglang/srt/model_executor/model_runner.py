@@ -2424,6 +2424,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if attn_layer is not None:
                 self.attention_layers.append(attn_layer)
+            elif hasattr(layer, "mixer"):
+                self.attention_layers.append(None)
 
             moe_block = None
             moe_fusion = None
