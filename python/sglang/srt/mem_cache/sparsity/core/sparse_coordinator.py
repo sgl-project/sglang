@@ -55,10 +55,13 @@ class RequestTrackers:
 class SparseConfig:
     """Configuration for sparse attention."""
 
-    backend: str
-    algorithm: str
-    page_size: int = 64
-    min_sparse_prompt_len: int = 2048
+    top_k: int = 2048
+    device_buffer_size: int = 4096
+    host_to_device_ratio: int = 2
+    algorithm: Optional[str] = None
+    backend: Optional[str] = None
+    page_size: Optional[int] = None
+    min_sparse_prompt_len: Optional[int] = None
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm

@@ -39,6 +39,7 @@ from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -78,6 +79,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -141,6 +143,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
+from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -193,6 +196,7 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
 )
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -204,10 +208,8 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
-    get_numa_node,
     is_mps,
     kill_itself_when_parent_died,
-    numa_bind_to_node,
     point_to_point_pyobj,
     require_mlp_sync,
     set_gpu_proc_affinity,
@@ -221,6 +223,8 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -334,6 +338,8 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.enable_hisparse = server_args.enable_hisparse
+        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -517,6 +523,24 @@ class Scheduler(
                     revision=server_args.revision,
                 )
 
+        # Load multimodal processor for M-RoPE fallback computation.
+        self._mm_processor = None
+        if self.model_config.is_multimodal and self.processor is not None:
+            try:
+                import_processors("sglang.srt.multimodal.processors")
+                self._mm_processor = get_mm_processor(
+                    self.model_config.hf_config,
+                    server_args,
+                    self.processor,
+                    "default",
+                    skip_mm_pool=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to load multimodal processor in scheduler; "
+                    "M-RoPE fallback will not be available."
+                )
+
         # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
@@ -546,9 +570,8 @@ class Scheduler(
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
     def init_tp_model_worker(self):
-        from sglang.srt.managers.tp_worker import TpModelWorker
 
-        self.tp_worker = TpModelWorker(
+        worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
@@ -559,6 +582,16 @@ class Scheduler(
             dp_rank=self.dp_rank,
             nccl_port=self.nccl_port,
         )
+
+        # FIXME: move tp worker's init logic outside of the scheduler.
+        if use_mlx():
+            from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+            self.tp_worker = MlxTpModelWorker(**worker_kwargs)
+        else:
+            from sglang.srt.managers.tp_worker import TpModelWorker
+
+            self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
@@ -767,8 +800,12 @@ class Scheduler(
                 self.tree_cache = RadixCache(params)
 
         if server_args.enable_streaming_session:
-
             self.tree_cache = SessionAwareCache(self.tree_cache)
+
+        if self.enable_hisparse:
+            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
+            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -797,6 +834,7 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
@@ -1386,7 +1424,6 @@ class Scheduler(
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                        recv_req = unwrap_shm_features(recv_req)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -1473,6 +1510,13 @@ class Scheduler(
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
 
+        # Unwrap shared memory features AFTER all broadcasts complete,
+        # so that ShmPointerMMData metadata (not full tensor data) is what
+        # gets serialized during broadcast_pyobj.
+        if recv_reqs:
+            for req in recv_reqs:
+                unwrap_shm_features(req)
+
         return recv_reqs
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
@@ -1524,6 +1568,8 @@ class Scheduler(
                 else:
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
+
+        self._check_pending_flush()
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -1609,6 +1655,23 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
+    def _maybe_compute_mrope_positions(self, req) -> None:
+        """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
+        if self._mm_processor is None:
+            return
+        mm = req.multimodal_inputs
+        if mm is None or mm.mrope_positions is not None:
+            return
+
+        mrope_positions, mrope_position_delta = (
+            self._mm_processor.compute_mrope_positions(
+                req.origin_input_ids, mm.mm_items
+            )
+        )
+        if mrope_positions is not None:
+            mm.mrope_positions = mrope_positions
+            mm.mrope_position_delta = mrope_position_delta
+
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -1617,8 +1680,7 @@ class Scheduler(
             if req.session:
                 continue
             # For non-session requests, clear features and mm_inputs
-            for item in mm_inputs.mm_items:
-                item.feature = None
+            mm_inputs.release_features()
             req.multimodal_inputs = None
 
     def handle_generate_request(
@@ -1740,6 +1802,7 @@ class Scheduler(
                 req.origin_input_ids, image_inputs
             )
             req.extend_image_inputs(image_inputs)
+            self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -1810,11 +1873,7 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = (
-                req.last_host_backup_node
-                if req.last_host_backup_node is not None
-                else req.last_host_node
-            )
+            last_host_node = req.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
@@ -1993,6 +2052,7 @@ class Scheduler(
                 )
 
             req.extend_image_inputs(image_inputs)
+            self._maybe_compute_mrope_positions(req)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -2034,6 +2094,45 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
+    def _build_hisparse_decode_batch(self, reqs):
+        """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
+        device = self.device
+
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+        )
+
+        batch.req_pool_indices = torch.tensor(
+            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=device
+        )
+        seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
+        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        batch.seq_lens_sum = sum(seq_lens)
+        # output_ids = last generated token, used as input_ids by prepare_for_decode
+        batch.output_ids = torch.tensor(
+            [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
+        )
+
+        # Set logprob fields if any request needs them
+        if batch.return_logprob:
+            batch.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+            batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
+
+        # Build sampling info from scratch for these requests
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, self.model_config.vocab_size
+        )
+        # todo hisparse, maybe other info to contain for the new batch
+        return batch
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
@@ -2054,30 +2153,40 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
-
-            if self.dllm_config is not None and self.last_batch.reqs:
-                chunked_req_to_exclude.update(self.last_batch.reqs)
-
-            # Filter batch
-            last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
-            if self.last_batch.batch_size() < last_bs:
-                self.running_batch.batch_is_full = False
-
-            # Merge the new batch into the running batch.
-            if not self.last_batch.is_empty():
+        if self.enable_hisparse:
+            ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
+            if len(ready_reqs) > 0:
+                new_batch = self._build_hisparse_decode_batch(ready_reqs)
                 if self.running_batch.is_empty():
-                    self.running_batch = self.last_batch
+                    self.running_batch = new_batch
                 else:
-                    # Merge running_batch with prefill batch
-                    self.running_batch.merge_batch(self.last_batch)
+                    self.running_batch.merge_batch(new_batch)
+                self.running_batch.hisparse_coordinator = self.hisparse_coordinator
+        else:
+            if self.last_batch and self.last_batch.forward_mode.is_extend():
+                if self.last_batch.chunked_req is not None:
+                    # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+                    # We need to discard it.
+                    chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+                if self.dllm_config is not None and self.last_batch.reqs:
+                    chunked_req_to_exclude.update(self.last_batch.reqs)
+
+                # Filter batch
+                last_bs = self.last_batch.batch_size()
+                self.last_batch.filter_batch(
+                    chunked_req_to_exclude=list(chunked_req_to_exclude)
+                )
+                if self.last_batch.batch_size() < last_bs:
+                    self.running_batch.batch_is_full = False
+
+                # Merge the new batch into the running batch.
+                if not self.last_batch.is_empty():
+                    if self.running_batch.is_empty():
+                        self.running_batch = self.last_batch
+                    else:
+                        # Merge running_batch with prefill batch
+                        self.running_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -2307,6 +2416,13 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
+                # revert matched mamba idx to avoid memory leak, if req is not added
+                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                if not added and req.mamba_pool_idx is not None:
+                    self.tree_cache.req_to_token_pool.mamba_pool.free(
+                        req.mamba_pool_idx.unsqueeze(-1)
+                    )
+                    req.mamba_pool_idx = None
                 break
 
         # Update waiting queue
@@ -2444,6 +2560,8 @@ class Scheduler(
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
+                if self.enable_hisparse:
+                    self.hisparse_coordinator.retract_req(req)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -2634,6 +2752,16 @@ class Scheduler(
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
+        # Release the closure and large GPU tensors that are no longer needed.
+        # The delay_sample_func closure captures forward_batch (which holds
+        # sampling_info with vocab_mask) and logits_output (which holds
+        # next_token_logits). Without clearing these, they stay alive via
+        # batch_result in result_queue and batch_record_buf until the next
+        # iteration, causing a steady VRAM leak with structured output.
+        batch_result.delay_sample_func = None
+        if batch_result.logits_output is not None:
+            batch_result.logits_output.next_token_logits = None
+
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -2668,9 +2796,50 @@ class Scheduler(
                 )
             )
 
-    def flush_cache_wrapped(self, recv_req: FlushCacheReqInput):
-        success = self.flush_cache()
-        return FlushCacheReqOutput(success=success)
+    def _check_pending_flush(self):
+        if self._pending_flush is None:
+            return
+
+        pending_req, deadline = self._pending_flush
+
+        if self.is_fully_idle():
+            success = self.flush_cache()
+            self._pending_flush = None
+            self.send_to_tokenizer.send_output(
+                FlushCacheReqOutput(success=success), pending_req
+            )
+            return
+
+        if time.monotonic() >= deadline:
+            logging.warning(
+                "Deferred flush_cache timed out while waiting for idle state."
+            )
+            self._pending_flush = None
+            self.send_to_tokenizer.send_output(
+                FlushCacheReqOutput(
+                    success=False, message="Timed out waiting for idle state."
+                ),
+                pending_req,
+            )
+
+    def flush_cache_wrapped(
+        self, recv_req: FlushCacheReqInput
+    ) -> Optional[FlushCacheReqOutput]:
+        if self._pending_flush is not None:
+            return FlushCacheReqOutput(
+                success=False,
+                message="Another flush_cache is already in progress.",
+            )
+
+        timeout_s = float(recv_req.timeout_s or 0.0)
+        if timeout_s <= 0.0:
+            return FlushCacheReqOutput(success=self.flush_cache())
+
+        if self.is_fully_idle():
+            return FlushCacheReqOutput(success=self.flush_cache())
+
+        self._pending_flush = (recv_req, time.monotonic() + timeout_s)
+        return None
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
         if self.enable_hierarchical_cache:
@@ -2970,6 +3139,7 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -2988,6 +3158,8 @@ class Scheduler(
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if self.enable_hisparse:
+                    self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3087,7 +3259,11 @@ class Scheduler(
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
-            self.running_batch.merge_batch(self.last_batch)
+            if not self.last_batch.is_empty():
+                if self.running_batch.is_empty():
+                    self.running_batch = self.last_batch
+                else:
+                    self.running_batch.merge_batch(self.last_batch)
 
         self.last_batch = None
         self.cur_batch = None
@@ -3244,7 +3420,7 @@ class IdleSleeper:
 
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith("HEALTH_CHECK")
+    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 def is_work_request(recv_req):
@@ -3379,12 +3555,7 @@ def run_scheduler_process(
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
-    numa_node = None
-    if (numa_nodes := server_args.numa_node) is not None:
-        numa_node = numa_nodes[gpu_id]
-    elif envs.SGLANG_AUTO_NUMA_BIND.get():
-        numa_node = get_numa_node(gpu_id)
-        logger.info(f"auto get NUMA node {numa_node} for GPU {gpu_id}")
+    numa_node = get_numa_node_if_available(server_args, gpu_id)
     if numa_node is not None and not envs.SGLANG_NUMA_BIND_V2.get():
         numa_bind_to_node(numa_node)
 

@@ -1,7 +1,6 @@
 import gc
 import multiprocessing
 import os
-import time
 import traceback
 import unittest
 from multiprocessing import Process
@@ -13,7 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -22,6 +21,11 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=64, suite="stage-c-test-4-gpu-h100")
+register_amd_ci(
+    est_time=64,
+    suite="stage-c-test-4-gpu-amd",
+    disabled="torch_memory_saver incompatible with ROCm (libcuda.so.1 not found)",
+)
 
 TEST_SUITE = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -29,6 +33,11 @@ TEST_SUITE = dict(
     dp_size=2,
     tp_size=2,
 )
+
+# Minimum expected memory change in MB for each operation.
+# Llama-3.2-1B bf16 is ~2GB total, ~1GB per TP rank.
+# KV cache with mem_fraction_static=0.83 is much larger.
+MIN_DELTA_MB = 200
 
 
 class EngineWrapper:
@@ -88,8 +97,26 @@ class EngineWrapper:
         dist.barrier(group=self._device_mesh_cpu.get_group())
 
 
-def get_gpu_memory_gb(gpu_id=0):
-    return torch.cuda.device_memory_used() / 1024**3
+def get_gpu_memory_mb(device_id: int) -> float:
+    """Return device-level GPU memory used in MB."""
+    free, total = torch.cuda.mem_get_info(device_id)
+    return (total - free) / (1024**2)
+
+
+def assert_memory_decreased(before_mb, after_mb, step_name):
+    delta = before_mb - after_mb
+    assert delta > MIN_DELTA_MB, (
+        f"[{step_name}] Expected memory decrease > {MIN_DELTA_MB} MB, "
+        f"got delta={delta:.0f} MB (before={before_mb:.0f}, after={after_mb:.0f})"
+    )
+
+
+def assert_memory_increased(before_mb, after_mb, step_name):
+    delta = after_mb - before_mb
+    assert delta > MIN_DELTA_MB, (
+        f"[{step_name}] Expected memory increase > {MIN_DELTA_MB} MB, "
+        f"got delta={delta:.0f} MB (before={before_mb:.0f}, after={after_mb:.0f})"
+    )
 
 
 class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
@@ -153,14 +180,13 @@ def _run_sglang_subprocess(
         mesh_kwargs = dict(
             mesh_shape=(dp_size, tp_size, 1), mesh_dim_names=["dp", "tp", "pp"]
         )
-        inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
         inference_device_mesh_cpu = init_device_mesh("cpu", **mesh_kwargs)
-        print(
-            f"subprocess[{rank=},{base_gpu_id=},{rank=},{tp_size=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
-        )
 
-        _mem_usage = get_gpu_memory_gb(rank)
-        print(f"GPU{rank} Memory usage before starting Engine: {_mem_usage}")
+        # Only TP master ranks (rank % tp_size == 0) create the Engine and
+        # measure memory. Non-master ranks share the same GPU and would see
+        # device-level memory from the master's Engine workers, causing
+        # unpredictable assertion results.
+        is_tp_master = rank % tp_size == 0
 
         engine = EngineWrapper(
             model_path=model_path,
@@ -169,86 +195,67 @@ def _run_sglang_subprocess(
             device_mesh_cpu=inference_device_mesh_cpu["tp"],
             base_gpu_id=base_gpu_id,
         )
-        print(f"subprocess[{rank=}] {engine=}", flush=True)
+        print(f"subprocess[{rank=}] engine created, {is_tp_master=}", flush=True)
 
         # 1 - release kv cache
-        _mem_usage = get_gpu_memory_gb(rank)
-        print(f"GPU{rank} Memory usage before releasing Sgl KV cache: {_mem_usage}")
+        if is_tp_master:
+            mem_before = get_gpu_memory_mb(rank)
+            print(f"GPU{rank} before releasing KV cache: {mem_before:.0f} MB")
         engine.release_memory_occupation(tags=["kv_cache"])
-        _curr_usage = get_gpu_memory_gb(rank)
-        assert (
-            _curr_usage < _mem_usage
-        ), f"Memory usage after releasing KV cache must be reduced! before: {_mem_usage} vs after: {_curr_usage}"
+        if is_tp_master:
+            mem_after = get_gpu_memory_mb(rank)
+            assert_memory_decreased(mem_before, mem_after, "release KV cache")
 
         # 2 - release sglang weights
-        _mem_usage = get_gpu_memory_gb(rank)
-        print(f"GPU{rank} Memory usage before releasing Sgl weights: {_mem_usage}")
+        if is_tp_master:
+            mem_before = get_gpu_memory_mb(rank)
+            print(f"GPU{rank} before releasing weights: {mem_before:.0f} MB")
         engine.release_memory_occupation(tags=["weights"])
+        if is_tp_master:
+            mem_after = get_gpu_memory_mb(rank)
+            assert_memory_decreased(mem_before, mem_after, "release weights")
 
-        _curr_usage = get_gpu_memory_gb(rank)
-        assert (
-            _curr_usage < _mem_usage
-        ), f"Memory usage after releasing weights must be reduced! before: {_mem_usage} vs after: {_curr_usage}"
+        # 3 - load hf model (TP master only)
+        hf_model = None
+        if is_tp_master:
+            mem_before = get_gpu_memory_mb(rank)
+            print(f"GPU{rank} before loading HF model: {mem_before:.0f} MB")
+            # Avoid device_map= which triggers accelerate dispatch hooks in
+            # transformers v5, preventing clean memory release on del.
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
+                torch_dtype="bfloat16",
+            ).to(f"cuda:{rank}")
+            mem_after = get_gpu_memory_mb(rank)
+            assert_memory_increased(mem_before, mem_after, "load HF model")
+        dist.barrier(group=inference_device_mesh_cpu["tp"].get_group())
 
-        # 3 - load hf model
-        _mem_usage = get_gpu_memory_gb(rank)
-        print(
-            f"GPU{rank} Memory usage after releasing Sgl weights and kv cache: {_mem_usage}"
-        )
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
-            torch_dtype="bfloat16",
-            device_map=f"cuda:{rank}",
-            trust_remote_code=True,
-        ).cuda()
-        _curr_usage = get_gpu_memory_gb(rank)
-        assert (
-            _curr_usage > _mem_usage
-        ), f"Memory usage after loading hf model must be increased! before: {_mem_usage} vs after: {_curr_usage}"
-
-        # 4 - resume sglang weights and update the weights
-        _mem_usage = get_gpu_memory_gb(rank)
-        print(f"GPU{rank} Memory usage after loading hf model: {_mem_usage}")
+        # 4 - resume sglang weights and update from hf model
         engine.resume_memory_occupation(tags=["weights"])
         engine.update_weights_from_tensor(
-            named_tensors=list(hf_model.named_parameters())
+            named_tensors=list(hf_model.named_parameters()) if hf_model else []
         )
 
-        # 5 - release hf model
-        _mem_usage = get_gpu_memory_gb(rank)
-        print(f"GPU{rank} Memory usage after resuming Sgl weights: {_mem_usage}")
-        # In transformers v5, from_pretrained with device_map attaches accelerate
-        # dispatch hooks that hold strong refs to parameters. Remove them first.
-        try:
-            from accelerate.hooks import remove_hook_from_submodules
+        # 5 - release hf model (TP master only)
+        if is_tp_master:
+            mem_before = get_gpu_memory_mb(rank)
+            print(f"GPU{rank} before releasing HF model: {mem_before:.0f} MB")
+            del hf_model
+            gc.collect()
+            torch.cuda.empty_cache()
+            mem_after = get_gpu_memory_mb(rank)
+            assert_memory_decreased(mem_before, mem_after, "release HF model")
+        dist.barrier(group=inference_device_mesh_cpu["tp"].get_group())
 
-            remove_hook_from_submodules(hf_model)
-        except (ImportError, Exception):
-            pass
-        del hf_model
-        hf_model = None
-        gc.collect()
-        torch.cuda.empty_cache()
-        time.sleep(3)
-        gc.collect()
-        torch.cuda.empty_cache()
-        _curr_usage = get_gpu_memory_gb(rank)
-        assert (
-            _curr_usage < _mem_usage
-        ), f"Memory usage after releasing hf model must be reduced! before: {_mem_usage} vs after: {_curr_usage}"
-
-        # 6 - resume slgang kv cache
-        _mem_usage = get_gpu_memory_gb(rank)
-        print(f"GPU{rank} Memory usage after releasing hf model: {_mem_usage}")
+        # 6 - resume kv cache
+        if is_tp_master:
+            mem_before = get_gpu_memory_mb(rank)
+            print(f"GPU{rank} before resuming KV cache: {mem_before:.0f} MB")
         engine.resume_memory_occupation(tags=["kv_cache"])
-        _curr_usage = get_gpu_memory_gb(rank)
-        assert (
-            _curr_usage > _mem_usage
-        ), f"Memory usage after resuming kv cache must be increased! before: {_mem_usage} vs after: {_curr_usage}"
-
-        # 7 - Final checking!
-        _mem_usage = get_gpu_memory_gb(rank)
-        print(f"GPU{rank} Memory usage after resuming Sgl KV cache: {_mem_usage}")
+        if is_tp_master:
+            mem_after = get_gpu_memory_mb(rank)
+            assert_memory_increased(mem_before, mem_after, "resume KV cache")
+            print(f"GPU{rank} final memory: {mem_after:.0f} MB")
 
         execution_ok = True
     except Exception as e:

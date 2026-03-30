@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
     est_time=10,
-    suite="stage-a-test-small-1-gpu",
+    suite="stage-a-test-1-gpu-small",
     disabled="Manual only: triggers intentional CUDA crash for coredump verification",
 )
 

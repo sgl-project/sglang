@@ -1,5 +1,6 @@
 import itertools
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -182,4 +183,4 @@ def test_per_token_group_quant_with_column_major(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))
