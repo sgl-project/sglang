@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.modelopt_quant import (
+    _apply_nvfp4_linear_pytorch,
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
     fp4_quantize,
@@ -91,6 +92,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         layer.register_parameter("input_global_scale", input_global_scale)
 
     def process_weights_after_loading(self, layer) -> None:
+        fp4_backend = get_fp4_gemm_runner_backend()
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 
@@ -98,7 +100,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
+        if fp4_backend.is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -124,6 +126,10 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.weight_packed = Parameter(
                 layer.weight_packed.data, requires_grad=False
             )
+            if fp4_backend.is_pytorch():
+                layer.weight_packed_pytorch = layer.weight_packed.data.view(
+                    torch.float4_e2m1fn_x2
+                )
 
         layer.alpha = Parameter(
             1 / (layer.input_global_scale * layer.weight_global_scale),
@@ -139,6 +145,21 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         output_dtype = x.dtype
         w_n, _ = layer.weight_packed.shape
         output_shape = [x.shape[0], w_n]
+        fp4_backend = get_fp4_gemm_runner_backend()
+
+        if fp4_backend.is_pytorch():
+            return _apply_nvfp4_linear_pytorch(
+                x=x,
+                weight=getattr(layer, "weight_packed_pytorch", layer.weight_packed),
+                weight_scale=layer.weight_scale,
+                input_global_scale=layer.input_global_scale,
+                alpha=layer.alpha,
+                output_dtype=output_dtype,
+                output_shape=output_shape,
+                output_size=w_n,
+                bias=bias,
+                fp4_quantize_fn=fp4_quantize,
+            )
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
