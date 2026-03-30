@@ -323,12 +323,58 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         return
 
+    def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+        self,
+        layer: torch.nn.Module,
+        param: torch.nn.Parameter,
+        weight_name: str,
+    ) -> None:
+        """Restore canonical BF16 MoE load shapes before hot weight copy.
+
+        The flashinfer TRT-LLM BF16 postprocess reshapes expert weights into
+        block layout. During weight update, checkpoint tensors are in
+        canonical layout and need a temporary shape restore for copy.
+        """
+        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+            return
+
+        expected_shape = None
+        if weight_name.endswith(".experts.w13_weight"):
+            w13_rows = (
+                2 * layer.intermediate_size_per_partition
+                if layer.moe_runner_config.is_gated
+                else layer.intermediate_size_per_partition
+            )
+            expected_shape = (layer.num_local_experts, w13_rows, layer.hidden_size)
+        elif weight_name.endswith(".experts.w2_weight"):
+            expected_shape = (
+                layer.num_local_experts,
+                layer.hidden_size,
+                layer.intermediate_size_per_partition,
+            )
+
+        if expected_shape is None or tuple(param.data.shape) == expected_shape:
+            return
+
+        expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
+        if param.data.numel() != expected_numel:
+            raise RuntimeError(
+                f"Cannot restore flashinfer TRT-LLM BF16 MoE weight shape for {weight_name}: "
+                f"current shape={tuple(param.data.shape)}, expected shape={expected_shape}."
+            )
+
+        param.data = param.data.reshape(expected_shape)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
         if self.use_flashinfer_trtllm_moe:
-            backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+            backend = (
+                MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+                if get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                else MoeRunnerBackend.FLASHINFER_TRTLLM
+            )
         elif self.use_triton_kernels:
             backend = MoeRunnerBackend.TRITON_KERNELS
         else:

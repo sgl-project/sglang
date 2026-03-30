@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -175,6 +176,13 @@ class LinearBase(torch.nn.Module):
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+
+        if self.quant_method is not None:
+            wrap_method_with_debug_kernel_once(
+                self.quant_method,
+                "apply",
+                op_name=f"sglang.quant_method.{self.quant_method.__class__.__name__}.apply",
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError

@@ -74,6 +74,7 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.mamba_value: Optional[torch.Tensor] = None
+        self.mamba_host_value: Optional[torch.Tensor] = None
         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
         # full_lock_ref is always >= mamba_lock_ref.
@@ -98,6 +99,8 @@ class TreeNode:
         self.next = None
         self.mamba_prev = None
         self.mamba_next = None
+        self.host_mamba_prev = None
+        self.host_mamba_next = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -107,8 +110,16 @@ class TreeNode:
         return self.value is None
 
     @property
+    def mamba_evicted(self):
+        return self.mamba_value is None
+
+    @property
     def backuped(self):
         return self.host_value is not None
+
+    @property
+    def mamba_backuped(self):
+        return self.mamba_host_value is not None
 
     def protect_host(self):
         """Protect the host value from eviction."""
