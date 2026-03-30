@@ -135,10 +135,10 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         # Override weight_loader for packed checkpoint format.
         # Must capture original_loader BEFORE overwriting.
-        self.in_proj_qkvz.weight.weight_loader = self._make_packed_weight_loader(
+        self.in_proj_qkvz.weight._weight_loader = self._make_packed_weight_loader(
             self.in_proj_qkvz
         )
-        self.in_proj_ba.weight.weight_loader = self._make_packed_weight_loader(
+        self.in_proj_ba.weight._weight_loader = self._make_packed_weight_loader(
             self.in_proj_ba
         )
 
