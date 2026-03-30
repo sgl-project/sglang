@@ -110,7 +110,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         # Graph inputs
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
             out_cache_loc = torch.ones(
                 (self.max_num_token,), dtype=self._cache_loc_dtype()
             )

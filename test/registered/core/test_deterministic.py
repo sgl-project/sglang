@@ -16,8 +16,8 @@ from sglang.test.test_deterministic_utils import (
 )
 from sglang.test.test_utils import is_in_amd_ci
 
-register_cuda_ci(est_time=278, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=278, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=278, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=278, suite="stage-b-test-1-gpu-small-amd")
 
 
 @unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")

@@ -80,7 +80,9 @@ class EAGLEDraftCudaGraphRunner:
         )
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
-        self.enable_spec_overlap_reflow = envs.SGLANG_SPEC_ENABLE_OVERLAP_REFLOW.get()
+        self.enable_spec_fully_aync_decoding = (
+            envs.SGLANG_SPEC_FULLY_ASYNC_DECODING.get()
+        )
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -107,7 +109,7 @@ class EAGLEDraftCudaGraphRunner:
         # Graph inputs
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
             out_cache_loc = torch.zeros(
                 (self.max_num_token * self.speculative_num_steps,),
                 dtype=self._cache_loc_dtype(),
@@ -331,9 +333,10 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            if self.enable_spec_overlap_reflow:
-                assert hasattr(self.eagle_worker, "draft_forward_v2"), \
-                    "Overlap reflow just support when enable overlap scheduler"
+            if self.enable_spec_fully_aync_decoding:
+                assert hasattr(
+                    self.eagle_worker, "draft_forward_v2"
+                ), "Overlap reflow just support when enable overlap scheduler"
                 ret = self.eagle_worker.draft_forward_v2(forward_batch)
             else:
                 ret = self.eagle_worker.draft_forward(forward_batch)
@@ -355,7 +358,7 @@ class EAGLEDraftCudaGraphRunner:
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         # Keep the variables name for readability
-        if self.enable_spec_overlap_reflow:
+        if self.enable_spec_fully_aync_decoding:
             ret_topk_p_list, ret_topk_index_list = (t[:raw_bs] for t in out)
             return ret_topk_p_list, ret_topk_index_list
 

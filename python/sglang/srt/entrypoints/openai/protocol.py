@@ -588,12 +588,13 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
-    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
-        default="medium",
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
+        default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
-        "result in faster responses and fewer tokens used on reasoning in a response. "
-        "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
+        "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
+        "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
+        "in a response. 'none' defaults thinking and enable_thinking to false in "
+        "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path.",
     )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -672,12 +673,10 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
         r = values.get("reasoning")
-        if r is None:
-            return values
 
-        if isinstance(r, dict):
+        if r is not None and isinstance(r, dict):
             effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"low", "medium", "high"}:
+            if effort in {"none", "low", "medium", "high"}:
                 values["reasoning_effort"] = effort
 
             enabled = (
@@ -693,6 +692,17 @@ class ChatCompletionRequest(BaseModel):
                     ctk = {}
                 ctk.setdefault("thinking", True)
                 values["chat_template_kwargs"] = ctk
+
+        if values.get("reasoning_effort") == "none":
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            # different models check different keys:
+            # - "thinking" for deepseek-v3, kimi_k2
+            # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
+            ctk.setdefault("thinking", False)
+            ctk.setdefault("enable_thinking", False)
+            values["chat_template_kwargs"] = ctk
 
         return values
 

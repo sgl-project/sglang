@@ -15,7 +15,7 @@
 import concurrent.futures
 import logging
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -46,8 +46,6 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.utils import (
-    _is_cpu,
-    _is_cpu_amx_available,
     _is_cuda,
     _is_fp8_fnuz,
     _is_hip,
@@ -583,14 +581,6 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
-                # TODO: remove this after adding FP8 support in bmm cpu kernel
-                if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
-                    self_attn.w_kc = (
-                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
-                    )
-                    self_attn.w_vc = (
-                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
-                    )
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
@@ -608,6 +598,35 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+    @classmethod
+    def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):
+        """
+        Generates a filter function that tests whether the (layer_id, expert_id)
+        indicated by a param name lies in the `logical_experts` map
+        Args:
+            logical_experts_map: a map of layer_id to expert_ids, specifying a list of expert_ids by a specific layer_id.
+
+        Returns:
+            A function (name: str) -> bool
+        """
+        import re
+
+        # Regex pattern to extract layer_id and expert_id from weight name
+        pattern = re.compile(r"layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+
+        def weight_name_filter(name: str) -> bool:
+            match = pattern.search(name)
+            if match:
+                layer_id, expert = int(match.group(1)), int(match.group(2))
+                # First check if layer_id exists, then check if expert is in the list
+                return (
+                    layer_id in logical_experts_map
+                    and expert in logical_experts_map[layer_id]
+                )
+            return False
+
+        return weight_name_filter
 
     def _maybe_quant_weights_to_fp8_ue8m0(
         self,

@@ -11,6 +11,7 @@ Covers:
 
 import asyncio
 import logging
+import sys
 import threading
 import time
 from unittest.mock import Mock
@@ -361,4 +362,4 @@ class TestAsyncMMDataProcessor:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

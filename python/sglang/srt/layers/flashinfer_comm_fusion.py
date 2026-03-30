@@ -1,12 +1,19 @@
+import contextlib
 import logging
+import platform
 from typing import Optional, Tuple
 
 import torch
 
 from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
+    get_attn_tensor_model_parallel_rank,
+    get_attn_tensor_model_parallel_world_size,
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -14,6 +21,74 @@ logger = logging.getLogger(__name__)
 
 _flashinfer_comm = None
 _workspace_manager = None
+_flashinfer_allreduce_unavailable = False
+_posix_transport_override_logged = False
+
+
+def _should_force_posix_fd_transport() -> bool:
+    force_posix_env = envs.SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT.get()
+    if force_posix_env is not None:
+        return force_posix_env
+
+    machine = platform.machine().lower()
+    if machine not in ("aarch64", "arm64"):
+        return False
+
+    if not torch.cuda.is_available():
+        return False
+
+    try:
+        major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception as e:
+        logger.debug("Failed to get CUDA device capability: %s", e)
+        return False
+
+    return major == 10
+
+
+@contextlib.contextmanager
+def _flashinfer_posix_fd_transport_override_if_needed():
+    # TODO(mmangkad): Remove this temporary override once the
+    # FlashInfer unified allreduce-fusion transport issue on
+    # GB200/GB300 platforms is fixed and verified resolved.
+    global _posix_transport_override_logged
+
+    if not _should_force_posix_fd_transport():
+        yield
+        return
+
+    try:
+        import flashinfer.comm.mnnvl as flashinfer_mnnvl
+    except Exception as e:
+        logger.debug(
+            "Failed to import flashinfer.comm.mnnvl for transport override: %s", e
+        )
+        yield
+        return
+
+    original_checker = getattr(flashinfer_mnnvl, "is_mnnvl_fabric_supported", None)
+    if original_checker is None:
+        yield
+        return
+
+    if not _posix_transport_override_logged:
+        logger.warning(
+            "Applying FlashInfer transport workaround: forcing PosixFD "
+            "symmetric-memory handle exchange on aarch64 + sm10x to avoid "
+            "known data corruption with Fabric handle exchange on GB systems. "
+            "Set SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT=0 to disable."
+        )
+        _posix_transport_override_logged = True
+
+    def _always_disable_fabric(_device_idx: int) -> bool:
+        return False
+
+    flashinfer_mnnvl.is_mnnvl_fabric_supported = _always_disable_fabric
+    try:
+        yield
+    finally:
+        flashinfer_mnnvl.is_mnnvl_fabric_supported = original_checker
+
 
 if is_flashinfer_available():
     try:
@@ -24,15 +99,21 @@ if is_flashinfer_available():
         ):
             _flashinfer_comm = comm
         else:
+            _flashinfer_allreduce_unavailable = True
             logger.warning(
                 "flashinfer.comm unified allreduce_fusion API is not available, "
                 "falling back to standard implementation"
             )
     except ImportError:
+        _flashinfer_allreduce_unavailable = True
         logger.warning(
             "flashinfer.comm is not available, falling back to standard "
             "implementation"
         )
+
+
+def is_flashinfer_allreduce_unavailable() -> bool:
+    return _flashinfer_allreduce_unavailable
 
 
 class FlashInferWorkspaceManager:
@@ -57,23 +138,29 @@ class FlashInferWorkspaceManager:
         """Initialize workspace"""
         if _flashinfer_comm is None:
             logger.warning(
-                "FlashInfer comm not available, skipping workspace " "initialization"
+                "FlashInfer comm not available, skipping workspace initialization"
             )
             return
 
         self.cleanup()
         try:
-            self.workspace = _flashinfer_comm.create_allreduce_fusion_workspace(
-                backend="trtllm",
-                world_size=world_size,
-                rank=rank,
-                max_token_num=max_token_num,
-                hidden_dim=hidden_dim,
-                dtype=dtype,
-                force_oneshot_support=bool(use_oneshot),
-            )
+            with _flashinfer_posix_fd_transport_override_if_needed():
+                self.workspace = _flashinfer_comm.create_allreduce_fusion_workspace(
+                    backend="trtllm",
+                    world_size=world_size,
+                    rank=rank,
+                    max_token_num=max_token_num,
+                    hidden_dim=hidden_dim,
+                    dtype=dtype,
+                    force_oneshot_support=bool(use_oneshot),
+                )
         except Exception as e:
-            logger.warning(f"Failed to initialize FlashInfer workspace: {e}")
+            global _flashinfer_allreduce_unavailable
+            _flashinfer_allreduce_unavailable = True
+            logger.warning(
+                f"Failed to initialize FlashInfer workspace: {e}. "
+                "Disabling flashinfer allreduce fusion permanently."
+            )
             self.workspace = None
             self.initialized = False
             return
@@ -138,16 +225,32 @@ def ensure_workspace_initialized(
     dtype: torch.dtype = torch.float16,
     token_num: Optional[int] = None,
     use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = True,
 ):
     """Ensure workspace is initialized"""
+    if _flashinfer_allreduce_unavailable:
+        return False
+
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
-    world_size = get_tensor_model_parallel_world_size()
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+        rank = get_attn_tensor_model_parallel_rank()
+    else:
+        # If MoE expert parallel world size > 1, use expert parallel group
+        # Otherwise, use tensor parallel group
+        # The two values cannot be larger than 1 at the same time
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+            rank = get_moe_expert_parallel_rank()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+            rank = get_moe_tensor_parallel_rank()
+
     if world_size <= 1:
         return False
 
-    rank = get_tensor_model_parallel_rank()
     token_num = token_num or max_token_num
 
     if (
@@ -182,6 +285,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
@@ -201,6 +305,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     use_oneshot: Optional[bool] = None,
     trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Use FlashInfer's fused allreduce + residual + RMS norm operation
@@ -214,17 +319,28 @@ def flashinfer_allreduce_residual_rmsnorm(
         use_oneshot: Whether to use oneshot mode
         trigger_completion_at_end: Whether to trigger completion at end
         fp32_acc: Whether to use fp32 precision
+        use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
     """
     if not is_flashinfer_available() or _flashinfer_comm is None:
         logger.debug(
-            "FlashInfer not available, falling back to standard " "implementation"
+            "FlashInfer not available, falling back to standard implementation"
         )
         return None, None
 
-    world_size = get_tensor_model_parallel_world_size()
+    if use_attn_tp_group:
+        world_size = get_attn_tensor_model_parallel_world_size()
+    else:
+        # If MoE expert parallel world size > 1, use expert parallel group
+        # Otherwise, use tensor parallel group
+        # The two values cannot be larger than 1 at the same time
+        if get_moe_expert_parallel_world_size() > 1:
+            world_size = get_moe_expert_parallel_world_size()
+        else:
+            world_size = get_moe_tensor_parallel_world_size()
+
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
         return None, None
@@ -244,6 +360,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         dtype=input_tensor.dtype,
         token_num=input_tensor.shape[0],
         use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
     ):
         logger.debug("FlashInfer workspace not available")
         return None, None

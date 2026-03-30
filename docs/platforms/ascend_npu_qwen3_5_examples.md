@@ -8,9 +8,9 @@ The dependencies required for the NPU runtime environment have been integrated i
 
 ```{code-block} bash
 #Atlas 800 A3
-docker pull quay.io/ascend/sglang:v0.5.9-cann8.5.0-a3
+docker pull quay.io/ascend/sglang:main-cann8.5.0-a3
 #Atlas 800 A2
-docker pull quay.io/ascend/sglang:v0.5.9-cann8.5.0-910b
+docker pull quay.io/ascend/sglang:main-cann8.5.0-910b
 
 #start container
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} \

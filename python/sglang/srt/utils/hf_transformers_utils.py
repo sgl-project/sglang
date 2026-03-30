@@ -19,6 +19,7 @@ import logging
 import os
 import tempfile
 import warnings
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -26,6 +27,24 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import get_bool_env_var
+
+# Compatibility shim: flash-attn-4 registers a bare ``flash_attn`` namespace
+# that makes ``is_flash_attn_2_available()`` return True, but lacks the v2 API
+# (``flash_attn_func``, etc.).  HuggingFace remote model code (e.g. Kimi-VL)
+# guarded by that check will crash with ImportError at module load time.
+# Force it to False when the real v2 API is absent.
+try:
+    import flash_attn as _flash_attn_mod
+
+    if not hasattr(_flash_attn_mod, "flash_attn_func"):
+        import transformers.utils as _hf_utils
+        import transformers.utils.import_utils as _hf_import_utils
+
+        _hf_import_utils.is_flash_attn_2_available = lambda: False
+        _hf_utils.is_flash_attn_2_available = lambda: False
+    del _flash_attn_mod
+except ImportError:
+    pass
 
 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
@@ -129,6 +148,47 @@ def download_from_hf(
     return snapshot_download(model_path, allow_patterns=allow_patterns)
 
 
+def get_rope_config(config):
+    """Get (rope_theta, rope_scaling) from config, supporting both v4 and v5.
+
+    In transformers v5, rope_theta/rope_scaling are accessed via the computed
+    property config.rope_parameters. Trust-remote-code configs or parent configs
+    passed to sub-models may not have this property or may return None.
+    Falls back to the v4-style config.rope_theta / config.rope_scaling attributes.
+    """
+    rope_params = getattr(config, "rope_parameters", None)
+    if rope_params is not None:
+        return rope_params["rope_theta"], rope_params
+    return config.rope_theta, getattr(config, "rope_scaling", None)
+
+
+def _patch_text_config(parent_config: PretrainedConfig, text_config):
+    """Synchronize standard attributes between parent config and text sub-config.
+
+    In transformers v5, the "untangle config" refactor removed automatic
+    inheritance of top-level PretrainedConfig attributes (pad_token_id,
+    tie_word_embeddings, etc.) from sub-configs. Downstream code expects
+    these attributes to be present on both configs (some models pass the
+    parent directly to the language model, others pass the text sub-config),
+    so we propagate in both directions when an attribute is missing.
+    (See https://github.com/huggingface/transformers/pull/41541)
+    """
+    _ATTRS_TO_PROPAGATE = [
+        "pad_token_id",
+        "bos_token_id",
+        "eos_token_id",
+        "tie_word_embeddings",
+    ]
+    for attr in _ATTRS_TO_PROPAGATE:
+        parent_has = hasattr(parent_config, attr)
+        text_has = hasattr(text_config, attr)
+        if parent_has and not text_has:
+            setattr(text_config, attr, getattr(parent_config, attr))
+        elif text_has and not parent_has:
+            setattr(parent_config, attr, getattr(text_config, attr))
+    return text_config
+
+
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.
@@ -143,20 +203,23 @@ def get_hf_text_config(config: PretrainedConfig):
             setattr(config, "dtype", torch.float16)
             return config
 
-    if hasattr(config, "text_config"):
-        # The code operates under the assumption that text_config should have
-        # `num_attention_heads` (among others). Assert here to fail early
-        # if transformers config doesn't align with this assumption.
-        assert hasattr(config.text_config, "num_attention_heads")
-        return config.text_config
+    text_config = None
 
-    if hasattr(config, "llm_config"):
-        # PointsV1.5 Chat Model
-        assert hasattr(config.llm_config, "num_attention_heads")
-        return config.llm_config
+    # Some models (e.g. DeepSeek-OCR) store sub-configs as plain dicts.
+    # Convert to PretrainedConfig early so hasattr() checks and asserts work.
+    for _attr in ("text_config", "llm_config", "language_config", "thinker_config"):
+        _sub = getattr(config, _attr, None)
+        if isinstance(_sub, dict):
+            _converted = PretrainedConfig(**_sub)
+            # Propagate torch_dtype from parent so weight loading uses correct precision.
+            if (
+                getattr(_converted, "torch_dtype", None) is None
+                and getattr(config, "torch_dtype", None) is not None
+            ):
+                _converted.torch_dtype = config.torch_dtype
+            setattr(config, _attr, _converted)
 
-    if hasattr(config, "language_config"):
-        return config.language_config
+    # Priority: thinker_config > llm_config > language_config > text_config
     if hasattr(config, "thinker_config"):
         # qwen2.5 omni
         thinker_config = config.thinker_config
@@ -166,12 +229,28 @@ def get_hf_text_config(config: PretrainedConfig):
                 "torch_dtype",
                 getattr(thinker_config, "torch_dtype", None),
             )
-            return thinker_config.text_config
-        return thinker_config
-    if hasattr(config, "llm_config"):
-        return config.llm_config
-    else:
-        return config
+            text_config = thinker_config.text_config
+        else:
+            text_config = thinker_config
+    elif hasattr(config, "llm_config"):
+        # PointsV1.5 Chat Model
+        assert hasattr(config.llm_config, "num_attention_heads")
+        text_config = config.llm_config
+    elif hasattr(config, "language_config"):
+        text_config = config.language_config
+    elif hasattr(config, "text_config"):
+        # The code operates under the assumption that text_config should have
+        # `num_attention_heads` (among others). Assert here to fail early
+        # if transformers config doesn't align with this assumption.
+        assert hasattr(config.text_config, "num_attention_heads")
+        text_config = config.text_config
+
+    # Ensure rope_scaling dicts have "type" for remote-code compat (v5).
+    normalize_rope_scaling_compat(config)
+
+    if text_config is not None:
+        return _patch_text_config(config, text_config)
+    return config
 
 
 # Temporary hack for DeepSeek-V3.2 model
@@ -207,11 +286,11 @@ def _load_deepseek_v32_model(
 
 
 # Temporary hack for Mistral Large
+@lru_cache(maxsize=2)
 def _load_mistral_large_3_for_causal_LM(
     model_path: str,
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
-    **kwargs,
 ):
     # first get the local path
     local_path = download_from_hf(model_path)
@@ -223,7 +302,7 @@ def _load_mistral_large_3_for_causal_LM(
         json.dump(config_dict, f)
         f.flush()
         loaded_config = AutoConfig.from_pretrained(
-            f.name, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            f.name, trust_remote_code=trust_remote_code, revision=revision
         )
     text_config = getattr(loaded_config, "text_config", None)
     if text_config is not None and isinstance(text_config, dict):
@@ -255,6 +334,13 @@ def _override_deepseek_ocr_v_head_dim(config: DeepseekVLV2Config) -> None:
     if config.text_config.v_head_dim == 0:
         V_HEAD_DIM_PATCH = 128
         config.text_config.v_head_dim = V_HEAD_DIM_PATCH
+        # Also fix language_config so get_hf_text_config (which may prefer it
+        # over text_config) stays consistent.
+        lc = getattr(config, "language_config", None)
+        if isinstance(lc, dict):
+            lc["v_head_dim"] = V_HEAD_DIM_PATCH
+        elif hasattr(lc, "v_head_dim"):
+            lc.v_head_dim = V_HEAD_DIM_PATCH
         logger.warning(
             f"Overriding deepseek-ocr's v_head_dim from 0 to {V_HEAD_DIM_PATCH} to avoid potential issues."
         )
@@ -273,15 +359,119 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
         )
 
 
+def _ensure_clean_up_tokenization_compat() -> None:
+    """Re-add ``clean_up_tokenization`` removed in transformers v5.
+
+    Remote-code tokenizers (e.g. InternLM2Tokenizer) call
+    ``self.clean_up_tokenization()`` which was a static method on
+    ``PreTrainedTokenizerBase`` in v4 but removed in v5. Patch it back
+    so existing HuggingFace Hub tokenizer code keeps working.
+    """
+    if hasattr(PreTrainedTokenizerBase, "clean_up_tokenization"):
+        return
+
+    @staticmethod
+    def clean_up_tokenization(out_string: str) -> str:
+        out_string = (
+            out_string.replace(" .", ".")
+            .replace(" ?", "?")
+            .replace(" !", "!")
+            .replace(" ,", ",")
+            .replace(" ' ", "'")
+            .replace(" n't", "n't")
+            .replace(" 'm", "'m")
+            .replace(" 's", "'s")
+            .replace(" 've", "'ve")
+            .replace(" 're", "'re")
+        )
+        return out_string
+
+    PreTrainedTokenizerBase.clean_up_tokenization = clean_up_tokenization
+
+
+# Apply immediately so all code paths (get_tokenizer, get_processor,
+# and any external callers) benefit without needing an explicit call.
+_ensure_clean_up_tokenization_compat()
+
+
+def _ensure_is_torch_fx_available_compat() -> None:
+    """Re-add ``is_torch_fx_available`` removed in transformers v5.
+
+    Remote-code models (e.g. MiniCPM-V) import ``is_torch_fx_available``
+    from ``transformers.utils.import_utils``.  The function was removed
+    in v5.  Patch it back so existing HuggingFace Hub model code keeps
+    working.  torch.fx is always available in PyTorch >= 2.0.
+    """
+    import transformers.utils.import_utils as _import_utils
+
+    if hasattr(_import_utils, "is_torch_fx_available"):
+        return
+
+    _import_utils.is_torch_fx_available = lambda: True
+
+
+_ensure_is_torch_fx_available_compat()
+
+
+def normalize_rope_scaling_compat(config: "PretrainedConfig") -> None:
+    """Ensure rope_scaling dicts have ``"type"`` alongside ``"rope_type"``.
+
+    Transformers v5 standardises rope_scaling to use ``"rope_type"`` and may
+    omit the legacy ``"type"`` key.  Remote-code models (e.g. Kimi-VL) still
+    read ``rope_scaling["type"]``, causing a ``KeyError``.  This helper adds
+    ``"type"`` from ``"rope_type"`` whenever it is missing, recursively across
+    the config and all its sub-configs.
+    """
+
+    def _patch(cfg):
+        try:
+            rs = getattr(cfg, "rope_scaling", None)
+        except AttributeError:
+            rs = None
+        if isinstance(rs, dict) and "rope_type" in rs and "type" not in rs:
+            rs["type"] = rs["rope_type"]
+        # Recurse into sub-configs
+        for attr in (
+            "text_config",
+            "llm_config",
+            "language_config",
+            "vision_config",
+            "thinker_config",
+        ):
+            sub = getattr(cfg, attr, None)
+            if sub is not None:
+                _patch(sub)
+
+    _patch(config)
+
+
 def _ensure_llama_flash_attention2_compat() -> None:
     """Ensure LlamaFlashAttention2 symbol exists for remote code compatibility."""
     try:
         from transformers.models.llama import modeling_llama
-    except Exception:
+    except (ImportError, ModuleNotFoundError):
         return
     if not hasattr(modeling_llama, "LlamaFlashAttention2"):
         if hasattr(modeling_llama, "LlamaAttention"):
             modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+
+
+def _ensure_gguf_version():
+    """Workaround for transformers v5 bug where is_gguf_available() fails
+    when the gguf package lacks __version__ and metadata lookup also fails,
+    resulting in packaging.version.InvalidVersion: Invalid version: 'N/A'."""
+    try:
+        import gguf
+
+        if not hasattr(gguf, "__version__"):
+            import importlib.metadata
+
+            try:
+                gguf.__version__ = importlib.metadata.version("gguf")
+            except Exception:
+                gguf.__version__ = "0.0.0"
+    except ImportError:
+        pass
 
 
 @lru_cache_frozenset(maxsize=32)
@@ -294,6 +484,7 @@ def get_config(
 ):
     is_gguf = check_gguf_file(model)
     if is_gguf:
+        _ensure_gguf_version()
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
@@ -305,9 +496,13 @@ def get_config(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
-    if "mistral-large-3" in str(model).lower():
+    if (
+        "mistral-large-3" in str(model).lower()
+        or "mistral-small-4" in str(model).lower()
+        or "leanstral" in str(model).lower()
+    ):
         config = _load_mistral_large_3_for_causal_LM(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            model, trust_remote_code=trust_remote_code, revision=revision
         )
     else:
         _ensure_llama_flash_attention2_compat()
@@ -321,6 +516,32 @@ def get_config(
             config = _load_deepseek_v32_model(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
+        except KeyError as e:
+            # Transformers v5 may register a built-in config class that
+            # conflicts with sglang's custom one (e.g. NemotronHConfig
+            # doesn't handle '-' in hybrid_override_pattern). Fall back
+            # to loading the raw config dict and using sglang's class.
+            # Also handle deepseek_v32 which v5 doesn't recognize.
+            if "deepseek_v32" in str(e):
+                config = _load_deepseek_v32_model(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            else:
+                config_dict, _ = PretrainedConfig.get_config_dict(
+                    model,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+                model_type = config_dict.get("model_type")
+                if model_type in _CONFIG_REGISTRY:
+                    config = _CONFIG_REGISTRY[model_type].from_dict(config_dict)
+                    config._name_or_path = model
+                else:
+                    raise
 
     if (
         config.architectures is not None
@@ -342,6 +563,14 @@ def get_config(
             "patch_size": 14,
         }
         config.vision_config = SiglipVisionConfig(**vision_config)
+
+    if config.architectures in [
+        ["LongcatCausalLM"],
+        ["LongcatFlashForCausalLM"],
+        ["LongcatFlashNgramForCausalLM"],
+    ]:
+        config.model_type = "longcat_flash"
+
     text_config = get_hf_text_config(config=config)
 
     if isinstance(model, str) and text_config is not None:
@@ -388,6 +617,9 @@ def get_config(
 
     if config.model_type == "multi_modality":
         config.update({"architectures": ["MultiModalityCausalLM"]})
+
+    if config.model_type == "longcat_flash":
+        config.update({"architectures": ["LongcatFlashForCausalLM"]})
 
     if model_override_args:
         config.update(model_override_args)
@@ -498,6 +730,12 @@ def get_tokenizer(
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+    elif tokenizer_mode == "auto":
+        # In Transformers v5, the default for use_fast changed from True to False.
+        # Explicitly set use_fast=True for "auto" mode to maintain previous behavior
+        # and avoid issues with models that have incorrect tokenizer_class values.
+        if "use_fast" not in kwargs:
+            kwargs["use_fast"] = True
 
     # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
     if tokenizer_name == "mistralai/Devstral-Small-2505":
@@ -505,6 +743,7 @@ def get_tokenizer(
 
     is_gguf = check_gguf_file(tokenizer_name)
     if is_gguf:
+        _ensure_gguf_version()
         kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
 
@@ -554,15 +793,249 @@ def get_tokenizer(
         else:
             raise e
 
+    # Transformers v5 may silently fall back to a generic TokenizersBackend
+    # when trust_remote_code=False and the model requires a custom tokenizer.
+    # Detect this and auto-retry with trust_remote_code=True.
+    if not trust_remote_code and type(tokenizer).__name__ == "TokenizersBackend":
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=True,
+            tokenizer_revision=tokenizer_revision,
+            clean_up_tokenization_spaces=False,
+            **kwargs,
+        )
+
+    _fix_v5_tokenizer_components(tokenizer, tokenizer_name, tokenizer_revision)
+    _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, tokenizer_revision)
+
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         warnings.warn(
             "Using a slow tokenizer. This might cause a significant "
             "slowdown. Consider using a fast tokenizer instead."
         )
 
+    _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     tokenizer = patch_tokenizer(tokenizer)
     return tokenizer
+
+
+def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
+    """Resolve a file from a local directory or HF hub cache (no network)."""
+    local_path = Path(model_name_or_path) / filename
+    if local_path.is_file():
+        return str(local_path)
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(
+        model_name_or_path, filename, revision=revision, local_files_only=True
+    )
+
+
+def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
+    """Fix pre_tokenizer/decoder when a v5 tokenizer class overwrites them.
+
+    In transformers v5, some tokenizer classes (e.g. LlamaTokenizer) have a
+    custom __init__ that rebuilds the pre_tokenizer and decoder from scratch
+    with class-specific components, discarding the originals from tokenizer.json.
+    This breaks models that specify LlamaTokenizerFast but actually use a
+    different tokenizer architecture (e.g. DeepSeek-V3.2 uses ByteLevel).
+
+    Detects the mismatch by comparing against the raw tokenizer.json and
+    restores the original components when they differ.
+    """
+    backend = getattr(tokenizer, "_tokenizer", None)
+    if backend is None:
+        return
+
+    try:
+        from tokenizers import Tokenizer as RawTokenizer
+
+        tok_file = _resolve_local_or_cached_file(
+            model_name_or_path, "tokenizer.json", revision
+        )
+        raw = RawTokenizer.from_file(tok_file)
+    except Exception as e:
+        logger.debug(
+            "_fix_v5_tokenizer_components: could not load tokenizer.json for %s: %s",
+            model_name_or_path,
+            e,
+        )
+        return
+
+    raw_pre = type(raw.pre_tokenizer).__name__ if raw.pre_tokenizer else None
+    loaded_pre = type(backend.pre_tokenizer).__name__ if backend.pre_tokenizer else None
+
+    if raw_pre and loaded_pre and raw_pre != loaded_pre:
+        logger.info(
+            "Fixing v5 tokenizer component mismatch for %s: "
+            "pre_tokenizer %s -> %s, decoder %s -> %s",
+            model_name_or_path,
+            loaded_pre,
+            raw_pre,
+            type(backend.decoder).__name__ if backend.decoder else None,
+            type(raw.decoder).__name__ if raw.decoder else None,
+        )
+        backend.pre_tokenizer = raw.pre_tokenizer
+        backend.decoder = raw.decoder
+
+
+def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
+    """Restore add_bos_token/add_eos_token stripped by transformers v5.
+
+    In transformers v5, _from_pretrained() strips add_bos_token and
+    add_eos_token from init kwargs when a tokenizer.json file is present,
+    assuming the tokenizer.json post-processor handles BOS/EOS addition.
+    However, many models (e.g. DeepSeek-V3) have a tokenizer.json whose
+    post-processor does NOT add BOS/EOS, and rely on the add_bos_token flag
+    from tokenizer_config.json instead. This causes silent accuracy regressions.
+
+    This function reads the tokenizer_config.json and restores the values,
+    but only for tokenizer classes that actually supported these flags in v4.
+    Classes like Qwen2Tokenizer did not support add_bos_token/add_eos_token
+    in v4, so restoring them would change behavior.
+    """
+    # In transformers v4, only certain tokenizer classes supported
+    # add_bos_token / add_eos_token as init parameters.  Restoring these
+    # flags for classes that never supported them (e.g. Qwen2Tokenizer)
+    # would incorrectly change tokenization behavior.
+    _V4_CLASSES_WITH_BOS_EOS_FLAGS = frozenset(
+        {
+            "LlamaTokenizer",
+            "LlamaTokenizerFast",
+            "CodeLlamaTokenizer",
+            "CodeLlamaTokenizerFast",
+            "GemmaTokenizer",
+            "GemmaTokenizerFast",
+            "CohereTokenizerFast",
+        }
+    )
+
+    try:
+        config_file = _resolve_local_or_cached_file(
+            model_name_or_path, "tokenizer_config.json", revision
+        )
+        with open(config_file) as f:
+            config = json.load(f)
+    except Exception as e:
+        logger.debug(
+            "_fix_v5_add_bos_eos_token: could not read tokenizer_config.json "
+            "for %s: %s",
+            model_name_or_path,
+            e,
+        )
+        return
+
+    tokenizer_class = config.get("tokenizer_class", "")
+    if tokenizer_class not in _V4_CLASSES_WITH_BOS_EOS_FLAGS:
+        logger.debug(
+            "_fix_v5_add_bos_eos_token: skipping %s (tokenizer_class=%s "
+            "did not support add_bos/eos_token in v4)",
+            model_name_or_path,
+            tokenizer_class,
+        )
+        return
+
+    # In v4, Llama/Gemma tokenizers defaulted add_bos_token=True.
+    # When the config omits the key or has null, use the v4 default so that
+    # update_post_processor() doesn't drop BOS/EOS that was there before.
+    _V4_DEFAULTS = {"add_bos_token": True, "add_eos_token": False}
+
+    changed = False
+    for attr in ("add_bos_token", "add_eos_token"):
+        config_val = config.get(attr)
+        if config_val is None:
+            # Key missing or null → use v4 default for this tokenizer class
+            config_val = _V4_DEFAULTS.get(attr, False)
+        current_val = getattr(tokenizer, attr, None)
+        if current_val != config_val:
+            logger.info(
+                "Restoring %s=%s for %s (was %s after v5 loading)",
+                attr,
+                config_val,
+                model_name_or_path,
+                current_val,
+            )
+            setattr(tokenizer, f"_{attr}", config_val)
+            changed = True
+
+    # Rebuild the post-processor so it respects the restored flags
+    if changed and hasattr(tokenizer, "update_post_processor"):
+        tokenizer.update_post_processor()
+
+
+def _fix_special_tokens_pattern(tokenizer):
+    """Fix https://github.com/huggingface/transformers/pull/42563 which defaults
+    special_tokens_pattern to "cls_sep", inserting None into token IDs when
+    cls_token/sep_token are undefined (e.g. Kimi-VL's TikTokenTokenizer).
+    """
+    pattern = getattr(tokenizer, "special_tokens_pattern", None)
+    if pattern == "cls_sep" and (
+        tokenizer.cls_token_id is None or tokenizer.sep_token_id is None
+    ):
+        tokenizer.special_tokens_pattern = "none"
+
+
+def _fix_added_tokens_encoding(tokenizer):
+    """Ensure special tokens encode as single tokens in transformers v5.
+
+    Some model tokenizers (e.g. MiniCPM-V-4) define special tokens like <image>,
+    <slice> as attributes on the tokenizer class with corresponding IDs in the
+    vocabulary (via tokenizer.json's added_tokens). In transformers v5, these
+    tokens may not appear in get_added_vocab() and encode() splits them into
+    subwords, breaking multimodal pipelines that rely on finding them in input_ids.
+
+    This function discovers such tokens by scanning tokenizer attributes, checks
+    if they encode correctly, and re-registers any that don't.
+    """
+    # Discover special token strings from tokenizer attributes.
+    # Model tokenizers (e.g. MiniCPMVTokenizerFast) store them as attributes
+    # like im_start="<image>", slice_start="<slice>", etc.
+    candidates = {}
+    for attr in dir(tokenizer):
+        if attr.startswith("_"):
+            continue
+        try:
+            val = getattr(tokenizer, attr)
+        except Exception:
+            continue
+        if (
+            not isinstance(val, str)
+            or not val.startswith("<")
+            or not val.endswith(">")
+            or len(val) > 20
+        ):
+            continue
+        token_id = tokenizer.convert_tokens_to_ids(val)
+        if token_id is not None and token_id != tokenizer.unk_token_id:
+            candidates[val] = token_id
+
+    if not candidates:
+        return
+
+    # Check which tokens fail to encode as single tokens.
+    broken = []
+    for token_str, expected_id in candidates.items():
+        try:
+            ids = tokenizer.encode(token_str, add_special_tokens=False)
+            if len(ids) != 1 or ids[0] != expected_id:
+                broken.append(token_str)
+        except Exception:
+            broken.append(token_str)
+
+    if not broken:
+        return
+
+    from transformers import AddedToken
+
+    tokens_to_add = [AddedToken(tok, special=True, normalized=False) for tok in broken]
+    tokenizer.add_tokens(tokens_to_add, special_tokens=True)
+    logger.info(
+        "Re-registered %d special tokens for correct v5 encoding: %s",
+        len(broken),
+        broken[:10],
+    )
 
 
 # Some models doesn't have an available processor, e.g.: InternVL
@@ -570,6 +1043,72 @@ def get_tokenizer_from_processor(processor):
     if isinstance(processor, PreTrainedTokenizerBase):
         return processor
     return processor.tokenizer
+
+
+def _build_processor_manually(
+    model_path, config, trust_remote_code, revision, **kwargs
+):
+    """Build processor when AutoProcessor fails to resolve feature_extractor_type.
+
+    In transformers v5, AutoProcessor.from_pretrained calls
+    AutoFeatureExtractor.from_pretrained which fails if
+    preprocessor_config.json lacks 'feature_extractor_type'. This loads the
+    processor class from the hub and constructs it with individually-loaded
+    components.
+    """
+    import transformers
+    from transformers import AutoImageProcessor, AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    # Resolve processor class from auto_map — check both the model config
+    # and the preprocessor_config.json (some models like MiniCPM-o only
+    # declare AutoProcessor in the latter).
+    auto_map = getattr(config, "auto_map", None) or {}
+    proc_ref = auto_map.get("AutoProcessor")
+    if not proc_ref:
+        try:
+            pp_file = _resolve_local_or_cached_file(
+                model_path, "preprocessor_config.json", revision
+            )
+            with open(pp_file) as f:
+                pp_auto_map = json.load(f).get("auto_map", {})
+            proc_ref = pp_auto_map.get("AutoProcessor")
+        except Exception as e:
+            logger.debug(
+                "_build_processor_manually: could not read preprocessor_config.json "
+                "for %s: %s",
+                model_path,
+                e,
+            )
+    if not proc_ref:
+        raise ValueError(f"Cannot determine processor class for {model_path}")
+
+    proc_cls = get_class_from_dynamic_module(
+        proc_ref, model_path, code_revision=revision
+    )
+
+    # Load sub-components individually (these succeed)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code, revision=revision
+    )
+    init_kwargs = {"tokenizer": tokenizer}
+
+    if "image_processor" in getattr(proc_cls, "attributes", []):
+        try:
+            init_kwargs["image_processor"] = AutoImageProcessor.from_pretrained(
+                model_path, trust_remote_code=trust_remote_code, revision=revision
+            )
+        except Exception as e:
+            logger.warning("Failed to load image_processor for %s: %s", model_path, e)
+
+    # Instantiate feature extractor from its declared class
+    fe_class_name = getattr(proc_cls, "feature_extractor_class", None)
+    if fe_class_name:
+        fe_class = getattr(transformers, fe_class_name, None)
+        if fe_class is not None:
+            init_kwargs["feature_extractor"] = fe_class()
+
+    return proc_cls(**init_kwargs)
 
 
 def get_processor(
@@ -583,12 +1122,15 @@ def get_processor(
 ):
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
-    if "mistral-large-3" in str(tokenizer_name).lower():
+    if (
+        "mistral-large-3" in str(tokenizer_name).lower()
+        or "mistral-small-4" in str(tokenizer_name).lower()
+        or "leanstral" in str(tokenizer_name).lower()
+    ):
         config = _load_mistral_large_3_for_causal_LM(
             tokenizer_name,
             trust_remote_code=trust_remote_code,
             revision=revision,
-            **kwargs,
         )
     else:
         _ensure_llama_flash_attention2_compat()
@@ -656,10 +1198,66 @@ def get_processor(
                 revision=revision,
                 **kwargs,
             )
+        elif "Unrecognized feature extractor" in error_message:
+            logger.info(
+                "AutoProcessor failed on feature extractor for %s, "
+                "constructing processor manually",
+                tokenizer_name,
+            )
+            processor = _build_processor_manually(
+                tokenizer_name,
+                config,
+                trust_remote_code,
+                revision,
+                **kwargs,
+            )
         else:
             raise e
+    # If processor is a bare tokenizer (e.g. Mistral-Small-4 has no processor_config.json)
+    # and the model is a vision model (pixtral), wrap it in a proper PixtralProcessor
+    # so that image data is actually processed through the image processor.
+    if (
+        isinstance(processor, PreTrainedTokenizerBase)
+        and getattr(config, "model_type", None) == "pixtral"
+    ):
+        from transformers.models.pixtral.image_processing_pixtral import (
+            PixtralImageProcessor,
+        )
+        from transformers.models.pixtral.processing_pixtral import (
+            PixtralProcessor as HFPixtralProcessor,
+        )
+
+        vision_config = config.vision_config
+        patch_size = vision_config.patch_size
+        image_size = vision_config.image_size
+        spatial_merge_size = getattr(vision_config, "spatial_merge_size", 1)
+
+        effective_patch = patch_size * spatial_merge_size
+        image_processor = PixtralImageProcessor(
+            do_resize=True,
+            size={"longest_edge": image_size},
+            patch_size={"height": effective_patch, "width": effective_patch},
+        )
+        processor = HFPixtralProcessor(
+            image_processor=image_processor,
+            tokenizer=processor,
+            patch_size=patch_size,
+            spatial_merge_size=spatial_merge_size,
+        )
+
     tokenizer = get_tokenizer_from_processor(processor)
 
+    if tokenizer.chat_template is None:
+        local_path = download_from_hf(
+            tokenizer_name, allow_patterns=["*.json", "*.jinja", "*.model"]
+        )
+        jinja_path = Path(local_path) / "chat_template.jinja"
+        if jinja_path.is_file():
+            tokenizer.chat_template = jinja_path.read_text()
+            logger.info("Loaded chat_template from %s", jinja_path)
+
+    _fix_special_tokens_pattern(tokenizer)
+    _fix_added_tokens_encoding(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     return processor
 

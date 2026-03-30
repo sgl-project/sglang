@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.srt.utils import add_prefix
 
 
 class MLP(nn.Module):
@@ -45,6 +46,7 @@ class MLP(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
+            prefix=add_prefix("0.proj", prefix),
         )
 
         self.act = get_act_fn(act_type)
@@ -56,6 +58,7 @@ class MLP(nn.Module):
             bias=True,
             input_is_parallel=True,
             quant_config=quant_config,
+            prefix=add_prefix("2", prefix),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -271,7 +271,9 @@ def triton_kernel_fused_experts_with_bias(
     # feature check
     assert inplace is False, "Inplace is not supported in new triton MoE kernel"
 
-    E, _, _ = w1.shape
+    M, K = hidden_states.shape
+    E, _, N = w1.shape
+    n_expts_act = routing_data.n_expts_act
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -292,7 +294,16 @@ def triton_kernel_fused_experts_with_bias(
         2,
     )
 
-    intermediate_cache = matmul_ogs(
+    intermediate_cache = torch.empty(
+        (1, M * n_expts_act, N // 2),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    output = torch.empty(
+        (1, M, K), device=hidden_states.device, dtype=hidden_states.dtype
+    )
+
+    matmul_ogs(
         hidden_states,
         w1,
         b1,
@@ -301,14 +312,17 @@ def triton_kernel_fused_experts_with_bias(
         precision_config=w1_pcg,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
         fused_activation=act,
+        y=intermediate_cache,
     )
 
-    return matmul_ogs(
-        intermediate_cache,
+    matmul_ogs(
+        intermediate_cache.view(M * n_expts_act, N // 2),
         w2,
         b2,
         routing_data,
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
+        y=output,
     )
+    return output.view(M, K)

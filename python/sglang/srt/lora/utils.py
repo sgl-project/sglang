@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -39,6 +39,10 @@ class LoRABatchInfo:
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
     permutation: Optional[torch.Tensor]
+
+    # Total number of tokens this batch info expects (host-side int).
+    # Used by lm_head LoRA to validate input shape without GPU sync.
+    expected_tokens: Optional[int] = None
 
 
 class LoRAType(Enum):
@@ -83,6 +87,10 @@ def get_hidden_dim(
             return config.hidden_size, config.intermediate_size * 2
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
+        elif module_name == "gate_up_proj_moe":
+            return config.hidden_size, config.moe_intermediate_size * 2
+        elif module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
         elif module_name == "embed_tokens":
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
             # if contain extra tokens will be added; otherwise is 0.
@@ -144,6 +152,7 @@ def get_stacked_multiply(module_name: str) -> int:
     stacked_rank = {
         "qkv_proj": 3,
         "gate_up_proj": 2,
+        "gate_up_proj_moe": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 
@@ -164,7 +173,26 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj", "down_proj_moe"]
+
+
+def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:
+    """Get the LoRA B output dimension for lm_head, accounting for TP.
+
+    lm_head is column-parallel, so its LoRA B must be sharded along the
+    vocab dimension to match the base output.  When shard_indices is
+    provided, the returned size reflects the base model's actual per-rank
+    vocab partition.
+
+    Args:
+        output_dim: Full (unsharded) output dimension (vocab_size).
+        shard_indices: VocabParallelEmbeddingShardIndices from the base
+            ParallelLMHead layer.  When provided, returns the per-rank
+            org vocab size from the base model's actual sharding.
+    """
+    if shard_indices is not None:
+        return shard_indices.num_org_elements
+    return output_dim
 
 
 def generate_sequence_lengths(
@@ -193,3 +221,130 @@ def generate_sequence_lengths(
         else:
             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
     return seg_lens
+
+
+def get_lm_head_pruned_lens(
+    forward_batch: ForwardBatch,
+) -> Optional[List[int]]:
+    """
+    Compute per-sequence pruned lengths for lm_head LoRA.
+
+    Returns a list of pruned lengths (one per sequence) if pruning applies,
+    or None if lm_head pruning is not applicable for this batch.
+
+    Pruning rules:
+    - Extend without logprobs: 1 token per sequence
+    - Extend with logprobs: max(extend_len - logprob_start_len, 1) per sequence
+    - Decode / target_verify / draft_extend_v2: no pruning
+
+    IMPORTANT: This must stay in sync with LogitsProcessor._get_pruned_states()
+    in sglang/srt/layers/logits_processor.py, which determines how many tokens
+    per sequence are passed to lm_head. If the pruning conditions or lengths
+    there change, this function must be updated to match, otherwise the
+    lm_head LoRA will operate on incorrectly shaped inputs.
+    """
+    lm_head_pruning = (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and not forward_batch.forward_mode.is_draft_extend_v2()
+    )
+
+    if not lm_head_pruning:
+        return None
+
+    if forward_batch.return_logprob:
+        pruned_lens = []
+        for ext_len, start_len in zip(
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.extend_logprob_start_lens_cpu,
+        ):
+            pruned_lens.append(1 if ext_len == start_len else ext_len - start_len)
+    else:
+        pruned_lens = [1] * forward_batch.batch_size
+
+    return pruned_lens
+
+
+def merge_and_chunk_segments(
+    weight_indices: list[int],
+    pruned_lens: List[int],
+    chunk_size: int,
+) -> Tuple[List[int], List[int]]:
+    """
+    Merge consecutive same-adapter sequences and chunk at chunk_size boundaries.
+
+    Merges consecutive sequences that use the same adapter into single
+    segments, splitting any segment that exceeds chunk_size.
+
+    Args:
+        weight_indices: Per-sequence adapter indices.
+        pruned_lens: Per-sequence pruned token counts.
+        chunk_size: Maximum segment length before splitting.
+
+    Returns:
+        (seg_weight_indices, seg_lens): Merged and chunked segments.
+    """
+    seg_weight_indices: List[int] = []
+    seg_lens: List[int] = []
+    for wi, pl in zip(weight_indices, pruned_lens):
+        if seg_weight_indices and seg_weight_indices[-1] == wi:
+            seg_lens[-1] += pl
+        else:
+            seg_weight_indices.append(wi)
+            seg_lens.append(pl)
+        # Split the last segment if it exceeds chunk_size
+        while seg_lens[-1] > chunk_size:
+            remainder = seg_lens[-1] - chunk_size
+            seg_lens[-1] = chunk_size
+            seg_weight_indices.append(wi)
+            seg_lens.append(remainder)
+
+    return seg_weight_indices, seg_lens
+
+
+def build_lm_head_pass_segments(
+    weight_indices: List[int],
+    pruned_lens: List[int],
+    logprobs_chunk_size: int,
+) -> List[Tuple[List[int], List[int]]]:
+    """
+    Precompute per-pass segment info for lm_head LoRA logprobs processing.
+
+    When LogitsProcessor uses chunked logprobs processing
+    (process_input_logprobs_by_chunk), pruned hidden states are split into
+    fixed-size passes.  Each pass needs its own segmentation
+    (weight_indices, seg_lens) so that lm_head LoRA operates on the
+    correct adapter assignments per pass.
+
+    Args:
+        weight_indices: Per-sequence adapter indices.
+        pruned_lens: Per-sequence pruned token counts.
+        logprobs_chunk_size: Fixed pass size used by LogitsProcessor.
+
+    Returns:
+        List of (seg_weight_indices, seg_lens) tuples, one per pass.
+    """
+    # Expand to per-token weight index
+    token_wi: List[int] = []
+    for wi, pl in zip(weight_indices, pruned_lens):
+        token_wi.extend([wi] * pl)
+    total = len(token_wi)
+    num_passes = (total + logprobs_chunk_size - 1) // logprobs_chunk_size
+
+    result: List[Tuple[List[int], List[int]]] = []
+    for i in range(num_passes):
+        start = i * logprobs_chunk_size
+        end = min((i + 1) * logprobs_chunk_size, total)
+
+        # Run-length encode the pass's adapter indices
+        seg_wi: List[int] = []
+        seg_lens: List[int] = []
+        for t in range(start, end):
+            if seg_wi and seg_wi[-1] == token_wi[t]:
+                seg_lens[-1] += 1
+            else:
+                seg_wi.append(token_wi[t])
+                seg_lens.append(1)
+        result.append((seg_wi, seg_lens))
+
+    return result
