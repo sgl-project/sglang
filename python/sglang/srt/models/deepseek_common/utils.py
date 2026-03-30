@@ -63,6 +63,12 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
 ]
 
 
+def add_forward_absorb_core_attention_backend(backend_name):
+    if backend_name not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+        FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append(backend_name)
+        logger.info(f"Added {backend_name} to FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.")
+
+
 def awq_dequantize_func():
     """
     Get the AWQ dequantize function for the current device

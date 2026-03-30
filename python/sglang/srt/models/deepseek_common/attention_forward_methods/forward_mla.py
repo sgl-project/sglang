@@ -5,8 +5,14 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.distributed import get_dcp_group, get_dcp_world_size
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
@@ -305,6 +311,38 @@ class DeepseekMLAForwardMixin:
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
+        if get_dcp_world_size() > 1:
+            if forward_batch.forward_mode.is_decode():
+                with use_symmetric_memory(get_dcp_group()):
+                    combined = torch.cat([q_pe, q_nope_out], dim=-1)
+                gathered = get_dcp_group().all_gather(combined, dim=-2)
+                d_pe = q_pe.size(-1)
+                d_nope = q_nope_out.size(-1)
+                q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+            elif forward_batch.forward_mode.is_extend():
+                cache_k_nope, cache_k_rope = (
+                    forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                        self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
+                    )
+                )
+                local_cache_kv = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
+                get_dcp_group().all_gather_into_tensor(
+                    forward_batch.dcp_kv_buffer[
+                        : forward_batch.dcp_extend_prefix_lens_sum
+                    ],
+                    local_cache_kv,
+                )
+                forward_batch.dcp_kv_buffer[
+                    forward_batch.dcp_extend_prefix_lens_sum :,
+                    ...,
+                    : self.kv_lora_rank,
+                ] = k_nope
+                forward_batch.dcp_kv_buffer[
+                    forward_batch.dcp_extend_prefix_lens_sum :,
+                    ...,
+                    self.kv_lora_rank :,
+                ] = k_pe
+
         return (
             q_pe,
             k_pe,
@@ -340,16 +378,36 @@ class DeepseekMLAForwardMixin:
                     "llama_4_scaling": llama_4_scaling,
                 }
 
-            attn_output = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-                **extra_args,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            else:
+                attn_output = self.attn_mqa(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
@@ -393,6 +451,30 @@ class DeepseekMLAForwardMixin:
                 save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+            is_base_e = self.current_attention_backend in ("fa3", "fa4")
+            if get_global_server_args().dcp_comm_backend == "a2a":
+                attn_output = attn_output.view(
+                    -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
+                ).contiguous()
+                lse = lse.contiguous()
+                attn_output = dcp_a2a_lse_reduce(
+                    attn_output,
+                    lse,
+                    get_dcp_group(),
+                    is_lse_base_on_e=is_base_e,
+                )
+            else:
+                with use_symmetric_memory(get_dcp_group()):
+                    attn_output = attn_output.view(
+                        -1,
+                        self.num_local_heads * get_dcp_world_size(),
+                        self.kv_lora_rank,
+                    ).clone(memory_format=torch.contiguous_format)
+                    lse = lse.clone(memory_format=torch.contiguous_format)
+                attn_output = cp_lse_ag_out_rs(
+                    attn_output, lse, get_dcp_group(), is_lse_base_on_e=is_base_e
+                )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:

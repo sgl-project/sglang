@@ -69,6 +69,9 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+# check whether only enable symmetric_memory for dcp group
+_DCP_ENABLE_SYMM_ONLY = get_bool_env_var("SGLANG_DCP_SYMM_ONLY", "false")
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -344,7 +347,12 @@ class GroupCoordinator:
         )
         from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
-        self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
+        if _DCP_ENABLE_SYMM_ONLY:
+            self.is_symmetric_memory_enabled = (
+                lambda: group_name == "dcp" and is_symmetric_memory_enabled()
+            )
+        else:
+            self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
         self.use_symmetric_memory = use_symmetric_memory
         self.is_allocation_symmetric = is_allocation_symmetric
         if is_hip():
@@ -736,6 +744,42 @@ class GroupCoordinator:
             torch_symm_mem_comm.all_reduce(input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
+
+    def reduce_scatter_along_dim(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        world_size = self.world_size
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return input_
+        assert (
+            -input_.dim() <= dim < input_.dim()
+        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+
+        with self.use_symmetric_memory(self):
+            # Note: This will produce an incorrect answer if we don't make
+            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+            input_tensor = input_.movedim(0, dim).contiguous()
+
+        assert input_tensor.shape[0] % world_size == 0
+        chunk_size = input_tensor.shape[0] // world_size
+        output_shape = (chunk_size,) + input_tensor.shape[1:]
+
+        with self.use_symmetric_memory(self):
+            output_tensor = torch.empty(
+                output_shape,
+                dtype=input_tensor.dtype,
+                device=input_tensor.device,
+            )
+
+        self.reduce_scatter_tensor(output_tensor, input_tensor)
+
+        # Reshape before returning
+        return output_tensor.movedim(0, dim)
 
     def _reduce_scatter_tensor(
         self,
@@ -1389,6 +1433,22 @@ class GroupCoordinator:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+    ) -> None:
+        """All-to-All: exchange equal-sized chunks between all ranks."""
+        if self.world_size == 1:
+            output.copy_(input)
+            return
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all_single(output, input)
+        else:
+            torch.distributed.all_to_all_single(output, input, group=self.device_group)
+
     def destroy(self):
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
@@ -1473,6 +1533,23 @@ _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 
+_DCP: Optional[GroupCoordinator] = None
+
+decode_context_parallel_size: Optional[int] = None
+
+
+def get_dcp_size_from_env():
+    global decode_context_parallel_size
+    if decode_context_parallel_size is None:
+        decode_context_parallel_size = 1
+    return decode_context_parallel_size
+
+
+def set_dcp_size(size: int):
+    global decode_context_parallel_size
+    decode_context_parallel_size = size
+
+
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
@@ -1506,6 +1583,11 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context parallel group is not initialized"
+    return _DCP
 
 
 _MOE_DP: Optional[GroupCoordinator] = None
@@ -1572,7 +1654,9 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     """
     with get_tp_group().graph_capture(
         stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    ) as context, get_pp_group().graph_capture(context), get_dcp_group().graph_capture(
+        context
+    ):
         moe_ep = _MOE_EP
         if moe_ep is not None and moe_ep is not _TP:
             with moe_ep.graph_capture(context):
@@ -1753,6 +1837,7 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
 ) -> None:
@@ -1923,6 +2008,46 @@ def initialize_model_parallel(
             use_torch_symm_mem_allreduce=False,
             group_name="attention_tp",
         )
+
+    # build decode context parallel groups
+    set_dcp_size(decode_context_parallel_size)
+    if decode_context_parallel_size > 1:
+        if get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
+    else:
+        if get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                f"DCP disabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
+    assert (
+        tensor_model_parallel_size % decode_context_parallel_size == 0
+    ), f"{tensor_model_parallel_size} must be divisible by decode_context_parallel_size"
+    num_decode_context_model_parallel_groups: int = (
+        world_size // decode_context_parallel_size
+    )
+    global _DCP
+    assert _DCP is None, "decode context parallel group is already initialized"
+    group_ranks = []
+    for i in range(num_decode_context_model_parallel_groups):
+        ranks = list(
+            range(
+                i * decode_context_parallel_size,
+                (i + 1) * decode_context_parallel_size,
+            )
+        )
+        group_ranks.append(ranks)
+
+    _DCP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=get_bool_env_var(
+            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
+        ),
+        group_name="dcp",
+    )
 
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
@@ -2102,6 +2227,11 @@ def ensure_model_parallel_initialized(
         f"{pipeline_model_parallel_size=}"
     )
 
+    dcp_world_size = get_dcp_group().world_size
+    assert (
+        dcp_world_size == get_dcp_size_from_env()
+    ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {get_dcp_size_from_env()=}"
+
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
@@ -2149,6 +2279,14 @@ def get_world_rank():
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     return get_tp_group().world_size
+
+
+def get_dcp_world_size():
+    return get_dcp_group().world_size
+
+
+def get_dcp_rank():
+    return get_dcp_group().rank_in_group
 
 
 def get_tensor_model_parallel_rank():
@@ -2262,6 +2400,9 @@ def destroy_model_parallel():
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
+    global _DCP
+    if _DCP:
+        _DCP.destroy()
 
 
 def destroy_distributed_environment():

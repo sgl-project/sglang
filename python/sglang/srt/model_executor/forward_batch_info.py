@@ -39,6 +39,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import (
+    get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
@@ -53,8 +54,9 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (  # noqa: F401
     ForwardBatchDeepSeekMHAMixin,
+    create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -431,6 +433,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+
+    # For decode context parallel
+    dcp_kv_indptr: Optional[torch.Tensor] = None
+    dcp_kv_buffer: Optional[torch.Tensor] = None
+    dcp_kv_indices: Optional[torch.Tensor] = None
+    dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
+    dcp_extend_prefix_lens_sum: Optional[int] = None
 
     @classmethod
     def init_new(
@@ -1054,6 +1063,102 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+
+    # Here we suppose the length of each chunk is equal
+    # For example, if we have 4 sequences with prefix length [256, 512, 768, 1024], prefix_chunk_len = 256
+    # num_prefix_chunks = cdiv(1024, 256) = 4
+    # prefix_chunk_starts = [[0, 0, 0, 0], [256, 256, 256, 256], [512, 512, 512, 512], [768, 768, 768, 768]]
+    # prefix_chunk_ends = [[256, 256, 256, 256], [256, 512, 512, 512], [256, 512, 768, 768], [256, 512, 768, 1024]]
+    # prefix_chunk_seq_lens = [[256, 256, 256, 256], [0, 256, 256, 256], [0, 0, 256, 256], [0, 0, 0, 256]]
+    # TODO: Implement a better way to allocate chunk lengths that uses memory spaces more efficiently.
+    def get_prefix_chunk_seq_lens(
+        self, prefix_lens: torch.Tensor, num_prefix_chunks: int, prefix_chunk_len: int
+    ):
+        device = prefix_lens.device
+        prefix_chunk_starts = (
+            torch.arange(num_prefix_chunks, device=device, dtype=torch.int32)
+            .unsqueeze(1)
+            .expand(-1, self.batch_size)
+            * prefix_chunk_len
+        )
+        prefix_chunk_ends = torch.min(
+            prefix_lens.unsqueeze(0),
+            prefix_chunk_starts + prefix_chunk_len,
+        ).to(torch.int32)
+
+        prefix_chunk_seq_lens = (
+            (prefix_chunk_ends - prefix_chunk_starts).clamp(min=0).to(torch.int32)
+        )
+
+        return prefix_chunk_starts, prefix_chunk_seq_lens
+
+    # Called before each attention module if using chunked kv cache for prefill
+    # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
+    def prepare_chunked_prefix_cache_info(self, device: torch.device):
+
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        assert isinstance(
+            self.token_to_kv_pool, MLATokenToKVPool
+        ), "Currently chunked prefix cache can only be used by Deepseek models"
+
+        if not any(self.extend_prefix_lens_cpu):
+            self.num_prefix_chunks = 0
+            return
+
+        if self.prefix_chunk_len is not None:
+            # Chunked kv cache info already prepared by prior modules
+            return
+
+        self.prefix_chunk_idx = -1
+
+        # chunk_capacity is the maximum number of tokens in each chunk
+        chunk_capacity = self.get_max_chunk_capacity()
+        self.prefix_chunk_len = chunk_capacity // self.batch_size
+        if get_dcp_world_size() > 1:
+            self.prefix_chunk_len = (
+                self.prefix_chunk_len // get_dcp_world_size() * get_dcp_world_size()
+            )
+
+        self.num_prefix_chunks = (
+            max(self.extend_prefix_lens_cpu) + self.prefix_chunk_len - 1
+        ) // self.prefix_chunk_len
+
+        # Here we compute chunk lens twice to avoid stream sync, once on gpu and once on cpu.
+        prefix_chunk_starts_cuda, prefix_chunk_seq_lens_cuda = (
+            self.get_prefix_chunk_seq_lens(
+                self.extend_prefix_lens,
+                self.num_prefix_chunks,
+                self.prefix_chunk_len,
+            )
+        )
+        _, prefix_chunk_seq_lens_cpu = self.get_prefix_chunk_seq_lens(
+            torch.tensor(self.extend_prefix_lens_cpu),
+            self.num_prefix_chunks,
+            self.prefix_chunk_len,
+        )
+        self.prefix_chunk_starts = prefix_chunk_starts_cuda
+        self.prefix_chunk_seq_lens = prefix_chunk_seq_lens_cuda
+
+        # Metadata for attention backend
+        self.prefix_chunk_cu_seq_lens = torch.zeros(
+            self.num_prefix_chunks,
+            self.batch_size + 1,
+            device=device,
+            dtype=torch.int32,
+        )
+        self.prefix_chunk_cu_seq_lens[:, 1:] = prefix_chunk_seq_lens_cuda.cumsum(
+            dim=1
+        ).to(torch.int32)
+        self.prefix_chunk_max_seq_lens = prefix_chunk_seq_lens_cpu.max(
+            dim=1
+        ).values.tolist()
+
+        self.prefix_chunk_num_tokens = prefix_chunk_seq_lens_cpu.sum(dim=1).tolist()
+        assert max(self.prefix_chunk_num_tokens) <= self.get_max_chunk_capacity()
+
+        # Precompute the kv indices for each chunk
+        self.prepare_chunked_kv_indices(device)
 
     @property
     def can_run_tbo(self):

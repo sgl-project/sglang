@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -232,11 +233,46 @@ class DeepseekMHAForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                kv_a, k_pe = self._get_mla_kv_buffer(
-                    forward_batch.fetch_mha_one_shot_kv_indices(),
-                    q.dtype,
-                    forward_batch,
-                )
+                if get_dcp_world_size() > 1:
+                    prefix_kv_a, prefix_k_pe = (
+                        forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                            self.attn_mqa,
+                            forward_batch.dcp_local_prefix_kv_indices,
+                        )
+                    )
+                    prefix_kv_a = self._all_gather_dcp_kv_cache(prefix_kv_a.squeeze(1))
+                    prefix_k_pe = self._all_gather_dcp_kv_cache(prefix_k_pe)
+                    prefix_lens_cu = torch.zeros(
+                        len(forward_batch.seq_lens) + 1,
+                        dtype=torch.int32,
+                        device=kv_a.device,
+                    )
+                    extend_lens_cu = torch.zeros_like(prefix_lens_cu)
+                    prefix_lens_cu[1:] = torch.cumsum(
+                        forward_batch.extend_prefix_lens, dim=0
+                    )
+                    extend_lens_cu[1:] = torch.cumsum(
+                        forward_batch.extend_seq_lens, dim=0
+                    )
+                    kv_a_tuple = ()
+                    k_pe_tuple = ()
+                    for i in range(len(forward_batch.seq_lens)):
+                        kv_a_tuple += (
+                            prefix_kv_a[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
+                            kv_a[extend_lens_cu[i] : extend_lens_cu[i + 1]],
+                        )
+                        k_pe_tuple += (
+                            prefix_k_pe[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
+                            k_pe[extend_lens_cu[i] : extend_lens_cu[i + 1]],
+                        )
+                    kv_a = torch.cat(kv_a_tuple, dim=0)
+                    k_pe = torch.cat(k_pe_tuple, dim=0)
+                else:
+                    kv_a, k_pe = self._get_mla_kv_buffer(
+                        forward_batch.fetch_mha_one_shot_kv_indices(),
+                        q.dtype,
+                        forward_batch,
+                    )
         if _use_fp8_prefill_attn and self.kv_b_proj.weight.dtype == torch.uint8:
             # MXFP4 weights + FP8 prefill: fuse GEMM, nope/v split, and k_pe cat
             # into a single kernel (fused_gemm_afp4wfp4_split_cat) that writes k and v
@@ -377,6 +413,9 @@ class DeepseekMHAForwardMixin:
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
                 kv_indices, q.dtype, forward_batch
             )
+            if get_dcp_world_size() > 1:
+                kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed)
+                k_pe = self._all_gather_dcp_kv_cache(k_pe)
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -438,6 +477,11 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
+            if get_dcp_world_size() > 1:
+                kv_indices = (
+                    kv_indices[kv_indices % get_dcp_world_size() == get_dcp_rank()]
+                    // get_dcp_world_size()
+                )
             kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

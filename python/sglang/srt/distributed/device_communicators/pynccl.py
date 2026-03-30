@@ -348,6 +348,46 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
+    def all_to_all_single(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        stream=None,
+    ):
+        """All-to-All: each rank sends equal-sized chunk i to rank i,
+        receives chunk from rank i into output position i.
+        Uses ncclGroupStart/End to fuse into one NCCL operation (graph-capturable)."""
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device
+        assert output_tensor.device == self.device
+        stream = self._resolve_stream(stream)
+
+        chunk_size = input_tensor.numel() // self.world_size
+        dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
+
+        self.nccl.ncclGroupStart()
+        for i in range(self.world_size):
+            send_buf = input_tensor.narrow(0, i * chunk_size, chunk_size)
+            self.nccl.ncclSend(
+                buffer_type(send_buf.data_ptr()),
+                chunk_size,
+                dtype,
+                i,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+            recv_buf = output_tensor.narrow(0, i * chunk_size, chunk_size)
+            self.nccl.ncclRecv(
+                buffer_type(recv_buf.data_ptr()),
+                chunk_size,
+                dtype,
+                i,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+        self.nccl.ncclGroupEnd()
+
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
         if self.disabled:
             return

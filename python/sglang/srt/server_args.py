@@ -440,6 +440,8 @@ class ServerArgs:
 
     attn_cp_size: int = 1
     moe_dp_size: int = 1
+    dcp_size: int = 1
+    dcp_comm_backend: str = "ag_rs"
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -2591,6 +2593,9 @@ class ServerArgs:
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
+        if self.dcp_comm_backend == "a2a" and self.dcp_size <= 1:
+            raise ValueError("--dcp-comm-backend a2a requires --dcp-size > 1")
+
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
@@ -4035,6 +4040,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.moe_dp_size,
             help="The moe data parallelism size.",
+        )
+        parser.add_argument(
+            "--dcp-size",
+            type=int,
+            default=ServerArgs.dcp_size,
+            help="The decode context parallelism size.",
+        )
+        parser.add_argument(
+            "--dcp-comm-backend",
+            type=str,
+            default=ServerArgs.dcp_comm_backend,
+            choices=["ag_rs", "a2a"],
+            help="DCP communication backend: ag_rs (AllGather+ReduceScatter) "
+            "or a2a (All-to-All exchange + local Triton combine).",
         )
         parser.add_argument(
             "--pipeline-parallel-size",

@@ -13,7 +13,9 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     # quantization_test suite migrated to test/registered/quant/
     # All CUDA tests migrated to test/registered/
-    "__not_in_ci__": [],
+    "__not_in_ci__": [
+        TestFile("test_dcp_interleaved_storage.py", 5),
+    ],
 }
 
 # Add AMD tests

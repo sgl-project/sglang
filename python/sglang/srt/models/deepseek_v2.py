@@ -41,10 +41,16 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_dcp_group,
+    get_dcp_rank,
+    get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -1238,6 +1244,17 @@ class DeepseekV2AttentionMLA(
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        if get_dcp_world_size() > 1:
+            self.attn_mqa_for_dcp_decode = RadixAttention(
+                self.num_local_heads * get_dcp_world_size(),
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
@@ -1498,6 +1515,20 @@ class DeepseekV2AttentionMLA(
             )
         else:
             return quant_config
+
+    def _all_gather_dcp_kv_cache(self, kv_a):
+        dcp_world_size = get_dcp_world_size()
+        dcp_rank = get_dcp_rank()
+        with use_symmetric_memory(get_dcp_group()):
+            gathered_kv_a = torch.zeros(
+                (kv_a.shape[0] * get_dcp_world_size(), *kv_a.shape[1:]),
+                dtype=kv_a.dtype,
+                device=kv_a.device,
+            )
+        idxs = torch.arange(kv_a.shape[0] * dcp_world_size, device=kv_a.device)
+        mask = idxs % dcp_world_size == dcp_rank
+        gathered_kv_a[mask] = kv_a
+        return get_dcp_group().all_reduce(gathered_kv_a)
 
 
 class DeepseekV2DecoderLayer(nn.Module):

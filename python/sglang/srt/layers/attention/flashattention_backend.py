@@ -9,7 +9,16 @@ import triton
 import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    SymmetricMemoryContext,
+)
+from sglang.srt.distributed.parallel_state import (
+    get_dcp_group,
+    get_dcp_size_from_env,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dcp_a2a import dcp_a2a_lse_reduce
+from sglang.srt.layers.attention.utils import cp_lse_ag_out_rs
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -87,6 +96,10 @@ class FlashAttentionMetadata:
 
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
+
+    # DCP-filtered metadata (local KV shard)
+    dcp_page_table: torch.Tensor = None
+    dcp_cache_seqlens: torch.Tensor = None
 
 
 # Copied from:
@@ -373,6 +386,20 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.fa_impl_ver = fa_impl_ver
 
+        # DCP (Decode Context Parallelism) settings
+        self.dcp_size = get_dcp_size_from_env()
+        self.dcp_comm_backend = model_runner.server_args.dcp_comm_backend
+        if self.dcp_size > 1:
+            from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+            tp_size = get_attention_tp_size()
+            self.dcp_num_heads_per_tp = (
+                model_runner.model_config.num_attention_heads // tp_size
+            )
+            self.dcp_head_dim = model_runner.model_config.head_dim
+            self.dcp_v_head_dim = model_runner.model_config.v_head_dim
+            self.dcp_dtype = model_runner.dtype
+
         # Local attention settings
         self.has_local_attention = model_runner.model_config.is_local_attention_model
         if self.has_local_attention:
@@ -494,6 +521,10 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+
+                if self.dcp_size > 1:
+                    self._init_dcp_decode_metadata(metadata, device)
+
             # TODO: we need to test this part for llama 4 eagle case
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -828,6 +859,7 @@ class FlashAttentionBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             and self.topk > 1
             and not is_swa_layer
+            and self.dcp_size <= 1
         )
 
         flash_attn_varlen_func_base = flash_attn_varlen_func_fa3
@@ -1171,7 +1203,11 @@ class FlashAttentionBackend(AttentionBackend):
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
         # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
-        use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
+        use_dcp = self.dcp_size > 1
+        use_cascade_attn = (
+            forward_batch.spec_info is not None and self.topk > 1 and not use_dcp
+        )
+        need_lse = use_cascade_attn or use_dcp
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
@@ -1263,7 +1299,12 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                page_table = metadata.page_table
+                if use_dcp and metadata.dcp_page_table is not None:
+                    page_table = metadata.dcp_page_table
+                    cache_seqlens = metadata.dcp_cache_seqlens
+                else:
+                    page_table = metadata.page_table
+                    cache_seqlens = metadata.cache_seqlens_int32
                 if is_swa_layer and self.use_sliding_window_kv_pool:
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
@@ -1273,14 +1314,17 @@ class FlashAttentionBackend(AttentionBackend):
                                 metadata.page_table
                             )
                         )
-                cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
-                # Default: single-token self-attention
+                if use_dcp:
+                    q_reshaped = get_dcp_group().all_gather(
+                        q_reshaped.contiguous(), dim=1
+                    )
+
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -1295,12 +1339,16 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
-                    return_softmax_lse=use_cascade_attn,
+                    return_softmax_lse=need_lse,
                     num_splits=self.num_splits,
                     **kwargs,
                 )
-                if use_cascade_attn:
+                if need_lse:
                     o, softmax_lse, *rest = result
+                else:
+                    o = result
+
+                if use_cascade_attn:
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_reshaped,
@@ -1328,8 +1376,31 @@ class FlashAttentionBackend(AttentionBackend):
                         o_expand,
                         softmax_lse_expand.T.contiguous(),
                     )
-                else:
-                    o = result
+
+                if use_dcp:
+                    # FA3 LSE shape: [B,H,S], [H,B], or [B,H]. Normalize to [B,H].
+                    B_out = o.shape[0]
+                    H_out = q_reshaped.shape[1]
+                    if softmax_lse.ndim == 3:
+                        lse_2d = softmax_lse.squeeze(-1)
+                    elif softmax_lse.shape == (H_out, B_out):
+                        lse_2d = softmax_lse.T.contiguous()
+                    else:
+                        lse_2d = softmax_lse.view(B_out, H_out)
+                    if self.dcp_comm_backend == "a2a":
+                        o = dcp_a2a_lse_reduce(
+                            o,
+                            lse_2d,
+                            get_dcp_group(),
+                            is_lse_base_on_e=True,
+                            cuda_graph_buffers=getattr(
+                                self, "dcp_cuda_graph_buffers", None
+                            ),
+                        )
+                    else:
+                        o = cp_lse_ag_out_rs(
+                            o, lse_2d, get_dcp_group(), is_lse_base_on_e=True
+                        )
         else:
             # Do absorbed multi-latent attention
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
@@ -1358,26 +1429,37 @@ class FlashAttentionBackend(AttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
+            need_mla_lse = use_cascade_attn or use_dcp
+
+            dcp_pt = metadata.dcp_page_table if use_dcp else None
+            dcp_sl = metadata.dcp_cache_seqlens if use_dcp else None
+
             result = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
                 qv=q_nope,
-                page_table=metadata.page_table,
-                cache_seqlens=metadata.cache_seqlens_int32,
+                page_table=dcp_pt if dcp_pt is not None else metadata.page_table,
+                cache_seqlens=(
+                    dcp_sl if dcp_sl is not None else metadata.cache_seqlens_int32
+                ),
                 cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k_new=metadata.cu_seqlens_k,
+                cu_seqlens_k_new=None if use_dcp else metadata.cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
+                return_softmax_lse=need_mla_lse,
                 num_splits=self.num_splits,
             )
-            if use_cascade_attn:
+            if need_mla_lse:
                 o, softmax_lse, *rest = result
+            else:
+                o = result
+
+            if use_cascade_attn:
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
@@ -1403,8 +1485,21 @@ class FlashAttentionBackend(AttentionBackend):
                     o_expand,
                     softmax_lse_expand.T.contiguous(),
                 )
+
+        if use_dcp:
+            # FA3 LSE shape varies by mode:
+            #   [B, H, S] for batch mode (S=1 for decode)
+            #   [H, total_q] for varlen/cu_seqlens mode
+            # Normalize to [B, H] for DCP reduce.
+            B_out = o.shape[0]
+            H_out = layer.tp_q_head_num
+            if softmax_lse.ndim == 3:
+                lse_2d = softmax_lse.squeeze(-1)  # [B, H, 1] -> [B, H]
+            elif softmax_lse.shape == (H_out, B_out):
+                lse_2d = softmax_lse.T.contiguous()  # [H, B] -> [B, H]
             else:
-                o = result
+                lse_2d = softmax_lse.view(B_out, H_out)
+            return o.view(-1, H_out * layer.v_head_dim), lse_2d
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -1472,6 +1567,28 @@ class FlashAttentionBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+
+        if self.dcp_size > 1:
+            max_local_pages = (max_num_pages + self.dcp_size - 1) // self.dcp_size
+            self.decode_cuda_graph_metadata["dcp_page_table"] = torch.zeros(
+                max_bs,
+                max_local_pages,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.decode_cuda_graph_metadata["dcp_cache_seqlens"] = torch.zeros(
+                max_bs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        if self.dcp_size > 1 and self.dcp_comm_backend == "a2a":
+            # Per-bs buffer allocation: each CUDA graph capture gets
+            # right-sized buffers so NCCL transfers only actual batch data,
+            # not the full max_bs padding. Buffers are lazily allocated in
+            # _alloc_dcp_a2a_buffers_for_bs() during graph capture.
+            self.dcp_cuda_graph_buffers_per_bs = {}
+            self.dcp_cuda_graph_buffers = None
 
         # This is used by draft decode's first half of metadata when topk > 1
         if self.topk > 1:
@@ -1805,6 +1922,11 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.decode_cuda_graph_metadata[bs] = metadata
 
+                if self.dcp_size > 1:
+                    self._init_dcp_decode_metadata(metadata, device)
+                    if self.dcp_comm_backend == "a2a":
+                        self._alloc_dcp_a2a_buffers_for_bs(bs)
+
                 self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
 
         elif forward_mode.is_target_verify():
@@ -2069,6 +2191,14 @@ class FlashAttentionBackend(AttentionBackend):
                     self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
                 )
 
+                if self.dcp_size > 1:
+                    self._init_dcp_decode_metadata(metadata, device)
+                    if self.dcp_comm_backend == "a2a":
+                        # Point to the right per-bs buffers for this graph replay.
+                        self.dcp_cuda_graph_buffers = (
+                            self.dcp_cuda_graph_buffers_per_bs[bs]
+                        )
+
                 self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
                     bs,
@@ -2311,6 +2441,130 @@ class FlashAttentionBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
+
+    def _alloc_dcp_a2a_buffers_for_bs(self, bs: int):
+        """Allocate right-sized DCP A2A buffers for a specific batch size.
+
+        Uses a fused buffer layout that packs output (bf16) + LSE (fp32
+        reinterpreted as 2×bf16) into a single [N, bs, H_per_rank, D+2]
+        buffer, enabling one all_to_all call instead of two.
+        """
+        if bs in self.dcp_cuda_graph_buffers_per_bs:
+            self.dcp_cuda_graph_buffers = self.dcp_cuda_graph_buffers_per_bs[bs]
+            return
+
+        from sglang.srt.layers.attention.dcp_a2a import _lse_pack_dim
+
+        N = self.dcp_size
+        H_per_rank = self.dcp_num_heads_per_tp
+        H_all = H_per_rank * N
+        D = self.dcp_v_head_dim
+        lpd = _lse_pack_dim(self.dcp_dtype)
+
+        with SymmetricMemoryContext(get_dcp_group()):
+            buffers = {
+                "q_gathered": torch.empty(
+                    bs,
+                    H_all,
+                    self.dcp_head_dim,
+                    dtype=self.dcp_dtype,
+                    device=self.device,
+                ),
+                # Fused output+LSE buffer: [N, bs, H_per_rank, D + lse_pack_dim]
+                "send_combined": torch.empty(
+                    N,
+                    bs,
+                    H_per_rank,
+                    D + lpd,
+                    dtype=self.dcp_dtype,
+                    device=self.device,
+                ),
+                "recv_combined": torch.empty(
+                    N,
+                    bs,
+                    H_per_rank,
+                    D + lpd,
+                    dtype=self.dcp_dtype,
+                    device=self.device,
+                ),
+                # fp32 staging buffers for LSE pack/unpack
+                "send_lse": torch.empty(
+                    N,
+                    bs,
+                    H_per_rank,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                "recv_lse": torch.empty(
+                    N,
+                    bs,
+                    H_per_rank,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            }
+        self.dcp_cuda_graph_buffers_per_bs[bs] = buffers
+        self.dcp_cuda_graph_buffers = buffers
+
+    def _init_dcp_decode_metadata(self, metadata: FlashAttentionMetadata, device):
+        """Build DCP-filtered page_table and cache_seqlens for local KV shard.
+
+        DCP interleaved ownership: token at virtual position `pos` belongs to
+        rank `pos % dcp_size`. The local KV buffer stores only this rank's
+        tokens, so page_table and seqlens must be remapped to local indices.
+
+        During CUDA graph mode, writes into pre-allocated buffers from
+        decode_cuda_graph_metadata to keep tensor addresses stable.
+        """
+        from sglang.srt.distributed.parallel_state import get_dcp_rank
+
+        N = self.dcp_size
+        dcp_rank = get_dcp_rank()
+
+        full_seqlens = metadata.cache_seqlens_int32  # [B]
+        B = full_seqlens.shape[0]
+
+        local_seqlens = ((full_seqlens - dcp_rank - 1) // N + 1).clamp(min=0)
+
+        global_pt = (
+            metadata.page_table
+        )  # [B, max_pages] (page indices, already strided)
+        max_global_pages = global_pt.shape[1]
+
+        # Compute local page count per request
+        max_local_tokens = local_seqlens.max().item()
+        max_local_pages = (max_local_tokens + self.page_size - 1) // self.page_size
+
+        # Vectorized page table construction (replaces Python for-loop).
+        # For each local page p, find the global page containing its first token:
+        #   local_token_start = p * page_size
+        #   global_token_pos = dcp_rank + local_token_start * N
+        #   global_page_idx = global_token_pos // page_size
+        if max_local_pages > 0:
+            p_indices = torch.arange(max_local_pages, device=device)
+            global_token_positions = dcp_rank + (p_indices * self.page_size) * N
+            global_page_indices = global_token_positions // self.page_size
+            valid_mask = global_page_indices < max_global_pages
+            global_page_indices_clamped = global_page_indices.clamp(
+                max=max_global_pages - 1
+            )
+            local_pt = global_pt[:, global_page_indices_clamped] // N
+            # Zero out entries beyond valid global pages
+            if not valid_mask.all():
+                local_pt[:, ~valid_mask] = 0
+        else:
+            local_pt = torch.zeros(B, 0, dtype=torch.int32, device=device)
+
+        # Use pre-allocated buffers if available (CUDA graph mode)
+        cg_meta = self.decode_cuda_graph_metadata
+        if isinstance(cg_meta, dict) and "dcp_page_table" in cg_meta:
+            cg_meta["dcp_cache_seqlens"][:B].copy_(local_seqlens.to(torch.int32))
+            cg_meta["dcp_page_table"][:B, :max_local_pages].copy_(local_pt)
+            metadata.dcp_cache_seqlens = cg_meta["dcp_cache_seqlens"][:B]
+            metadata.dcp_page_table = cg_meta["dcp_page_table"][:B, :max_local_pages]
+        else:
+            metadata.dcp_page_table = local_pt
+            metadata.dcp_cache_seqlens = local_seqlens.to(torch.int32)
 
     def _maybe_init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
