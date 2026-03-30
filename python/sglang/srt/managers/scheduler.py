@@ -39,6 +39,7 @@ from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -2415,6 +2416,13 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
+                # revert matched mamba idx to avoid memory leak, if req is not added
+                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                if not added and req.mamba_pool_idx is not None:
+                    self.tree_cache.req_to_token_pool.mamba_pool.free(
+                        req.mamba_pool_idx.unsqueeze(-1)
+                    )
+                    req.mamba_pool_idx = None
                 break
 
         # Update waiting queue
@@ -3412,7 +3420,7 @@ class IdleSleeper:
 
 def is_health_check_generate_req(recv_req):
     rid = getattr(recv_req, "rid", None)
-    return rid is not None and rid.startswith("HEALTH_CHECK")
+    return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 def is_work_request(recv_req):
