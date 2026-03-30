@@ -26,7 +26,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    flush_cache_with_retry,
     is_in_ci,
     popen_launch_server,
 )
@@ -170,9 +169,14 @@ class HiCacheStorageBaseMixin:
         meta = response_json.get("meta_info", {})
         return int(meta.get("cached_tokens", 0))
 
-    def flush_cache(self) -> bool:
+    def flush_cache(self):
         """Flush device cache to force remote storage access."""
-        return flush_cache_with_retry(self.base_url)
+        res = requests.post(
+            f"{self.base_url}/flush_cache",
+            params={"timeout": 30},
+            timeout=40,
+        )
+        res.raise_for_status()
 
     def gen_prompt(self, token_num: int) -> str:
         """Generate a random prompt of specified token length using tokenizer vocabulary."""
@@ -186,8 +190,7 @@ class HiCacheStorageBaseMixin:
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
         # Flush device cache to force remote storage access
-        time.sleep(2)
-        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
+        self.flush_cache()
 
     def test_basic_backup_and_prefetch(self):
         """Test storage and retrieval of large context through remote cache"""
@@ -304,8 +307,7 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
 
     # Flush cache to force remote storage access
     print("Phase 2: Flushing device cache...")
-    test_instance.assertTrue(test_instance.flush_cache(), "Cache flush should succeed")
-    time.sleep(2)
+    test_instance.flush_cache()
 
     # Second evaluation - should use remote cache
     print("Phase 3: Running second GSM8K evaluation using remote cache...")
