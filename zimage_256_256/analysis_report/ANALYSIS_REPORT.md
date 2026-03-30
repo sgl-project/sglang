@@ -2,7 +2,7 @@
 
 > **Hardware**: NVIDIA H20 (SM90, 96GB HBM3)
 > **Model**: Z-Image-Turbo (30-layer DiT, dim=3840, 9 denoising steps, no CFG)
-> **Date**: 2026-03-25 (updated)
+> **Date**: 2026-03-30 (updated)
 
 ---
 
@@ -47,6 +47,13 @@
   - [10.5 FP8 Overhead 时间收支](#105-fp8-overhead-时间收支)
   - [10.6 非 GEMM Kernel 跨分辨率对比](#106-非-gemm-kernel-跨分辨率对比)
   - [10.7 关键结论](#107-关键结论)
+- [11. 优化 #3：CUDA Graph 消除 Host Dispatch 开销](#11-优化-3cuda-graph-消除-host-dispatch-开销)
+  - [11.1 问题根因](#111-问题根因)
+  - [11.2 方案设计](#112-方案设计)
+  - [11.3 多分辨率 E2E 实测结果](#113-多分辨率-e2e-实测结果)
+  - [11.4 Per-Step 分析](#114-per-step-分析)
+  - [11.5 CUDA Graph 收益分析](#115-cuda-graph-收益分析)
+  - [11.6 关键发现](#116-关键发现)
 - [附录 A：与 Yikai 1024×1024 Profile 的对比](#附录-a与-yikai-10241024-profile-的对比)
 - [附录 B：复现命令](#附录-b复现命令)
 
@@ -362,10 +369,12 @@ BF16 优化后瓶颈从 TextEncoding 转移到 Denoising：
 
 | 分辨率 | 推荐配置 | E2E | 加速 |
 |--------|---------|:---:|:---:|
-| 256×256 | BF16-TE（简单有效） | 332ms | 1.09× |
-| 512×512 | CacheDiT + FP8-DeepGemm | 632ms | 1.46× |
-| 1024×1024 | CacheDiT + FP8-DeepGemm | 2186ms | 1.66× |
-| 1024×1024 (2GPU) | 2GPU + FP8-DeepGemm | 1639ms | 2.21× |
+| 256×256 | **FP8-DeepGemm + CUDA Graph** | **263ms** | **1.26×** |
+| 512×512 | **FP8-DeepGemm + CUDA Graph** | **693ms** | **1.33×** |
+| 1024×1024 | FP8-DeepGemm (+ CUDA Graph) | 2,604ms | 1.38× |
+| 1024×1024 (2GPU) | 2GPU + FP8-DeepGemm | 1,639ms | 2.21× |
+
+> 注：256×256 推荐从 BF16-TE 更新为 FP8+CUDA Graph（Section 11 验证后）。CUDA Graph 在 256×256 收益最大（-45% per-step），在 1024×1024 收益微弱（-1% per-step）但无副作用。
 
 ---
 
@@ -521,7 +530,7 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 
 ## 9. 优化路线图
 
-> **Updated**: 2026-03-27，基于 nsys no-warmup kernel 精细分析（Section 10）更新
+> **Updated**: 2026-03-30，基于 CUDA Graph 实测结果（Section 11）更新
 
 #### 已完成
 
@@ -533,22 +542,37 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 | ✅ | 多分辨率 Benchmark | 全面验证 | 确认 FP8 在 ≥512 E2E 有效 | 24 次测试 |
 | ✅ | Cache-DiT 调优 | Denoising skip | 256×256 最高 1.35× | W/R/MC 参数调优 |
 | ✅ | nsys no-warmup Kernel 分析 | 根因定位 | **GEMM ~1.9× 加速（所有分辨率）** | 推翻 transpose 瓶颈假说 |
+| ✅ | **CUDA Graph capture/replay** | **E2E latency** | **256×256: 1.26×, 512×512: 1.33×** | **消除 host dispatch，Graph 跨请求缓存** |
+
+#### 优化路线总览
+
+三步优化路线在所有分辨率下的累计效果：
+
+| 分辨率 | BF16 Baseline | + FP8 DeepGemm | + CUDA Graph | **总加速** |
+|--------|:---:|:---:|:---:|:---:|
+| 256×256 | 330ms | 443ms (1.34× 慢 ❌) | **263ms** | **1.26×** ✅ |
+| 512×512 | 923ms | 720ms (1.28×) | **693ms** | **1.33×** ✅ |
+| 1024×1024 | 3,607ms | 2,621ms (1.38×) | **2,604ms** | **1.38×** ✅ |
+
+> **核心成果**：CUDA Graph 解决了 256×256 FP8 反而更慢的问题（443ms → 263ms），使 FP8 在**所有分辨率**下都实现了 E2E 加速。
 
 #### 待做优化（优先级重排）
 
 | 优先级 | 优化 | 目标 | 预期收益 | 说明 |
 |:---:|------|------|------|------|
-| **P0** | **CUDA Graph / 减少 host dispatch** | E2E latency | **256×256: 从 0.90× 恢复到 ~1.25×** | nsys 证明 GPU kernel 已快 25%，E2E 慢在 host-side；CUDA Graph 可消除 Python dispatch + kernel launch overhead |
-| **P1** | **FlashAttention 优化（1024×1024）** | Attention | **-100~200ms（1024×1024 下 625ms, 占 FP8 GPU 21.7%）** | FP8 将 GEMM 减半后 Attention 成为 #2 瓶颈；可考虑 FP8 Attention / CuTe DSL / 更优 tile config |
+| **P0** | **FlashAttention 优化（1024×1024）** | Attention | **-100~200ms（1024×1024 下 625ms, 占 FP8 GPU 21.7%）** | FP8 将 GEMM 减半后 Attention 成为 #2 瓶颈；可考虑 FP8 Attention / CuTe DSL / 更优 tile config |
+| **P1** | **CUDA Graph + Cache-DiT 联合优化** | Denoising skip + replay | **各分辨率额外 +10~30%** | 当前 CUDA Graph 与 Cache-DiT 互斥（Cache-DiT 改变每步 kernel 序列）；可为 full/cached 两种模式各 capture 一个 graph，按 Cache-DiT 决策选择 replay |
 | **P2** | FP8 量化 kernel 融合 | Quantize overhead | -10~97ms（视分辨率） | 当前每个 GEMM 前单独 launch quant kernel（1836 次），可尝试 fuse 到前序 kernel |
 | **P3** | Fused adaLN + gate kernel | Elementwise | -5~10ms | Triton fused kernel，替代当前 ~20ms elementwise |
 | **P4** | Better RMSNorm (Quack) | Norm | -2~5ms | 38ms@1024×1024，bandwidth-bound |
-| ~~P0~~ | ~~Pre-transpose weight scale~~ | ~~DeepGemm transpose~~ | ~~已无需~~ | **nsys no-warmup 证明推理阶段无 transpose 开销**，Section 3.5 的 139.8ms transpose 仅发生在 JIT warmup 阶段 |
+| **P5** | 多分辨率 Graph 缓存 + 预热 | 首请求延迟 | 消除首请求 3× step overhead | 当前首请求需 2× warmup + capture；可在 server 启动时预热常用分辨率 |
+| ~~P0~~ | ~~CUDA Graph / 减少 host dispatch~~ | ~~E2E latency~~ | ~~已完成~~ | **Section 11，256×256 从 0.75× 恢复到 1.26×** |
+| ~~P0~~ | ~~Pre-transpose weight scale~~ | ~~DeepGemm transpose~~ | ~~已无需~~ | **nsys no-warmup 证明推理阶段无 transpose 开销** |
 
 > **路线图变更说明**：
-> - **P0 从 "消除 transpose" 改为 "CUDA Graph / 减少 host dispatch"**：nsys no-warmup 分析（Section 10）发现推理阶段无 transpose，256×256 E2E 慢的根因是 host-side overhead
-> - **新增 P1 FlashAttention 优化**：FP8 将 GEMM 减半后，1024×1024 的 FlashAttention 从 15% 升至 22%，成为新瓶颈
-> - **新增 P2 量化 kernel 融合**：per-token quant 在 1024×1024 下 97ms（3.4%），有融合空间
+> - **CUDA Graph 已完成（原 P0）**：256×256 从 FP8 反而更慢（0.75×）恢复到 1.26× 加速；graph 跨请求缓存，serve 场景下首次请求后无额外开销
+> - **P0 更新为 FlashAttention 优化**：GEMM 已被 FP8+CUDA Graph 充分优化，1024×1024 下 FlashAttention (625ms) 成为最大非 GEMM 瓶颈
+> - **新增 P1 CUDA Graph + Cache-DiT 联合**：两者当前互斥，联合后可在 CUDA Graph 的低 dispatch 开销基础上叠加 Cache-DiT 的步级跳过
 
 ---
 
@@ -792,6 +816,138 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 
 ---
 
+## 11. 优化 #3：CUDA Graph 消除 Host Dispatch 开销
+
+> Section 10 的 nsys no-warmup 分析揭示了一个关键矛盾：**FP8 GPU kernel 在所有分辨率下都快了 25-30%，但 256×256 E2E 反而慢了 34%**（443ms vs 330ms）。根因是 host-side 开销——FP8 增加了量化 kernel（+1,836 次 launch），加上 DeepGemm 的 Python dispatch 路径比 cuBLAS 的 C++ 路径更重，导致 CPU 侧 kernel launch latency 成为瓶颈。在 256×256 这种 GPU kernel 执行极快（~22ms/step）的场景下，CPU 侧的 ~18ms dispatch 开销占据了每步时间的近一半。
+
+### 11.1 问题根因
+
+**nsys timeline 观察**：
+- **BF16 场景**：CPU kernel launch 时间短，GPU kernel 时间长，GPU kernel 之间几乎没有 bubble
+- **FP8 场景**：CPU kernel launch 时间比 BF16 长 2× 以上（量化 kernel 增加了 launch 数量），但 FP8 GPU kernel 计算时间只有 BF16 的一半，导致 GPU kernel 之间出现大量 bubble——GPU 在等 CPU launch 下一个 kernel
+
+**本质**：FP8 把瓶颈从 GPU compute 转移到了 CPU dispatch。GPU 算得越快，CPU launch 的开销占比越大。
+
+### 11.2 方案设计
+
+**方案**：将 `dit.forward()` 的完整 kernel 序列 capture 到一个 CUDA Graph 中，replay 时通过单次 `cudaGraphLaunch()` 提交所有 kernel，消除逐 kernel 的 CPU launch 延迟。
+
+**Graph 边界**（与 LLM 侧 `CudaGraphRunner` 一致）：
+
+```
+Graph 内：  dit.forward()（完整模型 forward，包含 FP8 quantize + GEMM + attention + norm + FFN）
+Graph 外：  scheduler.step()、timestep 展开、CFG 合并、profiling
+```
+
+**跨请求缓存**：Graph 在 `DenoisingStage` 实例上按 latent shape 缓存。首次请求 capture（2× warmup + 1× capture = 3× eager forward 开销），后续同分辨率请求直接 replay。由于 ZImage tokenizer 将所有 prompt pad 到 512 tokens（`padding="max_length", max_length=512`），不同 prompt 在 text encoder 输出后 shape 完全一致，因此**同分辨率不同 prompt 的请求可以直接复用已 capture 的 graph**，仅需将新的 `encoder_hidden_states` 数据 copy 到持久 buffer 中。
+
+**实现细节**：
+- `DiffusionCudaGraphRunner` 类：管理 capture/replay/buffer 生命周期
+- 所有输入（timestep、latents、encoder_hidden_states、freqs_cis、guidance）都存储在持久 buffer 中，通过 `.copy_()` 更新数据
+- 使用 `torch.cuda.graph_pool_handle()` 共享内存池，避免跨分辨率 graph 的内存碎片化
+- Runtime assert 确保 attention backend 不依赖 `current_timestep` 做 kernel 路径选择（FlashAttention 安全，STA/VSA/SVG2 不兼容）
+
+### 11.3 多分辨率 E2E 实测结果
+
+> **测试条件**：1×H20, `sglang generate --warmup`（graph 在 warmup 请求时 capture，实际请求全部 replay）
+
+#### 完整三步优化路线对比
+
+| 分辨率 | BF16 TE (Baseline) | + FP8 DeepGemm | + CUDA Graph | vs Baseline |
+|--------|:---:|:---:|:---:|:---:|
+| **256×256** | **330ms** | 443ms (+34% ❌) | **263ms** | **1.26× ✅** |
+| **512×512** | **923ms** | 720ms (-22%) | **693ms** | **1.33× ✅** |
+| **1024×1024** | **3,607ms** | 2,621ms (-27%) | **2,604ms** | **1.38× ✅** |
+
+#### Stage 级分解
+
+**256×256**：
+
+| Stage | BF16 TE | FP8 DeepGemm | FP8 + CUDA Graph | CUDA Graph 收益 |
+|-------|:---:|:---:|:---:|:---:|
+| TextEncoding | 50ms | 62ms | 51ms | — |
+| **Denoising** | **268ms** | **371ms** | **204ms** | **-167ms (-45%)** |
+| Decoding | 10ms | 6ms | 6ms | — |
+| **E2E** | **330ms** | **443ms** | **263ms** | **-180ms (-41%)** |
+
+**512×512**：
+
+| Stage | BF16 TE | FP8 DeepGemm | FP8 + CUDA Graph | CUDA Graph 收益 |
+|-------|:---:|:---:|:---:|:---:|
+| TextEncoding | 51ms | 57ms | 52ms | — |
+| **Denoising** | **838ms** | **655ms** | **632ms** | **-23ms (-4%)** |
+| Decoding | 31ms | 6ms | 7ms | — |
+| **E2E** | **923ms** | **720ms** | **693ms** | **-27ms (-4%)** |
+
+**1024×1024**：
+
+| Stage | BF16 TE | FP8 DeepGemm | FP8 + CUDA Graph | CUDA Graph 收益 |
+|-------|:---:|:---:|:---:|:---:|
+| TextEncoding | 51ms | 51ms | 61ms | — |
+| **Denoising** | **3,412ms** | **2,561ms** | **2,535ms** | **-26ms (-1%)** |
+| Decoding | 142ms | 7ms | 6ms | — |
+| **E2E** | **3,607ms** | **2,621ms** | **2,604ms** | **-17ms (-1%)** |
+
+### 11.4 Per-Step 分析
+
+#### 256×256 — CUDA Graph 效果最显著
+
+| Step | BF16 TE (ms) | FP8 DeepGemm (ms) | FP8 + CUDA Graph (ms) |
+|:---:|:---:|:---:|:---:|
+| 0 | 21.9 | 43.1 | 22.9 |
+| 1 | 20.6 | 40.8 | 22.2 |
+| 2 | 24.7 | 40.6 | 22.2 |
+| 3 | 33.2 | 40.4 | 22.2 |
+| 4 | 32.8 | 40.9 | 22.2 |
+| 5 | 32.8 | 41.1 | 22.2 |
+| 6 | 32.9 | 40.2 | 22.2 |
+| 7 | 33.0 | 40.3 | 22.2 |
+| 8 | 32.8 | 40.6 | 22.2 |
+| **Avg (step 1-8)** | **30.4** | **40.6** | **22.2** |
+
+> **关键观察**：
+> - FP8 eager：40.6ms/step — 比 BF16 的 30.4ms 慢 34%（GPU 快了但 host dispatch 拖后腿）
+> - FP8 + CUDA Graph：22.2ms/step — 比 BF16 快 27%，比 FP8 eager 快 45%
+> - CUDA Graph 消除了 ~18ms/step 的 host dispatch 开销
+
+#### 1024×1024 — CUDA Graph 效果微弱
+
+| Step | BF16 TE (ms) | FP8 DeepGemm (ms) | FP8 + CUDA Graph (ms) |
+|:---:|:---:|:---:|:---:|
+| 0 | 27.7 | 283.9 | 281.8 |
+| 1-8 avg | 422.7 | 284.1 | 281.0 |
+
+> 1024×1024 下 GPU kernel 执行时间 ~280ms/step，host dispatch 开销相对微不足道（~3ms/step），CUDA Graph 仅节省 ~3ms/step。
+
+### 11.5 CUDA Graph 收益分析
+
+| 分辨率 | FP8 Eager Per-Step | FP8+CG Per-Step | Host Dispatch 消除 | 收益占比 |
+|--------|:---:|:---:|:---:|:---:|
+| **256×256** | 40.6ms | **22.2ms** | **-18.4ms/step (-45%)** | **显著** |
+| **512×512** | 72.4ms | **69.6ms** | -2.8ms/step (-4%) | 中等 |
+| **1024×1024** | 284.1ms | **281.0ms** | -3.1ms/step (-1%) | 微弱 |
+
+**收益与分辨率的关系**：CUDA Graph 消除的是**固定的** CPU-side dispatch 开销（~3-18ms/step，与 kernel 数量成正比但与矩阵大小无关）。当 GPU kernel 执行时间短（256×256: ~22ms）时，这个固定开销占比大（45%），收益显著；当 GPU kernel 执行时间长（1024×1024: ~280ms）时，占比可忽略（1%）。
+
+**VRAM 影响**：CUDA Graph 额外占用约 33-86MB 用于 graph 内部 tensor 缓存和 pool 管理，对总 VRAM（14-19GB）影响可忽略。
+
+| 分辨率 | FP8 Eager Peak VRAM | FP8+CG Peak VRAM | Delta |
+|--------|:---:|:---:|:---:|
+| 256×256 | 14,448MB | 14,481MB | +33MB (+0.2%) |
+| 512×512 | 15,365MB | 15,399MB | +34MB (+0.2%) |
+| 1024×1024 | 19,020MB | 19,056MB | +36MB (+0.2%) |
+
+### 11.6 关键发现
+
+1. **CUDA Graph 解决了 256×256 FP8 反而更慢的核心问题**：443ms → 263ms，E2E 从 0.75× 翻转为 1.26×
+2. **收益随分辨率递减**：256×256 下 -45% per-step（host-bound），1024×1024 下仅 -1%（compute-bound）
+3. **Graph 跨请求缓存有效**：同分辨率不同 prompt 直接 replay，无需重新 capture（ZImage tokenizer pad to 512 保证 shape 一致）
+4. **与 FP8 协同效应**：FP8 让 GPU kernel 变快 → host dispatch 占比升高 → CUDA Graph 消除 dispatch 的收益更大。FP8 + CUDA Graph 是互补组合
+5. **VRAM 开销可忽略**：+33~36MB（<0.2%），不影响实际部署
+6. **与 Cache-DiT 当前互斥**：CUDA Graph 要求每步 kernel 序列一致，而 Cache-DiT 的缓存命中步会跳过大部分 layer，改变 kernel 序列。联合优化需要为 full/cached 两种模式各 capture 一个 graph
+
+---
+
 ## 附录 A：与 Yikai 1024×1024 Profile 的对比
 
 **Source**: Z-Image Sgl-Diffusion Profile | **Hardware**: H100 | **Resolution**: 1024×1024 (~12K tokens)
@@ -847,6 +1003,14 @@ SGLANG_ENABLE_JIT_DEEPGEMM=0 sglang generate --model-path $MODEL \
     --prompt "$PROMPT" --height 256 --width 256 --warmup --save-output \
     --perf-dump-path ./baseline_fp8_cutlass.json
 
+# FP8 DeepGemm + CUDA Graph
+sglang generate --model-path $MODEL \
+    --transformer-path $MODEL/transformer-FP8-block128 \
+    --text-encoder-precisions bf16 \
+    --enable-diffusion-cuda-graph \
+    --prompt "$PROMPT" --height 256 --width 256 --warmup --save-output \
+    --perf-dump-path ./baseline_fp8_deepgemm_cuda_graph.json
+
 # Cache-DiT 调优
 SGLANG_CACHE_DIT_ENABLED=true SGLANG_CACHE_DIT_WARMUP=2 \
 SGLANG_CACHE_DIT_RDT=0.50 SGLANG_CACHE_DIT_MC=6 \
@@ -865,3 +1029,4 @@ sglang generate --model-path $MODEL --prompt "$PROMPT" \
 *Generated by analyze_profile.py + generate_multi_res_charts.py + manual analysis*
 *Charts: analysis_report/*.png*
 *Benchmark data: zimage_bench/{256_256,512_512,1024_1024}/*.json*
+*CUDA Graph implementation: python/sglang/multimodal_gen/runtime/managers/diffusion_cuda_graph_runner.py*
