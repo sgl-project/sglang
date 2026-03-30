@@ -29,7 +29,11 @@ from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
-from sglang.srt.utils.network import get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_local_ip_auto,
+    get_zmq_socket_on_host,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -447,7 +451,9 @@ class WaitingImageRequest:
                         payload = {
                             "req_id": part_req_id,  # use part_req_id to match encode request
                             "receive_count": receive_count,
-                            "receive_url": f"{host_name}:{embedding_port}",
+                            "receive_url": NetworkAddress(
+                                host_name, embedding_port
+                            ).to_host_port_str(),
                             "modality": modality.name,
                         }
                         logger.info(

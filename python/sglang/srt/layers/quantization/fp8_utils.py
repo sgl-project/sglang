@@ -50,6 +50,8 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_sm100_supported = is_sm100_supported()
+_is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -863,7 +865,7 @@ def triton_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    if not (_is_cuda and (is_sm100_supported() or is_sm120_supported())):
+    if not (_is_cuda and (_is_sm100_supported or _is_sm120_supported)):
         raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100/SM120).")
 
     input_2d = input.view(-1, input.shape[-1]).contiguous()
@@ -915,7 +917,7 @@ def triton_mxfp8_blockscaled_linear(
     a_scale_packed = _pack_mxfp8_scales(x_scale_u8)
     b_scale_packed = _pack_mxfp8_scales(weight_scale)
 
-    num_stages = 1 if is_sm120_supported() else (4 if is_sm100_supported() else 1)
+    num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
     output = mxfp8_block_scaled_matmul_triton(
         q_input,
         a_scale_packed,
