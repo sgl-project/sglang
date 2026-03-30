@@ -1,69 +1,25 @@
 import unittest
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kl_test_utils import (
-    test_input_output_logprobs_match_decode_cache_hit_helper,
-    test_input_output_logprobs_match_prefill_cache_hit_helper,
-)
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-)
+from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
+from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 MODEL = "openai/gpt-oss-20b"
 
-ACC_THRESHOLDS = {
-    MODEL: {"kl_div": 0.002},
-}
-
-register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=100, suite="stage-b-test-1-gpu-large")
 
 
-class TestSWARadixCacheKL(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            # Use a lower mem-fraction-static to avoid OOM during input logprobs
-            # gathering. With PCG enabled, more memory is reserved for CUDA graph
-            # captures, so the static fraction should be lower.
-            other_args=[
-                "--tp-size",
-                "1",
-                "--mem-fraction-static",
-                "0.70",
-                "--disable-piecewise-cuda-graph",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_input_output_logprobs_match_prefill_cache_hit(self):
-        test_input_output_logprobs_match_prefill_cache_hit_helper(
-            self.base_url,
-            ACC_THRESHOLDS,
-            self.model,
-            max_samples=32,
-            max_new_tokens=512,
-        )
-
-    def test_input_output_logprobs_match_decode_cache_hit(self):
-        test_input_output_logprobs_match_decode_cache_hit_helper(
-            self.base_url,
-            ACC_THRESHOLDS,
-            self.model,
-            max_samples=32,
-            max_new_tokens=2048,
-        )
+class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):
+    model = MODEL
+    kl_div_thres = 0.002
+    kl_div_decode_max_new_tokens = 2048
+    other_args = [
+        "--tp-size",
+        "1",
+        "--mem-fraction-static",
+        "0.70",
+        "--disable-piecewise-cuda-graph",
+    ]
 
 
 if __name__ == "__main__":

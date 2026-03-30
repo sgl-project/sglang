@@ -31,6 +31,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
@@ -198,6 +199,7 @@ class DiffusionServerArgs:
     dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
+    enable_warmup: bool = True
 
     extras: list[str] = field(default_factory=lambda: [])
 
@@ -233,12 +235,9 @@ class DiffusionSamplingParams:
 
     num_outputs_per_prompt: int = 1
 
-    # TeaCache acceleration
-    enable_teacache: bool = False
-
-    # Frame interpolation
-    enable_frame_interpolation: bool = False
-    frame_interpolation_exp: int = 1  # 1 = 2×, 2 = 4×
+    # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
+    # merged directly into the OpenAI extra_body dict.
+    extras: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -249,6 +248,37 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams
     run_perf_check: bool = True
+    run_models_api_check: bool = True
+    run_t2v_input_reference_check: bool = True
+    run_lora_basic_api_check: bool = False
+    run_lora_dynamic_load_check: bool = False
+    run_lora_dynamic_switch_check: bool = False
+    run_multi_lora_api_check: bool = False
+
+    def __post_init__(self) -> None:
+        has_startup_lora = self.server_args.lora_path is not None
+        has_dynamic_lora = self.server_args.dynamic_lora_path is not None
+        has_second_lora = self.server_args.second_lora_path is not None
+
+        if self.run_lora_basic_api_check and not (has_startup_lora or has_dynamic_lora):
+            raise ValueError(
+                f"{self.id}: run_lora_basic_api_check requires lora_path or dynamic_lora_path"
+            )
+
+        if self.run_lora_dynamic_load_check and not has_dynamic_lora:
+            raise ValueError(
+                f"{self.id}: run_lora_dynamic_load_check requires dynamic_lora_path"
+            )
+
+        if self.run_lora_dynamic_switch_check and not has_second_lora:
+            raise ValueError(
+                f"{self.id}: run_lora_dynamic_switch_check requires second_lora_path"
+            )
+
+        if self.run_multi_lora_api_check and not (has_startup_lora and has_second_lora):
+            raise ValueError(
+                f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
+            )
 
 
 def sample_step_indices(
@@ -369,6 +399,7 @@ TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     fps=4,
 )
 
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES_A: list[DiffusionTestCase] = [
@@ -461,6 +492,18 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             second_lora_path="tarn59/pixel_art_style_lora_z_image_turbo",
         ),
         T2I_sampling_params,
+        run_lora_basic_api_check=True,
+        run_lora_dynamic_switch_check=True,
+        run_multi_lora_api_check=True,
+    ),
+    DiffusionTestCase(
+        "sana_image_t2i",
+        DiffusionServerArgs(
+            model_path="Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            modality="image",
+        ),
+        T2I_sampling_params,
+        run_perf_check=False,
     ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
@@ -493,6 +536,30 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             modality="image",
         ),
         MULTI_FRAME_I2I_sampling_params,
+    ),
+    # Upscaling (Real-ESRGAN 4×) for T2I
+    DiffusionTestCase(
+        "flux_2_image_t2i_upscaling_4x",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+        ),
+        DiffusionSamplingParams(
+            prompt="Doraemon is eating dorayaki",
+            output_size="1024x1024",
+            extras={"enable_upscaling": True, "upscaling_scale": 4},
+        ),
+    ),
+    DiffusionTestCase(
+        "mova_360p_1gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=1,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
     ),
 ]
 
@@ -536,10 +603,10 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            enable_teacache=True,
+            extras={"enable_teacache": True},
         ),
     ),
-    # Frame interpolation correctness (2× / exp=1)
+    # Frame interpolation (2× / exp=1)
     # Uses the same 1.3B model already in the suite;
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_frame_interp_2x",
@@ -550,8 +617,40 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
-            enable_frame_interpolation=True,
-            frame_interpolation_exp=1,
+            extras={"enable_frame_interpolation": True, "frame_interpolation_exp": 1},
+        ),
+    ),
+    # Upscaling (Real-ESRGAN 4×)
+    # Uses the same 1.3B model already in the suite;
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_upscaling_4x",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            extras={"enable_upscaling": True, "upscaling_scale": 4},
+        ),
+    ),
+    # Combined: Frame interpolation (2×) + Upscaling (4×)
+    # Verifies that both post-processing steps compose correctly.
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_frame_interp_2x_upscaling_4x",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            extras={
+                "enable_frame_interpolation": True,
+                "frame_interpolation_exp": 1,
+                "enable_upscaling": True,
+                "upscaling_scale": 4,
+            },
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
@@ -569,6 +668,8 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
         ),
+        run_lora_basic_api_check=True,
+        run_lora_dynamic_load_check=True,
     ),
     # NOTE(mick): flaky
     # DiffusionTestCase(
@@ -628,6 +729,44 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         TI2V_sampling_params,
     ),
+    # flaky
+    # === Helios T2V ===
+    # DiffusionTestCase(
+    #     "helios_base_t2v",
+    #     DiffusionServerArgs(
+    #         model_path="BestWishYsh/Helios-Base",
+    #         modality="video",
+    #     ),
+    #     DiffusionSamplingParams(
+    #         prompt=T2V_PROMPT,
+    #         output_size="640x384",
+    #         num_frames=33,
+    #     ),
+    # ),
+    # DiffusionTestCase(
+    #     "helios_mid_t2v",
+    #     DiffusionServerArgs(
+    #         model_path="BestWishYsh/Helios-Mid",
+    #         modality="video",
+    #     ),
+    #     DiffusionSamplingParams(
+    #         prompt=T2V_PROMPT,
+    #         output_size="640x384",
+    #         num_frames=33,
+    #     ),
+    # ),
+    # DiffusionTestCase(
+    #     "helios_distilled_t2v",
+    #     DiffusionServerArgs(
+    #         model_path="BestWishYsh/Helios-Distilled",
+    #         modality="video",
+    #     ),
+    #     DiffusionSamplingParams(
+    #         prompt=T2V_PROMPT,
+    #         output_size="640x384",
+    #         num_frames=33,
+    #     ),
+    # ),
 ]
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
@@ -638,6 +777,7 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="tencent/Hunyuan3D-2",
                 modality="3d",
+                enable_warmup=False,
             ),
             HUNYUAN3D_SHAPE_sampling_params,
         ),
@@ -657,6 +797,18 @@ if not current_platform.is_hip():
             ),
         )
     )
+
+# TODO: enable on 4090/5090/b200
+ONE_GPU_CASES_C = [
+    DiffusionTestCase(
+        "flux_2_nvfp4_t2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev-NVFP4",
+            modality="image",
+        ),
+        T2I_sampling_params,
+    )
+]
 
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
@@ -680,6 +832,23 @@ TWO_GPU_CASES_A = [
             prompt=T2V_PROMPT,
         ),
     ),
+    # TeaCache smoke test for Wan2.2 T2V A14B — verifies enable_teacache=True
+    # doesn't crash. Perf check disabled because Wan2.2-specific TeaCache
+    # coefficients are not yet calibrated (teacache_params=None, so no speedup).
+    DiffusionTestCase(
+        "wan2_2_t2v_a14b_teacache_2gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            modality="video",
+            custom_validator="video",
+            num_gpus=2,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            extras={"enable_teacache": True},
+        ),
+        run_perf_check=False,
+    ),
     # LoRA test case for transformer_2 support
     DiffusionTestCase(
         "wan2_2_t2v_a14b_lora_2gpu",
@@ -693,6 +862,7 @@ TWO_GPU_CASES_A = [
         DiffusionSamplingParams(
             prompt="Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
         ),
+        run_lora_basic_api_check=True,
     ),
     DiffusionTestCase(
         "wan2_1_t2v_14b_2gpu",
@@ -730,6 +900,44 @@ TWO_GPU_CASES_A = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "mova_360p_tp2",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=2,
+            tp_size=2,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
+    ),
+    DiffusionTestCase(
+        "mova_360p_ring1_uly2",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=2,
+            ring_degree=1,
+            ulysses_degree=2,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
+    ),
+    DiffusionTestCase(
+        "mova_360p_ring2_uly1",
+        DiffusionServerArgs(
+            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+            modality="video",
+            num_gpus=2,
+            ring_degree=2,
+            ulysses_degree=1,
+            dit_layerwise_offload=True,
+        ),
+        TI2V_sampling_params,
+        run_perf_check=False,
+    ),
 ]
 
 TWO_GPU_CASES_B = [
@@ -754,6 +962,7 @@ TWO_GPU_CASES_B = [
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
         ),
         TI2V_sampling_params,
+        run_lora_basic_api_check=True,
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_720P_2gpu",
@@ -786,6 +995,20 @@ TWO_GPU_CASES_B = [
             ulysses_degree=2,
         ),
         T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i_2_gpus_non_square",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            modality="image",
+            num_gpus=2,
+            ulysses_degree=2,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2I_sampling_params.prompt,
+            output_size="1280x720",
+        ),
+        run_perf_check=False,
     ),
     DiffusionTestCase(
         "flux_image_t2i_2_gpus",
@@ -830,34 +1053,7 @@ if not current_platform.is_hip():
             MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
         )
     )
-    # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
-    ONE_GPU_CASES_B.append(
-        DiffusionTestCase(
-            "turbo_wan2_1_t2v_1.3b",
-            DiffusionServerArgs(
-                model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
-                modality="video",
-                custom_validator="video",
-            ),
-            DiffusionSamplingParams(
-                prompt=T2V_PROMPT,
-            ),
-        )
-    )
-    # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
-    TWO_GPU_CASES_A.append(
-        DiffusionTestCase(
-            "turbo_wan2_2_i2v_a14b_2gpu",
-            DiffusionServerArgs(
-                model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
-                modality="video",
-                custom_validator="video",
-                num_gpus=2,
-                tp_size=2,
-            ),
-            TURBOWAN_I2V_sampling_params,
-        )
-    )
+
 
 # Load global configuration
 BASELINE_CONFIG = BaselineConfig.load(

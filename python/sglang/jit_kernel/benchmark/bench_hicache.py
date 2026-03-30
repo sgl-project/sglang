@@ -31,10 +31,10 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer,
     transfer_hicache_one_layer,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
 
-# NOTE: Adjustable hyperparameters for better benchmark stability
+register_cuda_ci(est_time=29, suite="stage-b-kernel-benchmark-1-gpu-large")
 
-# NOTE: torch impl is too slow in benchmark
 DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
 PAGE_SIZE = 1
 ENABLE_SORT = True
@@ -193,7 +193,7 @@ ELEMENT_SIZE_RANGE = get_benchmark_range(
     ci_range=[1024],
 )
 
-LINE_VALS = ["aot", "jit", "pytorch"]
+LINE_VALS = ["aot", "jit", "torch"]
 LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
 STYLES = [("orange", "-"), ("blue", "--"), ("red", ":")]
 
@@ -228,12 +228,10 @@ def benchmark_one_layer_h2d(
     v_cache_src = cache_local.v_cache_host
     k_cache_dst = cache_local.k_cache_cuda
     v_cache_dst = cache_local.v_cache_cuda
-    # to avoid fluctutation, we set the seed as const
     torch.manual_seed(batch_size * 65536 + element_size)
     indices_src_gpu = gen_indices(batch_size, HOST_CACHE_SIZE)
     indices_dst_gpu = gen_indices(batch_size, GPU_CACHE_SIZE)
 
-    # sort by host indices to improve host access performance
     if ENABLE_SORT:
         indices_src_gpu, mapping = indices_src_gpu.sort()
         indices_dst_gpu = indices_dst_gpu[mapping]
@@ -267,7 +265,7 @@ def benchmark_one_layer_h2d(
             )
             for i in range(NUM_LAYERS)
         ],
-        "pytorch": lambda: [
+        "torch": lambda: [
             pytorch_transfer(
                 k_cache_dst[i],
                 v_cache_dst[i],
@@ -283,7 +281,7 @@ def benchmark_one_layer_h2d(
     if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
         return (float("nan"), float("nan"), float("nan"))
 
-    if DISABLE_TORCH and provider in ["pytorch"]:
+    if DISABLE_TORCH and provider in ["torch"]:
         return (float("nan"), float("nan"), float("nan"))
 
     ms, min_ms, max_ms = triton.testing.do_bench(  # type: ignore
@@ -333,12 +331,10 @@ def benchmark_all_layer_d2h(
     v_caches_src = cache_local.v_cache_cuda
     k_caches_dst = cache_local.k_cache_host
     v_caches_dst = cache_local.v_cache_host
-    # to avoid fluctutation, we set the seed as const
     torch.manual_seed(batch_size * 65536 + element_size)
 
     indices_src_gpu = gen_indices(batch_size, GPU_CACHE_SIZE)
     indices_dst_gpu = gen_indices(batch_size, HOST_CACHE_SIZE)
-    # sort by host indices to improve host access performance
     if ENABLE_SORT:
         indices_dst_gpu, mapping = indices_dst_gpu.sort()
         indices_src_gpu = indices_src_gpu[mapping]
@@ -373,7 +369,7 @@ def benchmark_all_layer_d2h(
             element_bytes,
             element_bytes,
         ),
-        "pytorch": lambda: [
+        "torch": lambda: [
             pytorch_transfer(
                 k_caches_dst[i],
                 v_caches_dst[i],
@@ -389,7 +385,7 @@ def benchmark_all_layer_d2h(
     if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
         return (float("nan"), float("nan"), float("nan"))
 
-    if DISABLE_TORCH and provider in ["pytorch"]:
+    if DISABLE_TORCH and provider in ["torch"]:
         return (float("nan"), float("nan"), float("nan"))
 
     ms, min_ms, max_ms = triton.testing.do_bench(  # type: ignore

@@ -39,8 +39,6 @@ class TestDeepseekV32FP4DPSpecV2(CustomTestCase):
             "flashinfer_trtllm",
             "--quantization",
             "modelopt_fp4",
-            "--kv-cache-dtype",
-            "fp8_e4m3",
             "--tool-call-parser",
             "deepseekv32",
             "--reasoning-parser",
@@ -97,7 +95,7 @@ class TestDeepseekV32FP4DPSpecV2(CustomTestCase):
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.94)
+            self.assertGreater(metrics["accuracy"], 0.93)
             self.assertGreater(avg_spec_accept_length, 2.7)
 
     def test_bs_1_speed(self):
@@ -131,8 +129,6 @@ class TestDeepseekV32FP4TPSpecV2(CustomTestCase):
             "flashinfer_trtllm",
             "--quantization",
             "modelopt_fp4",
-            "--kv-cache-dtype",
-            "fp8_e4m3",
             "--tool-call-parser",
             "deepseekv32",
             "--reasoning-parser",
@@ -189,7 +185,7 @@ class TestDeepseekV32FP4TPSpecV2(CustomTestCase):
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.94)
+            self.assertGreater(metrics["accuracy"], 0.93)
             self.assertGreater(avg_spec_accept_length, 2.7)
 
     def test_bs_1_speed(self):

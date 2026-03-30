@@ -31,12 +31,12 @@ Usage
 
 Step 1: Generate Baseline (Before Code Changes)
 ```bash
-python test/srt/test_logprobs.py gen
+python test/manual/test_logprobs.py gen
 ```
 
 Step 2: Test Against Baseline (After Code Changes)
 ```bash
-python test/srt/test_logprobs.py test
+python test/manual/test_logprobs.py test
 ```
 This tests your changes against the locally generated baseline from Step 1.
 The test passes if the maximum and mean differences are within the tolerance thresholds.

@@ -2,8 +2,8 @@
 
 import ctypes
 import logging
-import os
 from contextlib import contextmanager
+from functools import partial
 from typing import Any, List, Optional, Union
 
 import torch
@@ -14,11 +14,9 @@ import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
-    gpu_p2p_access_check,
-    is_full_nvlink,
+    can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
-from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -33,20 +31,6 @@ _is_hip = is_hip()
 _is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
-
-
-def _can_p2p(rank: int, world_size: int) -> bool:
-    # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
-    SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"
-    for i in range(world_size):
-        if i == rank:
-            continue
-        if SGLANG_SKIP_P2P_CHECK:
-            logger.info("Skipping P2P check and trusting the driver's P2P report.")
-            return torch.cuda.can_device_access_peer(rank, i)
-        if not gpu_p2p_access_check(rank, i):
-            return False
-    return True
 
 
 class CustomAllreduce:
@@ -85,35 +69,8 @@ class CustomAllreduce:
             # e.g. in a non-cuda environment
             return
 
-        self.group = group
-
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
-
-        if not all(in_the_same_node_as(group, source_rank=0)):
-            # No need to initialize custom allreduce for multi-node case.
-            logger.warning(
-                "Custom allreduce is disabled because this process group"
-                " spans across nodes."
-            )
-            return
-
-        rank = dist.get_rank(group=self.group)
-        world_size = dist.get_world_size(group=self.group)
-        if world_size == 1:
-            # No need to initialize custom allreduce for single GPU case.
-            return
-
-        if world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
-            logger.warning(
-                "Custom allreduce is disabled due to an unsupported world"
-                " size: %d. Supported world sizes: %s. To silence this "
-                "warning, specify disable_custom_all_reduce=True explicitly.",
-                world_size,
-                str(CustomAllreduce._SUPPORTED_WORLD_SIZES),
-            )
-            return
+        rank = dist.get_rank(group=group)
+        world_size = dist.get_world_size(group=group)
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -122,46 +79,16 @@ class CustomAllreduce:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
+        full_nvlink = can_use_custom_all_reduce_with_nvlink(
+            group=group,
+            device=device,
+            supported_world_size=self._SUPPORTED_WORLD_SIZES,
+            cls_name="CustomAllreduce",
+        )
+        if full_nvlink is None:
+            return  # fail to get nvlink status
 
-        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-        if cuda_visible_devices:
-            device_ids = list(map(int, cuda_visible_devices.split(",")))
-        else:
-            device_ids = list(range(torch.cuda.device_count()))
-
-        physical_device_id = device_ids[device.index]
-        tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        gather_list = [
-            torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-        ]
-        dist.all_gather(gather_list, tensor, group=self.group)
-        physical_device_ids = [t.item() for t in gather_list]
-
-        # test nvlink first, this will filter out most of the cases
-        # where custom allreduce is not supported
-        # this checks hardware and driver support for NVLink
-        if _is_cuda or _is_hip or _is_musa:
-            full_nvlink = is_full_nvlink(physical_device_ids, world_size)
-
-        if world_size > 2 and not full_nvlink:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
-            )
-            return
-        # test P2P capability, this checks software/cudaruntime support
-        # this is expensive to compute at the first time
-        # then we cache the result
-        # On AMD GPU, p2p is always enabled between XGMI connected GPUs
-        if not _is_hip and not _can_p2p(rank, world_size):
-            logger.warning(
-                "Custom allreduce is disabled because your platform lacks "
-                "GPU P2P capability or P2P test failed. To silence this "
-                "warning, specify disable_custom_all_reduce=True explicitly."
-            )
-            return
-
+        self.group = group
         self.max_size = max_size
         self.rank = rank
         self.world_size = world_size
@@ -457,7 +384,17 @@ def dispatch_custom_allreduce():
 
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
     Otherwise use AiterCustomAllreduce if available.
+
+    Set SGLANG_USE_JIT_ALL_REDUCE=1 to use the JIT-compiled v2 implementation.
     """
+    # HARDCODED: opt-in flag for v2 JIT all-reduce.
+    # Set SGLANG_USE_JIT_ALL_REDUCE=1 to enable.
+    if _is_cuda and get_bool_env_var("SGLANG_USE_JIT_ALL_REDUCE", default="false"):
+        from .custom_all_reduce_v2 import CustomAllReduceV2
+
+        logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
+        return CustomAllReduceV2
+
     if _is_cuda or _is_musa:
         return CustomAllreduce
 
@@ -495,7 +432,11 @@ def dispatch_custom_allreduce():
             )
 
             logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
-            return AiterCustomAllreduce
+            tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            return partial(
+                AiterCustomAllreduce,
+                enable_register_for_capturing=not tms_cudagraph,
+            )
         except ImportError as e:
             logger.warning(
                 "[AR] Aiter custom all-reduce not available; "

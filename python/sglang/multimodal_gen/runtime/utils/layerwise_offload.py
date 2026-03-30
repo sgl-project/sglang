@@ -66,6 +66,7 @@ class LayerwiseOffloadManager:
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
+        self._offload_placeholders: Dict[torch.dtype, torch.Tensor] = {}
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
 
@@ -79,6 +80,13 @@ class LayerwiseOffloadManager:
             return int(m.group(2))
         except Exception:
             return None
+
+    def _get_shared_empty_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+        placeholder = self._offload_placeholders.get(dtype)
+        if placeholder is None:
+            placeholder = torch.empty((1,), device=self.device, dtype=dtype)
+            self._offload_placeholders[dtype] = placeholder
+        return placeholder
 
     @torch.compiler.disable
     def _initialize(self) -> None:
@@ -126,7 +134,7 @@ class LayerwiseOffloadManager:
                         "shape": weight.shape,
                     }
 
-                    weight.data = torch.empty((1,), device=self.device, dtype=dtype)
+                    weight.data = self._get_shared_empty_tensor(dtype)
 
                     current_offset += numel
 
@@ -212,15 +220,13 @@ class LayerwiseOffloadManager:
         # clear prefetch event, since it's useless and needs to be reset
         self._prefetch_events.pop(layer_idx, None)
 
-        if layer_idx <= 0:
-            return
-
         if layer_idx not in self._gpu_layers:
             return
 
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
-            target.data = torch.empty((1,), device=self.device, dtype=meta["dtype"])
+            # Wraparound prefetch will reload the layer when it is needed again
+            target.data = self._get_shared_empty_tensor(meta["dtype"])
 
         self._gpu_layers.discard(layer_idx)
 

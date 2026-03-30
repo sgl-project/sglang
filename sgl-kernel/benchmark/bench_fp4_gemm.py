@@ -5,15 +5,12 @@ import os
 import torch
 import triton
 from flashinfer import mm_fp4
-from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 
+from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from sglang.srt.utils import get_device_capability, is_sm100_supported
+from sglang.utils import is_in_ci
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
