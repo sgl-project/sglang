@@ -181,8 +181,10 @@ class SessionAwareCache(BasePrefixCache):
 
         slot.restore_to_req(req)
 
-        max_prefix_len = len(params.key.token_ids)
-        prefix_len = min(req.kv_committed_len, max_prefix_len)
+        # logprob_start_len is already forced to -1 for streaming sessions
+        # (in Req.init_next_round_input), so the prefix key is not truncated
+        # and we can directly reuse the committed KV length.
+        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)

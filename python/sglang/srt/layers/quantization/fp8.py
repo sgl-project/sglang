@@ -57,7 +57,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -643,7 +646,7 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
-            return torch.ops.sglang.apply_fp8_marlin_linear(
+            return apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -1229,15 +1232,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
-            return
 
-        # Block quant doesn't need to process weights after loading
-        if self.block_quant:
+        elif self.block_quant:
+            # Block quant doesn't need to process weights after loading
             self.process_weights_after_loading_block_quant(layer)
-            return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
-        if not self.quant_config.is_checkpoint_fp8_serialized:
+        elif not self.quant_config.is_checkpoint_fp8_serialized:
             # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
@@ -1264,7 +1265,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
-            return
 
         # If checkpoint is fp8, we need to handle that the
         # MoE kernels require single activation scale and single weight
@@ -1355,7 +1355,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
-            return
+
+        if hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
 
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added

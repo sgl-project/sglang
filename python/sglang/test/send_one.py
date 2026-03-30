@@ -40,7 +40,7 @@ class BenchArgs:
     stop: Optional[list] = None
     stream: bool = False
     profile: bool = False
-    profile_steps: int = 3
+    profile_steps: int = 5
     profile_by_stage: bool = False
     profile_prefix: Optional[str] = None
 
