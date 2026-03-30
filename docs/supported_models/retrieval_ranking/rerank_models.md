@@ -161,6 +161,7 @@ Example (with `top_n: 2`):
 
 ### Common Pitfalls
 
+- **`--chat-template` is required.** Without `--chat-template examples/chat_template/qwen3_reranker.jinja`, the server does not recognize the model as a decoder-only reranker and returns a 400 error: `"This model does not appear to be an embedding model by default. Please add `--is-embedding`..."`. The fix is to add the chat template flag, NOT `--is-embedding`.
 - If you launch Qwen3-Reranker with `--is-embedding`, `/v1/rerank` cannot compute yes/no logprob scores. Relaunch **without** `--is-embedding`.
 - If you see a validation error like "score should be a valid number" and the backend returned a list, upgrade to a version that coerces `embedding[0]` into `score` for rerank responses.
 

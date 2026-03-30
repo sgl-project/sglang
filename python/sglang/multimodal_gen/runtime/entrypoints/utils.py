@@ -298,6 +298,9 @@ def prepare_request(
 
     req.adjust_size(server_args)
 
+    if not isinstance(req.prompt, str):
+        raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
+
     if (req.width is not None and req.width <= 0) or (
         req.height is not None and req.height <= 0
     ):
@@ -345,6 +348,9 @@ def save_outputs(
     frame_interpolation_exp: int = 1,
     frame_interpolation_scale: float = 1.0,
     frame_interpolation_model_path: Optional[str] = None,
+    enable_upscaling: bool = False,
+    upscaling_model_path: Optional[str] = None,
+    upscaling_scale: int = 4,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -366,6 +372,9 @@ def save_outputs(
             frame_interpolation_exp=frame_interpolation_exp,
             frame_interpolation_scale=frame_interpolation_scale,
             frame_interpolation_model_path=frame_interpolation_model_path,
+            enable_upscaling=enable_upscaling,
+            upscaling_model_path=upscaling_model_path,
+            upscaling_scale=upscaling_scale,
         )
 
         if samples_out is not None:
@@ -398,6 +407,9 @@ def post_process_sample(
     frame_interpolation_exp: int = 1,
     frame_interpolation_scale: float = 1.0,
     frame_interpolation_model_path: Optional[str] = None,
+    enable_upscaling: bool = False,
+    upscaling_model_path: Optional[str] = None,
+    upscaling_scale: int = 4,
 ):
     """
     Process sample output, optionally interpolate video frames, and save.
@@ -453,7 +465,17 @@ def post_process_sample(
         )
         fps = fps * multiplier
 
-    # 3. Save outputs if requested
+    # 3. Upscaling (images and videos)
+    if enable_upscaling and frames:
+        from sglang.multimodal_gen.runtime.postprocess import upscale_frames
+
+        frames = upscale_frames(
+            frames,
+            model_path=upscaling_model_path,
+            scale=upscaling_scale,
+        )
+
+    # 4. Save outputs if requested
     if save_output:
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)

@@ -97,6 +97,11 @@ class BaseIndexerMetadata(ABC):
         Return: seq lens for each batch.
         """
 
+    def get_indexer_seq_len(self) -> torch.Tensor:
+        """
+        Return: seq lens for each batch.
+        """
+
     def get_nsa_extend_len_cpu(self) -> List[int]:
         """
         Return: extend seq lens for each batch.
@@ -313,8 +318,8 @@ class Indexer(MultiPlatformOp):
 
         q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
-        query[..., : self.rope_head_dim] = q_rope
-        key[..., : self.rope_head_dim] = k_rope
+        query[..., : self.rope_head_dim] = q_rope.clone()
+        key[..., : self.rope_head_dim] = k_rope.clone()
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -324,6 +329,25 @@ class Indexer(MultiPlatformOp):
             with torch.cuda.stream(self.alt_stream):
                 key = rotate_activation(key)
             current_stream.wait_stream(self.alt_stream)
+        elif (
+            self.alt_stream is not None
+            and forward_batch.nsa_cp_metadata is not None
+            and self.nsa_enable_prefill_cp
+        ):
+            key = rotate_activation(key)
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            query = rotate_activation(query)
+
+            with torch.cuda.stream(self.alt_stream):
+                key = cp_all_gather_rerange_output(
+                    key.contiguous(),
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            current_stream.wait_stream(self.alt_stream)
+            return query, key
         else:
             query = rotate_activation(query)
             key = rotate_activation(key)
@@ -352,7 +376,7 @@ class Indexer(MultiPlatformOp):
         )
 
         _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
-        key[..., : self.rope_head_dim] = k_rope
+        key[..., : self.rope_head_dim] = k_rope.clone()
         key = rotate_activation(key)
 
         return key
@@ -491,6 +515,7 @@ class Indexer(MultiPlatformOp):
 
     def _get_topk_ragged(
         self,
+        enable_dual_stream: bool,
         forward_batch: ForwardBatch,
         layer_id: int,
         q_fp8: torch.Tensor,
@@ -509,9 +534,11 @@ class Indexer(MultiPlatformOp):
             assert page_size == 64, "only support page size 64"
 
         assert len(weights.shape) == 3
+        assert (
+            forward_batch.seq_lens_cpu is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+        )
         weights = weights.squeeze(-1)
-        k_fp8_list = []
-        k_scale_list = []
 
         if _is_hip:
             block_tables = metadata.get_page_table_1()
@@ -526,38 +553,38 @@ class Indexer(MultiPlatformOp):
         batch_size = len(block_tables)
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
+
         topk_result = torch.full(
             (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
         )
         if batch_size == 0:
             return topk_result
 
-        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
-        assert len(indexer_seq_lens_cpu) == batch_size
-        for i in range(batch_size):
-            seq_len = indexer_seq_lens_cpu[i].item()
-            assert isinstance(seq_len, int)
-            # Use fused Triton kernel to get both K and scale in a single call
-            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
-            k_fp8_list.append(k_fp8)
-            k_scale_list.append(k_scale)
-        if _is_fp8_fnuz:
-            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fnuz)
-        else:
-            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
-        k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
-        kv_fp8 = (k_fp8, k_scale)
         ks, ke = metadata.get_indexer_kvcache_range()
+
+        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
+        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
+        k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+            layer_id,
+            metadata.get_indexer_seq_len(),
+            block_tables,
+            seq_len_sum,
+            max_seq_len,
+        )
+        if _is_fp8_fnuz:
+            k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
+        else:
+            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+
+        k_scale = k_scale.view(torch.float32).squeeze(-1)
+        kv_fp8 = (k_fp8, k_scale)
+
+        # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
-
-        # Check if we need to chunk to avoid OOM
         need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
         if not need_chunk:
@@ -1187,7 +1214,12 @@ class Indexer(MultiPlatformOp):
                     return torch.cat([topk_result_prev, topk_result_next], dim=0)
                 else:
                     topk_result = self._get_topk_ragged(
-                        forward_batch, layer_id, q_fp8, weights, metadata
+                        enable_dual_stream,
+                        forward_batch,
+                        layer_id,
+                        q_fp8,
+                        weights,
+                        metadata,
                     )
         else:
             topk_result = self.forward_indexer(

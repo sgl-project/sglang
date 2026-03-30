@@ -19,7 +19,6 @@ class DllmReqPhase(str, enum.Enum):
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None
-        self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -55,13 +54,21 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
 
     def _init_fill_ids_for_dllm(self: Req):
-        if not self.dllm_ids:
-            self.dllm_ids = (
-                self.origin_input_ids
-                + [self.dllm_config.mask_id] * self.dllm_config.block_size
-            )
-        else:
-            self.dllm_block_offset += self.dllm_config.block_size
-            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+        self.dllm_block_offset = (
+            0
+            if not self.fill_ids
+            else self.dllm_block_offset + self.dllm_config.block_size
+        )
+        self.fill_ids = (
+            self.origin_input_ids
+            + self.output_ids
+            + [self.dllm_config.mask_id] * self.dllm_config.block_size
+        )
 
-        self.fill_ids = self.dllm_ids
+    def _update_block_offset_for_dllm(self):
+        prefix_len = len(self.prefix_indices)
+        assert (
+            prefix_len % self.dllm_config.block_size == 0
+        ), f"Unexpected prefix len: {prefix_len}"
+        if prefix_len > self.dllm_block_offset:
+            self.dllm_block_offset = prefix_len

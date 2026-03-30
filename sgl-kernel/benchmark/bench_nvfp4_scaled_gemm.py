@@ -5,8 +5,8 @@ import os
 
 import torch
 import triton
-from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 
+from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from sglang.srt.utils import get_device_capability
 
 # CI environment detection

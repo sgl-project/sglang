@@ -97,10 +97,6 @@ class STA_Mode(str, Enum):
     NONE = None
 
 
-def preprocess_text(prompt: str) -> str:
-    return prompt
-
-
 def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
     raise NotImplementedError
 
@@ -184,6 +180,7 @@ class PipelineConfig:
     vae_config: VAEConfig = field(default_factory=VAEConfig)
     vae_precision: str = "fp32"
     vae_tiling: bool = True
+    vae_slicing: bool = False
     vae_sp: bool = True
 
     # Image encoder configuration
@@ -205,8 +202,8 @@ class PipelineConfig:
     def postprocess_image(self, image):
         return image.last_hidden_state
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,)
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,)
     )
 
     # get prompt_embeds from encoder output
@@ -240,6 +237,19 @@ class PipelineConfig:
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return sigmas
+
+    def get_classifier_free_guidance_scale(self, batch, guidance_scale: float) -> float:
+        return guidance_scale
+
+    def postprocess_cfg_noise(
+        self,
+        batch,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        # Model-specific CFG variants can override this hook
+        # e.g. Qwen-Image's true-CFG norm matching.
+        return noise_pred
 
     ## For ImageVAEEncodingStage
     def preprocess_condition_image(
@@ -313,6 +323,9 @@ class PipelineConfig:
 
         return shape
 
+    def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
+        return prompt_dtype
+
     def allow_set_num_frames(self):
         return False
 
@@ -342,10 +355,19 @@ class PipelineConfig:
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
         latents = sequence_model_parallel_all_gather(latents, dim=2)
         return latents
+
+    def gather_noise_pred_for_sp(self, batch, noise_pred):
+        noise_pred = self.gather_latents_for_sp(noise_pred)
+        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
+        if raw_latent_shape is not None and noise_pred.dim() == 3:
+            orig_s = raw_latent_shape[1]
+            if noise_pred.shape[1] > orig_s:
+                noise_pred = noise_pred[:, :orig_s, :]
+        return noise_pred
 
     def preprocess_vae_image(self, batch, vae_image_processor):
         pass
@@ -436,6 +458,13 @@ class PipelineConfig:
             default=PipelineConfig.flow_shift,
             help="Flow shift parameter",
         )
+        parser.add_argument(
+            f"--{prefix_with_dot}resolution",
+            type=int,
+            dest=f"{prefix_with_dot.replace('-', '_')}resolution",
+            default=None,
+            help="Override the selected pipeline config's resolution setting. Only applies to pipelines that define a resolution field.",
+        )
 
         # DiT configuration
         parser.add_argument(
@@ -462,6 +491,13 @@ class PipelineConfig:
             dest=f"{prefix_with_dot.replace('-', '_')}vae_tiling",
             default=PipelineConfig.vae_tiling,
             help="Enable VAE tiling",
+        )
+        parser.add_argument(
+            f"--{prefix_with_dot}vae-slicing",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}vae_slicing",
+            default=PipelineConfig.vae_slicing,
+            help="Enable VAE slicing",
         )
         parser.add_argument(
             f"--{prefix_with_dot}vae-sp",
@@ -768,7 +804,7 @@ class ImagePipelineConfig(PipelineConfig):
         sharded_tensor = sharded_tensor[:, rank_in_sp_group, :, :]
         return sharded_tensor, True
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         # For image latents [B, S_local, D], gather along sequence dim=1
         latents = sequence_model_parallel_all_gather(latents, dim=1)
         return latents
@@ -822,11 +858,11 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
         sharded = latents[:, :, h0:h1, :].contiguous()
         return sharded, True
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         if get_sp_world_size() <= 1:
             return latents
         if latents.dim() != 4:
-            return super().gather_latents_for_sp(latents)
+            return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
         return sequence_model_parallel_all_gather(latents, dim=2)
 

@@ -40,14 +40,14 @@ from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     BaseReq,
     BatchEmbeddingOutput,
-    BatchMultimodalOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_process_tree
+from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
@@ -280,17 +280,6 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
-        )
-    elif isinstance(output, BatchMultimodalOutput):
-        new_output = BatchMultimodalOutput(
-            rids=[output.rids[i]],
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            outputs=_extract_field_by_index(output, "outputs", i),
-            prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
-            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
-            cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
         )
     else:
         new_output = output

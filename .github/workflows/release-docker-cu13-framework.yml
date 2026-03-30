@@ -9,11 +9,6 @@ on:
       version:
         description: "Version to build (without v prefix, e.g., 0.5.8)"
         required: true
-      flashinfer_version:
-        description: "FlashInfer version (default: 0.6.4)"
-        required: false
-        default: "0.6.4"
-
 jobs:
   publish-x86:
     if: github.repository == 'sgl-project/sglang'
@@ -62,22 +57,31 @@ jobs:
       - name: Build and Push AMD64 Framework (CUDA 13)
         run: |
           version=${{ steps.version.outputs.version }}
-          tag=v${version}-cu130-amd64
 
           docker buildx build \
             --target framework \
             --platform linux/amd64 \
-            --push \
+            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=all \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg FLASHINFER_VERSION=${{ github.event.inputs.flashinfer_version }} \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg SGL_VERSION=${version} \
-            -t lmsysorg/sglang:${tag} \
+            --metadata-file /tmp/metadata.json \
             --no-cache \
             .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "${DIGEST}" > /tmp/digest-cu130-amd64-framework.txt
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-cu130-amd64
+          path: /tmp/digest-cu130-amd64-framework.txt
+          retention-days: 1
 
   publish-arm64:
     if: github.repository == 'sgl-project/sglang'
@@ -115,22 +119,31 @@ jobs:
       - name: Build and Push ARM64 Framework (CUDA 13)
         run: |
           version=${{ steps.version.outputs.version }}
-          tag=v${version}-cu130-arm64
 
           docker buildx build \
             --target framework \
             --platform linux/arm64 \
-            --push \
+            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=all \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --build-arg FLASHINFER_VERSION=${{ github.event.inputs.flashinfer_version }} \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg SGL_VERSION=${version} \
-            -t lmsysorg/sglang:${tag} \
+            --metadata-file /tmp/metadata.json \
             --no-cache \
             .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "${DIGEST}" > /tmp/digest-cu130-arm64-framework.txt
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-cu130-arm64
+          path: /tmp/digest-cu130-arm64-framework.txt
+          retention-days: 1
 
   create-manifest:
     runs-on: ubuntu-22.04
@@ -146,18 +159,32 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Download amd64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-cu130-amd64
+          path: /tmp/digests/amd64
+
+      - name: Download arm64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-cu130-arm64
+          path: /tmp/digests/arm64
+
       - name: Create multi-arch manifest
         run: |
           version=${{ github.event.inputs.version }}
+          AMD64_DIGEST=$(cat /tmp/digests/amd64/digest-cu130-amd64-framework.txt)
+          ARM64_DIGEST=$(cat /tmp/digests/arm64/digest-cu130-arm64-framework.txt)
 
           # Create versioned CUDA 13 framework manifest
           docker buildx imagetools create \
             -t lmsysorg/sglang:v${version}-cu130 \
-            lmsysorg/sglang:v${version}-cu130-amd64 \
-            lmsysorg/sglang:v${version}-cu130-arm64
+            lmsysorg/sglang@${AMD64_DIGEST} \
+            lmsysorg/sglang@${ARM64_DIGEST}
 
           # Create latest CUDA 13 framework manifest
           docker buildx imagetools create \
             -t lmsysorg/sglang:latest-cu130 \
-            lmsysorg/sglang:v${version}-cu130-amd64 \
-            lmsysorg/sglang:v${version}-cu130-arm64
+            lmsysorg/sglang@${AMD64_DIGEST} \
+            lmsysorg/sglang@${ARM64_DIGEST}

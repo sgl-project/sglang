@@ -621,6 +621,9 @@ class SGLangAttentionWrapper(torch.nn.Module):
             [nn.Linear(self.inner_dim, query_dim, bias=out_bias), nn.Dropout(dropout)]
         )
 
+        from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+            wrap_attention_impl_forward,
+        )
         from sglang.multimodal_gen.runtime.layers.attention.selector import (
             get_attn_backend,
         )
@@ -636,6 +639,7 @@ class SGLangAttentionWrapper(torch.nn.Module):
             num_kv_heads=heads,
             causal=False,
         )
+        wrap_attention_impl_forward(self.attn_impl)
         self._attn_backend_name = attn_backend.get_enum().name
 
     def forward(

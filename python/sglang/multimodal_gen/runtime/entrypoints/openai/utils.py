@@ -109,8 +109,11 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     if size:
         w, h = _parse_size(size)
         if w is not None:
-            kwargs.setdefault("width", w)
-            kwargs.setdefault("height", h)
+            # treat None dimensions as unset so parsed size can fill them
+            if kwargs.get("width") is None:
+                kwargs["width"] = w
+            if kwargs.get("height") is None:
+                kwargs["height"] = h
 
     # filter out None values to let SamplingParams defaults apply
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -283,6 +286,9 @@ async def process_generation_batch(
                 frame_interpolation_exp=batch.frame_interpolation_exp,
                 frame_interpolation_scale=batch.frame_interpolation_scale,
                 frame_interpolation_model_path=batch.frame_interpolation_model_path,
+                enable_upscaling=batch.enable_upscaling,
+                upscaling_model_path=batch.upscaling_model_path,
+                upscaling_scale=batch.upscaling_scale,
             )
 
     total_time = time.perf_counter() - total_start_time

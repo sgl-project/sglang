@@ -110,6 +110,7 @@ if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
 else
   docker exec ci_sglang pip uninstall sgl-kernel -y || true
+  docker exec ci_sglang pip uninstall sglang-kernel -y || true
   docker exec ci_sglang pip uninstall sglang -y || true
   # Clear Python cache to ensure latest code is used
   docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true

@@ -95,14 +95,14 @@ class EmbeddingCacheController:
         tp_rank,
         tp_size,
         max_pool_size_gb=4.0,
-        hidden_dim=1024,
+        hidden_dims: dict = None,
         tp_group=None,
         all_rank_get=False,
     ):
         self.tp_world_size = tp_size
         self.tp_group = tp_group
         self.all_rank_get = all_rank_get
-        self.hidden_dim = hidden_dim
+        self.hidden_dims = hidden_dims or {}
         self.element_size = torch.float32.itemsize
 
         # 1. Mooncake Backend & Pinned Buffer
@@ -115,7 +115,8 @@ class EmbeddingCacheController:
 
         # 2. Variable Size Memory Management
         self.allocator = ContiguousMemoryAllocator(self.total_pool_size_bytes)
-        self.hash_to_metadata = {}  # {image_hash: (offset, num_tokens, size_bytes)}
+        # {hash: (offset, num_tokens, embedding_dim, size_bytes)}
+        self.hash_to_metadata = {}
 
         # 3. Task Tracking
         self.ongoing_prefetch = {}  # {req_id: EmbeddingPrefetchOperation}
@@ -142,9 +143,19 @@ class EmbeddingCacheController:
             self.prefetch_tp_group = None
 
     def prefetch(
-        self, req_id: str, image_hashes: List[str], expected_tokens: List[int]
+        self,
+        req_id: str,
+        image_hashes: List[str],
+        expected_tokens: List[int],
+        modality=None,
     ):
         """Issues ONE batch GET for all missing images in the request."""
+        dim = self.hidden_dims.get(modality) if modality is not None else None
+        if not dim:
+            logger.warning(
+                f"Req {req_id}: Unknown dim for modality={modality}, skipping prefetch (will fallback to ViT)."
+            )
+            return
         keys, ptrs, sizes = [], [], []
 
         with self.lock:
@@ -155,12 +166,12 @@ class EmbeddingCacheController:
                     )
                     continue
 
-                size_bytes = num_tokens * self.hidden_dim * self.element_size
+                size_bytes = num_tokens * dim * self.element_size
                 offset = self.allocator.allocate(size_bytes)
                 if offset is None:
                     continue
 
-                self.hash_to_metadata[h] = (offset, num_tokens, size_bytes)
+                self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
                 keys.append(h)
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
                 sizes.append(size_bytes)
@@ -187,20 +198,20 @@ class EmbeddingCacheController:
                 if h in self.hash_to_metadata:
                     continue
 
-                num_tokens = tensor.shape[0]
-                size_bytes = num_tokens * self.hidden_dim * self.element_size
+                num_tokens, dim = tensor.shape[0], tensor.shape[1]
+                size_bytes = num_tokens * dim * self.element_size
                 offset = self.allocator.allocate(size_bytes)
                 if offset is None:
                     continue
 
                 # Copy to pinned pool for RDMA
-                self.hash_to_metadata[h] = (offset, num_tokens, size_bytes)
                 target_view = (
                     self.cpu_pool[offset : offset + size_bytes]
                     .view(torch.float32)
-                    .view(num_tokens, self.hidden_dim)
+                    .view(num_tokens, dim)
                 )
                 target_view.copy_(tensor.cpu())
+                self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
 
                 keys.append(h)
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
@@ -277,11 +288,11 @@ class EmbeddingCacheController:
         with self.lock:
             tensors = []
             for h in image_hashes:
-                offset, num_tokens, size_bytes = self.hash_to_metadata[h]
+                offset, num_tokens, dim, size_bytes = self.hash_to_metadata[h]
                 tensors.append(
                     self.cpu_pool[offset : offset + size_bytes]
                     .view(torch.float32)
-                    .view(num_tokens, self.hidden_dim)
+                    .view(num_tokens, dim)
                 )
             return tensors
 

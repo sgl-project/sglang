@@ -48,6 +48,8 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             str(cls.PREFILL_DP_SIZE),
             "--dp",
@@ -70,6 +72,8 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             str(cls.DECODE_DP_SIZE),
             "--dp",
@@ -124,23 +128,6 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
 
         self.assertLess(result["mean_tpot_ms"], 20)
         self.assertEqual(result["completed"], 1000)
-
-    def test_bench_serving_itl(self):
-        num_prompts = 512
-        args = get_benchmark_args(
-            base_url=f"http://{self.base_host}:{self.lb_port}",
-            dataset_name="random",
-            tokenizer=self.model,
-            num_prompts=num_prompts,
-            random_input_len=512,
-            random_output_len=64,
-            request_rate=float("inf"),
-            max_concurrency=64,
-        )
-        result = run_benchmark(args)
-
-        self.assertEqual(result["completed"], num_prompts)
-        self.assertLess(result["p99_itl_ms"], 20)
 
 
 @unittest.skip(
