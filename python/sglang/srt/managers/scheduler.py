@@ -729,6 +729,8 @@ class Scheduler(
                 else self.tp_cpu_group
             ),
             eviction_policy=server_args.radix_eviction_policy,
+            tlru_xi_tokens=server_args.tlru_xi_tokens,
+            tlru_qhat_tokens=server_args.tlru_qhat_tokens,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),

@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
     SLRUStrategy,
+    TLRUStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 
@@ -145,6 +146,9 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # total number of tokens from root to this node (inclusive),
+        # used by T-LRU to compute TEL-safe eviction priority
+        self.cumulative_tokens = 0
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -328,10 +332,15 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
         elif self.eviction_policy == "slru":
             self.eviction_strategy: EvictionStrategy = SLRUStrategy()
+        elif self.eviction_policy == "tlru":
+            self.eviction_strategy: EvictionStrategy = TLRUStrategy(
+                xi=params.tlru_xi_tokens or 0,
+                q_hat=params.tlru_qhat_tokens,
+            )
 
         else:
             raise ValueError(
-                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru'."
             )
 
         self.evictable_leaves = set()
@@ -604,7 +613,9 @@ class RadixCache(BasePrefixCache):
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self.eviction_strategy.get_cascade_priority(
+                    x.parent
+                )
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
@@ -704,9 +715,11 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.cumulative_tokens = child.parent.cumulative_tokens + split_len
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
+        # child.cumulative_tokens stays unchanged (total depth is the same)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # Split hash_value if it was already computed, otherwise leave as None
@@ -769,6 +782,7 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            new_node.cumulative_tokens = node.cumulative_tokens + len(key)
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)

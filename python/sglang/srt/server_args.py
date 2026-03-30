@@ -173,7 +173,7 @@ NSA_CHOICES = [
     "trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "tlru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -356,6 +356,8 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    tlru_xi_tokens: Optional[int] = None
+    tlru_qhat_tokens: int = 200
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -3974,7 +3976,19 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'tlru' stands for Tail-Optimized LRU (arXiv:2510.15152).",
+        )
+        parser.add_argument(
+            "--tlru-xi-tokens",
+            type=int,
+            default=ServerArgs.tlru_xi_tokens,
+            help="SLA latency threshold in tokens for T-LRU eviction policy. Conversations whose next turn would still be under this threshold after eviction are considered TEL-safe and evicted first. Only used when --radix-eviction-policy=tlru.",
+        )
+        parser.add_argument(
+            "--tlru-qhat-tokens",
+            type=int,
+            default=ServerArgs.tlru_qhat_tokens,
+            help="Estimated next prompt length in tokens for T-LRU eviction policy. Used to compute the TEL-safe budget per conversation. Only used when --radix-eviction-policy=tlru.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

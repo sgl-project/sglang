@@ -34,5 +34,9 @@ class CacheInitParams:
 
     sliding_window_size: Optional[int] = None
 
+    # T-LRU parameters (Tail-Optimized LRU, arXiv:2510.15152)
+    tlru_xi_tokens: Optional[int] = None  # SLA latency threshold in tokens; None = disabled
+    tlru_qhat_tokens: int = 200  # estimated next prompt length in tokens
+
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None

@@ -12,6 +12,15 @@ class EvictionStrategy(ABC):
     def get_priority(self, node: "TreeNode") -> Union[float, Tuple]:
         pass
 
+    def get_cascade_priority(self, node: "TreeNode") -> Union[float, Tuple]:
+        """Priority for nodes that became evictable because their children were evicted.
+
+        In a radix tree, such nodes are shared prefixes — not conversation tails.
+        Subclasses may override this to handle cascade nodes differently from
+        direct eviction candidates. Default: same as get_priority.
+        """
+        return self.get_priority(node)
+
 
 class LRUStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> float:
@@ -63,3 +72,41 @@ class SLRUStrategy(EvictionStrategy):
 
         is_protected = 1 if node.hit_count >= self.protected_threshold else 0
         return (is_protected, node.last_access_time)
+
+
+class TLRUStrategy(EvictionStrategy):
+    """Tail-Optimized LRU: evicts TEL-safe blocks first, then falls back to LRU.
+
+    A block is TEL-safe if evicting it won't cause the next turn's TTFT to exceed
+    the latency threshold xi. See arXiv:2510.15152 for details.
+
+    Args:
+        xi: SLA latency threshold in tokens. Conversations whose next turn would
+            still be under this threshold after eviction are TEL-safe.
+        q_hat: Estimated next prompt length in tokens.
+    """
+
+    def __init__(self, xi: int, q_hat: int):
+        self.xi = xi
+        self.q_hat = q_hat
+
+    def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
+        L = node.cumulative_tokens
+        B = max(0, L + self.q_hat - self.xi)
+        node_start = L - len(node.value)
+
+        is_tel_safe = node_start >= B
+
+        # (0, time) for TEL-safe → evicted first; (1, time) for protected → evicted second
+        # Within each group, standard LRU ordering (older time = evicted first)
+        return (0 if is_tel_safe else 1, node.last_access_time)
+
+    def get_cascade_priority(self, node: "TreeNode") -> Tuple[int, float]:
+        """Cascade nodes are shared prefixes whose children were evicted — not conversation tails.
+
+        The paper's T-LRU (Algorithm 1) only marks conversation-level tail blocks as TEL-safe.
+        A shared prefix node's cumulative_tokens underestimates the actual conversation history
+        length (L), which would incorrectly classify it as TEL-safe. We fall back to protected/LRU
+        priority to avoid evicting shared prefixes before actual conversation tails.
+        """
+        return (1, node.last_access_time)
