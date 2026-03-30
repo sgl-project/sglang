@@ -45,10 +45,18 @@ SUITES = {
         "test_update_weights_from_disk.py",
         # add new 1-gpu test files here
     ],
+    "component-accuracy-1-gpu": [
+        "test_accuracy_1_gpu_a.py",
+        "test_accuracy_1_gpu_b.py",
+    ],
     "2-gpu": [
         "test_server_2_gpu_a.py",
         "test_server_2_gpu_b.py",
         # add new 2-gpu test files here
+    ],
+    "component-accuracy-2-gpu": [
+        "test_accuracy_2_gpu_a.py",
+        "test_accuracy_2_gpu_b.py",
     ],
 }
 
