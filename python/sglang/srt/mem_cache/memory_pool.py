@@ -220,6 +220,7 @@ class MambaPool:
         size: int,
         spec_state_size: int,
         cache_params: BaseLinearStateParams,
+        mamba_layer_ids: List[int],
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
@@ -231,7 +232,7 @@ class MambaPool:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
-        num_mamba_layers = len(cache_params.layers)
+        num_mamba_layers = len(mamba_layer_ids)
 
         self.size = size
         self.device = device
@@ -454,9 +455,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_memory_saver: bool,
         cache_params: BaseLinearStateParams,
+        mamba_layer_ids: List[int],
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
+        start_layer: Optional[int] = None,
     ):
         super().__init__(
             size=size,
@@ -468,13 +471,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        # TODO: Support PP
-        self.start_layer = 0
+        self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
             size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
+            mamba_layer_ids=mamba_layer_ids,
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
@@ -485,6 +488,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         size: int,
         mamba_spec_state_size: int,
         cache_params: BaseLinearStateParams,
+        mamba_layer_ids: List[int],
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
@@ -493,11 +497,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             size=size,
             spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
+            mamba_layer_ids=mamba_layer_ids,
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
-        self.mamba_map = {layer_id: i for i, layer_id in enumerate(cache_params.layers)}
+        self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
@@ -1235,13 +1240,14 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
+        start_layer: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
         self.device = device
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
-        self.start_layer = 0  # TODO: Support PP
+        self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self.head_num = head_num
         self.head_dim = head_dim

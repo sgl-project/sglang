@@ -131,6 +131,8 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
 
     @tvm_ffi.register_object("sgl.CustomAllReduce")
     class CustomAllReduceObjReal(tvm_ffi.Object):
+        __slots__ = ("__dict__",)
+
         def __init__(
             self,
             rank: int,
