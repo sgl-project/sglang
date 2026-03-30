@@ -192,7 +192,6 @@ class StageProfiler:
         log_stage_start_end: bool = False,
         perf_dump_path_provided: bool = False,
         capture_memory: bool = False,
-        sync_cuda: bool = False,
     ):
         self.stage_name = stage_name
         self.metrics = metrics
@@ -201,9 +200,6 @@ class StageProfiler:
         self.log_timing = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
         self.log_stage_start_end = log_stage_start_end
         self.capture_memory = capture_memory
-        # sync_cuda=True forces synchronization around denoising steps,
-        # e.g. when CUDA Graph replay makes kernels fully async.
-        self.sync_cuda = sync_cuda
 
     def __enter__(self):
         if self.log_stage_start_end:
@@ -216,10 +212,7 @@ class StageProfiler:
             if (
                 self.stage_name.startswith("denoising_step_")
                 and torch.get_device_module().is_available()
-                and (
-                    self.sync_cuda
-                    or os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                )
+                and os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
             ):
                 torch.get_device_module().synchronize()
             self.start_time = time.perf_counter()
@@ -233,10 +226,7 @@ class StageProfiler:
         if (
             self.stage_name.startswith("denoising_step_")
             and torch.get_device_module().is_available()
-            and (
-                self.sync_cuda
-                or os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            )
+            and os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
         ):
             torch.get_device_module().synchronize()
         execution_time_s = time.perf_counter() - self.start_time
