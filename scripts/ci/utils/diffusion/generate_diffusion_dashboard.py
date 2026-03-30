@@ -496,7 +496,7 @@ def generate_dashboard(
                 all_vals = sg_vals + [v for v in vl_vals if v is not None]
                 y_min = min(all_vals)
                 y_max = max(all_vals)
-                y_range = y_max - y_min if y_max > y_min else y_max * 0.1
+                y_range = y_max - y_min if y_max > y_min else max(y_max * 0.1, 0.1)
                 ax.set_ylim(
                     bottom=max(0, y_min - y_range * 0.3),
                     top=y_max + y_range * 0.3,
