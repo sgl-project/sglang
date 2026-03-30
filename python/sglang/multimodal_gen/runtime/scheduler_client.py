@@ -16,9 +16,8 @@ async def run_zeromq_broker(server_args: ServerArgs):
     It listens for TCP requests from offline clients (e.g., DiffGenerator).
     """
     ctx = zmq.asyncio.Context()
-    # This is the REP socket that listens for requests from DiffGenerator
     socket = ctx.socket(zmq.REP)
-    broker_endpoint = f"tcp://*:{server_args.broker_port}"
+    broker_endpoint = f"tcp://127.0.0.1:{server_args.broker_port}"
     socket.bind(broker_endpoint)
     logger.info(f"ZMQ Broker is listening for offline jobs on {broker_endpoint}")
 

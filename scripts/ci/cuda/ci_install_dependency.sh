@@ -84,8 +84,15 @@ mark_step_done "Host / runner detection"
 # Kill existing processes
 # ------------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bash "${SCRIPT_DIR}/../../killall_sglang.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+python3 "${REPO_ROOT}/python/sglang/cli/killall.py"
+KILLALL_EXIT=$?
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+
+if [ $KILLALL_EXIT -ne 0 ]; then
+    echo "ERROR: killall.py detected uncleanable GPU memory. Aborting CI."
+    exit 1
+fi
 
 mark_step_done "Kill existing processes"
 
@@ -291,7 +298,7 @@ if [ "$CU_VERSION" = "cu130" ]; then
 else
     NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
 fi
-$PIP_CMD install mooncake-transfer-engine==0.3.9 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.10 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
