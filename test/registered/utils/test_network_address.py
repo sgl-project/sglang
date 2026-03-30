@@ -1,9 +1,13 @@
+import os
 import socket
 import unittest
 from unittest.mock import patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_mooncake_transfer_engine_hostname,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
@@ -301,6 +305,61 @@ class TestPortArgsIPv6(unittest.TestCase):
         with self.assertRaises(ValueError) as context:
             PortArgs.init_new(server_args)
         self.assertIn("Expected ':port' after closing bracket", str(context.exception))
+
+
+class TestGetMooncakeTransferEngineHostname(unittest.TestCase):
+    _unset_host_ip = {"SGLANG_HOST_IP": "", "HOST_IP": ""}
+
+    @patch.dict(
+        os.environ,
+        {"SGLANG_HOST_IP": "10.10.10.1", "HOST_IP": ""},
+        clear=False,
+    )
+    def test_sglang_host_ip_overrides_server_host(self):
+        self.assertEqual(
+            get_mooncake_transfer_engine_hostname("prefill", "192.168.0.55"),
+            "10.10.10.1",
+        )
+
+    @patch.dict(os.environ, _unset_host_ip, clear=False)
+    @patch(
+        "sglang.srt.utils.network.get_local_ip_auto",
+        side_effect=AssertionError("should not auto-detect when PD host is set"),
+    )
+    def test_pd_mode_uses_explicit_bind_host(self, _mock_auto):
+        self.assertEqual(
+            get_mooncake_transfer_engine_hostname("prefill", "192.168.0.55"),
+            "192.168.0.55",
+        )
+
+    @patch.dict(os.environ, _unset_host_ip, clear=False)
+    @patch(
+        "sglang.srt.utils.network.get_local_ip_auto",
+        return_value="10.0.0.99",
+    )
+    def test_null_disaggregation_ignores_server_host(self, mock_auto):
+        self.assertEqual(
+            get_mooncake_transfer_engine_hostname("null", "192.168.0.55"),
+            "10.0.0.99",
+        )
+        mock_auto.assert_called_once_with()
+
+    @patch.dict(os.environ, _unset_host_ip, clear=False)
+    @patch(
+        "sglang.srt.utils.network.get_local_ip_auto",
+        return_value="10.0.0.99",
+    )
+    def test_pd_mode_bind_all_interfaces_falls_back_to_auto(self, mock_auto):
+        self.assertEqual(
+            get_mooncake_transfer_engine_hostname("prefill", "0.0.0.0"),
+            "10.0.0.99",
+        )
+        mock_auto.assert_called_once_with()
+        mock_auto.reset_mock()
+        self.assertEqual(
+            get_mooncake_transfer_engine_hostname("decode", "::"),
+            "10.0.0.99",
+        )
 
 
 class TestServerArgsIPv6Url(unittest.TestCase):

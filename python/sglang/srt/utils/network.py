@@ -348,6 +348,31 @@ def get_local_ip_auto(fallback: str = None) -> str:
     raise ValueError("Can not get local ip")
 
 
+def get_mooncake_transfer_engine_hostname(
+    disaggregation_mode: str,
+    server_host: str,
+) -> str:
+    """
+    Hostname for Mooncake transfer engine initialization.
+
+    ``SGLANG_HOST_IP`` / ``HOST_IP`` take precedence. In prefill-decode
+    disaggregation, ``--host`` is used when it is a concrete address (not an
+    all-interfaces bind) so multi-homed nodes can advertise the same IP as the
+    HTTP server (often the intended RoCE data plane). Otherwise falls back to
+    :func:`get_local_ip_auto`.
+    """
+    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
+    if host_ip:
+        return host_ip
+    if (
+        disaggregation_mode != "null"
+        and server_host
+        and server_host not in ("0.0.0.0", "::")
+    ):
+        return server_host
+    return get_local_ip_auto()
+
+
 def get_zmq_socket(
     context: zmq.Context,
     socket_type: zmq.SocketType,
