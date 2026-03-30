@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=360, suite="stage-c-test-8-gpu-h200")
 
-DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
+DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
 class TestDeepseekV32DP(CustomTestCase):

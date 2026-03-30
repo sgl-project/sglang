@@ -14,8 +14,8 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
 3. Register for CI at the **top of the file** (after imports, before test classes):
    ```python
    from sglang.test.ci.ci_register import register_cpu_ci
-   register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
-   # or: register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
+   register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+   # or: register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
    ```
 4. Run locally:
    ```bash
@@ -39,7 +39,7 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import unittest
 

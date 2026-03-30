@@ -8,7 +8,13 @@
 #include <torch/extension.h>
 #include <vector>
 #include <ATen/ATen.h>
+
+#ifdef CUDA_ENABLED
 #include <ATen/cuda/CUDAContext.h>
+#else
+#define __host__
+#define __device__
+#endif
 
 #define INT64 unsigned long long
 #define MAXINT 2147483647

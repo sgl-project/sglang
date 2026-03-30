@@ -40,7 +40,7 @@ class NGRAMWorker:
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
-        self.branch_length: int = server_args.speculative_ngram_branch_length
+        self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.max_match_window_size: int = (
             server_args.speculative_ngram_max_match_window_size
         )
@@ -57,7 +57,7 @@ class NGRAMWorker:
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
             match_type=server_args.speculative_ngram_match_type,
             capacity=server_args.speculative_ngram_capacity,
-            branch_length=server_args.speculative_ngram_branch_length,
+            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
             draft_token_num=server_args.speculative_num_draft_tokens,
         )
 
@@ -209,7 +209,7 @@ class NGRAMWorker:
             #     put_ids = req.origin_input_ids + req.output_ids
             # else:
             put_ids = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids, self.branch_length
+                req.origin_input_ids, req.output_ids, self.max_trie_depth
             )
             batch_tokens.append(put_ids)
         self.ngram_corpus.batch_put(batch_tokens)

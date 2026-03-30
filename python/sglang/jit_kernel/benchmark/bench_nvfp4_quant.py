@@ -8,6 +8,9 @@ import triton
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
 from sglang.srt.utils import is_sm100_supported
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
