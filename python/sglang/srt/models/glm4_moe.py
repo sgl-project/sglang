@@ -328,14 +328,13 @@ class Glm4MoeGate(nn.Module):
             torch.empty((config.n_routed_experts), dtype=torch.float32)
         )
         # GLM requires FP32 gate projection; cache to avoid per-forward cast.
+        # FIXME: if gate weight is updated at runtime (e.g. expert rebalancing), _weight_fp32 must be invalidated.
         self.register_buffer("_weight_fp32", None, persistent=False)
 
     def forward(self, hidden_states):
         if self._weight_fp32 is None:
             self._weight_fp32 = self.weight.data.to(torch.float32)
-        logits = F.linear(
-            hidden_states.to(torch.float32), self._weight_fp32, None
-        )
+        logits = F.linear(hidden_states.to(torch.float32), self._weight_fp32, None)
         return logits
 
 
