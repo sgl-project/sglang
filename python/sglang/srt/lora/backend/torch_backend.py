@@ -208,36 +208,44 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         scalings: list[float],
         use_cuda_graph: bool,
     ):
+        # Do not use merge optimization for graph mode
+        # Use pinned memory to avoid synchronizations during host-to-device transfer
         original_seq_lens_cpu = generate_sequence_lengths(forward_batch, device="cpu")
-        original_weight_indices_tensor = torch.tensor(
-            weight_indices, dtype=torch.int32, device="cpu"
-        )
-
-        unique_weight_indices_tensor, inverse_weight_indices_tensor = (
-            torch.unique_consecutive(
-                original_weight_indices_tensor, return_inverse=True
+        if not use_cuda_graph:
+            original_weight_indices_tensor = torch.tensor(
+                weight_indices, dtype=torch.int32, device="cpu"
             )
-        )
 
-        seg_lens_cpu = (
-            torch.zeros_like(
-                unique_weight_indices_tensor, dtype=torch.int32, device="cpu"
+            unique_weight_indices_tensor, inverse_weight_indices_tensor = (
+                torch.unique_consecutive(
+                    original_weight_indices_tensor, return_inverse=True
+                )
             )
-            .scatter_add_(
-                0,
-                inverse_weight_indices_tensor,
+
+            seg_lens_cpu = (
+                torch.zeros_like(
+                    unique_weight_indices_tensor, dtype=torch.int32, device="cpu"
+                )
+                .scatter_add_(
+                    0,
+                    inverse_weight_indices_tensor,
+                    original_seq_lens_cpu,
+                )
+                .pin_memory()
+            )
+
+            weight_indices_tensor = unique_weight_indices_tensor.pin_memory()
+        else:
+            weight_indices_tensor = torch.repeat_interleave(
+                torch.tensor(weight_indices, dtype=torch.int32, device="cpu"),
                 original_seq_lens_cpu,
-            )
-            .pin_memory()
-        )
+            ).pin_memory()
+            seg_lens_cpu = torch.ones_like(weight_indices_tensor).pin_memory()
 
         seg_indptr_cpu = torch.zeros(
             (len(seg_lens_cpu) + 1,), dtype=torch.int32, pin_memory=True
         )
         seg_indptr_cpu[1:] = torch.cumsum(seg_lens_cpu, dim=0)
-
-        # Use pinned memory to avoid synchronizations during host-to-device transfer
-        weight_indices_tensor = unique_weight_indices_tensor.pin_memory()
         lora_ranks_tensor = torch.tensor(
             lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
         )
