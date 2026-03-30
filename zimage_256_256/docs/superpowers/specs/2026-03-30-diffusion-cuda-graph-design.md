@@ -33,6 +33,7 @@ First implementation targets the narrowest useful case:
 | Attention | FlashAttention | No `current_timestep` dependency in GPU compute |
 | CFG | Disabled (`should_use_guidance=False`) | One forward pass per step |
 | Cache-DiT | Disabled | Deferred — every step executes the same kernel sequence |
+| Model switching | Disabled | ZImage `boundary_ratio=None`, all steps use same transformer |
 | Scheduler | Outside graph | Avoids dynamic tensor allocation issues |
 
 ## Architecture
@@ -82,9 +83,10 @@ for i, t_host in enumerate(timesteps_cpu):
         noise_pred = capture_and_run(...)
     elif cuda_graph_enabled and graph_captured:
         # === REPLAY ===
-        # 1. Copy timestep/latents into pre-allocated buffers
-        # 2. graph.replay()
-        # 3. Read from output buffer
+        # 1. Update forward context (CPU-side state)
+        # 2. Copy timestep/latents into pre-allocated buffers
+        # 3. graph.replay()
+        # 4. Read from output buffer
         noise_pred = replay(timestep, latent_model_input)
     else:
         # === EAGER FALLBACK ===
@@ -104,12 +106,18 @@ class DiffusionCudaGraphRunner:
 
     Captures a single DiT forward pass and replays it with updated inputs.
     Analogous to srt's CudaGraphRunner but for diffusion models.
+
+    Preconditions enforced at capture time:
+    - Attention backend must be FlashAttention (no timestep-dependent kernel paths)
+    - boundary_timestep must be None (no mid-request model switching)
     """
 
     def __init__(self, device: torch.device):
         self.device = device
         self.graph: Optional[torch.cuda.CUDAGraph] = None
-        self.pool = None                    # shared memory pool
+        # Shared memory pool — avoids fragmentation across captures.
+        # Mirrors LLM-side CudaGraphRunner behavior.
+        self.pool = torch.cuda.graph_pool_handle()
         self.input_buffers: dict = {}       # fixed-address input tensors
         self.output_buffer: Optional[torch.Tensor] = None
         self._captured = False
@@ -145,10 +153,12 @@ class DiffusionCudaGraphRunner:
             'latent': latent_buffer,
         }
 
-        # Build the callable that graph will capture
-        # Note: ZImage expects hidden_states as List[Tensor].
-        # We wrap the fixed-address buffer in a list each call.
-        # The list itself is transient; the tensor address is stable.
+        # Build the callable that graph will capture.
+        # ZImage expects hidden_states and encoder_hidden_states as
+        # List[Tensor]. We wrap the fixed-address buffer in a list each
+        # call. The list wrapper is transient Python overhead; the
+        # underlying tensor addresses are stable — which is what CUDA
+        # Graph cares about.
         def run_fn():
             return dit_forward_fn(
                 hidden_states=[latent_buffer],
@@ -156,7 +166,11 @@ class DiffusionCudaGraphRunner:
                 **static_kwargs,
             )
 
-        # Warmup: 2 eager runs to stabilize memory allocator
+        # Warmup: 2 eager runs to stabilize PyTorch caching allocator.
+        # Run 1 may trigger new CUDA memory allocations.
+        # Run 2 confirms steady state (no new allocations).
+        # This is critical: if the allocator's state differs between
+        # warmup and capture, the graph may record incorrect addresses.
         for _ in range(2):
             run_fn()
         torch.cuda.synchronize()
@@ -211,16 +225,16 @@ class DiffusionCudaGraphRunner:
 
 | Input | Type | How Updated |
 |---|---|---|
-| `timestep` | GPU tensor (scalar or [B]) | `timestep_buffer.copy_(new_timestep)` |
-| `hidden_states` (latents) | `List[torch.Tensor]` — ZImage wraps a single [C, H, W] tensor in a list. Buffer is the inner tensor; list wrapper is recreated each replay. | `latent_buffer.copy_(new_latents)` |
+| `timestep` | GPU tensor (scalar `[B]`) | `timestep_buffer.copy_(new_timestep)` |
+| `hidden_states` (latents) | `List[torch.Tensor]` — ZImage wraps a single `[C, H, W]` tensor in a list. Buffer is the inner tensor; list wrapper is recreated each call (transient Python object, not captured by graph). | `latent_buffer.copy_(new_latents)` |
 
 ### Fixed Across All Steps (bound at capture time)
 
 | Input | Type | Why Fixed |
 |---|---|---|
-| `encoder_hidden_states` | GPU tensor (list) | Same prompt for all steps |
-| `guidance` | GPU tensor (scalar) | Constant (ZImage: 0) |
-| `freqs_cis` | GPU tensor tuple | RoPE embeddings, shape-dependent only |
+| `encoder_hidden_states` | `List[torch.Tensor]` — same list format as `hidden_states`. Comes from `pos_cond_kwargs['encoder_hidden_states']` which is `batch.prompt_embeds` (typed `list[torch.Tensor]`). Inner tensor addresses are baked into graph. | Same prompt for all steps |
+| `guidance` | GPU tensor (scalar) | Constant (ZImage: `0`) |
+| `freqs_cis` | `Tuple[torch.Tensor, torch.Tensor]` | RoPE embeddings, shape-dependent only |
 | `patch_size`, `f_patch_size` | Python int | Fixed per resolution |
 | Model weights | GPU tensors | Inference only |
 
@@ -228,9 +242,9 @@ class DiffusionCudaGraphRunner:
 
 | State | Where Used | Impact on Graph |
 |---|---|---|
-| `_forward_context.current_timestep` | Python global | None for FlashAttention |
-| `attn_metadata` | Python dataclass | None for FlashAttention (returns None) |
-| `batch.is_cfg_negative` | Python attribute | Not applicable (no CFG) |
+| `_forward_context.current_timestep` | Python global via `get_forward_context()` | None for FlashAttention. Must still be updated for profiling/logging correctness. |
+| `attn_metadata` | Python dataclass | `None` for FlashAttention (`_build_attn_metadata` returns `None` when no sparse backend is configured) |
+| `batch.is_cfg_negative` | Python attribute | Not applicable (ZImage: no CFG) |
 
 ## Integration with Denoising Stage
 
@@ -242,12 +256,32 @@ cuda_graph_enabled = server_args.enable_diffusion_cuda_graph  # new flag
 graph_runner = None
 
 if cuda_graph_enabled:
+    # === Runtime safety checks ===
+    # These assert the preconditions documented in the Scope table.
+    # If any fails, the user gets a clear error instead of silent
+    # incorrect results from replaying a mismatched graph.
+    assert self.attn_backend.get_enum() == AttentionBackendEnum.FLASH_ATTN, (
+        f"Diffusion CUDA Graph requires FlashAttention backend, "
+        f"got {self.attn_backend.get_enum()}. Sparse attention backends "
+        f"(STA, VSA, SVG2) use current_timestep for kernel path selection "
+        f"which is incompatible with graph replay."
+    )
+    assert boundary_timestep is None, (
+        f"Diffusion CUDA Graph does not support mid-request model switching "
+        f"(boundary_timestep={boundary_timestep}). All denoising steps must "
+        f"use the same transformer."
+    )
+
     graph_runner = DiffusionCudaGraphRunner(device=get_local_torch_device())
     # Pre-allocate fixed-address buffers matching expected shapes
     timestep_buffer = torch.empty_like(timesteps[0].repeat(bsz))
     latent_buffer = torch.empty_like(latents)
 
-    # Collect static kwargs for dit.forward()
+    # Collect static kwargs for dit.forward().
+    # These are filtered through prepare_extra_func_kwargs() which
+    # inspects dit.forward()'s signature — only accepted params pass.
+    # For ZImage: encoder_hidden_states, guidance, patch_size,
+    # f_patch_size, freqs_cis.
     static_kwargs = {
         'encoder_hidden_states': pos_cond_kwargs['encoder_hidden_states'],
         'guidance': guidance,
@@ -279,7 +313,10 @@ for i, t_host in enumerate(timesteps_cpu):
             )
     elif cuda_graph_enabled and graph_runner.captured:
         # Step 1+: replay
-        noise_pred = graph_runner.replay(timestep, latent_model_input)
+        # Maintain forward context for profiling/logging consistency,
+        # even though FlashAttention does not read current_timestep.
+        with set_forward_context(current_timestep=i, attn_metadata=None, forward_batch=batch):
+            noise_pred = graph_runner.replay(timestep, latent_model_input)
     else:
         # Fallback eager
         noise_pred = self._predict_noise_with_cfg(...)
@@ -310,7 +347,7 @@ sglang serve --model-path ZhipuAI/ZImage-Turbo \
 
 ## Memory Considerations
 
-- CUDA Graph capture allocates a private memory pool. The graph's internal allocations are reused across replays.
+- CUDA Graph capture uses a shared memory pool (`torch.cuda.graph_pool_handle()`), matching the LLM-side `CudaGraphRunner` pattern. This avoids memory fragmentation when multiple graphs coexist (future: multi-resolution).
 - Pre-allocated input/output buffers persist for the request lifetime. For ZImage 256×256 with batch=1, this is small (latent: [1, 16, 32, 32] = 64KB in BF16).
 - Memory overhead is bounded: one graph + buffers per active resolution.
 
@@ -318,8 +355,9 @@ sglang serve --model-path ZhipuAI/ZImage-Turbo \
 
 1. **Step 0 captures and also produces valid output** — the capture run is a real forward pass, its output is used.
 2. **`scheduler.step()` stays outside graph** — free to allocate tensors, branch, etc.
-3. **`set_forward_context` only matters for sparse attention backends** — FlashAttention ignores it.
-4. **Warmup runs (2×) before capture** — ensures PyTorch's caching allocator is in steady state, avoiding allocation pattern changes that would invalidate the graph.
+3. **Runtime asserts before capture** — attention backend must be FlashAttention; `boundary_timestep` must be `None`. These catch misuse at startup rather than producing silent incorrect results.
+4. **`set_forward_context` set in both capture and replay** — maintains CPU-side state consistency for profiling, logging, and any code that reads the forward context.
+5. **Warmup runs (2×) before capture** — ensures PyTorch's caching allocator is in steady state. Run 1 may trigger new allocations; Run 2 confirms no further allocations occur. If the allocator state differs between warmup and capture, the graph could record incorrect memory addresses.
 
 ## Expected Performance
 
@@ -332,8 +370,9 @@ sglang serve --model-path ZhipuAI/ZImage-Turbo \
 
 ## Future Extensions
 
-1. **Multiple resolution buckets**: Cache graphs keyed by `(height, width)` in a dict.
-2. **Dynamic capture + caching**: First request per resolution captures; subsequent requests replay.
-3. **CFG support**: Capture two forward passes (positive + negative) in one graph.
-4. **Cache-DiT compatibility**: Capture different graphs for "full compute" vs "cached" steps.
+1. **Multiple resolution buckets**: Cache graphs keyed by `(height, width)` in a dict, each with its own input/output buffers.
+2. **Dynamic capture + caching**: First request per resolution captures; subsequent requests replay from cache.
+3. **CFG support**: Capture two forward passes (positive + negative) in one graph, or capture them as two separate graphs.
+4. **Cache-DiT compatibility**: Capture different graphs for "full compute" vs "cached" steps; select at replay time based on Cache-DiT's per-step decision.
 5. **torch.compile integration**: Use `torch.compile(mode="reduce-overhead")` as an alternative backend for graph capture with automatic kernel fusion.
+6. **Sparse attention backends**: Would require either (a) asserting `current_timestep` does not change the kernel path, or (b) capturing separate graphs per distinct kernel path and selecting at replay time.
