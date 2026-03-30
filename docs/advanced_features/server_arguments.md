@@ -185,6 +185,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--crash-dump-folder` | Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled. | `None` | Type: str |
 | `--show-time-cost` | Show time cost of custom marks. | `False` | bool flag (set to enable) |
 | `--enable-metrics` | Enable log prometheus metrics. | `False` | bool flag (set to enable) |
+| `--enable-mfu-metrics` | Enable estimated MFU-related prometheus metrics. | `False` | bool flag (set to enable) |
 | `--enable-metrics-for-all-schedulers` | Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) to record request metrics separately. This is especially useful when dp_attention is enabled, as otherwise all metrics appear to come from TP 0. | `False` | bool flag (set to enable) |
 | `--tokenizer-metrics-custom-labels-header` | Specify the HTTP header for passing custom labels for tokenizer metrics. | `x-custom-labels` | Type: str |
 | `--tokenizer-metrics-allowed-custom-labels` | The custom labels allowed for tokenizer metrics. The labels are specified via a dict in '--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': 'value2'} is allowed if '--tokenizer-metrics-allowed-custom-labels label1 label2' is set. | `None` | List[str] |
