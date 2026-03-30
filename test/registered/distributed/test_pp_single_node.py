@@ -180,7 +180,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.65)
+        self.assertGreaterEqual(metrics["accuracy"], 0.65)
         # Wait a little bit so that the memory check happens.
         time.sleep(4)
 

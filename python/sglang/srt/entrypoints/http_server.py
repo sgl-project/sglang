@@ -59,6 +59,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -177,6 +178,7 @@ from sglang.srt.utils.json_response import (
     dumps_json,
     orjson_response,
 )
+from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -509,13 +511,9 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    rid = f"HEALTH_CHECK_{time.time()}"
+    rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
 
-    if _global_state.tokenizer_manager.is_image_gen:
-        gri = _global_state.tokenizer_manager.get_image_gen_health_check_request(
-            rid, sampling_params
-        )
-    elif _global_state.tokenizer_manager.is_generation:
+    if _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             rid=rid,
             input_ids=[0],
@@ -1486,11 +1484,18 @@ async def openai_v1_audio_transcriptions(
     response_format: str = Form(default="json"),
     temperature: float = Form(default=0.0),
     stream: bool = Form(default=False),
+    timestamp_granularities: Optional[List[str]] = Form(
+        default=None, alias="timestamp_granularities[]"
+    ),
 ):
     """OpenAI-compatible audio transcription endpoint."""
-    if response_format not in ["json", "text"]:
+    if response_format not in ["json", "text", "verbose_json"]:
         return ORJSONResponse(
-            content={"error": {"message": "Only 'json' and 'text' formats supported"}},
+            content={
+                "error": {
+                    "message": "Only 'json', 'text', and 'verbose_json' formats supported"
+                }
+            },
             status_code=400,
         )
 
@@ -1504,6 +1509,7 @@ async def openai_v1_audio_transcriptions(
             response_format=response_format,
             temperature=temperature,
             stream=stream,
+            timestamp_granularities=timestamp_granularities,
             raw_request=raw_request,
         )
     )
@@ -1979,6 +1985,7 @@ def _setup_and_run_http_server(
     template_manager,
     port_args: PortArgs,
     scheduler_infos: List[Dict],
+    subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
@@ -2000,6 +2007,10 @@ def _setup_and_run_http_server(
             remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
         )
     )
+
+    # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
+    if tokenizer_manager is not None:
+        tokenizer_manager._subprocess_watchdog = subprocess_watchdog
 
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
@@ -2171,13 +2182,17 @@ def launch_server(
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
     # Launch subprocesses
-    tokenizer_manager, template_manager, port_args, scheduler_init_result = (
-        Engine._launch_subprocesses(
-            server_args=server_args,
-            init_tokenizer_manager_func=init_tokenizer_manager_func,
-            run_scheduler_process_func=run_scheduler_process_func,
-            run_detokenizer_process_func=run_detokenizer_process_func,
-        )
+    (
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result,
+        subprocess_watchdog,
+    ) = Engine._launch_subprocesses(
+        server_args=server_args,
+        init_tokenizer_manager_func=init_tokenizer_manager_func,
+        run_scheduler_process_func=run_scheduler_process_func,
+        run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
     _setup_and_run_http_server(
@@ -2186,6 +2201,7 @@ def launch_server(
         template_manager,
         port_args,
         scheduler_init_result.scheduler_infos,
+        subprocess_watchdog,
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
     )
