@@ -1055,11 +1055,7 @@ class SchedulerOutputProcessorMixin:
                         input_token_ids_logprobs_idx.append([])
 
                     if req.return_logprob:
-                        logprob_end = (
-                            max(req.finished_len, 1)
-                            if req.finished_len is not None
-                            else None
-                        )
+                        logprob_end = max(len(output_ids_), 1)
                         output_token_logprobs_val.append(
                             req.output_token_logprobs_val[
                                 send_output_token_logprobs_offset:logprob_end
@@ -1090,9 +1086,7 @@ class SchedulerOutputProcessorMixin:
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
-                        req.send_output_token_logprobs_offset = logprob_end or len(
-                            req.output_token_logprobs_val
-                        )
+                        req.send_output_token_logprobs_offset = logprob_end
                     else:
                         output_token_logprobs_val.append([])
                         output_token_logprobs_idx.append([])
