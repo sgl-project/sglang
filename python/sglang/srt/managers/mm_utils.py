@@ -1761,6 +1761,12 @@ class MMSendWrapper:
 
     def __init__(self, send_to_scheduler: zmq.Socket):
         self.send_to_scheduler = send_to_scheduler
+        server_args = get_global_server_args()
+        self.force_send_pyobj = (
+            _get_is_default_transport()
+            or server_args.skip_tokenizer_init
+            or server_args.keep_mm_feature_on_device
+        )
 
     def serialize(self, obj):
         return [MultiprocessingSerializer.serialize(obj)]
@@ -1773,6 +1779,9 @@ class MMSendWrapper:
         return False
 
     def send_pyobj(self, obj):
+        if self.force_send_pyobj:
+            return self.send_to_scheduler.send_pyobj(obj)
+
         if self.has_mm_data(obj):
             return self.send_to_scheduler.send_serialized(
                 msg=obj, serialize=self.serialize
