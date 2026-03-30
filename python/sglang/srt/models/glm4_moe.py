@@ -329,7 +329,10 @@ class Glm4MoeGate(nn.Module):
         )
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states, self.weight, None)
+        # Cast to FP32 before gate projection for GLM-V model.
+        logits = F.linear(
+            hidden_states.to(torch.float32), self.weight.to(torch.float32), None
+        )
         return logits
 
 
