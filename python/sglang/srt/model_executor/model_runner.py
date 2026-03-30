@@ -1192,14 +1192,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
         if self.server_args.debug_tensor_dump_output_folder is not None:
-            register_forward_hook_for_model(
-                self.model,
-                self.server_args.debug_tensor_dump_output_folder,
-                self.server_args.debug_tensor_dump_layers,
-                self.tp_size,
-                self.tp_rank,
-                self.pp_rank,
-            )
+            if self.spec_algorithm.is_eagle() :
+                dump_folder = self.server_args.debug_tensor_dump_output_folder
+                if self.is_draft_worker:
+                    dump_folder = os.path.join(dump_folder, "draft")
+                else:
+                    dump_folder = os.path.join(dump_folder, "target")
+                register_forward_hook_for_model(
+                        self.model,
+                        dump_folder,
+                        self.server_args.debug_tensor_dump_layers,
+                        self.tp_size,
+                        self.tp_rank,
+                        self.pp_rank,
+                        )
+            else:
+                register_forward_hook_for_model(
+                        self.model,
+                        self.server_args.debug_tensor_dump_output_folder,
+                        self.server_args.debug_tensor_dump_layers,
+                        self.tp_size,
+                        self.tp_rank,
+                        self.pp_rank,
+                        )
 
         if dumper.may_enable:
             dumper.apply_source_patches()
