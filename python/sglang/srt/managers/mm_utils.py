@@ -17,18 +17,26 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.managers.io_struct import (
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput, TokenizedEmbeddingReqInput
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import MultiprocessingSerializer, flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    flatten_nested_list,
+    is_npu,
+    print_warning_once,
+)
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -1750,21 +1758,24 @@ class MMSendWrapper:
     """
     Wrapper for sending multimodal data, which sharing tensors with processes.
     """
+
     def __init__(self, send_to_scheduler: zmq.Socket):
         self.send_to_scheduler = send_to_scheduler
-    
+
     def serialize(self, obj):
         return [MultiprocessingSerializer.serialize(obj)]
-    
+
     def has_mm_data(self, obj):
         if isinstance(obj, TokenizedGenerateReqInput):
-            return obj.mm_inputs 
+            return obj.mm_inputs
         elif isinstance(obj, TokenizedEmbeddingReqInput):
             return obj.image_inputs
         return False
-    
+
     def send_pyobj(self, obj):
         if self.has_mm_data(obj):
-            return self.send_to_scheduler.send_serialized(msg=obj, serialize=self.serialize)
+            return self.send_to_scheduler.send_serialized(
+                msg=obj, serialize=self.serialize
+            )
         else:
             return self.send_to_scheduler.send_pyobj(obj)

@@ -37,9 +37,9 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
+from sglang.srt.managers.mm_utils import MMSendWrapper
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.mm_utils import MMSendWrapper
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info

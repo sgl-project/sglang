@@ -319,7 +319,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
             )
 
-            # Using MMSendWrapper to handle multimodal inputs 
+            # Using MMSendWrapper to handle multimodal inputs
             self.send_to_scheduler = MMSendWrapper(send_to_scheduler)
         else:
             from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
@@ -330,7 +330,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
-            self.send_to_scheduler = SenderWrapper(port_args, MMSendWrapper(send_to_scheduler))
+            self.send_to_scheduler = SenderWrapper(
+                port_args, MMSendWrapper(send_to_scheduler)
+            )
 
     def init_running_status(self):
         # Request states
