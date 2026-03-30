@@ -1000,7 +1000,7 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
     def test_cutedsl_ep_sharded_allreduce(self):
         """Verify EP-sharded execution: partial outputs from EP ranks sum to full result.
 
-        Simulates the EP=TP all-reduce pattern used by FlashInferCuteDslMoE when
+        Simulates the EP=TP all-reduce pattern used by the CuteDSL moe_runner when
         ep_size > 1 and moe_a2a_backend=none. Each "rank" runs a wrapper with
         num_local_experts < num_experts and a corresponding local_expert_offset,
         receiving only the local slice of weights/scales/alphas — matching the
@@ -1056,7 +1056,7 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                 # EP-sharded: each rank independently quantizes its local
                 # bf16 weight shard and calls convert_sf_to_mma_layout with
                 # num_groups=num_local_experts — matching the real per-rank
-                # weight preprocessing in FlashInferCuteDslMoE.
+                # weight preprocessing in the CuteDSL moe_runner path.
                 accumulated = torch.zeros_like(out_full)
                 for rank in range(ep_size):
                     lo = rank * num_local_experts

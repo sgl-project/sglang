@@ -581,11 +581,7 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
         and get_moe_a2a_backend().is_none()
     ):
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            from sglang.srt.layers.moe.fused_moe_triton.layer import (
-                FlashInferCuteDslMoE,
-            )
-
-            return FlashInferCuteDslMoE
+            return FusedMoE
         quant_name = quant_config.get_name() if quant_config is not None else None
         raise ValueError(
             f"flashinfer_cutedsl with moe_a2a_backend='none' requires "

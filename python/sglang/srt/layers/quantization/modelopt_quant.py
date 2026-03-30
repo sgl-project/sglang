@@ -1802,11 +1802,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # CuteDSL expects MMA layout for weight scales. Convert from swizzled bytes.
                 from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
-                from sglang.srt.layers.moe.fused_moe_triton.layer import (
-                    FlashInferCuteDslMoE,
+                from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                    _FP4_SF_VEC_SIZE,
                 )
 
-                sf_vec_size = FlashInferCuteDslMoE._FP4_SF_VEC_SIZE
+                sf_vec_size = _FP4_SF_VEC_SIZE
                 num_local_experts = layer.w13_weight.shape[0]
                 w13_m = layer.w13_weight.shape[1]
                 w13_k = layer.w13_weight.shape[2] * 2
@@ -1860,6 +1860,69 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.enable_flashinfer_cutedsl_moe:
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
+
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTEDSL, moe_runner_config
+            )
+
+    def _ensure_cutedsl_wrapper(self, layer: torch.nn.Module) -> None:
+        """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
+
+        The wrapper is NOT created in __init__ / create_weights because of an
+        interaction with FlashInfer autotuning.  During server startup,
+        _flashinfer_autotune() runs a dummy forward pass to profile kernel
+        tactics.  That dummy run is the first forward call, so this helper is
+        invoked there.  The autotune pass uses torch.no_grad() (not
+        torch.inference_mode()) specifically so that the pre-allocated CUDA
+        graph buffers inside CuteDslMoEWrapper are created as normal tensors.
+        """
+        if getattr(layer, "_cutedsl_wrapper", None) is not None:
+            return
+
+        try:
+            from flashinfer import CuteDslMoEWrapper
+        except ImportError as e:
+            raise ImportError(
+                "flashinfer_cutedsl backend requires FlashInfer with CuteDSL support. "
+                "Install with: pip install flashinfer"
+            ) from e
+
+        from sglang.srt.server_args import get_global_server_args
+
+        assert layer.intermediate_size_per_partition > 0, (
+            f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
+            f"got {layer.intermediate_size_per_partition}. Check EP/TP configuration."
+        )
+
+        server_args = get_global_server_args()
+        use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
+        max_num_tokens = max(
+            getattr(server_args, "cuda_graph_max_bs", None) or 512,
+            getattr(server_args, "chunked_prefill_size", None) or 8192,
+        )
+        top_k = (
+            layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
+        )
+        layer._cutedsl_wrapper = CuteDslMoEWrapper(
+            num_experts=layer.num_experts,
+            top_k=top_k,
+            hidden_size=layer.hidden_size,
+            intermediate_size=layer.intermediate_size_per_partition,
+            use_cuda_graph=use_cuda_graph,
+            max_num_tokens=max_num_tokens,
+            num_local_experts=layer.num_local_experts,
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            output_dtype=layer.moe_runner_config.params_dtype,
+            device=str(layer.w13_weight.device),
+        )
+
+        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+            _resolve_cutedsl_standard_scales(layer)
+        )
+        layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+        layer._cutedsl_input_scale = used_input_scale
 
     def apply(
         self,
@@ -1883,6 +1946,32 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
             # This layer was processed with flashinfer TRTLLM - delegate to its own forward
             return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
+
+        if self.enable_flashinfer_cutedsl_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                CuteDslFp4MoeQuantInfo,
+            )
+
+            self._ensure_cutedsl_wrapper(layer)
+            w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
+            w1_weight_sf = getattr(
+                layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
+            )
+            w2_weight_sf = getattr(
+                layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
+            )
+            quant_info = CuteDslFp4MoeQuantInfo(
+                wrapper=layer._cutedsl_wrapper,
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_sf=w1_weight_sf,
+                w2_weight_sf=w2_weight_sf,
+                w1_alpha=w1_alpha,
+                w2_alpha=w2_alpha,
+                fc2_input_scale=fc2_input_scale,
+                input_scale=layer._cutedsl_input_scale,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

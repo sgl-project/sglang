@@ -1,7 +1,7 @@
-"""Backend tests for CuteDSL MoE (FlashInferCuteDslMoE layer, moe_a2a=none).
+"""Backend tests for CuteDSL MoE (FusedMoE + moe_runner, moe_a2a=none).
 
-Exercises the dedicated FlashInferCuteDslMoE layer with ModelOpt FP4 by
-launching a server with --moe-runner-backend flashinfer_cutedsl.
+Exercises the CuteDSL moe_runner path with ModelOpt FP4 by launching a
+server with --moe-runner-backend flashinfer_cutedsl.
 
 Two configurations are tested:
   - EP=1, TP=4: each GPU holds all experts with TP-sharded intermediate dim
