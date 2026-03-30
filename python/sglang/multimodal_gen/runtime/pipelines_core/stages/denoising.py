@@ -1042,10 +1042,11 @@ class DenoisingStage(PipelineStage):
             latent_buffer = torch.empty_like(latents)
 
             # Collect static kwargs for dit.forward().
-            # For ZImage: encoder_hidden_states (List[Tensor]), guidance,
-            # patch_size, f_patch_size, freqs_cis.
-            # prepare_extra_func_kwargs() filters by dit.forward() signature,
-            # so only accepted params are included.
+            # Use prepare_extra_func_kwargs() to filter by dit.forward()
+            # signature — only accepted params are included.
+            # For ZImage: encoder_hidden_states, guidance, freqs_cis.
+            # Note: patch_size/f_patch_size have defaults in ZImage.forward()
+            # and are not stored in ZImageDitConfig, so we don't pass them.
             static_kwargs = self.prepare_extra_func_kwargs(
                 getattr(self.transformer, "forward", self.transformer),
                 {
@@ -1053,10 +1054,6 @@ class DenoisingStage(PipelineStage):
                         "encoder_hidden_states"
                     ),
                     "guidance": guidance,
-                    "patch_size": server_args.pipeline_config.dit_config.patch_size,
-                    "f_patch_size": getattr(
-                        server_args.pipeline_config.dit_config, "f_patch_size", 1
-                    ),
                     "freqs_cis": pos_cond_kwargs.get("freqs_cis"),
                 },
             )
