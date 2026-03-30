@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import enum
 import random
+from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -197,6 +198,30 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_amp_supported(cls) -> bool:
         return True
+
+    @classmethod
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        return None
+
+    @classmethod
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        return None, None
+
+    @classmethod
+    def has_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return False
+
+    @classmethod
+    def can_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return False
+
+    @classmethod
+    def should_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return False
+
+    @classmethod
+    def warn_if_modelopt_fp4_best_performance_kit_missing(cls) -> None:
+        pass
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:

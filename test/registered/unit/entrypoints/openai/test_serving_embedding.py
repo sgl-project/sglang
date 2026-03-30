@@ -2,16 +2,47 @@
 Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 """
 
+import importlib
+import importlib.abc
+import importlib.machinery
 import sys
+import types
 import unittest
 import uuid
 from unittest.mock import MagicMock, Mock
 
+
 # Stub out sgl_kernel (and all submodules) before any sglang import so
 # the test runs on CPU-only runners without the real CUDA library.
-for _mod in ("sgl_kernel", "sgl_kernel.kvcacheio"):
-    if _mod not in sys.modules:
-        sys.modules[_mod] = MagicMock()
+class _SglKernelMockLoader(importlib.abc.Loader):
+    def create_module(self, spec):
+        mod = types.ModuleType(spec.name)
+        mod.__path__ = []
+        mod.__package__ = spec.name
+        mod.__loader__ = self
+        mod.__getattr__ = lambda name: MagicMock()
+        return mod
+
+    def exec_module(self, module):
+        pass
+
+
+class _SglKernelMockFinder(importlib.abc.MetaPathFinder):
+    """Import hook that intercepts all sgl_kernel.* imports and returns mocks."""
+
+    _PREFIX = "sgl_kernel"
+    _loader = _SglKernelMockLoader()
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname == self._PREFIX or fullname.startswith(self._PREFIX + "."):
+            return importlib.machinery.ModuleSpec(
+                fullname, self._loader, is_package=True
+            )
+        return None
+
+
+if "sgl_kernel" not in sys.modules:
+    sys.meta_path.insert(0, _SglKernelMockFinder())
 
 from fastapi import Request
 

@@ -37,7 +37,6 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -61,13 +60,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
-store_cache = register_custom_op(
-    debug_kernel_api(store_cache, op_name="jit_kernel.kvcache.store_cache"),
-    mutates_args=["k_cache", "v_cache"],
-)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -475,6 +468,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
+        # TODO: Support PP
+        self.start_layer = 0
+        self.layer_transfer_counter = None
         self._init_mamba_pool(
             size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -515,6 +511,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     device=self.device,
                 )
             )
+
+    def register_layer_transfer_counter(
+        self, layer_transfer_counter: "LayerDoneCounter"
+    ):
+        self.layer_transfer_counter = layer_transfer_counter
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
@@ -570,6 +571,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
@@ -1238,8 +1241,8 @@ class HybridLinearKVPool(KVCache):
         self.device = device
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = page_size
-        # TODO support pp?
-        self.start_layer = 0
+        self.start_layer = 0  # TODO: Support PP
+        self.layer_transfer_counter = None
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
@@ -1323,15 +1326,30 @@ class HybridLinearKVPool(KVCache):
             )
         return self.full_attention_layer_id_mapping[layer_id]
 
+    def register_layer_transfer_counter(
+        self, layer_transfer_counter: "LayerDoneCounter"
+    ):
+        self.layer_transfer_counter = layer_transfer_counter
+        # The layer-wise wait logic is executed at the Hybrid LinearPool level;
+        # no additional wait is needed in the full_kv_pool
+        self.full_kv_pool.register_layer_transfer_counter(None)
+
+    def _wait_for_layer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
     def get_key_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_key_buffer(layer_id)
 
     def get_value_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
 
