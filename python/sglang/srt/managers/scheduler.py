@@ -143,6 +143,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -1508,13 +1509,6 @@ class Scheduler(
                 )
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
-
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
-        if recv_reqs:
-            for req in recv_reqs:
-                unwrap_shm_features(req)
 
         return recv_reqs
 
