@@ -2068,9 +2068,11 @@ class CustomTestCase(unittest.TestCase):
         if getattr(setup, "_safe_setup_wrapped", False):
             return
 
-        def safe_setUpClass(klass, _orig=setup):
+        orig_func = setup.__func__
+
+        def safe_setUpClass(klass):
             try:
-                _orig.__func__(klass)
+                orig_func(klass)
             except Exception:
                 # Best-effort cleanup; suppress teardown errors so the
                 # original setUpClass exception propagates clearly.

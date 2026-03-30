@@ -1,13 +1,14 @@
 import asyncio
+import json
 import logging
 import unittest
 from typing import List
 
 import aiohttp
-import requests
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
+from sglang.benchmark.utils import download_and_cache_hf_file
 from sglang.srt.layers.moe.routed_experts_capturer import (
     extract_routed_experts_from_meta_info,
 )
@@ -21,23 +22,18 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=360, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=200, suite="stage-b-test-2-gpu-large")
 register_amd_ci(
-    est_time=360,
-    suite="stage-c-test-4-gpu-amd",
-    disabled="TP=4 DP=4 routed expert mismatch >15% on AMD; needs TP/DP tuning + concurrency reduction",
+    est_time=200,
+    suite="stage-b-test-2-gpu-large-amd",
+    disabled="TP=2 DP=2 routed expert mismatch >15% on AMD; needs TP/DP tuning + concurrency reduction",
 )
 
-SHAREGPT_URL = (
-    "https://huggingface.co/datasets/anon8231489123/"
-    "ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-)
+SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
+SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
 logger = logging.getLogger(__name__)
 
 
-@unittest.skip(
-    "Flaky in CI, need to be fixed and re-enabled. See https://github.com/sgl-project/sglang/issues/21266"
-)
 class TestReturnRoutedExperts(CustomTestCase):
     # modified from test_hicache.py
     @classmethod
@@ -50,31 +46,28 @@ class TestReturnRoutedExperts(CustomTestCase):
             "--disable-cuda-graph",
             "--disable-radix-cache",
             "--tp",
-            4,
+            2,
             "--dp",
-            4,
+            2,
             "--enable-dp-attention",
         ]
         cls.reference_args = [
             "--enable-return-routed-experts",
             "--enable-deterministic-inference",
             "--tp",
-            4,
+            2,
             "--dp",
-            4,
+            2,
             "--enable-dp-attention",
         ]
         cls.sampling_args = {
             "temperature": 0,
         }
         # prepare ShareGPT dataset
-        try:
-            response = requests.get(SHAREGPT_URL, timeout=60)
-            response.raise_for_status()
-            data = response.json()
-            print(f"Dataset size: {len(data)}")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Failed to download ShareGPT dataset: {e}") from e
+        dataset_path = download_and_cache_hf_file(SHAREGPT_REPO_ID, SHAREGPT_FILENAME)
+        with open(dataset_path) as f:
+            data = json.load(f)
+        print(f"Dataset size: {len(data)}")
         cls.texts = []
         for s in data:
             if "conversations" in s and len(s["conversations"]) > 0:

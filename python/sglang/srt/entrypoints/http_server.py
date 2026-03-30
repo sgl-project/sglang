@@ -513,11 +513,7 @@ async def health_generate(request: Request) -> Response:
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
 
-    if _global_state.tokenizer_manager.is_image_gen:
-        gri = _global_state.tokenizer_manager.get_image_gen_health_check_request(
-            rid, sampling_params
-        )
-    elif _global_state.tokenizer_manager.is_generation:
+    if _global_state.tokenizer_manager.is_generation:
         gri = GenerateReqInput(
             rid=rid,
             input_ids=[0],
