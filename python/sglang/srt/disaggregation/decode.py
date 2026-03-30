@@ -477,9 +477,6 @@ class DecodePreallocQueue:
         if not self.queue:
             return
 
-        if all(decode_req.waiting_for_input for decode_req in self.queue):
-            return
-
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )
@@ -654,20 +651,29 @@ class DecodePreallocQueue:
                 origin_input_len + self.num_reserved_decode_tokens
             )
 
+            max_new_tokens = min(
+                decode_req.req.sampling_params.max_new_tokens,
+                CLIP_MAX_NEW_TOKEN,
+            )
+            projected_required_tokens = (
+                origin_input_len + max_new_tokens - retractable_tokens
+            )
+            max_required_tokens = max(
+                required_tokens_for_request,
+                projected_required_tokens,
+            )
+
             if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
-                )
-                > allocatable_tokens
+                required_tokens_for_request > self.token_to_kv_pool_allocator.size
+                or max_required_tokens > self.token_to_kv_pool_allocator.size
             ):
-                break
-            if required_tokens_for_request > allocatable_tokens:
+                decode_req.kv_receiver.abort()
+                continue
+
+            if (
+                required_tokens_for_request > allocatable_tokens
+                or max_required_tokens > allocatable_tokens
+            ):
                 break
 
             allocatable_tokens -= required_tokens_for_request
