@@ -28,8 +28,9 @@ import sys
 import threading
 from functools import partialmethod
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
+import fastapi
 import setproctitle
 import zmq
 import zmq.asyncio
@@ -42,6 +43,9 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    ContinueGenerationReqInput,
+    GenerateReqInput,
+    PauseGenerationReqInput,
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -375,6 +379,10 @@ class MultiTokenizerRouter:
 class TokenizerWorker(TokenizerManager):
     """Tokenizer Worker in multi-http-worker mode"""
 
+    # Shared memory name for pause state (class-level, shared across all workers)
+    _PAUSE_SHM_NAME = None
+    _PAUSE_SHM = None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -389,6 +397,10 @@ class TokenizerWorker(TokenizerManager):
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
+        # Initialize shared memory for pause state across all workers
+        # Use parent PID to ensure all workers share the same memory
+        self._init_shared_pause_state()
+
         # For PD disaggregtion
         self.server_args.disaggregation_mode = disaggregation_mode
         self.disaggregation_mode = DisaggregationMode(
@@ -401,6 +413,95 @@ class TokenizerWorker(TokenizerManager):
         self.register_multi_tokenizer_communicator = _Communicator(
             self.send_to_scheduler, 2
         )
+
+    def _init_shared_pause_state(self):
+        """Initialize shared memory for pause state synchronization across workers."""
+        parent_pid = get_main_process_id()
+        shm_name = f"sglang_pause_state_{parent_pid}"
+
+        try:
+            # Try to create new shared memory (first worker)
+            self._PAUSE_SHM = shared_memory.SharedMemory(
+                name=shm_name, create=True, size=1
+            )
+            self._PAUSE_SHM.buf[0] = 0  # Initialize to not paused
+            logger.info(f"Worker {self.worker_id} created shared pause state")
+        except FileExistsError:
+            # Attach to existing shared memory (subsequent workers)
+            self._PAUSE_SHM = shared_memory.SharedMemory(name=shm_name)
+            logger.info(f"Worker {self.worker_id} attached to shared pause state")
+
+        TokenizerWorker._PAUSE_SHM_NAME = shm_name
+
+    def _is_globally_paused(self) -> bool:
+        """Check if any worker has triggered a global pause."""
+        if self._PAUSE_SHM is not None:
+            return self._PAUSE_SHM.buf[0] == 1
+        return self.is_pause  # Fallback to local state
+
+    def _set_global_pause(self, paused: bool):
+        """Set global pause state in shared memory."""
+        if self._PAUSE_SHM is not None:
+            self._PAUSE_SHM.buf[0] = 1 if paused else 0
+        self.is_pause = paused  # Also set local state
+
+    async def pause_generation(self, obj: PauseGenerationReqInput):
+        """Override to set global pause state across all workers."""
+        self._set_global_pause(True)
+        async with self.is_pause_cond:
+            if obj.mode != "abort":
+                await self.send_to_scheduler.send_pyobj(obj)
+            else:
+                # Abort all requests
+                while True:
+                    self.abort_request(abort_all=True)
+                    is_locked = await self.model_update_lock.is_locked()
+                    if not is_locked:
+                        break
+                    await asyncio.sleep(1.0)
+        logger.info(f"Worker {self.worker_id} triggered global pause")
+
+    async def continue_generation(self, obj: ContinueGenerationReqInput):
+        """Override to clear global pause state for all workers."""
+        self._set_global_pause(False)
+        async with self.is_pause_cond:
+            await self.send_to_scheduler.send_pyobj(obj)
+            self.is_pause_cond.notify_all()
+        logger.info(f"Worker {self.worker_id} cleared global pause")
+
+    async def generate_request(
+        self, obj: GenerateReqInput, request: Optional[fastapi.Request] = None
+    ):
+        """Override to check global pause state in addition to local state."""
+        if self.server_args.enable_dp_attention:
+            self._handle_dp_attention_encode_request(obj)
+        if self.server_args.language_only:
+            self._handle_epd_disaggregation_encode_request(obj)
+        if self.server_args.tokenizer_worker_num > 1:
+            self._attach_multi_http_worker_info(obj)
+
+        # Log the request
+        self.request_logger.log_received_request(obj, self.tokenizer, request)
+
+        # Check both local and global pause state
+        async with self.is_pause_cond:
+            await self.is_pause_cond.wait_for(
+                lambda: not self.is_pause and not self._is_globally_paused()
+            )
+
+        async with self.model_update_lock.reader_lock:
+            await self._validate_and_resolve_lora(obj)
+
+            # Tokenize the request and send it to the scheduler
+            if obj.is_single:
+                tokenized_obj = await self._tokenize_one_request(obj)
+                state = self.rid_to_state[obj.rid]
+                self._send_one_request(tokenized_obj)
+                async for response in self._wait_one_response(obj, state, request):
+                    yield response
+            else:
+                async for response in self._handle_batch_request(obj, request):
+                    yield response
 
     def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
 

@@ -1279,7 +1279,7 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        with self.device_module.StreamContext(self.schedule_stream):
+        with CudaStreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
     @DynamicGradMode()
