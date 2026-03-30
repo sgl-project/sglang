@@ -13,6 +13,7 @@ def main():
         "-m",
         "pytest",
         "-s",
+        "-v",
         "python/sglang/multimodal_gen/test/server/test_accuracy_1_gpu_a.py",
     ]
     raise SystemExit(subprocess.call(cmd, cwd=repo_root))
