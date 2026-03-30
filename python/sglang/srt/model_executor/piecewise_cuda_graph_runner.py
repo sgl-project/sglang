@@ -64,8 +64,9 @@ from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
 
-# These models consume `out_cache_loc` directly in model forward, so piecewise replay
-# must keep the captured static buffer shape instead of swapping in the runtime tensor.
+# These models consume `out_cache_loc` directly in model forward, so piecewise
+# replay must keep the captured static buffer shape instead of swapping in the
+# runtime tensor.
 _PCG_STATIC_OUT_CACHE_LOC_MODEL_TYPES = frozenset(
     {
         "BailingMoEForCausalLM",
@@ -176,11 +177,12 @@ class PiecewiseCudaGraphRunner:
         if self.model_runner.use_mla_backend:
             return True
 
+        language_model = getattr(
+            self.model_runner.model, "language_model", self.model_runner.model
+        )
         model_types = {
             type(self.model_runner.model).__name__,
-            type(
-                getattr(self.model_runner.model, "language_model", self.model_runner.model)
-            ).__name__,
+            type(language_model).__name__,
         }
         return any(
             model_type in _PCG_STATIC_OUT_CACHE_LOC_MODEL_TYPES
@@ -664,10 +666,11 @@ class PiecewiseCudaGraphRunner:
         if not use_runtime_out_cache_loc:
             buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
             if buffers.out_cache_loc_swa is not None:
+                translated_out_cache_loc_swa = self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
                 buffers.out_cache_loc_swa[: self.raw_num_tokens].copy_(
-                    self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
-                    )
+                    translated_out_cache_loc_swa
                 )
 
         if (
