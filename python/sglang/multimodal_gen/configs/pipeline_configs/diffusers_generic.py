@@ -116,7 +116,9 @@ class DiffusersI2MPipelineConfig(DiffusersGenericPipelineConfig):
     task_type: ModelTaskType = ModelTaskType.I2M
 
 
-DIFFUSERS_TASK_TYPE_TO_CONFIG: dict[ModelTaskType, type[DiffusersGenericPipelineConfig]] = {
+DIFFUSERS_TASK_TYPE_TO_CONFIG: dict[
+    ModelTaskType, type[DiffusersGenericPipelineConfig]
+] = {
     ModelTaskType.T2I: DiffusersGenericPipelineConfig,
     ModelTaskType.T2V: DiffusersT2VPipelineConfig,
     ModelTaskType.I2V: DiffusersI2VPipelineConfig,
