@@ -92,14 +92,13 @@ class DiffusionCudaGraphRunner:
         }
 
         # Build the callable that the graph will capture.
-        # ZImage expects hidden_states and encoder_hidden_states as
-        # List[Tensor]. We wrap the fixed-address buffer in a list
-        # each call. The list wrapper is transient Python overhead;
-        # the underlying tensor addresses are stable — which is what
-        # CUDA Graph cares about.
+        # Note: although ZImage's forward() signature declares
+        # hidden_states: List[torch.Tensor], the eager path in
+        # _predict_noise() passes a plain tensor (latent_model_input),
+        # not a list. We match that behavior here.
         def run_fn():
             return dit_forward_fn(
-                hidden_states=[latent_buffer],
+                hidden_states=latent_buffer,
                 timestep=timestep_buffer,
                 **static_kwargs,
             )
