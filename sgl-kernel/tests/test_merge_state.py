@@ -1,5 +1,6 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/55576c626421b5ee7e7ebe74afd26465c8ae863f/flashinfer/triton/kernels/cascade.py
 
+import sys
 from typing import List
 
 import pytest
@@ -139,4 +140,4 @@ def test_merge_state(seq_len, num_heads, head_dim):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

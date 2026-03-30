@@ -204,7 +204,16 @@ def encode_image_base64(image_path: Union[str, bytes]):
     elif isinstance(image_path, bytes):
         return pybase64.b64encode(image_path).decode("utf-8")
     else:
-        # image_path is PIL.WebPImagePlugin.WebPImageFile
+        import torch
+
+        if isinstance(image_path, torch.Tensor):
+            # Convert GPU-decoded image tensor (C, H, W) uint8 to PIL Image
+            from PIL import Image
+
+            tensor = image_path.cpu() if image_path.device.type != "cpu" else image_path
+            image_path = Image.fromarray(tensor.permute(1, 2, 0).numpy())
+
+        # image_path is a PIL Image
         image = image_path
         buffered = BytesIO()
         image.save(buffered, format="PNG")

@@ -713,7 +713,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("block_sparse_moe", prefix),
         )
 
         self.input_layernorm = RMSNorm(

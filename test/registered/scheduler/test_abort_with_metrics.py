@@ -18,7 +18,7 @@ from sglang.srt.utils.http_middleware_patch import _PureASGIDispatch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, suite="stage-a-cpu-only")
+register_cuda_ci(est_time=10, suite="stage-a-test-cpu")
 
 _HTTP_SCOPE = {
     "type": "http",
