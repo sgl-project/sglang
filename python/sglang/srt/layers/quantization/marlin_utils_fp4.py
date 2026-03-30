@@ -16,7 +16,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     should_use_atomic_add_reduce,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
-from sglang.srt.utils import get_device_capability, is_cuda
+from sglang.srt.utils import direct_register_custom_op, get_device_capability, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -138,6 +138,29 @@ def apply_fp4_marlin_linear(
         output.add_(bias)
 
     return output.reshape(out_shape)
+
+
+def fake_apply_fp4_marlin_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    bias: Optional[torch.Tensor] = None,
+    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+) -> torch.Tensor:
+    out_shape = input.shape[:-1] + (size_n,)
+    return torch.empty(out_shape, dtype=input.dtype, device=input.device)
+
+
+direct_register_custom_op(
+    op_name="apply_fp4_marlin_linear",
+    op_func=apply_fp4_marlin_linear,
+    mutates_args=[],
+    fake_impl=fake_apply_fp4_marlin_linear,
+)
 
 
 def prepare_fp4_layer_for_marlin(

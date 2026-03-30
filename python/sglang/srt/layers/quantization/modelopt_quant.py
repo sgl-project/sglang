@@ -40,6 +40,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_fp4_layer_for_marlin,
+    prepare_moe_fp4_layer_for_marlin,
+    should_use_fp4_marlin_fallback,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -1357,11 +1362,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-            prepare_fp4_layer_for_marlin,
-            should_use_fp4_marlin_fallback,
-        )
-
         if should_use_fp4_marlin_fallback():
             # Marlin FP4 fallback: consolidate global scale then repack weights
             weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
@@ -1477,11 +1477,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if layer.use_marlin_fallback:
-            from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-                apply_fp4_marlin_linear,
-            )
-
-            return apply_fp4_marlin_linear(
+            return torch.ops.sglang.apply_fp4_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -1545,9 +1541,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-            should_use_fp4_marlin_fallback,
-        )
 
         if should_use_fp4_marlin_fallback():
             logger.warning_once(
@@ -1720,10 +1713,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
         if self.use_marlin_fallback:
-            from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-                prepare_moe_fp4_layer_for_marlin,
-            )
-
             prepare_moe_fp4_layer_for_marlin(layer)
             return
 

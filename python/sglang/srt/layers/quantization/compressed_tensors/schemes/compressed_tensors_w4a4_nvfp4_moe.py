@@ -17,6 +17,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_moe_fp4_layer_for_marlin,
+    should_use_fp4_marlin_fallback,
+)
 from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
@@ -39,9 +43,6 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
 
     def __init__(self):
         self.group_size = 16
-        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-            should_use_fp4_marlin_fallback,
-        )
 
         if should_use_fp4_marlin_fallback():
             logger.warning_once(
@@ -188,10 +189,6 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         delattr(layer, "w2_weight_packed")
 
         if self.use_marlin_fallback:
-            from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-                prepare_moe_fp4_layer_for_marlin,
-            )
-
             # CompressedTensors checkpoint: global_scale is stored as the inverse.
             # Actual dequant scale = 1 / stored_value. We create w*_weight_scale_2
             # with the actual scale before calling prepare_moe_fp4_layer_for_marlin().

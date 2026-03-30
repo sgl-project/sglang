@@ -16,6 +16,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_fp4_layer_for_marlin,
+    should_use_fp4_marlin_fallback,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
@@ -92,11 +96,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         layer.register_parameter("input_global_scale", input_global_scale)
 
     def process_weights_after_loading(self, layer) -> None:
-        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-            prepare_fp4_layer_for_marlin,
-            should_use_fp4_marlin_fallback,
-        )
-
         if should_use_fp4_marlin_fallback():
             # Marlin FP4 fallback: consolidate global scale then repack weights
             global_scale = layer.weight_global_scale.max().to(torch.float32)
@@ -110,6 +109,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.use_marlin_fallback = True
             return
 
+        layer.use_marlin_fallback = False
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 
@@ -155,12 +155,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if getattr(layer, "use_marlin_fallback", False):
-            from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-                apply_fp4_marlin_linear,
-            )
-
-            return apply_fp4_marlin_linear(
+        if layer.use_marlin_fallback:
+            return torch.ops.sglang.apply_fp4_marlin_linear(
                 input=x,
                 weight=layer.weight_packed,
                 weight_scale=layer.weight_scale,

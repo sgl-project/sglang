@@ -93,6 +93,108 @@ class TestNvfp4MarlinLinear(CustomTestCase):
         self.assertEqual(output.shape, (M, N))
         self.assertEqual(output.dtype, self.dtype)
 
+    def test_fp4_marlin_numerical_correctness(self):
+        """Compare FP4 Marlin output against a BF16 dequantized reference."""
+        from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+            apply_fp4_marlin_linear,
+            prepare_fp4_layer_for_marlin,
+        )
+
+        N, K = 256, 256
+        M = 32
+
+        # FP4 E2M1 lookup table (nibble value → float)
+        FP4_E2M1_LUT = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        raw_weight = torch.randint(
+            0, 256, (N, K // 2), dtype=torch.uint8, device=self.device
+        )
+
+        # Dequantize FP4 to float for reference
+        lo = (raw_weight.int() & 0x0F).long()
+        hi = ((raw_weight.int() >> 4) & 0x0F).long()
+        dq_weight = torch.stack([FP4_E2M1_LUT[lo], FP4_E2M1_LUT[hi]], dim=-1).reshape(
+            N, K
+        )
+
+        # Per-group scale = 1.0 and global_scale = 1.0 for clean comparison
+        raw_scale = torch.full(
+            (N, K // 16), 1.0, dtype=torch.float8_e4m3fn, device=self.device
+        )
+        global_scale_val = torch.tensor(1.0, dtype=torch.float32, device=self.device)
+
+        # Reference: fp4_dequant * per_group_scale(=1) * global_scale(=1)
+        x = torch.randn(M, K, dtype=self.dtype, device=self.device)
+        ref_output = (x.float() @ dq_weight.T).to(self.dtype)
+
+        # Build a fake layer and run through the Marlin pipeline
+        layer = self._make_fake_fp4_layer(N, K)
+        layer.weight = torch.nn.Parameter(raw_weight, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(raw_scale, requires_grad=False)
+        layer.weight_scale_2_marlin = torch.nn.Parameter(
+            global_scale_val.to(self.dtype), requires_grad=False
+        )
+
+        prepare_fp4_layer_for_marlin(
+            layer,
+            weight_attr="weight",
+            weight_scale_attr="weight_scale",
+            weight_global_scale_attr="weight_scale_2_marlin",
+        )
+
+        marlin_output = apply_fp4_marlin_linear(
+            input=x,
+            weight=layer.weight,
+            weight_scale=layer.weight_scale,
+            weight_global_scale=layer.weight_scale_2_marlin,
+            workspace=layer.marlin_workspace,
+            size_n=N,
+            size_k=K,
+        )
+
+        self.assertEqual(marlin_output.shape, ref_output.shape)
+        self.assertEqual(marlin_output.dtype, ref_output.dtype)
+
+        cos_sim = torch.nn.functional.cosine_similarity(
+            marlin_output.float().flatten(), ref_output.float().flatten(), dim=0
+        )
+        self.assertGreater(
+            cos_sim.item(),
+            0.99,
+            f"Cosine similarity {cos_sim.item():.6f} too low; "
+            "Marlin output diverges from BF16 dequant reference.",
+        )
+
+    def test_fp4_marlin_custom_op_registration(self):
+        """Verify apply_fp4_marlin_linear is registered as torch.ops.sglang for PCG."""
+        import sglang.srt.layers.quantization.marlin_utils_fp4  # noqa: F401
+
+        self.assertTrue(
+            hasattr(torch.ops.sglang, "apply_fp4_marlin_linear"),
+            "apply_fp4_marlin_linear not registered as a custom op",
+        )
+
     def test_nvfp4_marlin_process_scales(self):
         """Test that scale conversion functions produce non-NaN outputs."""
         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
