@@ -684,8 +684,20 @@ class PiecewiseCudaGraphRunner:
 
         next_token_logits_buffer = None
 
+        # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1) doesn't fail on MIXED=3.
+        pcg_forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.forward_mode == ForwardMode.MIXED
+            else forward_batch.forward_mode
+        )
+        pcg_global_forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.global_forward_mode == ForwardMode.MIXED
+            else forward_batch.global_forward_mode
+        )
+
         static_forward_batch = ForwardBatch(
-            forward_mode=forward_batch.forward_mode,
+            forward_mode=pcg_forward_mode,
             batch_size=bs,
             input_ids=input_ids,
             input_embeds=input_embeds,
@@ -724,7 +736,7 @@ class PiecewiseCudaGraphRunner:
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=forward_batch.num_token_non_padded,
             num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
-            global_forward_mode=forward_batch.global_forward_mode,
+            global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
@@ -745,9 +757,13 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+        num_tokens = len(forward_batch.input_ids)
+        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
+        static_num_tokens = self.capture_num_tokens[index]
         with enable_piecewise_cuda_graph():
-            # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # Prepare static buffers first so set_forward_context can carry num_tokens
+            # into call_begin_forward (via ForwardContext.num_tokens), eliminating the
+            # need for a separate global and allowing pre-calculation of dummy-page count.
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
             with set_forward_context(
@@ -756,7 +772,10 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                num_tokens=static_num_tokens,
             ):
+                # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
+                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,
