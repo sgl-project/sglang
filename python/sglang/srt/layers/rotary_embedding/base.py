@@ -15,6 +15,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_mps,
     is_musa,
     is_npu,
     is_xpu,
@@ -31,12 +32,18 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_is_mps = is_mps()
 
 if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
 
 if _is_npu:
     import torch_npu
+
+if _is_hip:
+    from sglang.srt.layers.attention.utils import (
+        fused_qk_rope_reshape_and_cache,
+    )
 
 
 class RotaryEmbedding(MultiPlatformOp):
@@ -70,11 +77,12 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_xpu)
             and not (_is_npu)
             and not (_is_musa)
+            and not (_is_mps)
         ):
-            # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
+            # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
             if _is_cuda:
-                from sglang.jit_kernel.pos_enc import rotary_embedding
+                from sglang.jit_kernel.rope import rotary_embedding
             elif _is_hip:
                 from sgl_kernel import rotary_embedding
             else:
@@ -284,7 +292,7 @@ class RotaryEmbedding(MultiPlatformOp):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
-        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
@@ -302,18 +310,48 @@ class RotaryEmbedding(MultiPlatformOp):
                 fused_args=fused_set_kv_buffer_arg,
             )
         else:
-            assert (
-                fused_set_kv_buffer_arg is None
-            ), "save kv cache is not supported for fallback_rotary_embedding."
-            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            self.fallback_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+
+            if fused_set_kv_buffer_arg is not None and _is_hip:
+                extra_args = fused_set_kv_buffer_arg
+
+                k_cache_shape = fused_set_kv_buffer_arg["key_cache"].shape
+                qk_head_dim = k_cache_shape[-1]
+                tp_k_head_num = k_cache_shape[-2]
+
+                key = key.view(-1, tp_k_head_num, qk_head_dim)
+
+                tokens = key.shape[0]
+
+                query = query.view(tokens, -1, qk_head_dim)
+
+                query, key, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                    q=query,
+                    k=key,
+                    pos=positions,
+                    cos_sin=self.cos_sin_cache,
+                    is_neox=self.is_neox_style,
+                    flash_layout=True,
+                    offs=None,
+                    q_out=query,
+                    k_out=key,
+                    output_zeros=False,
+                    **extra_args,
+                )
+            else:
+                assert (
+                    fused_set_kv_buffer_arg is None
+                ), "save kv cache is not supported for fallback_rotary_embedding."
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
+                self.fallback_rotary_embedding(
+                    positions,
+                    query,
+                    key,
+                    self.head_size,
+                    self.cos_sin_cache,
+                    self.is_neox_style,
+                )
         return query, key
 
     def extra_repr(self) -> str:

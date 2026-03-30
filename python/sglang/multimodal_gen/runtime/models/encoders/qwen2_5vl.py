@@ -64,6 +64,7 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VisionRotaryEmbedding,
     Qwen2_5_VisionTransformerPretrainedModel,
     Qwen2_5_VLAttention,
     Qwen2_5_VLCausalLMOutputWithPast,
@@ -515,6 +516,17 @@ class Qwen2_5_VLModel(nn.Module):
                 config.vision_config
             )
             self.visual.to(torch.get_default_dtype())
+            # keeps the vision rotary frequencies in fp32 even when weights are bf16 (as HF does)
+            head_dim = (
+                config.vision_config.hidden_size // config.vision_config.num_heads
+            )
+            rotary_dim = head_dim // 2
+            inv_freq = Qwen2_5_VisionRotaryEmbedding(rotary_dim).inv_freq
+            self.visual.rotary_pos_emb.register_buffer(
+                "inv_freq",
+                inv_freq,
+                persistent=False,
+            )
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
         # Initialize weights and apply final processing
@@ -798,6 +810,11 @@ class Qwen2_5_VLModel(nn.Module):
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if not isinstance(image_embeds, torch.Tensor):
+            # In transformers v5, the visual encoder returns BaseModelOutputWithPooling.
+            # pooler_output contains the spatially merged embeddings (what we need),
+            # while last_hidden_state contains the raw unmerged output.
+            image_embeds = image_embeds.pooler_output
         split_sizes = (
             image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
         ).tolist()

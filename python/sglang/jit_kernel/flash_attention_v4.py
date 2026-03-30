@@ -4,8 +4,10 @@ from typing import Callable, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernel_api_logging import debug_kernel_api
+
 try:
-    from sgl_fa4.cute import flash_attn_varlen_func as _flash_attn_varlen_func
+    from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
 except Exception as _e:  # pragma: no cover
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
@@ -17,6 +19,7 @@ def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+@debug_kernel_api
 def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -44,7 +47,7 @@ def flash_attn_varlen_func(
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
             "Vendored FlashAttention CUTE is not available (cannot import "
-            "sgl_fa4.cute). Please check your source tree."
+            "flash_attn.cute). Please check your source tree."
         ) from _flash_attn_import_error
 
     q, k, v = [_maybe_contiguous(t) for t in (q, k, v)]
@@ -89,6 +92,7 @@ def flash_attn_varlen_func(
     return result
 
 
+@debug_kernel_api
 def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,

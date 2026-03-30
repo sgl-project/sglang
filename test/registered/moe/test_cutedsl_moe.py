@@ -4,9 +4,9 @@ from typing import Callable
 
 import torch
 from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
-from sgl_kernel import scaled_fp4_quant
 from torch.nn import functional as F
 
+from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts

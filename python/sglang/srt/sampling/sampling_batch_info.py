@@ -191,6 +191,12 @@ class SamplingBatchInfo:
     def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
         pass
 
+    # placeholder for override
+    def adjusted_filter_batch(
+        self, keep_indices: List[int], keep_indices_device: torch.Tensor
+    ):
+        pass
+
     def __len__(self):
         return len(self.temperatures)
 
@@ -266,6 +272,8 @@ class SamplingBatchInfo:
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
+
+        self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor

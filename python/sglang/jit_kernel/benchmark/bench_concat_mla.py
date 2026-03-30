@@ -6,13 +6,16 @@ import triton.testing
 from sgl_kernel import concat_mla_absorb_q as aot_absorb_q
 from sgl_kernel import concat_mla_k as aot_k
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.concat_mla import concat_mla_absorb_q as jit_absorb_q
 from sglang.jit_kernel.concat_mla import concat_mla_k as jit_k
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.utils import is_in_ci
+
+register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 IS_CI = is_in_ci()
 
-# Constants
 NUM_LOCAL_HEADS = 128
 QK_NOPE_HEAD_DIM = 128
 QK_ROPE_HEAD_DIM = 64
@@ -109,9 +112,7 @@ def bench_concat_mla_k(num_tokens: int, provider: str):
         "torch": torch_concat_mla_k,
     }
     fn = lambda: FN_MAP[provider](k, k_nope, k_rope)
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if IS_CI:
@@ -153,9 +154,7 @@ def bench_concat_mla_absorb_q(dim_0: int, dim_1: int, provider: str):
         }
         fn = lambda: FN_MAP[provider](a, b)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":

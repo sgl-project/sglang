@@ -209,7 +209,7 @@ class NightlyBenchmarkRunner:
             )
 
             # Note: JSON files are preserved for metrics collection by CI scripts
-            # They will be collected by scripts/ci/save_metrics.py
+            # They will be collected by scripts/ci/utils/save_metrics.py
 
             return benchmark_results, True
 
