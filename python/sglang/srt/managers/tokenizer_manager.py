@@ -32,6 +32,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import pybase64
 import uvloop
 import zmq
 import zmq.asyncio
@@ -49,7 +50,6 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
     BatchEmbeddingOutput,
-    BatchMultimodalOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -132,12 +132,15 @@ class ReqState:
     finished: bool
     event: asyncio.Event
     obj: Union[GenerateReqInput, EmbeddingReqInput]
+
+    # For performance metrics
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
     # For streaming output
     last_output_offset: int = 0
+    last_text_offset: int = 0
 
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
@@ -212,11 +215,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Init PD disaggregation and encoder disaggregation
         self.init_disaggregation()
 
+        # Subprocess liveness watchdog — set by Engine or http_server after construction
+        self._subprocess_watchdog = None
+
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
-
-        if self.enable_metrics:
-            start_cpu_monitor_thread("tokenizer")
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -230,7 +233,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.served_model_name = server_args.served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
-        self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
@@ -338,10 +340,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.gracefully_exit = False
         self.last_receive_tstamp = real_time()
 
-        # For load balancing
-        self.current_load = 0
-        self.current_load_lock = asyncio.Lock()
-
         # Session
         self.session_futures = {}  # session_id -> asyncio event
 
@@ -440,6 +438,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
 
+            start_cpu_monitor_thread("tokenizer")
+
         if self.server_args.gc_warning_threshold_secs > 0.0:
             configure_gc_warning(self.server_args.gc_warning_threshold_secs)
         self.soft_watchdog = Watchdog.create(
@@ -457,7 +457,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         BatchStrOutput,
                         BatchEmbeddingOutput,
                         BatchTokenIDOutput,
-                        BatchMultimodalOutput,
                     ),
                     self._handle_batch_output,
                 ),
@@ -488,7 +487,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
-        self._validate_rid(obj)
+        self._validate_rid_not_in_flight(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
@@ -770,20 +769,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
 
-    def _validate_rid(self, obj: Union[GenerateReqInput, EmbeddingReqInput]) -> None:
-        """Validate the request ID (rid) uniqueness."""
-        rid = obj.rid
-        if rid is None:
+    def _validate_rid_not_in_flight(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        """Validate that request IDs are not already in flight."""
+        if obj.rid is None:
             return
-        ids = rid if isinstance(rid, list) else [rid]
-        if len(ids) != len(set(ids)):
-            raise ValueError(
-                f"Duplicate request IDs detected within the request: {ids}"
-            )
-
-        for i in ids:
-            if i in self.rid_to_state:
-                raise ValueError(f"Duplicate request ID detected: {i}")
+        rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
+        conflicts = set(rids) & self.rid_to_state.keys()
+        if conflicts:
+            raise ValueError(f"Duplicate request IDs detected: {list(conflicts)}")
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -1147,89 +1142,108 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     )
                 continue
 
-            # Drain all pending outputs atomically. For streaming, every
-            # chunk must be yielded to avoid dropping token deltas. For
-            # non-streaming only the latest cumulative output matters.
-            pending = state.out_list if is_stream else state.out_list[-1:]
+            # Drain all pending outputs atomically.
+            # With incremental streaming output, each chunk carries only a
+            # delta, so every queued chunk must be yielded to avoid dropping
+            # token ids. Without it, outputs are cumulative and only the
+            # latest chunk contains the full result, so we can safely skip
+            # intermediate ones.
+            incremental_stream = (
+                is_stream and self.server_args.incremental_streaming_output
+            )
+            out_list = state.out_list
             state.out_list = []
             finished = state.finished
             state.event.clear()
 
-            for i, out in enumerate(pending):
-                is_last = i == len(pending) - 1
-
-                if finished and is_last:
-                    # For non-streaming cases, response has not been sent yet (`response_sent_to_client_time` has not been set yet).
-                    # Record response sent time right before we log finished results and metrics.
-                    if not state.time_stats.response_sent_to_client_time:
-                        state.time_stats.set_response_sent_to_client_time()
-                        out["meta_info"][
-                            "response_sent_to_client_ts"
-                        ] = state.time_stats.get_response_sent_to_client_realtime()
-                    self.request_logger.log_finished_request(
-                        obj,
-                        out,
-                        is_multimodal_gen=self.model_config.is_multimodal_gen,
-                        request=request,
+            if incremental_stream and len(out_list) > 1:
+                if len(out_list) >= 20:
+                    logger.warning(
+                        "Streaming backlog: rid=%s, coalescing %d queued chunks into one. "
+                        "This may inflate P99 ITL for affected requests.",
+                        obj.rid,
+                        len(out_list),
                     )
-
-                    if self.request_metrics_exporter_manager.exporter_enabled():
-                        # Asynchronously write metrics for this request using the exporter manager.
-                        asyncio.create_task(
-                            self.request_metrics_exporter_manager.write_record(obj, out)
-                        )
-
-                    # Check if this was an abort/error created by scheduler
-                    if isinstance(out["meta_info"].get("finish_reason"), dict):
-                        finish_reason = out["meta_info"]["finish_reason"]
-                        if (
-                            finish_reason.get("type") == "abort"
-                            and finish_reason.get("status_code")
-                            == HTTPStatus.BAD_REQUEST
-                        ):
-                            if not is_stream:
-                                raise ValueError(finish_reason["message"])
-                            else:
-                                yield out
-                                break
-
-                        if finish_reason.get("type") == "abort" and finish_reason.get(
-                            "status_code"
-                        ) in (
-                            HTTPStatus.SERVICE_UNAVAILABLE,
-                            HTTPStatus.INTERNAL_SERVER_ERROR,
-                        ):
-                            # This is an abort request initiated by scheduler.
-                            # Delete the key to prevent resending abort request to the scheduler and
-                            # to ensure aborted request state is cleaned up.
-                            if state.obj.rid in self.rid_to_state:
-                                del self.rid_to_state[state.obj.rid]
-
-                            # Mark ongoing LoRA request as finished.
-                            if self.server_args.enable_lora and state.obj.lora_path:
-                                await self.lora_registry.release(state.obj.lora_id)
-                            if not is_stream:
-                                raise fastapi.HTTPException(
-                                    status_code=finish_reason["status_code"],
-                                    detail=finish_reason["message"],
-                                )
-                            else:
-                                yield out
-                                break
-                    yield out
-                    break
-
-                if is_stream:
-                    # Record response sent time right before we send response.
-                    if not state.time_stats.response_sent_to_client_time:
-                        state.time_stats.set_response_sent_to_client_time()
-                        out["meta_info"][
-                            "response_sent_to_client_ts"
-                        ] = state.time_stats.get_response_sent_to_client_realtime()
-                    yield out
+                # Coalesce all deltas into a single chunk. Both text and
+                # output_ids are incremental, so we concatenate them; all
+                # other fields (meta_info, etc.) are taken from the last chunk.
+                out = dict(out_list[-1])
+                if "output_ids" in out:
+                    out["output_ids"] = [
+                        id for chunk in out_list for id in chunk["output_ids"]
+                    ]
+                if "text" in out:
+                    out["text"] = "".join(chunk["text"] for chunk in out_list)
+            else:
+                out = out_list[-1]
 
             if finished:
+                # For non-streaming cases, response has not been sent yet (`response_sent_to_client_time` has not been set yet).
+                # Record response sent time right before we log finished results and metrics.
+                if not state.time_stats.response_sent_to_client_time:
+                    state.time_stats.set_response_sent_to_client_time()
+                    out["meta_info"][
+                        "response_sent_to_client_ts"
+                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                self.request_logger.log_finished_request(
+                    obj,
+                    out,
+                    request=request,
+                )
+
+                if self.request_metrics_exporter_manager.exporter_enabled():
+                    # Asynchronously write metrics for this request using the exporter manager.
+                    asyncio.create_task(
+                        self.request_metrics_exporter_manager.write_record(obj, out)
+                    )
+
+                # Check if this was an abort/error created by scheduler
+                if isinstance(out["meta_info"].get("finish_reason"), dict):
+                    finish_reason = out["meta_info"]["finish_reason"]
+                    if (
+                        finish_reason.get("type") == "abort"
+                        and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
+                    ):
+                        if not is_stream:
+                            raise ValueError(finish_reason["message"])
+                        else:
+                            yield out
+                            break
+
+                    if finish_reason.get("type") == "abort" and finish_reason.get(
+                        "status_code"
+                    ) in (
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                    ):
+                        # This is an abort request initiated by scheduler.
+                        # Delete the key to prevent resending abort request to the scheduler and
+                        # to ensure aborted request state is cleaned up.
+                        if state.obj.rid in self.rid_to_state:
+                            del self.rid_to_state[state.obj.rid]
+
+                        # Mark ongoing LoRA request as finished.
+                        if self.server_args.enable_lora and state.obj.lora_path:
+                            await self.lora_registry.release(state.obj.lora_id)
+                        if not is_stream:
+                            raise fastapi.HTTPException(
+                                status_code=finish_reason["status_code"],
+                                detail=finish_reason["message"],
+                            )
+                        else:
+                            yield out
+                            break
+                yield out
                 break
+
+            if is_stream:
+                # Record response sent time right before we send response.
+                if not state.time_stats.response_sent_to_client_time:
+                    state.time_stats.set_response_sent_to_client_time()
+                    out["meta_info"][
+                        "response_sent_to_client_ts"
+                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                yield out
 
             if not is_stream:
                 if (
@@ -1517,7 +1531,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         recv_obj: Union[
             BatchStrOutput,
             BatchEmbeddingOutput,
-            BatchMultimodalOutput,
             BatchTokenIDOutput,
         ],
     ):
@@ -1574,7 +1587,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
-                meta_info["routed_experts"] = recv_obj.routed_experts[i]
+                routed_experts_tensor = recv_obj.routed_experts[i]
+                if routed_experts_tensor is not None:
+                    meta_info["routed_experts"] = pybase64.b64encode(
+                        routed_experts_tensor.numpy().tobytes()
+                    ).decode("utf-8")
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
@@ -1589,12 +1606,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
+                    output_text = state.text[state.last_text_offset :]
+                    state.last_text_offset = len(state.text)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids.copy()
+                    output_text = state.text
 
                 out_dict = {
-                    "text": state.text,
+                    "text": output_text,
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
@@ -1613,8 +1633,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
-            elif isinstance(recv_obj, BatchMultimodalOutput):
-                raise NotImplementedError("BatchMultimodalOut not implemented")
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
@@ -1883,7 +1901,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         recv_obj: Union[
             BatchStrOutput,
             BatchEmbeddingOutput,
-            BatchMultimodalOutput,
             BatchTokenIDOutput,
         ],
         i: int,
@@ -2289,14 +2306,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         external_trace_header = None
         if self.server_args.enable_trace:
-            if request:
-                external_trace_header = extract_trace_headers(request.headers)
-                obj.external_trace_header = external_trace_header
-            elif obj.external_trace_header:
-                # When the request comes form the rust grpc server or Engine there isn't a
+            if obj.external_trace_header:
+                # When the request comes from the rust grpc server or Engine there isn't a
                 # real request object but we still need to propagate the trace context from
                 # the trace context that is explicitly passed in
                 external_trace_header = obj.external_trace_header
+            elif request:
+                external_trace_header = extract_trace_headers(request.headers)
+                obj.external_trace_header = external_trace_header
 
         if not hasattr(obj, "is_single") or obj.is_single:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
@@ -2393,7 +2410,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         recv_obj: Union[
             BatchStrOutput,
             BatchEmbeddingOutput,
-            BatchMultimodalOutput,
             BatchTokenIDOutput,
         ],
         i: int,
@@ -2539,6 +2555,10 @@ class SignalHandler:
         logger.error(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
+        # Stop subprocess watchdog before killing processes to prevent false-positive
+        # crash detection during normal shutdown
+        if self.tokenizer_manager._subprocess_watchdog is not None:
+            self.tokenizer_manager._subprocess_watchdog.stop()
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())
 
