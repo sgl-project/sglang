@@ -13,11 +13,8 @@
   - [1.2 CUDA Kernel 分类分析](#12-cuda-kernel-分类分析)
   - [1.3 DiT Denoising 细粒度 Kernel 分解](#13-dit-denoising-细粒度-kernel-分解)
   - [1.4 关键发现](#14-关键发现)
-- [2. 优化 #1：TextEncoder FP32 → BF16](#2-优化-1textencoder-fp32--bf16)
-  - [2.1 方法与结果](#21-方法与结果)
-  - [2.2 Kernel 级验证](#22-kernel-级验证)
-  - [2.3 瓶颈转移](#23-瓶颈转移)
-- [3. 优化 #2：DiT FP8 量化](#3-优化-2dit-fp8-量化)
+- [2. 关于 TextEncoder 精度的说明](#2-关于-textencoder-精度的说明)
+- [3. 优化 #1：DiT FP8 量化](#3-优化-1dit-fp8-量化)
   - [3.1 量化方案设计](#31-量化方案设计)
   - [3.2 FP8 三层 Bug 修复](#32-fp8-三层-bug-修复)
   - [3.3 FP8 实测结果与根因分析](#33-fp8-实测结果与根因分析)
@@ -63,30 +60,29 @@
 
 ### 1.1 E2E 时延分解
 
-**Baseline**: 1 GPU, FP32 TextEncoder, 256×256, E2E = 362ms
+**Baseline**: 1 GPU, BF16 TextEncoder（ZImage 默认配置）, 256×256, E2E = 332ms
 
 | Stage | Time (ms) | 占比 | 说明 |
 |-------|-----------|------|------|
-| TextEncodingStage | 81 | 22.4% | Qwen3 text encoder |
-| DenoisingStage | 269 | 74.3% | **#1 瓶颈** — 9 steps, ~33ms/step |
-| DecodingStage | 10 | 2.7% | VAE decoder |
+| TextEncodingStage | 51 | 15.4% | Qwen3 text encoder (BF16) |
+| DenoisingStage | 268 | 80.7% | **#1 瓶颈** — 9 steps, ~33ms/step |
+| DecodingStage | 10 | 3.0% | VAE decoder |
 
-> 注：早期 profile（FP32 TextEncoder 未配置 bf16 CLI flag 的旧基准）中 TextEncoder 占比更高（62%），因旧版本 TextEncoder 以 FP32 运行。当前基准（benchmark JSON）中 TextEncoder 已默认优化。
+> 注：ZImage pipeline config 默认 `text_encoder_precisions: ("bf16",)`（zimage.py 第 49 行），TextEncoder 始终以 BF16 运行。早期报告中的"FP32 TextEncoder"数据来自旧版 sglang 的通用基准（base.py 默认 `("fp32",)`），不适用于 ZImage。本报告所有 baseline 数据均基于 ZImage 默认配置（BF16 TextEncoder）。
 
 ![Pipeline Breakdown](01_pipeline_and_kernel_breakdown.png)
 
 ### 1.2 CUDA Kernel 分类分析
 
-**Total GPU kernel time: 474ms (Torch Profiler, FP32 baseline)**
+**Total GPU kernel time: ~341ms (Torch Profiler, BF16 baseline)**
 
 | Category | Time (ms) | % | 说明 |
 |----------|-----------|---|------|
-| BF16 GEMM (DiT) | 251.0 | 53.0% | 优化目标 #2 (FP8) |
-| FP32 GEMM (TextEncoder) | 156.6 | 33.0% | **优化目标 #1** (FP32→BF16) |
-| Elementwise Ops | 21.1 | 4.4% | |
-| Convolution (VAE) | 12.6 | 2.6% | |
-| FlashAttention | 9.7 | 2.1% | 短序列(768 tokens), 非瓶颈 |
-| RMSNorm / QKNorm | 5.7 | 1.2% | |
+| BF16 GEMM (DiT + TE) | 279.6 | 81.8% | **优化目标** (FP8) |
+| Elementwise Ops | 18.2 | 5.3% | |
+| Convolution (VAE) | 12.6 | 3.7% | |
+| FlashAttention | 10.7 | 3.1% | 短序列(768 tokens), 非瓶颈 |
+| RMSNorm / QKNorm | 5.7 | 1.7% | |
 
 ![GEMM Breakdown](04_fp32_vs_bf16_gemm.png)
 
@@ -112,59 +108,27 @@
 
 ### 1.4 关键发现
 
-1. **GEMM 占 91.5%** GPU kernel 时间（TextEncoder FP32 GEMM + DiT BF16 GEMM）
-2. **FlashAttention 仅 2.1%** — 短序列(768 tokens)下 attention 非瓶颈
+1. **GEMM 占 ~82%** GPU kernel 时间（DiT BF16 GEMM + TextEncoder BF16 GEMM）
+2. **FlashAttention 仅 3.1%** — 短序列(768 tokens)下 attention 非瓶颈
 3. **torch.compile 导致严重回退** — 256×256 下 +48%，Triton kernel 在小矩阵上比 cuBLAS/nvJET 慢
 4. **2-GPU SP 无收益** — 768 tokens 太短，通信开销 > 并行收益
 5. **Cache-DiT 默认配置效果有限** — 9 步仅 1 步命中缓存
 
 ---
 
-## 2. 优化 #1：TextEncoder FP32 → BF16
+## 2. 关于 TextEncoder 精度的说明
 
-### 2.1 方法与结果
+> ⚠️ **勘误**：早期报告（及部分图表）中记录了"FP32 TextEncoder → BF16"的优化步骤，这基于旧版 sglang-diffusion 的通用默认配置（`base.py` 第 195 行 `text_encoder_precisions: ("fp32",)`）。但 **ZImage 的 pipeline config 从一开始就将 text encoder 默认为 BF16**（`zimage.py` 第 49 行 `text_encoder_precisions: ("bf16",)`），因此 ZImage 模型从未以 FP32 TextEncoder 运行。
+>
+> 早期报告中的 FP32 数据（E2E=362ms、TextEnc=81ms）**不是 ZImage 的真实 baseline**，仅反映旧版 sglang 的通用配置行为。本报告的所有 baseline 数据已更正为 ZImage 默认配置（BF16 TextEncoder），来源为 `zimage_bench/*/baseline_1gpu.json`。
+>
+> Section 1 中引用的图表（`01_pipeline_and_kernel_breakdown.png`、`04_fp32_vs_bf16_gemm.png`、`07_bottleneck_shift_before_after.png`、`08_kernel_comparison_fp32_vs_bf16.png`）是基于早期旧基准生成的，其中包含 FP32 TextEncoder 的数据，**仅供历史参考，不代表 ZImage 的实际优化路径**。
 
-**方法**：`--text-encoder-precisions bf16`（零代码修改，CLI flag）
-
-| 指标 | FP32 Baseline | BF16 TextEnc | 变化 |
-|------|:---:|:---:|:---:|
-| **E2E** | 362ms | **332ms** | **-8.3%** |
-| TextEncoding | 81ms | 53ms | -34.6% |
-| Denoising | 269ms | 267ms | 不变 |
-| Peak VRAM | 20,167MB | 20,167MB | 不变 |
-
-> 注：在更早期的旧基准中（TextEncoder 默认 FP32 运行），BF16 带来了 35% 加速（749ms→486ms）。当前 benchmark 基准中 TextEncoder 耗时已较低。
-
-### 2.2 Kernel 级验证
-
-**Total GPU kernel time: 474.0ms (FP32) → 341.7ms (BF16) = -132.4ms (-27.9%)**
-
-| Kernel Category | FP32 (ms) | BF16 (ms) | Delta | 说明 |
-|----------------|-----------|-----------|-------|------|
-| BF16 GEMM (DiT) | 251.0 | 279.6 | +28.5ms | TE GEMM 转为 BF16 nvjet |
-| **FP32 GEMM (TE)** | **156.6** | **0.2** | **-156.4ms** | **消除** |
-| Elementwise | 21.1 | 18.2 | -2.9ms | 少了 FP32 cast |
-| FlashAttention | 9.7 | 10.7 | +1.0ms | TE 注意力转 BF16 |
-| LayerNorm | 1.2 | 0.1 | -1.1ms | FP32 LayerNorm 消除 |
-
-核心：**156.6ms FP32 GEMM 被替换为 ~28.5ms BF16 nvjet GEMM（5.5× 加速）**。
-
-![Kernel Comparison](08_kernel_comparison_fp32_vs_bf16.png)
-
-### 2.3 瓶颈转移
-
-BF16 优化后瓶颈从 TextEncoding 转移到 Denoising：
-
-| Stage | 优化前 | 优化后 | 占比变化 |
-|-------|--------|--------|----------|
-| TextEncoding | 62.1% | 41.4% | ↓ |
-| **Denoising** | 35.9% | **55.9%** | **↑ 成为新瓶颈** |
-
-![Bottleneck Shift](07_bottleneck_shift_before_after.png)
+**ZImage 的实际优化起点**是 BF16 TextEncoder baseline，直接进入 DiT FP8 量化（Section 3）。
 
 ---
 
-## 3. 优化 #2：DiT FP8 量化
+## 3. 优化 #1：DiT FP8 量化
 
 ### 3.1 量化方案设计
 
@@ -220,14 +184,15 @@ BF16 优化后瓶颈从 TextEncoding 转移到 Denoising：
 
 > 256×256 下 FP8 **未加速反而略慢**，但 VRAM 节省 28%。
 
-**nsys Kernel 级根因**：
+**nsys Kernel 级根因（早期含 warmup 的 profile）**：
 
 | 指标 | BF16 nvjet | FP8 DeepGemm | FP8 CUTLASS |
 |------|:---:|:---:|:---:|
 | DiT GEMM 计算 | 260.0ms | **171.8ms** ✅ | 238.8ms |
-| transpose 开销 | 0ms | **+139.8ms** ❌ | 0ms |
 | 量化开销 | 0ms | +11.8ms | +16.2ms |
-| **GEMM 总计** | **260.0ms** | **323.4ms** | **255.0ms** |
+| **GEMM 总计** | **260.0ms** | **183.6ms** | **255.0ms** |
+
+> ⚠️ **勘误**：此表数据来自早期**未排除 warmup** 的 nsys profile。原版本包含 139.8ms transpose 开销，后经 Section 10 的 no-warmup 精确分析证明该 transpose 仅发生在 DeepGemm JIT 编译的 warmup 阶段（weight scale 预处理），推理阶段无 transpose 开销。上表已移除 transpose 行。正确的推理阶段 kernel 数据见 Section 10。
 
 ### 3.4 CUTLASS vs DeepGemm vs BF16 对比
 
@@ -240,39 +205,24 @@ BF16 优化后瓶颈从 TextEncoding 转移到 Denoising：
 | FFN w2 | 768×10240×3840 | 175 | **120** | ~117 | **1.46×** |
 | **DiT 合计** | — | **260.0ms** | **171.8ms** | **238.8ms** | **1.51×** |
 
-> **DeepGemm GEMM 计算快 1.51×**，但 139.8ms transpose 抵消了全部加速。
-> **CUTLASS FP8 无 transpose**，总时间 255ms，比 BF16 略快 2%（-5ms）。
+> **DeepGemm GEMM 计算快 1.51×**（早期含 warmup 数据；Section 10 no-warmup 数据显示 ~1.9× 加速）。
 
-### 3.5 DeepGemm Transpose 开销分析
+### 3.5 早期 Transpose 开销分析（已证伪）
 
-**根因**：Hopper SM90 TMA 硬件要求 block scale 以列优先、16-byte 对齐存储。DeepGemm 在**每次** GEMM 调用时都对 weight scale 和 activation scale 做 transpose。
-
-| 指标 | 值 |
-|------|---:|
-| Transpose 总时间 | **139.8ms** |
-| GEMM 计算总时间 | 171.8ms |
-| Transpose / GEMM | **81%** |
-| Transpose kernel launch 次数 | **49,152** |
-| GEMM kernel launch 次数 | 2,040 |
-
-**FP8 时间收支**：
-
-| 组件 | 时间 | 说明 |
-|------|------|------|
-| BF16 nvjet GEMM（被替换） | 260.0ms | 参照 |
-| FP8 DeepGemm GEMM 计算 | 171.8ms | 快了 88.2ms ✅ |
-| FP8 DeepGemm transpose | **+139.8ms** | **回吐所有加速** ❌ |
-| FP8 量化开销 | +11.8ms | 可接受 |
-| **FP8 总计** | **323.4ms** | **比 BF16 慢 63.4ms** |
-
-> **结论**：如能消除 transpose，FP8 DiT GEMM 从 260ms 降至 ~184ms，实现 **1.42× 加速**。
+> ⚠️ **已证伪**：本节原记录了 139.8ms transpose 开销，认为是 FP8 DeepGemm 在推理阶段的主要瓶颈。Section 10 的 `cudaProfilerStart()`/`cudaProfilerStop()` 精确框选推理区间的 nsys 分析证明：**该 transpose 仅发生在 DeepGemm JIT 编译（warmup）阶段**，用于将 weight scale 从行优先转为 Hopper TMA 要求的列优先格式。推理阶段 scale 已预处理完毕，无额外 transpose。
+>
+> 早期 profile 观察到 transpose 的原因是 nsys 录制范围包含了 JIT warmup，未使用 CUDA Profiler API 排除。这一误导性结论促使了后续的 no-warmup 精细分析（Section 10），最终定位到真正的 E2E 瓶颈——host-side dispatch 开销（Section 11 CUDA Graph 解决）。
+>
+> **原始数据（仅供历史参考）**：Transpose 总时间 139.8ms，49,152 次 kernel launch，GEMM 计算 171.8ms — 均为 warmup 阶段数据。
 
 ---
 
 ## 4. 多分辨率全面 Benchmark
 
 > **测试时间**：2026-03-23 | **硬件**：1×H20 / 2×H20 (Ulysses SP)
-> **配置**：8 种优化组合 × 3 种分辨率 = 24 次测试
+> **配置**：多种优化组合 × 3 种分辨率
+>
+> 注：Baseline 为 ZImage 默认配置（BF16 TextEncoder），非 FP32。下表中"1GPU BF16-TE"即为 baseline。早期表格中的"1GPU FP32 (baseline)"标注有误，已更正。
 
 ### 4.1 E2E 时延总表
 
@@ -280,8 +230,7 @@ BF16 优化后瓶颈从 TextEncoding 转移到 Denoising：
 
 | 配置 | E2E (ms) | TextEnc | Denoise | SS Step | vs Baseline | VRAM |
 |------|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1GPU FP32 (baseline) | **362** | 81 | 269 | 33.0ms | — | 20.2GB |
-| 1GPU BF16-TE | **332** | 53 | 267 | 32.9ms | **1.09×** | 20.2GB |
+| 1GPU BF16-TE (baseline) | **332** | 51 | 268 | 33.0ms | — | 20.2GB |
 | BF16-TE+CacheDiT | **336** | 63 | 264 | 31.9ms | **1.08×** | 20.2GB |
 | CacheDiT+FP8-CUTLASS | 384 | 86 | 289 | 29.7ms | 0.94× | **14.5GB** |
 | CacheDiT+FP8-DeepGemm | 404 | 52 | 343 | 35.4ms | 0.90× | **14.5GB** |
@@ -292,7 +241,7 @@ BF16 优化后瓶颈从 TextEncoding 转移到 Denoising：
 
 | 配置 | E2E (ms) | TextEnc | Denoise | SS Step | vs Baseline | VRAM |
 |------|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1GPU FP32 (baseline) | **924** | 52 | 838 | 104.5ms | — | 21.1GB |
+| 1GPU BF16-TE (baseline) | **923** | 51 | 838 | 104.5ms | — | 21.1GB |
 | BF16-TE+CacheDiT | **865** | 78 | 779 | 94.4ms | **1.07×** | 21.1GB |
 | **CacheDiT+FP8-CUTLASS** | **753** | 187 | 558 | 65.5ms | **1.23×** | **15.4GB** |
 | **CacheDiT+FP8-DeepGemm** | **632** | 68 | 555 | 66.8ms | **1.46×** | **15.4GB** |
@@ -303,7 +252,7 @@ BF16 优化后瓶颈从 TextEncoding 转移到 Denoising：
 
 | 配置 | E2E (ms) | TextEnc | Denoise | SS Step | vs Baseline | VRAM |
 |------|:---:|:---:|:---:|:---:|:---:|:---:|
-| 1GPU FP32 (baseline) | **3628** | 71 | 3413 | 422.7ms | — | 24.7GB |
+| 1GPU BF16-TE (baseline) | **3609** | 51 | 3413 | 422.7ms | — | 24.7GB |
 | BF16-TE+CacheDiT | **3237** | 56 | 3069 | 365.2ms | **1.12×** | 24.8GB |
 | **CacheDiT+FP8-CUTLASS** | **2388** | 51 | 2252 | 269.9ms | **1.52×** | **19.1GB** |
 | **CacheDiT+FP8-DeepGemm** | **2186** | 51 | 2082 | 248.4ms | **1.66×** | **19.1GB** |
@@ -362,7 +311,7 @@ BF16 优化后瓶颈从 TextEncoding 转移到 Denoising：
 #### ❌ 无效的优化
 
 1. **torch.compile**：256×256 严重回退(-36%)，大分辨率收益 ≤3%
-2. **FP8 在 256×256**：GEMM bandwidth-bound，无法发挥 2× TFLOPs
+2. **FP8 在 256×256（不含 CUDA Graph）**：GPU kernel 已快 25-30%，但 host dispatch 开销抵消了全部加速（已通过 CUDA Graph 解决，见 Section 11）
 3. **2GPU SP 在 256×256**：通信开销 > 并行收益
 
 #### 分辨率适配推荐
@@ -501,7 +450,9 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 → 平均 SM 利用率远高于 256×256
 ```
 
-> **结论**：256×256 GEMM 是 **bandwidth-bound**，FP8 的 2× TFLOPs 无法转化为实际加速。这已被多分辨率 benchmark 实测验证（256×256 FP8 无加速，1024×1024 FP8 加速 1.66×）。
+> ⚠️ **勘误**：本节原结论为"256×256 GEMM 是 bandwidth-bound，FP8 无法转化为实际加速"。该结论基于 Roofline 理论分析和 wave quantization 推导，但**未被 nsys 实测数据验证**。Section 10.4 的 no-warmup kernel 数据显示，DeepGemm FP8 在 256×256（M=768）下实现了 **1.93× GEMM 加速**，与 512×512（1.84×）和 1024×1024（1.90×）高度一致，接近 FP8 理论 2× 极限。这说明 DeepGemm 的 JIT tile autotuning 在小 M 值下仍能有效利用 FP8 TFLOPs，所有测试分辨率下 GEMM 均表现为 compute-bound。
+>
+> 256×256 E2E 未加速的真正原因是 **host-side dispatch 开销**（Section 11 CUDA Graph 解决），而非 GPU kernel 层面的 bandwidth-bound。
 
 ---
 
@@ -519,12 +470,12 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 
 **不同场景速度预测**：
 
-| 场景 | 限制因素 | H100 vs H20 |
+| 场景 | H20 特性 | H100 vs H20 |
 |------|---------|:---:|
-| 256×256 GEMM (M=768) | **带宽受限** | H100 ≈ H20（仅快 ~10%） |
-| 1024×1024 GEMM (M=12288) | **计算受限** | **H100 快 5-6.7×** |
+| 256×256 GEMM (M=768) | H20 HBM BW 优势 | H100 受限于算力削减，预期加速有限 |
+| 1024×1024 GEMM (M=12288) | 计算密集 | **H100 快 5-6.7×** |
 
-> **结论**：对 256×256，换 H100 几乎无收益。H100 的算力优势只在 1024×1024 等 compute-bound 场景发挥。
+> **结论**：H20 的算力弱势在大分辨率下最为显著。
 
 ---
 
@@ -708,7 +659,7 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 
 ### 10.4 逐 Shape GEMM 加速比分析
 
-#### 256×256 (M=768, bandwidth-bound)
+#### 256×256 (M=768)
 
 | GEMM 用途 | Shape (M×K→N) | BF16 nvjet (ms) | FP8 DeepGemm (ms) | Speedup | BF16 avg (μs) | FP8 avg (μs) |
 |-----------|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -717,7 +668,7 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 | FFN w2 (down) | 768×10240→3840 | 47.22 | 32.45 | **1.46×** | 174.9 | 120.2 |
 | **DiT GEMM 合计** | — | **233.67** | **145.25** | **1.61×** | — | — |
 
-#### 512×512 (M=3072, 过渡区间)
+#### 512×512 (M=3072)
 
 | GEMM 用途 | Shape (M×K→N) | BF16 nvjet (ms) | FP8 DeepGemm (ms) | Speedup | BF16 avg (μs) | FP8 avg (μs) |
 |-----------|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -727,7 +678,7 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 
 > 注：512×512 下 BF16 nvjet 将 QKV+out (1080) 和 FFN w13 (270) 合并到同一 tile config `128x224`，共 1350 次。FFN w2 单独使用 `384x96` config。DeepGemm 对 FFN w2 加速最大 (3.33×)，因其矩阵最大 (K=10240) 最能利用 FP8 计算密度优势。
 
-#### 1024×1024 (M=12288, compute-bound)
+#### 1024×1024 (M=12288)
 
 | GEMM 用途 | Shape (M×K→N) | BF16 nvjet (ms) | FP8 DeepGemm (ms) | Speedup | BF16 avg (μs) | FP8 avg (μs) |
 |-----------|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -748,8 +699,8 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 
 > **发现**：
 > - **GEMM 纯计算加速在所有分辨率下均接近 1.9×**，非常接近 FP8 的理论 2× TFLOPs 极限
-> - 此前 Section 7 分析认为 256×256 是 bandwidth-bound、FP8 无法发挥，但 nsys 数据证明 **DeepGemm 的 JIT tile autotuning 成功突破了这一限制**
-> - 跨分辨率 GEMM 加速非常一致（1.84-1.93×），说明 DeepGemm 在各 M 值下都能有效利用 FP8 TFLOPs
+> - 跨分辨率 GEMM 加速非常一致（1.84-1.93×），说明 DeepGemm 在各 M 值下都能有效利用 FP8 TFLOPs，所有测试分辨率下 GEMM 均为 compute-bound
+> - Section 7 中关于 256×256 bandwidth-bound 的理论分析**未被实测验证**——DeepGemm 的 JIT tile autotuning 在小 M 值下仍能达到接近理论极限的加速比
 
 ### 10.5 FP8 Overhead 时间收支
 
@@ -807,10 +758,10 @@ grid = 128 × 30 = 3840 tiles → ~49 waves (nearly full)
 
 ### 10.7 关键结论
 
-1. **GEMM 纯计算加速跨分辨率一致：~1.9×**，接近 FP8 理论 2× 极限
+1. **GEMM 纯计算加速跨分辨率一致：~1.9×**，接近 FP8 理论 2× 极限，所有测试分辨率均为 compute-bound
 2. **FP8 新增 overhead 仅 5.5-7.7%**，远小于 GEMM 节省量
-3. **256×256 E2E 未加速的根因是 host-side dispatch**，GPU kernel 本身已快 25%
-4. **去除 warmup 后 transpose 开销消失**，推翻了 Section 3.5 的结论——DeepGemm 在推理阶段无额外 transpose
+3. **256×256 E2E 未加速的根因是 host-side dispatch**，GPU kernel 本身已快 25%（Section 11 CUDA Graph 已解决）
+4. **去除 warmup 后 transpose 开销消失**，推翻了 Section 3.5 的结论——DeepGemm 在推理阶段无额外 transpose，transpose 仅发生在 JIT warmup 阶段
 5. **1024×1024 FP8 后 FlashAttention 成为 #2 瓶颈**（625ms, 21.7%），是后续优化方向
 6. **量化 overhead 随分辨率线性增长**（10→28→97ms），占比从 4.1% 降至 3.4%，说明 FP8 越大分辨率越划算
 
@@ -991,21 +942,21 @@ sglang generate --model-path $MODEL --prompt "$PROMPT" \
 
 # FP8 DeepGemm
 sglang generate --model-path $MODEL \
-    --transformer-path $MODEL/transformer-FP8-block128 \
+    --transformer-weights-path $MODEL/transformer-FP8-block128 \
     --text-encoder-precisions bf16 \
     --prompt "$PROMPT" --height 256 --width 256 --warmup --save-output \
     --perf-dump-path ./baseline_fp8_deepgemm.json
 
 # FP8 CUTLASS (disable DeepGemm)
 SGLANG_ENABLE_JIT_DEEPGEMM=0 sglang generate --model-path $MODEL \
-    --transformer-path $MODEL/transformer-FP8-block128 \
+    --transformer--weights-path $MODEL/transformer-FP8-block128 \
     --text-encoder-precisions bf16 \
     --prompt "$PROMPT" --height 256 --width 256 --warmup --save-output \
     --perf-dump-path ./baseline_fp8_cutlass.json
 
 # FP8 DeepGemm + CUDA Graph
 sglang generate --model-path $MODEL \
-    --transformer-path $MODEL/transformer-FP8-block128 \
+    --transformer--weights-path $MODEL/transformer-FP8-block128 \
     --text-encoder-precisions bf16 \
     --enable-diffusion-cuda-graph \
     --prompt "$PROMPT" --height 256 --width 256 --warmup --save-output \
