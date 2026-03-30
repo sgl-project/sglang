@@ -285,6 +285,73 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_backup[ack_id] = (req.rid, host_indices, start_time)
         return page_hashes[-1] if len(page_hashes) > 0 else prior_hash
 
+    def release_aborted_request(self, rid: str) -> None:
+        """Free GPU KV cache and host memory for an aborted request.
+
+        Requests in ongoing_backup are handled by _check_backup_progress and
+        need no special treatment here.
+        """
+        aborted_ack_ids = {
+            ack_id
+            for ack_id, (req, *_) in self.ongoing_offload.items()
+            if req.rid == rid
+        }
+        if not aborted_ack_ids:
+            return
+
+        remaining_acks = []
+        for ack in self.cache_controller.ack_write_queue:
+            _, finish_event, node_ids = ack
+            aborted_in_batch = [n for n in node_ids if n in aborted_ack_ids]
+            normal_in_batch = [n for n in node_ids if n not in aborted_ack_ids]
+
+            if not aborted_in_batch:
+                remaining_acks.append(ack)
+                continue
+
+            finish_event.synchronize()
+
+            for ack_id in aborted_in_batch:
+                req, host_indices, _, _, start, end = self.ongoing_offload.pop(ack_id)
+                if req.finished():
+                    self._release_finished_req(req, start)
+                else:
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, start:end
+                    ]
+                    self.token_to_kv_pool_allocator.free(kv_indices)
+                    self.offloaded_state.pop(req.rid, None)
+                self.decode_host_mem_pool.free(host_indices)
+
+            for ack_id in normal_in_batch:
+                (
+                    req,
+                    host_indices,
+                    incremental_tokens,
+                    start_time,
+                    start,
+                    end,
+                ) = self.ongoing_offload.pop(ack_id)
+                if req.finished():
+                    self._release_finished_req(req, start)
+                else:
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, start:end
+                    ]
+                    self.token_to_kv_pool_allocator.free(kv_indices)
+                prior_hash = (
+                    self.offloaded_state[req.rid].last_hash
+                    if req.rid in self.offloaded_state
+                    else None
+                )
+                last_hash = self._trigger_backup(
+                    req, host_indices, incremental_tokens, start_time, prior_hash
+                )
+                if req.rid in self.offloaded_state:
+                    self.offloaded_state[req.rid].last_hash = last_hash
+
+        self.cache_controller.ack_write_queue = remaining_acks
+
     def _compute_prefix_hash(self, tokens, prior_hash=""):
         page_hashes = []
         last_hash = prior_hash

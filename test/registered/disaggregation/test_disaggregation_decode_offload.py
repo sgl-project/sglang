@@ -1,7 +1,11 @@
 import os
 import shutil
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -169,6 +173,88 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
 
         # Score should be consistent: round 2 should be >= round 1, or at least within a 0.05 margin if slightly lower
         self.assertGreaterEqual(metrics2["score"], metrics1["score"] - 0.05)
+
+    def test_abort_no_memory_leak(self):
+        """
+        Verify that aborting requests mid-flight in decode-offload mode does not
+        leak GPU KV cache or host memory.
+
+        Strategy:
+        1. Fire a batch of long-running requests through the load balancer.
+        2. After a short delay (so some requests have started offloading), abort
+           all of them via the decode server's /abort_request endpoint.
+        3. Wait for the server to stabilize, then send a fresh batch of requests
+           and verify they complete successfully — which would fail if KV cache
+           or host memory had been exhausted by the leak.
+        """
+        num_requests = 8
+        prompt = (
+            "Repeat the following sentence 100 times: The quick brown fox jumps over the lazy dog. "
+            * 3
+        )
+
+        def send_one(_):
+            try:
+                requests.post(
+                    f"{self.lb_url}/generate",
+                    json={
+                        "text": prompt,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 512,
+                            "ignore_eos": True,
+                        },
+                    },
+                    timeout=60,
+                )
+            except Exception:
+                pass
+
+        # Start requests concurrently
+        with ThreadPoolExecutor(num_requests) as executor:
+            futures = [executor.submit(send_one, i) for i in range(num_requests)]
+
+            # Give the decode server time to start offloading KV cache
+            time.sleep(3)
+
+            # Abort all in-flight requests on the decode server directly
+            abort_resp = requests.post(
+                f"{self.decode_url}/abort_request",
+                json={"abort_all": True},
+                timeout=10,
+            )
+            self.assertIn(abort_resp.status_code, (200, 204))
+
+            # Wait for all client threads to finish (they may get abort responses)
+            for future in as_completed(futures, timeout=30):
+                future.result()
+
+        # Allow the server to fully process the abort and reclaim resources
+        time.sleep(5)
+
+        # Verify the server is still healthy after the abort
+        health_resp = requests.get(f"{self.decode_url}/health", timeout=10)
+        self.assertEqual(health_resp.status_code, 200)
+
+        # Send a fresh batch of short requests; if memory leaked these would
+        # fail with OOM or hang indefinitely
+        def send_short(_):
+            resp = requests.post(
+                f"{self.lb_url}/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+                },
+                timeout=60,
+            )
+            return resp
+
+        with ThreadPoolExecutor(num_requests) as executor:
+            results = list(executor.map(send_short, range(num_requests)))
+
+        for resp in results:
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("text", resp.json())
 
 
 if __name__ == "__main__":

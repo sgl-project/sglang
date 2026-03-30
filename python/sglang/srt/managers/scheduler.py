@@ -3191,6 +3191,17 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if self.decode_offload_manager is not None:
+                rids = list(
+                    {
+                        req.rid
+                        for req, *_ in self.decode_offload_manager.ongoing_offload.values()
+                        if recv_req.abort_all or req.rid.startswith(recv_req.rid)
+                    }
+                )
+                for rid in rids:
+                    self.decode_offload_manager.release_aborted_request(rid)
+
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
