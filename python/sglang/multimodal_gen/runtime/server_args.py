@@ -701,6 +701,15 @@ class ServerArgs:
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
+        parser.add_argument(
+            "--enable-diffusion-cuda-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_diffusion_cuda_graph,
+            help="Capture dit.forward() into a CUDA Graph to eliminate CPU-side "
+            "kernel launch latency. Effective for FP8 quantized models where "
+            "GPU kernels are fast but launch overhead dominates. "
+            "Requires FlashAttention backend and no mid-request model switching.",
+        )
 
         # warmup
         parser.add_argument(
