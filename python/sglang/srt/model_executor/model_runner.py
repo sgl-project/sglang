@@ -2008,9 +2008,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            # no_grad (not inference_mode) — backends like CuteDSL lazily
-            # allocate persistent buffers during this pass; inference_mode would
-            # tag them as inference tensors, breaking later CUDA graph capture.
             with torch.no_grad(), autotune():
                 self._dummy_run(
                     batch_size=self.req_to_token_pool.size, run_ctx=autotune()

@@ -210,13 +210,13 @@ def resolve_cutedsl_standard_scales(
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
-    The wrapper is NOT created in __init__ / create_weights because of an
-    interaction with FlashInfer autotuning.  During server startup,
-    _flashinfer_autotune() runs a dummy forward pass to profile kernel
-    tactics.  That dummy run is the first forward call, so this helper is
-    invoked there.  The autotune pass uses torch.no_grad() (not
-    torch.inference_mode()) specifically so that the pre-allocated CUDA
-    graph buffers inside CuteDslMoEWrapper are created as normal tensors.
+    The wrapper is created lazily (not in __init__ / create_weights) because
+    it depends on final weight shapes and EP configuration.  The wrapper's
+    CUDA-graph buffers are allocated inside CuteDslMoEWrapper.__init__, which
+    typically runs during the autotune dummy forward under inference_mode().
+    We wrap the creation in inference_mode(False) so that those pre-allocated
+    buffers are normal tensors -- inference tensors cannot be inplace-updated
+    during later CUDA graph capture, which runs outside inference_mode.
     """
     if getattr(layer, "_cutedsl_wrapper", None) is not None:
         return
@@ -243,18 +243,24 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         getattr(server_args, "chunked_prefill_size", None) or 8192,
     )
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
-    layer._cutedsl_wrapper = CuteDslMoEWrapper(
-        num_experts=layer.num_experts,
-        top_k=top_k,
-        hidden_size=layer.hidden_size,
-        intermediate_size=layer.intermediate_size_per_partition,
-        use_cuda_graph=use_cuda_graph,
-        max_num_tokens=max_num_tokens,
-        num_local_experts=layer.num_local_experts,
-        local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-        output_dtype=layer.moe_runner_config.params_dtype,
-        device=str(layer.w13_weight.device),
-    )
+    # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
+    # buffers are normal tensors.  This call typically happens inside
+    # _dummy_run which runs under inference_mode(); inference tensors cannot
+    # be inplace-updated during later CUDA graph capture (which runs outside
+    # inference_mode), so we must opt out here.
+    with torch.inference_mode(False):
+        layer._cutedsl_wrapper = CuteDslMoEWrapper(
+            num_experts=layer.num_experts,
+            top_k=top_k,
+            hidden_size=layer.hidden_size,
+            intermediate_size=layer.intermediate_size_per_partition,
+            use_cuda_graph=use_cuda_graph,
+            max_num_tokens=max_num_tokens,
+            num_local_experts=layer.num_local_experts,
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            output_dtype=layer.moe_runner_config.params_dtype,
+            device=str(layer.w13_weight.device),
+        )
 
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
         resolve_cutedsl_standard_scales(layer)
