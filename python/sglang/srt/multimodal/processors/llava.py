@@ -105,10 +105,6 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 grid_pinpoints,
                 self._processor,
             )
-            # Reuse the same REQUEST_TIMEOUT env var used by requests.get()
-            # in the download layer. asyncio.wait_for provides an additional
-            # total-time guard that socket-level timeouts cannot (e.g. slow
-            # trickle downloads where each read succeeds within the timeout).
             timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
             return await asyncio.wait_for(fut, timeout=timeout)
         else:
