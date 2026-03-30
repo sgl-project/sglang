@@ -7,7 +7,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=300, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=300, suite="stage-b-test-1-gpu-large")
 
 
 def _check_requirements():
