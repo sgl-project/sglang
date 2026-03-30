@@ -72,21 +72,42 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
+# Supported GPU architectures:
+# - gfx942: AMD Instinct MI300X/MI325X (data-center, full FP8 + AITER support)
+# - gfx950: AMD Instinct MI350X (data-center, full FP8 + AITER support)
+# - gfx1100: AMD Radeon RX 7900 XTX/XT/GRE (RDNA3 consumer, no native FP8, no AITER)
+# - gfx1103: AMD Radeon 780M / Ryzen AI iGPU (RDNA3 consumer, no native FP8, no AITER)
+_supported_targets = ["gfx942", "gfx950", "gfx1100", "gfx1103"]
+
+# RDNA3 consumer GPUs lack FP8 hardware and AITER kernel support.
+_rdna3_targets = ["gfx1100", "gfx1103"]
+
+if amdgpu_target not in _supported_targets:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. "
+        f"Expected one of: {', '.join(_supported_targets)}."
     )
     sys.exit(1)
 
-fp8_macro = (
-    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)
+# FP8 is only supported on CDNA3 (gfx942/gfx950) data-center GPUs.
+# RDNA3 consumer GPUs (gfx1100, gfx1103) have no FP8 hardware support.
+enable_fp8 = amdgpu_target not in _rdna3_targets
+
+if enable_fp8:
+    fp8_macro = (
+        "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
+    )
+else:
+    fp8_macro = None
 
 # Dynamic shared-memory budget for the TopK kernels.
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
 # - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+# - gfx110x (RDNA3): LDS is 64KB per workgroup, same budget as gfx942.
+topk_dynamic_smem_bytes = (
+    48 * 1024 if amdgpu_target in ["gfx942"] + _rdna3_targets else 32 * 1024 * 4
+)
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -97,10 +118,11 @@ hipcc_flags = [
     "-std=c++17",
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
-    "-DENABLE_FP8",
-    fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
 ]
+
+if enable_fp8:
+    hipcc_flags += ["-DENABLE_FP8", fp8_macro]
 
 ext_modules = [
     CUDAExtension(

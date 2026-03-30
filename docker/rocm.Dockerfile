@@ -3,6 +3,7 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.9-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950 -t v0.5.9-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.9-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx1100 -t v0.5.9-rocm-rdna3-rx7900 -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
 #   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.9-rocm700-mi30x -f rocm.Dockerfile .
@@ -15,6 +16,9 @@ ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+# RDNA3 consumer GPUs (RX 7900 XTX/XT, gfx1100) use ROCm 7.2 pytorch base image.
+# Note: gfx1103 (Radeon 780M iGPU) uses the same base image as gfx1100.
+ARG BASE_IMAGE_1100="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -28,6 +32,7 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
+ENV SGLANG_USE_AITER="1"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -38,6 +43,7 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
+ENV SGLANG_USE_AITER="1"
 
 # ===============================
 # Base image 950 and args
@@ -48,6 +54,7 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
+ENV SGLANG_USE_AITER="1"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -58,6 +65,34 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
+ENV SGLANG_USE_AITER="1"
+
+# ===============================
+# Base image for RDNA3 consumer GPUs (gfx1100: RX 7900 XTX/XT, gfx1103: Radeon 780M iGPU)
+# RDNA3 limitations: no native FP8 hardware, AITER kernels do not compile/run on consumer GPUs.
+# AITER is fully disabled: BUILD_AITER_ALL=0, AITER_PREBUILD_KERNELS=0, SGLANG_USE_AITER=0.
+# BUILD_MOONCAKE is disabled as it requires data-center networking hardware (InfiniBand/RoCE).
+FROM $BASE_IMAGE_1100 AS gfx1100
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+# Disable AITER: kernels do not compile/run on RDNA3 consumer GPUs.
+ENV BUILD_AITER_ALL="0"
+ENV BUILD_MOONCAKE="0"
+ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
+ENV AITER_PREBUILD_KERNELS="0"
+ENV SGLANG_USE_AITER="0"
+
+# gfx1103 (Radeon 780M / Ryzen AI iGPU) uses the same base image and settings as gfx1100.
+FROM $BASE_IMAGE_1100 AS gfx1103
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="0"
+ENV BUILD_MOONCAKE="0"
+ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
+ENV AITER_PREBUILD_KERNELS="0"
+ENV SGLANG_USE_AITER="0"
 
 # ===============================
 # Chosen arch and args
@@ -66,7 +101,7 @@ FROM ${GPU_ARCH}
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
-ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
+ENV PYTORCH_ROCM_ARCH=gfx942;gfx950;gfx1100;gfx1103
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
@@ -545,8 +580,11 @@ ENV SGLANG_MOE_PADDING=1
 ENV SGLANG_ROCM_DISABLE_LINEARQUANT=0
 ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
-ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=1
+
+# SGLANG_USE_AITER is set per-arch in the multi-stage build above:
+# CDNA stages (gfx942, gfx950) inherit the default SGLANG_USE_AITER=1,
+# RDNA3 stages (gfx1100, gfx1103) explicitly set SGLANG_USE_AITER=0.
 
 ENV NCCL_MIN_NCHANNELS=112
 ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
