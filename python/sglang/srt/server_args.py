@@ -398,6 +398,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
+    enable_mfu_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
     tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
@@ -4219,6 +4220,11 @@ class ServerArgs:
             "--enable-metrics",
             action="store_true",
             help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--enable-mfu-metrics",
+            action="store_true",
+            help="Enable estimated MFU-related prometheus metrics.",
         )
         parser.add_argument(
             "--enable-metrics-for-all-schedulers",
