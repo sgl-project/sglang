@@ -20,7 +20,6 @@ register_cuda_ci(est_time=660, suite="stage-c-test-deepep-4-gpu-h100")
 ib_devices = get_rdma_devices_args()
 
 
-@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep is flaky.")
 class TestTP(CustomTestCase):
     extra_args = []
 
@@ -84,7 +83,7 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep is flaky.")
+@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep fault-tolerant test is flaky.")
 class TestPureDP(TestTP):
     extra_args = [
         "--enable-dp-attention",

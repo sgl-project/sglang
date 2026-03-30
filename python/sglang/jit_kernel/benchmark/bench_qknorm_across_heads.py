@@ -9,7 +9,10 @@ from sgl_kernel import rmsnorm
 from sglang.jit_kernel.benchmark.utils import run_benchmark
 from sglang.jit_kernel.norm import fused_inplace_qknorm_across_heads
 from sglang.srt.utils import get_current_device_stream_fast
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
+
+register_cuda_ci(est_time=12, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 IS_CI = is_in_ci()
 

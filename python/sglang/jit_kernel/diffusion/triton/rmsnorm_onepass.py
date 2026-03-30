@@ -2,7 +2,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -37,7 +37,6 @@ def _rms_norm_tiled_onepass(
     tl.store(y_blk, x * rstd * w, mask=mask)
 
 
-@maybe_wrap_jit_kernel_debug
 @register_custom_op(op_name="triton_one_pass_rms_norm_cuda", out_shape="x")
 def _triton_one_pass_rms_norm_cuda(
     x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
@@ -73,6 +72,6 @@ def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
 if current_platform.is_mps():
     from .mps_fallback import triton_one_pass_rms_norm_native
 
-    @maybe_wrap_jit_kernel_debug
+    @debug_kernel_api
     def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
         return triton_one_pass_rms_norm_native(x, w, eps)

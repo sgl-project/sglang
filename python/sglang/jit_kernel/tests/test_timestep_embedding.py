@@ -14,6 +14,10 @@ from sglang.jit_kernel.timestep_embedding import (
     timestep_embedding as timestep_embedding_cuda,
 )
 from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=16, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 CORRECTNESS_BATCH_SIZES = get_ci_test_range(
     [1, 2, 8, 128, 256, 512, 1536, 2048, 4096, 11008, 16384],

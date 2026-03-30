@@ -16,6 +16,8 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -689,11 +691,199 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return B
 
 
+class FusedMoEWithLoRA(BaseLayerWithLoRA):
+    """
+    Wrapper around FusedMoE that integrates LoRA into the MoE computation.
+
+    Design: LoRA deltas are added at specific points in the MoE forward pass:
+    1. After gate_up projection, BEFORE activation (halfway through)
+    2. After down projection, BEFORE final reduction
+
+    This follows the vLLM/HF approach where LoRA is fused into the computation
+    rather than computed independently and added at the end.
+    """
+
+    def __init__(
+        self,
+        base_layer: FusedMoE,
+        lora_backend: BaseLoRABackend,
+    ):
+        # initializes FusedMoE with its own moe_runner for base path
+        super().__init__(base_layer, lora_backend)
+
+        self.tp_size = getattr(base_layer, "moe_tp_size", 1)
+        self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
+        self.intermediate_size_per_partition = getattr(
+            base_layer, "intermediate_size_per_partition", None
+        )
+
+        # initialize triton_lora moe runner for batches with lora enabled
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        self._lora_runner = MoeRunner(
+            base_layer.quant_method.runner.runner_backend,
+            base_layer.moe_runner_config,
+            lora_enabled=True,
+        )
+
+        # Pre-compute quant info for efficiency (weights don't change during inference)
+        self._quant_info = TritonMoeQuantInfo(
+            w13_weight=base_layer.w13_weight,
+            w2_weight=base_layer.w2_weight,
+            b13=getattr(base_layer, "w13_weight_bias", None),
+            b2=getattr(base_layer, "w2_weight_bias", None),
+        )
+
+    def set_lora_info(
+        self,
+        gate_up_lora_a_weights: torch.Tensor,
+        gate_up_lora_b_weights: torch.Tensor,
+        down_lora_a_weights: torch.Tensor = None,
+        down_lora_b_weights: torch.Tensor = None,
+    ):
+        """Set LoRA weight tensors from memory pool."""
+        self.set_lora = True
+        self.gate_up_lora_a_weights = gate_up_lora_a_weights
+        self.gate_up_lora_b_weights = gate_up_lora_b_weights
+        self.down_lora_a_weights = down_lora_a_weights
+        self.down_lora_b_weights = down_lora_b_weights
+
+    def _get_lora_info(self):
+        """
+        Build LoRAInfo for the current batch.
+
+        Returns None if LoRA is not enabled or weights are not set.
+        """
+        from sglang.srt.lora.lora_moe_runners import LoRAInfo
+
+        # Get LoRA batch info from backend
+        batch_info = self.lora_backend.batch_info
+        lora_ranks = batch_info.lora_ranks  # [num_loras]
+
+        max_lora_rank = self.down_lora_a_weights.shape[2]
+
+        # Create adapter_enabled tensor for the current batch
+        # Only enable LoRA adapters that are actually used in this batch
+        # TODO: Jonahbernard: check that this doesn't slow down inference for this batch
+        adapter_enabled = torch.zeros(
+            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
+        )
+        adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
+
+        return LoRAInfo(
+            gate_up_lora_a_weights=self.gate_up_lora_a_weights,
+            gate_up_lora_b_weights=self.gate_up_lora_b_weights,
+            down_lora_a_weights=self.down_lora_a_weights,
+            down_lora_b_weights=self.down_lora_b_weights,
+            seg_indptr=batch_info.seg_indptr,
+            req_to_lora=batch_info.weight_indices,
+            lora_ranks=lora_ranks,
+            adapter_enabled=adapter_enabled,
+            max_lora_rank=max_lora_rank,
+            num_experts=self.base_layer.num_experts,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            hidden_size=getattr(self.base_layer, "hidden_size", 0),
+        )
+
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
+        """
+        Forward pass with integrated LoRA computation.
+
+        LoRA deltas are added at the correct points inside the MoE computation:
+        1. After gate_up projection, before activation
+        2. After down projection, before final reduction
+        """
+
+        # Build LoRA info for this batch
+        lora_info = self._get_lora_info()
+
+        # run lora moe_runner
+        return self._forward_with_lora(hidden_states, topk_output, lora_info, **kwargs)
+
+    def _forward_with_lora(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        lora_info,
+        **kwargs,
+    ):
+        """
+        Run MoE forward with LoRA integration at the correct points.
+        """
+        # Get the base layer's dispatch and combine logic
+        base_layer = self.base_layer
+
+        # Dispatch tokens (doesn't do much in the LoRA case)
+        dispatch_output = base_layer.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+
+        # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
+        quant_info = self._quant_info
+
+        # Run the only lora moe runner (Triton)
+        combine_input = self._lora_runner.run(
+            dispatch_output, quant_info, lora_info=lora_info
+        )
+
+        final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
+
+        return final_hidden_states
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        return B
+
+    def slice_moe_lora_a_weights(
+        self, A: torch.Tensor, tp_rank: int, target_module: str
+    ) -> torch.Tensor:
+        """Slice LoRA A weights for MoE with TP.
+
+        Per-expert weight shapes:
+          gate_up_proj_moe A: [rank, hidden_size]  — input is full hidden_states, no slice
+          down_proj_moe A:    [rank, intermediate_size] — input is sharded intermediate
+        """
+        if self.tp_size <= 1:
+            return A
+        if target_module == "down_proj_moe":
+            shard_size = self.intermediate_size_per_partition
+            start = tp_rank * shard_size
+            end = start + shard_size
+            return A[:, start:end].contiguous()
+        return A
+
+    def slice_moe_lora_b_weights(
+        self, B: torch.Tensor, tp_rank: int, target_module: str
+    ) -> torch.Tensor:
+        """Slice LoRA B weights for MoE with TP.
+
+        Per-expert weight shapes:
+          gate_up_proj_moe B: [intermediate_size*2, rank] — output matches sharded base w13
+          down_proj_moe B:    [hidden_size, rank] — output is all-reduced, no slice
+        """
+        if self.tp_size <= 1:
+            return B
+        if target_module == "gate_up_proj_moe":
+            shard_size = self.intermediate_size_per_partition
+            start = tp_rank * shard_size
+            end = start + shard_size
+            full_inter = B.shape[0] // 2
+            gate_b = B[start:end, :]
+            up_b = B[full_inter + start : full_inter + end, :]
+            return torch.cat([gate_b, up_b], dim=0).contiguous()
+        return B
+
+
 def get_lora_layer(
     layer: nn.Module, lora_backend: BaseLoRABackend
 ) -> BaseLayerWithLoRA:
     supported_layer_types = {
         # the order matters
+        FusedMoE: FusedMoEWithLoRA,
         ParallelLMHead: ParallelLMHeadWithLoRA,
         VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
         QKVParallelLinear: QKVParallelLinearWithLoRA,

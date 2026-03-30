@@ -297,6 +297,19 @@ class GPUWorker:
                 # Avoid logging warmup perf records that share the same request_id.
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
+
+            # dump per-request perf report to specified file (server mode)
+            if (
+                req.perf_dump_path is not None
+                and not req.is_warmup
+                and output_batch.metrics is not None
+            ):
+                PerformanceLogger.dump_benchmark_report(
+                    file_path=req.perf_dump_path,
+                    metrics=output_batch.metrics,
+                    meta={"model": self.server_args.model_path},
+                    tag="server_perf_dump",
+                )
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
