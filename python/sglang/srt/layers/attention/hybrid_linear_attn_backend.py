@@ -30,7 +30,7 @@ if not is_cpu():
     )
 
 if is_npu():
-    from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    from sgl_kernel_npu.mamba.mamba_state_update_triton import (
         conv_state_rollback,
         move_intermediate_cache_dynamic_h_block,
     )
