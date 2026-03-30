@@ -706,7 +706,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module, CompilableRegionMixin):
             q, k = self.rotary_emb(
                 positions, q, k, fused_set_kv_buffer_arg=fused_kv_arg
             )
-            self._did_fused_kv_write_last_call = fused_kv_arg is not None
+            # MRoPE forward_triton (2D positions) silently drops fused_set_kv_buffer_arg,
+            # so the fused KV write only actually executes in the compiled path.
+            self._did_fused_kv_write_last_call = fused_kv_arg is not None and is_compiled
         save_kv_cache = not self._did_fused_kv_write_last_call
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
