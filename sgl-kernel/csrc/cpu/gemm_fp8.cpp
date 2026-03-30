@@ -355,6 +355,75 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, has_bias, BLOC
     Unroll<ROWS * COLS>{}(storec);
   }
 };
+template <int BLOCK_M, int BLOCK_N>
+struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      float scale,
+      int K,
+      int lda,
+      int ldb,
+      int ldc) {
+    constexpr int ROWS = BLOCK_M;
+    constexpr int COLS = BLOCK_N / 16;
+
+    // prefetch distance
+    constexpr int PREFETCH_SIZE_K = 64;
+
+    __m512bh va;
+    __m512bh vb[COLS];
+    __m512 vc[ROWS * COLS];
+
+    const __m512 vscale = _mm512_set1_ps(scale);
+
+    auto loadc = [&](auto i) { vc[i] = _mm512_setzero_ps(); };
+    Unroll<ROWS * COLS>{}(loadc);
+
+    const int K2 = K >> 1;
+    const int lda2 = lda >> 1;
+    const int ldb2 = ldb;  // ldb * 2 >> 1;
+    const float* a_ptr = reinterpret_cast<const float*>(A);
+    const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(B);
+
+    auto compute = [&](auto i, int k) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+
+      if constexpr (col == 0) {
+        va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
+      }
+      if constexpr (row == 0) {
+        if constexpr (col % 2 == 0) {
+          __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2 + col * 16);
+          if constexpr (PREFETCH_SIZE_K > 0) {
+            _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
+          }
+          vb[col + 0] = CVT_FP8_TO_BF16(_mm512_extracti32x8_epi32(b8, 0));
+          vb[col + 1] = CVT_FP8_TO_BF16(_mm512_extracti32x8_epi32(b8, 1));
+        }
+      }
+      vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
+    };
+    for (int k = 0; k < K2; ++k) {
+      Unroll<ROWS * COLS>{}(compute, k);
+    }
+
+    auto storec = [&](auto i) {
+      constexpr int row = i / COLS;
+      constexpr int col = i % COLS;
+      // for COLS = 2, 4 use 512bit store
+      if constexpr (col % 2 == 0) {
+        __m512 vc0 = _mm512_mul_ps(vc[row * COLS + col + 0], vscale);
+        __m512 vc1 = _mm512_mul_ps(vc[row * COLS + col + 1], vscale);
+        _mm512_storeu_si512(
+            reinterpret_cast<__m512i*>((C + row * ldc + col * 16)), (__m512i)(_mm512_cvtne2ps_pbh(vc1, vc0)));
+      }
+    };
+    Unroll<ROWS * COLS>{}(storec);
+  }
+};
 
 template <bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, has_bias, BLOCK_M, BLOCK_N> {
@@ -455,75 +524,6 @@ struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, has_bias, BLOCK_M, BLO
     Unroll<ROWS * COLS>{}(storec);
   }
 };
-template <int BLOCK_M, int BLOCK_N>
-struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
-  static inline void apply(
-      const at::BFloat16* __restrict__ A,
-      const at::Float8_e4m3fn* __restrict__ B,
-      at::BFloat16* __restrict__ C,
-      float scale,
-      int K,
-      int lda,
-      int ldb,
-      int ldc) {
-    constexpr int ROWS = BLOCK_M;
-    constexpr int COLS = BLOCK_N / 16;
-
-    // prefetch distance
-    constexpr int PREFETCH_SIZE_K = 64;
-
-    __m512bh va;
-    __m512bh vb[COLS];
-    __m512 vc[ROWS * COLS];
-
-    const __m512 vscale = _mm512_set1_ps(scale);
-
-    auto loadc = [&](auto i) { vc[i] = _mm512_setzero_ps(); };
-    Unroll<ROWS * COLS>{}(loadc);
-
-    const int K2 = K >> 1;
-    const int lda2 = lda >> 1;
-    const int ldb2 = ldb;  // ldb * 2 >> 1;
-    const float* a_ptr = reinterpret_cast<const float*>(A);
-    const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(B);
-
-    auto compute = [&](auto i, int k) {
-      constexpr int row = i / COLS;
-      constexpr int col = i % COLS;
-
-      if constexpr (col == 0) {
-        va = (__m512bh)(_mm512_set1_ps(a_ptr[row * lda2 + k]));
-      }
-      if constexpr (row == 0) {
-        if constexpr (col % 2 == 0) {
-          __m512i b8 = _mm512_loadu_si512(b_ptr + k * ldb2 + col * 16);
-          if constexpr (PREFETCH_SIZE_K > 0) {
-            _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
-          }
-          vb[col + 0] = CVT_FP8_TO_BF16(_mm512_extracti32x8_epi32(b8, 0));
-          vb[col + 1] = CVT_FP8_TO_BF16(_mm512_extracti32x8_epi32(b8, 1));
-        }
-      }
-      vc[i] = _mm512_dpbf16_ps(vc[i], va, vb[col]);
-    };
-    for (int k = 0; k < K2; ++k) {
-      Unroll<ROWS * COLS>{}(compute, k);
-    }
-
-    auto storec = [&](auto i) {
-      constexpr int row = i / COLS;
-      constexpr int col = i % COLS;
-      // for COLS = 2, 4 use 512bit store
-      if constexpr (col % 2 == 0) {
-        __m512 vc0 = _mm512_mul_ps(vc[row * COLS + col + 0], vscale);
-        __m512 vc1 = _mm512_mul_ps(vc[row * COLS + col + 1], vscale);
-        _mm512_storeu_si512(
-            reinterpret_cast<__m512i*>((C + row * ldc + col * 16)), (__m512i)(_mm512_cvtne2ps_pbh(vc1, vc0)));
-      }
-    };
-    Unroll<ROWS * COLS>{}(storec);
-  }
-};
 #endif
 
 #define LAUNCH_TINYGEMM_KERNEL_NN(MB_SIZE, NB_SIZE)                                   \
@@ -610,6 +610,42 @@ struct brgemm<at::BFloat16, at::Float8_e4m3fn, float, has_bias> {
   }
 };
 
+template <>
+struct brgemm2<at::BFloat16> {
+  static inline void apply(
+      const at::BFloat16* __restrict__ A,
+      const at::Float8_e4m3fn* __restrict__ B,
+      at::BFloat16* __restrict__ C,
+      at::BFloat16* __restrict__ Btmp,
+      float* __restrict__ Ctmp,
+      float scale,
+      int M,
+      int N,
+      int K,
+      int lda,
+      int ldb,
+      int ldc) {
+    constexpr int BLOCK_N = block_size_n();
+
+    // [BLOCK_K, BLOCK_N] -> [BLOCK_K / 2, BLOCK_N * 2]
+    const int ldb_tmp = block_size_n();
+
+    // accumulate across K per BLOCK_K
+    for (int k = 0; k < K; k += BLOCK_K) {
+      int kb_size = std::min(BLOCK_K, K - k);
+      unpack_B(Btmp, B + k * ldb, N, kb_size, ldb, ldb_tmp);
+
+      const bool add_C = (k != 0);
+      at::native::cpublas::brgemm(M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
+    }
+
+    // copy from Ctmp to C and mul scale
+    for (int m = 0; m < M; ++m) {
+      copy_mul_stub(C + m * ldc, Ctmp + m * BLOCK_N, N, scale);
+    }
+  }
+};
+
 template <bool has_bias>
 struct brgemm<at::BFloat16, uint8_t, uint8_t, has_bias> {
   static inline void apply(
@@ -648,42 +684,6 @@ struct brgemm<at::BFloat16, uint8_t, uint8_t, has_bias> {
       } else {
         copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
       }
-    }
-  }
-};
-
-template <>
-struct brgemm2<at::BFloat16> {
-  static inline void apply(
-      const at::BFloat16* __restrict__ A,
-      const at::Float8_e4m3fn* __restrict__ B,
-      at::BFloat16* __restrict__ C,
-      at::BFloat16* __restrict__ Btmp,
-      float* __restrict__ Ctmp,
-      float scale,
-      int M,
-      int N,
-      int K,
-      int lda,
-      int ldb,
-      int ldc) {
-    constexpr int BLOCK_N = block_size_n();
-
-    // [BLOCK_K, BLOCK_N] -> [BLOCK_K / 2, BLOCK_N * 2]
-    const int ldb_tmp = block_size_n();
-
-    // accumulate across K per BLOCK_K
-    for (int k = 0; k < K; k += BLOCK_K) {
-      int kb_size = std::min(BLOCK_K, K - k);
-      unpack_B(Btmp, B + k * ldb, N, kb_size, ldb, ldb_tmp);
-
-      const bool add_C = (k != 0);
-      at::native::cpublas::brgemm(M, N, kb_size, lda, ldb_tmp, BLOCK_N, add_C, A + k, Btmp, Ctmp);
-    }
-
-    // copy from Ctmp to C and mul scale
-    for (int m = 0; m < M; ++m) {
-      copy_mul_stub(C + m * ldc, Ctmp + m * BLOCK_N, N, scale);
     }
   }
 };
@@ -743,6 +743,7 @@ void tinygemm_kernel(
     }
   }
 }
+
 template <typename scalar_t>
 void tinygemm_kernel2(
     const scalar_t* __restrict__ A,
@@ -840,6 +841,7 @@ void tinygemm_kernel2(
     }
   }
 }
+
 // NB: fp8/fp4 scaled mm kernel implementation
 //
 //        scalar_t     packed_t     param_t
@@ -950,6 +952,23 @@ void tinygemm_kernel(
 template <typename scalar_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
+    const at::Float8_e4m3fn* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    float scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg) {
+  tinygemm_kernel2<scalar_t>(A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, brg);
+}
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
     const uint8_t* __restrict__ B,
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
@@ -1026,23 +1045,7 @@ void tinygemm_kernel(
   tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
       A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
-template <typename scalar_t>
-void tinygemm_kernel(
-    const scalar_t* __restrict__ A,
-    const at::Float8_e4m3fn* __restrict__ B,
-    scalar_t* __restrict__ C,
-    scalar_t* __restrict__ Btmp,
-    float* __restrict__ Ctmp,
-    float scale,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc,
-    bool brg) {
-  tinygemm_kernel2<scalar_t>(A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, brg);
-}
+
 #define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE_A, TYPE_B, TYPE_S) \
   template void tinygemm_kernel<TYPE_A>(                      \
       const TYPE_A* __restrict__ A,                           \
@@ -1061,6 +1064,12 @@ void tinygemm_kernel(
       bool brg,                                               \
       int64_t block_size_K,                                   \
       bool do_unpack)
+
+INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, at::Float8_e4m3fn, float);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16, uint8_t, uint8_t);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
+
 #define INSTANTIATE_TINYGEMM_TEMPLATE2(TYPE)   \
   template void tinygemm_kernel<TYPE>(         \
       const TYPE* __restrict__ A,              \
@@ -1077,11 +1086,8 @@ void tinygemm_kernel(
       int64_t ldc,                             \
       bool brg)
 
-INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float);
-INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, at::Float8_e4m3fn, float);
-INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16, uint8_t, uint8_t);
-INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
 INSTANTIATE_TINYGEMM_TEMPLATE2(at::BFloat16);
+
 inline const float* get_bias_data(const std::optional<at::Tensor>& bias, int64_t N) {
   if (bias.has_value()) {
     const auto& bias_ref = bias.value();
@@ -1090,7 +1096,6 @@ inline const float* get_bias_data(const std::optional<at::Tensor>& bias, int64_t
   }
   return nullptr;
 }
-
 // FP8 and MXFP4 WoQ uses the same pattern:
 //   Btmp : [T, BLOCK_N * K]
 //   Ctmp : [T, BLOCK_M * BLOCK_N]
