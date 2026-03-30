@@ -80,7 +80,7 @@ class EAGLEDraftCudaGraphRunner:
         )
         self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
-        self.enable_spec_fully_aync_decoding = (
+        self.enable_spec_fully_async_decoding = (
             envs.SGLANG_SPEC_FULLY_ASYNC_DECODING.get()
         )
 
@@ -333,10 +333,10 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            if self.enable_spec_fully_aync_decoding:
+            if self.enable_spec_fully_async_decoding:
                 assert hasattr(
                     self.eagle_worker, "draft_forward_v2"
-                ), "Overlap reflow just support when enable overlap scheduler"
+                ), "draft_forward_v2 just support when enable speculative fully async decoding"
                 ret = self.eagle_worker.draft_forward_v2(forward_batch)
             else:
                 ret = self.eagle_worker.draft_forward(forward_batch)
@@ -358,7 +358,7 @@ class EAGLEDraftCudaGraphRunner:
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         # Keep the variables name for readability
-        if self.enable_spec_fully_aync_decoding:
+        if self.enable_spec_fully_async_decoding:
             ret_topk_p_list, ret_topk_index_list = (t[:raw_bs] for t in out)
             return ret_topk_p_list, ret_topk_index_list
 
