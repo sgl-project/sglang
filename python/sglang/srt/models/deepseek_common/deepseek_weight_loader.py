@@ -664,14 +664,19 @@ class DeepseekV2WeightLoaderMixin:
         Processes one layer at a time to keep peak memory overhead to ~1/num_layers.
         Reuses intermediate buffers across layers for parameters of the same shape.
         """
-        import torch.distributed as dist
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         buf_cache: dict[tuple[torch.Size, torch.dtype], torch.Tensor] = {}
 
-        for layer_id in range(self.model.start_layer, self.model.end_layer):
-            layer = self.model.layers[layer_id]
+        if hasattr(self.model, "layers"):
+            layers = self.model.layers[self.model.start_layer : self.model.end_layer]
+        elif hasattr(self.model, "decoder"):
+            layers = [self.model.decoder]
+        else:
+            raise ValueError("Internal error: model has no layers or decoder attribute")
+
+        for layer in layers:
             mlp = layer.mlp
 
             # Find the FusedMoE module (either mlp itself or mlp.experts)
