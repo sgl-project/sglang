@@ -307,3 +307,5 @@ python3 -m sglang.bench_offline_throughput \
 | 1024 | 512 prompts, cg-bs 512 | Reshape + QKNorm + RopeKV + RMSNorm | 10,775 | −5.2% |
 
 Results are flat across all batch sizes and output sequence lengths (within ±1.3%), meaning Inductor-compiled q/k normalization, rotary embedding, and KV-cache store match the performance of the hand-written custom kernels. The result holds for both decode-heavy workloads (OSL=8192) and shorter generation (OSL=1024), confirming that output sequence length does not change the picture. This is a positive result: Inductor introduces no regression while replacing specialized CUDA/Triton kernels with compiler-generated code, validating that the compilation approach is viable for this model without a throughput penalty.
+
+TODO: update this with new runs
