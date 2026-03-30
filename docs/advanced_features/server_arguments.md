@@ -383,6 +383,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--expert-offload-resident-selection` | Strategy for choosing which experts stay resident on GPU. `first_n` = experts 0..N-1; `frequency` = adaptive selection based on routing frequency warmup; `manual` = explicit list via `--expert-offload-resident-ids`. | `first_n` | Choices: `first_n`, `frequency`, `manual` |
 | `--expert-offload-resident-ids` | Comma-separated expert IDs to keep resident on GPU (for `manual` selection mode). | `None` | Type: str |
 | `--expert-offload-prefetch-num` | Number of hot offloaded experts to prefetch for the next MoE layer. After each layer's MoE kernel, `cudaMemPrefetchAsync` is issued on a background stream for the next layer's most-frequently-hit offloaded experts. Too high a value can cause GPU memory pressure and page thrashing, reducing decode speed. | `0` | Type: int |
+| `--expert-offload-prefetch-depth` | How many layers ahead to prefetch offloaded experts. Default 1 prefetches only the next layer. Higher values (e.g. 2-4) issue prefetch for the next D layers, giving more overlap between PCIe transfers and compute when prefetch takes longer than one layer's attention + layernorm. | `1` | Type: int |
 
 ## Diffusion LLM
 

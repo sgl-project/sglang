@@ -148,15 +148,60 @@ class ExpertOffloadWrapperMethod(FusedMoEMethodBase):
           - Decode (CUDA graph replay): resident -> VRAM, offloaded -> PCIe.
         Full correctness in all phases.
         """
+        import time
+
+        import sglang.srt.layers.moe.expert_offload as _eo_mod
+
+        # Log entry into each MoE layer during the first prefill after reset.
+        # This lets us see exactly which layer the kernel hangs on.
+        tracing = _eo_mod._tracing_prefill
+        if tracing and self.manager is not None:
+            layer_idx = self.manager.config.layer_idx
+            num_tokens = dispatch_output.hidden_states.shape[0] if hasattr(dispatch_output, 'hidden_states') else -1
+            logger.info(
+                f"[ExpertOffload] Layer {layer_idx}: entering MoE kernel "
+                f"(tokens={num_tokens})"
+            )
+
+        t0 = time.monotonic()
         result = self.gpu_method.apply(layer, dispatch_output)
+        elapsed = time.monotonic() - t0
 
         if self.manager is not None:
+            if tracing or elapsed > 1.0:
+                logger.info(
+                    f"[ExpertOffload] Layer {self.manager.config.layer_idx}: "
+                    f"MoE kernel done in {elapsed:.3f}s"
+                )
+
+            # After the last MoE layer: flush the GPU stream so all queued
+            # MoE kernels complete and their UVM page references are released.
+            # Without this, the post-MoE operations (LM head, NCCL) can't
+            # allocate workspace because the driver can't evict pages that are
+            # still referenced by in-flight kernels on the stream.
+            is_last_moe = (
+                self.manager.config.layer_idx
+                == _eo_mod._all_managers[-1][0].config.layer_idx
+            )
+            if is_last_moe and not torch.cuda.is_current_stream_capturing():
+                torch.cuda.synchronize()
+                if tracing:
+                    free, total = torch.cuda.mem_get_info()
+                    logger.info(
+                        f"[ExpertOffload] Post-MoE sync done. "
+                        f"GPU mem: {free / (1 << 30):.2f} GiB free"
+                    )
+
+            # Clear tracing flag after last MoE layer completes.
+            if tracing and is_last_moe:
+                _eo_mod._tracing_prefill = False
+
             # One-shot lazy chaining (no-op after first call).
             from sglang.srt.layers.moe.expert_offload import chain_managers
 
             chain_managers()
 
-            self.manager.trigger_prefetch_for_next_layer()
+            self.manager.trigger_prefetch_for_next_layers()
 
         return result
 

@@ -2687,6 +2687,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if self.server_args.expert_offload_num_resident >= 0:
+                from sglang.srt.layers.moe.expert_offload import (
+                    notify_decode_completed,
+                )
+
+                notify_decode_completed()
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
@@ -2720,6 +2726,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if self.server_args.expert_offload_num_resident >= 0:
+                from sglang.srt.layers.moe.expert_offload import (
+                    notify_decode_completed,
+                )
+
+                notify_decode_completed()
         elif forward_batch.forward_mode.is_split_prefill():
             ret = self.forward_split_prefill(
                 forward_batch,
@@ -2727,6 +2739,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            if self.server_args.expert_offload_num_resident >= 0:
+                from sglang.srt.layers.moe.expert_offload import (
+                    prepare_for_new_prefill,
+                )
+
+                prepare_for_new_prefill()
+                logger.info(
+                    f"[ExpertOffload] Starting forward_extend "
+                    f"(batch_size={forward_batch.batch_size})"
+                )
             ret, can_run_graph = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

@@ -43,6 +43,7 @@ from sglang.srt.layers.moe.expert_offload.config import ExpertOffloadConfig
 from sglang.srt.layers.moe.expert_offload.uvm import (
     ADVISE_SET_ACCESSED_BY,
     ADVISE_SET_PREFERRED_LOCATION,
+    ADVISE_UNSET_ACCESSED_BY,
     CUDA_CPU_DEVICE,
     uvm_advise,
     uvm_copy_from_tensor,
@@ -81,7 +82,7 @@ class ExpertOffloadManager:
         self._warmup_done: bool = False
 
         # Cross-layer prefetch state.
-        self.next_layer_manager: Optional["ExpertOffloadManager"] = None
+        self.next_layer_managers: List["ExpertOffloadManager"] = []
         self._prefetch_slices: Optional[List[List[torch.Tensor]]] = None
         self._hot_offloaded_ids: List[int] = []
 
@@ -105,6 +106,11 @@ class ExpertOffloadManager:
         """
         cfg = self.config
         num_local = cfg.num_local_experts
+
+        # Set UVM headroom once (idempotent).
+        from sglang.srt.utils.common import set_uvm_memory_headroom
+
+        set_uvm_memory_headroom(cfg.memory_headroom_gib)
 
         # 1. Choose resident expert IDs.
         self.resident_expert_ids = self._select_resident_ids(cfg)
@@ -131,16 +137,10 @@ class ExpertOffloadManager:
 
         # 5. Register offloaded bytes with SGLang's memory reporting.
         #
-        # On PCIe-attached discrete GPUs, cudaMemPrefetchAsync(->CPU) may not
-        # immediately return physical GPU pages to the free pool -- the UVM
-        # driver keeps them cached until a regular cudaMalloc triggers eviction.
-        # This causes torch.cuda.mem_get_info() to under-report available memory,
-        # breaking SGLang's init_memory_pool check.
-        #
-        # Instead of forcing a slow pressure-based eviction here, we register
-        # the offloaded bytes with get_available_gpu_memory() so that the check
-        # sees the correct "effective" available memory.  The actual eviction
-        # happens on-demand when the KV-cache allocator issues cudaMalloc calls.
+        # UVM-managed offloaded pages are evictable on-demand by the CUDA
+        # driver when regular cudaMalloc requests exceed free physical pages.
+        # Without this registration, SGLang would see too little available
+        # memory and refuse to allocate enough KV cache.
         if self.offloaded_expert_ids:
             self._register_offloaded_bytes_for_memory_reporting(layer)
 
@@ -291,7 +291,7 @@ class ExpertOffloadManager:
 
     def prepare_prefetch_cache(self, layer: torch.nn.Module) -> None:
         """Pre-compute tensor views for hot offloaded experts to minimize
-        hot-path overhead in trigger_prefetch_for_next_layer().
+        hot-path overhead in trigger_prefetch_for_next_layers().
 
         Called once from chain_managers() and again from _readvise_from_frequency()
         when the resident/offloaded sets change.
@@ -334,23 +334,79 @@ class ExpertOffloadManager:
             f"({len(ranges)} coalesced ranges)"
         )
 
-    def trigger_prefetch_for_next_layer(self) -> None:
-        """Issue cudaMemPrefetchAsync for the next layer's hot offloaded experts.
+    def trigger_prefetch_for_next_layers(self) -> None:
+        """Issue cudaMemPrefetchAsync for upcoming layers' hot offloaded experts.
 
-        Called from wrapper.apply() after each MoE kernel. Purely opportunistic:
-        no stream synchronization. If the prefetch wins the race, the next layer's
-        kernel reads at HBM speed; otherwise, PCIe read-through (existing behavior).
+        Called from wrapper.apply() after each MoE kernel. Iterates over
+        ``self.next_layer_managers`` (up to ``prefetch_depth`` managers) and
+        issues prefetch for each. Purely opportunistic: no stream
+        synchronization. If the prefetch wins the race, the target layer's
+        kernel reads at HBM speed; otherwise, PCIe read-through (existing
+        behavior).
         """
-        next_mgr = self.next_layer_manager
-        if next_mgr is None or next_mgr._prefetch_slices is None:
+        if not self.next_layer_managers:
             return
         if torch.cuda.is_current_stream_capturing():
             return
-        for param_slices in next_mgr._prefetch_slices:
-            for s in param_slices:
-                uvm_prefetch_async(
-                    s, next_mgr.device_id, stream=next_mgr.prefetch_stream
-                )
+        for next_mgr in self.next_layer_managers:
+            if next_mgr._prefetch_slices is None:
+                continue
+            for param_slices in next_mgr._prefetch_slices:
+                for s in param_slices:
+                    uvm_prefetch_async(
+                        s, next_mgr.device_id, stream=next_mgr.prefetch_stream
+                    )
+
+    # ------------------------------------------------------------------
+    # Per-prefill UVM page eviction control
+    # ------------------------------------------------------------------
+
+    def unset_accessed_by_for_offloaded(self, layer: torch.nn.Module) -> None:
+        """Remove GPU direct mapping for offloaded expert pages.
+
+        The ACCESSED_BY advice creates a persistent GPU page table mapping
+        that prevents the CUDA driver from evicting pages even under memory
+        pressure.  Unsetting it before prefill allows on-demand eviction
+        when cudaMalloc needs space for prefill workspace.
+
+        Expert weights are read-only, so this is safe -- no dirty pages to
+        flush.  Pages will fault back into GPU on the next decode access.
+        """
+        if not self.offloaded_expert_ids:
+            return
+        for param_name in self._expert_param_names:
+            managed: torch.Tensor = getattr(layer, param_name)
+            for eid in self.offloaded_expert_ids:
+                uvm_advise(managed[eid], ADVISE_UNSET_ACCESSED_BY, self.device_id)
+
+    def restore_accessed_by_for_offloaded(self, layer: torch.nn.Module) -> None:
+        """Re-enable GPU direct mapping for offloaded expert pages.
+
+        Called after prefill completes to restore PCIe read-through access
+        for decode.  This avoids page fault overhead during latency-sensitive
+        CUDA graph replay.
+        """
+        if not self.offloaded_expert_ids:
+            return
+        for param_name in self._expert_param_names:
+            managed: torch.Tensor = getattr(layer, param_name)
+            for eid in self.offloaded_expert_ids:
+                uvm_advise(managed[eid], ADVISE_SET_ACCESSED_BY, self.device_id)
+
+    def reset_offloaded_pages_to_cpu(self, layer: torch.nn.Module) -> None:
+        """Prefetch all offloaded expert pages back to CPU.
+
+        Called before each new prefill to clear pages that migrated to GPU
+        via page faults during previous forward passes.  Prevents GPU memory
+        accumulation that causes page thrashing when switching requests.
+        """
+        if not self.offloaded_expert_ids:
+            return
+        for param_name in self._expert_param_names:
+            managed: torch.Tensor = getattr(layer, param_name)
+            self._prefetch_experts_to_device(
+                managed, self.offloaded_expert_ids, CUDA_CPU_DEVICE
+            )
 
     # ------------------------------------------------------------------
     # Per-layer adaptive resident selection (warmup-then-readvise)
@@ -439,18 +495,22 @@ class ExpertOffloadManager:
         )
 
         # Apply cudaMemAdvise + prefetch for each managed parameter.
+        # This runs only once (first request's warmup), so the synchronous
+        # uvm_advise cost is acceptable.
         for param_name in self._expert_param_names:
             managed: torch.Tensor = getattr(layer, param_name)
 
             # Promote: prefer GPU
             for eid in promoted:
-                expert_slice = managed[eid]
-                uvm_advise(expert_slice, ADVISE_SET_PREFERRED_LOCATION, self.device_id)
+                uvm_advise(
+                    managed[eid], ADVISE_SET_PREFERRED_LOCATION, self.device_id
+                )
 
             # Demote: prefer CPU
             for eid in demoted:
-                expert_slice = managed[eid]
-                uvm_advise(expert_slice, ADVISE_SET_PREFERRED_LOCATION, CUDA_CPU_DEVICE)
+                uvm_advise(
+                    managed[eid], ADVISE_SET_PREFERRED_LOCATION, CUDA_CPU_DEVICE
+                )
 
             # Prefetch promoted experts to GPU.
             if promoted:
@@ -493,9 +553,9 @@ class ExpertOffloadManager:
         local PCIe bandwidth instead of cross-socket UPI bandwidth.
         Only performed once per manager instance.
         """
-        if self._numa_bound:
+        if ExpertOffloadManager._numa_bound:
             return
-        self._numa_bound = True
+        ExpertOffloadManager._numa_bound = True
 
         if not is_numa_available():
             logger.debug("[ExpertOffload] NUMA not available, skipping bind")

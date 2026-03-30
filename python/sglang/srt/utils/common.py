@@ -512,6 +512,17 @@ def calculate_time(show=False, min_cost_ms=0.0):
 # exactly as designed.
 # ---------------------------------------------------------------------------
 _uvm_evictable_bytes: dict = {}  # {gpu_id: int (bytes)}
+_uvm_headroom_bytes: int = 2 * (1 << 30)  # default 2 GiB
+
+
+def set_uvm_memory_headroom(gib: int) -> None:
+    """Set the UVM page-swap headroom in GiB.
+
+    Called from ExpertOffloadManager during init with the value of
+    --expert-offload-memory-headroom.
+    """
+    global _uvm_headroom_bytes
+    _uvm_headroom_bytes = gib * (1 << 30)
 
 
 def register_uvm_evictable_memory(gpu_id: int, nbytes: int) -> None:
@@ -624,9 +635,14 @@ def get_available_gpu_memory(
     # Add UVM-evictable bytes: CPU-preferred managed pages that the UVM driver
     # has cached in GPU physical memory.  They will be evicted on-demand when
     # regular cudaMalloc requests exceed the currently-free physical pages.
+    #
+    # Reserve headroom so the UVM driver always has free GPU pages for page
+    # swapping.  Without headroom, bi-directional page faults (evict old +
+    # bring new) at 0 bytes free can deadlock the UVM driver.
     if device == "cuda":
         extra = _uvm_evictable_bytes.get(gpu_id, 0)
         if extra:
+            extra = max(0, extra - _uvm_headroom_bytes)
             free_gpu_memory = free_gpu_memory + extra
 
     if distributed:

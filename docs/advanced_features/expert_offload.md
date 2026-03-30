@@ -93,7 +93,7 @@ python3 -m sglang.launch_server --model-path /models/GLM-5-FP8 \
 
 ## Cross-Layer Pipeline Prefetch
 
-When a decode token is routed to an offloaded expert, the MoE kernel stalls while reading weight pages at PCIe bandwidth instead of HBM bandwidth. Cross-layer prefetch mitigates this by issuing `cudaMemPrefetchAsync` for the next layer's hot offloaded experts on a background CUDA stream, overlapping the PCIe transfer with the current layer's attention and layernorm computation.
+When a decode token is routed to an offloaded expert, the MoE kernel stalls while reading weight pages at PCIe bandwidth instead of HBM bandwidth. Cross-layer prefetch mitigates this by issuing `cudaMemPrefetchAsync` for upcoming layers' hot offloaded experts on a background CUDA stream, overlapping the PCIe transfer with intervening attention and layernorm computation.
 
 Enable it with `--expert-offload-prefetch-num N`:
 
@@ -103,9 +103,22 @@ Enable it with `--expert-offload-prefetch-num N`:
 --expert-offload-prefetch-num 3
 ```
 
-If the prefetch completes before the next MoE kernel launches, the kernel reads at HBM speed. If not, the kernel falls back to PCIe read-through (existing behavior). However, prefetching too many experts can cause GPU memory pressure and page thrashing, which degrades decode speed.
+If the prefetch completes before the target MoE kernel launches, the kernel reads at HBM speed. If not, the kernel falls back to PCIe read-through (existing behavior). However, prefetching too many experts can cause GPU memory pressure and page thrashing, which degrades decode speed.
 
-**Tuning**: Start with `--expert-offload-prefetch-num 2`. Higher values prefetch more experts but consume more PCIe bandwidth and GPU memory, which can cause page thrashing. Typical sweet spot is 2-4 depending on model size and available GPU memory headroom.
+### Prefetch Depth
+
+By default, each layer only prefetches for the **next** layer (`--expert-offload-prefetch-depth 1`). When expert prefetch takes longer than one layer's attention + layernorm compute, increase the depth so that prefetch is issued further ahead:
+
+```bash
+--expert-offload-num-resident 200 \
+--expert-offload-resident-selection frequency \
+--expert-offload-prefetch-num 3 \
+--expert-offload-prefetch-depth 3
+```
+
+With depth D, after layer i's MoE kernel, prefetch is issued for layers i+1, i+2, ..., i+D. This gives D layers' worth of attention + layernorm compute to overlap with the PCIe transfers.
+
+**Tuning**: Start with `--expert-offload-prefetch-num 2` and `--expert-offload-prefetch-depth 1`. If profiling shows that prefetch is not completing in time, increase depth to 2-4. Higher depth values issue more concurrent prefetch requests, which can improve overlap but also increase PCIe contention and GPU memory pressure.
 
 ## How It Works
 
@@ -132,4 +145,5 @@ If the prefetch completes before the next MoE kernel launches, the kernel reads 
 | `--expert-offload-num-resident` | Number of experts kept resident on GPU per MoE layer. `-1` disables offloading. | `-1` |
 | `--expert-offload-resident-selection` | Strategy for choosing resident experts: `first_n`, `frequency`, or `manual`. | `first_n` |
 | `--expert-offload-resident-ids` | Comma-separated expert IDs for `manual` selection mode. | `None` |
-| `--expert-offload-prefetch-num` | Number of hot offloaded experts to prefetch for the next layer on a background stream. `0` disables. | `0` |
+| `--expert-offload-prefetch-num` | Number of hot offloaded experts to prefetch per target layer on a background stream. `0` disables. | `0` |
+| `--expert-offload-prefetch-depth` | How many layers ahead to prefetch. `1` = next layer only. Higher values give more overlap. | `1` |

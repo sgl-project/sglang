@@ -44,6 +44,7 @@ import torch
 # ---------------------------------------------------------------------------
 ADVISE_SET_PREFERRED_LOCATION = 3  # cudaMemAdviseSetPreferredLocation
 ADVISE_SET_ACCESSED_BY = 5  # cudaMemAdviseSetAccessedBy
+ADVISE_UNSET_ACCESSED_BY = 6  # cudaMemAdviseUnsetAccessedBy
 
 # cudaCpuDeviceId -- pass as device_id to target the CPU
 CUDA_CPU_DEVICE: int = -1

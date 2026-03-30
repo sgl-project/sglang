@@ -591,6 +591,12 @@ class ServerArgs:
     expert_offload_prefetch_num: int = (
         0  # 0 = disabled; N = prefetch top-N hot offloaded experts
     )
+    expert_offload_prefetch_depth: int = (
+        1  # how many layers ahead to prefetch (default 1 = next layer only)
+    )
+    expert_offload_memory_headroom: int = (
+        2  # GiB of GPU memory reserved for UVM page swapping
+    )
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -2832,9 +2838,16 @@ class ServerArgs:
         if self.expert_offload_prefetch_num < 0:
             raise ValueError("--expert-offload-prefetch-num must be >= 0")
 
+        if self.expert_offload_prefetch_depth < 1:
+            raise ValueError("--expert-offload-prefetch-depth must be >= 1")
+
+        if self.expert_offload_memory_headroom < 0:
+            raise ValueError("--expert-offload-memory-headroom must be >= 0")
+
         logger.info(
             f"[ExpertOffload] Enabled (UVM): num_resident={self.expert_offload_num_resident}, "
-            f"resident_selection={self.expert_offload_resident_selection!r}. "
+            f"resident_selection={self.expert_offload_resident_selection!r}, "
+            f"memory_headroom={self.expert_offload_memory_headroom} GiB. "
             "Expert weights stored in CUDA Unified Memory. "
             "Resident experts stay on GPU (VRAM speed). "
             "Offloaded experts accessible via PCIe read-through (no quality loss). "
@@ -5226,6 +5239,26 @@ class ServerArgs:
             "offloaded experts on a background CUDA stream. "
             "Too high a value can cause GPU memory pressure and page thrashing, "
             "reducing decode speed.",
+        )
+        parser.add_argument(
+            "--expert-offload-prefetch-depth",
+            type=int,
+            default=1,
+            help="How many layers ahead to prefetch offloaded experts. "
+            "Default 1 = prefetch only the next layer's experts. "
+            "Higher values (e.g. 2-4) issue prefetch for the next D layers, "
+            "giving more overlap between PCIe transfers and compute. "
+            "Useful when expert prefetch takes longer than one layer's "
+            "attention + layernorm compute.",
+        )
+        parser.add_argument(
+            "--expert-offload-memory-headroom",
+            type=int,
+            default=ServerArgs.expert_offload_memory_headroom,
+            help="GiB of GPU memory to reserve as headroom for UVM page swapping. "
+            "Prevents deadlocks when switching between requests with different "
+            "expert routing patterns. Higher values are safer but reduce KV cache "
+            "capacity. Default 2 GiB. Set to 0 to disable.",
         )
 
         # Diffusion LLM

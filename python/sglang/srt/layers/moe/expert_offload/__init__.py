@@ -32,7 +32,7 @@ Pass ``--expert-offload-num-resident N`` to enable.  Additional options:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 from sglang.srt.layers.moe.expert_offload.config import (
     ExpertOffloadConfig,
@@ -50,7 +50,10 @@ __all__ = [
     "ExpertOffloadWrapperMethod",
     "chain_managers",
     "create_expert_offload_config_from_server_args",
+    "notify_decode_completed",
+    "prepare_for_new_prefill",
     "register_manager",
+    "restore_after_prefill",
 ]
 
 # ---------------------------------------------------------------------------
@@ -60,17 +63,34 @@ __all__ = [
 _manager_registry: Dict[int, Tuple["ExpertOffloadManager", "torch.nn.Module"]] = {}
 _managers_chained: bool = False
 
+# Persistent list of all (manager, layer) pairs.
+# Unlike _manager_registry which is cleared after chain_managers(), this list
+# survives so that prepare_for_new_prefill() can iterate over all managers.
+_all_managers: List[Tuple["ExpertOffloadManager", "torch.nn.Module"]] = []
+
+# True once at least one decode step has executed since the last page reset.
+# Used to skip the expensive prefetch+sync when consecutive extends run
+# (e.g. chunked prefill) with no intervening decode.
+_decode_since_last_reset: bool = False
+
+# Set True during the first forward pass after prepare_for_new_prefill.
+# Used to enable per-layer tracing in wrapper.apply() so we can see which
+# MoE layer the kernel hangs on.
+_tracing_prefill: bool = False
+
 
 def register_manager(
     layer_idx: int, manager: "ExpertOffloadManager", layer: "torch.nn.Module"
 ) -> None:
     """Called from wrapper.process_weights_after_loading()."""
     _manager_registry[layer_idx] = (manager, layer)
+    _all_managers.append((manager, layer))
 
 
 def chain_managers() -> None:
-    """Link managers[i].next_layer_manager = managers[i+1], build prefetch caches.
+    """Link managers[i].next_layer_managers to the next D managers, build prefetch caches.
 
+    D is determined by each manager's ``config.prefetch_depth``.
     Guarded by ``_managers_chained`` flag -- no-op after first call.
     """
     global _managers_chained
@@ -79,10 +99,17 @@ def chain_managers() -> None:
     _managers_chained = True
 
     sorted_idxs = sorted(_manager_registry.keys())
-    for i in range(len(sorted_idxs) - 1):
+    n = len(sorted_idxs)
+    for i in range(n):
         curr_mgr, _ = _manager_registry[sorted_idxs[i]]
-        next_mgr, _ = _manager_registry[sorted_idxs[i + 1]]
-        curr_mgr.next_layer_manager = next_mgr
+        depth = curr_mgr.config.prefetch_depth
+        targets = []
+        for d in range(1, depth + 1):
+            j = i + d
+            if j < n:
+                next_mgr, _ = _manager_registry[sorted_idxs[j]]
+                targets.append(next_mgr)
+        curr_mgr.next_layer_managers = targets
 
     # Build prefetch caches for all managers.
     for idx in sorted_idxs:
@@ -90,3 +117,66 @@ def chain_managers() -> None:
         mgr.prepare_prefetch_cache(layer)
 
     _manager_registry.clear()
+
+
+def notify_decode_completed() -> None:
+    """Mark that a decode step has run, so the next prefill triggers page reset."""
+    global _decode_since_last_reset
+    _decode_since_last_reset = True
+
+
+def prepare_for_new_prefill() -> None:
+    """Notify decode->prefill transition.
+
+    The real fix for UVM page-swap deadlocks is a 2 GiB headroom
+    reserved in get_available_gpu_memory() so the UVM driver always
+    has free GPU pages for bi-directional page swapping.
+    This function just resets bookkeeping flags and logs memory state.
+    """
+    import logging
+
+    import torch
+
+    logger = logging.getLogger(__name__)
+
+    global _decode_since_last_reset
+    if not _all_managers or not _decode_since_last_reset:
+        return
+    _decode_since_last_reset = False
+
+    global _tracing_prefill
+    _tracing_prefill = True
+
+    free, total = torch.cuda.mem_get_info()
+    used_gb = (total - free) / (1 << 30)
+    free_gb = free / (1 << 30)
+    logger.info(
+        f"[ExpertOffload] prepare_for_new_prefill: "
+        f"decode->prefill transition "
+        f"(GPU mem: {used_gb:.2f} GiB used, {free_gb:.2f} GiB free)"
+    )
+
+
+def restore_after_prefill() -> None:
+    """Re-enable GPU direct mapping for offloaded experts after prefill.
+
+    Called after forward_extend completes to restore ACCESSED_BY advice
+    so decode can use fast PCIe read-through without page fault overhead.
+    """
+    import logging
+    import time
+
+    logger = logging.getLogger(__name__)
+
+    if not _all_managers:
+        return
+
+    t0 = time.monotonic()
+    for mgr, layer in _all_managers:
+        mgr.restore_accessed_by_for_offloaded(layer)
+    t1 = time.monotonic()
+
+    logger.info(
+        f"[ExpertOffload] restore_after_prefill: "
+        f"re-set ACCESSED_BY in {t1 - t0:.3f}s"
+    )
