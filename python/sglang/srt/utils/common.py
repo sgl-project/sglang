@@ -706,7 +706,17 @@ def load_audio(
     ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         with requests.get(audio_file, timeout=timeout) as response:
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                status_code = (
+                    e.response.status_code if e.response is not None else None
+                )
+                if status_code is not None and 400 <= status_code < 500:
+                    raise ValueError(
+                        f"Failed to load audio from URL: {status_code} Client Error for url: {audio_file}"
+                    ) from e
+                raise
             source = response.content
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
         source = unquote(urlparse(audio_file).path)
@@ -856,6 +866,13 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         try:
             response.raise_for_status()
             result = response.content
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code is not None and 400 <= status_code < 500:
+                raise ValueError(
+                    f"Failed to load image from URL: {status_code} Client Error for url: {image_file}"
+                ) from e
+            raise
         finally:
             response.close()
         return result
@@ -885,7 +902,17 @@ def _normalize_video_input(
         if video_file.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
             response = requests.get(video_file, stream=True, timeout=timeout)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                status_code = (
+                    e.response.status_code if e.response is not None else None
+                )
+                if status_code is not None and 400 <= status_code < 500:
+                    raise ValueError(
+                        f"Failed to load video from URL: {status_code} Client Error for url: {video_file}"
+                    ) from e
+                raise
             return response.content
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
