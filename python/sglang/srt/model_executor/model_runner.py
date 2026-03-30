@@ -1812,15 +1812,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def kernel_warmup(self):
-        """
-        Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
-        """
+        """Warmup and tune kernels before cuda graph capture."""
         if self.device != "cuda":
             return
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+        self._warmup_fused_sampling()
+
+    def _warmup_fused_sampling(self):
+        """Pre-compile and autotune fused sampling Triton kernels."""
+        from sglang.srt.layers.fused_sampling import (
+            warmup_fused_temperature_softmax,
+        )
+
+        warmup_fused_temperature_softmax(
+            vocab_size=self.model_config.vocab_size,
+            device=self.device,
+        )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

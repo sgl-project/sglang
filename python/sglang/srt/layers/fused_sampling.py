@@ -10,9 +10,13 @@ Two kernel variants:
     Used for large vocabs (e.g. 128K+).
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 _MAX_SINGLE_PASS_BLOCK = 32768
 
@@ -199,19 +203,63 @@ def _single_pass_num_warps(block_size: int) -> int:
     return max(4, min(32, block_size // 256))
 
 
+def _dispatch_kernel(
+    logits: torch.Tensor,
+    temperatures_flat: torch.Tensor,
+    vocab_size: int,
+    batch_size: int,
+    output: torch.Tensor = None,
+) -> None:
+    """Dispatch to single-pass or multi-pass kernel. output=None means in-place."""
+    grid = (batch_size,)
+    block_size = triton.next_power_of_2(vocab_size)
+    inplace = output is None
+
+    if block_size <= _MAX_SINGLE_PASS_BLOCK:
+        if inplace:
+            _single_pass_temperature_softmax_inplace_kernel[grid](
+                logits,
+                temperatures_flat,
+                vocab_size,
+                logits.stride(0),
+                BLOCK_SIZE=block_size,
+                num_warps=_single_pass_num_warps(block_size),
+            )
+        else:
+            _single_pass_temperature_softmax_kernel[grid](
+                logits,
+                temperatures_flat,
+                output,
+                vocab_size,
+                logits.stride(0),
+                output.stride(0),
+                BLOCK_SIZE=block_size,
+                num_warps=_single_pass_num_warps(block_size),
+            )
+    else:
+        if inplace:
+            _multi_pass_temperature_softmax_inplace_kernel[grid](
+                logits,
+                temperatures_flat,
+                vocab_size,
+                logits.stride(0),
+            )
+        else:
+            _multi_pass_temperature_softmax_kernel[grid](
+                logits,
+                temperatures_flat,
+                output,
+                vocab_size,
+                logits.stride(0),
+                output.stride(0),
+            )
+
+
 def fused_temperature_softmax(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused temperature scaling + softmax in a single Triton kernel.
-
-    Args:
-        logits: Raw logits of shape ``(batch_size, vocab_size)``.
-        temperatures: Per-request temperatures of shape ``(batch_size, 1)``.
-
-    Returns:
-        Probability tensor of shape ``(batch_size, vocab_size)`` in float32.
-    """
+    """Fused temperature scaling + softmax. Returns float32 probabilities."""
     batch_size, vocab_size = logits.shape
     if batch_size == 0:
         return torch.empty(0, vocab_size, dtype=torch.float32, device=logits.device)
@@ -223,29 +271,7 @@ def fused_temperature_softmax(
         batch_size, vocab_size, dtype=torch.float32, device=logits.device
     )
     temperatures_flat = temperatures.contiguous().view(-1)
-    grid = (batch_size,)
-
-    block_size = triton.next_power_of_2(vocab_size)
-    if block_size <= _MAX_SINGLE_PASS_BLOCK:
-        _single_pass_temperature_softmax_kernel[grid](
-            logits,
-            temperatures_flat,
-            output,
-            vocab_size,
-            logits.stride(0),
-            output.stride(0),
-            BLOCK_SIZE=block_size,
-            num_warps=_single_pass_num_warps(block_size),
-        )
-    else:
-        _multi_pass_temperature_softmax_kernel[grid](
-            logits,
-            temperatures_flat,
-            output,
-            vocab_size,
-            logits.stride(0),
-            output.stride(0),
-        )
+    _dispatch_kernel(logits, temperatures_flat, vocab_size, batch_size, output)
     return output
 
 
@@ -253,14 +279,7 @@ def fused_temperature_softmax_inplace(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
 ) -> None:
-    """In-place fused temperature scaling + softmax.
-
-    After this call, ``logits`` contains probabilities.
-
-    Args:
-        logits: Raw logits of shape ``(batch_size, vocab_size)``. Modified in-place.
-        temperatures: Per-request temperatures of shape ``(batch_size, 1)``.
-    """
+    """In-place fused temperature scaling + softmax. Overwrites logits with probabilities."""
     batch_size, vocab_size = logits.shape
     if batch_size == 0:
         return
@@ -268,22 +287,34 @@ def fused_temperature_softmax_inplace(
     assert logits.is_contiguous(), "logits must be contiguous for in-place kernel"
 
     temperatures_flat = temperatures.contiguous().view(-1)
-    grid = (batch_size,)
+    _dispatch_kernel(logits, temperatures_flat, vocab_size, batch_size)
+
+
+def warmup_fused_temperature_softmax(
+    vocab_size: int,
+    device: torch.device = None,
+) -> None:
+    """Pre-compile and autotune kernels at startup so first request has no latency spike."""
+    if device is None:
+        device = torch.cuda.current_device()
 
     block_size = triton.next_power_of_2(vocab_size)
-    if block_size <= _MAX_SINGLE_PASS_BLOCK:
-        _single_pass_temperature_softmax_inplace_kernel[grid](
-            logits,
-            temperatures_flat,
-            vocab_size,
-            logits.stride(0),
-            BLOCK_SIZE=block_size,
-            num_warps=_single_pass_num_warps(block_size),
-        )
-    else:
-        _multi_pass_temperature_softmax_inplace_kernel[grid](
-            logits,
-            temperatures_flat,
-            vocab_size,
-            logits.stride(0),
-        )
+    is_multi_pass = block_size > _MAX_SINGLE_PASS_BLOCK
+    label = "multi-pass autotune" if is_multi_pass else "single-pass JIT"
+    logger.info(
+        "Warming up fused_temperature_softmax (%s, vocab_size=%d) ...",
+        label,
+        vocab_size,
+    )
+
+    # Small dummy tensors — only 1 row needed to trigger compile + autotune.
+    dummy_logits = torch.randn(1, vocab_size, dtype=torch.bfloat16, device=device)
+    dummy_temps = torch.ones(1, 1, dtype=torch.float32, device=device)
+
+    # Trigger out-of-place kernel
+    fused_temperature_softmax(dummy_logits, dummy_temps)
+    # Trigger in-place kernel
+    fused_temperature_softmax_inplace(dummy_logits.clone(), dummy_temps)
+    torch.cuda.synchronize(device)
+
+    logger.info("fused_temperature_softmax warmup done (vocab_size=%d).", vocab_size)

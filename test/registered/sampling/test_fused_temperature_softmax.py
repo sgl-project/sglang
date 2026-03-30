@@ -1,13 +1,9 @@
-"""Correctness tests for fused_temperature_softmax Triton kernel.
-
-Compares the fused kernel output against the reference PyTorch implementation
-(logits.div_(temperatures) followed by torch.softmax) across a range of batch
-sizes, vocab sizes, dtypes, and temperature values.
-"""
+"""Correctness tests for fused_temperature_softmax Triton kernel."""
 
 import unittest
 
 import torch
+from flashinfer.sampling import softmax as flashinfer_softmax
 
 from sglang.srt.layers.fused_sampling import (
     fused_temperature_softmax,
@@ -152,6 +148,120 @@ class TestFusedTemperatureSoftmax(CustomTestCase):
         ref = reference_temperature_softmax(logits, temps)
         fused_temperature_softmax_inplace(logits, temps)
         self._check_close(logits.float(), ref, atol=2e-3, rtol=2e-3)
+
+    # --- exact known-value correctness ---
+
+    def test_known_uniform_logits(self):
+        """Identical logits must produce uniform distribution regardless of temperature."""
+        logits = torch.zeros(2, 5, dtype=torch.float32)
+        temps = torch.tensor([0.5, 2.0], dtype=torch.float32).view(-1, 1)
+        fused = fused_temperature_softmax(logits, temps)
+        expected = torch.full((2, 5), 0.2, dtype=torch.float32, device=fused.device)
+        torch.testing.assert_close(fused, expected, atol=1e-6, rtol=1e-6)
+
+    def test_known_softmax_values(self):
+        """Verify against hand-computed softmax(logits / T)."""
+        logits = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+        temps = torch.tensor([[1.0]], dtype=torch.float32)
+        fused = fused_temperature_softmax(logits, temps)
+        # softmax([1,2,3]) = exp([1,2,3]) / sum(exp([1,2,3]))
+        e = torch.exp(logits)
+        expected = (e / e.sum(dim=-1, keepdim=True)).to(fused.device)
+        torch.testing.assert_close(fused, expected, atol=1e-6, rtol=1e-6)
+
+    def test_known_softmax_with_temperature(self):
+        """Verify softmax([1,2,3] / 0.5) against hand computation."""
+        logits = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+        temps = torch.tensor([[0.5]], dtype=torch.float32)
+        fused = fused_temperature_softmax(logits, temps)
+        scaled = logits / 0.5
+        e = torch.exp(scaled)
+        expected = (e / e.sum(dim=-1, keepdim=True)).to(fused.device)
+        torch.testing.assert_close(fused, expected, atol=1e-6, rtol=1e-6)
+
+    # --- argmax preservation ---
+
+    def test_argmax_preserved(self):
+        """argmax must be invariant to temperature for finite T > 0."""
+        logits = torch.randn(64, 32000, dtype=torch.bfloat16)
+        original_argmax = logits.float().argmax(dim=-1)
+        for t_val in [0.1, 0.5, 1.0, 2.0, 10.0]:
+            temps = torch.full((64, 1), t_val, dtype=torch.float32)
+            fused = fused_temperature_softmax(logits, temps)
+            fused_argmax = fused.argmax(dim=-1)
+            self.assertTrue(
+                (original_argmax == fused_argmax).all(),
+                f"argmax changed at temperature={t_val}",
+            )
+
+    # --- numerical stability ---
+
+    def test_large_logits_no_nan(self):
+        """Extreme logit magnitudes must not produce NaN or Inf."""
+        logits = torch.tensor(
+            [[1e6, -1e6, 0.0], [1e4, 1e4 + 1, 1e4 - 1]], dtype=torch.float32
+        )
+        temps = torch.tensor([[1.0], [0.01]], dtype=torch.float32)
+        fused = fused_temperature_softmax(logits, temps)
+        self.assertFalse(torch.isnan(fused).any(), "NaN in output")
+        self.assertFalse(torch.isinf(fused).any(), "Inf in output")
+        row_sums = fused.sum(dim=-1)
+        torch.testing.assert_close(
+            row_sums,
+            torch.ones_like(row_sums),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    def test_large_logits_inplace_no_nan(self):
+        """In-place variant: extreme logits must not produce NaN or Inf."""
+        logits = torch.tensor(
+            [[1e6, -1e6, 0.0], [1e4, 1e4 + 1, 1e4 - 1]], dtype=torch.float32
+        )
+        temps = torch.tensor([[1.0], [0.01]], dtype=torch.float32)
+        fused_temperature_softmax_inplace(logits, temps)
+        self.assertFalse(torch.isnan(logits).any(), "NaN in output")
+        self.assertFalse(torch.isinf(logits).any(), "Inf in output")
+
+    # --- comparison with flashinfer.sampling.softmax ---
+
+    def test_vs_flashinfer_basic(self):
+        logits = torch.randn(4, 1024, dtype=torch.bfloat16)
+        temps = torch.tensor([0.7, 1.0, 1.5, 2.0], dtype=torch.float32).view(-1, 1)
+        fused = fused_temperature_softmax(logits, temps)
+        fi = flashinfer_softmax(logits, temperature=temps.view(-1))
+        self._check_close(fused, fi, atol=1e-4, rtol=1e-3)
+
+    def test_vs_flashinfer_large_vocab(self):
+        logits = torch.randn(8, 128256, dtype=torch.bfloat16)
+        temps = torch.full((8, 1), 0.6, dtype=torch.float32)
+        fused = fused_temperature_softmax(logits, temps)
+        fi = flashinfer_softmax(logits, temperature=temps.view(-1))
+        self._check_close(fused, fi, atol=1e-4, rtol=1e-3)
+
+    def test_vs_flashinfer_batch_sizes(self):
+        for bs in [1, 16, 64, 128, 512]:
+            logits = torch.randn(bs, 32000, dtype=torch.bfloat16)
+            temps = torch.rand(bs, 1, dtype=torch.float32) * 1.5 + 0.1
+            fused = fused_temperature_softmax(logits, temps)
+            fi = flashinfer_softmax(logits, temperature=temps.view(-1))
+            self._check_close(fused, fi, atol=1e-4, rtol=1e-3)
+
+    def test_vs_flashinfer_scalar_temperature(self):
+        logits = torch.randn(16, 32000, dtype=torch.bfloat16)
+        temps_2d = torch.full((16, 1), 0.8, dtype=torch.float32)
+        fused = fused_temperature_softmax(logits, temps_2d)
+        fi = flashinfer_softmax(logits, temperature=0.8)
+        self._check_close(fused, fi, atol=1e-4, rtol=1e-3)
+
+    def test_vs_flashinfer_mixed_temperatures(self):
+        logits = torch.randn(8, 32000, dtype=torch.bfloat16)
+        temps = torch.tensor(
+            [0.1, 0.5, 0.7, 1.0, 1.2, 1.5, 2.0, 5.0], dtype=torch.float32
+        ).view(-1, 1)
+        fused = fused_temperature_softmax(logits, temps)
+        fi = flashinfer_softmax(logits, temperature=temps.view(-1))
+        self._check_close(fused, fi, atol=1e-4, rtol=1e-3)
 
 
 if __name__ == "__main__":

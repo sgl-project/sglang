@@ -1,8 +1,4 @@
-"""Benchmark: fused_temperature_softmax vs separate div_ + softmax.
-
-Measures wall-clock time with torch.cuda.Event timing, 200 iterations
-after 50 warmup. Reports per-call latency and speedup.
-"""
+"""Benchmark: fused_temperature_softmax vs div_+softmax vs flashinfer.sampling.softmax."""
 
 import argparse
 
@@ -31,6 +27,8 @@ def main():
     parser.add_argument("--iters", type=int, default=200)
     args = parser.parse_args()
 
+    from flashinfer.sampling import softmax as flashinfer_softmax
+
     from sglang.srt.layers.fused_sampling import (
         fused_temperature_softmax,
         fused_temperature_softmax_inplace,
@@ -48,43 +46,52 @@ def main():
         (512, 128256, torch.bfloat16),
     ]
 
-    print(
-        f"{'bs':>5}  {'vocab':>7}  {'dtype':>8}  {'original (us)':>14}  "
-        f"{'fused (us)':>11}  {'inplace (us)':>13}  {'speedup':>8}  {'speedup_ip':>11}"
+    header = (
+        f"{'bs':>5}  {'vocab':>7}  {'dtype':>8}  "
+        f"{'baseline (us)':>14}  {'triton (us)':>12}  {'inplace (us)':>13}  {'flashinfer (us)':>16}  "
+        f"{'tri/base':>9}  {'fi/base':>8}"
     )
-    print("-" * 100)
+    print(header)
+    print("-" * len(header))
 
     for bs, vocab, dtype in configs:
         temps = torch.rand(bs, 1, dtype=torch.float32, device="cuda") * 1.5 + 0.1
-        # Pre-allocate a source tensor; each run clones from it for fair comparison.
+        temps_1d = temps.view(-1)
         logits_src = torch.randn(bs, vocab, dtype=dtype, device="cuda")
 
-        # --- Original ---
-        def run_original(src=logits_src, t=temps):
+        # --- Baseline: div_ + softmax ---
+        def run_baseline(src=logits_src, t=temps):
             l = src.clone()
             l.div_(t)
             l[:] = torch.softmax(l, dim=-1)
 
-        t_orig = benchmark_fn(run_original, args.warmup, args.iters)
+        t_base = benchmark_fn(run_baseline, args.warmup, args.iters)
 
-        # --- Fused (out-of-place) ---
-        def run_fused(src=logits_src, t=temps):
+        # --- Triton fused (out-of-place) ---
+        def run_triton(src=logits_src, t=temps):
             fused_temperature_softmax(src.clone(), t)
 
-        t_fused = benchmark_fn(run_fused, args.warmup, args.iters)
+        t_triton = benchmark_fn(run_triton, args.warmup, args.iters)
 
-        # --- Fused (in-place) ---
+        # --- Triton fused (in-place) ---
         def run_inplace(src=logits_src, t=temps):
             l = src.clone()
             fused_temperature_softmax_inplace(l, t)
 
         t_ip = benchmark_fn(run_inplace, args.warmup, args.iters)
 
-        speedup = t_orig / t_fused
-        speedup_ip = t_orig / t_ip
+        # --- FlashInfer softmax with temperature ---
+        def run_flashinfer(src=logits_src, t=temps_1d):
+            flashinfer_softmax(src, temperature=t)
+
+        t_fi = benchmark_fn(run_flashinfer, args.warmup, args.iters)
+
+        sp_triton = t_base / t_triton
+        sp_fi = t_base / t_fi
         print(
-            f"{bs:>5}  {vocab:>7}  {str(dtype):>8}  {t_orig:>14.1f}  "
-            f"{t_fused:>11.1f}  {t_ip:>13.1f}  {speedup:>7.2f}x  {speedup_ip:>10.2f}x"
+            f"{bs:>5}  {vocab:>7}  {str(dtype):>8}  "
+            f"{t_base:>14.1f}  {t_triton:>12.1f}  {t_ip:>13.1f}  {t_fi:>16.1f}  "
+            f"{sp_triton:>8.2f}x  {sp_fi:>7.2f}x"
         )
 
 
