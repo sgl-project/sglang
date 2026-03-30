@@ -133,6 +133,11 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
+        # CUDA Graph runner cache: keyed by latent shape tuple.
+        # Persists across requests — first request captures, subsequent
+        # requests only copy new data into persistent buffers + replay.
+        self._cuda_graph_runners: dict[tuple, "DiffusionCudaGraphRunner"] = {}
+
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
@@ -1028,25 +1033,9 @@ class DenoisingStage(PipelineStage):
                 f"denoising steps must use the same transformer."
             )
 
-            graph_runner = DiffusionCudaGraphRunner(
-                device=get_local_torch_device()
-            )
-            # Pre-allocate fixed-address buffers matching expected shapes.
-            # These tensors' addresses are baked into the CUDA Graph.
-            bsz = batch.raw_latent_shape[0]
-            timestep_buffer = torch.empty(
-                bsz,
-                dtype=target_dtype,
-                device=get_local_torch_device(),
-            )
-            latent_buffer = torch.empty_like(latents)
-
             # Collect static kwargs for dit.forward().
-            # Use prepare_extra_func_kwargs() to filter by dit.forward()
-            # signature — only accepted params are included.
-            # For ZImage: encoder_hidden_states, guidance, freqs_cis.
-            # Note: patch_size/f_patch_size have defaults in ZImage.forward()
-            # and are not stored in ZImageDitConfig, so we don't pass them.
+            # These are per-request (different prompt = different embeddings),
+            # but their shapes are fixed for the same resolution.
             static_kwargs = self.prepare_extra_func_kwargs(
                 getattr(self.transformer, "forward", self.transformer),
                 {
@@ -1057,10 +1046,30 @@ class DenoisingStage(PipelineStage):
                     "freqs_cis": pos_cond_kwargs.get("freqs_cis"),
                 },
             )
-            logger.info(
-                "Diffusion CUDA Graph enabled. Static kwargs: %s",
-                list(static_kwargs.keys()),
-            )
+
+            # Look up cached graph runner by latent shape.
+            # Same resolution → same latent shape → reuse graph.
+            latent_shape = tuple(latents.shape)
+            graph_runner = self._cuda_graph_runners.get(latent_shape)
+
+            if graph_runner is not None:
+                # Cached graph exists — just update per-request data
+                graph_runner.update_static_kwargs(static_kwargs)
+                logger.info(
+                    "Diffusion CUDA Graph: reusing cached graph for shape %s",
+                    latent_shape,
+                )
+            else:
+                # First request for this shape — will capture in step 0
+                graph_runner = DiffusionCudaGraphRunner(
+                    device=get_local_torch_device()
+                )
+                logger.info(
+                    "Diffusion CUDA Graph: will capture for shape %s. "
+                    "Static kwargs: %s",
+                    latent_shape,
+                    list(static_kwargs.keys()),
+                )
 
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
@@ -1127,10 +1136,9 @@ class DenoisingStage(PipelineStage):
                             cuda_graph_enabled
                             and not graph_runner.captured
                         ):
-                            # === Step 0: CUDA Graph Capture ===
-                            # Copy initial data into fixed-address buffers
-                            timestep_buffer.copy_(timestep)
-                            latent_buffer.copy_(latent_model_input)
+                            # === First request for this shape: Capture ===
+                            # warmup + capture happens once, then the runner
+                            # is cached for all subsequent requests.
                             with set_forward_context(
                                 current_timestep=i,
                                 attn_metadata=None,
@@ -1138,15 +1146,14 @@ class DenoisingStage(PipelineStage):
                             ):
                                 noise_pred = graph_runner.capture(
                                     dit_forward_fn=current_model,
-                                    timestep_buffer=timestep_buffer,
-                                    latent_buffer=latent_buffer,
+                                    timestep=timestep,
+                                    latents=latent_model_input,
                                     static_kwargs=static_kwargs,
                                 )
+                            # Cache the runner for future requests
+                            self._cuda_graph_runners[latent_shape] = graph_runner
                         elif cuda_graph_enabled and graph_runner.captured:
-                            # === Step 1+: CUDA Graph Replay ===
-                            # Maintain forward context for profiling/logging
-                            # consistency, even though FlashAttention does
-                            # not read current_timestep.
+                            # === Replay (same or subsequent request) ===
                             with set_forward_context(
                                 current_timestep=i,
                                 attn_metadata=None,
