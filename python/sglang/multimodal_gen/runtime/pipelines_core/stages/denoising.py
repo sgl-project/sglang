@@ -59,6 +59,9 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.diffusion_cuda_graph_runner import (
+    DiffusionCudaGraphRunner,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -1001,6 +1004,67 @@ class DenoisingStage(PipelineStage):
         seq_len = prepared_vars["seq_len"]
         guidance = prepared_vars["guidance"]
 
+        # CUDA Graph setup for denoising
+        cuda_graph_enabled = server_args.enable_diffusion_cuda_graph
+        graph_runner = None
+        if cuda_graph_enabled:
+            # Runtime safety checks — catch misuse at startup, not silently
+            # produce incorrect results from replaying a mismatched graph.
+            _TIMESTEP_DEPENDENT_BACKENDS = {
+                AttentionBackendEnum.SLIDING_TILE_ATTN,
+                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+                AttentionBackendEnum.VMOBA_ATTN,
+            }
+            assert self.attn_backend.get_enum() not in _TIMESTEP_DEPENDENT_BACKENDS, (
+                f"Diffusion CUDA Graph is incompatible with attention backend "
+                f"'{self.attn_backend.get_enum().name}'. These backends use "
+                f"current_timestep for kernel path selection, which cannot "
+                f"change after graph capture. Use FlashAttention instead."
+            )
+            assert boundary_timestep is None, (
+                f"Diffusion CUDA Graph does not support mid-request model "
+                f"switching (boundary_timestep={boundary_timestep}). All "
+                f"denoising steps must use the same transformer."
+            )
+
+            graph_runner = DiffusionCudaGraphRunner(
+                device=get_local_torch_device()
+            )
+            # Pre-allocate fixed-address buffers matching expected shapes.
+            # These tensors' addresses are baked into the CUDA Graph.
+            bsz = batch.raw_latent_shape[0]
+            timestep_buffer = torch.empty(
+                bsz,
+                dtype=target_dtype,
+                device=get_local_torch_device(),
+            )
+            latent_buffer = torch.empty_like(latents)
+
+            # Collect static kwargs for dit.forward().
+            # For ZImage: encoder_hidden_states (List[Tensor]), guidance,
+            # patch_size, f_patch_size, freqs_cis.
+            # prepare_extra_func_kwargs() filters by dit.forward() signature,
+            # so only accepted params are included.
+            static_kwargs = self.prepare_extra_func_kwargs(
+                getattr(self.transformer, "forward", self.transformer),
+                {
+                    "encoder_hidden_states": pos_cond_kwargs.get(
+                        "encoder_hidden_states"
+                    ),
+                    "guidance": guidance,
+                    "patch_size": server_args.pipeline_config.dit_config.patch_size,
+                    "f_patch_size": getattr(
+                        server_args.pipeline_config.dit_config, "f_patch_size", 1
+                    ),
+                    "freqs_cis": pos_cond_kwargs.get("freqs_cis"),
+                },
+            )
+            logger.info(
+                "Diffusion CUDA Graph enabled. Static kwargs: %s",
+                list(static_kwargs.keys()),
+            )
+
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
@@ -1062,29 +1126,63 @@ class DenoisingStage(PipelineStage):
                         )
 
                         # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(
-                            i,
-                            batch,
-                            server_args,
-                            timestep_value=t_int,
-                            timesteps=timesteps_cpu,
-                        )
-                        noise_pred = self._predict_noise_with_cfg(
-                            current_model=current_model,
-                            latent_model_input=latent_model_input,
-                            timestep=timestep,
-                            batch=batch,
-                            timestep_index=i,
-                            attn_metadata=attn_metadata,
-                            target_dtype=target_dtype,
-                            current_guidance_scale=current_guidance_scale,
-                            image_kwargs=image_kwargs,
-                            pos_cond_kwargs=pos_cond_kwargs,
-                            neg_cond_kwargs=neg_cond_kwargs,
-                            server_args=server_args,
-                            guidance=guidance,
-                            latents=latents,
-                        )
+                        if (
+                            cuda_graph_enabled
+                            and not graph_runner.captured
+                        ):
+                            # === Step 0: CUDA Graph Capture ===
+                            # Copy initial data into fixed-address buffers
+                            timestep_buffer.copy_(timestep)
+                            latent_buffer.copy_(latent_model_input)
+                            with set_forward_context(
+                                current_timestep=i,
+                                attn_metadata=None,
+                                forward_batch=batch,
+                            ):
+                                noise_pred = graph_runner.capture(
+                                    dit_forward_fn=current_model,
+                                    timestep_buffer=timestep_buffer,
+                                    latent_buffer=latent_buffer,
+                                    static_kwargs=static_kwargs,
+                                )
+                        elif cuda_graph_enabled and graph_runner.captured:
+                            # === Step 1+: CUDA Graph Replay ===
+                            # Maintain forward context for profiling/logging
+                            # consistency, even though FlashAttention does
+                            # not read current_timestep.
+                            with set_forward_context(
+                                current_timestep=i,
+                                attn_metadata=None,
+                                forward_batch=batch,
+                            ):
+                                noise_pred = graph_runner.replay(
+                                    timestep, latent_model_input
+                                )
+                        else:
+                            # === Eager fallback ===
+                            attn_metadata = self._build_attn_metadata(
+                                i,
+                                batch,
+                                server_args,
+                                timestep_value=t_int,
+                                timesteps=timesteps_cpu,
+                            )
+                            noise_pred = self._predict_noise_with_cfg(
+                                current_model=current_model,
+                                latent_model_input=latent_model_input,
+                                timestep=timestep,
+                                batch=batch,
+                                timestep_index=i,
+                                attn_metadata=attn_metadata,
+                                target_dtype=target_dtype,
+                                current_guidance_scale=current_guidance_scale,
+                                image_kwargs=image_kwargs,
+                                pos_cond_kwargs=pos_cond_kwargs,
+                                neg_cond_kwargs=neg_cond_kwargs,
+                                server_args=server_args,
+                                guidance=guidance,
+                                latents=latents,
+                            )
 
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
                         if server_args.comfyui_mode:
