@@ -321,7 +321,9 @@ def launch_pool_disagg_server(
             role_args = ServerArgs.from_kwargs(**base_dict)
 
             pool_ctx = mp.get_context("spawn")
+            inst_readers = []
 
+            # Spawn all ranks first — NCCL init blocks until all ranks connect
             for rank_idx in range(num_role_gpus):
                 reader, writer = pool_ctx.Pipe(duplex=False)
                 gpu_id = gpu_ids[rank_idx]
@@ -334,7 +336,10 @@ def launch_pool_disagg_server(
                 )
                 process.start()
                 all_processes.append(process)
+                inst_readers.append(reader)
 
+            # Wait for all ranks to be ready (after all are spawned)
+            for rank_idx, reader in enumerate(inst_readers):
                 try:
                     data = reader.recv()
                 except EOFError:
@@ -581,10 +586,13 @@ def launch_disagg_role(server_args: ServerArgs):
     role_args = ServerArgs.from_kwargs(**base_dict)
 
     # Spawn GPU worker processes
+    # NOTE: All ranks must be spawned before waiting for ready signals,
+    # because NCCL init_process_group blocks until all ranks connect.
     num_gpus = server_args.num_gpus
     base_gpu_id = server_args.base_gpu_id
     pool_ctx = mp.get_context("spawn")
     processes = []
+    readers = []
 
     for rank_idx in range(num_gpus):
         reader, writer = pool_ctx.Pipe(duplex=False)
@@ -598,7 +606,10 @@ def launch_disagg_role(server_args: ServerArgs):
         )
         process.start()
         processes.append(process)
+        readers.append(reader)
 
+    # Wait for all ranks to be ready (after all are spawned)
+    for rank_idx, reader in enumerate(readers):
         try:
             data = reader.recv()
         except EOFError:

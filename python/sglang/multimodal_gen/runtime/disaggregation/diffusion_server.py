@@ -327,6 +327,10 @@ class DiffusionServer:
                 payload=payload,
             )
         )
+        logger.debug(
+            "DiffusionServer: queued %s to encoder_tta",
+            request_id,
+        )
 
     def _handle_decoder_result_frames(self, frames: list) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
@@ -338,6 +342,7 @@ class DiffusionServer:
             logger.warning("DiffusionServer: decoder result missing request_id")
             return
 
+        logger.debug("DiffusionServer: decoder result %s", request_id)
         record = self._tracker.get(request_id)
         if record and record.decoder_instance is not None:
             self._decoder_free_slots[record.decoder_instance] += 1
@@ -595,6 +600,7 @@ class DiffusionServer:
 
     def _handle_transfer_staged(self, msg: dict) -> None:
         request_id = msg["request_id"]
+        logger.debug("DiffusionServer transfer: encoder staged %s", request_id)
         record = self._tracker.get(request_id)
         encoder_idx = record.encoder_instance if record else 0
 
@@ -714,6 +720,7 @@ class DiffusionServer:
 
     def _handle_transfer_pushed(self, msg: dict) -> None:
         request_id = msg["request_id"]
+        logger.debug("DiffusionServer transfer: pushed %s", request_id)
         p2p = self._transfer_state.get(request_id)
         if p2p is None:
             logger.warning(
@@ -795,6 +802,11 @@ class DiffusionServer:
 
     def _handle_transfer_done(self, msg: dict, role: RoleType) -> None:
         request_id = msg.get("request_id", "")
+        logger.debug(
+            "DiffusionServer transfer: done %s role=%s",
+            request_id,
+            role.value,
+        )
         error = msg.get("error")
         p2p = self._transfer_state.get(request_id)
 

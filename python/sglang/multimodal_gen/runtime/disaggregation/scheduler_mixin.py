@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import pickle
 import queue
 import threading
@@ -147,6 +148,7 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
     """Extract all transferable fields from a Req, split into tensors and scalars."""
     tensor_fields = {}
     scalar_fields = {}
+    _debug_transfer = logger.isEnabledFor(logging.DEBUG)
 
     for f in dataclasses.fields(req):
         if f.name in _EXCLUDE_FIELDS:
@@ -178,6 +180,32 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
             value = getattr(sp, name, None)
             if value is not None:
                 scalar_fields[name] = _to_json_serializable(value)
+
+    if _debug_transfer:
+        import torch as _torch
+
+        for _n, _t in tensor_fields.items():
+            if isinstance(_t, _torch.Tensor):
+                _sz = _t.nelement() * _t.element_size()
+                logger.debug(
+                    "transfer_field %s shape=%s dtype=%s size=%d",
+                    _n,
+                    list(_t.shape),
+                    _t.dtype,
+                    _sz,
+                )
+            elif isinstance(_t, list):
+                for _i, _ti in enumerate(_t):
+                    if isinstance(_ti, _torch.Tensor):
+                        _sz = _ti.nelement() * _ti.element_size()
+                        logger.debug(
+                            "transfer_field %s[%d] shape=%s dtype=%s size=%d",
+                            _n,
+                            _i,
+                            list(_ti.shape),
+                            _ti.dtype,
+                            _sz,
+                        )
 
     return tensor_fields, scalar_fields
 
@@ -421,8 +449,17 @@ class SchedulerDisaggMixin:
                     # Prefetch: load tensors + build Req in this thread
                     item = self._prefetch_transfer_ready(msg)
                     self._compute_ready_queue.put(("transfer_compute", item))
+                elif msg_type == TransferMsgType.PUSH:
+                    # Handle push directly in prefetch thread — it only
+                    # enqueues to the RDMA bg thread (thread-safe queue).
+                    # Critical for pipeline parallelism: if deferred to the
+                    # main thread, this gets blocked behind the next request's
+                    # GPU compute, preventing the previous request's output
+                    # from reaching the decoder.
+                    self._handle_transfer_push(msg)
                 else:
-                    # alloc, push: pass to main thread
+                    # alloc and other messages: pass to main thread
+                    # (alloc sends on _pool_result_push which isn't thread-safe)
                     self._compute_ready_queue.put(("transfer_control", frames))
 
             except zmq.ZMQError as e:
@@ -473,17 +510,11 @@ class SchedulerDisaggMixin:
         # Build Req (CPU work, overlapped with load)
         req = self._build_disagg_req(scalar_fields, tensors)
 
-        # Init scheduler timesteps (CPU work, overlapped with load)
-        if self._disagg_role == RoleType.DENOISER:
-            scheduler_mod = self.worker.pipeline.get_module("scheduler")
-            num_steps = getattr(req, "num_inference_steps", None)
-            if scheduler_mod is not None and num_steps is not None:
-                device = torch.device(local_device)
-                extra_kwargs = {}
-                mu = req.extra.get("mu") if hasattr(req, "extra") else None
-                if mu is not None:
-                    extra_kwargs["mu"] = mu
-                scheduler_mod.set_timesteps(num_steps, device=device, **extra_kwargs)
+        # NOTE: Do NOT call scheduler_mod.set_timesteps() here!
+        # This runs on the prefetch thread. set_timesteps mutates shared
+        # scheduler state (self.sigmas), which would corrupt the currently
+        # running denoising loop on the main thread. Deferred to main thread
+        # in _disagg_prefetch_event_loop, right before compute.
 
         return (req, load_event, request_id, role_name, prealloc_slot_id, scalar_fields)
 
@@ -591,6 +622,20 @@ class SchedulerDisaggMixin:
                     # Broadcast scalar fields to non-rank-0
                     if is_multi_rank:
                         self._broadcast_to_all_ranks(("compute", scalar_fields))
+                    # Init scheduler timesteps on main thread (safe — no
+                    # concurrent denoising loop can be running here).
+                    if self._disagg_role == RoleType.DENOISER:
+                        scheduler_mod = self.worker.pipeline.get_module("scheduler")
+                        num_steps = getattr(req, "num_inference_steps", None)
+                        if scheduler_mod is not None and num_steps is not None:
+                            device = torch.device(f"cuda:{self.worker.local_rank}")
+                            extra_kwargs = {}
+                            mu = req.extra.get("mu") if hasattr(req, "extra") else None
+                            if mu is not None:
+                                extra_kwargs["mu"] = mu
+                            scheduler_mod.set_timesteps(
+                                num_steps, device=device, **extra_kwargs
+                            )
                     # Run compute
                     if self._disagg_role == RoleType.DENOISER:
                         self._disagg_denoiser_compute(req, request_id, rn)
@@ -1047,6 +1092,7 @@ class SchedulerDisaggMixin:
             gen = torch.Generator(device="cpu")
             gen.manual_seed(int(seed))
             req.generator = gen
+        req.validate()
         return req
 
     def _disagg_denoiser_compute(
