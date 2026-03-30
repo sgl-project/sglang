@@ -90,7 +90,7 @@ class DPBudget:
             self.total_requests[load.dp_rank] = load.num_reqs
             self.total_tokens[load.dp_rank] = load.num_tokens
 
-    def dispatch(self, method: LoadBalanceMethod):
+    def dispatch(self, method: LoadBalanceMethod,req: Req =None):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
             target_rank = self.total_requests.index(min(self.total_requests))
         elif method == LoadBalanceMethod.TOTAL_TOKENS:
@@ -104,6 +104,8 @@ class DPBudget:
 
         # Increment the load of that worker by one as a heuristic
         self.total_requests[target_rank] += 1
+        if req is not None:
+          self.total_tokens[target_rank] += len(req.input_ids)
         return target_rank
 
 
@@ -557,7 +559,7 @@ class DataParallelController:
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
+        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS,req=req)
         self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):
