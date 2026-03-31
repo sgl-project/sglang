@@ -93,7 +93,7 @@ class TLRUStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
         L = node.cumulative_tokens
         B = max(0, L + self.q_hat - self.xi)
-        node_start = L - len(node.value)
+        node_start = L - len(node.key)
 
         is_tel_safe = node_start >= B
 
