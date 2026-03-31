@@ -213,8 +213,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
     ; \
     fi \
-    && . scripts/ci/cuda/nvidia_package_constraints.sh \
-    && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} -c "$CONSTRAINTS_FILE" \
+    && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
