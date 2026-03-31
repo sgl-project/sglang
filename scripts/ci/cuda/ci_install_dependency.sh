@@ -218,13 +218,7 @@ if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
-# Pin nvidia packages that we override later to avoid downloading the wrong
-# version first (e.g. torch pins cudnn 9.10 but we need 9.16, saving ~700 MB).
-CONSTRAINTS_FILE=$(mktemp)
-cat > "$CONSTRAINTS_FILE" <<CONSTRAINTS
-nvidia-cudnn-cu12==9.16.0.29
-nvidia-nvshmem-cu12==3.4.5
-CONSTRAINTS
+source "$(dirname "$0")/nvidia_package_constraints.sh"
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} -c "$CONSTRAINTS_FILE" $PIP_INSTALL_SUFFIX
 rm -f "$CONSTRAINTS_FILE"
 
