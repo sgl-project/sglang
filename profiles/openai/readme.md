@@ -25,7 +25,7 @@
 - **Precision:** bf16
 - **TP:** 1
 
-## `bench\_offline\_throughput` (Real Engine)
+## `bench_offline_throughput`
 
 ```bash
 python3 -m sglang.bench_offline_throughput \
@@ -97,7 +97,7 @@ Against the fair baseline (no piecewise CG), individual Inductor compilation sho
 - **Precision:** mxfp4
 - **TP:** 4
 
-## `bench\_offline\_throughput` (Real Engine)
+## `bench_offline_throughput`
 
 ```bash
 python3 -m sglang.bench_offline_throughput \

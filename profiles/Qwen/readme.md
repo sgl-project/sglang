@@ -33,7 +33,7 @@
 - `inductor[ropekv-rmsnorm]` compiles the rotary embedding with KV-cache write (fused into a single Inductor graph) and the layer-level RMSNorm. Q/k normalization uses the custom kernel. Same compilation scope as `inductor[rope-rmsnorm]` but with naming that makes the KV-cache fusion explicit.
 - `inductor[qvnorm-ropekv-rmsnorm]` splits the `QKNormRope` region into two separate Inductor graphs: one for q/k normalization (no dynamic shapes) and one for rope + KV-cache write (dynamic shapes). This reduces the scope of the dynamic-shape graph compared to the fully-fused `qvnormropekv` variant.
 
-## `bench\_offline\_throughput` (Real Engine)
+## `bench_offline_throughput`
 
 ```bash
 python3 -m sglang.bench_offline_throughput \
@@ -150,7 +150,7 @@ The baseline fires 3 kernels between the projection GEMM and `fmhaSm100fKernel`:
 - `inductor[reshape-qknorm-ropekv-gemmarmsnorm]` compiles the reshape, q/k normalization, rotary embedding with KV-cache write, and GemmaRMSNorm (the layer-level normalization used by Qwen3.5) as separate Inductor graphs. This is the broadest compilation scope tested on this model.
 - Qwen3.5-35B-A3B-FP8 is a hybrid architecture with 40 decoder layers: only 10 are full attention layers (every 4th layer, `full_attention_interval=4`) and the remaining 30 are linear attention (GatedDeltaNet) layers. Inductor compilation targets only the full attention layers, so the optimized region covers just 25% of the decoder stack.
 
-## `bench\_offline\_throughput` (Real Engine)
+## `bench_offline_throughput`
 
 ```bash
 python3 -m sglang.bench_offline_throughput \
