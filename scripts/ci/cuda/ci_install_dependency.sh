@@ -223,11 +223,7 @@ if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
-# Pin nvidia packages to the versions we actually need (installed later in this script).
-# Without this, torch pulls cudnn 9.10 (~700 MB) + nvshmem 3.3 (~125 MB) only to be replaced.
-$PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} \
-    -c <(printf '%s\n' "nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION}" "nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION}") \
-    $PIP_INSTALL_SUFFIX
+$PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 mark_step_done "Install main package"
 
