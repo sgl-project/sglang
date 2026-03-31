@@ -264,7 +264,7 @@ class LoRAMemoryPool:
             target_modules: Set[str],
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
         ):
-            # Check if model has both shared experts and MoE experts
+            # Check if model has shared experts and/or MoE experts
             has_shared_experts = (
                 hasattr(base_model.config, "shared_expert_intermediate_size")
                 and base_model.config.shared_expert_intermediate_size > 0
@@ -276,20 +276,20 @@ class LoRAMemoryPool:
             for module_name in target_modules:
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
-                if module_name in ambiguous_modules and has_shared_experts and has_moe:
-                    # Allocate separate buffers for shared and MoE contexts
-                    # Shared expert version (3D)
-                    shared_key = module_name
-                    buffer[shared_key] = [
-                        torch.empty(
-                            get_lora_shape_fn(
-                                module_name, base_model, self.max_lora_rank, idx
-                            ),
-                            dtype=self.dtype,
-                            device=device,
-                        )
-                        for idx in range(self.num_layer)
-                    ]
+                if module_name in ambiguous_modules and has_moe:
+                    if has_shared_experts:
+                        # Allocate separate buffers for shared and MoE contexts
+                        # Shared expert version (3D)
+                        buffer[module_name] = [
+                            torch.empty(
+                                get_lora_shape_fn(
+                                    module_name, base_model, self.max_lora_rank, idx
+                                ),
+                                dtype=self.dtype,
+                                device=device,
+                            )
+                            for idx in range(self.num_layer)
+                        ]
 
                     # MoE expert version (4D)
                     moe_key = f"{module_name}_moe"
@@ -534,6 +534,8 @@ class LoRAMemoryPool:
                         temp_B_buffer[target_module][expert_id] = weights
                 else:
                     # Standard weight - single tensor per module
+                    if target_module not in temp_A_buffer:
+                        continue
                     if "lora_A" in name:
                         temp_A_buffer[target_module] = weights
                     else:
@@ -549,7 +551,7 @@ class LoRAMemoryPool:
                     if isinstance(module, FusedMoEWithLoRA):
                         moe_target_modules = ["gate_up_proj_moe", "down_proj_moe"]
                         for target_module in moe_target_modules:
-                            if temp_A_buffer[target_module] is None:
+                            if not temp_A_buffer[target_module]:
                                 continue
 
                             for expert_id in temp_A_buffer[target_module].keys():
@@ -575,7 +577,10 @@ class LoRAMemoryPool:
                         module_name, self.target_modules
                     )
 
-                    if temp_A_buffer[target_module] is None:
+                    if (
+                        target_module not in temp_A_buffer
+                        or temp_A_buffer[target_module] is None
+                    ):
                         # Skip weight slicing if the weight is not present in the adapter
                         continue
 
@@ -594,6 +599,9 @@ class LoRAMemoryPool:
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     # MoE: multiple tensors per module (one per expert)
+                    if not weights:
+                        target_buffer[buffer_id].zero_()
+                        continue
                     for expert_id, expert_weight in weights.items():
                         # Buffer shape: [num_loras, num_experts, max_rank, hidden_dim]
                         buffer_view = target_buffer[
@@ -611,6 +619,9 @@ class LoRAMemoryPool:
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     # MoE: multiple tensors per module (one per expert)
+                    if not weights:
+                        target_buffer[buffer_id].zero_()
+                        continue
                     for expert_id, expert_weight in weights.items():
                         # Buffer shape: [num_loras, num_experts, intermediate_dim, max_rank]
                         buffer_view = target_buffer[buffer_id, expert_id, :, :lora_rank]

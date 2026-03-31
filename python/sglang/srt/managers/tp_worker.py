@@ -189,9 +189,10 @@ class BaseTpWorker(ABC):
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
+        monkey_patch_torch_reductions()
         if recv_req.load_format == "flattened_bucket":
             flattened_data = MultiprocessingSerializer.deserialize(
-                recv_req.serialized_tensors
+                recv_req.serialized_tensors[self.tp_rank]
             )
             bucket = FlattenedTensorBucket(
                 flattened_tensor=flattened_data["flattened_tensor"],
@@ -199,7 +200,9 @@ class BaseTpWorker(ABC):
             )
             tensors = dict(bucket.reconstruct_tensors())
         else:
-            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+            tensors = MultiprocessingSerializer.deserialize(
+                recv_req.serialized_tensors[self.tp_rank]
+            )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,

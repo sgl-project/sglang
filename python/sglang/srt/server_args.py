@@ -1753,10 +1753,17 @@ class ServerArgs:
                     and is_triton_kernels_available()
                     and self.quantization is None
                 ):
-                    self.moe_runner_backend = "triton_kernel"
-                    logger.warning(
-                        "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
-                    )
+                    if self.lora_paths or self.enable_lora:
+                        self.moe_runner_backend = "triton"
+                        logger.warning(
+                            "LoRA is enabled for GPT-OSS model, using triton MOE kernel "
+                            "(triton_kernels backend does not support LoRA)."
+                        )
+                    else:
+                        self.moe_runner_backend = "triton_kernel"
+                        logger.warning(
+                            "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
+                        )
 
             if self.moe_runner_backend == "triton_kernel":
                 assert (

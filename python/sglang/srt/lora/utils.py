@@ -83,9 +83,9 @@ def get_hidden_dim(
                 head_dim * config.num_attention_heads,
                 config.hidden_size,
             )
-        elif module_name == "gate_up_proj":
+        elif module_name in ("gate_up_proj", "gate_up_proj_moe"):
             return config.hidden_size, config.intermediate_size * 2
-        elif module_name == "down_proj":
+        elif module_name in ("down_proj", "down_proj_moe"):
             return config.intermediate_size, config.hidden_size
         elif module_name == "gate_up_proj_moe":
             return config.hidden_size, config.moe_intermediate_size * 2

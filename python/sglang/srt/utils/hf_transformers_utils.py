@@ -543,6 +543,12 @@ def get_config(
                 else:
                     raise
 
+    if getattr(config, "model_type", None) == "gpt_oss":
+        if not hasattr(config, "num_experts"):
+            config.num_experts = config.num_local_experts
+        if not hasattr(config, "moe_intermediate_size"):
+            config.moe_intermediate_size = config.intermediate_size
+
     if (
         config.architectures is not None
         and config.architectures[0] == "Phi4MMForCausalLM"
