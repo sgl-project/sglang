@@ -490,9 +490,11 @@ class CommonKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
     ):
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
+        self.conclude_state: Optional[KVPoll] = None
         self.bootstrap_infos = None
         self.prefill_info = None
         self.prefill_dp_rank = None
@@ -502,17 +504,16 @@ class CommonKVReceiver(BaseKVReceiver):
         self.target_pp_ranks = None
         self.required_dst_info_num = None
         self.required_prefill_response_num = None
-        self.bootstrap_initialized = False
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
     def init(self, prefill_dp_rank: int):
-        if self.bootstrap_initialized:
-            return
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"Prefill server with bootstrap_addr: {self.bootstrap_addr} is healthy before, but now it is down. Request (bootstrap_room: {self.bootstrap_room}) has been marked as failed.",
             )
+            self.conclude_state = KVPoll.Failed
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
@@ -533,9 +534,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()
-        if self.kv_mgr.check_status(self.bootstrap_room) == KVPoll.Failed:
-            return
-        self.bootstrap_initialized = True
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _setup_bootstrap_infos(self):
         all_bootstrap_infos = []
@@ -573,6 +572,7 @@ class CommonKVReceiver(BaseKVReceiver):
                                 self.bootstrap_room,
                                 f"Could not fetch bootstrap info for: prefill_dp_rank: {self.prefill_dp_rank} prefill_cp_rank: {target_cp_rank} target_tp_rank: {target_tp_rank} and target_pp_rank {target_pp_rank}",
                             )
+                            self.conclude_state = KVPoll.Failed
                             self.kv_mgr.update_status(
                                 self.bootstrap_room, KVPoll.Failed
                             )

@@ -987,21 +987,16 @@ class MoriKVReceiver(CommonKVReceiver):
         bootstrap_room: Optional[int] = None,
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
-        self.conclude_state: Optional[KVPoll] = None
         self.init_time: Optional[float] = None
 
     def init(
         self,
         prefill_dp_rank: int,
     ):
-        if self.bootstrap_initialized:
-            return
         super().init(prefill_dp_rank)
-        if not self.bootstrap_initialized or self.bootstrap_room is None:
+        if self.bootstrap_room is None:
             return
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _register_kv_args(self):
         if self.bootstrap_infos is None:

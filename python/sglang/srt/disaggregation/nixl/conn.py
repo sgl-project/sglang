@@ -959,7 +959,6 @@ class NixlKVReceiver(CommonKVReceiver):
         bootstrap_room: Optional[int] = None,
     ):
         self.started_transfer = False
-        self.conclude_state = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
 
@@ -967,16 +966,7 @@ class NixlKVReceiver(CommonKVReceiver):
         self,
         prefill_dp_rank: int,
     ):
-        if self.bootstrap_initialized:
-            return
         super().init(prefill_dp_rank)
-        if not self.bootstrap_initialized:
-            return
-        if hasattr(self.kv_mgr, "addr_to_rooms_tracker"):
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
-                self.bootstrap_room
-            )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def send_metadata(
         self,

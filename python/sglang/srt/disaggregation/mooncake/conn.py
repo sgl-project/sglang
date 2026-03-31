@@ -1240,7 +1240,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
         bootstrap_room: Optional[int] = None,
     ):
         self.session_id = mgr.get_session_id()
-        self.conclude_state = None
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
@@ -1296,13 +1295,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self,
         prefill_dp_rank: int,
     ):
-        if self.bootstrap_initialized:
-            return
         super().init(prefill_dp_rank)
-        if not self.bootstrap_initialized:
-            return
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def send_metadata(
         self,

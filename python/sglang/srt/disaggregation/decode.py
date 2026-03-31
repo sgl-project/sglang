@@ -578,10 +578,7 @@ class DecodePreallocQueue:
         ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
 
         resolved: List[Tuple[DecodeRequest, int]] = []
-        for bootstrap_addr, decode_reqs in addr_to_reqs.items():
-            if bootstrap_addr not in ready_addrs:
-                continue
-
+        for bootstrap_addr, decode_reqs in ready_addrs.items():
             need_query: List[DecodeRequest] = []
             for decode_req in decode_reqs:
                 prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
