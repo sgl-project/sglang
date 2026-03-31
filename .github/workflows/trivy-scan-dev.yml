@@ -1,0 +1,63 @@
+name: Trivy Scan Dev Docker Images
+
+on:
+  # Run daily after nightly dev builds (which run at midnight UTC)
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to scan (e.g., dev, dev-cu13, latest)"
+        required: false
+        default: ""
+
+jobs:
+  scan:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: x64-docker-build-node
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: [dev, dev-cu13]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ matrix.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: 'docker.io/lmsysorg/sglang:${{ steps.tag.outputs.tag }}'
+          scanners: 'vuln'
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.tag }}.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      - name: Upload Trivy scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles(format('trivy-results-{0}.sarif', matrix.tag)) != ''
+        with:
+          sarif_file: 'trivy-results-${{ matrix.tag }}.sarif'
+          category: 'trivy-${{ matrix.tag }}'
+
+      - name: Run Trivy (table output for logs)
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: 'docker.io/lmsysorg/sglang:${{ steps.tag.outputs.tag }}'
+          scanners: 'vuln'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
