@@ -867,5 +867,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         self.language_model.set_embed_and_head(embed, head)
 
+    def post_load_weights(self, *args, **kwargs):
+        # remote_instance paths may bypass KimiK25.load_weights() and call
+        # post_load_weights() on the top-level model directly. Forward to the
+        # wrapped language model so DeepSeek MLA can derive weights like
+        # w_kc/w_vc from kv_b_proj before graph capture starts.
+        if hasattr(self.language_model, "post_load_weights"):
+            self.language_model.post_load_weights(*args, **kwargs)
+
 
 EntryClass = [KimiK25ForConditionalGeneration]

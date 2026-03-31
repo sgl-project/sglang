@@ -108,7 +108,16 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
 
 def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos):
     remote_instance_transfer_engine_info = {}
-    for data in scheduler_infos:
+
+    def iter_scheduler_infos(items):
+        for data in items:
+            nested_infos = data.get("scheduler_infos")
+            if nested_infos:
+                yield from iter_scheduler_infos(nested_infos)
+            else:
+                yield data
+
+    for data in iter_scheduler_infos(scheduler_infos):
         if (
             "tp_rank" in data
             and "remote_instance_transfer_engine_session_id" in data

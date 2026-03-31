@@ -2109,9 +2109,18 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         )
 
         quant_config = _get_quantization_config(model_config, self.load_config)
+        target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
+            with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
+
+            # Keep remote-instance model layout consistent with the local load
+            # path before TE metadata registration and weight-info validation.
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
 
         if (
             load_config.remote_instance_weight_loader_backend
@@ -2260,8 +2269,14 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     f"got ({tensor.numel()}, {tensor.element_size()})"
                 )
                 return False
-            client_ptr = tensor.data_ptr()
+            # Zero-byte tensors do not need data transfer. Some quantized
+            # post-processing paths intentionally rewrite tensors like g_idx
+            # into empty placeholders, and passing them into Mooncake causes
+            # zero-slice transfer tasks to abort inside the transport layer.
             client_len = tensor.numel() * tensor.element_size()
+            if client_len == 0:
+                continue
+            client_ptr = tensor.data_ptr()
             seed_ptr_list.append(seed_ptr)
             client_ptr_list.append(client_ptr)
             client_len_list.append(client_len)

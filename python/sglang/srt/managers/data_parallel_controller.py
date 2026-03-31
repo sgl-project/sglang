@@ -154,6 +154,7 @@ class DataParallelController:
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
+        self.scheduler_infos = []
 
         if server_args.enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
@@ -500,6 +501,7 @@ class DataParallelController:
         scheduler_info = []
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
+        self.scheduler_infos.extend(scheduler_info)
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
@@ -601,6 +603,7 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "scheduler_infos": controller.scheduler_infos,
             }
         )
         if server_args.node_rank == 0:
