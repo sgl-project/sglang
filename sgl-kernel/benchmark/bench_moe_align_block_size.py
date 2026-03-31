@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.utils import is_in_ci
 
 try:
@@ -354,9 +355,9 @@ def benchmark(num_tokens, num_experts, topk, provider):
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    quantiles = [0.5, 0.2, 0.8]
+    quantiles = (0.5, 0.2, 0.8)
     if provider == "sgl":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: sgl_moe_align_block_size_with_empty(
                 topk_ids,
                 num_experts,
@@ -365,10 +366,11 @@ def benchmark(num_tokens, num_experts, topk, provider):
                 expert_ids,
                 num_tokens_post_pad,
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     elif provider == "sgl_fusion":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: sgl_moe_align_block_size_with_empty(
                 topk_ids,
                 num_experts,
@@ -378,11 +380,12 @@ def benchmark(num_tokens, num_experts, topk, provider):
                 num_tokens_post_pad,
                 pad_sorted_token_ids=True,
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     elif provider == "triton":
         sorted_ids.fill_(topk_ids.numel())
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: moe_align_block_size_triton(
                 topk_ids,
                 num_experts,
@@ -391,6 +394,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
                 expert_ids.clone(),
                 num_tokens_post_pad.clone(),
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
 

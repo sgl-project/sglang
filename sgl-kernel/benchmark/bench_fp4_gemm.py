@@ -6,6 +6,7 @@ import torch
 import triton
 from flashinfer import mm_fp4
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from sglang.srt.utils import get_device_capability, is_sm100_supported
 from sglang.utils import is_in_ci
@@ -106,16 +107,17 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
     b_fp4, b_scale_interleaved = scaled_fp4_quant(b_dtype, b_global_scale)
     res_fi = torch.empty((M, N), dtype=dtype, device="cuda")
 
-    quantiles = [0.5, 0.2, 0.8]
+    quantiles = (0.5, 0.2, 0.8)
     if provider == "sglang_cutlass":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: cutlass_scaled_fp4_mm(
                 a_fp4, b_fp4, a_scale_interleaved, b_scale_interleaved, alpha, dtype
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     if provider == "cutlass":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: mm_fp4(
                 a_fp4,
                 b_fp4.T,
@@ -126,10 +128,11 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
                 res_fi,
                 backend="cutlass",
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     if provider == "cudnn":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: mm_fp4(
                 a_fp4,
                 b_fp4.T,
@@ -140,12 +143,13 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
                 res_fi,
                 backend="cudnn",
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     if provider == "trtllm":
         a_scale_interleaved = a_scale_interleaved.to(torch.uint8)
         b_scale_interleaved = b_scale_interleaved.to(torch.uint8)
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: mm_fp4(
                 a_fp4,
                 b_fp4.T,
@@ -156,10 +160,11 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
                 res_fi,
                 backend="trtllm",
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     if provider == "auto":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: mm_fp4(
                 a_fp4,
                 b_fp4.T,
@@ -169,6 +174,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
                 dtype,
                 res_fi,
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     if correctness:

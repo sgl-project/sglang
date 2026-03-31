@@ -8,6 +8,7 @@ import torch
 import triton
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 from sglang.utils import is_in_ci
 
@@ -157,8 +158,8 @@ def benchmark(batch_size, provider, N, K):
     scale_b_scalar = torch.randn(1, device="cuda", dtype=torch.float32)
     scale_a = torch.randn((M,), device="cuda", dtype=torch.float32)
     scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
-    quantiles = [0.5, 0.2, 0.8]
 
+    quantiles = (0.5, 0.2, 0.8)
     dtype = torch.float16 if "fp16" in provider else torch.bfloat16
 
     if "vllm-fp8" in provider:
@@ -168,18 +169,20 @@ def benchmark(batch_size, provider, N, K):
         a_fp8, scale_a_fp8 = vllm_scaled_fp8_quant(a, scale_a_scalar)
         b_fp8, scale_b_fp8 = vllm_scaled_fp8_quant(b, scale_b_scalar)
         b_fp8 = b_fp8.t()
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: vllm_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     elif "sglang-fp8" in provider:
         a_fp8, scale_a_fp8 = sglang_scaled_fp8_quant(a, scale_a)
         b_fp8, scale_b_fp8 = sglang_scaled_fp8_quant(b, scale_b)
         b_fp8 = b_fp8.t()
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: sgl_scaled_mm(
                 a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype, bias=None
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
 

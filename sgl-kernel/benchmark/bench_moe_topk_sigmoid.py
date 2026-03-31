@@ -6,6 +6,13 @@ import torch
 import triton
 from sgl_kernel import topk_sigmoid
 
+from sglang.benchmark.bench_utils import run_bench
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 from sglang.utils import is_in_ci
 
 IS_CI = is_in_ci()
@@ -144,8 +151,8 @@ def benchmark(num_tokens, num_experts, topk, provider):
         def fn():
             return sglang_topk_sigmoid(gating_output, topk, True, correction_bias)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(fn, use_cuda_graph=True, quantiles=quantiles)
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 

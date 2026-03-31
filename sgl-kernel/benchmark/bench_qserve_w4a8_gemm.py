@@ -11,6 +11,13 @@ from sgl_kernel import (
     qserve_w4a8_per_group_gemm,
 )
 
+from sglang.benchmark.bench_utils import run_bench
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 from sglang.utils import is_in_ci
 
 IS_CI = is_in_ci()
@@ -127,19 +134,21 @@ def benchmark(batch_size, provider, N, K):
         torch.randn((K // group_size, N), device="cuda", dtype=torch.float16)
     )
 
-    quantiles = [0.5, 0.2, 0.8]
+    quantiles = (0.5, 0.2, 0.8)
     if provider == "FP16":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: torch.matmul(a_fp16, b_fp16),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     if provider == "W8A8":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: int8_scaled_mm(a, b, scale_a, scale_b, torch.float16),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     if provider == "Qserve_W4A8_Per_Channel":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: qserve_w4a8_per_chn_gemm(
                 a_qserve_chn,
                 b_qserve_chn,
@@ -148,10 +157,11 @@ def benchmark(batch_size, provider, N, K):
                 szero_b_qserve_chn,
                 a_sum_qserve_chn,
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     if provider == "Qserve_W4A8_Per_Group":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: qserve_w4a8_per_group_gemm(
                 a_qserve_group,
                 b_qserve_group,
@@ -160,6 +170,7 @@ def benchmark(batch_size, provider, N, K):
                 scale_b_qserve_group,
                 scale_a_qserve_group,
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
 

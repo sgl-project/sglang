@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.benchmark.bench_utils import run_bench
+
 
 def quantize_k_cache(cache_k):
     return _quantize_k_cache_fast_wrapped(cache_k)
@@ -445,5 +447,10 @@ if __name__ == "__main__":
         def run_ans():
             return dequant_k_cache.dequantize_k_cache_paged(actual_quant, page_table_1)
 
-        ans_time: float = triton.testing.do_bench(run_ans, warmup=10, rep=20) / 1000  # type: ignore
+        ans_time: float = (
+            run_bench(
+                run_ans, use_cuda_graph=False, quantiles=None, warmup_ms=25, rep_ms=100
+            )[0]
+            / 1000
+        )
         print(f"seq_kv: {num_blocks * block_size}, time: {ans_time * 1e6: 4.0f} us")

@@ -9,6 +9,7 @@ import triton
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
 from sgl_kernel import fp8_blockwise_scaled_mm
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.utils import is_in_ci
 
 # Optional vLLM import
@@ -157,14 +158,15 @@ def benchmark(batch_size, provider, N, K):
     scale_a = torch.randn(scale_a_shape, device="cuda", dtype=torch.float32)
     scale_b = torch.randn(scale_b_shape, device="cuda", dtype=torch.float32)
 
-    quantiles = [0.5, 0.2, 0.8]
+    quantiles = (0.5, 0.2, 0.8)
     if provider == "sgl-kernel":
         scale_a = scale_a.t().contiguous().t()
         b_fp8, scale_b = b_fp8.t(), scale_b.t()
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: fp8_blockwise_scaled_mm(
                 a_fp8, b_fp8, scale_a, scale_b, torch.float16
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     elif provider == "vllm":
@@ -172,23 +174,26 @@ def benchmark(batch_size, provider, N, K):
             return (0, 0, 0)
         scale_a = scale_a.t().contiguous().t()
         b_fp8, scale_b = b_fp8.t(), scale_b.t()
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: vllm_scaled_mm(a_fp8, b_fp8, scale_a, scale_b, torch.float16),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     elif provider == "triton":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: w8a8_block_fp8_matmul(
                 a_fp8, b_fp8, scale_a, scale_b, [128, 128], torch.float16
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     if provider == "deepgemm":
         scale_a_col_major = get_mn_major_tma_aligned_tensor(scale_a.clone())
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: fp8_gemm_deepgemm(
                 a_fp8, scale_a_col_major, b_fp8, scale_b, M, N, K
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms

@@ -6,6 +6,7 @@ import torch
 import triton
 from sgl_kernel import topk_softmax
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.utils import is_in_ci
 
 # Optional vLLM import
@@ -136,8 +137,8 @@ def benchmark(num_tokens, num_experts, topk, provider):
     elif provider == "sglang" or provider == "sglang1":
         fn = lambda: sglang_topk_softmax(gating_output, topk)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(fn, use_cuda_graph=True, quantiles=quantiles)
 
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 

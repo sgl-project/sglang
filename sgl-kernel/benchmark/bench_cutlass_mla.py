@@ -7,6 +7,7 @@ import torch
 import triton
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.utils import get_device_capability
 from sglang.utils import is_in_ci
 
@@ -97,8 +98,8 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
     )
     workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(
         lambda: cutlass_mla_decode(
             qn.transpose(0, 1),
             qr,
@@ -109,6 +110,7 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
             1.44,
             num_kv_splits,
         ),
+        use_cuda_graph=True,
         quantiles=quantiles,
     )
 

@@ -1,10 +1,9 @@
 import argparse
 
 import torch
-import triton  # Added import
-import triton.testing  # Added import
 from transformers import AutoConfig
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -198,15 +197,15 @@ def run_test(tp_size, batch_size, model_config, check=False):
     torch.cuda.synchronize()
 
     # --- Benchmarking ---
-    quantiles = [0.5, 0.2, 0.8]
+    quantiles = (0.5, 0.2, 0.8)
     print(f"Benchmarking Cutlass fused_experts...")
-    cutlass_ms, cutlass_min, cutlass_max = triton.testing.do_bench_cudagraph(
-        cutlass_lambda, rep=1000, quantiles=quantiles
+    cutlass_ms, cutlass_min, cutlass_max = run_bench(
+        cutlass_lambda, use_cuda_graph=True, quantiles=quantiles, rep_ms=100
     )
 
     print(f"Benchmarking Triton fused_experts...")
-    triton_ms, triton_min, triton_max = triton.testing.do_bench_cudagraph(
-        triton_lambda, rep=1000, quantiles=quantiles
+    triton_ms, triton_min, triton_max = run_bench(
+        triton_lambda, use_cuda_graph=True, quantiles=quantiles, rep_ms=100
     )
     print(
         f"Cutlass fused_experts time: {cutlass_ms:.3f} ms (median) [{cutlass_min:.3f} - {cutlass_max:.3f}]"

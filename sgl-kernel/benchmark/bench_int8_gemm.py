@@ -7,6 +7,7 @@ import torch
 import triton
 from sgl_kernel import int8_scaled_mm
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.utils import is_in_ci
 
 # Optional vLLM import
@@ -114,17 +115,19 @@ def benchmark(batch_size, provider, N, K):
     scale_b = torch.randn((N,), device="cuda", dtype=torch.float32)
     bias = torch.randn((N,), device="cuda", dtype=torch.float16)
 
-    quantiles = [0.5, 0.2, 0.8]
+    quantiles = (0.5, 0.2, 0.8)
     if provider == "sgl-kernel":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: int8_scaled_mm(a, b, scale_a, scale_b, torch.float16, bias),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     elif provider == "vllm":
         if not VLLM_AVAILABLE:
             return (0, 0, 0)
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: vllm_scaled_mm(a, b, scale_a, scale_b, torch.float16, bias),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     gbps = (

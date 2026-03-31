@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 from sgl_kernel import kimi_k2_moe_fused_gate
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers.moe.topk import kimi_k2_biased_topk_impl
 from sglang.utils import is_in_ci
 
@@ -86,20 +87,21 @@ def benchmark(seq_length, provider):
     scores = torch.randn((seq_length, num_experts), device=device, dtype=dtype)
     bias = torch.rand(num_experts, device=device, dtype=dtype)
 
-    quantiles = [0.5, 0.2, 0.8]
-
+    quantiles = (0.5, 0.2, 0.8)
     if provider == "torch_compile":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: kimi_k2_biased_topk_torch_compile(
                 scores.clone(), bias.clone(), topk, routed_scaling_factor
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
     elif provider == "fused_kernel":
-        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+        ms, min_ms, max_ms = run_bench(
             lambda: kimi_k2_biased_topk_fused_kernel(
                 scores.clone(), bias.clone(), topk, routed_scaling_factor
             ),
+            use_cuda_graph=True,
             quantiles=quantiles,
         )
 
