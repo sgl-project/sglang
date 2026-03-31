@@ -229,7 +229,7 @@ echo "Installing python extras: [${EXTRAS}]"
 NVIDIA_WHEEL_CACHE="/root/.cache/nvidia-wheels"
 mkdir -p "$NVIDIA_WHEEL_CACHE"
 pip download nvidia-cudnn-cu12==9.10.2.21 nvidia-nvshmem-cu12==3.3.20 \
-    -d "$NVIDIA_WHEEL_CACHE" --no-deps -q 2>/dev/null || true
+    -d "$NVIDIA_WHEEL_CACHE" --no-deps 2>/dev/null || true
 pip install --no-deps "$NVIDIA_WHEEL_CACHE"/nvidia_cudnn_cu12-9.10.2.21*.whl \
     "$NVIDIA_WHEEL_CACHE"/nvidia_nvshmem_cu12-3.3.20*.whl 2>/dev/null || true
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
