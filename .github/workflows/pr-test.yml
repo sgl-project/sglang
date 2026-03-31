@@ -687,6 +687,7 @@ jobs:
         run: |
           source /etc/profile.d/sglang-ci.sh
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
+          pip install "setuptools==70.0.0"
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e . --no-build-isolation
@@ -801,6 +802,7 @@ jobs:
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
+          pip install "setuptools==70.0.0"
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
           pip install -e . --no-build-isolation
