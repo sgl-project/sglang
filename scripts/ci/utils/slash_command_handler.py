@@ -45,7 +45,7 @@ def find_workflow_run_url(
         The workflow run URL if found, None otherwise.
     """
     # Build expected display_title based on workflow's run-name.
-    # rerun-ut includes test_command: "[rerun-ut] <test_command> [<sha>]"
+    # rerun-single-test includes test_command: "[rerun-single-test] <test_command> [<sha>]"
     # Other workflows: "[stage-name] [<sha>]"
     suffix = f" {test_command}" if test_command else ""
     if pr_head_sha:
@@ -464,7 +464,7 @@ def resolve_test_file(file_part):
             return None, (
                 f"Ambiguous filename `{file_part}` — matched {len(matches)} files:\n\n"
                 f"{match_list}\n\n"
-                f"Please provide the full path, e.g. `/rerun-ut {matches[0]}`"
+                f"Please provide the full path, e.g. `/rerun-single-test {matches[0]}`"
             )
         return matches[0][len("test/") :], None
 
@@ -553,7 +553,7 @@ def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
     )
 
     try:
-        workflow_name = "Rerun UT"
+        workflow_name = "Rerun Single Test"
         workflows = gh_repo.get_workflows()
         target_workflow = None
         for wf in workflows:
@@ -610,13 +610,13 @@ def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
                 "error": f"Dispatch failed: {dispatch_resp.status_code}",
             }
 
-        print(f"Successfully triggered rerun-ut: {test_command}")
+        print(f"Successfully triggered rerun-single-test: {test_command}")
 
         run_url = find_workflow_run_url(
             gh_repo,
             target_workflow.id,
             ref,
-            "rerun-ut",
+            "rerun-single-test",
             token,
             dispatch_time,
             pr_head_sha=pr_head_sha,
@@ -632,16 +632,16 @@ def _resolve_and_dispatch_ut(gh_repo, pr, test_spec, token):
         }
 
     except Exception as e:
-        print(f"Error triggering rerun-ut for {test_spec}: {e}")
+        print(f"Error triggering rerun-single-test for {test_spec}: {e}")
         return {"spec": test_spec, "success": False, "error": str(e)}
 
 
-def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_specs, token):
+def handle_rerun_single_test(gh_repo, pr, comment, user_perms, test_specs, token):
     """
-    Handles the /rerun-ut command. Accepts a list of test specs and dispatches
+    Handles the /rerun-single-test command. Accepts a list of test specs and dispatches
     a workflow run for each, posting a single consolidated comment.
     """
-    # SECURITY: For fork PRs, only allow /rerun-ut if the commenter has write+ permission.
+    # SECURITY: For fork PRs, only allow /rerun-single-test if the commenter has write+ permission.
     # This command checks out and executes code from the PR branch on self-hosted GPU
     # runners, so we must ensure the commenter is a trusted collaborator.
     is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
@@ -649,10 +649,10 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_specs, token):
         commenter = comment.user.login
         perm = gh_repo.get_collaborator_permission(commenter)
         if perm not in ("admin", "write"):
-            print(f"Permission denied: /rerun-ut on fork PR by {commenter}.")
+            print(f"Permission denied: /rerun-single-test on fork PR by {commenter}.")
             comment.create_reaction("confused")
             pr.create_issue_comment(
-                "❌ `/rerun-ut` is not available for fork PRs unless the commenter "
+                "❌ `/rerun-single-test` is not available for fork PRs unless the commenter "
                 "has write permission on the repo.\n\n"
                 "Please ask a maintainer to run this command, or use the normal CI flow."
             )
@@ -660,21 +660,23 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_specs, token):
         print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
 
     if not (
-        user_perms.get("can_rerun_ut", False)
+        user_perms.get("can_rerun_single_test", False)
         or user_perms.get("can_rerun_stage", False)
     ):
-        print("Permission denied: neither can_rerun_ut nor can_rerun_stage is true.")
+        print(
+            "Permission denied: neither can_rerun_single_test nor can_rerun_stage is true."
+        )
         return False
 
     if not test_specs:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            "❌ Please specify a test: `/rerun-ut <file>::<TestClass.test_method>`\n\n"
+            "❌ Please specify a test: `/rerun-single-test <file>::<TestClass.test_method>`\n\n"
             "Examples:\n"
-            "- `/rerun-ut test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
-            "- `/rerun-ut registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
-            "- `/rerun-ut test_srt_endpoint.py`\n"
-            "- `/rerun-ut test_a.py test_b.py test_c.py` (multiple tests)"
+            "- `/rerun-single-test test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
+            "- `/rerun-single-test registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
+            "- `/rerun-single-test test_srt_endpoint.py`\n"
+            "- `/rerun-single-test test_a.py test_b.py test_c.py` (multiple tests)"
         )
         return False
 
@@ -737,7 +739,7 @@ def main():
     # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label and /rerun-stage still require CI_PERMISSIONS.json.
-    # Note: /rerun-ut is blocked entirely for fork PRs in handle_rerun_ut() itself.
+    # Note: /rerun-single-test is blocked entirely for fork PRs in handle_rerun_single_test() itself.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -750,7 +752,7 @@ def main():
                 f"User {user_login} is the PR author and has existing CI permissions."
             )
         user_perms["can_rerun_failed_ci"] = True
-        user_perms["can_rerun_ut"] = True
+        user_perms["can_rerun_single_test"] = True
 
     if not user_perms:
         print(f"User {user_login} does not have any configured permissions. Exiting.")
@@ -795,9 +797,11 @@ def main():
         stage_name = parts[1].strip() if len(parts) > 1 else None
         handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
 
-    elif first_line.startswith("/rerun-ut"):
+    elif first_line.startswith("/rerun-single-test"):
         test_specs = first_line.split()[1:]
-        handle_rerun_ut(repo, pr, comment, user_perms, test_specs or None, token)
+        handle_rerun_single_test(
+            repo, pr, comment, user_perms, test_specs or None, token
+        )
 
     else:
         print(f"Unknown or ignored command: {first_line}")
