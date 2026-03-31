@@ -834,7 +834,7 @@ do
     if [[ "$LOCAL_HOST1" == "${P_IP[$i]}" || "$LOCAL_HOST2" == "${P_IP[$i]}" ]];
     then
         echo "${P_IP[$i]}"
-        export HCCL_BUFFSIZE=1200
+        export HCCL_BUFFSIZE=1600
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=xxx
