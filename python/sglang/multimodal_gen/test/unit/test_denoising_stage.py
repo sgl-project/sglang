@@ -53,7 +53,9 @@ class TestDenoisingStageDevicePlacement(unittest.TestCase):
 class TestTextEncodingStageOffload(unittest.TestCase):
     def test_offloads_text_encoders_after_forward_when_requested(self):
         text_encoder = _FakeModule("xpu:0")
-        stage = TextEncodingStage(text_encoders=[text_encoder], tokenizers=[object()])
+        stage = object.__new__(TextEncodingStage)
+        stage.text_encoders = [text_encoder]
+        stage.tokenizers = [object()]
         stage.server_args = SimpleNamespace(
             text_encoder_cpu_offload=True,
             use_fsdp_inference=False,
