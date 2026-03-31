@@ -650,22 +650,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
-                finish_reason = content["meta_info"].get("finish_reason", None)
                 choice_logprobs = None
                 if request.logprobs:
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    total_output_logprobs = len(
-                        content["meta_info"]["output_token_logprobs"]
-                    )
-                    # When finish_reason is set and all logprobs have been sent,
-                    # any remaining text is just buffered text being flushed by the
-                    # detokenizer (it holds back text at word boundaries). Return None
-                    # for logprobs since no new tokens were generated for this text.
-                    if n_prev_token < total_output_logprobs or finish_reason is None:
+                    total_output_logprobs = content["meta_info"][
+                        "output_token_logprobs_length"
+                    ]
+                    if n_prev_token < total_output_logprobs:
                         choice_logprobs = self._process_streaming_logprobs(
-                            content, n_prev_token
+                            content, n_prev_token, total_output_logprobs
                         )
                     n_prev_tokens[index] = total_output_logprobs
+
+                finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
@@ -1174,15 +1171,18 @@ class OpenAIServingChat(OpenAIServingBase):
         return ToolCallProcessingResult(None, text, finish_reason)
 
     def _process_streaming_logprobs(
-        self, content: Dict[str, Any], n_prev_token: int
+        self,
+        content: Dict[str, Any],
+        n_prev_token: int,
+        total_output_logprobs: int,
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
         logprobs = to_openai_style_logprobs(
             output_token_logprobs=content["meta_info"]["output_token_logprobs"][
-                n_prev_token:
+                n_prev_token:total_output_logprobs
             ],
             output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
-                n_prev_token:
+                n_prev_token:total_output_logprobs
             ],
         )
 
