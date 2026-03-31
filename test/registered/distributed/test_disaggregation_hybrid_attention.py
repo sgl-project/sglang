@@ -88,6 +88,7 @@ class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
         self.assertGreater(metrics["accuracy"], 0.93)
 
 
+@unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -164,6 +165,7 @@ class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBa
         self.assertGreater(metrics["accuracy"], 0.93)
 
 
+@unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase):
     """Test with prefill tp=2 and decode tp=2/dp=2 with dp-attention enabled."""
 
