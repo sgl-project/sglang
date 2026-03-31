@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_batch_completion,
     log_generation_timer,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
 
 logger = init_logger(__name__)
 
@@ -235,7 +236,7 @@ class DiffGenerator:
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
             try:
-                with log_generation_timer(
+                with trace_req(req.trace_ctx), log_generation_timer(
                     logger, req.prompt, request_idx + 1, len(requests)
                 ) as timer:
                     output_batch = self._send_to_scheduler_and_wait_for_response([req])
@@ -336,8 +337,6 @@ class DiffGenerator:
                     exc_info=True,
                 )
                 continue
-            finally:
-                req.trace_ctx.trace_req_finish()
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)

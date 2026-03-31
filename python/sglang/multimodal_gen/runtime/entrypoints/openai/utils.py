@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_batch_completion,
     log_generation_timer,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
 
 # re-export LoRA protocol types for backward compatibility
 __all__ = [
@@ -260,47 +261,44 @@ async def process_generation_batch(
     batch,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
-    try:
-        with log_generation_timer(logger, batch.prompt):
-            result = await scheduler_client.forward([batch])
+    with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
+        result = await scheduler_client.forward([batch])
 
-            if result.output is None and result.output_file_paths is None:
-                error_msg = result.error or "Unknown error"
-                raise RuntimeError(
-                    f"Model generation returned no output. Error from scheduler: {error_msg}"
-                )
+        if result.output is None and result.output_file_paths is None:
+            error_msg = result.error or "Unknown error"
+            raise RuntimeError(
+                f"Model generation returned no output. Error from scheduler: {error_msg}"
+            )
 
-            if result.output_file_paths:
-                save_file_path_list = result.output_file_paths
-            else:
-                num_outputs = len(result.output)
-                save_file_path_list = save_outputs(
-                    result.output,
-                    batch.data_type,
-                    batch.fps,
-                    batch.save_output,
-                    lambda idx: str(batch.output_file_path(num_outputs, idx)),
-                    audio=result.audio,
-                    audio_sample_rate=result.audio_sample_rate,
-                    output_compression=batch.output_compression,
-                    enable_frame_interpolation=batch.enable_frame_interpolation,
-                    frame_interpolation_exp=batch.frame_interpolation_exp,
-                    frame_interpolation_scale=batch.frame_interpolation_scale,
-                    frame_interpolation_model_path=batch.frame_interpolation_model_path,
-                    enable_upscaling=batch.enable_upscaling,
-                    upscaling_model_path=batch.upscaling_model_path,
-                    upscaling_scale=batch.upscaling_scale,
-                )
+        if result.output_file_paths:
+            save_file_path_list = result.output_file_paths
+        else:
+            num_outputs = len(result.output)
+            save_file_path_list = save_outputs(
+                result.output,
+                batch.data_type,
+                batch.fps,
+                batch.save_output,
+                lambda idx: str(batch.output_file_path(num_outputs, idx)),
+                audio=result.audio,
+                audio_sample_rate=result.audio_sample_rate,
+                output_compression=batch.output_compression,
+                enable_frame_interpolation=batch.enable_frame_interpolation,
+                frame_interpolation_exp=batch.frame_interpolation_exp,
+                frame_interpolation_scale=batch.frame_interpolation_scale,
+                frame_interpolation_model_path=batch.frame_interpolation_model_path,
+                enable_upscaling=batch.enable_upscaling,
+                upscaling_model_path=batch.upscaling_model_path,
+                upscaling_scale=batch.upscaling_scale,
+            )
 
-        total_time = time.perf_counter() - total_start_time
-        log_batch_completion(logger, 1, total_time)
+    total_time = time.perf_counter() - total_start_time
+    log_batch_completion(logger, 1, total_time)
 
-        if result.peak_memory_mb and result.peak_memory_mb > 0:
-            logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
+    if result.peak_memory_mb and result.peak_memory_mb > 0:
+        logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
 
-        return save_file_path_list, result
-    finally:
-        batch.trace_ctx.trace_req_finish()
+    return save_file_path_list, result
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:

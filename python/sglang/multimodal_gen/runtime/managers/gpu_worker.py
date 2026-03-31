@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -227,11 +228,8 @@ class GPUWorker:
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
-            req.trace_ctx.trace_slice_start("gpu_forward", level=2)
-            try:
+            with trace_slice(req.trace_ctx, DiffStage.GPU_FORWARD, level=2):
                 result = self.pipeline.forward(req, self.server_args)
-            finally:
-                req.trace_ctx.trace_slice_end("gpu_forward", level=2)
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
