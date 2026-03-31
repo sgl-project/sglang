@@ -55,6 +55,8 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
+    # CUDA Graph warmup resolutions for diffusion
+    SGLANG_DIFFUSION_CUDA_GRAPH_WARMUP_SIZES: str = "(256,256),(512,512),(1024,1024)"
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
 
@@ -279,6 +281,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+    ),
+    # CUDA Graph warmup resolutions
+    "SGLANG_DIFFUSION_CUDA_GRAPH_WARMUP_SIZES": _lazy_str(
+        "SGLANG_DIFFUSION_CUDA_GRAPH_WARMUP_SIZES",
+        "(256,256),(512,512),(1024,1024)",
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
