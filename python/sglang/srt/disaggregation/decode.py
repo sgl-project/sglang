@@ -66,7 +66,6 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils.common import broadcast_pyobj
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -278,7 +277,6 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[Req] = []
-        self._globally_ready_prefill_addrs: set[str] = set()
         self._ensure_retry_count: Dict[str, int] = {}
         self._max_ensure_retries: int = 20  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
@@ -291,67 +289,6 @@ class DecodePreallocQueue:
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
-
-    def _broadcast_pending_resolution(
-        self, payload: Optional[dict], is_pending_resolution_leader: bool
-    ) -> Optional[dict]:
-        payload_list = [payload] if is_pending_resolution_leader else []
-
-        if self.scheduler.attn_tp_size != 1:
-            payload_list = broadcast_pyobj(
-                payload_list,
-                self.scheduler.attn_tp_group.rank,
-                self.scheduler.attn_tp_cpu_group,
-                src=self.scheduler.attn_tp_group.ranks[0],
-            )
-
-        if self.scheduler.attn_cp_size != 1:
-            payload_list = broadcast_pyobj(
-                payload_list,
-                self.scheduler.attn_cp_group.rank,
-                self.scheduler.attn_cp_cpu_group,
-                src=self.scheduler.attn_cp_group.ranks[0],
-            )
-
-        return payload_list[0] if payload_list else None
-
-    def _sync_pending_prefill_info_state(
-        self, ready_addrs: Dict[str, List[Req]], failed_addrs: set[str]
-    ) -> Tuple[set[str], set[str]]:
-        state = {
-            "ready_addrs": sorted(ready_addrs.keys()),
-            "failed_addrs": sorted(failed_addrs),
-        }
-
-        if self.scheduler.attn_tp_size != 1:
-            gathered = [None] * self.scheduler.attn_tp_size
-            torch.distributed.all_gather_object(
-                gathered, state, group=self.scheduler.attn_tp_cpu_group
-            )
-            ready_sets = [set(item["ready_addrs"]) for item in gathered]
-            merged_failed = set().union(
-                *(set(item["failed_addrs"]) for item in gathered)
-            )
-            state = {
-                "ready_addrs": sorted(set.intersection(*ready_sets)),
-                "failed_addrs": sorted(merged_failed),
-            }
-
-        if self.scheduler.attn_cp_size != 1:
-            gathered = [None] * self.scheduler.attn_cp_size
-            torch.distributed.all_gather_object(
-                gathered, state, group=self.scheduler.attn_cp_cpu_group
-            )
-            ready_sets = [set(item["ready_addrs"]) for item in gathered]
-            merged_failed = set().union(
-                *(set(item["failed_addrs"]) for item in gathered)
-            )
-            state = {
-                "ready_addrs": sorted(set.intersection(*ready_sets)),
-                "failed_addrs": sorted(merged_failed),
-            }
-
-        return set(state["ready_addrs"]), set(state["failed_addrs"])
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -436,17 +373,12 @@ class DecodePreallocQueue:
                 self._create_receiver_and_enqueue(req, 0)
                 return
 
-            bootstrap_addr = _bootstrap_addr(req)
-
-            # Fast path is gated by global readiness to avoid per-rank divergence
-            # (some ranks enqueue while others still leave the same request pending).
-            if bootstrap_addr in self._globally_ready_prefill_addrs:
-                prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-                if prefill_dp_rank is not None:
-                    self._create_receiver_and_enqueue(req, prefill_dp_rank)
-                    return
-
-            self.pending_reqs.append(req)
+            # Fast path: cache-only lookup, no network calls
+            prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+            if prefill_dp_rank is not None:
+                self._create_receiver_and_enqueue(req, prefill_dp_rank)
+            else:
+                self.pending_reqs.append(req)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         if req.disagg_prefill_dp_rank is not None:
@@ -580,11 +512,11 @@ class DecodePreallocQueue:
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[Req]]
-    ) -> Tuple[Dict[str, List[Req]], set[str]]:
+    ) -> Tuple[Dict[str, List[Req]], List[Req]]:
         """Non-blocking ensure parallel info for each addr.
-        Returns (ready_addrs, failed_addrs)."""
+        Returns (ready_addrs, remaining_reqs)."""
         ready: Dict[str, List[Req]] = {}
-        failed_addrs: set[str] = set()
+        remaining: List[Req] = []
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
@@ -592,6 +524,7 @@ class DecodePreallocQueue:
             if last_attempt is not None and (
                 now - last_attempt < self._ensure_retry_interval
             ):
+                remaining.extend(reqs)
                 continue
 
             self._ensure_last_attempt_time[bootstrap_addr] = now
@@ -610,11 +543,19 @@ class DecodePreallocQueue:
             if count >= self._max_ensure_retries:
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
-                failed_addrs.add(bootstrap_addr)
+                for req in reqs:
+                    prepare_abort(
+                        req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    )
+                    if self.scheduler.enable_metrics:
+                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+                    self.scheduler.stream_output([req], req.return_logprob)
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
+            else:
+                remaining.extend(reqs)
 
-        return ready, failed_addrs
+        return ready, remaining
 
     def _resolve_pending_reqs(self) -> None:
         """Batch-resolve prefill_dp_ranks for pending requests and create receivers."""
@@ -628,84 +569,30 @@ class DecodePreallocQueue:
             addr_to_reqs.setdefault(addr, []).append(req)
 
         # Pass 1: ensure parallel info for each addr
-        ready_addrs, failed_addrs = self._ensure_prefill_info(addr_to_reqs)
-        global_ready_addrs, global_failed_addrs = (
-            self._sync_pending_prefill_info_state(ready_addrs, failed_addrs)
-        )
-        self._globally_ready_prefill_addrs.update(global_ready_addrs)
-        self._globally_ready_prefill_addrs.difference_update(global_failed_addrs)
-
-        for bootstrap_addr in global_failed_addrs:
-            error_msg = (
-                f"Failed to synchronize prefill parallel info readiness for {bootstrap_addr}: "
-                f"at least one decode rank entered a terminal error state while ensuring local prefill info"
-            )
-            for req in addr_to_reqs.get(bootstrap_addr, []):
-                prepare_abort(
-                    req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                if self.scheduler.enable_metrics:
-                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                self.scheduler.stream_output([req], req.return_logprob)
+        ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
 
         # Pass 2: resolve dp rank for addrs whose info is available
-
-        is_pending_resolution_leader = (
-            self.scheduler.attn_tp_rank == 0 and self.scheduler.attn_cp_rank == 0
-        )
-        payload = None
-        if is_pending_resolution_leader:
-            resolved_by_rid: Dict[str, int] = {}
-            remaining: List[Req] = []
-            for bootstrap_addr, reqs in addr_to_reqs.items():
-                if (
-                    bootstrap_addr not in global_ready_addrs
-                    and bootstrap_addr not in global_failed_addrs
-                ):
-                    remaining.extend(reqs)
-
-            for bootstrap_addr in global_ready_addrs:
-                reqs = ready_addrs[bootstrap_addr]
-                need_query: List[Req] = []
-                for req in reqs:
-                    prefill_dp_rank = self._resolve_prefill_dp_rank(req)
-                    if prefill_dp_rank is not None:
-                        resolved_by_rid[req.rid] = prefill_dp_rank
-                    else:
-                        need_query.append(req)
-
-                if need_query:
-                    rooms = [req.bootstrap_room for req in need_query]
-                    room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                        bootstrap_addr, rooms
-                    )
-                    for req in need_query:
-                        prefill_dp_rank = room_to_rank.get(str(req.bootstrap_room))
-                        if prefill_dp_rank is not None:
-                            resolved_by_rid[req.rid] = int(prefill_dp_rank)
-                        else:
-                            remaining.append(req)
-
-            payload = {
-                "resolved_by_rid": resolved_by_rid,
-                "remaining_rids": [req.rid for req in remaining],
-            }
-
-        payload = self._broadcast_pending_resolution(
-            payload, is_pending_resolution_leader
-        )
-        if payload is None:
-            return
-
         resolved = []
-        remaining = []
-        resolved_by_rid = payload["resolved_by_rid"]
-        remaining_rids = set(payload["remaining_rids"])
-        for req in self.pending_reqs:
-            if req.rid in resolved_by_rid:
-                resolved.append((req, int(resolved_by_rid[req.rid])))
-            elif req.rid in remaining_rids:
-                remaining.append(req)
+        for bootstrap_addr, reqs in ready_addrs.items():
+            need_query: List[Req] = []
+            for req in reqs:
+                prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+                if prefill_dp_rank is not None:
+                    resolved.append((req, prefill_dp_rank))
+                else:
+                    need_query.append(req)
+
+            if need_query:
+                rooms = [req.bootstrap_room for req in need_query]
+                room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                    bootstrap_addr, rooms
+                )
+                for req in need_query:
+                    prefill_dp_rank = room_to_rank.get(str(req.bootstrap_room))
+                    if prefill_dp_rank is not None:
+                        resolved.append((req, int(prefill_dp_rank)))
+                    else:
+                        remaining.append(req)
 
         self.pending_reqs = remaining
 
