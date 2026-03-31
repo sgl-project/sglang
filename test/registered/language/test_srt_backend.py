@@ -32,6 +32,7 @@ class TestSRTBackend(CustomTestCase):
             model_path=DEFAULT_MODEL_NAME_FOR_TEST,
             cuda_graph_max_bs=4,
             mem_fraction_static=0.7,
+            log_level="info",
         )
         sgl.set_default_backend(cls.backend)
 

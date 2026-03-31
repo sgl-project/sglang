@@ -83,6 +83,7 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
+@unittest.skipIf(is_in_ci(), "Skip since mooncake-ep fault-tolerant test is flaky.")
 class TestPureDP(TestTP):
     extra_args = [
         "--enable-dp-attention",

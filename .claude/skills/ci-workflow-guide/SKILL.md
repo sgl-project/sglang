@@ -381,6 +381,6 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | `/rerun-failed-ci` | Reruns failed jobs in the latest workflow run |
 | `/tag-and-rerun-ci` | Adds label + reruns |
 | `/rerun-stage <stage>` | Dispatches `pr-test.yml` with `target_stage=<stage>` |
-| `/rerun-ut <test-file>` | Reruns a specific test file via `rerun-ut.yml` |
+| `/rerun-test <test-file>` | Reruns a specific test file via `rerun-test.yml` |
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
