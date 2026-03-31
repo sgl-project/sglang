@@ -19,6 +19,7 @@ from sglang.srt.lora.utils import (
     get_normalized_target_modules,
     get_stacked_multiply,
     get_target_module_name,
+    get_text_config,
 )
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -62,7 +63,8 @@ class LoRAMemoryPool:
         lora_added_tokens_size: int,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
-        self.num_layer: int = base_hf_config.num_hidden_layers
+        text_config = get_text_config(base_hf_config)
+        self.num_layer: int = text_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
         self.dtype: torch.dtype = dtype
         self.tp_size: int = tp_size
@@ -88,7 +90,7 @@ class LoRAMemoryPool:
         self.lm_head_B_buffer: Dict[str, torch.Tensor] = {}
         self.new_embeddings_buffer: Dict[str, torch.Tensor] = {}
 
-        self.embedding_dim: int = self.base_hf_config.hidden_size
+        self.embedding_dim: int = text_config.hidden_size
 
         # Lora uid -> buffer idx in memory pool
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
@@ -477,7 +479,9 @@ class LoRAMemoryPool:
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
         def load_lora_weight_tensor(
-            buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
+            buffer_view: torch.Tensor,
+            weight: Optional[torch.Tensor],
+            debug_info: str = "",
         ):
             if weight is None:
                 # If the particular weight is not present in the adapter, we initialize the buffer to zero
@@ -486,7 +490,7 @@ class LoRAMemoryPool:
             else:
                 assert (
                     buffer_view.shape == weight.shape
-                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
+                ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}. {debug_info}"
                 buffer_view.copy_(weight, non_blocking=True)
 
         if uid is None:
@@ -599,12 +603,17 @@ class LoRAMemoryPool:
                         buffer_view = target_buffer[
                             buffer_id, expert_id, : lora_rank * c, :
                         ]
-                        load_lora_weight_tensor(buffer_view, expert_weight)
+                        load_lora_weight_tensor(
+                            buffer_view, expert_weight,
+                            f"module={name} layer={layer_id} type=A rank={lora_rank} c={c} expert={expert_id} uid={uid}",
+                        )
                 else:
                     # Standard: single tensor per module
-                    c = get_stacked_multiply(name)
                     buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
-                    load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(
+                        buffer_view, weights,
+                        f"module={name} layer={layer_id} type=A rank={lora_rank} c={c} uid={uid}",
+                    )
 
             for name, weights in temp_B_buffer.items():
                 target_buffer = self.B_buffer[name][layer_id]
@@ -619,11 +628,17 @@ class LoRAMemoryPool:
                         if weight_to_load is not None:
                             weight_to_load = weight_to_load * lora_adapter.scaling
 
-                        load_lora_weight_tensor(buffer_view, weight_to_load)
+                        load_lora_weight_tensor(
+                            buffer_view, weight_to_load,
+                            f"module={name} layer={layer_id} type=B rank={lora_rank} expert={expert_id} uid={uid}",
+                        )
                 else:
                     # Standard: single tensor per module
                     buffer_view = target_buffer[buffer_id, :, :lora_rank]
-                    load_lora_weight_tensor(buffer_view, weights)
+                    load_lora_weight_tensor(
+                        buffer_view, weights,
+                        f"module={name} layer={layer_id} type=B rank={lora_rank} uid={uid}",
+                    )
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size

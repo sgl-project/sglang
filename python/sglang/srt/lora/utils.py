@@ -50,6 +50,23 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
+def get_text_config(config: AutoConfig) -> AutoConfig:
+    """Resolve VLM configs to their text sub-config.
+
+    VLM models (e.g. Qwen3_5, InternVL) store model-architecture attributes
+    like hidden_size, num_hidden_layers, etc. on a text_config sub-object
+    rather than the top-level config. SGLang's LoRA serving currently supports
+    adapters targeting the text (language) backbone of VLMs by reading these
+    attributes from text_config when present.
+
+    For text-only models, the top-level config already has these attributes
+    and is returned as-is.
+    """
+    if hasattr(config, "text_config"):
+        return config.text_config
+    return config
+
+
 def get_hidden_dim(
     module_name: str,
     config: AutoConfig,
@@ -71,34 +88,38 @@ def get_hidden_dim(
         Please implement the function in the model class if it is not.
         You can reference this function in llama.py.
         """
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
+        # Resolve VLM configs to text sub-config for hidden_size etc.
+        text_config = get_text_config(config)
+        head_dim = getattr(text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
+
+        # Qwen 3.5 (and similar hybrid models) use attn_output_gate which
+        # doubles the Q projection size in attention layers. The gate values
+        # are interleaved with the Q outputs in the same projection.
+        attn_output_gate = getattr(text_config, "attn_output_gate", False)
+        q_heads_multiplier = 2 if attn_output_gate else 1
+
         if module_name == "qkv_proj":
-            return config.hidden_size, head_dim * (
-                config.num_attention_heads + config.num_key_value_heads * 2
+            return text_config.hidden_size, head_dim * (
+                text_config.num_attention_heads * q_heads_multiplier
+                + text_config.num_key_value_heads * 2
             )
         elif module_name == "o_proj":
             return (
-                head_dim * config.num_attention_heads,
-                config.hidden_size,
+                head_dim * text_config.num_attention_heads,
+                text_config.hidden_size,
             )
         elif module_name == "gate_up_proj":
-            return config.hidden_size, config.intermediate_size * 2
+            return text_config.hidden_size, text_config.intermediate_size * 2
         elif module_name == "down_proj":
-            return config.intermediate_size, config.hidden_size
+            return text_config.intermediate_size, text_config.hidden_size
         elif module_name == "gate_up_proj_moe":
-            return config.hidden_size, config.moe_intermediate_size * 2
+            return text_config.hidden_size, text_config.moe_intermediate_size * 2
         elif module_name == "down_proj_moe":
-            return config.moe_intermediate_size, config.hidden_size
+            return text_config.moe_intermediate_size, text_config.hidden_size
         elif module_name == "embed_tokens":
-            # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
-            # if contain extra tokens will be added; otherwise is 0.
-            return config.vocab_size + lora_added_vocab_size, config.hidden_size
+            return config.vocab_size + lora_added_vocab_size, text_config.hidden_size
         elif module_name == "lm_head":
-            # For lm_head: input is hidden_size, output is vocab_size
-            # if contain extra tokens will be added; otherwise is 0.
-            return config.hidden_size, config.vocab_size + lora_added_vocab_size
+            return text_config.hidden_size, config.vocab_size + lora_added_vocab_size
         else:
             raise NotImplementedError(
                 "get_hidden_dim not implemented for " + module_name

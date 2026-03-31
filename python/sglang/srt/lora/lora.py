@@ -29,6 +29,7 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.utils import get_text_config
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -63,10 +64,11 @@ class LoRAAdapter(nn.Module):
         self.lora_backend: BaseLoRABackend = lora_backend
         self.scaling: float = self.config.lora_alpha / self.config.r
 
+        text_config = get_text_config(base_hf_config)
         self.layers: List[LoRALayer] = nn.ModuleList(
             [
                 LoRALayer(config, base_hf_config)
-                for _ in range(base_hf_config.num_hidden_layers)
+                for _ in range(text_config.num_hidden_layers)
             ]
         )
 
