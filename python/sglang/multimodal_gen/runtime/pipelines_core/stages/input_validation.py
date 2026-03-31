@@ -191,8 +191,30 @@ class InputValidationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
+
+            # User-specified width/height controls the target area (scale),
+            # capped by max_area. Aspect ratio always comes from the
+            # condition image for I2V.
+            if batch.width is not None or batch.height is not None:
+                # If one dimension is provided, calculate the other based on the image's aspect ratio.
+                if batch.width is None:
+                    batch.width = round(batch.height / aspect_ratio)
+                elif batch.height is None:
+                    batch.height = round(batch.width * aspect_ratio)
+
+                target_area = min(batch.width * batch.height, max_area)
+                if batch.width * batch.height > max_area:
+                    logger.warning(
+                        "Requested resolution %dx%d exceeds max_area %d, "
+                        "clamping to max_area",
+                        batch.width,
+                        batch.height,
+                        max_area,
+                    )
+            else:
+                target_area = max_area
             width, height = self._calculate_dimensions_from_area(
-                max_area, aspect_ratio, mod_value
+                target_area, aspect_ratio, mod_value
             )
 
             batch.condition_image = batch.condition_image.resize((width, height))
