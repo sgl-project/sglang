@@ -1117,8 +1117,9 @@ class ServerArgs:
         # 16. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
             self.disable_piecewise_cuda_graph = True
-        # 17. NVFP4 KV cache: piecewise forces use_ragged=False, which triggers
-        #     FP4→FP8 dequant path during prefill and causes accuracy degradation.
+        # 17. NVFP4 KV cache: piecewise captures extend batches which invoke
+        #     trtllm_batch_decode_with_kv_cache with kv_cache_sf (requires
+        #     flashinfer >= 0.6.7).  Keep disabled until flashinfer is updated.
         if self.kv_cache_dtype == "fp4_e2m1":
             self.disable_piecewise_cuda_graph = True
 
