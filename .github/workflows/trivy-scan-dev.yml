@@ -22,24 +22,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tag: [dev, dev-cu13]
+        tag: ${{ inputs.tag && fromJSON(format('["{0}"]', inputs.tag)) || fromJSON('["dev", "dev-cu13"]') }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Determine image tag
-        id: tag
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ matrix.tag }}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.35.0
         with:
-          image-ref: 'docker.io/lmsysorg/sglang:${{ steps.tag.outputs.tag }}'
+          image-ref: 'docker.io/lmsysorg/sglang:${{ matrix.tag }}'
           scanners: 'vuln'
           format: 'sarif'
           output: 'trivy-results-${{ matrix.tag }}.sarif'
@@ -54,9 +45,10 @@ jobs:
           category: 'trivy-${{ matrix.tag }}'
 
       - name: Run Trivy (table output for logs)
+        if: success()
         uses: aquasecurity/trivy-action@v0.35.0
         with:
-          image-ref: 'docker.io/lmsysorg/sglang:${{ steps.tag.outputs.tag }}'
+          image-ref: 'docker.io/lmsysorg/sglang:${{ matrix.tag }}'
           scanners: 'vuln'
           format: 'table'
           severity: 'CRITICAL,HIGH'
