@@ -150,7 +150,7 @@ def parse_tool_calls_from_content(
             for call_info in call_info_list:
                 tool_id = generate_tool_call_id(call_info, history_tool_calls_cnt)
                 function_tool_call = ResponseFunctionToolCall(
-                    id=f"fc_{random_uuid()[:16]}",
+                    id=f"fc_{random_uuid()[:32]}",
                     type="function_call",
                     call_id=tool_id,
                     name=call_info.name,
