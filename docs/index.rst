@@ -86,6 +86,8 @@ Its core features include:
    diffusion/compatibility_matrix
    diffusion/api/cli
    diffusion/api/openai_api
+   diffusion/performance/index
+   diffusion/performance/ring_sp_performance
    diffusion/performance/attention_backends
    diffusion/performance/cache/index
    diffusion/quantization
