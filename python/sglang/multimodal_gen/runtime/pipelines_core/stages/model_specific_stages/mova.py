@@ -335,9 +335,11 @@ class MOVADenoisingStage(PipelineStage):
         if not server_args.dit_cpu_offload:
             return
 
+        active_device_type = get_local_torch_device().type
+
         if (
             model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
+            and next(model_to_offload.parameters()).device.type == active_device_type
         ):
             model_to_offload.to("cpu")
 

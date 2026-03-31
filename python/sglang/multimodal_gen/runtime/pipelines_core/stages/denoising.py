@@ -857,10 +857,12 @@ class DenoisingStage(PipelineStage):
         if server_args.use_fsdp_inference:
             return
 
-        # Offload the unused model if it's on CUDA
+        active_device_type = get_local_torch_device().type
+
+        # Offload the inactive model before loading the next one on any accelerator.
         if (
             model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
+            and next(model_to_offload.parameters()).device.type == active_device_type
         ):
             model_to_offload.to("cpu")
 
