@@ -50,6 +50,9 @@ SUITES = {
         "test_server_2_gpu_b.py",
         # add new 2-gpu test files here
     ],
+    "1-gpu-b200": [
+        "test_server_c.py",
+    ],
 }
 
 suites_ascend = {
@@ -78,7 +81,7 @@ def parse_args():
         type=str,
         required=True,
         choices=list(SUITES.keys()),
-        help="The test suite to run (e.g., 1-gpu, 2-gpu)",
+        help="The test suite to run (valid names are defined in SUITES)",
     )
     parser.add_argument(
         "--partition-id",
