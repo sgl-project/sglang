@@ -352,6 +352,13 @@ mark_step_done "Fix other dependencies"
 # can delete the .pth file without reliably recreating it (pip race condition).
 $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --no-deps --force-reinstall $PIP_INSTALL_SUFFIX || true
 
+
+# Install human-eval
+pip install "setuptools==70.0.0"
+git clone https://github.com/merrymercy/human-eval.git
+cd human-eval
+pip install -e . --no-build-isolation
+
 # ------------------------------------------------------------------------------
 # Prepare runner
 # ------------------------------------------------------------------------------
