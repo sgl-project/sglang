@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -1457,15 +1456,16 @@ def apply_fp8_linear(
         num_token_padding = output_padding
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             num_token_padding = None
-        # For static per-tensor scales, use pure PyTorch ops instead of the
-        # opaque sgl_kernel quant kernel. Inductor can fuse these with
-        # surrounding ops (RMSNorm, residual add), eliminating a separate
-        # kernel launch per linear layer.
+        # For static per-tensor scales under torch.compile, use pure PyTorch
+        # ops instead of the opaque sgl_kernel quant kernel. Inductor fuses
+        # these with surrounding ops (RMSNorm, residual add), eliminating
+        # a separate kernel launch per linear layer. Only activates during
+        # inductor tracing (prefill PCG); decode uses the faster custom kernel.
         if (
             input_scale is not None
             and input_scale.numel() == 1
             and weight_scale.numel() == 1
-            and envs.SGLANG_ENABLE_TORCH_COMPILE.get()
+            and torch.compiler.is_compiling()
         ):
             qinput = (
                 (input_2d * input_scale.reciprocal())
