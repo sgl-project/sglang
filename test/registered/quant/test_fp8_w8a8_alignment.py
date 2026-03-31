@@ -147,6 +147,26 @@ class TestTensorStrategyAlignment(CustomTestCase):
 
         self.assertEqual(output.shape, (batch, out_dim))
 
+    def test_output_shape_with_bias(self):
+        """Bias (shape [out_dim]) must not cause a shape mismatch when N is padded."""
+        out_dim, in_dim = 1368, 2048
+        scheme = _make_scheme("TENSOR")
+
+        weight = _make_fp8_weight(out_dim, in_dim)
+        weight_scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+        layer = _make_layer(weight, weight_scale)
+        layer.logical_widths = [out_dim]
+        layer.input_scale = None
+
+        scheme.process_weights_after_loading(layer)
+
+        batch = 4
+        x = torch.zeros(batch, in_dim, dtype=torch.bfloat16, device="cuda")
+        bias = torch.ones(out_dim, dtype=torch.bfloat16, device="cuda")
+        output = scheme.apply_weights(layer, x, bias=bias)
+
+        self.assertEqual(output.shape, (batch, out_dim))
+
 
 class TestChannelStrategyAlignment(CustomTestCase):
     """process_weights_after_loading (CHANNEL) pads weight + scale and
@@ -198,6 +218,25 @@ class TestChannelStrategyAlignment(CustomTestCase):
         batch = 4
         x = torch.zeros(batch, in_dim, dtype=torch.bfloat16, device="cuda")
         output = scheme.apply_weights(layer, x)
+
+        self.assertEqual(output.shape, (batch, out_dim))
+
+    def test_output_shape_with_bias(self):
+        """Bias (shape [out_dim]) must not cause a shape mismatch when N is padded."""
+        out_dim, in_dim = 1368, 2048
+        scheme = _make_scheme("CHANNEL")
+
+        weight = _make_fp8_weight(out_dim, in_dim)
+        weight_scale = torch.ones(out_dim, 1, dtype=torch.float32, device="cuda")
+        layer = _make_layer(weight, weight_scale)
+        layer.input_scale = None
+
+        scheme.process_weights_after_loading(layer)
+
+        batch = 4
+        x = torch.zeros(batch, in_dim, dtype=torch.bfloat16, device="cuda")
+        bias = torch.ones(out_dim, dtype=torch.bfloat16, device="cuda")
+        output = scheme.apply_weights(layer, x, bias=bias)
 
         self.assertEqual(output.shape, (batch, out_dim))
 
