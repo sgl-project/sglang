@@ -131,9 +131,9 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
 
 class TestDisaggregationDPAttentionTotalRequests(TestDisaggregationDPAttention):
     LOAD_BALANCE_METHOD = "total_requests"
-    test_gsm8k = unittest.skip("Covered by base class; this class targets total_requests path.")(
-        TestDisaggregationDPAttention.test_gsm8k
-    )
+    test_gsm8k = unittest.skip(
+        "Covered by base class; this class targets total_requests path."
+    )(TestDisaggregationDPAttention.test_gsm8k)
 
     def test_bench_serving(self):
         args = get_benchmark_args(
@@ -152,9 +152,9 @@ class TestDisaggregationDPAttentionTotalRequests(TestDisaggregationDPAttention):
 
 class TestDisaggregationDPAttentionTotalTokens(TestDisaggregationDPAttention):
     LOAD_BALANCE_METHOD = "total_tokens"
-    test_gsm8k = unittest.skip("Covered by base class; this class targets total_tokens path.")(
-        TestDisaggregationDPAttention.test_gsm8k
-    )
+    test_gsm8k = unittest.skip(
+        "Covered by base class; this class targets total_tokens path."
+    )(TestDisaggregationDPAttention.test_gsm8k)
 
     def test_bench_serving(self):
         args = get_benchmark_args(
