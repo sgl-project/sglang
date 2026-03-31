@@ -30,6 +30,7 @@ class TestEAGLEServerBasic(EagleServerBase):
 
     extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
+    # FIXME(lsyin): move the test methods to kits
     def test_request_abort(self):
         concurrency = 4
         threads = [
@@ -83,6 +84,8 @@ class TestEAGLEServerExtend(TestEAGLEServerBasic):
         8,
         "--cuda-graph-max-bs",
         8,
+        "--attention-backend",
+        "fa3",
         "--page-size",
         256,
     ]
