@@ -238,14 +238,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Reject multimodal content when multimodal is not enabled
         if not self.tokenizer_manager.model_config.is_multimodal:
+            multimodal_types = {"image_url", "video_url", "audio_url"}
             for message in request.messages:
                 if isinstance(message.content, list):
                     for part in message.content:
-                        if hasattr(part, "type") and part.type in (
-                            "image_url",
-                            "video_url",
-                            "audio_url",
-                        ):
+                        if getattr(part, "type", None) in multimodal_types:
                             return (
                                 "Multimodal input (images, videos, or audio) is not "
                                 "supported by this model or server configuration. "

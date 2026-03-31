@@ -391,8 +391,7 @@ class TestMultimodalContentDetection(unittest.TestCase):
             if isinstance(message.content, list):
                 for part in message.content:
                     if (
-                        hasattr(part, "type")
-                        and part.type
+                        getattr(part, "type", None)
                         in TestMultimodalContentDetection._MULTIMODAL_TYPES
                     ):
                         return True
