@@ -4,11 +4,15 @@ import ipaddress
 import logging
 import os
 import platform
+import re
 import signal
 import socket
 import sys
+import tempfile
 import threading
+import time
 from functools import lru_cache
+from typing import Dict, Tuple
 
 import psutil
 import torch
@@ -16,6 +20,28 @@ import zmq
 
 # use the native logger to avoid circular import
 logger = logging.getLogger(__name__)
+
+# Temporary directory for prometheus multiprocess mode
+# Cleaned up automatically when this object is garbage collected
+prometheus_multiproc_dir: tempfile.TemporaryDirectory
+
+
+def set_prometheus_multiproc_dir():
+    # Set prometheus multiprocess directory
+    # sglang uses prometheus multiprocess mode
+    # we need to set this before importing prometheus_client
+    # https://prometheus.github.io/client_python/multiprocess/
+    global prometheus_multiproc_dir
+
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.debug("PROMETHEUS_MULTIPROC_DIR: %s", os.environ["PROMETHEUS_MULTIPROC_DIR"])
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -122,6 +148,180 @@ def is_port_available(port):
             return False
         except OverflowError:
             return False
+
+
+def add_prometheus_middleware(app):
+    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+    from prometheus_client import (
+        GC_COLLECTOR,
+        PLATFORM_COLLECTOR,
+        PROCESS_COLLECTOR,
+        CollectorRegistry,
+        make_asgi_app,
+        multiprocess,
+    )
+    from starlette.routing import Mount
+
+    registry = CollectorRegistry()
+    registry.register(GC_COLLECTOR)
+    registry.register(PLATFORM_COLLECTOR)
+    registry.register(PROCESS_COLLECTOR)
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
+
+
+class RefCountedGauge:
+    def __init__(self, gauge):
+        self._gauge = gauge
+        self._refcount: Dict[str, int] = {}
+
+    def inc(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] += 1
+        else:
+            self._refcount[key] = 1
+            self._gauge.inc()
+
+    def dec(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] -= 1
+            if self._refcount[key] == 0:
+                del self._refcount[key]
+                self._gauge.dec()
+
+
+def add_prometheus_track_response_middleware(app):
+    from prometheus_client import Counter, Gauge, Histogram, Summary
+
+    http_request_counter = Counter(
+        name="sglang:http_requests_total",
+        documentation="Total number of HTTP requests by endpoint and method",
+        labelnames=["endpoint", "method"],
+    )
+
+    http_response_counter = Counter(
+        name="sglang:http_responses_total",
+        documentation="Total number of HTTP responses by endpoint and status code",
+        labelnames=["endpoint", "status_code", "method"],
+    )
+
+    http_requests_active = Gauge(
+        name="sglang:http_requests_active",
+        documentation="Number of currently active HTTP requests",
+        labelnames=["endpoint", "method"],
+        multiprocess_mode="livesum",
+    )
+
+    http_request_size = Summary(
+        name="sglang:http_request_size_bytes",
+        documentation=(
+            "Content length of incoming requests by endpoint. "
+            "Only value of header is respected. Otherwise ignored."
+        ),
+        labelnames=["endpoint"],
+    )
+
+    http_response_size = Summary(
+        name="sglang:http_response_size_bytes",
+        documentation=(
+            "Content length of outgoing responses by endpoint. "
+            "Only value of header is respected. Otherwise ignored."
+        ),
+        labelnames=["endpoint"],
+    )
+
+    http_request_latency = Histogram(
+        name="sglang:http_request_latency_seconds",
+        documentation="End-to-end HTTP request latency in seconds",
+        labelnames=["endpoint", "status_code", "method"],
+        buckets=(
+            0.4,
+            0.8,
+            2.0,
+            4.0,
+            8.0,
+            10.0,
+            20.0,
+            60.0,
+            80.0,
+            100.0,
+            200.0,
+        ),
+    )
+
+    routing_keys_active = RefCountedGauge(
+        Gauge(
+            name="sglang:routing_keys_active",
+            documentation="Number of unique routing keys with active requests",
+            multiprocess_mode="livesum",
+        )
+    )
+
+    @app.middleware("http")
+    async def track_http_status_code(request, call_next):
+        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
+        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
+        path, _is_handled_path = _get_fastapi_request_path(request)
+        method = request.method
+        routing_key = request.headers.get("x-smg-routing-key")
+
+        start_time = time.monotonic()
+        http_request_counter.labels(endpoint=path, method=method).inc()
+        http_requests_active.labels(endpoint=path, method=method).inc()
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                http_request_size.labels(endpoint=path).observe(float(content_length))
+            except ValueError:
+                pass
+        if routing_key:
+            routing_keys_active.inc(routing_key)
+        status_code = "500"
+        response = None
+        try:
+            response = await call_next(request)
+            status_code = str(response.status_code)
+            http_response_counter.labels(
+                endpoint=path,
+                method=method,
+                status_code=status_code,
+            ).inc()
+
+            return response
+        finally:
+            response_length = (
+                response.headers.get("content-length") if response else None
+            )
+            if response_length is not None:
+                try:
+                    http_response_size.labels(endpoint=path).observe(
+                        float(response_length)
+                    )
+                except ValueError:
+                    pass
+            http_request_latency.labels(
+                endpoint=path,
+                method=method,
+                status_code=status_code,
+            ).observe(time.monotonic() - start_time)
+            http_requests_active.labels(endpoint=path, method=method).dec()
+            if routing_key:
+                routing_keys_active.dec(routing_key)
+
+
+def _get_fastapi_request_path(request) -> Tuple[str, bool]:
+    from starlette.routing import Match
+
+    for route in request.app.routes:
+        match, _child_scope = route.matches(request.scope)
+        if match == Match.FULL:
+            return route.path, True
+
+    return request.url.path, False
 
 
 def get_zmq_socket(
