@@ -226,7 +226,7 @@ jobs:
 
       - name: Run Trivy vulnerability scanner
         id: trivy-sarif
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           image-ref: 'docker.io/lmsysorg/sglang:${{ matrix.tag }}'
           format: 'sarif'
@@ -243,7 +243,7 @@ jobs:
           category: 'trivy-${{ matrix.tag }}'
 
       - name: Run Trivy (table output for logs)
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           image-ref: 'docker.io/lmsysorg/sglang:${{ matrix.tag }}'
           format: 'table'
