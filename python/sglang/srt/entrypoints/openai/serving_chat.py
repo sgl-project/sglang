@@ -236,6 +236,23 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
+        # Reject multimodal content when multimodal is not enabled
+        if not self.tokenizer_manager.model_config.is_multimodal:
+            for message in request.messages:
+                if isinstance(message.content, list):
+                    for part in message.content:
+                        if hasattr(part, "type") and part.type in (
+                            "image_url",
+                            "video_url",
+                            "audio_url",
+                        ):
+                            return (
+                                "Multimodal input (images, videos, or audio) is not "
+                                "supported by this model or server configuration. "
+                                "To enable multimodal support, start the server "
+                                "with --enable-multimodal."
+                            )
+
         return None
 
     def _convert_to_internal_request(

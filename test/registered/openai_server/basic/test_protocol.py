@@ -374,5 +374,100 @@ class TestValidationEdgeCases(unittest.TestCase):
         self.assertEqual(len(restored_request.messages), len(original_request.messages))
 
 
+class TestMultimodalContentDetection(unittest.TestCase):
+    """Test that multimodal content parts are correctly identified in requests.
+
+    This validates the parsing side used by serving_chat._validate_request()
+    to reject multimodal content when --enable-multimodal is not set.
+    The full serving validation is tested in CI integration tests.
+    """
+
+    _MULTIMODAL_TYPES = {"image_url", "video_url", "audio_url"}
+
+    @staticmethod
+    def _has_multimodal_content(request: ChatCompletionRequest) -> bool:
+        """Mirror of the detection logic in serving_chat._validate_request."""
+        for message in request.messages:
+            if isinstance(message.content, list):
+                for part in message.content:
+                    if (
+                        hasattr(part, "type")
+                        and part.type
+                        in TestMultimodalContentDetection._MULTIMODAL_TYPES
+                    ):
+                        return True
+        return False
+
+    def test_image_content_detected(self):
+        """Image content parts should be detected as multimodal."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,abc123"},
+                        },
+                    ],
+                }
+            ],
+        )
+        self.assertTrue(self._has_multimodal_content(request))
+
+    def test_video_content_detected(self):
+        """Video content parts should be detected as multimodal."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this video."},
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": "https://example.com/video.mp4"},
+                        },
+                    ],
+                }
+            ],
+        )
+        self.assertTrue(self._has_multimodal_content(request))
+
+    def test_text_string_not_detected(self):
+        """Plain string content should not be detected as multimodal."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello, world!"}],
+        )
+        self.assertFalse(self._has_multimodal_content(request))
+
+    def test_text_list_not_detected(self):
+        """List content with only text parts should not be multimodal."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Just text."}],
+                }
+            ],
+        )
+        self.assertFalse(self._has_multimodal_content(request))
+
+    def test_none_content_not_detected(self):
+        """None content (e.g., tool-call messages) should not be multimodal."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": None},
+            ],
+        )
+        self.assertFalse(self._has_multimodal_content(request))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
