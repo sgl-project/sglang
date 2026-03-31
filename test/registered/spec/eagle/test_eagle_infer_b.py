@@ -78,16 +78,21 @@ class TestEAGLEServerBasic(EagleServerBase):
         time.sleep(4)
 
 
-class TestEAGLEServerExtend(TestEAGLEServerBasic):
+class TestEAGLEServerAdditional(TestEAGLEServerBasic):
+    spec_topk = 5
+    spec_steps = 8
+    spec_tokens = 64
     extra_args = [
         "--max-running-requests",
         8,
         "--cuda-graph-max-bs",
-        8,
+        5,
         "--attention-backend",
         "fa3",
         "--page-size",
         256,
+        "--dtype",
+        "float16",
     ]
 
     def test_radix_attention(self):
