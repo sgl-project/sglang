@@ -654,7 +654,7 @@ class SamplingParams:
         add_argument(
             "--prompt-path",
             type=str,
-            help="Path to a text file containing prompts (one per line)",
+            help="Path to a text file containing the prompt",
         )
         add_argument(
             "--output-file-name",
