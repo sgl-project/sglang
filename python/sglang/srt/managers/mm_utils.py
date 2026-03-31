@@ -1772,6 +1772,8 @@ class MMSendWrapper:
         return [MultiprocessingSerializer.serialize(obj)]
 
     def has_mm_data(self, obj):
+        if hasattr(obj, "batch"):
+            return self.has_mm_data(obj.batch[0]) if obj.batch else False
         if isinstance(obj, TokenizedGenerateReqInput):
             return obj.mm_inputs
         elif isinstance(obj, TokenizedEmbeddingReqInput):
