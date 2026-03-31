@@ -157,10 +157,12 @@ The baseline fires 3 kernels between the projection GEMM and `fmhaSm100fKernel`:
 - **Model:** `Qwen/Qwen3.5-35B-A3B-FP8`
 - **Precision:** FP8
 - **TP:** 1
+- **Attention backend:** `trtllm_mha` (as recommended by the [SGLang cookbook](https://docs.sglang.ai/))
 
 ## Notes
 
-- `inductor[qknorm-ropekv-gemmarmsnorm]` compiles q/k normalization, rotary embedding with KV-cache write, and GemmaRMSNorm (the layer-level normalization used by Qwen3.5) as separate Inductor graphs. This is the broadest compilation scope tested on this model.
+- These results use the `trtllm_mha` attention backend, as recommended by the SGLang cookbook.
+- `inductor[reshape-qknorm-ropekv-gemmarmsnorm]` compiles the reshape, q/k normalization, rotary embedding with KV-cache write, and GemmaRMSNorm (the layer-level normalization used by Qwen3.5) as separate Inductor graphs. This is the broadest compilation scope tested on this model.
 
 ## bench\_offline\_throughput (Real Engine)
 
@@ -173,6 +175,7 @@ python3 -m sglang.bench_offline_throughput \
   --sharegpt-output-len <osl> \
   --num-prompts <N> \
   --dataset-name sharegpt \
+  --attention-backend trtllm_mha \
   --result-filename "" \
   [--enable-torch-compile --torch-compile-override-layers <layers> --torch-compile-scope local]
 ```
@@ -183,46 +186,64 @@ python3 -m sglang.bench_offline_throughput \
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 201 | — | 202 | — |
-| Inductor — RopeKV | 196 | −2.5% | 197 | −2.5% |
-| Inductor — QKNorm + RopeKV + RMSNorm | 204 | +1.5% | 204 | +1.2% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 200 | −0.5% | 200 | −1.0% |
+| Baseline | 289 | — | 289 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 294 | **+1.8%** | 294 | **+1.8%** |
+
+#### 4 prompts, cuda-graph-bs 4
+
+| Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|--------------------------|-------------|------------------------|
+| Baseline | 886 | — | 911 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 911 | **+2.9%** | 937 | **+2.9%** |
+
+#### 8 prompts, cuda-graph-bs 8
+
+| Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|--------------------------|-------------|------------------------|
+| Baseline | 1,572 | — | 1,607 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 1,594 | **+1.4%** | 1,629 | **+1.4%** |
+
+#### 16 prompts, cuda-graph-bs 16
+
+| Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|--------------------------|-------------|------------------------|
+| Baseline | 2,567 | — | 2,722 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 2,616 | **+1.9%** | 2,774 | **+1.9%** |
 
 #### 32 prompts, cuda-graph-bs 32
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 3,298 | — | 3,429 | — |
-| Inductor — RopeKV | 3,308 | **+0.3%** | 3,439 | **+0.3%** |
-| Inductor — QKNorm + RopeKV + RMSNorm | 3,263 | −1.1% | 3,392 | −1.1% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 3,239 | −1.8% | 3,367 | −1.8% |
+| Baseline | 3,992 | — | 4,151 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 3,914 | −2.0% | 4,069 | −2.0% |
+
+#### 64 prompts, cuda-graph-bs 64
+
+| Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|--------------------------|-------------|------------------------|
+| Baseline | 6,269 | — | 6,513 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 6,303 | **+0.5%** | 6,548 | **+0.5%** |
 
 #### 128 prompts, cuda-graph-bs 128
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 7,302 | — | 7,642 | — |
-| Inductor — RopeKV | 7,240 | −0.8% | 7,578 | −0.8% |
-| Inductor — QKNorm + RopeKV + RMSNorm | 7,286 | −0.2% | 7,626 | −0.2% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 7,173 | −1.8% | 7,507 | −1.8% |
+| Baseline | 9,478 | — | 9,920 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 9,549 | **+0.7%** | 9,994 | **+0.7%** |
 
 #### 256 prompts, cuda-graph-bs 256
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 10,007 | — | 10,391 | — |
-| Inductor — RopeKV | 10,021 | **+0.1%** | 10,405 | **+0.1%** |
-| Inductor — QKNorm + RopeKV + RMSNorm | 10,012 | +0.0% | 10,396 | +0.0% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 9,836 | −1.7% | 10,213 | −1.7% |
+| Baseline | 13,603 | — | 14,125 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 13,702 | **+0.7%** | 14,227 | **+0.7%** |
 
 #### 512 prompts, cuda-graph-bs 512
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 9,980 | — | 10,375 | — |
-| Inductor — RopeKV | 9,793 | −1.9% | 10,181 | −1.9% |
-| Inductor — QKNorm + RopeKV + RMSNorm | 9,945 | −0.4% | 10,339 | −0.3% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 9,860 | −1.2% | 10,251 | −1.2% |
+| Baseline | 11,176 | — | 11,619 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 11,233 | **+0.5%** | 11,678 | **+0.5%** |
 
 ### OSL 1024
 
@@ -230,82 +251,96 @@ python3 -m sglang.bench_offline_throughput \
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 226 | — | 229 | — |
-| Inductor — RopeKV | 218 | −3.5% | 222 | −3.1% |
-| Inductor — QKNorm + RopeKV + RMSNorm | 229 | +1.3% | 232 | +1.3% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 222 | −1.8% | 226 | −1.3% |
+| Baseline | 282 | — | 287 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 287 | **+1.9%** | 292 | **+1.9%** |
+
+#### 4 prompts, cuda-graph-bs 4
+
+| Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|--------------------------|-------------|------------------------|
+| Baseline | 868 | — | 1,066 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 884 | **+1.9%** | 1,086 | **+1.9%** |
+
+#### 8 prompts, cuda-graph-bs 8
+
+| Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|--------------------------|-------------|------------------------|
+| Baseline | 1,533 | — | 1,802 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 1,565 | **+2.1%** | 1,839 | **+2.1%** |
+
+#### 16 prompts, cuda-graph-bs 16
+
+| Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|--------------------------|-------------|------------------------|
+| Baseline | 2,550 | — | 3,779 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 2,443 | −4.2% | 3,621 | −4.2% |
 
 #### 32 prompts, cuda-graph-bs 32
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 3,336 | — | 4,395 | — |
-| Inductor — RopeKV | 3,374 | **+1.1%** | 4,444 | **+1.1%** |
-| Inductor — QKNorm + RopeKV + RMSNorm | 3,354 | +0.5% | 4,418 | +0.5% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 3,399 | **+1.9%** | 4,477 | **+1.9%** |
+| Baseline | 3,968 | — | 5,226 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 3,906 | −1.6% | 5,145 | −1.6% |
+
+#### 64 prompts, cuda-graph-bs 64
+
+| Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
+|--------|-------------|--------------------------|-------------|------------------------|
+| Baseline | 6,371 | — | 8,351 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 6,335 | −0.6% | 8,304 | −0.6% |
 
 #### 128 prompts, cuda-graph-bs 128
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 8,032 | — | 11,028 | — |
-| Inductor — RopeKV | 8,085 | **+0.7%** | 11,102 | **+0.7%** |
-| Inductor — QKNorm + RopeKV + RMSNorm | 8,097 | +0.8% | 11,118 | +0.8% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 8,109 | **+1.0%** | 11,134 | **+1.0%** |
+| Baseline | 9,798 | — | 13,453 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 9,892 | **+1.0%** | 13,582 | **+1.0%** |
 
 #### 256 prompts, cuda-graph-bs 256
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 11,476 | — | 14,997 | — |
-| Inductor — RopeKV | 11,451 | −0.2% | 14,965 | −0.2% |
-| Inductor — QKNorm + RopeKV + RMSNorm | 11,420 | −0.5% | 14,924 | −0.5% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 11,536 | **+0.5%** | 15,076 | **+0.5%** |
+| Baseline | 14,601 | — | 19,081 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 14,723 | **+0.8%** | 19,240 | **+0.8%** |
 
 #### 512 prompts, cuda-graph-bs 512
 
 | Config | Output tok/s | Output tok/s vs Baseline | Total tok/s | Total tok/s vs Baseline |
 |--------|-------------|--------------------------|-------------|------------------------|
-| Baseline | 11,366 | — | 14,970 | — |
-| Inductor — RopeKV | 11,163 | −1.8% | 14,702 | −1.8% |
-| Inductor — QKNorm + RopeKV + RMSNorm | 11,308 | −0.5% | 14,894 | −0.5% |
-| Inductor — Reshape + QKNorm + RopeKV + RMSNorm | 10,775 | −5.2% | 14,191 | −5.2% |
+| Baseline | 18,256 | — | 24,045 | — |
+| Inductor — Reshape + QKNorm + RopeKV + GemmaRMSNorm | 18,419 | **+0.9%** | 24,259 | **+0.9%** |
 
 ### Summary
 
 | OSL | Scenario | Config | Output tok/s | Output tok/s vs Baseline |
 |-----|----------|--------|-------------|------------------------|
-| 8192 | 1 prompt, cg-bs 1 | QKNorm + RopeKV + RMSNorm | 204 | **+1.5%** |
-| 8192 | 1 prompt, cg-bs 1 | Reshape + QKNorm + RopeKV + RMSNorm | 200 | −0.5% |
-| 8192 | 1 prompt, cg-bs 1 | RopeKV | 196 | −2.5% |
-| 8192 | 32 prompts, cg-bs 32 | RopeKV | 3,308 | **+0.3%** |
-| 8192 | 32 prompts, cg-bs 32 | QKNorm + RopeKV + RMSNorm | 3,263 | −1.1% |
-| 8192 | 32 prompts, cg-bs 32 | Reshape + QKNorm + RopeKV + RMSNorm | 3,239 | −1.8% |
-| 8192 | 128 prompts, cg-bs 128 | QKNorm + RopeKV + RMSNorm | 7,286 | −0.2% |
-| 8192 | 128 prompts, cg-bs 128 | RopeKV | 7,240 | −0.8% |
-| 8192 | 128 prompts, cg-bs 128 | Reshape + QKNorm + RopeKV + RMSNorm | 7,173 | −1.8% |
-| 8192 | 256 prompts, cg-bs 256 | RopeKV | 10,021 | **+0.1%** |
-| 8192 | 256 prompts, cg-bs 256 | QKNorm + RopeKV + RMSNorm | 10,012 | +0.0% |
-| 8192 | 256 prompts, cg-bs 256 | Reshape + QKNorm + RopeKV + RMSNorm | 9,836 | −1.7% |
-| 8192 | 512 prompts, cg-bs 512 | QKNorm + RopeKV + RMSNorm | 9,945 | −0.4% |
-| 8192 | 512 prompts, cg-bs 512 | Reshape + QKNorm + RopeKV + RMSNorm | 9,860 | −1.2% |
-| 8192 | 512 prompts, cg-bs 512 | RopeKV | 9,793 | −1.9% |
-| 1024 | 1 prompt, cg-bs 1 | QKNorm + RopeKV + RMSNorm | 229 | **+1.3%** |
-| 1024 | 1 prompt, cg-bs 1 | Reshape + QKNorm + RopeKV + RMSNorm | 222 | −1.8% |
-| 1024 | 1 prompt, cg-bs 1 | RopeKV | 218 | −3.5% |
-| 1024 | 32 prompts, cg-bs 32 | Reshape + QKNorm + RopeKV + RMSNorm | 3,399 | **+1.9%** |
-| 1024 | 32 prompts, cg-bs 32 | RopeKV | 3,374 | **+1.1%** |
-| 1024 | 32 prompts, cg-bs 32 | QKNorm + RopeKV + RMSNorm | 3,354 | **+0.5%** |
-| 1024 | 128 prompts, cg-bs 128 | Reshape + QKNorm + RopeKV + RMSNorm | 8,109 | **+1.0%** |
-| 1024 | 128 prompts, cg-bs 128 | QKNorm + RopeKV + RMSNorm | 8,097 | **+0.8%** |
-| 1024 | 128 prompts, cg-bs 128 | RopeKV | 8,085 | **+0.7%** |
-| 1024 | 256 prompts, cg-bs 256 | Reshape + QKNorm + RopeKV + RMSNorm | 11,536 | **+0.5%** |
-| 1024 | 256 prompts, cg-bs 256 | RopeKV | 11,451 | −0.2% |
-| 1024 | 256 prompts, cg-bs 256 | QKNorm + RopeKV + RMSNorm | 11,420 | −0.5% |
-| 1024 | 512 prompts, cg-bs 512 | QKNorm + RopeKV + RMSNorm | 11,308 | −0.5% |
-| 1024 | 512 prompts, cg-bs 512 | RopeKV | 11,163 | −1.8% |
-| 1024 | 512 prompts, cg-bs 512 | Reshape + QKNorm + RopeKV + RMSNorm | 10,775 | −5.2% |
+| 8192 | 1 prompt, cg-bs 1 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 294 | **+1.8%** |
+| 8192 | 4 prompts, cg-bs 4 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 911 | **+2.9%** |
+| 8192 | 8 prompts, cg-bs 8 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 1,594 | **+1.4%** |
+| 8192 | 16 prompts, cg-bs 16 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 2,616 | **+1.9%** |
+| 8192 | 32 prompts, cg-bs 32 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 3,914 | −2.0% |
+| 8192 | 64 prompts, cg-bs 64 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 6,303 | **+0.5%** |
+| 8192 | 128 prompts, cg-bs 128 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 9,549 | **+0.7%** |
+| 8192 | 256 prompts, cg-bs 256 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 13,702 | **+0.7%** |
+| 8192 | 512 prompts, cg-bs 512 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 11,233 | **+0.5%** |
+| 1024 | 1 prompt, cg-bs 1 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 287 | **+1.9%** |
+| 1024 | 4 prompts, cg-bs 4 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 884 | **+1.9%** |
+| 1024 | 8 prompts, cg-bs 8 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 1,565 | **+2.1%** |
+| 1024 | 16 prompts, cg-bs 16 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 2,443 | −4.2% |
+| 1024 | 32 prompts, cg-bs 32 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 3,906 | −1.6% |
+| 1024 | 64 prompts, cg-bs 64 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 6,335 | −0.6% |
+| 1024 | 128 prompts, cg-bs 128 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 9,892 | **+1.0%** |
+| 1024 | 256 prompts, cg-bs 256 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 14,723 | **+0.8%** |
+| 1024 | 512 prompts, cg-bs 512 | Reshape + QKNorm + RopeKV + GemmaRMSNorm | 18,419 | **+0.9%** |
 
-Results are flat across all batch sizes and output sequence lengths (within ±1.3%), meaning Inductor-compiled q/k normalization, rotary embedding, and KV-cache store match the performance of the hand-written custom kernels. The result holds for both decode-heavy workloads (OSL=8192) and shorter generation (OSL=1024), confirming that output sequence length does not change the picture. This is a positive result: Inductor introduces no regression while replacing specialized CUDA/Triton kernels with compiler-generated code, validating that the compilation approach is viable for this model without a throughput penalty.
+Inductor compilation shows consistent gains at low concurrency (B=1–8) across both OSLs, peaking at **+2.9%** (OSL=8192, B=4) and **+2.1%** (OSL=1024, B=8). At high concurrency (B=128–512) the gains are smaller but still positive, ranging from **+0.5%** to **+1.0%**. A dip appears at medium concurrency (B=16–32 for OSL=1024, B=32 for OSL=8192), where the Inductor config shows regressions of up to −4.2% (OSL=1024, B=16) and −2.0% (OSL=8192, B=32).
 
-TODO: update this with new runs
+The kernels targeted by Inductor (reshape, q/k normalization, rotary embedding, KV-cache store, GemmaRMSNorm) are **memory-bound**. Inductor reduces total kernel launch count by fusing these operations into fewer graphs. At higher concurrency the attention and MoE kernels — which are **compute-bound** — grow larger and become the dominant bottleneck of decode execution, so the memory-bound region we optimize contributes a shrinking fraction of overall latency. This explains why the end-to-end gains taper from ~2–3% at low B to ~0.5–1% at high B.
+
+Nsys profiling at B=1 confirms the mechanism: the latency of the targeted region between the projection GEMM (`deep_gemm`) and the attention kernel (`fmhaSm100fKernel`) drops by ~50% (11,077 μs → 5,231 μs).
+
+| Baseline | Inductor |
+|---|---|
+| ![Baseline nsys](Qwen3.5-35B-A3B-FP8/inductor[none].png) | ![Inductor nsys](Qwen3.5-35B-A3B-FP8/inductor[reshape-qknorm-ropekv].png) |
+
+The baseline fires multiple separate kernels for the reshape, q/k normalization, rotary embedding, and KV-cache store. Inductor compiles these into fewer fused Triton kernels, eliminating intermediate launches and reducing the gap between the two compute-bound bookends.
