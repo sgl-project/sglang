@@ -10,6 +10,7 @@ import time
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
+    CompletionSampler,
     Eval,
     make_report,
     set_ulimit,
@@ -60,15 +61,23 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         if value is not None:
             extra_body[param_name] = value
 
-    sampler = ChatCompletionSampler(
+    common_kwargs = dict(
         model=args.model,
         max_tokens=getattr(args, "max_tokens", 2048),
         top_p=getattr(args, "top_p", 1.0),
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
-        reasoning_effort=getattr(args, "reasoning_effort", None),
-        extra_body=extra_body if extra_body else None,
     )
+
+    api_mode = getattr(args, "api", "chat")
+    if api_mode == "completion":
+        sampler = CompletionSampler(**common_kwargs)
+    else:
+        sampler = ChatCompletionSampler(
+            **common_kwargs,
+            reasoning_effort=getattr(args, "reasoning_effort", None),
+            extra_body=extra_body if extra_body else None,
+        )
 
     # Run eval
     tic = time.perf_counter()
@@ -266,6 +275,13 @@ if __name__ == "__main__":
         "--repeat", type=int, default=1, help="repeat the evaluation n times"
     )
     parser.add_argument("--eval-name", type=str, default="mmlu")
+    parser.add_argument(
+        "--api",
+        type=str,
+        default="chat",
+        choices=["chat", "completion"],
+        help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions",
+    )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
