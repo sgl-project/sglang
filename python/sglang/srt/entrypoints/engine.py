@@ -634,7 +634,6 @@ class Engine(EngineBase):
 
         Returns:
             Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog).
-            engine_info_bootstrap_server is stored on scheduler_init_result if started.
         """
         # Configure global environment
         configure_logger(server_args)

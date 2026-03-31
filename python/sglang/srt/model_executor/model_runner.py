@@ -532,13 +532,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model, self.remote_instance_transfer_engine
             )
             self._register_to_engine_info_bootstrap()
-
-        # Register parallelism config with the bootstrap server
-        if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
-            and self.parallelism_config is not None
-        ):
-            self._register_parallelism_config_to_bootstrap()
+            if self.parallelism_config is not None:
+                self._register_parallelism_config_to_bootstrap()
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
