@@ -485,7 +485,9 @@ def detect_cuda_suite(file_path_from_test):
         content = f.read()
 
     match = re.search(
-        r'register_cuda_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']', content
+        r'^[^#\n]*register_cuda_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
+        content,
+        re.MULTILINE,
     )
     if not match:
         return (
