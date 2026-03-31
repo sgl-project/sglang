@@ -115,10 +115,9 @@ class WhisperProcessor(BaseMultimodalProcessor):
         # Cache tokenizer for language token lookup
         self._tokenizer = getattr(self._processor, "tokenizer", None)
 
-    def _extract_language_from_request(self, request_obj) -> Optional[str]:
+    def _pop_sampling_param(self, request_obj, key: str):
         sampling_params = getattr(request_obj, "sampling_params", None) or {}
-        language = sampling_params.pop("language", None)
-        return normalize_language_to_code(language)
+        return sampling_params.pop(key, None)
 
     def _get_language_token_id(self, language: Optional[str]) -> int:
         # Default to English if not specified
@@ -148,27 +147,35 @@ class WhisperProcessor(BaseMultimodalProcessor):
         # For Whisper, ALWAYS use the proper transcription token sequence
         # and IGNORE any text prompt - Whisper is a pure speech-to-text model
         # The decoder_start_token_id and forced_decoder_ids from generation config
-        # set up: <|startoftranscript|> <|lang|> <|task|> [<|notimestamps|>]
+        # set up: <|startoftranscript|> <|lang|> <|task|> [<|notimestamps|> or <|0.00|>]
 
-        # Extract language from request and get token ID
-        language = self._extract_language_from_request(request_obj)
+        language = normalize_language_to_code(
+            self._pop_sampling_param(request_obj, "language")
+        )
         language_token_id = self._get_language_token_id(language)
+        timestamp_granularities = self._pop_sampling_param(
+            request_obj, "timestamp_granularities"
+        )
 
         # Build decoder input tokens
-        # <|startoftranscript|> + <|lang|> + <|transcribe|> + <|notimestamps|>
         decoder_start_token_id = getattr(
             self.hf_config, "decoder_start_token_id", 50258
         )
         transcribe_token_id = self._tokenizer.convert_tokens_to_ids("<|transcribe|>")
-        notimestamps_token_id = self._tokenizer.convert_tokens_to_ids(
-            "<|notimestamps|>"
-        )
+
+        # Use <|0.00|> to enable timestamp generation, or <|notimestamps|> to disable
+        if timestamp_granularities:
+            timestamp_token_id = self._tokenizer.convert_tokens_to_ids("<|0.00|>")
+        else:
+            timestamp_token_id = self._tokenizer.convert_tokens_to_ids(
+                "<|notimestamps|>"
+            )
 
         input_ids = [
             decoder_start_token_id,
             language_token_id,
             transcribe_token_id,
-            notimestamps_token_id,
+            timestamp_token_id,
         ]
 
         # Whisper expects input features padded to max_length (3000 frames = 30 seconds)

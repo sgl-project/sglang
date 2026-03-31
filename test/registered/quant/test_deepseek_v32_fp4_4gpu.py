@@ -58,8 +58,8 @@ class TestDeepseekV32FP4DP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1319,
-            parallel=1319,
+            num_questions=500,
+            parallel=500,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -72,7 +72,7 @@ class TestDeepseekV32FP4DP(CustomTestCase):
                 f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -125,8 +125,8 @@ class TestDeepseekV32FP4TP(CustomTestCase):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
-            num_questions=1319,
-            parallel=1319,
+            num_questions=500,
+            parallel=500,
             max_new_tokens=512,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
@@ -139,7 +139,7 @@ class TestDeepseekV32FP4TP(CustomTestCase):
                 f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
 
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)

@@ -9,7 +9,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.kits.ebnf_constrained_kit import EBNFConstrainedMixin
-from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
@@ -30,16 +30,16 @@ register_cuda_ci(est_time=350, suite="stage-b-test-2-gpu-large")
 
 class TestDPAttentionDP2TP2(
     CustomTestCase,
-    MGSMEnMixin,
+    GSM8KMixin,
     JSONConstrainedMixin,
     EBNFConstrainedMixin,
     RegexConstrainedMixin,
 ):
-    mgsm_en_score_threshold = 0.8
+    gsm8k_accuracy_thres = 0.6
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
             True

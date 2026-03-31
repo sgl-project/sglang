@@ -298,7 +298,7 @@ if [ "$CU_VERSION" = "cu130" ]; then
 else
     NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
 fi
-$PIP_CMD install mooncake-transfer-engine==0.3.9 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.10 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
@@ -351,6 +351,13 @@ mark_step_done "Fix other dependencies"
 # The Docker image ships nvidia-cutlass-dsl-libs-base 4.3.5; upgrading to 4.4.2
 # can delete the .pth file without reliably recreating it (pip race condition).
 $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --no-deps --force-reinstall $PIP_INSTALL_SUFFIX || true
+
+
+# Install human-eval
+pip install "setuptools==70.0.0"
+git clone https://github.com/merrymercy/human-eval.git
+cd human-eval
+pip install -e . --no-build-isolation
 
 # ------------------------------------------------------------------------------
 # Prepare runner
