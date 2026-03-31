@@ -20,6 +20,7 @@ import asyncio
 import builtins
 import ctypes
 import functools
+import gc
 import importlib
 import inspect
 import io
@@ -86,6 +87,7 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
+from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -363,7 +365,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "ascend"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -763,64 +765,109 @@ class ImageData:
     max_dynamic_patch: Optional[int] = None
 
 
+image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+    """
+    Check three conditions:
+    1. whether CUDA is available.
+    2. whether input is recognized as JPEG.
+    3. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
+    """
+    if not is_cuda() or not gpu_image_decode:
+        return False
+    if image_bytes != b"":
+        return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
+    return False
+
+
+def _load_image(
+    image_bytes: bytes = b"",
+    image_file: str = "",
+    gpu_image_decode: bool = True,
+) -> Union[torch.Tensor, Image.Image]:
+    """
+    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
+    otherwise fallback to decode with PIL on CPU and return a PIL Image.
+    Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
+    """
+    if image_file != "":
+        image_bytes = get_image_bytes(image_file)
+    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
+        try:
+            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            return image_tensor
+        except Exception as e:
+            logger.warning(
+                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
+            )
+    return Image.open(BytesIO(image_bytes))
+
+
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
-) -> tuple[Image.Image, tuple[int, int]]:
+    gpu_image_decode: bool = True,
+) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
+    """
+    Load image from multiple input formats, including:
+    ImageData, PIL Image, bytes, URL, file path, or base64 string.
+    """
     if isinstance(image_file, ImageData):
         image_file = image_file.url
 
-    image = image_size = None
+    image = None
+    image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
         image = image_file
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = Image.open(BytesIO(image_file))
-    elif image_file.startswith("http://") or image_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout)
-        try:
-            response.raise_for_status()
-            image = Image.open(response.raw)
-            image.load()  # Force loading to avoid issues after closing the stream
-        finally:
-            response.close()
-    elif image_file.startswith("file://"):
-        image_file = unquote(urlparse(image_file).path)
-        image = Image.open(image_file)
-    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
-        image = Image.open(image_file)
-    elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
-    elif isinstance(image_file, str):
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("file://"):
+        image = _load_image(
+            image_file=unquote(urlparse(image_file).path),
+            gpu_image_decode=gpu_image_decode,
+        )
+    elif isinstance(image_file, str) and image_file.lower().endswith(
+        image_extension_names
+    ):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("data:"):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(
+        image_file, str
+    ):  # Other formats, try to decode as base64 by default
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
-
     return image, image_size
 
 
-def get_image_bytes(image_file: Union[str, bytes]):
+def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
+    """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
-    elif image_file.startswith("http://") or image_file.startswith("https://"):
+    if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
-        return response.content
-    elif image_file.startswith("file://"):
-        image_file = unquote(urlparse(image_file).path)
+        try:
+            response.raise_for_status()
+            result = response.content
+        finally:
+            response.close()
+        return result
+    if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
             return f.read()
-    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
-        with open(image_file, "rb") as f:
-            return f.read()
-    elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
+    if isinstance(image_file, str) and image_file.startswith("data:"):
+        _, encoded = image_file.split(",", 1)
+        return pybase64.b64decode(encoded, validate=True)
+    if isinstance(image_file, str):
         return pybase64.b64decode(image_file, validate=True)
-    elif isinstance(image_file, str):
-        return pybase64.b64decode(image_file, validate=True)
-    else:
-        raise NotImplementedError(f"Invalid image: {image_file}")
+    raise NotImplementedError(f"Invalid image: {image_file}")
 
 
 def _normalize_video_input(
@@ -2144,6 +2191,11 @@ class SafeUnpickler(pickle.Unpickler):
         )
 
 
+def safe_pickle_load(fp):
+    """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
+    return SafeUnpickler(fp).load()
+
+
 def debug_timing(func):
     # todo: replace with a more organized instrumentation
     def wrapper(*args, **kwargs):
@@ -2374,6 +2426,8 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     import uvicorn
     from fastapi import FastAPI, Response
 
+    from sglang.srt.utils.network import NetworkAddress
+
     app = FastAPI()
 
     @app.get("/ping")
@@ -2416,14 +2470,16 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
             logger.error(f"Dummy health check server failed to start: {e}")
             raise
         finally:
-            logger.info(f"Dummy health check server stopped at {host}:{port}")
+            logger.info(
+                f"Dummy health check server stopped at {NetworkAddress(host, port).to_host_port_str()}"
+            )
 
     thread = threading.Thread(
         target=run_server, daemon=True, name="health-check-server"
     )
     thread.start()
     logger.info(
-        f"Dummy health check server started in background thread at {host}:{port}"
+        f"Dummy health check server started in background thread at {NetworkAddress(host, port).to_host_port_str()}"
     )
 
 
@@ -2940,8 +2996,6 @@ def configure_gc_warning(warn_threshold_secs):
 
 
 def freeze_gc(context: str):
-    import gc
-
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
@@ -2955,8 +3009,6 @@ def freeze_gc(context: str):
 
 def configure_gc_logger():
     logger.info("Enable GC Logger")
-
-    import gc
 
     gc_start_time = {}
 
@@ -3403,30 +3455,6 @@ def get_device_sm_nvidia_smi():
         return (0, 0)  # Default/fallback value
 
 
-def get_libnuma():
-    libnuma = None
-
-    for libnuma_so in ["libnuma.so", "libnuma.so.1"]:
-        try:
-            libnuma = ctypes.CDLL(libnuma_so)
-        except OSError as e:
-            logger.error(f"{e}")
-            libnuma = None
-        if libnuma is not None:
-            break
-    return libnuma
-
-
-def numa_bind_to_node(node: int):
-    libnuma = get_libnuma()
-
-    if libnuma is None or libnuma.numa_available() < 0:
-        logger.error("numa not available on this system, skip bind action")
-    else:
-        libnuma.numa_run_on_node(ctypes.c_int(node))
-        libnuma.numa_set_preferred(ctypes.c_int(node))
-
-
 def json_list_type(value):
     try:
         return orjson.loads(value)
@@ -3724,140 +3752,3 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
-
-
-def get_numa_node_count() -> int:
-    """
-    Get the number of NUMA nodes available on the system.
-    Must be called after is_numa_available() is True.
-    Returns:
-        int: The number of NUMA nodes.
-    """
-    libnuma = get_libnuma()
-    return libnuma.numa_max_node() + 1
-
-
-def is_numa_available() -> bool:
-    try:
-        libnuma = get_libnuma()
-        return libnuma.numa_available() >= 0
-    except Exception:
-        return False
-
-
-def get_system_nvgpu_count() -> int:
-    """
-    Get the total number of GPUs in the system (not affected by CUDA_VISIBLE_DEVICES).
-
-    Returns:
-        int: The total number of physical GPUs.
-    """
-    result = subprocess.run(
-        ["nvidia-smi", "--list-gpus"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    gpu_lines = [
-        line
-        for line in result.stdout.strip().split("\n")
-        if line.strip().startswith("GPU")
-    ]
-    return len(gpu_lines)
-
-
-@lru_cache(maxsize=1)
-def get_device_numa_node_cuda(gpu_id: int = 0) -> int:
-    """
-    Retrieve the NUMA node ID of the CPU socket closest to the gpu_id.
-
-    First tries to query nvidia-smi topology. If it returns a single NUMA ID, uses that directly.
-    If it returns multiple NUMA IDs (comma/dash separated), falls back to distributing GPUs
-    evenly across NUMA nodes based on GPU ID intervals.
-
-    For example, with 8 GPUs and 2 NUMA nodes: GPUs 0-3 -> node 0, GPUs 4-7 -> node 1.
-
-    Returns:
-        int: The NUMA node ID (e.g., 0, 1).
-
-    Raises:
-        RuntimeError: If device information cannot be retrieved.
-    """
-
-    physical_device_id = get_physical_device_id(gpu_id)
-
-    # Query NUMA topology from nvidia-smi
-    result = subprocess.run(
-        ["nvidia-smi", "topo", "-C", "-i", str(physical_device_id)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    output_line = result.stdout.strip()
-    prefix = "NUMA IDs of closest CPU:"
-
-    if output_line.startswith(prefix):
-        numa_id_str = output_line[len(prefix) :].strip()
-        if numa_id_str.isdigit():
-            return int(numa_id_str)
-
-    # Fall back: distribute GPUs evenly across NUMA nodes
-    numa_count = get_numa_node_count()
-    gpu_count = get_system_nvgpu_count()
-
-    if gpu_count >= numa_count:
-        gpus_per_numa = gpu_count // numa_count  # >= 1
-        numa_node = physical_device_id // gpus_per_numa  # 0 ~ numa_count - 1
-    else:
-        logger.warning(
-            f"GPU count {gpu_count} is less than NUMA count {numa_count}. Using first NUMA node."
-        )
-        numa_node = 0
-
-    return numa_node
-
-
-def get_numa_node(gpu_id):
-    numa_node = None
-    try:
-        device = get_device()
-        if device == "cuda":
-            numa_node = get_device_numa_node_cuda(gpu_id)
-        else:
-            logger.info(f"Now only supports NVIDIA devices")
-    except Exception as e:
-        logger.error(f"Error: {e}")
-
-    return numa_node
-
-
-@lru_cache(maxsize=1)
-def get_current_device_numa_node_cuda() -> int:
-    """
-    Retrieve the NUMA node ID of the CPU socket closest to the currently active CUDA device.
-    """
-
-    logical_device_id = torch.cuda.current_device()
-    numa_node = get_device_numa_node_cuda(logical_device_id)
-
-    return numa_node
-
-
-def nvgpu_available() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    if torch.version.cuda is None:
-        return False
-    return True
-
-
-def bind_to_closest_numa_node_cuda():
-    """
-    Bind the current process to the NUMA node closest to the active CUDA device.
-
-    Uses `numa` library calls via ctypes to set the CPU affinity of the process.
-    """
-    if is_numa_available() and nvgpu_available():
-        node_id = get_current_device_numa_node_cuda()
-        numa_bind_to_node(node_id)

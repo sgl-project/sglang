@@ -22,7 +22,13 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
 from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer_mla as jit_transfer_hicache_all_layer_mla,
+)
+from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
+)
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -309,8 +315,16 @@ class MHATokenToKVPoolHost(HostKVCache):
             element_size=self.element_dim * self.dtype.itemsize
         )
 
-        self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
-        self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        if self.layout == "page_first":
+            # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
+            # This swaps strides without copying data
+            k_transposed = self.k_buffer.transpose(0, 1)
+            v_transposed = self.v_buffer.transpose(0, 1)
+            self.k_data_refs = [k_transposed[i] for i in range(self.layer_num)]
+            self.v_data_refs = [v_transposed[i] for i in range(self.layer_num)]
+        else:
+            self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+            self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_data_refs],
             dtype=torch.uint64,
@@ -409,17 +423,31 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                     )
             elif self.layout == "page_first":
-                transfer_kv_per_layer_pf_lf(
-                    src_k=self.k_buffer,
-                    dst_k=device_pool.k_buffer[layer_id],
-                    src_v=self.v_buffer,
-                    dst_v=device_pool.v_buffer[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    item_size=self.token_stride_size,
-                    src_layout_dim=self.layout_dim,
-                )
+                if self.can_use_jit:
+                    # Transpose [page, layer, ...] -> [layer, page, ...] then
+                    # index by layer_id to get a per-layer view with strided layout.
+                    # The kernel handles different src/dst strides automatically.
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=device_pool.k_buffer[layer_id],
+                        v_cache_dst=device_pool.v_buffer[layer_id],
+                        k_cache_src=self.k_data_refs[layer_id],
+                        v_cache_src=self.v_data_refs[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_pf_lf(
+                        src_k=self.k_buffer,
+                        dst_k=device_pool.k_buffer[layer_id],
+                        src_v=self.v_buffer,
+                        dst_v=device_pool.v_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                    )
             elif self.layout == "page_head":
                 transfer_kv_per_layer_ph_lf(
                     src_k=self.k_buffer,
@@ -510,17 +538,32 @@ class MHATokenToKVPoolHost(HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                transfer_kv_all_layer_lf_pf(
-                    src_k_layers=device_pool.k_data_ptrs,
-                    dst_k=self.k_buffer,
-                    src_v_layers=device_pool.v_data_ptrs,
-                    dst_v=self.v_buffer,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    dst_layout_dim=self.layout_dim,
-                    num_layers=self.layer_num,
-                )
+                if self.can_use_jit:
+                    # Use transposed data ptrs so the kernel writes to
+                    # [layer, page, item] view with stride layout_dim per token.
+                    jit_transfer_hicache_all_layer(
+                        k_ptr_dst=self.k_data_ptrs,
+                        v_ptr_dst=self.v_data_ptrs,
+                        indices_dst=host_indices,
+                        k_ptr_src=device_pool.k_data_ptrs,
+                        v_ptr_src=device_pool.v_data_ptrs,
+                        indices_src=device_indices,
+                        kv_cache_src_stride_bytes=self.token_stride_size,
+                        kv_cache_dst_stride_bytes=self.layout_dim,
+                        element_size=self.element_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer_lf_pf(
+                        src_k_layers=device_pool.k_data_ptrs,
+                        dst_k=self.k_buffer,
+                        src_v_layers=device_pool.v_data_ptrs,
+                        dst_v=self.v_buffer,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
+                        num_layers=self.layer_num,
+                    )
             elif self.layout == "page_head":
                 transfer_kv_all_layer_lf_ph(
                     src_k_layers=device_pool.k_data_ptrs,
@@ -766,7 +809,17 @@ class MLATokenToKVPoolHost(HostKVCache):
             device,
             allocator_type,
         )
-        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.kv_cache_dim * self.dtype.itemsize
+        )
+
+        if self.layout == "page_first" and self.can_use_jit:
+            # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
+            # This swaps strides without copying data
+            transposed = self.kv_buffer.transpose(0, 1)
+            self.data_refs = [transposed[i] for i in range(self.layer_num)]
+        else:
+            self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.data_refs],
             dtype=torch.uint64,
@@ -864,23 +917,41 @@ class MLATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                transfer_kv_per_layer_mla(
-                    src=self.kv_buffer[layer_id],
-                    dst=device_pool.kv_buffer[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    item_size=self.token_stride_size,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=device_pool.kv_buffer[layer_id],
+                        cache_src=self.kv_buffer[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_mla(
+                        src=self.kv_buffer[layer_id],
+                        dst=device_pool.kv_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        item_size=self.token_stride_size,
+                    )
             elif self.layout == "page_first":
-                transfer_kv_per_layer_mla_pf_lf(
-                    src=self.kv_buffer,
-                    dst=device_pool.kv_buffer[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    item_size=self.token_stride_size,
-                    src_layout_dim=self.layout_dim,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=device_pool.kv_buffer[layer_id],
+                        cache_src=self.data_refs[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_mla_pf_lf(
+                        src=self.kv_buffer,
+                        dst=device_pool.kv_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -929,24 +1000,46 @@ class MLATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                transfer_kv_all_layer_mla(
-                    src_layers=device_pool.data_ptrs,
-                    dst_layers=self.data_ptrs,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    num_layers=self.layer_num,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_all_layer_mla(
+                        ptr_dst=self.data_ptrs,
+                        indices_dst=host_indices,
+                        ptr_src=device_pool.data_ptrs,
+                        indices_src=device_indices,
+                        cache_dst_stride_bytes=self.token_stride_size,
+                        cache_src_stride_bytes=self.token_stride_size,
+                        element_size=self.kv_cache_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer_mla(
+                        src_layers=device_pool.data_ptrs,
+                        dst_layers=self.data_ptrs,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        num_layers=self.layer_num,
+                    )
             elif self.layout == "page_first":
-                transfer_kv_all_layer_mla_lf_pf(
-                    src_layers=device_pool.data_ptrs,
-                    dst=self.kv_buffer,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    dst_layout_dim=self.layout_dim,
-                    num_layers=self.layer_num,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_all_layer_mla(
+                        ptr_dst=self.data_ptrs,
+                        indices_dst=host_indices,
+                        ptr_src=device_pool.data_ptrs,
+                        indices_src=device_indices,
+                        cache_src_stride_bytes=self.token_stride_size,
+                        cache_dst_stride_bytes=self.layout_dim,
+                        element_size=self.kv_cache_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer_mla_lf_pf(
+                        src_layers=device_pool.data_ptrs,
+                        dst=self.kv_buffer,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
+                        num_layers=self.layer_num,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":

@@ -398,6 +398,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
+    enable_mfu_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
     tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
@@ -517,6 +518,7 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+    enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -555,7 +557,6 @@ class ServerArgs:
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
-    disable_hicache_numa_detect: bool = False
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "best_effort"
     hicache_storage_backend_extra_config: Optional[str] = None
@@ -661,6 +662,7 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
+    gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "round-robin-split"
@@ -712,6 +714,7 @@ class ServerArgs:
         "transfer_engine", "nccl", "modelexpress"
     ] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    engine_info_bootstrap_port: int = 6789
     modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
@@ -1706,13 +1709,6 @@ class ServerArgs:
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
-            if is_blackwell_supported():
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
-                    self.enable_flashinfer_allreduce_fusion = True
-                    logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
-                    )
             if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
                 # TODO (Hubert): Put this back later
                 # self.enable_aiter_allreduce_fusion = True
@@ -2076,6 +2072,7 @@ class ServerArgs:
                 "Qwen3_5ForConditionalGeneration",
             ]
             and (is_sm90_supported() or is_sm100_supported())
+            and self.tp_size > 1
             and not self.enable_dp_attention
             and self.attn_cp_size <= 1
             and self.nnodes == 1
@@ -2083,6 +2080,17 @@ class ServerArgs:
             and self.moe_a2a_backend == "none"
         ):
             self.enable_flashinfer_allreduce_fusion = True
+            logger.info(
+                f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
+            )
+
+        # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
+        if self.enforce_disable_flashinfer_allreduce_fusion:
+            self.enable_flashinfer_allreduce_fusion = False
+            logger.info(
+                "FlashInfer allreduce fusion is forcibly disabled "
+                "via --enforce-disable-flashinfer-allreduce-fusion."
+            )
 
     def _handle_mamba_radix_cache(
         self,
@@ -2192,6 +2200,12 @@ class ServerArgs:
             2.2 We will use Flashinfer backend on blackwell.
             2.3 Otherwise, we will use triton backend.
         """
+        # Whisper requires flashinfer for cross-attention CUDA graph support
+        if "WhisperForConditionalGeneration" in (
+            model_config.hf_config.architectures or []
+        ):
+            return "flashinfer"
+
         if not use_mla_backend:
             # MHA architecture
             if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
@@ -2267,12 +2281,16 @@ class ServerArgs:
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
 
-        # Encoder-decoder models (e.g., Whisper)
-        if model_config.is_encoder_decoder:
-            logger.warning(
-                "Cuda graph is disabled for encoder-decoder models (e.g., Whisper)"
-            )
-            self.disable_cuda_graph = True
+        # Whisper's encoder token padding conflicts with prefix caching.
+        # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
+        if (
+            model_config.is_encoder_decoder
+            and not self.disable_radix_cache
+            and "WhisperForConditionalGeneration"
+            in (model_config.hf_config.architectures or [])
+        ):
+            logger.info("Radix cache is disabled for Whisper")
+            self.disable_radix_cache = True
 
         # Major NVIDIA platforms backends
         if (
@@ -3149,22 +3167,42 @@ class ServerArgs:
     def _is_mistral_native_format(self) -> bool:
         """Detect if the model uses Mistral native format (params.json + consolidated weights).
 
-        Models like Mistral-7B-Instruct-v0.3 have BOTH params.json (native) and
-        config.json (HF standard). When both exist, prefer the HF format to avoid
-        parameter name mismatches between consolidated.safetensors (native names
-        like layers.0.attention.wk.weight) and HuggingFace model classes (names
-        like model.layers.0.self_attn.k_proj.weight).
+        When both params.json and config.json exist, default to HF format to
+        avoid weight-name mismatches (e.g. Mistral-7B-Instruct-v0.3).
+
+        Exception: models routed through ``_load_mistral_large_3_for_causal_LM``
+        (mistral-large-3, mistral-small-4, leanstral) build their config from
+        params.json and expect native weight names, so native format is required
+        even when config.json is also present.
         """
+        # Keep in sync with the name checks in
+        # hf_transformers_utils.py::get_config / get_tokenizer.
+        _MISTRAL_NATIVE_CONFIG_PATTERNS = (
+            "mistral-large-3",
+            "mistral-small-4",
+            "leanstral",
+        )
+
+        def _check_format(has_params: bool, has_hf_config: bool) -> bool:
+            if has_params and not has_hf_config:
+                return True
+            if has_params and has_hf_config:
+                model_lower = str(self.model_path).lower()
+                if any(name in model_lower for name in _MISTRAL_NATIVE_CONFIG_PATTERNS):
+                    return True
+            return False
+
         if os.path.isdir(self.model_path):
             has_params = os.path.exists(os.path.join(self.model_path, "params.json"))
             has_hf_config = os.path.exists(os.path.join(self.model_path, "config.json"))
-            return has_params and not has_hf_config
+            return _check_format(has_params, has_hf_config)
+
         # For hub models, check remote files
         try:
             from huggingface_hub import HfApi
 
             files = {s.rfilename for s in HfApi().model_info(self.model_path).siblings}
-            return "params.json" in files and "config.json" not in files
+            return _check_format("params.json" in files, "config.json" in files)
         except Exception:
             return False
 
@@ -4214,6 +4252,11 @@ class ServerArgs:
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
+            "--enable-mfu-metrics",
+            action="store_true",
+            help="Enable estimated MFU-related prometheus metrics.",
+        )
+        parser.add_argument(
             "--enable-metrics-for-all-schedulers",
             action="store_true",
             help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
@@ -4632,9 +4675,7 @@ class ServerArgs:
             "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
-            "'aiter' (ROCm only). "
-            "NOTE: This replaces the deprecated environment variables "
-            "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
+            "'aiter' (ROCm only). ",
         )
         parser.add_argument(
             "--fp4-gemm-backend",
@@ -4646,9 +4687,7 @@ class ServerArgs:
             "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
             "'flashinfer_cutlass' (CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
-            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). "
-            "NOTE: This replaces the deprecated environment variable "
-            "SGLANG_FLASHINFER_FP4_GEMM_BACKEND.",
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
         )
         parser.add_argument(
             "--disable-flashinfer-autotune",
@@ -4844,6 +4883,11 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+        )
+        parser.add_argument(
+            "--enforce-disable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enforce disable FlashInfer allreduce fusion.",
         )
         parser.add_argument(
             "--enable-aiter-allreduce-fusion",
@@ -5067,11 +5111,6 @@ class ServerArgs:
             ],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
-        )
-        parser.add_argument(
-            "--disable-hicache-numa-detect",
-            action="store_true",
-            help="Disable binding the process to the NUMA node closest to the active CUDA device when hierarchical cache is enabled.",
         )
         parser.add_argument(
             "--hicache-storage-backend",
@@ -5541,7 +5580,7 @@ class ServerArgs:
             "--numa-node",
             type=int,
             nargs="+",
-            help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess.",
+            help="Sets the numa node for the subprocesses. i-th element corresponds to i-th subprocess. If unset, will be automatically detected on NUMA systems.",
         )
         parser.add_argument(
             "--enable-deterministic-inference",
@@ -5599,6 +5638,12 @@ class ServerArgs:
             "--enable-fused-moe-sum-all-reduce",
             action="store_true",
             help="Enable fused moe triton and sum all reduce.",
+        )
+        parser.add_argument(
+            "--gc-threshold",
+            type=int,
+            nargs="+",
+            help="Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
         )
 
         # Dynamic batch tokenizer
@@ -5769,6 +5814,13 @@ class ServerArgs:
             help="Start seed server via transfer engine backend for remote instance weight loader.",
         )
         parser.add_argument(
+            "--engine-info-bootstrap-port",
+            type=int,
+            default=ServerArgs.engine_info_bootstrap_port,
+            help="Port for the engine info bootstrap server. Default is 6789. "
+            "Must be set explicitly when running multiple instances on the same node.",
+        )
+        parser.add_argument(
             "--modelexpress-config",
             type=str,
             default=ServerArgs.modelexpress_config,
@@ -5887,7 +5939,7 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
-    def url(self):
+    def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
         host = self.host
@@ -5895,7 +5947,13 @@ class ServerArgs:
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
-        return NetworkAddress(host, self.port).to_url(scheme)
+        return NetworkAddress(host, port if port is not None else self.port).to_url(
+            scheme
+        )
+
+    @property
+    def engine_info_bootstrap_url(self):
+        return self.url(port=self.engine_info_bootstrap_port)
 
     def ssl_verify(self):
         """Return the value for the requests library's ``verify=`` parameter.
@@ -6115,6 +6173,12 @@ class ServerArgs:
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
+
+        if self.gc_threshold:
+            if not (1 <= len(self.gc_threshold) <= 3):
+                raise ValueError(
+                    "When setting gc_threshold, it must contain 1 to 3 integers."
+                )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
