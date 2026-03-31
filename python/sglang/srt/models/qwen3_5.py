@@ -307,12 +307,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
                 if len(loaded_weight.shape) == 0:
-                    # Scalar only makes sense for a single logical shard.
-                    assert len(split_sizes) == 1 and split_sizes[0] == 1, (
-                        f"Unexpected scalar for tuple shard load: "
-                        f"{loaded_shard_id=}, {split_sizes=}"
-                    )
-                    chunks = [loaded_weight.reshape(1)]
+                    # Scalar: broadcast the same value to every shard.
+                    chunks = [loaded_weight.reshape(1)] * len(loaded_shard_id)
+                elif (
+                    loaded_weight.shape[0] == 1
+                    and sum(split_sizes) > 1
+                ):
+                    # Per-tensor scale (shape [1]) being loaded into a fused
+                    # param that expects multiple shards.  Broadcast the
+                    # single scale to each shard.
+                    chunks = [loaded_weight] * len(loaded_shard_id)
                 else:
                     split_dim = getattr(param, "output_dim", 0)
                     chunks = loaded_weight.split(split_sizes, dim=split_dim)
