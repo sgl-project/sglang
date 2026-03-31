@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_PROFILE_STEP_RANGE: str | None = None
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -282,6 +283,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
+    # ================== Profiling Env Vars ==================
+    # Global denoising step range for cudaProfilerApi profiling
+    # Format: "START-END" (e.g., "100-150" to profile steps 100-150)
+    # Used with nsys -c cudaProfilerApi to capture specific denoising steps
+    "SGLANG_DIFFUSION_PROFILE_STEP_RANGE": _lazy_str(
+        "SGLANG_DIFFUSION_PROFILE_STEP_RANGE"
+    ),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
