@@ -3399,6 +3399,23 @@ def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
 
 
+@lru_cache(maxsize=1)
+def get_nvidia_driver_version() -> tuple:
+    """Return the NVIDIA driver version as a tuple of ints, e.g. (595, 58, 3).
+    Returns (0,) on failure."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        version_str = result.stdout.strip().split("\n")[0]
+        return tuple(int(x) for x in version_str.split("."))
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return (0,)
+
+
 def check_cuda_result(raw_output):
     import cuda.bindings.runtime as cuda_rt
 
