@@ -284,7 +284,7 @@ def fused_sigmoid_gating_delta_rule_update(
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(
         triton.next_power_of_2(V), 16 if is_intel else 32
-    )  # BV=16 on Intel Xe2
+    )  # BV=16 on Intel Xe2 to avoid GRF spilling
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3

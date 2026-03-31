@@ -362,9 +362,7 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        BV=(
-            16 if is_intel else 32
-        ),  # BV=16 on Intel Xe2: avoids GRF spilling (32KB→8KB), min for tl.dot
+        BV=(16 if is_intel else 32),  # BV=16 on Intel Xe2 to avoid GRF spilling
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
