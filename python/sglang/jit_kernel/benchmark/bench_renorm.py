@@ -6,7 +6,10 @@ import triton
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 
 def torch_top_k_renorm_probs(probs, top_k):

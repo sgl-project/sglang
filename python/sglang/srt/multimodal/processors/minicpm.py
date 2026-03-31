@@ -19,6 +19,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
     models = [MiniCPMV, MiniCPMO]
     support_dynamic_frame_expansion = True
+    gpu_image_decode = False  # MiniCPM HF processor does not support tensor inputs
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
