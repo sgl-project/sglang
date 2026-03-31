@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -45,6 +46,30 @@ class TextEncodingStage(PipelineStage):
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
 
+    def load_model(self):
+        if not self.server_args.text_encoder_cpu_offload:
+            return
+        if self.server_args.use_fsdp_inference:
+            return
+
+        device = get_local_torch_device()
+        for idx, text_encoder in enumerate(self.text_encoders):
+            if hasattr(text_encoder, "to"):
+                self.text_encoders[idx] = text_encoder.to(device)
+
+    def offload_model(self):
+        if not self.server_args.text_encoder_cpu_offload:
+            return
+        if self.server_args.use_fsdp_inference:
+            return
+
+        for idx, text_encoder in enumerate(self.text_encoders):
+            if hasattr(text_encoder, "to"):
+                self.text_encoders[idx] = text_encoder.to("cpu")
+
+        if current_platform.is_xpu():
+            torch.xpu.empty_cache()
+
     @torch.no_grad()
     def forward(
         self,
@@ -58,6 +83,8 @@ class TextEncodingStage(PipelineStage):
         assert len(self.text_encoders) == len(
             server_args.pipeline_config.text_encoder_configs
         )
+
+        self.load_model()
 
         # Encode positive prompt with all available encoders
         assert batch.prompt is not None
@@ -104,6 +131,8 @@ class TextEncodingStage(PipelineStage):
                 batch.negative_attention_mask = []
                 for nm in neg_masks_list:
                     batch.negative_attention_mask.append(nm)
+
+        self.offload_model()
 
         return batch
 

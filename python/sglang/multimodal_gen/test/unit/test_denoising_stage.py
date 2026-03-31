@@ -7,6 +7,9 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
 
 
 class _FakeModule:
@@ -45,6 +48,27 @@ class TestDenoisingStageDevicePlacement(unittest.TestCase):
 
         self.assertEqual(model_to_offload.to_calls, ["cpu"])
         self.assertEqual(model_to_use.to_calls, [torch.device("xpu:0")])
+
+
+class TestTextEncodingStageOffload(unittest.TestCase):
+    def test_offloads_text_encoders_after_forward_when_requested(self):
+        text_encoder = _FakeModule("xpu:0")
+        stage = TextEncodingStage(text_encoders=[text_encoder], tokenizers=[object()])
+        stage.server_args = SimpleNamespace(
+            text_encoder_cpu_offload=True,
+            use_fsdp_inference=False,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding.current_platform.is_xpu",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding.torch.xpu.empty_cache"
+        ) as empty_cache:
+            stage.offload_model()
+
+        self.assertEqual(text_encoder.to_calls, ["cpu"])
+        empty_cache.assert_called_once()
 
 
 if __name__ == "__main__":
