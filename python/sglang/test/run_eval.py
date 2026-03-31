@@ -61,22 +61,20 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         if value is not None:
             extra_body[param_name] = value
 
+    common_kwargs = dict(
+        model=args.model,
+        max_tokens=getattr(args, "max_tokens", 2048),
+        top_p=getattr(args, "top_p", 1.0),
+        base_url=base_url,
+        temperature=getattr(args, "temperature", 0.0),
+    )
+
     api_mode = getattr(args, "api", "chat")
     if api_mode == "completion":
-        sampler = CompletionSampler(
-            model=args.model,
-            max_tokens=getattr(args, "max_tokens", 2048),
-            top_p=getattr(args, "top_p", 1.0),
-            base_url=base_url,
-            temperature=getattr(args, "temperature", 0.0),
-        )
+        sampler = CompletionSampler(**common_kwargs)
     else:
         sampler = ChatCompletionSampler(
-            model=args.model,
-            max_tokens=getattr(args, "max_tokens", 2048),
-            top_p=getattr(args, "top_p", 1.0),
-            base_url=base_url,
-            temperature=getattr(args, "temperature", 0.0),
+            **common_kwargs,
             reasoning_effort=getattr(args, "reasoning_effort", None),
             extra_body=extra_body if extra_body else None,
         )
