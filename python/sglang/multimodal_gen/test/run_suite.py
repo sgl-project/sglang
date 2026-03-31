@@ -35,6 +35,7 @@ SUITES = {
         "../unit/test_storage.py",
         "../unit/test_lora_format_adapter.py",
         "../unit/test_server_args.py",
+        "../unit/test_input_validation.py",
         # add new unit tests here
     ],
     "1-gpu": [

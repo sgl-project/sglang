@@ -2503,7 +2503,7 @@ class AiterAttnBackend(AttentionBackend):
 
                 o = torch.empty_like(q, dtype=self.input_dtype)
 
-                max_kv_len = page_table.shape[1]
+                max_kv_len = page_table.shape[1] * self.page_size
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

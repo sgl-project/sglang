@@ -153,9 +153,11 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 
+if _use_aiter:
+    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
+
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
-        aiter_dsv3_router_gemm,
         get_dsv3_gemm_output_zero_allocator_size,
     )
 
@@ -323,7 +325,6 @@ class MoEGate(nn.Module):
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
-<<<<<<< dsv3_router_gemm
                 if _device_sm >= 100 and self.weight.shape[0] == 256:
                     # router gemm output float32
                     logits = torch.empty(
@@ -342,22 +343,9 @@ class MoEGate(nn.Module):
                     logits = dsv3_router_gemm(
                         hidden_states, self.weight, out_dtype=torch.float32
                     )
-            elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
-=======
 
-                # router gemm output float32
-                logits = dsv3_router_gemm(
-                    hidden_states, self.weight, out_dtype=torch.float32
-                )
-            elif (
-                _use_aiter_gfx95
-                and hidden_states.shape[0] <= 256
-                and self.weight.shape[0] <= 256
-            ):
->>>>>>> main
-                logits = aiter_dsv3_router_gemm(
-                    hidden_states, self.weight, gemm_output_zero_allocator
-                )
+            elif _use_aiter:
+                logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             else:
                 logits = F.linear(hidden_states, self.weight, None)
 

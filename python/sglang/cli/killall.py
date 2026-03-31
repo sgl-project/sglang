@@ -77,19 +77,11 @@ def _run_smi(query, query_type="gpu"):
 
 
 def _get_smi_version():
-    """Return nvidia-smi driver version and CUDA version, or None on failure."""
-    try:
-        out = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=driver_version",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-            timeout=10,
-        )
-        driver = out.strip().splitlines()[0].strip() if out.strip() else "unknown"
-    except (subprocess.SubprocessError, FileNotFoundError, IndexError):
+    """Return nvidia-smi driver version and GPU name, or None on failure."""
+    from sglang.srt.utils.common import get_nvidia_driver_version_str
+
+    driver = get_nvidia_driver_version_str()
+    if driver is None:
         return None
     try:
         out = subprocess.check_output(
