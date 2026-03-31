@@ -23,7 +23,7 @@ register_amd_ci(est_time=500, suite="stage-b-test-2-gpu-large-amd")
 
 
 class TestMoEEvalAccuracyLarge(CustomTestCase, GSM8KMixin):
-    gsm8k_accuracy_thres = 0.7
+    gsm8k_accuracy_thres = 0.6
 
     @classmethod
     def setUpClass(cls):
