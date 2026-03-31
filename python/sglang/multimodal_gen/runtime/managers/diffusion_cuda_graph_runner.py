@@ -290,6 +290,10 @@ class StepLevelCudaGraphRunner:
         # Reference to the model (set at capture time)
         self._transformer = None
 
+        # cache-dit state: cache_context from the CachedBlocks wrapper
+        # (needed to call set_context() before can_cache())
+        self._cache_context = None
+
         self._captured = False
 
     @property
@@ -325,6 +329,21 @@ class StepLevelCudaGraphRunner:
         self._transformer = dit_model
         self._patch_size = static_kwargs.get("patch_size", 2)
         self._f_patch_size = static_kwargs.get("f_patch_size", 1)
+
+        # Extract cache_context from the first CachedBlocks wrapper.
+        # This is needed to call set_context() before can_cache().
+        # CachedBlocks wrappers (installed by cache-dit's enable_cache())
+        # have a .cache_context attribute that holds the per-layer-group
+        # CachedContext object.
+        first_layer = dit_model.layers[0]
+        if hasattr(first_layer, "cache_context"):
+            self._cache_context = first_layer.cache_context
+            logger.info("  Found cache_context on CachedBlocks wrapper")
+        else:
+            logger.warning(
+                "  No cache_context found on first layer — "
+                "can_cache() may fail if cache-dit is enabled"
+            )
 
         # Create persistent buffers for inputs
         timestep_buffer = timestep.clone()
@@ -531,12 +550,23 @@ class StepLevelCudaGraphRunner:
 
         Saves Fn output snapshot for _update_fn_wrapper_cached_output().
         Returns True if remaining blocks can use cache.
+
+        Must call set_context() + mark_step_begin() before can_cache(),
+        mirroring what CachedBlocks.forward() does internally.
         """
         self._fn_output_snapshot.copy_(self.inter_buffer)
 
         ctx_mgr = getattr(self._transformer, "_context_manager", None)
         if ctx_mgr is None:
             return False
+
+        # Replicate the CachedBlocks.forward() initialization sequence:
+        # 1. set_context() — sets the active CachedContext object
+        # 2. mark_step_begin() — initializes per-step state
+        # Without these, can_cache() asserts "cached_context must be set before"
+        if self._cache_context is not None:
+            ctx_mgr.set_context(self._cache_context)
+            ctx_mgr.mark_step_begin()
 
         return ctx_mgr.can_cache(self.inter_buffer)
 
@@ -571,4 +601,5 @@ class StepLevelCudaGraphRunner:
         self.cached_outputs = None
         self._fn_output_snapshot = None
         self._transformer = None
+        self._cache_context = None
         self._captured = False
