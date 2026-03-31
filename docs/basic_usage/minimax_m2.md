@@ -1,6 +1,6 @@
-# MiniMax M2.5/M2.1/M2 Usage
+# MiniMax M2.7/M2.5/M2.1/M2 Usage
 
-[MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5), [MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1), and [MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2) are advanced large language models created by [MiniMax](https://www.minimax.io/).
+[MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7), [MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5), [MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1), and [MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2) are advanced large language models created by [MiniMax](https://www.minimax.io/).
 
 The MiniMax-M2 series redefines efficiency for agents. These compact, fast, and cost-effective MoE models (230 billion total parameters with 10 billion active parameters) are built for elite performance in coding and agentic tasks, all while maintaining powerful general intelligence. With just 10 billion activated parameters, the MiniMax-M2 series provides sophisticated, end-to-end tool use performance expected from today's leading models, but in a streamlined form factor that makes deployment and scaling easier than ever.
 
@@ -8,6 +8,8 @@ The MiniMax-M2 series redefines efficiency for agents. These compact, fast, and 
 
 This guide applies to the following models. You only need to update the model name during deployment. The following examples use **MiniMax-M2**:
 
+- [MiniMaxAI/MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7)
+- [MiniMaxAI/MiniMax-M2.7-highspeed](https://huggingface.co/MiniMaxAI/MiniMax-M2.7-highspeed)
 - [MiniMaxAI/MiniMax-M2.5](https://huggingface.co/MiniMaxAI/MiniMax-M2.5)
 - [MiniMaxAI/MiniMax-M2.1](https://huggingface.co/MiniMaxAI/MiniMax-M2.1)
 - [MiniMaxAI/MiniMax-M2](https://huggingface.co/MiniMaxAI/MiniMax-M2)
@@ -83,3 +85,10 @@ curl http://localhost:8000/v1/chat/completions \
         ]
     }'
 ```
+
+## MiniMax API Models
+
+MiniMax also offers API-hosted model variants that can be accessed through the MiniMax platform:
+
+- **MiniMax-M2.7**: The latest model in the MiniMax-M2 series, with improved performance across reasoning, coding, and agentic tasks. Available in both standard and highspeed variants.
+- **MiniMax-M2.5**: A high-performance model optimized for coding and agentic workflows.
