@@ -152,6 +152,18 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+                if logits_output.next_token_top_logprobs_val:
+                    logits_output.next_token_top_logprobs_val = [
+                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    ]
+                    logits_output.next_token_top_logprobs_idx = [
+                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    ]
+                if logits_output.next_token_token_ids_logprobs_val:
+                    logits_output.next_token_token_ids_logprobs_val = [
+                        v.tolist()
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    ]
 
             hidden_state_offset = 0
 
@@ -377,7 +389,7 @@ class SchedulerOutputProcessorMixin:
 
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                if batch.is_spec_v2 and logits_output.next_token_top_logprobs_val:
+                if logits_output.next_token_top_logprobs_val:
                     logits_output.next_token_top_logprobs_val = [
                         v.tolist() for v in logits_output.next_token_top_logprobs_val
                     ]
@@ -385,7 +397,7 @@ class SchedulerOutputProcessorMixin:
                         x.tolist() for x in logits_output.next_token_top_logprobs_idx
                     ]
 
-                if batch.is_spec_v2 and logits_output.next_token_token_ids_logprobs_val:
+                if logits_output.next_token_token_ids_logprobs_val:
                     logits_output.next_token_token_ids_logprobs_val = [
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
@@ -941,10 +953,6 @@ class SchedulerOutputProcessorMixin:
             if req is skip_req:
                 continue
 
-            # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
-            if self.model_config.is_multimodal_gen and req.to_finish:
-                continue
-
             if req.finished():
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice
@@ -963,8 +971,7 @@ class SchedulerOutputProcessorMixin:
                     # origin stream_interval logic
                     should_output = (
                         len(req.output_ids) % stream_interval == 1
-                        if not self.model_config.is_multimodal_gen
-                        and stream_interval > 1
+                        if stream_interval > 1
                         else len(req.output_ids) % stream_interval == 0
                     )
 
@@ -974,8 +981,6 @@ class SchedulerOutputProcessorMixin:
                 else:
                     should_output = (
                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                        if not self.model_config.is_multimodal_gen
-                        else False
                     )
 
             if should_output:
@@ -991,10 +996,7 @@ class SchedulerOutputProcessorMixin:
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 
-                if self.model_config.is_multimodal_gen:
-                    decode_ids_list.append(decode_ids)
-                else:
-                    decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+                decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
 
                 # Exclude the tokens after stop condition
                 output_ids_ = req.output_ids_through_stop
@@ -1120,8 +1122,6 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if reqs or is_idle_batch:
-            if self.model_config.is_multimodal_gen:
-                return
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
