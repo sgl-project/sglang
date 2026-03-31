@@ -25,23 +25,7 @@
 - **Precision:** bf16
 - **TP:** 1
 
-## bench\_one\_batch Speedup Charts
-
-The charts below were generated with `bench_one_batch.py`, which measures raw single-batch latency and throughput at various batch sizes (1, 4, 16, 32, 64, 128, 256) with input length 1024 and output length 8192. The baseline is `inductor[None]` (no Inductor compilation).
-
-```bash
-python profiles/plot_speedup.py profiles/openai/gpt-oss-20b-bf16
-```
-
-![Speedup Charts](gpt-oss-20b-bf16/speedup_charts.png)
-
-**Key observations:**
-- `inductor[moe]` and `inductor[moe-rmsnorm]` deliver ~1.80x decode throughput at bs=1 and ~1.77x at bs=4, thanks to replacing the `triton_kernel` MoE backend with Inductor-compiled code.
-- The MoE compilation advantage diminishes at larger batch sizes (16+), where all configs converge near 1.0x.
-- `inductor[rmsnorm]`, `inductor[rope-rmsnorm]`, and `inductor[rope]` stay at parity (~0.98–1.01x) across all batch sizes.
-- `inductor[rope]` shows a small ~1.07x decode speedup at bs=256.
-
-## bench\_offline\_throughput (Real Engine)
+## `bench\_offline\_throughput` (Real Engine)
 
 ```bash
 python3 -m sglang.bench_offline_throughput \
@@ -113,7 +97,7 @@ Against the fair baseline (no piecewise CG), individual Inductor compilation sho
 - **Precision:** mxfp4
 - **TP:** 4
 
-## bench\_offline\_throughput (Real Engine)
+## `bench\_offline\_throughput` (Real Engine)
 
 ```bash
 python3 -m sglang.bench_offline_throughput \

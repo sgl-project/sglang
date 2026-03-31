@@ -33,22 +33,7 @@
 - `inductor[ropekv-rmsnorm]` compiles the rotary embedding with KV-cache write (fused into a single Inductor graph) and the layer-level RMSNorm. Q/k normalization uses the custom kernel. Same compilation scope as `inductor[rope-rmsnorm]` but with naming that makes the KV-cache fusion explicit.
 - `inductor[qvnorm-ropekv-rmsnorm]` splits the `QKNormRope` region into two separate Inductor graphs: one for q/k normalization (no dynamic shapes) and one for rope + KV-cache write (dynamic shapes). This reduces the scope of the dynamic-shape graph compared to the fully-fused `qvnormropekv` variant.
 
-## bench\_one\_batch Speedup Charts
-
-The charts below were generated with `bench_one_batch.py`, which measures raw single-batch latency and throughput at various batch sizes (1, 4, 16, 32, 64) with input length 1024 and output length 8192. The baseline is `inductor[None]` (no Inductor compilation).
-
-```bash
-python profiles/plot_speedup.py profiles/Qwen/Qwen3-30B-A3B
-```
-
-![Speedup Charts](Qwen3-30B-A3B/speedup_charts.png)
-
-**Key observations:**
-- `inductor[moe]` significantly hurts decode throughput (~0.70x at bs=1), likely due to the triton\_kernel prefill overhead bleeding into measured totals.
-- `inductor[rmsnorm]`, `inductor[rope-rmsnorm]`, and `inductor[rope]` are all roughly at parity with the baseline for decode throughput (1.00–1.02x).
-- Overall throughput shows similar trends: the non-moe configs hover around 1.00x, while `inductor[moe]` drags overall throughput to ~0.65x at bs=1.
-
-## bench\_offline\_throughput (Real Engine)
+## `bench\_offline\_throughput` (Real Engine)
 
 ```bash
 python3 -m sglang.bench_offline_throughput \
@@ -163,8 +148,9 @@ The baseline fires 3 kernels between the projection GEMM and `fmhaSm100fKernel`:
 
 - These results use the `trtllm_mha` attention backend, as recommended by the SGLang cookbook.
 - `inductor[reshape-qknorm-ropekv-gemmarmsnorm]` compiles the reshape, q/k normalization, rotary embedding with KV-cache write, and GemmaRMSNorm (the layer-level normalization used by Qwen3.5) as separate Inductor graphs. This is the broadest compilation scope tested on this model.
+- Qwen3.5-35B-A3B-FP8 is a hybrid architecture with 40 decoder layers: only 10 are full attention layers (every 4th layer, `full_attention_interval=4`) and the remaining 30 are linear attention (GatedDeltaNet) layers. Inductor compilation targets only the full attention layers, so the optimized region covers just 25% of the decoder stack.
 
-## bench\_offline\_throughput (Real Engine)
+## `bench\_offline\_throughput` (Real Engine)
 
 ```bash
 python3 -m sglang.bench_offline_throughput \
