@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
-from typing import Callable
 
 import torch
 from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
 from torch.nn import functional as F
 
-from sglang.jit_kernel.nvfp4 import scaled_fp4_quant
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.test.ci.ci_register import register_cuda_ci
 
 try:
@@ -85,10 +82,10 @@ def break_fp4_bytes(a, dtype):
     return values.reshape(m, n * 2).to(dtype=dtype)
 
 
-def _interleave_linear_and_gate(
+def _interleave_w13_halves(
     x: torch.Tensor, group_size: int = 64, dim: int = -1
 ) -> torch.Tensor:
-    """Interleave linear and gate weights for SwiGLU (CuteDSL wrapper layout)."""
+    """Interleave the two logical W13 halves for the CuteDSL wrapper layout."""
     sizes = x.size()
     dim = dim % x.dim()
     assert sizes[dim] % (group_size * 2) == 0
@@ -149,7 +146,7 @@ def _create_cutedsl_wrapper_tensors(
         )
         / 10
     )
-    w1_bf16_interleaved = _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+    w1_bf16_interleaved = _interleave_w13_halves(w1_bf16, group_size=64, dim=1)
     w1_amax = w1_bf16.abs().amax(dim=(1, 2)).to(torch.float32)
     w1_gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax.mean()
     w1_gs = w1_gs.unsqueeze(0)
@@ -247,7 +244,7 @@ def _quantize_local_expert_weights(
     intermediate_size = w2_bf16_local.shape[2]
 
     # GEMM1: interleave -> quantize -> MMA layout
-    w1_interleaved = _interleave_linear_and_gate(w1_bf16_local, group_size=64, dim=1)
+    w1_interleaved = _interleave_w13_halves(w1_bf16_local, group_size=64, dim=1)
     w1_flat = w1_interleaved.view(num_local_experts * intermediate_size_2x, hidden_size)
     w1_q_flat, w1_sf_flat = fp4_quantize(
         w1_flat,
@@ -422,20 +419,6 @@ def prepare_inputs(
     return hidden_states_3d, masked_m, topk_idx, routing_weights
 
 
-MNK_FACTORS = [
-    (2, 1024, 1024),
-    (2, 1024, 1536),
-    (2, 3072, 1024),
-    (2, 3072, 1536),
-    (64, 1024, 1024),
-    (64, 1024, 1536),
-    (64, 3072, 1024),
-    (64, 2048, 1024),
-    (224, 1024, 1024),
-    (224, 1024, 1536),
-]
-
-
 # Reference implementation of torch_moe
 def torch_moe(a, w1, w2, score, topk, expert_map):
     B, D = a.shape
@@ -471,7 +454,7 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
         if mask.sum():
             m = w1[i].shape[0]
             assert m % 2 == 0
-            # Note: w1 and w3 are swapped!
+            # The first and second W13 halves feed the two SwiGLU branches.
             w3_expert, w1_expert = w1[i][m // 2 :, :], w1[i][: m // 2, :]
             inter = F.silu(a[mask] @ w1_expert.t()) * (a[mask] @ w3_expert.t())
             inter_gs = torch.tensor(1.0).cuda()
@@ -488,128 +471,6 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
     return (
         out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
     ).sum(dim=1)
-
-
-def check_moe(
-    m: int,
-    n: int,
-    k: int,
-    e: int,
-    topk: int,
-    dtype: torch.dtype,
-    moe_impl: Callable,
-    flip_w13: bool,
-):
-    torch.manual_seed(7)
-    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
-    quant_blocksize = 16
-    round_up = lambda x, y: (x + y - 1) // y * y
-    sf_w1_2n = round_up(2 * n, 128)
-    sf_w1_k = round_up(k // quant_blocksize, 4)
-    w1_blockscale = torch.empty(
-        (e, sf_w1_2n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
-    )
-
-    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
-    sf_w2_k = round_up(k, 128)
-    sf_w2_n = round_up(n // quant_blocksize, 4)
-    w2_blockscale = torch.empty(
-        (e, sf_w2_k, sf_w2_n), device="cuda", dtype=torch.float8_e4m3fn
-    )
-
-    w1_q = torch.empty((e, 2 * n, k // 2), device="cuda", dtype=torch.uint8)
-    w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
-    w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
-    w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
-
-    for expert in range(e):
-        w1_amax = torch.abs(w1).max().to(torch.float32)
-        w2_amax = torch.abs(w2).max().to(torch.float32)
-        w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
-        w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
-
-        w1_q[expert], w1_blockscale[expert] = scaled_fp4_quant(
-            w1[expert], w1_gs[expert]
-        )
-
-        w2_q[expert], w2_blockscale[expert] = scaled_fp4_quant(
-            w2[expert], w2_gs[expert]
-        )
-
-    score = torch.randn((m, e), device="cuda", dtype=dtype)
-
-    topk_output = select_experts(
-        hidden_states=a,
-        router_logits=score,
-        topk_config=TopKConfig(top_k=topk, renormalize=False),
-    )
-    topk_weights, topk_ids, _ = topk_output
-
-    a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
-    a2_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
-    test_output = moe_impl(
-        a=a,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        w1_q=w1_q,
-        w2_q=w2_q,
-        a1_gs=a1_gs,
-        w1_blockscale=w1_blockscale,
-        w1_alphas=(1 / w1_gs),
-        a2_gs=a2_gs,
-        w2_blockscale=w2_blockscale,
-        w2_alphas=(1 / w2_gs),
-    )
-
-    # Reference check:
-    a_global_scale = (
-        (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(a.flatten(), dim=-1)
-    ).to(torch.float32)
-    a_fp4, a_scale_interleaved = scaled_fp4_quant(a, a_global_scale)
-    _, m_k = a_fp4.shape
-    a_in_dtype = dequantize_nvfp4_to_dtype(
-        a_fp4,
-        a_scale_interleaved,
-        a_global_scale,
-        dtype=a.dtype,
-        device=a.device,
-        block_size=quant_blocksize,
-    )
-
-    w1_d = torch.empty((e, 2 * n, k), device="cuda", dtype=dtype)
-    w2_d = torch.empty((e, k, n), device="cuda", dtype=dtype)
-
-    for idx in range(0, e):
-        w1_d[idx] = dequantize_nvfp4_to_dtype(
-            w1_q[idx],
-            w1_blockscale[idx],
-            w1_gs[idx],
-            dtype=w1.dtype,
-            device=w1.device,
-            block_size=quant_blocksize,
-        )
-        w2_d[idx] = dequantize_nvfp4_to_dtype(
-            w2_q[idx],
-            w2_blockscale[idx],
-            w2_gs[idx],
-            dtype=w2.dtype,
-            device=w2.device,
-            block_size=quant_blocksize,
-        )
-
-    if flip_w13:
-        dim = -2
-        size = w1_d.size(dim)
-        assert size % 2 == 0, f"Expected even size in dim {dim}, got {size}"
-        half = size // 2
-        # Reorder weight
-        w1, w3 = w1_d.split(half, dim=dim)
-        w1_d = torch.cat([w3, w1], dim=dim).contiguous()
-
-    torch_output = torch_moe(a_in_dtype, w1_d, w2_d, score, topk, None)
-
-    torch.testing.assert_close(torch_output, test_output, atol=1e-1, rtol=1e-1)
 
 
 class TestFlashinferCutedslMoe(unittest.TestCase):
@@ -629,9 +490,6 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
             with self.subTest(
                 bs=bs, hidden_dim=hidden_dim, inter_dim=inter_dim, topk=topk
             ):
-                print(
-                    f"Testing with bs={bs}, hidden_dim={hidden_dim}, inter_dim={inter_dim}, topk={topk}"
-                )
                 with torch.inference_mode():
                     torch.manual_seed(42)
                     device = "cuda"
@@ -789,9 +647,6 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                     torch.testing.assert_close(
                         out_weighted.cpu(), ref_output.cpu(), atol=5e-2, rtol=5e-2
                     )
-                print(
-                    f"Test passed with bs={bs}, hidden_dim={hidden_dim}, inter_dim={inter_dim}, topk={topk}"
-                )
 
     @unittest.skipIf(SKIP_TEST, SKIP_REASON)
     @unittest.skipIf(
@@ -824,12 +679,6 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                 intermediate_size=intermediate_size,
                 top_k=top_k,
             ):
-                print(
-                    f"Testing wrapper with num_tokens={num_tokens}, "
-                    f"hidden_size={hidden_size}, inter_size={intermediate_size}, "
-                    f"top_k={top_k}"
-                )
-
                 tensors = _create_cutedsl_wrapper_tensors(
                     num_tokens=num_tokens,
                     hidden_size=hidden_size,
@@ -884,7 +733,6 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                     f"Only {pct_within * 100:.2f}% of elements within tolerance "
                     f"(atol={atol:.4f})",
                 )
-                print(f"  PASSED: {pct_within * 100:.1f}% within tol (atol={atol:.4f})")
 
     @unittest.skipIf(SKIP_TEST, SKIP_REASON)
     @unittest.skipIf(
@@ -986,10 +834,6 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                     pct_within,
                     0.925,
                     f"graph vs reference: only {pct_within * 100:.2f}% within tol",
-                )
-                print(
-                    f"  parity PASS, graph vs ref: {pct_within * 100:.1f}% within tol "
-                    f"(tokens={num_tokens}, hidden={hidden_size}, inter={intermediate_size}, top_k={top_k})"
                 )
 
     @unittest.skipIf(SKIP_TEST, SKIP_REASON)
@@ -1093,10 +937,6 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                         f"EP-sharded all-reduce mismatch "
                         f"(ep_size={ep_size}, tokens={num_tokens})"
                     ),
-                )
-                print(
-                    f"  EP shard PASS: ep_size={ep_size}, tokens={num_tokens}, "
-                    f"experts={num_experts}, top_k={top_k}"
                 )
 
 

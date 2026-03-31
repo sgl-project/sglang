@@ -32,10 +32,11 @@ register_cuda_ci(est_time=900, suite="nightly-4-gpu-b200", nightly=True)
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1000
+GSM8K_ACCURACY_THRESHOLD = 0.935
 
 
 class TestDeepseekV3FP4CuteDSLMoE(CustomTestCase):
-    """CuteDSL dedicated layer: flashinfer_cutedsl + modelopt_fp4, EP=1."""
+    """CuteDSL standard moe_runner path: flashinfer_cutedsl + modelopt_fp4, EP=1."""
 
     @classmethod
     def setUpClass(cls):
@@ -81,18 +82,16 @@ class TestDeepseekV3FP4CuteDSLMoE(CustomTestCase):
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
-
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-v3-fp4-cutedsl-moe)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreater(metrics["accuracy"], GSM8K_ACCURACY_THRESHOLD)
 
 
 class TestDeepseekV3FP4CuteDSLMoEEP4(CustomTestCase):
-    """CuteDSL dedicated layer: flashinfer_cutedsl + modelopt_fp4, EP=TP=4 (all-reduce, no A2A)."""
+    """CuteDSL standard moe_runner path: flashinfer_cutedsl + modelopt_fp4, EP=TP=4."""
 
     @classmethod
     def setUpClass(cls):
@@ -138,14 +137,12 @@ class TestDeepseekV3FP4CuteDSLMoEEP4(CustomTestCase):
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
-
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-v3-fp4-cutedsl-moe-ep4)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreater(metrics["accuracy"], GSM8K_ACCURACY_THRESHOLD)
 
 
 if __name__ == "__main__":

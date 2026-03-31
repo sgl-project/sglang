@@ -1795,20 +1795,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # CUTLASS processing - handle w13 and w2 separately
 
             if self.enable_flashinfer_cutedsl_moe and layer.moe_runner_config.is_gated:
-                # For CuteDSL FP4 path, apply TRT-LLM-style post-quant W1 interleave:
-                # interleave packed W1 rows and linear block-scales before swizzling.
+                # For the CuteDSL FP4 path, interleave the two logical W13 halves
+                # in 64-row chunks before swizzling the block-scales.
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                    interleave_linear_and_gate,
+                    interleave_w13_halves,
                 )
 
                 layer.w13_weight = Parameter(
-                    interleave_linear_and_gate(
+                    interleave_w13_halves(
                         layer.w13_weight.view(torch.uint8), group_size=64, dim=1
                     ).contiguous(),
                     requires_grad=False,
                 )
                 layer.w13_weight_scale = Parameter(
-                    interleave_linear_and_gate(
+                    interleave_w13_halves(
                         layer.w13_weight_scale, group_size=64, dim=1
                     ).contiguous(),
                     requires_grad=False,
@@ -1922,7 +1922,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        # FlashInfer CUTLASS/CuteDSL kernels assume [Up, Gate] Proj as W13.
+        # Load W13 as [Up, Gate] for FlashInfer CUTLASS/CuteDSL kernels.
         return self.moe_runner_config.is_gated and (
             self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_cutedsl_moe
         )
