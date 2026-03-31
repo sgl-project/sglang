@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import get_bool_env_var, is_hip
 
-__all__ = ["CompressedTensorsW8A8Fp8"]
+__all__ = ["CompressedTensorsW8A8Fp8", "FP8_ALIGNMENT", "_pad_to_alignment"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -39,27 +39,44 @@ if _use_aiter:
 # torch._scaled_mm requires both matrix dimensions divisible by 16.
 # Models where intermediate_size / tp_size is not 16-aligned
 # (e.g. 10944 / tp=8 = 1368) fail CUDA Graph capture without padding.
-_FP8_MM_ALIGNMENT = 16
+FP8_ALIGNMENT = 16
+
+
+def _pad_to_alignment(
+    tensor: torch.Tensor, dim: int, alignment: int = FP8_ALIGNMENT
+) -> torch.Tensor:
+    """Zero-pad tensor along dim to the next multiple of alignment.
+
+    Returns the original tensor unchanged when already aligned.
+    """
+    size = tensor.shape[dim]
+    pad = (-size) % alignment
+    if pad == 0:
+        return tensor
+    pad_arg = [0] * (2 * tensor.ndim)
+    pad_arg[2 * (tensor.ndim - 1 - dim) + 1] = pad
+    return F.pad(tensor, pad_arg)
 
 
 def _pad_weight_to_alignment(
     weight: torch.Tensor, weight_scale: Optional[torch.Tensor]
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], int]:
-    """Pad weight (N, K) so both dims are multiples of _FP8_MM_ALIGNMENT.
+    """Pad weight (N, K) so both dims are multiples of FP8_ALIGNMENT.
 
     Returns (weight_t, weight_scale, orig_N) where weight_t is transposed.
     weight_scale is padded along dim-0 when it is per-channel (shape [N, 1]).
     """
     orig_n, orig_k = weight.shape
-    pad_n = (-orig_n) % _FP8_MM_ALIGNMENT
-    pad_k = (-orig_k) % _FP8_MM_ALIGNMENT
+    pad_n = (-orig_n) % FP8_ALIGNMENT
+    pad_k = (-orig_k) % FP8_ALIGNMENT
     if pad_n or pad_k:
         weight = F.pad(weight, (0, pad_k, 0, pad_n))
         if weight_scale is not None:
-            assert weight_scale.shape == (orig_n, 1), (
-                f"Expected per-channel scale shape ({orig_n}, 1), "
-                f"got {tuple(weight_scale.shape)}"
-            )
+            if weight_scale.shape != (orig_n, 1):
+                raise ValueError(
+                    f"Expected per-channel scale shape ({orig_n}, 1), "
+                    f"got {tuple(weight_scale.shape)}"
+                )
             weight_scale = F.pad(weight_scale, (0, 0, 0, pad_n))
     return weight.t(), weight_scale, orig_n
 
@@ -207,13 +224,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
-                # keep the weight as (N, K)
+                # keep the weight as (N, K); aiter kernel handles alignment internally
                 layer.weight = Parameter(
-                    shuffle_weight(weight, (_FP8_MM_ALIGNMENT, _FP8_MM_ALIGNMENT)),
+                    shuffle_weight(weight, (FP8_ALIGNMENT, FP8_ALIGNMENT)),
                     requires_grad=False,
                 )
                 # required by torch.compile to be torch.nn.Parameter
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+                layer._orig_output_dim = weight.shape[0]
             else:
                 weight_t, weight_scale, orig_out = _pad_weight_to_alignment(
                     weight, weight_scale
@@ -272,9 +290,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             )
 
         # weight is stored transposed as (K_padded, N_padded); pad x to match.
+        orig_out = layer._orig_output_dim
         pad_k = layer.weight.shape[0] - x.shape[-1]
         if pad_k > 0:
             x = F.pad(x, (0, pad_k))
+
+        # Pad bias to N_padded so apply_fp8_linear can add it before we slice.
+        pad_n = layer.weight.shape[1] - orig_out
+        if bias is not None and pad_n > 0:
+            bias = F.pad(bias, (0, pad_n))
 
         output = apply_fp8_linear(
             input=x,
@@ -286,4 +310,4 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             compressed_tensor_quant=True,
         )
 
-        return output[..., : layer._orig_output_dim]
+        return output[..., :orig_out]
