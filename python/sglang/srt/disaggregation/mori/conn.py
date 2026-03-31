@@ -972,10 +972,8 @@ class MoriKVSender(CommonKVSender):
         raise RuntimeError(failure_reason)
 
     def abort(self):
-        reason = "Aborted by AbortReq."
-        self.kv_mgr.record_failure(self.bootstrap_room, reason)
-        self._notify_decode(KVPoll.Failed, reason)
-        self.conclude_state = KVPoll.Failed
+        super().abort()
+        self._notify_decode(KVPoll.Failed, "Aborted by AbortReq.")
 
 
 class MoriKVReceiver(CommonKVReceiver):
@@ -1106,10 +1104,8 @@ class MoriKVReceiver(CommonKVReceiver):
     def abort(self):
         if self.bootstrap_room is None:
             return
-        reason = "Aborted by AbortReq."
-        self.kv_mgr.record_failure(self.bootstrap_room, reason)
+        super().abort()
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.conclude_state = KVPoll.Failed
         self.clear()
 
 
