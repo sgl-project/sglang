@@ -1352,6 +1352,9 @@ class ServerArgs:
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
+        if self.cuda_graph_max_bs not in capture_bs:
+            capture_bs.append(self.cuda_graph_max_bs)
+
         return capture_bs
 
     def _generate_cpu_graph_batch_sizes(self):
