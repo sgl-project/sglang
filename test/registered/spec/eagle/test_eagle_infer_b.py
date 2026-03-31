@@ -20,12 +20,12 @@ from sglang.test.kits.abort_timeout_kit import (
 )
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
-from sglang.test.test_utils import run_logprob_check
+from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
 
 register_cuda_ci(est_time=600, suite="stage-b-test-1-gpu-large")
 
 
-class TestEAGLEServerBasic:
+class TestEAGLEServerBasic(EagleServerBase):
     """Core tests that run on every server config variant."""
 
     def test_request_abort(self):
@@ -75,7 +75,7 @@ class TestEAGLEServerBasic:
         time.sleep(4)
 
 
-class TestEAGLEServerExtend(TestEAGLEServerBasic, EagleServerBase):
+class TestEAGLEServerExtend(TestEAGLEServerBasic):
     extra_args = [
         "--chunked-prefill-size",
         128,
@@ -264,8 +264,41 @@ class TestEAGLEServerExtend(TestEAGLEServerBasic, EagleServerBase):
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(self.run_decode, args))
 
+    def test_constrained_decoding(self):
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Give me a json"},
+        ]
 
-class TestEAGLERetract(TestEAGLEServerBasic, EagleServerBase):
+        response = requests.post(
+            self.base_url + "/v1/chat/completions",
+            json={
+                "model": DEFAULT_TARGET_MODEL_EAGLE,
+                "messages": messages,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        res = response.json()
+
+        self.assertIn("choices", res)
+        self.assertEqual(len(res["choices"]), 1)
+        self.assertIn("message", res["choices"][0])
+        self.assertIn("content", res["choices"][0]["message"])
+
+        content_json = res["choices"][0]["message"]["content"]
+        is_valid_json = True
+        try:
+            content = json.loads(content_json)
+            self.assertIsInstance(content, dict)
+        except Exception:
+            print(f"parse JSON failed: {content_json}")
+            is_valid_json = False
+        self.assertTrue(is_valid_json)
+
+
+class TestEAGLERetract(TestEAGLEServerBasic):
     extra_args = [
         "--chunked-prefill-size=128",
         "--max-running-requests=64",
@@ -279,11 +312,11 @@ class TestEAGLERetract(TestEAGLEServerBasic, EagleServerBase):
             super().setUpClass()
 
 
-class TestEAGLEServerTriton(TestEAGLEServerBasic, EagleServerBase):
+class TestEAGLEServerTriton(TestEAGLEServerBasic):
     extra_args = ["--attention-backend=triton", "--max-running-requests=8"]
 
 
-class TestEAGLEServerPageSize(TestEAGLEServerBasic, EagleServerBase):
+class TestEAGLEServerPageSize(TestEAGLEServerBasic):
     spec_steps = 5
     spec_topk = 1
     spec_tokens = 6
@@ -301,7 +334,7 @@ class TestEAGLEServerPageSize(TestEAGLEServerBasic, EagleServerBase):
             super().setUpClass()
 
 
-class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic, EagleServerBase):
+class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
     # default topk=8 and tokens=64
     extra_args = [
         "--chunked-prefill-size=128",
