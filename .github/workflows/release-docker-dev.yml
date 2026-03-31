@@ -207,3 +207,52 @@ jobs:
           else
             echo "Only $TAG_COUNT nightly builds found, no cleanup needed"
           fi
+
+  trivy-scan:
+    needs: [create-manifests]
+    if: ${{ github.repository == 'sgl-project/sglang' && !inputs.tag && !inputs.pr_number }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: [dev, dev-cu13]
+    steps:
+      - name: Free disk space for large image scan
+        run: |
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        id: trivy-sarif
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: 'docker.io/lmsysorg/sglang:${{ matrix.tag }}'
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.tag }}.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Upload Trivy scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles(format('trivy-results-{0}.sarif', matrix.tag)) != ''
+        with:
+          sarif_file: 'trivy-results-${{ matrix.tag }}.sarif'
+          category: 'trivy-${{ matrix.tag }}'
+
+      - name: Run Trivy (table output for logs)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: 'docker.io/lmsysorg/sglang:${{ matrix.tag }}'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
