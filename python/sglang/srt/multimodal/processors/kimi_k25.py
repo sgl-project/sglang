@@ -3,7 +3,10 @@ from typing import Dict, List, Tuple, Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,

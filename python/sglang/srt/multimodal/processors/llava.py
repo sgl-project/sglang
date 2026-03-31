@@ -7,7 +7,11 @@ from transformers.models.auto.processing_auto import (
 )
 
 import sglang.srt.managers.multimodal_processor as sgl_mm_processor_utils
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.llava import (
     LlavaForConditionalGeneration,
     LlavaLlamaForCausalLM,

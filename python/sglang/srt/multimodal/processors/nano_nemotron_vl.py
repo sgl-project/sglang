@@ -18,10 +18,10 @@ import torch
 from PIL import Image
 
 from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.multimodal.evs import EVSProcessor
 from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,

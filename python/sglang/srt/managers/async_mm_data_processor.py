@@ -98,9 +98,7 @@ class AsyncMMDataProcessor:
         if self.semaphore is not None:
             async with self.semaphore:
                 if self.timeout_s is not None:
-                    result = await asyncio.wait_for(
-                        _invoke(), timeout=self.timeout_s
-                    )
+                    result = await asyncio.wait_for(_invoke(), timeout=self.timeout_s)
                 else:
                     result = await _invoke()
         elif self.timeout_s is not None:
