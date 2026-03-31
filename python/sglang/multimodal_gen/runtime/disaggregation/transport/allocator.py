@@ -48,25 +48,6 @@ class BuddyAllocator:
     def pool_size(self) -> int:
         return self._pool_size
 
-    @property
-    def min_block_size(self) -> int:
-        return self._min_block_size
-
-    @property
-    def allocated_bytes(self) -> int:
-        with self._lock:
-            return self._allocated_bytes
-
-    @property
-    def free_bytes(self) -> int:
-        with self._lock:
-            return self._pool_size - self._allocated_bytes
-
-    @property
-    def num_allocations(self) -> int:
-        with self._lock:
-            return self._num_allocations
-
     def allocate(self, size: int, request_id: str | None = None) -> int | None:
         """Allocate a block of at least `size` bytes. Returns offset or None."""
         if size <= 0:
@@ -110,20 +91,6 @@ class BuddyAllocator:
                 "num_blocks": len(self._blocks),
                 "free_blocks_by_size": free_blocks_by_order,
             }
-
-    def can_allocate(self, size: int) -> bool:
-        if size <= 0:
-            return False
-        alloc_size = max(self._next_power_of_2(size), self._min_block_size)
-        target_order = self._size_to_order(alloc_size)
-        if target_order > self._max_order:
-            return False
-
-        with self._lock:
-            for order in range(target_order, self._max_order + 1):
-                if self._free_lists[order]:
-                    return True
-            return False
 
     def count_free_slots(self, slot_size: int) -> int:
         """Count how many allocations of the given size can fit."""

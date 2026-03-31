@@ -99,7 +99,6 @@ class TransferReadyMsg:
 class TransferDoneMsg:
     msg_type: str = TransferMsgType.DONE
     request_id: str = ""
-    result_frames: list[bytes] | None = None
     error: str | None = None
 
 
@@ -122,8 +121,6 @@ def encode_transfer_msg(msg: Any) -> list[bytes]:
         d = msg
     else:
         raise TypeError(f"Cannot encode transfer message: {type(msg)}")
-
-    d.pop("result_frames", None)
 
     return [TRANSFER_MAGIC, json.dumps(d, separators=(",", ":")).encode("utf-8")]
 

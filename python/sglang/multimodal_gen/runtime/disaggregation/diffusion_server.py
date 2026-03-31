@@ -864,11 +864,7 @@ class DiffusionServer:
                 except ValueError:
                     pass
 
-                result_frames = msg.get("result_frames")
-                if result_frames:
-                    self._transfer_return_to_client(request_id, result_frames)
-                else:
-                    self._transfer_return_to_client_from_msg(request_id, msg)
+                self._transfer_return_to_client_from_msg(request_id, msg)
 
             self._transfer_state.pop(request_id, None)
 
@@ -924,46 +920,6 @@ class DiffusionServer:
             self._decoder_pushes[decoder_idx].send_multipart(
                 encode_transfer_msg(alloc_msg)
             )
-
-    def _transfer_return_to_client(self, request_id: str, result_frames: list) -> None:
-        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-            OutputBatch,
-        )
-
-        with self._lock:
-            client_identity = self._pending.pop(request_id, None)
-
-        if client_identity is None:
-            self._tracker.remove(request_id)
-            return
-
-        try:
-            raw_frames = []
-            for f in result_frames:
-                if isinstance(f, str):
-                    raw_frames.append(bytes.fromhex(f))
-                else:
-                    raw_frames.append(f)
-
-            tensor_fields, scalar_fields = unpack_tensors(raw_frames)
-            output_batch = OutputBatch(
-                output=tensor_fields.get("output"),
-                audio=tensor_fields.get("audio"),
-                audio_sample_rate=scalar_fields.get("audio_sample_rate"),
-                error=scalar_fields.get("error"),
-            )
-
-            self._frontend.send_multipart(
-                [client_identity, b"", pickle.dumps(output_batch)]
-            )
-        except Exception as e:
-            logger.error(
-                "DiffusionServer transfer: failed to send result for %s: %s",
-                request_id,
-                e,
-            )
-
-        self._tracker.remove(request_id)
 
     def _transfer_return_to_client_from_msg(self, request_id: str, msg: dict) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (

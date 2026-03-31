@@ -137,11 +137,9 @@ Role instances derive their result endpoint automatically from `--disagg-server-
 
 Tensor data between roles (encoder→denoiser, denoiser→decoder) is transferred via a P2P transfer engine. The DiffusionServer only routes lightweight control messages (alloc/push/ready); actual tensor data flows directly between instances.
 
-- If **mooncake-transfer-engine** is installed, transfers use RDMA for direct GPU-to-GPU data movement.
-- Otherwise, a **MockTransferEngine** (in-process `memmove`) is used as fallback — suitable for testing and single-machine setups.
+**mooncake-transfer-engine** is required for disaggregated diffusion. It provides RDMA for direct GPU-to-GPU data movement.
 
 ```bash
-# Install for production RDMA transfers:
 pip install mooncake-transfer-engine
 ```
 
