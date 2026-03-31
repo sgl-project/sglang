@@ -240,7 +240,7 @@ class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase)
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
 
-        # TODO: Fix PD disaggregation accuracy issue and increase the threshold back to 0.93.
+        # TODO: Fix PD disaggregation accuracy issue (https://github.com/sgl-project/sglang/issues/21744) and increase the threshold back to 0.93.
         self.assertGreater(metrics["accuracy"], 0.90)
 
 
