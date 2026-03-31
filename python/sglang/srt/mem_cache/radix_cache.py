@@ -613,9 +613,7 @@ class RadixCache(BasePrefixCache):
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_cascade_priority(
-                    x.parent
-                )
+                new_priority = self.eviction_strategy.get_cascade_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
@@ -655,7 +653,7 @@ class RadixCache(BasePrefixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 

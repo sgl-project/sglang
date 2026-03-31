@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
@@ -147,15 +147,21 @@ class TestTLRUEviction(unittest.TestCase):
 
         # Conv B should be evicted (TEL-safe)
         match_b = cache2.match_prefix(MatchPrefixParams(key=conv_b))
-        self.assertEqual(match_b.device_indices.numel(), 0, "TEL-safe conv B should be evicted")
+        self.assertEqual(
+            match_b.device_indices.numel(), 0, "TEL-safe conv B should be evicted"
+        )
 
         # Conv A should still be present (protected)
         match_a = cache2.match_prefix(MatchPrefixParams(key=conv_a))
-        self.assertTrue(match_a.device_indices.numel() > 0, "Protected conv A should be retained")
+        self.assertTrue(
+            match_a.device_indices.numel() > 0, "Protected conv A should be retained"
+        )
 
         # Conv C should still be present (protected)
         match_c = cache2.match_prefix(MatchPrefixParams(key=conv_c))
-        self.assertTrue(match_c.device_indices.numel() > 0, "Protected conv C should be retained")
+        self.assertTrue(
+            match_c.device_indices.numel() > 0, "Protected conv C should be retained"
+        )
 
     def test_lru_fallback_when_no_tel_safe(self):
         """When all conversations are protected (no TEL-safe), fall back to standard LRU."""
@@ -186,7 +192,11 @@ class TestTLRUEviction(unittest.TestCase):
         cache.evict(EvictParams(num_tokens=2))
 
         match_a = cache.match_prefix(MatchPrefixParams(key=conv_a))
-        self.assertEqual(match_a.device_indices.numel(), 0, "Oldest conv A should be evicted via LRU fallback")
+        self.assertEqual(
+            match_a.device_indices.numel(),
+            0,
+            "Oldest conv A should be evicted via LRU fallback",
+        )
 
         match_b = cache.match_prefix(MatchPrefixParams(key=conv_b))
         self.assertTrue(match_b.device_indices.numel() > 0, "Conv B should be retained")
@@ -208,7 +218,9 @@ class TestTLRUEviction(unittest.TestCase):
         time.sleep(0.01)
 
         # Conv B: L=9, B=1, node_start=0 < 1 → protected (single node covers [0,8])
-        conv_b = RadixKey(token_ids=[10, 11, 12, 13, 14, 15, 16, 17, 18], extra_key=None)
+        conv_b = RadixKey(
+            token_ids=[10, 11, 12, 13, 14, 15, 16, 17, 18], extra_key=None
+        )
         val_b = torch.arange(9, dtype=torch.int64) + 100
         cache.insert(InsertParams(key=conv_b, value=val_b))
 
@@ -218,10 +230,14 @@ class TestTLRUEviction(unittest.TestCase):
         cache.evict(EvictParams(num_tokens=3))
 
         match_a = cache.match_prefix(MatchPrefixParams(key=conv_a))
-        self.assertEqual(match_a.device_indices.numel(), 0, "Short TEL-safe conv A should be evicted")
+        self.assertEqual(
+            match_a.device_indices.numel(), 0, "Short TEL-safe conv A should be evicted"
+        )
 
         match_b = cache.match_prefix(MatchPrefixParams(key=conv_b))
-        self.assertTrue(match_b.device_indices.numel() > 0, "Protected conv B should be retained")
+        self.assertTrue(
+            match_b.device_indices.numel() > 0, "Protected conv B should be retained"
+        )
 
     def test_xi_and_qhat_affect_behavior(self):
         """Different xi/q_hat values should change which nodes are TEL-safe."""
@@ -230,16 +246,29 @@ class TestTLRUEviction(unittest.TestCase):
         cache_loose = _make_cache(size=6, xi=100, q_hat=1)
         conv_a = RadixKey(token_ids=[1, 2], extra_key=None)
         conv_b = RadixKey(token_ids=[10, 11], extra_key=None)
-        cache_loose.insert(InsertParams(key=conv_a, value=torch.arange(2, dtype=torch.int64)))
+        cache_loose.insert(
+            InsertParams(key=conv_a, value=torch.arange(2, dtype=torch.int64))
+        )
         time.sleep(0.01)
-        cache_loose.insert(InsertParams(key=conv_b, value=torch.arange(2, dtype=torch.int64) + 100))
+        cache_loose.insert(
+            InsertParams(key=conv_b, value=torch.arange(2, dtype=torch.int64) + 100)
+        )
         time.sleep(0.01)
-        cache_loose.insert(InsertParams(key=RadixKey(token_ids=[20, 21], extra_key=None), value=torch.arange(2, dtype=torch.int64) + 200))
+        cache_loose.insert(
+            InsertParams(
+                key=RadixKey(token_ids=[20, 21], extra_key=None),
+                value=torch.arange(2, dtype=torch.int64) + 200,
+            )
+        )
 
         # Both are TEL-safe, so LRU within TEL-safe: oldest (conv_a) evicted first
         cache_loose.evict(EvictParams(num_tokens=2))
         match_a = cache_loose.match_prefix(MatchPrefixParams(key=conv_a))
-        self.assertEqual(match_a.device_indices.numel(), 0, "With large xi, oldest TEL-safe should be evicted first")
+        self.assertEqual(
+            match_a.device_indices.numel(),
+            0,
+            "With large xi, oldest TEL-safe should be evicted first",
+        )
 
 
 class TestTLRUWithSplitNodes(unittest.TestCase):
