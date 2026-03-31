@@ -24,6 +24,11 @@ set -euxo pipefail
 # ------------------------------------------------------------------------------
 # Set up environment variables
 CU_VERSION="cu129"
+
+# Nvidia package versions we override (torch pins older versions).
+# Used both as pip constraints during install and for post-install verification.
+NVIDIA_CUDNN_VERSION="9.16.0.29"
+NVIDIA_NVSHMEM_VERSION="3.4.5"
 OPTIONAL_DEPS="${1:-}"
 
 SECONDS=0
@@ -221,7 +226,7 @@ echo "Installing python extras: [${EXTRAS}]"
 # Pin nvidia packages to the versions we actually need (installed later in this script).
 # Without this, torch pulls cudnn 9.10 (~700 MB) + nvshmem 3.3 (~125 MB) only to be replaced.
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} \
-    -c <(printf '%s\n' 'nvidia-cudnn-cu12==9.16.0.29' 'nvidia-nvshmem-cu12==3.4.5') \
+    -c <(printf '%s\n' "nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION}" "nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION}") \
     $PIP_INSTALL_SUFFIX
 
 mark_step_done "Install main package"
@@ -335,18 +340,18 @@ fi
 
 # Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
 INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-if [ "$INSTALLED_NVSHMEM" = "3.4.5" ]; then
-    echo "nvidia-nvshmem-cu12==3.4.5 already installed, skipping reinstall"
+if [ "$INSTALLED_NVSHMEM" = "$NVIDIA_NVSHMEM_VERSION" ]; then
+    echo "nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} already installed, skipping reinstall"
 else
-    $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 $PIP_INSTALL_SUFFIX
+    $PIP_CMD install nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} $PIP_INSTALL_SUFFIX
 fi
 
 # Fix dependencies: Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
 INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
-    echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
+if [ "$INSTALLED_CUDNN" = "$NVIDIA_CUDNN_VERSION" ]; then
+    echo "nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} already installed, skipping reinstall"
 else
-    $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 $PIP_INSTALL_SUFFIX
+    $PIP_CMD install nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} $PIP_INSTALL_SUFFIX
 fi
 
 mark_step_done "Fix other dependencies"
