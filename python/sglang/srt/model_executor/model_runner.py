@@ -1108,6 +1108,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
+        # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
+        # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
+        if _is_npu:
+            torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
         # Publish metadata to ModelExpress if running as seed source
