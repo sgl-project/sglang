@@ -714,6 +714,7 @@ class ServerArgs:
         "transfer_engine", "nccl", "modelexpress"
     ] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    engine_info_bootstrap_port: int = 6789
     modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
@@ -5813,6 +5814,13 @@ class ServerArgs:
             help="Start seed server via transfer engine backend for remote instance weight loader.",
         )
         parser.add_argument(
+            "--engine-info-bootstrap-port",
+            type=int,
+            default=ServerArgs.engine_info_bootstrap_port,
+            help="Port for the engine info bootstrap server. Default is 6789. "
+            "Must be set explicitly when running multiple instances on the same node.",
+        )
+        parser.add_argument(
             "--modelexpress-config",
             type=str,
             default=ServerArgs.modelexpress_config,
@@ -5931,7 +5939,7 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
-    def url(self):
+    def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
         host = self.host
@@ -5939,7 +5947,13 @@ class ServerArgs:
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
-        return NetworkAddress(host, self.port).to_url(scheme)
+        return NetworkAddress(host, port if port is not None else self.port).to_url(
+            scheme
+        )
+
+    @property
+    def engine_info_bootstrap_url(self):
+        return self.url(port=self.engine_info_bootstrap_port)
 
     def ssl_verify(self):
         """Return the value for the requests library's ``verify=`` parameter.
