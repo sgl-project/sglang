@@ -11,7 +11,6 @@ def sgemm_lora_a_embedding_graph_fwd(
     seg_len_tensor: torch.Tensor,
     scaling_tensor: torch.Tensor,
     vocab_size: int,
-    batch_size: int,
 ) -> torch.Tensor:
     total_seq_len = inputs.shape[0]
     if weights.numel() == 0:
@@ -25,7 +24,7 @@ def sgemm_lora_a_embedding_graph_fwd(
 
     for lora_idx in range(num_loras):
 
-        batch_token_mask = weight_indices[:batch_size] == lora_idx
+        batch_token_mask = weight_indices[:total_seq_len] == lora_idx
 
         x_seq = torch.where(batch_token_mask, inputs, 0)
         w_seq = weights[lora_idx]
@@ -46,7 +45,6 @@ def sgemm_lora_a_graph_fwd(
     weight_indices: torch.Tensor,
     seg_len_tensor: torch.Tensor,
     scaling_tensor: torch.Tensor,
-    batch_size: int,
     num_slices: int = 1,
 ) -> torch.Tensor:
     total_seq_len, input_dim = inputs.shape
@@ -62,7 +60,7 @@ def sgemm_lora_a_graph_fwd(
 
     for lora_idx in range(num_loras):
 
-        batch_token_mask = (weight_indices[:batch_size] == lora_idx).unsqueeze(1)
+        batch_token_mask = (weight_indices[:total_seq_len] == lora_idx).unsqueeze(1)
 
         x_seq = torch.where(batch_token_mask, inputs, 0)
         w_seq = weights[lora_idx]
@@ -81,7 +79,6 @@ def sgemm_lora_b_graph_fwd(
     weight_indices: torch.Tensor,
     seg_len_tensor: torch.Tensor,
     slice_offsets: torch.Tensor,
-    batch_size: int,
     base_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     total_seq_len, input_dim = inputs.shape
@@ -105,7 +102,7 @@ def sgemm_lora_b_graph_fwd(
 
     for lora_idx in range(num_loras):
 
-        batch_token_mask = (weight_indices[:batch_size] == lora_idx).unsqueeze(1)
+        batch_token_mask = (weight_indices[:total_seq_len] == lora_idx).unsqueeze(1)
 
         for slice_idx in range(num_slices):
             slice_start_input = slice_idx * max_rank

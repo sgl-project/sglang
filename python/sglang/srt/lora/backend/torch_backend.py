@@ -54,10 +54,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         output_tensor = sgemm_lora_a_embedding_fwd(
             inputs=input_ids,
             weights=weights,
-            weight_indices=self.batch_info.weight_indices_cpu,
-            seg_len_tensor=self.batch_info.seg_lens_cpu,
-            lora_ranks=self.batch_info.lora_ranks_cpu,
-            scaling_tensor=self.batch_info.scalings,
+            batch_info=self.batch_info,
             vocab_size=vocab_size,
         )
 
@@ -69,10 +66,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         output_tensor = sgemm_lora_a_fwd(
             inputs=x,
             weights=weights,
-            weight_indices=self.batch_info.weight_indices_cpu,
-            seg_len_tensor=self.batch_info.seg_lens_cpu,
-            lora_ranks=self.batch_info.lora_ranks_cpu,
-            scaling_tensor=self.batch_info.scalings,
+            batch_info=self.batch_info,
             num_slices=1,
         )
 
@@ -92,9 +86,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         output_tensor = sgemm_lora_b_fwd(
             inputs=x,
             weights=weights,
-            weight_indices=self.batch_info.weight_indices_cpu,
-            seg_len_tensor=self.batch_info.seg_lens_cpu,
-            lora_ranks=self.batch_info.lora_ranks_cpu,
+            batch_info=self.batch_info,
             slice_offsets=output_offset_cpu,
             base_output=base_output,
         )
@@ -117,19 +109,14 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         lora_a_output = sgemm_lora_a_fwd(
             inputs=x,
             weights=qkv_lora_a,
-            weight_indices=self.batch_info.weight_indices_cpu,
-            seg_len_tensor=self.batch_info.seg_lens_cpu,
-            lora_ranks=self.batch_info.lora_ranks_cpu,
-            scaling_tensor=self.batch_info.scalings,
+            batch_info=self.batch_info,
             num_slices=num_slices,
         )
 
         output_tensor = sgemm_lora_b_fwd(
             inputs=lora_a_output,
             weights=qkv_lora_b,
-            weight_indices=self.batch_info.weight_indices_cpu,
-            seg_len_tensor=self.batch_info.seg_lens_cpu,
-            lora_ranks=self.batch_info.lora_ranks_cpu,
+            batch_info=self.batch_info,
             slice_offsets=output_offset_cpu,
             base_output=base_output,
         )
@@ -152,19 +139,14 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         lora_a_output = sgemm_lora_a_fwd(
             inputs=x,
             weights=gate_up_lora_a,
-            weight_indices=self.batch_info.weight_indices_cpu,
-            seg_len_tensor=self.batch_info.seg_lens_cpu,
-            lora_ranks=self.batch_info.lora_ranks_cpu,
-            scaling_tensor=self.batch_info.scalings,
+            batch_info=self.batch_info,
             num_slices=num_slices,
         )
 
         output_tensor = sgemm_lora_b_fwd(
             inputs=lora_a_output,
             weights=gate_up_lora_b,
-            weight_indices=self.batch_info.weight_indices_cpu,
-            seg_len_tensor=self.batch_info.seg_lens_cpu,
-            lora_ranks=self.batch_info.lora_ranks_cpu,
+            batch_info=self.batch_info,
             slice_offsets=output_offset_cpu,
             base_output=base_output,
         )

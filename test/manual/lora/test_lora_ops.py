@@ -396,7 +396,6 @@ class TestLoraOps(CustomTestCase):
             seq_len_tensor,
             lora_scaling_tensor,
             vocab_size,
-            batch_size,
         )
 
         self.assertTrue(
@@ -453,7 +452,6 @@ class TestLoraOps(CustomTestCase):
             lora_indices_tensor,
             seq_len_tensor,
             lora_scaling_tensor,
-            batch_size,
         )
 
         self.assertTrue(
@@ -501,7 +499,6 @@ class TestLoraOps(CustomTestCase):
             lora_indices_tensor,
             seq_len_tensor,
             slice_offsets,
-            batch_size,
         )
 
         self.assertTrue(

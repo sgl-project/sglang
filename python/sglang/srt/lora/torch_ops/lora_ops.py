@@ -51,7 +51,7 @@ def sgemm_lora_a_fwd(
     lora_ranks: torch.Tensor,
     scaling_tensor: torch.Tensor,
     num_slices: int = 1,
-):
+) -> torch.Tensor:
     total_seq_len, input_dim = inputs.shape
     if weights.numel() == 0:
         return torch.zeros(total_seq_len, 0, dtype=inputs.dtype, device=inputs.device)
@@ -92,7 +92,7 @@ def sgemm_lora_b_fwd(
     lora_ranks: torch.Tensor,
     slice_offsets: torch.Tensor,
     base_output: Optional[torch.Tensor] = None,
-):
+) -> torch.Tensor:
     total_seq_len, _ = inputs.shape
     num_loras, weight_out_dim, _ = weights.shape
     total_output_dim = slice_offsets[-1].item() if len(slice_offsets) > 0 else 0
