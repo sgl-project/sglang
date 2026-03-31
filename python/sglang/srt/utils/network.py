@@ -365,7 +365,7 @@ def get_mooncake_transfer_engine_hostname(
     if host_ip:
         return host_ip
     if (
-        disaggregation_mode != "null"
+        disaggregation_mode in ("prefill", "decode")
         and server_host
         and server_host not in ("0.0.0.0", "::")
     ):
