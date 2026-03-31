@@ -42,6 +42,7 @@ class W4AFp8Config(QuantizationConfig):
         linear_activation_scheme: str = "dynamic",
         moe_activation_scheme: str = "static",
         ignored_layers: Optional[List[str]] = None,
+        unquantized_layers: Optional[List[str]] = None,
         weight_block_size: Optional[List[int]] = None,
         group_size: int = 128,
     ) -> None:
@@ -55,6 +56,11 @@ class W4AFp8Config(QuantizationConfig):
         self.linear_activation_scheme = linear_activation_scheme
         self.moe_activation_scheme = moe_activation_scheme
         self.ignored_layers = ignored_layers or []
+        # Layers that are truly unquantized (no FP8, no W4) — e.g. lm_head.
+        # In W4AFP8, the "ignore" list means "skip W4, use FP8 instead",
+        # so most ignored layers are still FP8-quantized.  Only layers in
+        # unquantized_layers are loaded without any quantization method.
+        self.unquantized_layers = unquantized_layers or []
         self.weight_block_size = [128, 128]
         self.group_size = group_size
 
@@ -79,15 +85,72 @@ class W4AFp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         is_checkpoint_w4afp8_serialized = "w4afp8" in quant_method
-        linear_activation_scheme = "dynamic"
-        moe_activation_scheme = "static"
-        weight_block_size = [128, 128]
+
+        # Read activation schemes from config, with sensible defaults
+        linear_activation_scheme = cls.get_from_keys_or(
+            config, ["linear_activation_scheme"], "dynamic"
+        ) or "dynamic"
+        moe_activation_scheme = cls.get_from_keys_or(
+            config, ["moe_activation_scheme"], "dynamic"
+        ) or "dynamic"
+
+        # Read ignored layers list (multiple possible key names)
+        # NOTE: In W4AFP8, "ignore" means "skip W4 quantization, use FP8 instead".
+        # Most ignored layers are still FP8-quantized in the checkpoint.
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignore", "ignored_layers", "modules_to_not_convert"], None
+        )
+        if ignored_layers:
+            # Keep both "model." and non-"model." variants for robust prefix matching
+            normalized = []
+            for layer in ignored_layers:
+                base = layer.removeprefix("model.")
+                normalized.append(base)
+                normalized.append(f"model.{base}")
+            ignored_layers = normalized
+
+        # Layers that are truly unquantized (no FP8, no W4) in the checkpoint.
+        # For example, lm_head is typically kept in float16/bfloat16.
+        # If not specified, we auto-detect from the ignore list: "lm_head" is
+        # the canonical unquantized layer in W4AFP8 checkpoints.
+        unquantized_layers = cls.get_from_keys_or(
+            config, ["modules_to_not_quantize", "unquantized_layers"], None
+        )
+        if unquantized_layers:
+            normalized_unq = []
+            for layer in unquantized_layers:
+                base = layer.removeprefix("model.")
+                normalized_unq.append(base)
+                normalized_unq.append(f"model.{base}")
+            unquantized_layers = normalized_unq
+        elif ignored_layers:
+            # Auto-detect: lm_head in ignore list → truly unquantized
+            unquantized_layers = [x for x in ignored_layers if "lm_head" in x]
+
+        weight_block_size = cls.get_from_keys_or(
+            config, ["weight_block_size"], [128, 128]
+        ) or [128, 128]
+        group_size = cls.get_from_keys_or(
+            config, ["group_size"], 128
+        ) or 128
+
+        logger.info(
+            f"W4AFp8Config: moe_activation_scheme={moe_activation_scheme}, "
+            f"linear_activation_scheme={linear_activation_scheme}, "
+            f"group_size={group_size}, "
+            f"ignored_layers={ignored_layers}, "
+            f"unquantized_layers={unquantized_layers}"
+        )
+
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             is_checkpoint_w4afp8_serialized=is_checkpoint_w4afp8_serialized,
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
+            ignored_layers=ignored_layers,
+            unquantized_layers=unquantized_layers,
             weight_block_size=weight_block_size,
+            group_size=group_size,
         )
 
     def get_quant_method(
@@ -97,7 +160,13 @@ class W4AFp8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.ignored_layers):
+            # In W4AFP8, the "ignore" list means "skip W4, use FP8 instead",
+            # so most ignored LinearBase layers are still FP8-quantized.
+            # Only layers in unquantized_layers (e.g. lm_head) are truly
+            # unquantized and should use UnquantizedLinearMethod.
+            if self.unquantized_layers and is_layer_skipped(
+                prefix, self.unquantized_layers
+            ):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
