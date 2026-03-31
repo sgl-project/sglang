@@ -28,6 +28,8 @@ register_cuda_ci(est_time=600, suite="stage-b-test-1-gpu-large")
 class TestEAGLEServerBasic(EagleServerBase):
     """Core tests that run on every server config variant."""
 
+    extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
+
     def test_request_abort(self):
         concurrency = 4
         threads = [
@@ -77,9 +79,9 @@ class TestEAGLEServerBasic(EagleServerBase):
 
 class TestEAGLEServerExtend(TestEAGLEServerBasic):
     extra_args = [
-        "--chunked-prefill-size",
-        128,
         "--max-running-requests",
+        8,
+        "--cuda-graph-max-bs",
         8,
         "--page-size",
         256,
@@ -282,11 +284,13 @@ class TestEAGLEServerExtend(TestEAGLEServerBasic):
         self.assertEqual(response.status_code, 200)
         res = response.json()
 
+        # Validate response structure
         self.assertIn("choices", res)
         self.assertEqual(len(res["choices"]), 1)
         self.assertIn("message", res["choices"][0])
         self.assertIn("content", res["choices"][0]["message"])
 
+        # Validate JSON content
         content_json = res["choices"][0]["message"]["content"]
         is_valid_json = True
         try:
