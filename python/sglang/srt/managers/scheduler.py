@@ -1747,6 +1747,7 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
+                kvcache_params=recv_req.kvcache_params,
             )
             req.tokenizer = self.tokenizer
 
@@ -1896,12 +1897,20 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
+
+                cached_token_count = (
+                    max(0, req.exkvcache.cached_token_count - matched_len)
+                    if req.exkvcache is not None
+                    else None
+                )
+
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
                     last_host_node,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
+                    cached_token_count,
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):

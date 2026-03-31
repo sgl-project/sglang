@@ -22,7 +22,7 @@ import copy
 import uuid
 from abc import ABC
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
@@ -112,6 +112,17 @@ class SessionParams:
     drop_previous_output: Optional[bool] = None
 
 
+# Parameters for explicit KVCache management
+@dataclass
+class ExKVCacheParams:
+    # The count of tokens cached in HiCacheStorage.
+    # Return this value via the response and use it as input for the next request.
+    cached_token_count: int = 0
+
+    def to_dict(self):
+        return asdict(self)
+
+
 # Type definitions for multimodal input data
 # Individual data item types for each modality
 ImageDataInputItem = Union[Image, str, ImageData, Dict]
@@ -176,6 +187,9 @@ class GenerateReqInput(BaseReq):
     modalities: Optional[List[str]] = None
     # Session info for continual prompting
     session_params: Optional[Union[List[Dict], Dict]] = None
+
+    # KVCache params for explicit management
+    kvcache_params: Optional[Union[List[Dict], Dict]] = None
 
     # The path to the LoRA adaptors
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
@@ -702,6 +716,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
 
+    # KVCache info for continual prompting
+    kvcache_params: Optional[ExKVCacheParams] = None
+
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
 
@@ -1006,6 +1023,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # kvcache params
+    kvcache_params: List[Optional[ExKVCacheParams]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1066,6 +1086,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # kvcache params
+    kvcache_params: List[Optional[ExKVCacheParams]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None

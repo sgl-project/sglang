@@ -215,6 +215,7 @@ class HiMambaRadixCache(MambaRadixCache):
             pp_rank=params.pp_rank,
             pp_size=params.pp_size,
             transfer_layer_num=self.transfer_layer_num,
+            enable_explicit_kvcache=server_args.enable_explicit_kvcache,
         )
         params.req_to_token_pool.register_layer_transfer_counter(
             self.cache_controller.layer_done_counter
@@ -1757,6 +1758,7 @@ class HiMambaRadixCache(MambaRadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        cached_token_count: Optional[int] = None,
     ):
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size
@@ -1799,6 +1801,7 @@ class HiMambaRadixCache(MambaRadixCache):
             new_input_tokens,
             last_hash,
             prefix_keys,
+            cached_token_count,
             extra_pools=extra_pools,
         )
         self.ongoing_prefetch[req_id] = (

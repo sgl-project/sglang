@@ -500,6 +500,9 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
+
+            if req.exkvcache is not None:
+                req.exkvcache.cached_token_count = new_prefix_len
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : len(keys)]

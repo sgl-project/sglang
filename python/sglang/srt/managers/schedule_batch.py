@@ -95,6 +95,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.io_struct import ExKVCacheParams
     from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -555,6 +556,7 @@ class Req(ReqDllmMixin):
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
+        kvcache_params: Optional[ExKVCacheParams] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -831,6 +833,14 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+        # For explicit KVCache
+        if kvcache_params is not None:
+            from sglang.srt.mem_cache.explicit_kvcache import ExKVCache
+
+            self.exkvcache = ExKVCache(kvcache_params)
+        else:
+            self.exkvcache = None
 
     @property
     def seqlen(self) -> int:

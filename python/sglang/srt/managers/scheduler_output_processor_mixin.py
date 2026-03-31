@@ -922,6 +922,7 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         routed_experts = None
         customized_info = {}
+        kvcache_params = []
 
         time_stats = []
 
@@ -1020,6 +1021,8 @@ class SchedulerOutputProcessorMixin:
                 retraction_counts.append(req.retraction_count)
 
                 time_stats.append(req.time_stats)
+
+                kvcache_params.append(req.exkvcache.params() if req.exkvcache else None)
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -1163,6 +1166,7 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                     dp_ranks=dp_ranks,
+                    kvcache_params=kvcache_params,
                 )
             )
 

@@ -117,12 +117,14 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        cached_token_count: Optional[int] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
     ):
         self.request_id = request_id
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        self.cached_token_count = cached_token_count
         super().__init__(
             host_indices,
             token_ids,
@@ -163,6 +165,7 @@ class HybridCacheController(BaseHiCacheController):
         pp_rank: int = 0,
         pp_size: int = 1,
         transfer_layer_num: Optional[int] = None,
+        enable_explicit_kvcache: bool = False,
     ):
         startup_storage_backend = storage_backend
         super().__init__(
@@ -179,6 +182,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=pp_rank,
             pp_size=pp_size,
+            enable_explicit_kvcache=enable_explicit_kvcache,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
@@ -348,6 +352,7 @@ class HybridCacheController(BaseHiCacheController):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        cached_token_count: Optional[int] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
@@ -356,6 +361,7 @@ class HybridCacheController(BaseHiCacheController):
             new_input_tokens,
             last_hash,
             prefix_keys=prefix_keys,
+            cached_token_count=cached_token_count,
             pool_transfers=extra_pools,
         )
         self.prefetch_queue.put(operation)

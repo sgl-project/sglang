@@ -128,6 +128,7 @@ class HiRadixCache(RadixCache):
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             enable_storage_metrics=self.enable_storage_metrics,
+            enable_explicit_kvcache=server_args.enable_explicit_kvcache,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -1297,6 +1298,7 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        cached_token_count: Optional[int] = None,
     ):
         new_input_tokens = (
             convert_to_bigram_key(new_input_tokens)
@@ -1325,7 +1327,12 @@ class HiRadixCache(RadixCache):
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            cached_token_count,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
