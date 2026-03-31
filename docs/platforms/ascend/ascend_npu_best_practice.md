@@ -408,11 +408,11 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
-
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=200
 export HCCL_SOCKET_IFNAME=lo
 export GLOO_SOCKET_IFNAME=lo
 
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=88
 export HCCL_BUFFSIZE=1600
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
@@ -424,7 +424,7 @@ export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_USE_FIA_NZ=1
-export ENABLE_MOE_NZ=1
+
 
 python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 --tp 16 \
@@ -434,13 +434,13 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 --quantization modelslim \
 --watchdog-timeout 9000 \
 --host 127.0.0.1 --port 6699 \
---cuda-graph-bs 4 8 16 \
---mem-fraction-static 0.74 \
---max-running-requests 256 \
+--cuda-graph-bs 4 8 20 21 22 \
+--mem-fraction-static 0.78 \
+--max-running-requests 352 \
 --disable-radix-cache --chunked-prefill-size -1 --max-prefill-tokens 1500 \
 --moe-a2a-backend deepep --deepep-mode auto \
 --enable-dp-attention --dp-size 16 --enable-dp-lm-head \
---speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+--speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3 \
 --dtype bfloat16
 
 ```
