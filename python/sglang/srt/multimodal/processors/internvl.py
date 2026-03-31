@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 class InternVLProcessor(BaseMultimodalProcessor):
     models = [InternVLChatModel, InternS1ForConditionalGeneration]
+    gpu_image_decode = False  # InternVL HF processor does not support tensor inputs
 
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_STD = [0.229, 0.224, 0.225]

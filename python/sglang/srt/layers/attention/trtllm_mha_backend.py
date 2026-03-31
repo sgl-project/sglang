@@ -908,6 +908,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             bmm2_scale=bmm2_scale,
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             out_dtype=q.dtype,  # model_runner.dtype
             kv_cache_sf=kv_cache_block_scales,
         )
@@ -1119,6 +1120,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 bmm2_scale=bmm2_scale,
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=q.dtype,  # fp4 kv kernel doesn't support bf16 output
                 q_len_per_req=q_seq_len,
                 mask=spec_mask,
@@ -1252,6 +1254,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
                 out_dtype=self.q_data_type,
             )
         # import sys
