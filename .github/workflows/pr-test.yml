@@ -690,7 +690,7 @@ jobs:
           pip install "setuptools<71"
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
-          pip install . --no-build-isolation
+          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
@@ -805,7 +805,7 @@ jobs:
           pip install "setuptools<71"
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
-          pip install . --no-build-isolation
+          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
