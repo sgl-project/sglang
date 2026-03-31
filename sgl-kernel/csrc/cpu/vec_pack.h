@@ -60,6 +60,7 @@ void MM512_LOAD_VEC(
   } else {
     TORCH_CHECK(false, "unsupported mask_type=", mask_type);
   }
+  // TODO: optimize the process of converting fp8 to bf16: fp8 -> bf16 -> fp32 -> bf16
   __m512bh bf16 = CVT_FP8_TO_BF16_EXT(s8);
   __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 0));
   __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16, 1));
