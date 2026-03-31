@@ -23,7 +23,7 @@ PYBIND11_MODULE(ngram_corpus_cpp, m) {
       .def_readwrite("max_bfs_breadth", &Param::max_bfs_breadth)
       .def_readwrite("min_match_window_size", &Param::min_match_window_size)
       .def_readwrite("max_match_window_size", &Param::max_match_window_size)
-      .def_readwrite("branch_length", &Param::branch_length)
+      .def_readwrite("max_trie_depth", &Param::max_trie_depth)
       .def_readwrite("draft_token_num", &Param::draft_token_num)
       .def_readwrite("match_type", &Param::match_type)
       .def_readwrite("batch_min_match_window_size", &Param::batch_min_match_window_size)

@@ -52,6 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Glm4Config = None
 
@@ -217,9 +218,10 @@ class Glm4DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
-        partial_rotary_factor = config.rope_parameters.get("partial_rotary_factor", 0.5)
+        rope_theta, rope_scaling = get_rope_config(config)
+        partial_rotary_factor = (rope_scaling or {}).get("partial_rotary_factor")
+        if partial_rotary_factor is None:
+            partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
         bias = getattr(config, "attention_bias", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)

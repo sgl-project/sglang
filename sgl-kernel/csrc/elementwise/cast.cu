@@ -1,4 +1,6 @@
-#include "pytorch_extension_utils.h"
+#include <ATen/cuda/CUDAContext.h>
+
+#include "utils.h"
 
 template <typename T>
 struct ConvertToFP8 {
@@ -118,8 +120,8 @@ void downcast_fp8_impl(
   int vec_size = 8;
   dim3 block(std::min(int(dim) / vec_size, 1024));
 
-  const T max_fp8 = static_cast<T>(448.0f);
-  const T min_fp8 = static_cast<T>(-448.0f);
+  const T max_fp8 = static_cast<T>(FP8_E4M3_MAX);
+  const T min_fp8 = static_cast<T>(-FP8_E4M3_MAX);
 
   fused_downcast_kernel<T><<<grid, block, 0, stream>>>(
       static_cast<const T*>(k.data_ptr()),

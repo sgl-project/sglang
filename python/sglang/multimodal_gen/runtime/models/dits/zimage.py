@@ -19,7 +19,10 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     UlyssesAttention,
     USPAttention,
 )
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm_with_optional_rope,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -256,16 +259,6 @@ class ZImageAttention(nn.Module):
         k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
         v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
 
-        if self.qk_norm:
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                allow_inplace=True,
-            )
-
         if freqs_cis is not None:
             cos, sin = freqs_cis
             if _is_cuda and q.shape == k.shape:
@@ -276,12 +269,42 @@ class ZImageAttention(nn.Module):
                     ],
                     dim=-1,
                 )
-                q, k = apply_flashinfer_rope_qk_inplace(
-                    q, k, cos_sin_cache, is_neox=False
-                )
+                if self.qk_norm:
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        cos_sin_cache=cos_sin_cache,
+                        is_neox=False,
+                        allow_inplace=True,
+                    )
+                else:
+                    q, k = apply_flashinfer_rope_qk_inplace(
+                        q, k, cos_sin_cache, is_neox=False
+                    )
             else:
+                if self.qk_norm:
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        allow_inplace=True,
+                    )
                 q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
                 k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+        elif self.qk_norm:
+            q, k = apply_qk_norm_with_optional_rope(
+                q=q,
+                k=k,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                allow_inplace=True,
+            )
 
         if (
             num_replicated_suffix > 0
@@ -718,12 +741,19 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         grids = torch.meshgrid(axes, indexing="ij")
         return torch.stack(grids, dim=-1)
 
+    @staticmethod
+    def _ceil_to_multiple(value: int, multiple: int) -> int:
+        if multiple <= 0:
+            return value
+        return int(math.ceil(value / multiple) * multiple)
+
     def patchify_and_embed(
         self,
         all_image: List[torch.Tensor],
         all_cap_feats: List[torch.Tensor],
         patch_size: int,
         f_patch_size: int,
+        image_seq_len_target: int | None = None,
     ):
         assert len(all_image) == len(all_cap_feats) == 1
 
@@ -761,7 +791,12 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             F_tokens * H_tokens * W_tokens, pF * pH * pW * C
         )
         image_ori_len = image.size(0)
-        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+        min_image_seq_len = self._ceil_to_multiple(image_ori_len, SEQ_MULTI_OF)
+        if image_seq_len_target is None:
+            image_seq_len_target = min_image_seq_len
+        else:
+            image_seq_len_target = max(min_image_seq_len, image_seq_len_target)
+        image_padding_len = image_seq_len_target - image_ori_len
 
         # padded feature
         image_padded_feat = torch.cat(
@@ -788,6 +823,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         patch_size=2,
         f_patch_size=1,
         freqs_cis=None,
+        image_seq_len_target: int | None = None,
         **kwargs,
     ):
         assert patch_size in self.all_patch_size
@@ -807,7 +843,13 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             x_size,
             x_valid_lens,
             cap_valid_lens,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+        ) = self.patchify_and_embed(
+            x,
+            cap_feats,
+            patch_size,
+            f_patch_size,
+            image_seq_len_target=image_seq_len_target,
+        )
 
         x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)

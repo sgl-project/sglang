@@ -178,12 +178,6 @@ class ModelConfig:
         self.is_multimodal = enable_multimodal and is_multimodal_model(
             self.hf_config.architectures
         )
-        self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
-            self.hf_config.architectures
-        )
-        self.is_image_gen = enable_multimodal and is_image_gen_model(
-            self.hf_config.architectures
-        )
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
@@ -779,6 +773,8 @@ class ModelConfig:
         return quant_cfg
 
     def _find_quant_modelslim_config(self):
+        if self.is_draft_model:
+            return None
         quant_config_file = Path(self.model_path, "quant_model_description.json")
         quant_cfg = None
         if quant_config_file.is_file():
@@ -1094,13 +1090,6 @@ class ModelConfig:
                     f"or model type {self.hf_config.model_type}. "
                     "Please upgrade transformers to >= 5.0.0."
                 )
-        elif not needs_tf_v5:
-            logger.warning(
-                f"Transformers version {tf_version_str} is used for model type {self.hf_config.model_type}. "
-                "If you experience issues related to RoPE parameters, "
-                "they may be due to incompatibilities between Transformers >=5.0.0 and some models. "
-                "You can try downgrading to transformers==4.57.1 as a workaround."
-            )
 
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
@@ -1356,14 +1345,6 @@ def is_multimodal_model(model_architectures: List[str]):
         return True
     else:
         return False
-
-
-def is_multimodal_gen_model(model_architectures: List[str]):
-    return False
-
-
-def is_image_gen_model(model_architectures: List[str]):
-    return False
 
 
 def is_audio_model(model_architectures: List[str]):
