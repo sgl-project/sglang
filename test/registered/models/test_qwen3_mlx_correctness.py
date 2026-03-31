@@ -40,7 +40,8 @@ class TestQwen3MlxCorrectness(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process is not None:
+            kill_process_tree(cls.process.pid)
 
     def _chat(self, messages, max_tokens=32, temperature=0):
         resp = requests.post(
