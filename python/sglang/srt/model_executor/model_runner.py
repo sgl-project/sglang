@@ -1108,6 +1108,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
+        # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
+        # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
+        if _is_npu:
+            torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
         # Publish metadata to ModelExpress if running as seed source
@@ -2068,7 +2072,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             is_encoder_decoder=self.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather_,
             seq_len_fill_value=seq_len_fill_value,
-            encoder_len_fill_value=0,
+            encoder_len_fill_value=(
+                getattr(self.model_config.hf_config, "max_source_positions", 0)
+                if self.model_config.is_encoder_decoder
+                else 0
+            ),
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
@@ -2379,6 +2387,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
+
+        # Some draft models (e.g. eagle3) don't have a standard 'layers' attribute
+        if not hasattr(language_model.model, "layers"):
+            logger.warning(
+                "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
+            )
+            return
+
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
@@ -2412,6 +2428,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if attn_layer is not None:
                 self.attention_layers.append(attn_layer)
+            elif hasattr(layer, "mixer"):
+                self.attention_layers.append(None)
 
             moe_block = None
             moe_fusion = None

@@ -65,6 +65,15 @@ class TestModelIdResolution(unittest.TestCase):
         info = _get_config_info(expanded, model_id="Qwen-Image")
         self.assertIsNotNone(info)
 
+    def test_hf_cache_snapshot_path_resolves_registered_nvfp4_model(self):
+        path = (
+            "/root/.cache/huggingface/hub/"
+            "models--black-forest-labs--FLUX.2-dev-NVFP4/"
+            "snapshots/142b87e70bc3006937b7093d89ff287b5f59f071"
+        )
+        info = _get_config_info(path)
+        self.assertIsNotNone(info)
+
     def test_model_id_unknown_falls_back_without_crash(self):
         # unrecognized model_id: should warn and fall back to path-based detection
         # with an unresolvable path, expect RuntimeError from the detector step
