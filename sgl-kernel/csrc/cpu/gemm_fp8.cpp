@@ -1058,6 +1058,7 @@ inline at::Tensor alloc_thread_buffer(const at::TensorOptions& options, int64_t 
   constexpr int64_t BLOCK_N = block_size_n();
   int num_threads = at::get_num_threads();
   int64_t size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * K + BLOCK_M * BLOCK_N * 2;
+  return at::empty({num_threads, size_per_thread}, options);
 }
 
 at::Tensor fp8_scaled_mm_cpu(
