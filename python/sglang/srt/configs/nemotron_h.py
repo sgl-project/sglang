@@ -32,6 +32,7 @@ MLP = "-"
 MOE = "E"
 DEFAULT_LAYERS_BLOCK_TYPE = ["mamba", "moe", "attention", "moe"]
 DEFAULT_MTP_LAYERS_BLOCK_TYPE = ["attention", "moe"]
+DEFAULT_MAMBA_CHUNK_SIZE = 256
 
 
 class NemotronHConfig(PretrainedConfig):
@@ -213,6 +214,28 @@ class NemotronHConfig(PretrainedConfig):
                 mtp_layers_block_type = NemotronHConfig._pattern_to_list(pattern)
         return mtp_layers_block_type
 
+    @staticmethod
+    def _resolve_mamba_chunk_size(mamba_chunk_size, kwargs) -> int:
+        """Resolve canonical mamba_chunk_size from new and legacy config fields."""
+        chunk_size = kwargs.pop("chunk_size", None)
+        if (
+            mamba_chunk_size is not None
+            and chunk_size is not None
+            and mamba_chunk_size != chunk_size
+        ):
+            logger.warning(
+                "Both chunk_size=%s and mamba_chunk_size=%s were provided. "
+                "Using mamba_chunk_size.",
+                chunk_size,
+                mamba_chunk_size,
+            )
+
+        if mamba_chunk_size is None:
+            mamba_chunk_size = chunk_size
+        if mamba_chunk_size is None:
+            mamba_chunk_size = DEFAULT_MAMBA_CHUNK_SIZE
+        return mamba_chunk_size
+
     def __init__(
         self,
         vocab_size=131072,
@@ -255,7 +278,7 @@ class NemotronHConfig(PretrainedConfig):
         mamba_dt_init_floor=1e-4,
         mamba_conv_bias=True,
         mamba_proj_bias=False,
-        mamba_chunk_size=256,
+        mamba_chunk_size=None,
         rescale_prenorm_residual=True,
         n_routed_experts=8,
         n_shared_experts=1,
@@ -271,6 +294,8 @@ class NemotronHConfig(PretrainedConfig):
         mtp_layers_block_type=DEFAULT_MTP_LAYERS_BLOCK_TYPE,
         **kwargs,
     ):
+        mamba_chunk_size = self._resolve_mamba_chunk_size(mamba_chunk_size, kwargs)
+
         # Compatibility parsing: normalize legacy pattern fields into canonical list fields.
         layers_block_type = self._resolve_layers_block_type(
             layers_block_type, hybrid_override_pattern, kwargs

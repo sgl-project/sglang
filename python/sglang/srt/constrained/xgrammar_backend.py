@@ -29,10 +29,10 @@ from xgrammar import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
     GrammarStats,
+    InvalidGrammarObject,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
@@ -104,11 +104,7 @@ class XGrammarGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if (
-            logits.device.type == "cuda"
-            or logits.device.type == "npu"
-            or logits.device.type == "xpu"
-        ):
+        if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
@@ -266,7 +262,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
         except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
 
     def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
@@ -274,7 +270,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             ctx = self.grammar_compiler.compile_grammar(key_string)
         except RuntimeError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
@@ -282,7 +278,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             ctx = self.grammar_compiler.compile_regex(key_string)
         except RuntimeError as e:
             logger.error(f"Hit invalid regex: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
@@ -311,7 +307,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 ctx = self.grammar_compiler.compile_structural_tag(key_string)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")
         )

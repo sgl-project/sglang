@@ -183,6 +183,48 @@ class RocmPlatform(Platform):
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # works for ROCm too
 
     @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Replace nn.GroupNorm with AITer GroupNorm for improved ROCm VAE performance."""
+        if not envs.SGLANG_USE_ROCM_VAE:
+            return vae
+        try:
+            from aiter.ops.groupnorm import GroupNorm as AiterGroupNorm
+
+            count = cls._replace_groupnorm(vae, AiterGroupNorm)
+            if count > 0:
+                logger.info(
+                    "Replaced %d nn.GroupNorm modules with AITer GroupNorm in VAE",
+                    count,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to apply AITer GroupNorm to VAE.",
+                exc_info=True,
+            )
+        return vae
+
+    @staticmethod
+    def _replace_groupnorm(module: torch.nn.Module, aiter_gn_cls: type) -> int:
+        count = 0
+        for name, child in module.named_children():
+            if isinstance(child, torch.nn.GroupNorm) and child.affine:
+                replacement = aiter_gn_cls(
+                    num_groups=child.num_groups,
+                    num_channels=child.num_channels,
+                    eps=child.eps,
+                    affine=True,
+                    device=child.weight.device,
+                    dtype=child.weight.dtype,
+                )
+                replacement.weight = child.weight
+                replacement.bias = child.bias
+                setattr(module, name, replacement)
+                count += 1
+            else:
+                count += RocmPlatform._replace_groupnorm(child, aiter_gn_cls)
+        return count
+
+    @classmethod
     def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
         """ROCm performs better without DIT layerwise offload on Wan."""
         return False

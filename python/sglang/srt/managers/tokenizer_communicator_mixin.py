@@ -352,9 +352,13 @@ class TokenizerCommunicatorMixin:
             ]
         )
 
-    async def flush_cache(self: TokenizerManager) -> FlushCacheReqOutput:
+    async def flush_cache(
+        self: TokenizerManager, timeout_s: Optional[float] = None
+    ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+        return (
+            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+        )[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

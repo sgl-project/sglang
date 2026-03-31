@@ -774,12 +774,6 @@ class NemotronHForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> None:
-        updated_weights = []
-        for name, loaded_weight in weights:
-            name = replace_prefix(name, self.remap_prefix)
-            name = replace_substrings(name, self.remap_substr)
-            updated_weights.append((name, loaded_weight))
-
         # - FusedMoe.w1 (aka gate_proj) should be up_proj since that's
         #   what the activation is applied to
         # - FusedMoe.w3 (aka up_proj) should be ignored since we're
@@ -793,7 +787,13 @@ class NemotronHForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
-        for name, loaded_weight in updated_weights:
+        # Stream weights directly from the generator to avoid buffering
+        # the entire checkpoint (~75 GB) into a Python list. On unified-
+        # memory systems (e.g. DGX Spark, 119 GB) the old buffered path
+        # caused OOM: skeleton 81.6 GB + buffer 75 GB = 157 GB peak.
+        for name, loaded_weight in weights:
+            name = replace_prefix(name, self.remap_prefix)
+            name = replace_substrings(name, self.remap_substr)
             if is_mtp:
                 if "mtp" not in name:
                     continue

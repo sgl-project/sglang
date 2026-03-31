@@ -10,7 +10,6 @@ from utils import compare_versions, get_repo_root, normalize_version, validate_v
 FILES_TO_UPDATE = [
     Path("python/pyproject.toml"),
     Path("docker/Dockerfile"),
-    Path("scripts/ci/cuda/ci_install_dependency.sh"),
     Path("python/sglang/srt/entrypoints/engine.py"),
     Path("python/sglang/srt/utils/common.py"),
 ]
@@ -49,12 +48,6 @@ def replace_flashinfer_version(
     elif name == "Dockerfile":
         new_content = re.sub(
             rf"(ARG FLASHINFER_VERSION=){re.escape(old_version)}",
-            rf"\g<1>{new_version}",
-            new_content,
-        )
-    elif name == "ci_install_dependency.sh":
-        new_content = re.sub(
-            rf"(FLASHINFER_VERSION=){re.escape(old_version)}",
             rf"\g<1>{new_version}",
             new_content,
         )

@@ -116,7 +116,15 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
-INVALID_GRAMMAR_OBJ = BaseGrammarObject()
+class InvalidGrammarObject(BaseGrammarObject):
+    """Represents a grammar that failed to compile, carrying the original error message."""
+
+    def __init__(self, error_message: str = "Unknown grammar error"):
+        super().__init__()
+        self.error_message = error_message
+
+    def __repr__(self):
+        return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
 
 class BaseGrammarBackend:
@@ -126,7 +134,7 @@ class BaseGrammarBackend:
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
-        return INVALID_GRAMMAR_OBJ
+        return InvalidGrammarObject()
 
     def dispatch_fallback(self, key_type: str, key_string: str) -> BaseGrammarObject:
         """
