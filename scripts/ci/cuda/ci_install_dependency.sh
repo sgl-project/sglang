@@ -223,7 +223,15 @@ if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
-$PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+# Pre-download nvidia wheels that torch pins (pypi.nvidia.com sets no-store,
+# so pip re-downloads ~830 MB every run). Cache them locally with --find-links.
+NVIDIA_WHEEL_CACHE="/root/.cache/nvidia-wheels"
+mkdir -p "$NVIDIA_WHEEL_CACHE"
+pip download nvidia-cudnn-cu12==9.10.2.21 nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} \
+    nvidia-nvshmem-cu12==3.3.20 nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} \
+    -d "$NVIDIA_WHEEL_CACHE" --no-deps -q 2>/dev/null || true
+$PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} \
+    --find-links "$NVIDIA_WHEEL_CACHE" $PIP_INSTALL_SUFFIX
 
 mark_step_done "Install main package"
 
@@ -339,7 +347,7 @@ INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" 
 if [ "$INSTALLED_NVSHMEM" = "$NVIDIA_NVSHMEM_VERSION" ]; then
     echo "nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} already installed, skipping reinstall"
 else
-    $PIP_CMD install nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} $PIP_INSTALL_SUFFIX
+    $PIP_CMD install nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION} --find-links "$NVIDIA_WHEEL_CACHE" $PIP_INSTALL_SUFFIX
 fi
 
 # Fix dependencies: Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
@@ -347,7 +355,7 @@ INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | aw
 if [ "$INSTALLED_CUDNN" = "$NVIDIA_CUDNN_VERSION" ]; then
     echo "nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} already installed, skipping reinstall"
 else
-    $PIP_CMD install nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} $PIP_INSTALL_SUFFIX
+    $PIP_CMD install nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION} --find-links "$NVIDIA_WHEEL_CACHE" $PIP_INSTALL_SUFFIX
 fi
 
 mark_step_done "Fix other dependencies"
