@@ -109,6 +109,7 @@ class ChatCompletionSampler(SamplerBase):
         self.reasoning_effort = reasoning_effort
         self.extra_body = extra_body
         self.image_format = "url"
+        self._completion_tokens: list[int] = []
         print(
             f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=}"
         )
@@ -151,6 +152,8 @@ class ChatCompletionSampler(SamplerBase):
                     reasoning_effort=self.reasoning_effort,
                     extra_body=self.extra_body,
                 )
+                if response.usage and response.usage.completion_tokens is not None:
+                    self._completion_tokens.append(response.usage.completion_tokens)
                 return response.choices[0].message.content or ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
