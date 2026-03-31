@@ -89,11 +89,13 @@ class DiffusionCudaGraphRunner:
         runner.replay(timestep, latents)  # no re-capture needed
     """
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, pool=None):
         self.device = device
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         # Shared memory pool — avoids fragmentation across captures.
-        self.pool = torch.cuda.graph_pool_handle()
+        # If pool is provided externally, use it (shared across runners).
+        # Otherwise create a private pool (backward compatible).
+        self.pool = pool if pool is not None else torch.cuda.graph_pool_handle()
         self.input_buffers: dict[str, torch.Tensor] = {}
         # Persistent buffers for static kwargs (encoder_hidden_states, etc.)
         self.static_buffers: dict[str, object] = {}
