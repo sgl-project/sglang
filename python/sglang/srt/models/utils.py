@@ -422,6 +422,7 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and not envs.SGLANG_ENABLE_TORCH_COMPILE.get()  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
@@ -437,16 +438,16 @@ def apply_qk_norm(
     if alt_stream is not None and get_is_capture_mode():
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
-        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = q.view(*q.shape[:-1], -1, head_dim)
         q_by_head = q_norm(q_by_head)
         with torch.cuda.stream(alt_stream):
-            k_by_head = k.reshape(-1, head_dim)
+            k_by_head = k.view(*k.shape[:-1], -1, head_dim)
             k_by_head = k_norm(k_by_head)
         current_stream.wait_stream(alt_stream)
     else:
-        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = q.view(*q.shape[:-1], -1, head_dim)
         q_by_head = q_norm(q_by_head)
-        k_by_head = k.reshape(-1, head_dim)
+        k_by_head = k.view(*k.shape[:-1], -1, head_dim)
         k_by_head = k_norm(k_by_head)
     q = q_by_head.view(q.shape)
     k = k_by_head.view(k.shape)

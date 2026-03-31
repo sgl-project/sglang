@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
+    fp8_min,
     is_fp8_fnuz,
     mxfp8_block_scaled_matmul_triton,
     per_token_group_quant_fp8,
@@ -28,6 +29,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -1455,12 +1457,27 @@ def apply_fp8_linear(
         num_token_padding = output_padding
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             num_token_padding = None
-        qinput, x_scale = scaled_fp8_quant(
-            input_2d,
-            input_scale,
-            num_token_padding=num_token_padding,
-            use_per_token_if_dynamic=use_per_token_if_dynamic,
-        )
+        # For static per-tensor scales, use pure PyTorch ops instead of the
+        # opaque sgl_kernel quant kernel. Inductor can fuse these with
+        # surrounding ops (RMSNorm, residual add), eliminating a separate
+        # kernel launch per linear layer.
+        if (
+            input_scale is not None
+            and input_scale.numel() == 1
+            and weight_scale.numel() == 1
+            and envs.SGLANG_ENABLE_TORCH_COMPILE.get()
+        ):
+            qinput = (input_2d * input_scale.reciprocal()).clamp(
+                min=fp8_min, max=fp8_max
+            ).to(fp8_dtype)
+            x_scale = input_scale
+        else:
+            qinput, x_scale = scaled_fp8_quant(
+                input_2d,
+                input_scale,
+                num_token_padding=num_token_padding,
+                use_per_token_if_dynamic=use_per_token_if_dynamic,
+            )
     else:
         # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
         if input_scale is not None:
