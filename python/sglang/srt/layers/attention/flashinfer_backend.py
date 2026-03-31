@@ -138,9 +138,22 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
 
+        self.is_nvfp4_kvcache = model_runner.kv_cache_dtype == torch.float4_e2m1fn_x2
+        self.dq_page_table = None
+        self.dq_paged_kernel_lens = None
+        self.cpu_req_pool_indices = None
+        self.transfer_cur_chunk_kv = False
+        # For nvfp4 kv cache, we don't use flashinfer-decode, and we use fp8 kv cache for prefill, so set kv_cache_dtype_alias
+        # to pass the checks
+        self.kv_cache_dtype_alias = (
+            model_runner.kv_cache_dtype
+            if not self.is_nvfp4_kvcache
+            else torch.float8_e4m3fn
+        )
+
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
-            kv_cache_dtype=model_runner.kv_cache_dtype,
+            kv_cache_dtype=self.kv_cache_dtype_alias,
             num_attention_heads=model_runner.model_config.num_attention_heads
             // get_attention_tp_size(),
             num_kv_heads=model_runner.model_config.get_num_kv_heads(
@@ -305,6 +318,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
+        self.page_size = model_runner.page_size
+
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
     ) -> MultiItemScoringParams:
@@ -427,6 +442,74 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
+    def _prepare_nvfp4_metadata_for_extend_base(
+        self, forward_batch: ForwardBatch, use_ragged: bool = False
+    ):
+        """This must be called after init_forward_metadata/capture_cuda_graph/replay_cuda_graph"""
+        # construct nvfp4 kv cache dequant page table for extend stage
+        self.dq_page_table = None
+        self.dq_paged_kernel_lens = None
+        self.cpu_req_pool_indices = None
+        if (
+            self.is_nvfp4_kvcache
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            if use_ragged:
+                paged_seq_lens_cpu = forward_batch.extend_prefix_lens_cpu
+            else:
+                paged_seq_lens_cpu = forward_batch.seq_lens_cpu
+            if not isinstance(paged_seq_lens_cpu, list):
+                paged_seq_lens_cpu = paged_seq_lens_cpu.tolist()
+            if sum(paged_seq_lens_cpu) > 0:
+                # dq_buffer layout is page-aligned: each request occupies
+                # ceil(seq_len/page_size)*page_size slots, starting after a
+                # page_size dummy prefix.  We build dq_page_table (kv_indices)
+                # that maps only the *actual* token positions (skipping padding
+                # gaps), and dq_paged_kernel_lens stores the real seq_lens so
+                # that kv_indptr reflects exact lengths.  This ensures the
+                # flashinfer causal offset = seq_len - q_len (correct), not
+                # page_align(seq_len) - q_len (wrong, leaks future tokens).
+                paged_seq_lens_cpu.append(256)
+                import numpy as np
+
+                seq_lens_arr = np.array(paged_seq_lens_cpu)
+                padded_lens = (
+                    (seq_lens_arr + self.page_size - 1)
+                    // self.page_size
+                    * self.page_size
+                )
+
+                # Compute page-aligned start offsets in dq_buffer
+                # (skip page_size dummy at the beginning)
+                starts = np.empty(len(seq_lens_arr) + 1, dtype=np.int64)
+                starts[0] = self.page_size
+                np.cumsum(padded_lens, out=starts[1:])
+                starts[1:] += self.page_size
+
+                # Build kv_indices: for each request, only include the
+                # actual data positions [start, start+actual_len), skipping
+                # the padding [start+actual_len, start+padded_len).
+                indices = []
+                for i in range(len(seq_lens_arr)):
+                    indices.append(np.arange(starts[i], starts[i] + seq_lens_arr[i]))
+                self.dq_page_table = torch.tensor(
+                    np.concatenate(indices),
+                    device=forward_batch.req_pool_indices.device,
+                    dtype=torch.int32,
+                )
+
+                # Use actual (non-padded) lengths for kv_indptr so causal
+                # masking computes the correct offset.  Exclude the trailing
+                # 256-token buffer entry.
+                self.dq_paged_kernel_lens = torch.tensor(
+                    seq_lens_arr[:-1].tolist(),
+                    dtype=torch.int32,
+                    device=forward_batch.req_pool_indices.device,
+                )
+            self.cpu_req_pool_indices = forward_batch.req_pool_indices.to(
+                "cpu", non_blocking=True
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -496,6 +579,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
+            self._prepare_nvfp4_metadata_for_extend_base(forward_batch, use_ragged)
+
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -508,6 +593,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
+                custom_kv_indices=self.dq_page_table,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -515,6 +601,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
             )
+        # For none-ragged case, we transfer current chunk into dq kv table
+        self.transfer_cur_chunk_kv = not self.forward_metadata.use_ragged
 
     def init_cuda_graph_state(
         self,
@@ -626,6 +714,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+            self.transfer_cur_chunk_kv = not self.forward_metadata.use_ragged
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -656,6 +745,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+            self.transfer_cur_chunk_kv = not self.forward_metadata.use_ragged
         elif forward_mode.is_dllm_extend():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -775,17 +865,57 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
-        if not self.forward_metadata.use_ragged:
-            if k is not None:
-                assert v is not None
-                if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
 
+        assert not (
+            self.is_nvfp4_kvcache and layer.is_cross_attention
+        ), "NVFP4 dequant KV cache is not supported for cross-attention"
+
+        # We perform dequant for chunk prefill/cache reuse.
+        pool = forward_batch.token_to_kv_pool
+        if self.is_nvfp4_kvcache:
+            if self.dq_page_table is not None:
+                # For paged path (not use_ragged), the paged attention uses the dq buffer for
+                # ALL tokens (prefix + current chunk). Current chunk must be written to dq workspace.
+                # For ragged path (use_ragged), flashinfer handles new-to-new with raw k/v; dq not used.
+                transfer_cur_kv = not self.forward_metadata.use_ragged
+                k_cur_fp8 = (
+                    k.to(torch.float8_e4m3fn)
+                    if (k is not None and transfer_cur_kv)
+                    else None
+                )
+                v_cur_fp8 = (
+                    v.to(torch.float8_e4m3fn)
+                    if (v is not None and transfer_cur_kv)
+                    else None
+                )
+                pool.dequant_kv_for_extend(
+                    layer.layer_id,
+                    forward_batch.req_to_token_pool.req_to_token,
+                    self.cpu_req_pool_indices,
+                    forward_batch.extend_prefix_lens_cpu,
+                    forward_batch.extend_seq_lens_cpu,
+                    self.page_size,
+                    k_cur_fp8=k_cur_fp8,
+                    v_cur_fp8=v_cur_fp8,
+                )
+            k_buffer_dq, v_buffer_dq = pool.get_dq_kv_buffer()
+            k_paged = k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim)
+            v_paged = v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim)
+            kv_cache = (k_paged, v_paged)
+        else:
+            kv_cache = pool.get_kv_buffer(layer.layer_id)
+
+        # use paged attention
+        if not self.forward_metadata.use_ragged:
+            if k is not None and save_kv_cache:
+                assert v is not None
+                # For NVFP4, global scales are auto-resolved from pool.quant_method.
+                pool.set_kv_buffer(layer, cache_loc, k, v, layer.k_scale, layer.v_scale)
+
+            # We need to process the paged part for nvfp4 kv cache
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                kv_cache,
                 causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
@@ -813,6 +943,9 @@ class FlashInferAttnBackend(AttentionBackend):
             # previously cached context without re-materializing KV tensors (e.g., the
             # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
             if k is None and v is None:
+                assert (
+                    not self.is_nvfp4_kvcache
+                ), "KV cache must be provided for ragged attention when using NVFP4 kv cache"
                 k = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
                 v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
@@ -853,7 +986,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    kv_cache,
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
@@ -862,9 +995,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
+                # For NVFP4, global scales are auto-resolved from pool.quant_method.
+                pool.set_kv_buffer(layer, cache_loc, k, v, layer.k_scale, layer.v_scale)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -929,7 +1061,7 @@ class FlashInferIndicesUpdaterDecode:
             get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.data_type = model_runner.kv_cache_dtype
+        self.data_type = attn_backend.kv_cache_dtype_alias
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1192,7 +1324,7 @@ class FlashInferIndicesUpdaterPrefill:
             get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.data_type = model_runner.kv_cache_dtype
+        self.data_type = attn_backend.kv_cache_dtype_alias
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1244,6 +1376,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        custom_kv_indices: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1269,6 +1402,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            custom_kv_indices=custom_kv_indices,
         )
 
     def update_sliding_window(
@@ -1379,32 +1513,51 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        custom_kv_indices: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
+            # When using custom_kv_indices (NVFP4 dq_page_table), use the
+            # actual (non-padded) seq_lens stored in dq_paged_kernel_lens for
+            # kv_indptr.  The dq_page_table already maps only the real data
+            # positions (skipping page-aligned padding gaps), so kv_indptr
+            # must reflect the exact token count to get correct causal offsets.
+            if (
+                custom_kv_indices is not None
+                and self.attn_backend.dq_paged_kernel_lens is not None
+            ):
+                kv_indptr[1 : bs + 1] = torch.cumsum(
+                    self.attn_backend.dq_paged_kernel_lens, dim=0
+                )
+            else:
+                kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
+
             # Reserve extra space in kv_indices for a potential piecewise CUDA graph
             # dummy request (see below). Worst case: static_num_tokens extra pages.
             fwd_ctx = get_forward_context()
             pcg_num_tokens = fwd_ctx.num_tokens if fwd_ctx is not None else None
             extra_kv = pcg_num_tokens if pcg_num_tokens is not None else 0
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + extra_kv + 256,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
+
+            if custom_kv_indices is not None:
+                kv_indices = custom_kv_indices
+            else:
+                kv_indices = torch.empty(
+                    paged_kernel_lens_sum + extra_kv + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    paged_kernel_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices,
+                    self.req_to_token.shape[1],
+                )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
 
@@ -1466,6 +1619,7 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         if use_sliding_window_kv_pool:
+            assert not custom_kv_indices, "custom_kv_indices incompatible with SWA"
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
                 self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(

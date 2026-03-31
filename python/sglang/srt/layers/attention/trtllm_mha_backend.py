@@ -23,7 +23,11 @@ from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
+from sglang.srt.utils.common import (
+    is_sm90_supported,
+    is_sm100_supported,
+    is_sm120_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,10 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
+    # Prefix length, for NVFP4 KV Cache
+    # prefix_lengths_kv_cpu: torch.Tensor = None
+    # # Extend lengths, for NVFP4 KV Cache
+    # extend_lengths_kv_cpu: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -138,6 +146,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
+
+        self.is_sm100_gpu = is_sm100_supported()
+        self.is_nvfp4_kvcache = self.data_type == torch.float4_e2m1fn_x2
 
         # Init backend (XQA or TRTLLM-GEN)
         # We need to specify q_type and out_type for different backend
@@ -438,7 +449,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
             self.draft_extend_metadata[bs] = metadata
+
+            # if self.is_nvfp4_kvcache:
+            #     self.extend_lengths_kv_cpu = torch.full(
+            #         (bs,), num_tokens_per_bs, dtype=torch.int32, device="cpu")
+            #     self.prefix_lengths_kv_cpu = seq_lens.to("cpu", non_blocking=True) - self.extend_lengths_kv_cpu
+
         self.forward_metadata = metadata
+        # self._prepare_nvfp4_metadata_for_extend(forward_mode, req_pool_indices)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -543,7 +561,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+            # if self.is_nvfp4_kvcache:
+            #     self.extend_lengths_kv_cpu = accept_length.to("cpu", non_blocking=True)
+            #     self.prefix_lengths_kv_cpu = seq_lens_cpu - self.extend_lengths_kv_cpu
         self.forward_metadata = metadata
+        # self._prepare_nvfp4_metadata_for_extend(forward_mode, req_pool_indices)
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
@@ -674,10 +696,38 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
+            # construct nvfp4 kv cache dequant page table for extend stage
+            if self.data_type == torch.float4_e2m1fn_x2:
+                num_pages_per_req = (
+                    metadata.max_seq_len_k + self.page_size - 1
+                ) // self.page_size
+            # if self.is_nvfp4_kvcache:
+            #     self.extend_lengths_kv_cpu = forward_batch.extend_seq_lens_cpu
+            #     self.prefix_lengths_kv_cpu = forward_batch.extend_prefix_lens_cpu
+
+            # if self.is_nvfp4_kvcache:
+            #     num_pages_per_req = (
+            #         metadata.max_seq_len_k + self.page_size - 1
+            #     ) // self.page_size
+
+            #     row_offsets = torch.arange(
+            #         0, num_pages_per_req, device=self.device, dtype=torch.int32
+            #     ).unsqueeze(0)
+            #     batch_offsets = (
+            #         metadata.cu_seqlens_k + self.page_size - 1
+            #     ) // self.page_size
+            #     batch_offsets = batch_offsets.unsqueeze(1)
+            #     self.dq_page_table = row_offsets + batch_offsets + 1
+            #     self.dq_page_table = self.dq_page_table.to(torch.int32)
+            #     self.cpu_req_pool_indices = forward_batch.req_pool_indices.to(
+            #         "cpu", non_blocking=True
+            #     )
+
+        # Convert the page tables to a strided format
         # Compute SWA page table (None for non-SWA models)
         metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
 
-        # Convert the page tables to a strided format
+        # Convert the page table to a strided format
         if self.page_size > 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
@@ -692,6 +742,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.forward_metadata = metadata
 
+        # self._prepare_nvfp4_metadata_for_extend(forward_batch)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -702,59 +754,122 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        """Run forward for decode using TRTLLM MHA kernel."""
+        """
+        Run forward for decode using TRTLLM MHA kernel.
+        DECODE
+        """
         cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
-        if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
-            )
-            k = None
-            v = None
-        else:
-            # Use original set_kv_buffer path
-            if save_kv_cache and k is not None:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+        # k/v scale for attention BMM (FP8 path needs a float; default 1.0)
+        k_scale = (
+            layer.k_scale
+            if (hasattr(layer, "k_scale") and layer.k_scale is not None)
+            else 1.0
+        )
+        v_scale = (
+            layer.v_scale
+            if (hasattr(layer, "v_scale") and layer.v_scale is not None)
+            else 1.0
+        )
+        # k/v scale for set_kv_buffer: pass None so pool auto-resolves NVFP4 per-layer scales
+        kv_store_k_scale = (
+            layer.k_scale
+            if (hasattr(layer, "k_scale") and layer.k_scale is not None)
+            else None
+        )
+        kv_store_v_scale = (
+            layer.v_scale
+            if (hasattr(layer, "v_scale") and layer.v_scale is not None)
+            else None
+        )
+
+        pool = forward_batch.token_to_kv_pool
+
+        # save k/v cache to kv pool
+        if save_kv_cache and k is not None:
+            if use_fused_fp8_path:
+                # fused fp8 quant + write kv cache
+                self._fused_fp8_set_kv_buffer(
+                    q=q,
+                    k=k,
+                    v=v,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                )
+                k = None
+                v = None
+            else:
+                # For NVFP4, pool auto-resolves global scales from quant_method.
+                pool.set_kv_buffer(
+                    layer, cache_loc, k, v, kv_store_k_scale, kv_store_v_scale
                 )
 
         # For XQA, q_dtype should be bf16
-        if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
+        if (self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache) and (
+            not self.is_xqa_impl
+        ):
             q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # shape conversion:
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
 
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
+        # prepare kv cache
+        if self.is_nvfp4_kvcache:
+            raw = pool.get_raw_kv_buffer(layer.layer_id)
+            k_cache, k_cache_scales = raw["k"], raw["k_scale"]
+            v_cache, v_cache_scales = raw["v"], raw["v_scale"]
+            k_cache = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim // 2
+            ).permute(0, 2, 1, 3)
+            v_cache = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim // 2
+            ).permute(0, 2, 1, 3)
 
-        kv_cache = (k_cache, v_cache)
+            k_cache_scales = k_cache_scales.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim // 16
+            ).permute(0, 2, 1, 3)
+            v_cache_scales = v_cache_scales.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim // 16
+            ).permute(0, 2, 1, 3)
+
+            if layer.tp_k_head_num == 1:
+                k_cache = canonicalize_stride(k_cache)
+                k_cache_scales = canonicalize_stride(k_cache_scales)
+            if layer.tp_v_head_num == 1:
+                v_cache = canonicalize_stride(v_cache)
+                v_cache_scales = canonicalize_stride(v_cache_scales)
+
+            kv_cache = (k_cache, v_cache)
+            kv_cache_block_scales = (k_cache_scales, v_cache_scales)
+
+        else:
+            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
+            # shape conversion:
+            # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
+            k_cache = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            v_cache = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+
+            if layer.tp_k_head_num == 1:
+                k_cache = canonicalize_stride(k_cache)
+            if layer.tp_v_head_num == 1:
+                v_cache = canonicalize_stride(v_cache)
+            kv_cache = (k_cache, v_cache)
+            kv_cache_block_scales = None
 
         # TODO: add support for quantization
         q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
+        # k_scale = (
+        #     layer.k_scale_float
+        #     if getattr(layer, "k_scale_float", None) is not None
+        #     else 1.0
+        # )
+
         bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm2_scale = v_scale
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
@@ -762,6 +877,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Call TRT-LLM kernel
         # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
+
+        # torch.cuda.synchronize()
+        # prefix = "./unit_test/"
+        # torch.save(q, f"{prefix}/query.pt")
+        # torch.save(kv_cache, f"{prefix}/kv_cache.pt")
+        # torch.save(self.workspace_buffer, f"{prefix}/workspace_buffer.pt")
+        # torch.save(self.forward_metadata.page_table, f"{prefix}/block_tables.pt")
+        # torch.save(self.forward_metadata.cache_seqlens_int32, f"{prefix}/seq_lens.pt")
+
+        # torch.save(self.max_context_len, f"{prefix}/max_seq_len.pt")
+        # torch.save(bmm1_scale, f"{prefix}/bmm1_scale.pt")
+        # torch.save(bmm2_scale, f"{prefix}/bmm2_scale.pt")
+        # torch.save(layer.sliding_window_size, f"{prefix}/window_left.pt")
+        # torch.save(attention_sink, f"{prefix}/sinks.pt")
+        # torch.save(kv_cache_block_scales, f"{prefix}/kv_block_scales.pt")
+        # exit(0)
+
+        # FIXME(Sam): Here XQA only support fp16 input for now, we will add bf16 support when flashinfer release.
+        if self.is_xqa_impl and self.is_nvfp4_kvcache:
+            q = q.to(torch.float16)
         o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=kv_cache,
@@ -774,9 +909,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-            out_dtype=self.q_data_type,  # model_runner.dtype
+            out_dtype=q.dtype,  # model_runner.dtype
+            kv_cache_sf=kv_cache_block_scales,
         )
-
+        o = o.to(self.q_data_type)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_extend(
@@ -789,67 +925,195 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        """
+        Target-Prefill[EXTEND](w/o cudagraph), context_api
+        Draft-Prefill [EXTEND](w/o cudagraph), context_api
+        Draft-Extend  [DRAFT_EXTEND](cudagraph), context_api
+        Target-Verify [TARGET_VERIFY](cudagraph), decode_api
+        """
         cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
-        if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
-            self._fused_fp8_set_kv_buffer(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
-            )
-            k = None
-            v = None
-        else:
-            # Use original set_kv_buffer path
-            if save_kv_cache and k is not None:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+        # process k/v global scale (for FP8 attention BMM; NVFP4 scales are in pool.quant_method)
+        k_scale = (
+            layer.k_scale
+            if (hasattr(layer, "k_scale") and layer.k_scale is not None)
+            else 1.0
+        )
+        v_scale = (
+            layer.v_scale
+            if (hasattr(layer, "v_scale") and layer.v_scale is not None)
+            else 1.0
+        )
+        kv_store_k_scale = (
+            layer.k_scale
+            if (hasattr(layer, "k_scale") and layer.k_scale is not None)
+            else None
+        )
+        kv_store_v_scale = (
+            layer.v_scale
+            if (hasattr(layer, "v_scale") and layer.v_scale is not None)
+            else None
+        )
+
+        pool = forward_batch.token_to_kv_pool
+
+        # save k/v cache to kv pool
+        if save_kv_cache and k is not None:
+            if use_fused_fp8_path:
+                # Use fused FP8 quantization + KV cache write path
+                self._fused_fp8_set_kv_buffer(
+                    q=q,
+                    k=k,
+                    v=v,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                )
+                k = None
+                v = None
+            else:
+                # For NVFP4, pool auto-resolves global scales from quant_method.
+                pool.set_kv_buffer(
+                    layer, cache_loc, k, v, kv_store_k_scale, kv_store_v_scale
                 )
 
-        if self.data_type == torch.float8_e4m3fn:
-            q = q.to(torch.float8_e4m3fn)
+        if (
+            self.is_nvfp4_kvcache
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            # path:
+            #   1. nvfp4, target model prefill/chunkedprefill, w/o cudagraph, is_extend_without_speculative(), context mha kernel
+            #   2. nvfp4, draft model prefill/chunkedprefill, w/o cudagraph, is_extend_without_speculative(), context mha kernel
+
+            # Convert current k/v to fp8 for writing into dequant workspace
+            k_cur_fp8 = k.to(torch.float8_e4m3fn) if k is not None else None
+            v_cur_fp8 = v.to(torch.float8_e4m3fn) if v is not None else None
+
+            k_buffer_dq, v_buffer_dq = pool.dequant_kv_for_extend(
+                layer.layer_id,
+                forward_batch.req_to_token_pool.req_to_token,
+                self.cpu_req_pool_indices,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                self.page_size,
+                k_cur_fp8=k_cur_fp8,
+                v_cur_fp8=v_cur_fp8,
+            )
+
+            k_paged = k_buffer_dq.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            v_paged = v_buffer_dq.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            if layer.tp_k_head_num == 1:
+                k_paged = canonicalize_stride(k_paged)
+            if layer.tp_v_head_num == 1:
+                v_paged = canonicalize_stride(v_paged)
+            # logger.info(f"[NVFP4 Extend {layer.layer_id}] {k_paged.shape=}, {v_paged.shape=}, {k_buffer_dq.shape=}, {k_buffer_nvfp4.shape=}, {k_scales_buffer.shape=}, {k_cur_fp8.shape=}, {v_cur_fp8.shape=}")
+
+            # logger.debug(
+            #     f"[NVFP4 Path Optimized] Reshaped to paged format: "
+            #     f"k_paged.shape={k_paged.shape}, v_paged.shape={v_paged.shape}"
+            # )
+
+            # Use paged KV cache for attention
+            kv_cache = (k_paged, v_paged)
+            kv_block_scales = None
+            # self.dq_page_table is only used for nvfp4 target model prefill path
+            cur_step_page_table = self.dq_page_table
+        elif self.is_nvfp4_kvcache and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        ):
+            # MTP path: no dequant — directly pass FP4 + scales to XQA decode kernel
+            raw = pool.get_raw_kv_buffer(layer.layer_id)
+            k_cache, k_cache_scales = raw["k"], raw["k_scale"]
+            v_cache, v_cache_scales = raw["v"], raw["v_scale"]
+
+            k_cache = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim // 2
+            ).permute(0, 2, 1, 3)
+            v_cache = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim // 2
+            ).permute(0, 2, 1, 3)
+
+            k_cache_scales = k_cache_scales.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim // 16
+            ).permute(0, 2, 1, 3)
+            v_cache_scales = v_cache_scales.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim // 16
+            ).permute(0, 2, 1, 3)
+
+            if layer.tp_k_head_num == 1:
+                k_cache = canonicalize_stride(k_cache)
+                k_cache_scales = canonicalize_stride(k_cache_scales)
+            if layer.tp_v_head_num == 1:
+                v_cache = canonicalize_stride(v_cache)
+                v_cache_scales = canonicalize_stride(v_cache_scales)
+
+            kv_cache = (k_cache, v_cache)
+            kv_block_scales = (k_cache_scales, v_cache_scales)
+            cur_step_page_table = self._get_layer_page_table(layer, forward_batch)
+        else:
+            # bf16/fp8, all paths
+            # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
+            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
+            k_cache = k_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            v_cache = v_cache.view(
+                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            ).permute(0, 2, 1, 3)
+            if layer.tp_k_head_num == 1:
+                k_cache = canonicalize_stride(k_cache)
+            if layer.tp_v_head_num == 1:
+                v_cache = canonicalize_stride(v_cache)
+            kv_cache = (k_cache, v_cache)
+            kv_block_scales = None
+            cur_step_page_table = self._get_layer_page_table(layer, forward_batch)
+
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-        v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
-        ).permute(0, 2, 1, 3)
-
-        if layer.tp_k_head_num == 1:
-            k_cache = canonicalize_stride(k_cache)
-        if layer.tp_v_head_num == 1:
-            v_cache = canonicalize_stride(v_cache)
-
-        kv_cache = (k_cache, v_cache)
 
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
-        # TODO: add support for quantization
         q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
         bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
+        bmm2_scale = v_scale
 
-        page_table = self._get_layer_page_table(layer, forward_batch)
+        if forward_batch.forward_mode.is_target_verify() or (
+            forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            and self.is_xqa_impl
+        ):
+            # Use XQA decode kernel for target_verify and draft_extend on XQA-capable GPUs
+            # XQA only supports fp16/bf16 query input
+            if (
+                self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache
+            ) and self.is_xqa_impl:
+                q = q.to(torch.float16)
 
-        if forward_batch.forward_mode.is_target_verify():
+            # Build causal mask for speculative decoding (q_seq_len > 1)
+            q_seq_len = self.forward_metadata.max_seq_len_q
+            spec_mask = None
+            if q_seq_len > 1:
+                mask_size_per_row = ((q_seq_len + 31) // 32) * 2
+                spec_mask = torch.zeros(
+                    (forward_batch.batch_size, q_seq_len, mask_size_per_row),
+                    dtype=torch.uint16,
+                    device=q.device,
+                )
+                for i in range(q_seq_len):
+                    # Each row i: bits 0..i are set (causal: token i sees tokens 0..i)
+                    val = (1 << (i + 1)) - 1
+                    spec_mask[:, i, 0] = val
+
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
+                kv_cache_sf=kv_block_scales,
                 workspace_buffer=self.workspace_buffer,
-                block_tables=page_table,
+                block_tables=cur_step_page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_seq_len=self.max_context_len,
                 bmm1_scale=bmm1_scale,
@@ -857,15 +1121,129 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
-                q_len_per_req=self.forward_metadata.max_seq_len_q,
+                out_dtype=q.dtype,  # fp4 kv kernel doesn't support bf16 output
+                q_len_per_req=q_seq_len,
+                mask=spec_mask,
             )
         else:
+            # Context kernel path for normal prefill/extend
+            if self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache:
+                q = q.to(torch.float8_e4m3fn)
+
+            # # print(f"{q.shape=}, {q.dtype}")
+
+            # # ============ Debug Info Before Kernel Call ============
+            # logger.debug(
+            #     f"[KERNEL DEBUG] ====== trtllm_batch_context_with_kv_cache Parameters ======"
+            # )
+            # logger.debug(f"[KERNEL DEBUG] nvfp4_kvcache_path={nvfp4_kvcache_path}")
+
+            # # Query info
+            # logger.debug(f"[KERNEL DEBUG] query.shape={q.shape}, query.dtype={q.dtype}")
+            # logger.debug(
+            #     f"[KERNEL DEBUG] query.device={q.device}, query.is_contiguous={q.is_contiguous()}"
+            # )
+
+            # # KV cache info
+            # k_cache, v_cache = kv_cache
+            # logger.debug(
+            #     f"[KERNEL DEBUG] k_cache.shape={k_cache.shape}, k_cache.dtype={k_cache.dtype}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] v_cache.shape={v_cache.shape}, v_cache.dtype={v_cache.dtype}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] k_cache.is_contiguous={k_cache.is_contiguous()}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] v_cache.is_contiguous={v_cache.is_contiguous()}"
+            # )
+            # logger.debug(f"[KERNEL DEBUG] k_cache layout: strides={k_cache.stride()}")
+            # logger.debug(f"[KERNEL DEBUG] v_cache layout: strides={v_cache.stride()}")
+
+            # # Block tables and sequence lengths
+            # logger.debug(
+            #     f"[KERNEL DEBUG] block_tables.shape={self.forward_metadata.page_table.shape}, "
+            #     f"dtype={self.forward_metadata.page_table.dtype}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] block_tables sample (first 2 rows):\n{self.forward_metadata.page_table[:2]}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] block_tables min={self.forward_metadata.page_table.min().item()}, "
+            #     f"max={self.forward_metadata.page_table.max().item()}"
+            # )
+
+            # logger.debug(
+            #     f"[KERNEL DEBUG] seq_lens={self.forward_metadata.cache_seqlens_int32.tolist()}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] cum_seq_lens_q={self.forward_metadata.cu_seqlens_q.tolist()}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] cum_seq_lens_kv={self.forward_metadata.cu_seqlens_k.tolist()}"
+            # )
+
+            # # Max lengths
+            # logger.debug(
+            #     f"[KERNEL DEBUG] max_q_len={self.forward_metadata.max_seq_len_q}"
+            # )
+            # logger.debug(f"[KERNEL DEBUG] max_kv_len={self.max_context_len}")
+            # logger.debug(f"[KERNEL DEBUG] batch_size={forward_batch.batch_size}")
+
+            # # Scales
+            # logger.debug(
+            #     f"[KERNEL DEBUG] bmm1_scale={bmm1_scale}, bmm2_scale={bmm2_scale}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] q_scale={q_scale}, k_scale={k_scale}, layer.scaling={layer.scaling}"
+            # )
+
+            # # Window and other params
+            # logger.debug(f"[KERNEL DEBUG] window_left={layer.sliding_window_size}")
+            # logger.debug(f"[KERNEL DEBUG] attention_sink={attention_sink}")
+            # logger.debug(f"[KERNEL DEBUG] out_dtype={self.q_data_type}")
+
+            # # Workspace buffer
+            # logger.debug(
+            #     f"[KERNEL DEBUG] workspace_buffer.shape={self.workspace_buffer.shape}, "
+            #     f"dtype={self.workspace_buffer.dtype}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] workspace_buffer size={self.workspace_buffer.numel() * self.workspace_buffer.element_size() / (1024**2):.2f} MB"
+            # )
+
+            # # Page size info
+            # logger.debug(f"[KERNEL DEBUG] page_size={self.page_size}")
+
+            # # Sanity checks
+            # expected_total_q_tokens = self.forward_metadata.cu_seqlens_q[-1].item()
+            # expected_total_kv_tokens = self.forward_metadata.cu_seqlens_k[-1].item()
+            # logger.debug(
+            #     f"[KERNEL DEBUG] Sanity check: q.shape[0]={q.shape[0]} vs expected_total_q_tokens={expected_total_q_tokens}"
+            # )
+            # logger.debug(
+            #     f"[KERNEL DEBUG] Sanity check: expected_total_kv_tokens={expected_total_kv_tokens}"
+            # )
+
+            # # Check if dimensions match expectations
+            # if nvfp4_kvcache_path:
+            #     logger.debug(f"[KERNEL DEBUG] NVFP4 Path: using temporary paged buffer")
+            #     logger.debug(
+            #         f"[KERNEL DEBUG] NVFP4 Path: num_pages={k_cache.shape[0]}, "
+            #         f"page_size={k_cache.shape[2]}, num_heads={k_cache.shape[1]}, head_dim={k_cache.shape[3]}"
+            #     )
+            # else:
+            #     logger.debug(f"[KERNEL DEBUG] Standard Path: using original KV buffer")
+
+            # logger.debug(f"[KERNEL DEBUG] ====== End of Parameter Dump ======")
+
+            # TODO(Sam): NVFP4 kv cache is not supported or MTP. Because draft extend will invoke this api, it needs nvfp4 kv cache support.
             o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
                 workspace_buffer=self.workspace_buffer,
-                block_tables=page_table,
+                block_tables=cur_step_page_table,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
                 max_kv_len=self.max_context_len,
@@ -877,8 +1255,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 window_left=layer.sliding_window_size,
                 sinks=attention_sink,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-                out_dtype=self.q_data_type,  # model_runner.dtype
+                out_dtype=self.q_data_type,
             )
+        # import sys
+        # sys.stdout.flush()
+        o = o.to(self.q_data_type)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

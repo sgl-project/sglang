@@ -10,6 +10,9 @@ from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.kv_cache_quant_method import (
+    get_kv_cache_quant_method,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -23,7 +26,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
-    MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
@@ -129,14 +131,18 @@ class ModelRunnerKVCacheMixin:
                 )
 
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                # kv_scale_buffer
+                # FP4 KV cache: data is half-width + block scale buffer + dequant workspace
                 scale_block_size = 16
 
                 n = self.model_config.get_num_kv_heads(get_attention_tp_size())
                 k = self.model_config.head_dim
+                # FP4 data (half of FP16 size) + per-layer block scales
                 cell_size = (cell_size // 2) + (
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
+                # Dequant workspace (FP8, 1 byte/element): shared across all layers,
+                # so NOT multiplied by num_layers.  K+V each have n*k elements.
+                cell_size += n * k * 2 * kv_size
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
@@ -641,6 +647,29 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                hybrid_full_layer_ids = (
+                    [0]
+                    if self.is_draft_worker
+                    else [
+                        i
+                        for i in config.full_attention_layer_ids
+                        if self.start_layer <= i < self.end_layer
+                    ]
+                )
+                hybrid_quant_method = None
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    from sglang.srt.utils.common import (
+                        is_sm100_supported,
+                    )
+
+                    sm_version = 100 if is_sm100_supported() else 120
+                    recipe = self.server_args.fp4_kv_cache_recipe
+                    hybrid_quant_method = get_kv_cache_quant_method(
+                        recipe,
+                        num_layers=len(hybrid_full_layer_ids),
+                        device=self.device,
+                        sm_version=sm_version,
+                    )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,
@@ -649,63 +678,54 @@ class ModelRunnerKVCacheMixin:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    # if draft worker, we only need 1 attention layer's kv pool
-                    full_attention_layer_ids=(
-                        [0]
-                        if self.is_draft_worker
-                        else [
-                            i
-                            for i in config.full_attention_layer_ids
-                            if self.start_layer <= i < self.end_layer
-                        ]
-                    ),
+                    full_attention_layer_ids=hybrid_full_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
+                    quant_method=hybrid_quant_method,
                     start_layer=self.start_layer,
                     **extra_args,
                 )
+                if hybrid_quant_method is not None:
+                    hybrid_quant_method.load_scales_from_model(self, sm_version)
             else:
+                quant_method = None
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    self.token_to_kv_pool = MHATokenToKVPoolFP4(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
+                    from sglang.srt.utils.common import (
+                        is_sm100_supported,
                     )
-                else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        layer_num=self.num_effective_layers,
+
+                    sm_version = 100 if is_sm100_supported() else 120
+                    recipe = self.server_args.fp4_kv_cache_recipe
+                    quant_method = get_kv_cache_quant_method(
+                        recipe,
+                        num_layers=self.num_effective_layers,
                         device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
+                        sm_version=sm_version,
                     )
+                self.token_to_kv_pool = MHATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    enable_alt_stream=not self.server_args.enable_pdmux,
+                    enable_kv_cache_copy=(
+                        self.server_args.speculative_algorithm is not None
+                    ),
+                    quant_method=quant_method,
+                )
+                if quant_method is not None:
+                    quant_method.load_scales_from_model(self, sm_version)
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")

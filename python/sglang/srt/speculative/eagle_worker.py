@@ -876,6 +876,7 @@ class EAGLEWorker(TpModelWorker):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
+            req_pool_indices=batch.req_pool_indices,
         )
 
     def forward_draft_extend(
