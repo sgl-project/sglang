@@ -34,7 +34,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "/LLM-Research/Llama-3.2-1B-Instruct"  # Example ModelScope model
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = (
+    "/LLM-Research/Llama-3.2-1B-Instruct"  # Example ModelScope model
+)
 
 from sglang.utils import terminate_process
 
