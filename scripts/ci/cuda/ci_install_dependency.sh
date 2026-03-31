@@ -224,14 +224,15 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 echo "Installing python extras: [${EXTRAS}]"
 # Pre-install nvidia wheels that torch pins from a local cache directory.
-# pypi.nvidia.com returns Cache-Control: no-store, so pip re-downloads
-# cudnn (~707 MB) and nvshmem (~125 MB) on every run without this.
+# pypi.nvidia.com returns Cache-Control: no-store, so pip/curl re-downloads
+# cudnn (~707 MB) and nvshmem (~125 MB) on every run without this cache.
 NVIDIA_WHEEL_CACHE="/root/.cache/nvidia-wheels"
 mkdir -p "$NVIDIA_WHEEL_CACHE"
-pip download nvidia-cudnn-cu12==9.10.2.21 nvidia-nvshmem-cu12==3.3.20 \
-    -d "$NVIDIA_WHEEL_CACHE" --no-deps 2>/dev/null || true
-pip install --no-deps "$NVIDIA_WHEEL_CACHE"/nvidia_cudnn_cu12-9.10.2.21*.whl \
-    "$NVIDIA_WHEEL_CACHE"/nvidia_nvshmem_cu12-3.3.20*.whl 2>/dev/null || true
+CUDNN_WHL="$NVIDIA_WHEEL_CACHE/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl"
+NVSHMEM_WHL="$NVIDIA_WHEEL_CACHE/nvidia_nvshmem_cu12-3.3.20-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+[ -f "$CUDNN_WHL" ] || curl -sfL -o "$CUDNN_WHL" "https://pypi.nvidia.com/nvidia-cudnn-cu12/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl" || true
+[ -f "$NVSHMEM_WHL" ] || curl -sfL -o "$NVSHMEM_WHL" "https://pypi.nvidia.com/nvidia-nvshmem-cu12/nvidia_nvshmem_cu12-3.3.20-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl" || true
+pip install --no-deps "$CUDNN_WHL" "$NVSHMEM_WHL" 2>/dev/null || true
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 mark_step_done "Install main package"
