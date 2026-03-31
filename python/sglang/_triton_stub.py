@@ -226,9 +226,3 @@ def install() -> None:
     triton.backends = backends
     compiler = _make_mock("triton.backends.compiler")
     backends.compiler = compiler
-
-    # triton.compiler / triton.compiler.compiler  (used by torch._inductor.runtime.hints in torch 2.9+)
-    triton_compiler = _make_mock("triton.compiler")
-    triton.compiler = triton_compiler
-    triton_compiler_compiler = _make_mock("triton.compiler.compiler")
-    triton_compiler.compiler = triton_compiler_compiler
