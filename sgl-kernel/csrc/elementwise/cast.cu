@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_fp8.h>
 
 #include "utils.h"
 

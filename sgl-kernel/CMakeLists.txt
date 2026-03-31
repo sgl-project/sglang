@@ -338,6 +338,25 @@ set(INCLUDES
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
+# =========================== Common SM89 Build (Ada/Ampere) ================ #
+# Build SM89 library for Ada Lovelace (RTX 4090, L40S, RTX 5880, A6000) and Ampere
+# Exclude SM100-only sources that use Blackwell MXFP types unavailable on older architectures
+if (ENABLE_BELOW_SM90)
+    set(SOURCES_SM89 ${SOURCES})
+    list(FILTER SOURCES_SM89 EXCLUDE REGEX "es_sm100_")
+
+    Python_add_library(common_ops_sm89_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES_SM89})
+
+    target_compile_options(common_ops_sm89_build PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS} -use_fast_math>
+    )
+    target_include_directories(common_ops_sm89_build PRIVATE ${INCLUDES})
+    set_target_properties(common_ops_sm89_build PROPERTIES
+        OUTPUT_NAME "common_ops"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm89"
+    )
+endif()
+
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
 Python_add_library(common_ops_sm90_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
@@ -391,10 +410,20 @@ add_subdirectory(
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
 )
 
+if (ENABLE_BELOW_SM90)
+    target_link_libraries(common_ops_sm89_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+endif()
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
 # sparse flash attention
+if (ENABLE_BELOW_SM90)
+    target_compile_definitions(common_ops_sm89_build PRIVATE
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        FLASHATTENTION_DISABLE_UNEVEN_K
+    )
+endif()
 target_compile_definitions(common_ops_sm90_build PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
     FLASHATTENTION_DISABLE_DROPOUT
@@ -409,6 +438,9 @@ target_compile_definitions(common_ops_sm100_build PRIVATE
 # Install to different subdirectories
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
+if (ENABLE_BELOW_SM90)
+    install(TARGETS common_ops_sm89_build LIBRARY DESTINATION sgl_kernel/sm89)
+endif()
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
