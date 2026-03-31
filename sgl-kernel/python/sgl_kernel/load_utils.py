@@ -65,10 +65,14 @@ def _load_architecture_specific_ops():
         variant_name = "SM90 (Hopper/H100 with fast math optimization)"
     elif compute_capability is not None and compute_capability >= 80:
         ops_subdir = "sm89"
-        variant_name = f"SM{compute_capability} (Ampere/Ada with fast math optimization)"
+        variant_name = (
+            f"SM{compute_capability} (Ampere/Ada with fast math optimization)"
+        )
     elif compute_capability is not None:
         ops_subdir = "sm89"
-        variant_name = f"SM{compute_capability} (using Ampere/Ada build for compatibility)"
+        variant_name = (
+            f"SM{compute_capability} (using Ampere/Ada build for compatibility)"
+        )
     else:
         ops_subdir = "sm100"
         variant_name = "CPU/No GPU detected (using precise math)"
