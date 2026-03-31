@@ -151,7 +151,6 @@ def _multi_pass_temperature_softmax_kernel(
         tl.store(output_row + offsets, prob, mask=mask)
 
 
-@triton.autotune(configs=_MULTI_PASS_AUTOTUNE_CONFIGS, key=["vocab_size"])
 @triton.jit
 def _multi_pass_temperature_softmax_inplace_kernel(
     logits_ptr,
@@ -198,9 +197,21 @@ def _multi_pass_temperature_softmax_inplace_kernel(
 # Public API
 # ---------------------------------------------------------------------------
 
+_DEFAULT_MULTI_PASS_CONFIG = {"BLOCK_SIZE": 4096, "num_warps": 16}
+
+# Populated by warmup from the out-of-place kernel's autotune result.
+_multi_pass_inplace_config: dict | None = None
+
 
 def _single_pass_num_warps(block_size: int) -> int:
     return max(4, min(32, block_size // 256))
+
+
+def _get_multi_pass_inplace_config() -> dict:
+    """Return the launch config for the multi-pass in-place kernel."""
+    if _multi_pass_inplace_config is not None:
+        return _multi_pass_inplace_config
+    return _DEFAULT_MULTI_PASS_CONFIG
 
 
 def _dispatch_kernel(
@@ -238,11 +249,13 @@ def _dispatch_kernel(
             )
     else:
         if inplace:
+            cfg = _get_multi_pass_inplace_config()
             _multi_pass_temperature_softmax_inplace_kernel[grid](
                 logits,
                 temperatures_flat,
                 vocab_size,
                 logits.stride(0),
+                **cfg,
             )
         else:
             _multi_pass_temperature_softmax_kernel[grid](
@@ -294,7 +307,14 @@ def warmup_fused_temperature_softmax(
     vocab_size: int,
     device: torch.device = None,
 ) -> None:
-    """Pre-compile and autotune kernels at startup so first request has no latency spike."""
+    """Pre-compile and autotune kernels at startup so first request has no latency spike.
+
+    For multi-pass kernels the out-of-place variant is autotuned (safe — separate
+    input/output buffers), and its winning config is reused for the in-place
+    variant so that no autotune ever runs on a live logits buffer.
+    """
+    global _multi_pass_inplace_config
+
     if device is None:
         device = torch.cuda.current_device()
 
@@ -307,13 +327,28 @@ def warmup_fused_temperature_softmax(
         vocab_size,
     )
 
-    # Small dummy tensors — only 1 row needed to trigger compile + autotune.
     dummy_logits = torch.randn(1, vocab_size, dtype=torch.float32, device=device)
     dummy_temps = torch.ones(1, 1, dtype=torch.float32, device=device)
 
-    # Trigger out-of-place kernel
+    # 1. Out-of-place kernel: autotune runs here (safe, separate buffers).
     fused_temperature_softmax(dummy_logits, dummy_temps)
-    # Trigger in-place kernel
+
+    # 2. Propagate best config to the in-place kernel (no autotune needed).
+    if is_multi_pass:
+        best = _multi_pass_temperature_softmax_kernel.best_config
+        _multi_pass_inplace_config = {
+            "BLOCK_SIZE": best.kwargs["BLOCK_SIZE"],
+            "num_warps": best.num_warps,
+            "num_stages": best.num_stages,
+        }
+        logger.info(
+            "Multi-pass autotune result: BLOCK_SIZE=%d, num_warps=%d, num_stages=%d",
+            _multi_pass_inplace_config["BLOCK_SIZE"],
+            _multi_pass_inplace_config["num_warps"],
+            _multi_pass_inplace_config["num_stages"],
+        )
+
+    # 3. In-place kernel: JIT compile only (uses the config from step 2).
     fused_temperature_softmax_inplace(dummy_logits.clone(), dummy_temps)
     torch.cuda.synchronize(device)
 
