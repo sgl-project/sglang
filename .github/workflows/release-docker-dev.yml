@@ -211,7 +211,7 @@ jobs:
   trivy-scan:
     needs: [create-manifests]
     if: ${{ github.repository == 'sgl-project/sglang' && !inputs.tag && !inputs.pr_number }}
-    runs-on: ubuntu-22.04
+    runs-on: x64-docker-build-node
     timeout-minutes: 45
     permissions:
       contents: read
@@ -221,13 +221,6 @@ jobs:
       matrix:
         tag: [dev, dev-cu13]
     steps:
-      - name: Free disk space for large image scan
-        run: |
-          sudo rm -rf /opt/hostedtoolcache
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          df -h
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
