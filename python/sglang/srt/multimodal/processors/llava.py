@@ -7,7 +7,7 @@ from transformers.models.auto.processing_auto import (
 )
 
 import sglang.srt.managers.multimodal_processor as sgl_mm_processor_utils
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.llava import (
     LlavaForConditionalGeneration,
     LlavaLlamaForCausalLM,
@@ -136,7 +136,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     model_specific_data=item,
                 )
             )
-        return {"mm_items": mm_items}
+        return MultimodalProcessorOutput(mm_items=mm_items)
 
     async def process_mm_data_async(
         self,
@@ -202,8 +202,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             elif request_obj.modalities[0] == "video":
                 modality = Modality.VIDEO
 
-        return {
-            "mm_items": [
+        return MultimodalProcessorOutput(
+            mm_items=[
                 MultimodalDataItem(
                     feature=pixel_values,
                     model_specific_data={
@@ -212,7 +212,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     modality=modality,
                 )
             ],
-        }
+        )
 
 
 class LlavaMultimodalProcessor(BaseMultimodalProcessor):
