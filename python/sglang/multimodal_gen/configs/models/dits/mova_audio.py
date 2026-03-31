@@ -45,7 +45,7 @@ class MOVAAudioArchConfig(DiTArchConfig):
     has_ref_conv: bool = False
     add_control_adapter: bool = False
     in_dim_control_adapter: int = 24
-    seperated_timestep: bool = False
+    separated_timestep: bool = False
     require_vae_embedding: bool = False
     require_clip_embedding: bool = False
     fuse_vae_embedding_in_latents: bool = False

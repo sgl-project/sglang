@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import enum
 import random
+from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -34,6 +35,7 @@ class AttentionBackendEnum(enum.Enum):
     SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
+    AITER_SAGE = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
@@ -198,6 +200,30 @@ class Platform:
         return True
 
     @classmethod
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        return None
+
+    @classmethod
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        return None, None
+
+    @classmethod
+    def has_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return False
+
+    @classmethod
+    def can_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return False
+
+    @classmethod
+    def should_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return False
+
+    @classmethod
+    def warn_if_modelopt_fp4_best_performance_kit_missing(cls) -> None:
+        pass
+
+    @classmethod
     def get_local_torch_device(cls) -> torch.device:
         raise NotImplementedError
 
@@ -315,7 +341,7 @@ class Platform:
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+            torch.get_device_module().manual_seed_all(seed)
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
@@ -378,6 +404,11 @@ class Platform:
     def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
         """Whether to enable DIT layerwise offload by default on the current platform."""
         return True
+
+    @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Apply platform-specific optimizations to VAE after loading."""
+        return vae
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)

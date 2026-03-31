@@ -38,7 +38,7 @@ class TestDisaggregationPiecewiseCudaGraph(PDDisaggregationServerBase):
             "prefill",
             "--tp",
             "1",
-            "--enable-piecewise-cuda-graph",
+            "--enforce-piecewise-cuda-graph",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(

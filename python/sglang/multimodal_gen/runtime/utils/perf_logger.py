@@ -120,7 +120,7 @@ def get_git_commit_hash() -> str:
 
 
 def capture_memory_snapshot() -> MemorySnapshot:
-    if not torch.cuda.is_available():
+    if not torch.get_device_module().is_available():
         return MemorySnapshot(
             allocated_mb=0.0,
             reserved_mb=0.0,
@@ -128,10 +128,10 @@ def capture_memory_snapshot() -> MemorySnapshot:
             peak_reserved_mb=0.0,
         )
 
-    allocated = torch.cuda.memory_allocated()
-    reserved = torch.cuda.memory_reserved()
-    peak_allocated = torch.cuda.max_memory_allocated()
-    peak_reserved = torch.cuda.max_memory_reserved()
+    allocated = torch.get_device_module().memory_allocated()
+    reserved = torch.get_device_module().memory_reserved()
+    peak_allocated = torch.get_device_module().max_memory_allocated()
+    peak_reserved = torch.get_device_module().max_memory_reserved()
 
     return MemorySnapshot(
         allocated_mb=allocated / (1024**2),
@@ -212,9 +212,9 @@ class StageProfiler:
             if (
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
                 and self.stage_name.startswith("denoising_step_")
-                and torch.cuda.is_available()
+                and torch.get_device_module().is_available()
             ):
-                torch.cuda.synchronize()
+                torch.get_device_module().synchronize()
             self.start_time = time.perf_counter()
 
         return self
@@ -226,9 +226,9 @@ class StageProfiler:
         if (
             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
             and self.stage_name.startswith("denoising_step_")
-            and torch.cuda.is_available()
+            and torch.get_device_module().is_available()
         ):
-            torch.cuda.synchronize()
+            torch.get_device_module().synchronize()
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
@@ -254,7 +254,7 @@ class StageProfiler:
                 self.metrics.record_stage(self.stage_name, execution_time_s)
 
             # capture memory snapshot after stage if requested
-            if self.capture_memory and torch.cuda.is_available():
+            if self.capture_memory and torch.get_device_module().is_available():
                 snapshot = capture_memory_snapshot()
                 self.metrics.record_memory_snapshot(
                     f"after_{self.stage_name}", snapshot

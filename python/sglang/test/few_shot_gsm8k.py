@@ -14,7 +14,12 @@ import numpy as np
 
 from sglang.lang.api import set_default_backend
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
+from sglang.utils import (
+    download_and_cache_file,
+    dump_state_text,
+    normalize_base_url,
+    read_jsonl,
+)
 
 INVALID = -9999999
 
@@ -46,7 +51,7 @@ def get_answer_value(answer_str):
 
 def run_eval(args):
     # Select backend
-    set_default_backend(RuntimeEndpoint(f"{args.host}:{args.port}"))
+    set_default_backend(RuntimeEndpoint(normalize_base_url(args.host, args.port)))
 
     if args.data_path is None:
         # Read data
@@ -142,7 +147,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-questions", type=int, default=200)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=128)
-    parser.add_argument("--host", type=str, default="http://127.0.0.1")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()

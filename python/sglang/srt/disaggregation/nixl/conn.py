@@ -11,7 +11,6 @@ from typing import Dict, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
-import requests
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -21,7 +20,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
@@ -193,21 +195,6 @@ class NixlKVManager(CommonKVManager):
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
-            self.heartbeat_failures = {}
-            self.session_pool = defaultdict(requests.Session)
-            self.session_pool_lock = threading.Lock()
-            self.addr_to_rooms_tracker = defaultdict(set)
-            self.connection_lock = threading.Lock()
-
-            # Heartbeat interval should be at least 2 seconds
-            self.heartbeat_interval = max(
-                envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
-            )
-            # Heartbeat failure should be at least 1
-            self.max_failures = max(
-                envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
-            )
-            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
@@ -921,6 +908,20 @@ class NixlKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
+        # Special handling for cp
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
+            if not is_last:
+                return
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return
+
         new_xfer_handles = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
@@ -1082,7 +1083,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_aux_data_ptrs,
                         packed_state_data_ptrs,
                         str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
-                        str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii"),
+                        str(self.kv_mgr.attn_tp_size).encode("ascii"),
                         str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                     ]

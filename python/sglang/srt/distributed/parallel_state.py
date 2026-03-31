@@ -42,12 +42,12 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
-    get_local_ip_auto,
     is_cpu,
     is_cuda_alike,
     is_hip,
@@ -57,6 +57,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.network import get_local_ip_auto
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -67,6 +68,24 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
+
+
+def get_torch_distributed_pg_options(group_name=None):
+    if not _is_npu:
+        return None
+
+    # Only create HCCL options for default group or MoE-related groups
+    if group_name is not None and "moe" not in group_name:
+        return None
+
+    import torch_npu
+
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    hccl_buffer_size = int(
+        os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
+    )
+    options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+    return options
 
 
 @dataclass
@@ -274,8 +293,9 @@ class GroupCoordinator:
                     pg_options=MooncakeBackendOptions(active_ranks_cpu),
                 )
             else:
+                pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
+                    ranks, backend=torch_distributed_backend, pg_options=pg_options
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -625,6 +645,58 @@ class GroupCoordinator:
         else:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+
+        # Prefer communicator-native fused API when provided.
+        if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
+            try:
+                return ca_comm.fused_allreduce_rmsnorm(
+                    input_, residual_inp_, weight_, eps
+                )
+            except Exception:
+                # Fall back to custom_fused_ar_rms path below.
+                pass
+
+        if not hasattr(ca_comm, "custom_fused_ar_rms"):
+            return None
+
+        # 1-stage policy for fused AR+RMSNorm:
+        # 1) Explicit env override wins.
+        # 2) Deterministic inference forces 1-stage for reproducibility.
+        # 3) Otherwise follow AITER's heuristic (small payloads only).
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            use_1stage_ar = True
+        else:
+            total_bytes = input_.numel() * input_.element_size()
+            hidden_dim = input_.shape[-1]
+            use_1stage_ar = total_bytes <= 128 * 1024 and hidden_dim in {
+                512,
+                1024,
+                2048,
+                4096,
+            }
+
+        fused_outputs = ca_comm.custom_fused_ar_rms(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            use_1stage_ar,
+        )
+        return fused_outputs
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
@@ -1501,7 +1573,12 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     with get_tp_group().graph_capture(
         stream=stream
     ) as context, get_pp_group().graph_capture(context):
-        yield context
+        moe_ep = _MOE_EP
+        if moe_ep is not None and moe_ep is not _TP:
+            with moe_ep.graph_capture(context):
+                yield context
+        else:
+            yield context
 
 
 logger = logging.getLogger(__name__)
@@ -1526,6 +1603,75 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
+_DEVICE_TO_DISTRIBUTED_BACKEND = {
+    "cuda": "nccl",
+    "xpu": "xccl",
+    "hpu": "hccl",
+    "cpu": "gloo",
+    "npu": "hccl",
+    "musa": "mccl",
+}
+
+
+def get_default_distributed_backend(device: str) -> str:
+    return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
+
+
+def _create_global_tcp_store(rank: int, world_size: int) -> None:
+    """Create a global TCPStore for coordination across ranks.
+
+    This function creates a TCPStore that all ranks can use for coordination
+    (e.g., for NIXL buffer setup).
+    """
+    from torch.distributed import TCPStore
+
+    master_ip = os.environ.get("MASTER_ADDR")
+
+    if not master_ip:
+        logger.warning(
+            "Could not determine master IP for global TCPStore. "
+            "Broadcasting from rank 0 to all ranks."
+        )
+
+    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
+
+    # Rank 0 gets its local IP and broadcasts it to all ranks
+    # Use broadcast_object_list which works with any backend (handles CPU/GPU automatically)
+    if not master_ip:
+        if rank == 0:
+            master_ip = get_local_ip_auto()
+            ip_list = [master_ip]
+        else:
+            ip_list = [None]
+
+        torch.distributed.broadcast_object_list(ip_list, src=0)
+        master_ip = ip_list[0]
+
+    try:
+        tcp_store = TCPStore(
+            host_name=master_ip,
+            port=base_store_port,
+            world_size=world_size,
+            is_master=(rank == 0),
+        )
+        set_global_tcp_store(tcp_store)
+        logger.info(
+            "Created global TCPStore at %s:%d (rank=%d, world_size=%d)",
+            master_ip,
+            base_store_port,
+            rank,
+            world_size,
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to create global TCPStore at %s:%d: %s. "
+            "Components requiring TCPStore (like NIXL) may not work.",
+            master_ip,
+            base_store_port,
+            e,
+        )
+
+
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
@@ -1533,6 +1679,7 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
     timeout: Optional[int] = None,
+    moe_a2a_backend: Optional[str] = None,
 ):
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -1563,6 +1710,8 @@ def init_distributed_environment(
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
 
+        pg_options = get_torch_distributed_pg_options()
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1570,7 +1719,12 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
             timeout=timeout,
+            pg_options=pg_options,
         )
+
+        # Create a global TCPStore for coordination (used by NIXL)
+        if moe_a2a_backend == "nixl":
+            _create_global_tcp_store(rank, world_size)
 
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
@@ -2093,6 +2247,11 @@ def destroy_model_parallel():
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None
+
+    global _ATTN_TP
+    if _ATTN_TP:
+        _ATTN_TP.destroy()
+    _ATTN_TP = None
 
     global _MOE_DP
     if _MOE_DP:

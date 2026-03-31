@@ -7,7 +7,9 @@ from typing import Optional, Tuple
 import torch
 import triton
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
-from sgl_kernel import sgl_per_tensor_quant_fp8
+
+from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
+from sglang.utils import is_in_ci
 
 # Optional vLLM import
 try:
@@ -20,11 +22,7 @@ except ImportError:
     vllm_scaled_fp8_quant = None
     VLLM_AVAILABLE = False
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 # Weight Shapes are in the format
 # ([K, N], TP_SPLIT_DIM)
@@ -97,7 +95,7 @@ def sglang_scaled_fp8_quant(
     if scale is None:
         scale = torch.zeros(1, device=input.device, dtype=torch.float32)
         is_static = False
-    sgl_per_tensor_quant_fp8(input, output, scale, is_static)
+    per_tensor_quant_fp8(input, output, scale, is_static)
 
     return output, scale
 

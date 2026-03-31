@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=100,
-    suite="stage-b-test-large-2-gpu",
+    suite="stage-b-test-2-gpu-large",
 )
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
@@ -41,7 +41,6 @@ class TestKimiLinearPiecewiseCudaGraph(CustomTestCase):
                 "--tp",
                 "2",
                 "--trust-remote-code",
-                "--enable-piecewise-cuda-graph",
             ],
         )
 

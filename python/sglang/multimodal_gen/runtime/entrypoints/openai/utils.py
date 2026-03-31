@@ -2,8 +2,11 @@
 import base64
 import os
 import re
+import shutil
+import tempfile
 import time
-from typing import Any, List, Optional, Union
+from contextlib import contextmanager
+from typing import Any, Generator, List, Optional, Union
 
 import httpx
 from fastapi import UploadFile
@@ -45,6 +48,23 @@ logger = init_logger(__name__)
 OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
 DEFAULT_FPS = 24
 DEFAULT_VIDEO_SECONDS = 4
+
+
+@contextmanager
+def temp_dir_if_disabled(
+    configured_path: str | None,
+) -> Generator[str, None, None]:
+    """Yield *configured_path* when it is set, otherwise create a temporary
+    directory that is automatically removed when the context exits."""
+    if configured_path is not None:
+        os.makedirs(configured_path, exist_ok=True)
+        yield configured_path
+    else:
+        tmp = tempfile.mkdtemp(prefix="sglang_")
+        try:
+            yield tmp
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
@@ -89,8 +109,11 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     if size:
         w, h = _parse_size(size)
         if w is not None:
-            kwargs.setdefault("width", w)
-            kwargs.setdefault("height", h)
+            # treat None dimensions as unset so parsed size can fill them
+            if kwargs.get("width") is None:
+                kwargs["width"] = w
+            if kwargs.get("height") is None:
+                kwargs["height"] = h
 
     # filter out None values to let SamplingParams defaults apply
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -259,6 +282,13 @@ async def process_generation_batch(
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
                 output_compression=batch.output_compression,
+                enable_frame_interpolation=batch.enable_frame_interpolation,
+                frame_interpolation_exp=batch.frame_interpolation_exp,
+                frame_interpolation_scale=batch.frame_interpolation_scale,
+                frame_interpolation_model_path=batch.frame_interpolation_model_path,
+                enable_upscaling=batch.enable_upscaling,
+                upscaling_model_path=batch.upscaling_model_path,
+                upscaling_scale=batch.upscaling_scale,
             )
 
     total_time = time.perf_counter() - total_start_time

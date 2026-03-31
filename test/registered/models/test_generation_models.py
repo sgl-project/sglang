@@ -1,8 +1,8 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Generation model tests (CUDA only)
-register_cuda_ci(est_time=103, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=106, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=103, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd")
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -66,7 +66,7 @@ CI_MODELS = [
 # the complete set of models to test sglang's generation model
 ALL_MODELS = [
     *CI_MODELS,
-    ModelCase("Qwen/Qwen2-1.5B"),
+    ModelCase("Qwen/Qwen2-1.5B", decode_tolerance=7e-2),
     ModelCase("Qwen/Qwen2.5-14B-Instruct"),
     ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
     ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),

@@ -44,8 +44,11 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
+
+_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -123,6 +126,27 @@ def get_request_headers() -> Dict[str, str]:
     if h := getattr(args, "header", None):
         headers.update(parse_custom_headers(h))
     return headers
+
+
+def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
+    """Wait for the server to become ready by polling the given URL."""
+    print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
+    start_time = time.perf_counter()
+    headers = get_auth_headers()
+    while True:
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                elapsed = time.perf_counter() - start_time
+                print(f"Server ready in {elapsed:.1f}s.")
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        elapsed = time.perf_counter() - start_time
+        if elapsed >= timeout_sec:
+            print(f"Server did not become ready within {timeout_sec}s timeout.")
+            return False
+        time.sleep(1)
 
 
 # trt llm does not support ignore_eos
@@ -226,6 +250,9 @@ async def async_request_openai_completions(
         # Add ignore_eos default only if not specified in extra_request_body
         if "ignore_eos" not in request_func_input.extra_request_body:
             payload["ignore_eos"] = not args.disable_ignore_eos
+
+        if args.return_logprob and args.top_logprobs_num > 0:
+            payload["logprobs"] = args.top_logprobs_num
 
         # Merge in extra parameters - these will override defaults if present
         payload.update(request_func_input.extra_request_body)
@@ -588,9 +615,13 @@ async def async_request_sglang_generate(
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
             "return_routed_experts": args.return_routed_experts,
-            "logprob_start_len": -1,
+            "logprob_start_len": args.logprob_start_len,
             **request_func_input.extra_request_body,
         }
+        if args.top_logprobs_num > 0:
+            payload["top_logprobs_num"] = args.top_logprobs_num
+        if args.token_ids_logprob is not None:
+            payload["token_ids_logprob"] = args.token_ids_logprob
 
         # Add image data if available (list of image urls/base64)
         if request_func_input.image_data:
@@ -671,6 +702,56 @@ async def async_request_sglang_generate(
     return output
 
 
+async def async_request_openai_embeddings(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+
+    async with _create_bench_client_session() as session:
+        payload = {
+            "input": request_func_input.prompt,
+            "model": request_func_input.model,
+        }
+
+        if request_func_input.lora_name:
+            payload["model"] = request_func_input.lora_name
+            payload["lora_path"] = request_func_input.lora_name
+
+        payload.update(request_func_input.extra_request_body)
+
+        headers = get_request_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+
+        output = RequestFuncOutput.init_new(request_func_input)
+
+        st = time.perf_counter()
+        output.start_time = st
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status == 200:
+                    await response.json()
+                    output.latency = time.perf_counter() - st
+                    output.success = True
+                    output.output_len = 0
+                else:
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 async def async_request_gserver(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -709,6 +790,14 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 # stop_profile doesn't need any parameters
                 body = {}
             print(f"async_request_profile {api_url=} {body=}")
+            # Add optional profiling parameters if provided
+            if (
+                hasattr(args, "profile_start_step")
+                and args.profile_start_step is not None
+            ):
+                body["start_step"] = str(args.profile_start_step)
+            if hasattr(args, "profile_steps") and args.profile_steps is not None:
+                body["num_steps"] = str(args.profile_steps)
             async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
@@ -772,6 +861,7 @@ ASYNC_REQUEST_FUNCS = {
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
     "sglang-oai-chat": async_request_openai_chat_completions,
+    "sglang-embedding": async_request_openai_embeddings,
     "vllm": async_request_openai_completions,
     "vllm-chat": async_request_openai_chat_completions,
     "lmdeploy": async_request_openai_completions,
@@ -1291,8 +1381,10 @@ async def benchmark(
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
-    # Stop profiler
-    if profile:
+    # Stop profiler (only if profile_steps was not provided, as it auto-stops)
+    if profile and not (
+        hasattr(args, "profile_steps") and args.profile_steps is not None
+    ):
         if pd_separated:
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "stop")
@@ -1365,12 +1457,15 @@ async def benchmark(
                 "Total input vision tokens:", metrics.total_input_vision
             )
         )
-    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
-    print(
-        "{:<40} {:<10}".format(
-            "Total generated tokens (retokenized):", metrics.total_output_retokenized
+    is_embedding = backend == "sglang-embedding"
+    if not is_embedding:
+        print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+        print(
+            "{:<40} {:<10}".format(
+                "Total generated tokens (retokenized):",
+                metrics.total_output_retokenized,
+            )
         )
-    )
     print(
         "{:<40} {:<10.2f}".format(
             "Request throughput (req/s):", metrics.request_throughput
@@ -1381,26 +1476,29 @@ async def benchmark(
             "Input token throughput (tok/s):", metrics.input_throughput
         )
     )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", metrics.output_throughput
+    if not is_embedding:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Output token throughput (tok/s):", metrics.output_throughput
+            )
         )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Peak output token throughput (tok/s):", metrics.max_output_tokens_per_s
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Peak output token throughput (tok/s):",
+                metrics.max_output_tokens_per_s,
+            )
         )
-    )
     print(
         "{:<40} {:<10}".format(
             "Peak concurrent requests:", metrics.max_concurrent_requests
         )
     )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", metrics.total_throughput
+    if not is_embedding:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Total token throughput (tok/s):", metrics.total_throughput
+            )
         )
-    )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
@@ -1419,22 +1517,25 @@ async def benchmark(
     print(
         "{:<40} {:<10.2f}".format("P99 E2E Latency (ms):", metrics.p99_e2e_latency_ms)
     )
-    print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
-    print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
-    print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
-    print(
-        "{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st token)", n=50, c="-")
-    )
-    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
-    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
-    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
-    print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
-    print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
-    print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
-    print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
-    print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    if not is_embedding:
+        print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
+        print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+        print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+        print(
+            "{s:{c}^{n}}".format(
+                s="Time per Output Token (excl. 1st token)", n=50, c="-"
+            )
+        )
+        print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
+        print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+        print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
+        print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
+        print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
+        print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
+        print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
+        print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
     resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
@@ -1571,6 +1672,15 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "plot_throughput"):
         args.plot_throughput = False
 
+    if not hasattr(args, "top_logprobs_num"):
+        args.top_logprobs_num = 0
+    if not hasattr(args, "token_ids_logprob"):
+        args.token_ids_logprob = None
+    if not hasattr(args, "logprob_start_len"):
+        args.logprob_start_len = -1
+    if not hasattr(args, "return_logprob"):
+        args.return_logprob = False
+
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
     if not hasattr(args, "mooncake_slowdown_factor"):
@@ -1617,51 +1727,66 @@ def run_benchmark(args_: argparse.Namespace):
             "truss": 8080,
         }.get(args.backend, 30000)
 
+    # Build base URL with proper IPv6 bracket wrapping (only when base_url is not provided)
+    if not args.base_url:
+        _na = NetworkAddress(args.host, args.port)
+        _host_base = _na.to_url()
+    else:
+        _na = None
+        _host_base = None
+
     model_url = (
-        f"{args.base_url}/v1/models"
-        if args.base_url
-        else f"http://{args.host}:{args.port}/v1/models"
+        f"{args.base_url}/v1/models" if args.base_url else f"{_host_base}/v1/models"
     )
 
-    if args.backend in ["sglang", "sglang-native"]:
+    if args.backend == "sglang-embedding":
         api_url = (
-            f"{args.base_url}/generate"
+            f"{args.base_url}/v1/embeddings"
             if args.base_url
-            else f"http://{args.host}:{args.port}/generate"
+            else f"http://{args.host}:{args.port}/v1/embeddings"
+        )
+    elif args.backend in ["sglang", "sglang-native"]:
+        api_url = (
+            f"{args.base_url}/generate" if args.base_url else f"{_host_base}/generate"
         )
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
         api_url = (
             f"{args.base_url}/v1/completions"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/completions"
+            else f"{_host_base}/v1/completions"
         )
     elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
         api_url = (
             f"{args.base_url}/v1/chat/completions"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/chat/completions"
+            else f"{_host_base}/v1/chat/completions"
         )
     elif args.backend == "trt":
         api_url = (
             f"{args.base_url}/v2/models/ensemble/generate_stream"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v2/models/ensemble/generate_stream"
+            else f"{_host_base}/v2/models/ensemble/generate_stream"
         )
         if args.model is None:
             print("Please provide a model using `--model` when using `trt` backend.")
             sys.exit(1)
     elif args.backend == "gserver":
-        api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
+        api_url = args.base_url if args.base_url else _na.to_host_port_str()
         args.model = args.model or "default"
     elif args.backend == "truss":
         api_url = (
             f"{args.base_url}/v1/models/model:predict"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/models/model:predict"
+            else f"{_host_base}/v1/models/model:predict"
         )
-    base_url = (
-        f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
-    )
+    base_url = _host_base if args.base_url is None else args.base_url
+
+    # Wait for server to be ready
+    if args.ready_check_timeout_sec > 0:
+        health_url = model_url if args.backend not in ("trt", "gserver") else base_url
+        if not wait_for_endpoint(health_url, args.ready_check_timeout_sec):
+            print(f"Server at {health_url} is not ready. Exiting.")
+            sys.exit(1)
 
     # Get model name
     if args.model is None:
@@ -1685,11 +1810,18 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if not check_chat_template(args.model):
+    if args.backend != "sglang-embedding" and not check_chat_template(args.model):
         print(
             "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
+
+    if (
+        args.backend == "sglang-embedding"
+        and args.dataset_name in _EMBEDDING_UNSUPPORTED_DATASETS
+    ):
+        print(f"{args.dataset_name} dataset is unsupported for embeddings benchmark")
+        sys.exit(1)
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
@@ -1789,6 +1921,12 @@ if __name__ == "__main__":
         help="If not set, the default port is configured according to its default value for different LLM Inference Engines.",
     )
     parser.add_argument(
+        "--ready-check-timeout-sec",
+        type=int,
+        default=60,
+        help="Maximum time in seconds to wait for the server to be ready before benchmarking. Set to 0 to skip. Default: 60.",
+    )
+    parser.add_argument(
         "--dataset-name",
         type=str,
         default="sharegpt",
@@ -1802,6 +1940,7 @@ if __name__ == "__main__":
             "mmmu",
             "image",
             "mooncake",
+            "longbench_v2",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -1943,6 +2082,25 @@ if __name__ == "__main__":
         help="Return logprob.",
     )
     parser.add_argument(
+        "--top-logprobs-num",
+        type=int,
+        default=0,
+        help="Number of top logprobs to return per token. Only used with --return-logprob.",
+    )
+    parser.add_argument(
+        "--token-ids-logprob",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Token IDs to probe logprobs for. E.g. --token-ids-logprob 1 2 10 100 1000. Only used with --return-logprob.",
+    )
+    parser.add_argument(
+        "--logprob-start-len",
+        type=int,
+        default=-1,
+        help="Start position for returning input logprobs. -1 means no input logprobs, 0 means all. Only used with --return-logprob.",
+    )
+    parser.add_argument(
         "--return-routed-experts",
         action="store_true",
         help="Return routed experts.",
@@ -1982,7 +2140,20 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["CPU", "GPU"],
-        choices=["CPU", "GPU", "CUDA_PROFILER"],
+        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
+        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER.",
+    )
+    parser.add_argument(
+        "--profile-start-step",
+        type=int,
+        default=None,
+        help="Start profiling after this many forward steps. Useful for warmup.",
+    )
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=None,
+        help="Number of steps to profile. If specified, profiling stops automatically after this many steps.",
     )
     parser.add_argument("--profile-num-steps", type=int, default=None)
     parser.add_argument("--profile-by-stage", action="store_true", default=False)

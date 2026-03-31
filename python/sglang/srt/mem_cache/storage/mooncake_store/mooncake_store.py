@@ -388,11 +388,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
+            self.enable_storage_metrics = False
             if storage_config is not None:
                 self.is_mla_backend = storage_config.is_mla_model
                 self.local_rank = storage_config.tp_rank
                 self.pp_rank = storage_config.pp_rank
                 self.pp_size = storage_config.pp_size
+                self.enable_storage_metrics = storage_config.enable_storage_metrics
             else:
                 self.is_mla_backend = False
                 self.local_rank = 0
@@ -406,6 +408,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+
+            self.storage_config = storage_config
+            self.split_factor = 0
+            if self.storage_config.should_split_heads:
+                self.split_factor = (
+                    self.storage_config.tp_lcm_size // self.storage_config.tp_size
+                )
+                base_rank = self.local_rank * self.split_factor
+                target_ranks = [base_rank + i for i in range(self.split_factor)]
+                if self.enable_pp:
+                    self.mha_suffix = [
+                        f"{rank}_{self.pp_rank}" for rank in target_ranks
+                    ]
+                else:
+                    self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -477,6 +494,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
 
+    def _get_mha_split_heads_buffer_meta(self, keys, indices):
+        ptr_list, element_size_list = (
+            self.mem_pool_host.get_split_heads_page_buffer_meta(
+                indices, self.split_factor
+            )
+        )
+        key_list = []
+        for key_ in keys:
+            for suffix in self.mha_suffix:
+                key_list.append(f"{key_}_{suffix}_k")
+                key_list.append(f"{key_}_{suffix}_v")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
@@ -500,7 +531,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
-            return self._get_mha_buffer_meta(keys, host_indices)
+            if self.storage_config.should_split_heads:
+                return self._get_mha_split_heads_buffer_meta(keys, host_indices)
+            else:
+                return self._get_mha_buffer_meta(keys, host_indices)
 
     def _batch_postprocess(self, results: List[int], is_set_operate=False):
         """
@@ -513,15 +547,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.is_mla_backend:
             return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
         else:
-            kv_pairs = zip(results[::2], results[1::2])
-            return [
-                (
-                    (k_res == 0 and v_res == 0)
-                    if is_set_operate
-                    else (k_res > 0 and v_res > 0)
-                )
-                for k_res, v_res in kv_pairs
-            ]
+            if self.storage_config.should_split_heads:
+                kv_groups = [
+                    results[i : i + self.split_factor * 2]
+                    for i in range(0, len(results), self.split_factor * 2)
+                ]
+                return [
+                    (
+                        all(res == 0 for res in kv_group)
+                        if is_set_operate
+                        else all(res > 0 for res in kv_group)
+                    )
+                    for kv_group in kv_groups
+                ]
+            else:
+                kv_pairs = zip(results[::2], results[1::2])
+                return [
+                    (
+                        (k_res == 0 and v_res == 0)
+                        if is_set_operate
+                        else (k_res > 0 and v_res > 0)
+                    )
+                    for k_res, v_res in kv_pairs
+                ]
 
     def batch_get_v1(
         self,
@@ -535,9 +583,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             keys = [f"{prefix}_{key}" for key in keys]
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+
+        start_time = time.perf_counter()
         get_results = self._get_batch_zero_copy_impl(
             key_strs, buffer_ptrs, buffer_sizes
         )
+        end_time = time.perf_counter()
+
+        if self.enable_storage_metrics:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (end_time - start_time) * self.gb_per_page
+            )
+
         return self._batch_postprocess(get_results, is_set_operate=False)
 
     def batch_set_v1(
@@ -570,9 +628,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Only set non-existing keys to storage
         if len(set_keys) > 0:
+            start_time = time.perf_counter()
             put_results = self._put_batch_zero_copy_impl(
                 set_keys, set_buffer_ptrs, set_buffer_sizes
             )
+            end_time = time.perf_counter()
+
+            if self.enable_storage_metrics:
+                self.backup_pgs.append(len(set_keys))
+                self.backup_bandwidth.append(
+                    len(set_keys) / (end_time - start_time) * self.gb_per_page
+                )
+
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
 
@@ -635,10 +702,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         )
         end_time = time.perf_counter()
 
-        self.backup_pgs.append(len(keys))
-        self.backup_bandwidth.append(
-            len(keys) / (end_time - start_time) * self.gb_per_page
-        )
+        if self.enable_storage_metrics:
+            self.backup_pgs.append(len(set_keys))
+            self.backup_bandwidth.append(
+                len(set_keys) / (end_time - start_time) * self.gb_per_page
+            )
 
         for i in range(len(set_indices)):
             if put_result[i] == 0:
@@ -685,10 +753,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         else:
             key_multiplier = 2
 
-        self.prefetch_pgs.append(len(keys))
-        self.prefetch_bandwidth.append(
-            len(keys) / (end_time - start_time) * self.gb_per_page
-        )
+        if self.enable_storage_metrics:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (end_time - start_time) * self.gb_per_page
+            )
 
         for i in range(len(keys)):
             if get_result[i] < 0:
@@ -712,10 +781,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_multiplier = 1
         else:
             query_keys = []
-            for key in keys:
-                query_keys.append(f"{key}_{self.mha_suffix}_k")
-                query_keys.append(f"{key}_{self.mha_suffix}_v")
-            key_multiplier = 2
+            if self.storage_config.should_split_heads:
+                for key in keys:
+                    for suffix in self.mha_suffix:
+                        query_keys.append(f"{key}_{suffix}_k")
+                        query_keys.append(f"{key}_{suffix}_v")
+                key_multiplier = 2 * self.split_factor
+            else:
+                for key in keys:
+                    query_keys.append(f"{key}_{self.mha_suffix}_k")
+                    query_keys.append(f"{key}_{self.mha_suffix}_v")
+                key_multiplier = 2
 
         exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):

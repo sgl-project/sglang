@@ -7,6 +7,7 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import is_cpu
 
@@ -65,7 +66,7 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
         raise ValueError(
             f"Unsupported copy between dtypes: {target.dtype=}, {loaded_weight.dtype=}"
         )
-    if target_rank < loaded_rank:
+    if target_rank < loaded_rank and not envs.SGLANG_QUANT_ALLOW_DOWNCASTING.get():
         raise ValueError(
             f"Downcasting not allowed: {target.dtype=}, {loaded_weight.dtype=}"
         )
