@@ -1,0 +1,205 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║               ZIMAGE-TURBO QUICK REFERENCE - V2 SPEC VALIDATION                ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+✅ COMPLETE ANSWERS TO YOUR QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1️⃣  ZImageTransformerBlock CLASS DEFINITION
+   └─ Lines 366-516 in zimage.py
+   
+2️⃣  forward() METHOD SIGNATURE
+   └─ Lines 443-516
+   └─ Inputs:
+      • x: [B, seq_len, dim] tensor
+      • freqs_cis: (cos_tensor, sin_tensor) rotary embeddings
+      • adaln_input: [B, 256] optional timestep embedding (required if modulation=True)
+      • num_replicated_prefix: int (0 default)
+      • num_replicated_suffix: int (0 default)
+   └─ Output: [B, seq_len, dim] tensor
+
+3️⃣  skip_sequence_parallel USAGE
+   ✓ STATIC (line 397 in __init__):
+     - Set during construction if modulation=False (context_refiner)
+     - Reason: caption tokens are replicated across all SP ranks
+   
+   ✓ DYNAMIC (lines 961-962, 966 in forward):
+     - Set in main transformer loop
+     - Value: use_full_unified_sequence (bool)
+     - Reason: Skip SP comm when unified sequence is fully gathered
+   
+   Location: attention.attn.skip_sequence_parallel (USPAttention.forward line 383)
+
+4️⃣  noise_refiner & context_refiner STRUCTURES
+   ├─ noise_refiner: nn.ModuleList of 2 ZImageTransformerBlock
+   │  └─ modulation=True, receives adaln_input
+   │  └─ layer_ids: 1000, 1001
+   │
+   └─ context_refiner: nn.ModuleList of 2 ZImageTransformerBlock
+      └─ modulation=False, NO adaln_input
+      └─ skip_sequence_parallel=True (set in __init__)
+      └─ layer_ids: 0, 1
+   
+   ✓ SAME CLASS as main transformer blocks (ZImageTransformerBlock)
+
+5️⃣  final_layer IMPLEMENTATION
+   Location: Lines 519-544
+   
+   Inputs:
+   ├─ x: [B, seq_len, hidden_size] from main layer 29
+   └─ c: [B, 256] adaln_input (timestep embedding)
+   
+   ✓ DOES use adaln_input (parameter c)
+   ✓ Scale-only modulation (NO gates)
+   ✗ NO gate_msa, gate_mlp (different from transformer blocks)
+   
+   Process:
+   1. scale = 1.0 + adaLN_modulation(c)
+   2. x = norm_final(x) * scale.unsqueeze(1)
+   3. x = linear(x)
+   4. return x
+
+6️⃣  unpatchify() METHOD
+   Location: Lines 761-778
+   
+   Input: [ori_len, pf*ph*pw*c] (flattened patches with padding)
+   Process:
+   1. Extract valid: ori_len = (F//pF) * (H//pH) * (W//pW)
+   2. View: [F//pF, H//pH, W//pW, pF, pH, pW, c]
+   3. Permute: [c, F//pF, pF, H//pH, pH, W//pW, pW]
+   4. Reshape: [c, F, H, W]
+   Output: [out_channels, F, H, W]
+
+7️⃣  TOTAL MAIN TRANSFORMER BLOCKS
+   ├─ noise_refiner: 2 blocks
+   ├─ context_refiner: 2 blocks
+   ├─ main layers: 30 blocks (from config: num_layers=30)
+   ├─ final_layer: 1 block
+   └─ TOTAL: 35 blocks (34 ZImageTransformerBlock + 1 FinalLayer)
+
+8️⃣  t_embedder RETURN VALUES
+   Shape: [batch_size, 256]
+   Dtype: Same as mlp[0].weight.dtype
+   
+   Architecture:
+   ├─ Freq embedding: cos/sin of timestep → [B, 256]
+   ├─ Linear + SiLU: [B, 256] → [B, 1024]
+   ├─ Linear: [B, 1024] → [B, 256]
+   └─ Returns: [B, 256] tensor
+   
+   Used as: adaln_input = t_embedder(timestep)
+
+9️⃣  type_as(x) BEHAVIOR
+   ⚠️  CRITICAL BUG FOUND at line 877:
+   
+   ```
+   x = hidden_states              # Line 868: List[torch.Tensor]
+   ...
+   t = self.t_embedder(t)         # Line 876: torch.Tensor
+   adaln_input = t.type_as(x)     # Line 877: WRONG - x is a list!
+   ```
+   
+   Standard PyTorch:
+   ├─ Tensor.type_as(other) → casts to other's dtype
+   ├─ Works with: Tensor input
+   └─ Fails with: List, Tuple, etc.
+   
+   Should be: adaln_input = t.type_as(x[0])
+
+🔟  SEGMENT BOUNDARIES FOR V2 SPEC
+   ┌─ SEGMENT 1: Input Embedding & Refiners ────────────────┐
+   │ ├─ TimestepEmbedder (1 module)                         │
+   │ ├─ x_embedder (ColumnParallelLinear)                   │
+   │ ├─ noise_refiner[0] (ZImageTransformerBlock)           │
+   │ ├─ noise_refiner[1] (ZImageTransformerBlock)           │
+   │ ├─ cap_embedder (Sequential)                           │
+   │ ├─ context_refiner[0] (ZImageTransformerBlock)         │
+   │ └─ context_refiner[1] (ZImageTransformerBlock)         │
+   │    → Total Transformer Blocks: 4                        │
+   └─────────────────────────────────────────────────────────┘
+   
+   ┌─ SEGMENT 2: Main Transformer ──────────────────────────┐
+   │ ├─ layers[0..29] (30 ZImageTransformerBlock)           │
+   │    → Total Transformer Blocks: 30                       │
+   └─────────────────────────────────────────────────────────┘
+   
+   ┌─ SEGMENT 3: Output ────────────────────────────────────┐
+   │ ├─ all_final_layer (FinalLayer)                        │
+   │ ├─ unpatchify (reshape operation)                      │
+   │ └─ return -x[0]                                        │
+   │    → Total Transformer Blocks: 1                        │
+   └─────────────────────────────────────────────────────────┘
+   
+   TOTAL: 4 + 30 + 1 = 35 blocks
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LAYER COUNT VALIDATION TABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Component          Count  Type                    Modulation  Skip SP    Segment
+───────────────────────────────────────────────────────────────────────────────
+noise_refiner[0]     1    ZImageTransformerBlock  True        Dynamic    1
+noise_refiner[1]     1    ZImageTransformerBlock  True        Dynamic    1
+context_refiner[0]   1    ZImageTransformerBlock  False       True       1
+context_refiner[1]   1    ZImageTransformerBlock  False       True       1
+layers[0-29]        30    ZImageTransformerBlock  True        Dynamic    2
+final_layer          1    FinalLayer              N/A         N/A        3
+───────────────────────────────────────────────────────────────────────────────
+TOTAL               35    Mixed                   Mostly True  Variable  All
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KEY EXECUTION FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Timestep Embedding (line 876)
+   └─ t: scalar → t_embedder → [B, 256] tensor
+
+2. Patchify & Image Refinement (lines 880-905)
+   └─ x: List[T] → x_embed → noise_refiner(2 blocks) → [B, seq, 3840]
+
+3. Caption Refinement (lines 907-927)
+   └─ cap: List[T] → cap_embed → context_refiner(2 blocks) → [B, seq, 3840]
+
+4. Unified Processing (lines 929-976)
+   ├─ Concatenate: [x_tokens | cap_tokens]
+   ├─ Main loop: 30 transformer blocks
+   └─ Output: [B, total_seq, 3840]
+
+5. Final & Output (lines 978-995)
+   ├─ final_layer: apply scale-only AdaLN + linear
+   ├─ unpatchify: reshape to [out_channels, F, H, W]
+   └─ Return: -x[0] (negated)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KEY CONSTANTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ADALN_EMBED_DIM = 256      (timestep embedding dimension)
+SEQ_MULTI_OF = 32          (sequence padding multiple)
+
+Config Defaults:
+├─ dim: 3840               (hidden dimension)
+├─ num_layers: 30          (main transformer blocks)
+├─ n_refiner_layers: 2     (per refiner)
+├─ num_heads: 30           (attention heads)
+└─ norm_eps: 1e-5          (RMSNorm epsilon)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILES GENERATED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. ZIMAGE_ANALYSIS.md
+   └─ Comprehensive 10-section analysis with full implementations
+
+2. ZIMAGE_SUMMARY.txt
+   └─ Visual architecture summary with ASCII diagrams
+
+3. ZIMAGE_CODE_REFERENCE.md
+   └─ Line-by-line code references and critical sections
+
+4. QUICK_REFERENCE.txt (this file)
+   └─ Quick answers to all 10 questions
+
+All files are in: /data/home/rhyshen/sgl-workspace/sglang/
+
+╚════════════════════════════════════════════════════════════════════════════════╝

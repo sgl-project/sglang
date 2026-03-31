@@ -137,6 +137,11 @@ class DiffusionCudaGraphRunner:
     ) -> torch.Tensor:
         """Capture one DiT forward pass.
 
+        Must be called within a set_forward_context() block to ensure
+        warmup runs and the capture run share the same forward context.
+        The context is read by attention backends and profiling code
+        during the warmup eager executions.
+
         Args:
             dit_forward_fn: The model's forward callable.
             timestep_buffer: Pre-allocated tensor for timestep input.
@@ -146,7 +151,8 @@ class DiffusionCudaGraphRunner:
                 baked into the graph.
 
         Returns:
-            Output tensor (noise_pred). Its address is fixed for replay.
+            Output tensor (noise_pred, shape [B, C, H, W] as torch.Tensor).
+            Its address is fixed for replay.
         """
         self.input_buffers = {
             'timestep': timestep_buffer,
@@ -245,6 +251,17 @@ class DiffusionCudaGraphRunner:
 | `_forward_context.current_timestep` | Python global via `get_forward_context()` | None for FlashAttention. Must still be updated for profiling/logging correctness. |
 | `attn_metadata` | Python dataclass | `None` for FlashAttention (`_build_attn_metadata` returns `None` when no sparse backend is configured) |
 | `batch.is_cfg_negative` | Python attribute | Not applicable (ZImage: no CFG) |
+
+### dit.forward() Return Type and Post-Processing
+
+ZImage's `forward()` returns a single `torch.Tensor` (shape `[B, C, H, W]`): `return -x[0]`.
+
+In the eager path, `_predict_noise_with_cfg()` applies two post-processing steps after `dit.forward()`:
+
+1. **`slice_noise_pred(noise_pred, latents)`** — ZImage inherits the base implementation which is a no-op (`return noise`). Only Qwen-Image and FLUX override this to slice I2V noise.
+2. **CFG combine** — ZImage has `should_use_guidance=False`, so `do_classifier_free_guidance` is `False` and the function returns immediately after the positive pass.
+
+Both steps are no-ops for ZImage. The CUDA Graph path safely skips them — its `dit.forward()` output is the final `noise_pred` with no further transformation needed.
 
 ## Integration with Denoising Stage
 
@@ -371,7 +388,7 @@ sglang serve --model-path ZhipuAI/ZImage-Turbo \
 ## Future Extensions
 
 1. **Multiple resolution buckets**: Cache graphs keyed by `(height, width)` in a dict, each with its own input/output buffers.
-2. **Dynamic capture + caching**: First request per resolution captures; subsequent requests replay from cache.
+2. **Dynamic capture + caching**: First request per resolution captures; subsequent requests replay from cache. Note: first-request latency per new resolution includes 2× warmup + synchronize + capture overhead (~3-4× single step time). Consider async warmup or background capture for latency-sensitive multi-resolution scenarios.
 3. **CFG support**: Capture two forward passes (positive + negative) in one graph, or capture them as two separate graphs.
 4. **Cache-DiT compatibility**: Capture different graphs for "full compute" vs "cached" steps; select at replay time based on Cache-DiT's per-step decision.
 5. **torch.compile integration**: Use `torch.compile(mode="reduce-overhead")` as an alternative backend for graph capture with automatic kernel fusion.

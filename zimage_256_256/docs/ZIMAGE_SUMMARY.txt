@@ -1,0 +1,235 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                    ZIMAGE-TURBO ARCHITECTURE SUMMARY                          ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. ZIMAGE TRANSFORMER BLOCK COMPONENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─ ZImageTransformerBlock ─────────────────────────────────────────────────────┐
+│                                                                               │
+│  Inputs:  x [B, seq_len, dim]                                                │
+│           freqs_cis: (cos, sin) rotary embeddings                           │
+│           adaln_input (if modulation=True): [B, 256]                        │
+│                                                                               │
+│  Architecture:                                                                │
+│  ├─ ZImageAttention                                                           │
+│  │  ├─ USPAttention (Ulysses Sequence Parallelism + Ring Attention)          │
+│  │  ├─ skip_sequence_parallel: bool (for cross-attention replicated KV)      │
+│  │  └─ QK norm + RoPE applied                                                │
+│  │                                                                             │
+│  ├─ FeedForward                                                               │
+│  │  ├─ Hidden dim: dim * 8/3 (expansion ratio)                               │
+│  │  └─ Uses SiLU + Mul (SwiGLU variant)                                       │
+│  │                                                                             │
+│  ├─ Layer Norms (4x RMSNorm)                                                  │
+│  │  ├─ attention_norm1, attention_norm2                                       │
+│  │  └─ ffn_norm1, ffn_norm2                                                   │
+│  │                                                                             │
+│  └─ AdaLN Modulation (ONLY if modulation=True)                               │
+│     ├─ Input: [B, 256] from t_embedder                                        │
+│     ├─ Output: scale_msa, gate_msa, scale_mlp, gate_mlp                      │
+│     └─ Gates: tanh(), Scales: 1.0 + scale                                     │
+│                                                                               │
+│  Execution (modulation=True):                                                 │
+│  ├─ attn_in = norm1(x) * scale_msa                                            │
+│  ├─ attn_out = attention(attn_in, ...)                                        │
+│  ├─ x = x + gate_msa * norm2(attn_out)          ← Residual                    │
+│  ├─ ffn_in = norm1(x) * scale_mlp                                             │
+│  ├─ ffn_out = feed_forward(ffn_in)                                            │
+│  └─ x = x + gate_mlp * norm2(ffn_out)           ← Residual                    │
+│                                                                               │
+│  Execution (modulation=False):                                                │
+│  ├─ attn_in = norm1(x)         (no scaling)                                   │
+│  ├─ attn_out = attention(attn_in, ...)                                        │
+│  ├─ x = x + norm2(attn_out)                    ← Residual only                │
+│  ├─ ffn_in = norm1(x)          (no scaling)                                   │
+│  ├─ ffn_out = feed_forward(ffn_in)                                            │
+│  └─ x = x + norm2(ffn_out)                    ← Residual only                 │
+│                                                                               │
+│  Output: x [B, seq_len, dim]                                                  │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. SKIP_SEQUENCE_PARALLEL USAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Where: attention.attn.skip_sequence_parallel
+
+Context Refiner (modulation=False):
+  ├─ Set during __init__: skip_sequence_parallel = True
+  └─ Reason: Caption tokens fully replicated across SP ranks
+     → No need for Ulysses all-to-all communication
+     → Run local attention only
+
+Main Layers (modulation=True):
+  ├─ Dynamic setting during forward (lines 958-968)
+  ├─ If use_full_unified_sequence=True: skip_sequence_parallel=True
+  ├─ Reason: Unified sequence already fully gathered
+  └─ Effect: Bypasses SP communication in USPAttention.forward()
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. ARCHITECTURE LAYERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NOISE_REFINER (2 blocks)
+├─ ZImageTransformerBlock(layer_id=1000, modulation=True)
+├─ ZImageTransformerBlock(layer_id=1001, modulation=True)
+└─ Input: Image patches + timestep embedding
+   Output: Refined image embeddings
+
+CONTEXT_REFINER (2 blocks)
+├─ ZImageTransformerBlock(layer_id=0, modulation=False)  [skip_sp=True]
+├─ ZImageTransformerBlock(layer_id=1, modulation=False)  [skip_sp=True]
+└─ Input: Caption embeddings (NO timestep)
+   Output: Refined caption embeddings
+
+MAIN LAYERS (30 blocks)
+├─ ZImageTransformerBlock(layer_id=0, modulation=True)
+├─ ZImageTransformerBlock(layer_id=1, modulation=True)
+├─ ...
+└─ ZImageTransformerBlock(layer_id=29, modulation=True)
+
+   Input: Unified [image_patches | caption_tokens]
+   Output: Unified embeddings ready for final layer
+
+FINAL_LAYER (1 block)
+├─ Layer norm + AdaLN scale
+├─ Linear projection to output channels
+└─ Input: Unified output + timestep embedding
+   Output: Predicted image tokens
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. FINAL LAYER DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+forward(x, c):
+  1. scale = 1.0 + adaLN_modulation(c)
+  2. x = norm_final(x) * scale.unsqueeze(1)
+  3. x = linear(x)
+  4. return x
+
+Inputs:
+  x: [B, seq_len, hidden_size] from main layer 29
+  c: [B, 256] adaln_input (timestep embedding)
+
+Key differences from TransformerBlock:
+  ✗ NO gate_msa, gate_mlp (no gating)
+  ✓ Scale-only modulation
+  ✓ DOES use adaln_input
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. UNPATCHIFY METHOD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Input:  [ori_len, pf*ph*pw*c] (flattened patches with padding)
+        
+Process:
+  1. Extract valid length: ori_len = (F//pF) * (H//pH) * (W//pW)
+  2. View as: [F//pF, H//pH, W//pW, pF, pH, pW, c]
+  3. Permute to: [c, F//pF, pF, H//pH, pH, W//pW, pW]
+  4. Reshape to: [c, F, H, W]
+
+Output: [out_channels, F, H, W] (spatial video tensor)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. T_EMBEDDER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Architecture:
+  1. Frequency embedding: [B, 256] → sum(cos, sin)
+  2. Linear layer 1: [B, 256] → [B, 1024] with TP parallelism
+  3. SiLU activation: [B, 1024] → [B, 1024]
+  4. Linear layer 2: [B, 1024] → [B, 256]
+
+Output Shape: [batch_size, 256]
+Output Dtype: Same as mlp[0].weight.dtype (BF16/FP32)
+
+Usage:
+  t_emb = t_embedder(timestep)
+  adaln_input = t_emb.type_as(x)  ⚠️ BUG: x is List[Tensor], not Tensor!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. TYPE_AS(X) BEHAVIOR
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Standard PyTorch:
+  Tensor.type_as(other) → Cast tensor to same dtype as other
+
+ZImage Issue (line 877):
+  adaln_input = t.type_as(x)
+  
+  Problem: x is List[torch.Tensor] at this point!
+  
+  ┌─────────────────────────────────────┐
+  │ x = hidden_states  [List[Tensor]]   │
+  │ ...                                 │
+  │ t = t_embedder(t)  [Tensor]         │
+  │ adaln_input = t.type_as(x)  ✗ ERROR │
+  │                                     │
+  │ Should be:                          │
+  │ adaln_input = t.type_as(x[0])  ✓    │
+  └─────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. SEGMENT BOUNDARIES FOR V2 SPEC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SEGMENT 1: Input Embedding & Refiners
+├─ TimestepEmbedder (1 module)
+├─ x_embedder (ColumnParallelLinear)
+├─ noise_refiner[0] (ZImageTransformerBlock)
+├─ noise_refiner[1] (ZImageTransformerBlock)
+├─ cap_embedder (Sequential)
+├─ context_refiner[0] (ZImageTransformerBlock)
+└─ context_refiner[1] (ZImageTransformerBlock)
+   Total Transformer Blocks: 4
+
+SEGMENT 2: Main Transformer
+├─ layers[0] (ZImageTransformerBlock)
+├─ layers[1] (ZImageTransformerBlock)
+├─ ...
+└─ layers[29] (ZImageTransformerBlock)
+   Total Transformer Blocks: 30
+
+SEGMENT 3: Output
+├─ all_final_layer (FinalLayer)
+├─ unpatchify (reshape operation)
+└─ return -x[0]
+   Total Transformer Blocks: 1
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. LAYER COUNT SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Component                    Count   Modulation   Skip SP      Layer IDs
+────────────────────────────────────────────────────────────────────────
+noise_refiner                  2      True         Dynamic      1000-1001
+context_refiner                2      False        True         0-1
+main layers                   30      True         Dynamic      0-29
+final_layer                    1      —            —            —
+────────────────────────────────────────────────────────────────────────
+TOTAL TransformerBlocks       34
+Total with FinalLayer         35
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. CONSTANTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ADALN_EMBED_DIM       = 256         (timestep/context embedding dimension)
+SEQ_MULTI_OF          = 32          (sequence length padding multiple)
+Default Config:
+  ├─ dim               = 3840        (model hidden dimension)
+  ├─ num_layers        = 30          (main transformer layers)
+  ├─ n_refiner_layers  = 2           (per refiner)
+  ├─ num_heads         = 30          (attention heads)
+  ├─ n_kv_heads        = 30          (KV heads)
+  ├─ norm_eps          = 1e-5        (layer norm epsilon)
+  ├─ qk_norm           = True        (QK normalization)
+  ├─ cap_feat_dim      = 2560        (caption embedding dimension)
+  ├─ rope_theta        = 256.0       (RoPE base)
+  ├─ in_channels       = 16          (patch dimension)
+  ├─ axes_dims         = (32, 48, 48) (RoPE per-axis dimensions)
+  └─ axes_lens         = (1024, 512, 512) (RoPE sequence lengths per axis)
+
+╚════════════════════════════════════════════════════════════════════════════════╝
