@@ -1,5 +1,5 @@
-name: Rerun UT
-run-name: ${{ inputs.pr_head_sha && format('[rerun-ut] {0} {1}', inputs.test_command, inputs.pr_head_sha) || format('[rerun-ut] {0}', inputs.test_command) }}
+name: Rerun Test
+run-name: ${{ inputs.pr_head_sha && format('[rerun-test] {0} {1}', inputs.test_command, inputs.pr_head_sha) || format('[rerun-test] {0}', inputs.test_command) }}
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ on:
           - 8-gpu-h20
           - 8-gpu-b200
       pr_head_sha:
-        description: "PR head SHA to checkout (for /rerun-ut on fork PRs)"
+        description: "PR head SHA to checkout (for /rerun-test on fork PRs)"
         required: false
         type: string
         default: ""
@@ -44,7 +44,7 @@ permissions:
   issues: read
 
 jobs:
-  rerun-ut-cuda:
+  rerun-test-cuda:
     runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 120
     env:

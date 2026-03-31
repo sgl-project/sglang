@@ -773,6 +773,8 @@ class ModelConfig:
         return quant_cfg
 
     def _find_quant_modelslim_config(self):
+        if self.is_draft_model:
+            return None
         quant_config_file = Path(self.model_path, "quant_model_description.json")
         quant_cfg = None
         if quant_config_file.is_file():
