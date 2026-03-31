@@ -278,7 +278,7 @@ class DecodePreallocQueue:
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
         self._ensure_retry_count: Dict[str, int] = {}
-        self._max_ensure_retries: int = 20  # scheduling cycles
+        self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
         self.kv_manager = self._init_kv_manager()
@@ -546,16 +546,7 @@ class DecodePreallocQueue:
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    prepare_abort(
-                        decode_req.req,
-                        error_msg,
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
-                    if self.scheduler.enable_metrics:
-                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                    self.scheduler.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
+                    decode_req.kv_receiver.abort()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
