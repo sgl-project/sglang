@@ -1,13 +1,13 @@
 """Weight update API for the diffusion engine."""
 
 from fastapi import APIRouter, Request
-from sglang.srt.utils.json_response import orjson_response
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.srt.utils.json_response import orjson_response
 
 router = APIRouter()
 
