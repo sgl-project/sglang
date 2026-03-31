@@ -308,7 +308,7 @@ def warmup_fused_temperature_softmax(
     )
 
     # Small dummy tensors — only 1 row needed to trigger compile + autotune.
-    dummy_logits = torch.randn(1, vocab_size, dtype=torch.bfloat16, device=device)
+    dummy_logits = torch.randn(1, vocab_size, dtype=torch.float32, device=device)
     dummy_temps = torch.ones(1, 1, dtype=torch.float32, device=device)
 
     # Trigger out-of-place kernel
