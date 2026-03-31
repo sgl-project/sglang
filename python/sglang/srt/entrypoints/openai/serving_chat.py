@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageParam
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -261,7 +262,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
-
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -356,8 +356,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 tool_call_constraint = ("json_schema", json_schema)
 
-        # Use chat template
-        if self.template_manager.chat_template_name is None:
+        # When input_ids are provided, skip template tokenization entirely;
+        # only stop tokens and tool_call_constraint are needed.
+        if request.input_ids is not None:
+            result = MessageProcessingResult(
+                prompt=self.tokenizer_manager.tokenizer.decode(request.input_ids),
+                prompt_ids=request.input_ids,
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=request.stop or [],
+            )
+        elif self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
             result = self._apply_conversation_template(request, is_multimodal)
@@ -975,11 +986,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 else None
             )
 
+            choice_meta_info = (
+                ret_item["meta_info"] if request.return_meta_info else None
+            )
+            # NOTE: content should not be None but empty string to make sure retokenize consistancy.
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=text if text else None,
+                    content=text if text else "",
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
                 ),
@@ -992,6 +1007,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
+                meta_info=choice_meta_info,
             )
             choices.append(choice_data)
 
@@ -1023,8 +1039,8 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         token_logprobs = []
 
-        for token_idx, (token, token_id, logprob) in enumerate(
-            zip(logprobs.tokens, logprobs.token_ids, logprobs.token_logprobs)
+        for token_idx, (token, logprob) in enumerate(
+            zip(logprobs.tokens, logprobs.token_logprobs)
         ):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
@@ -1046,7 +1062,6 @@ class OpenAIServingChat(OpenAIServingBase):
             token_logprobs.append(
                 ChatCompletionTokenLogprob(
                     token=token,
-                    token_id=token_id,
                     bytes=token_bytes,
                     logprob=logprob,
                     top_logprobs=top_logprobs,
