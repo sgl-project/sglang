@@ -147,7 +147,15 @@ def bench_fused_qknorm_rope_production():
     print(header)
     print(sep)
 
-    for name, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim, rotary_dim in PRODUCTION_SHAPES:
+    for (
+        name,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+    ) in PRODUCTION_SHAPES:
         total_heads = num_heads_q + num_heads_k + num_heads_v
         qkv = torch.randn(
             (num_tokens, total_heads * head_dim), dtype=torch.bfloat16, device=device
@@ -174,9 +182,13 @@ def bench_fused_qknorm_rope_production():
             rotary_dim=rotary_dim,
         )
 
-        jit_us, _, _ = run_benchmark(lambda: fused_qk_norm_rope_jit(qkv.clone(), **common_kwargs))
+        jit_us, _, _ = run_benchmark(
+            lambda: fused_qk_norm_rope_jit(qkv.clone(), **common_kwargs)
+        )
         if AOT_AVAILABLE:
-            aot_us, _, _ = run_benchmark(lambda: fused_qk_norm_rope_aot(qkv.clone(), **common_kwargs))
+            aot_us, _, _ = run_benchmark(
+                lambda: fused_qk_norm_rope_aot(qkv.clone(), **common_kwargs)
+            )
             speedup = f"{aot_us / jit_us:.2f}x"
             aot_str = f"{aot_us:9.3f}"
         else:

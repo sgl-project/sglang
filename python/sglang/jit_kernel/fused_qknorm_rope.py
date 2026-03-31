@@ -99,13 +99,16 @@ def fused_qk_norm_rope_out(
 
 @cache_once
 def can_use_fused_qk_norm_rope(
-    head_dim: int, is_neox: bool, dtype: torch.dtype
+    head_dim: int, is_neox: bool, dtype: torch.dtype, yarn: bool = False
 ) -> bool:
     """Return True if the JIT fused QK-Norm + RoPE kernel can be used.
 
     Args:
         head_dim: head dimension; supported values are 64, 128, 256
         dtype: tensor dtype; only bfloat16 is supported
+        yarn: whether YaRN scaling is active (factor != 1.0); prebuilds the
+              correct kernel variant so no extra JIT compile occurs on the
+              first real call.
     """
     logger = logging.getLogger(__name__)
     if head_dim not in (64, 128, 256):
@@ -117,7 +120,7 @@ def can_use_fused_qk_norm_rope(
         logger.warning(f"Unsupported dtype={dtype} for JIT fused_qk_norm_rope kernel")
         return False
     try:
-        _jit_fused_qknorm_rope_module(head_dim, is_neox, False)
+        _jit_fused_qknorm_rope_module(head_dim, is_neox, yarn)
         return True
     except Exception as e:
         logger.warning(f"Failed to load JIT fused_qk_norm_rope kernel: {e}")
