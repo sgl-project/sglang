@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,12 +61,12 @@ class AsyncMMDataProcessor:
         input_text_or_ids: Union[str, List[int], None] = None,
         request_obj: Any,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> Optional[MultimodalProcessorOutput]:
         """
         Public entrypoint: process a single multimodal request without blocking the event loop.
         """
 
-        async def _invoke() -> Dict[str, Any]:
+        async def _invoke() -> Optional[Dict[str, Any]]:
             if self.is_async:
                 # Native async implementation
                 return await self._proc_async(
@@ -96,13 +98,21 @@ class AsyncMMDataProcessor:
         if self.semaphore is not None:
             async with self.semaphore:
                 if self.timeout_s is not None:
-                    return await asyncio.wait_for(_invoke(), timeout=self.timeout_s)
-                return await _invoke()
+                    result = await asyncio.wait_for(
+                        _invoke(), timeout=self.timeout_s
+                    )
+                else:
+                    result = await _invoke()
+        elif self.timeout_s is not None:
+            result = await asyncio.wait_for(_invoke(), timeout=self.timeout_s)
+        else:
+            result = await _invoke()
 
-        # No concurrency guard
-        if self.timeout_s is not None:
-            return await asyncio.wait_for(_invoke(), timeout=self.timeout_s)
-        return await _invoke()
+        if result is None:
+            return None
+        if isinstance(result, MultimodalProcessorOutput):
+            return result
+        return MultimodalProcessorOutput.from_dict(result)
 
     def shutdown(self) -> None:
         """Gracefully shutdown resources owned by this wrapper."""
