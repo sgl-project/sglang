@@ -69,9 +69,7 @@ class SaveRemoteArgs:
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "SaveRemoteArgs":
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(
-            **{attr: getattr(args, attr) for attr, _ in attrs}
-        )
+        return cls(**{attr: getattr(args, attr) for attr, _ in attrs})
 
 
 def run_save_remote(server_args: ServerArgs, save_args: SaveRemoteArgs):

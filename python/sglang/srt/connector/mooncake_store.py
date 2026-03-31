@@ -82,13 +82,17 @@ class MooncakeStoreConnector(BaseKVConnector):
         tensor_sizes = [tensor.untyped_storage().nbytes() for tensor in tensors]
 
         for tensor in tensors:
-            ret_code = self.store.register_buffer(tensor.data_ptr(), tensor.untyped_storage().nbytes())
+            ret_code = self.store.register_buffer(
+                tensor.data_ptr(), tensor.untyped_storage().nbytes()
+            )
             if ret_code:
                 raise RuntimeError(
                     f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
                 )
 
-        results = self.store.batch_get_into([f"{self.model_name}/{key}" for key in keys], tensor_ptrs, tensor_sizes)
+        results = self.store.batch_get_into(
+            [f"{self.model_name}/{key}" for key in keys], tensor_ptrs, tensor_sizes
+        )
         print(results)
 
     def get_into(self, key: str, tensor: torch.Tensor) -> None:
@@ -101,10 +105,12 @@ class MooncakeStoreConnector(BaseKVConnector):
                 f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
             )
 
-        self.store.batch_get_into([f"{self.model_name}/{key}"], [tensor_ptr], [tensor_size])
+        self.store.batch_get_into(
+            [f"{self.model_name}/{key}"], [tensor_ptr], [tensor_size]
+        )
 
     def get(self, key: str) -> Optional[torch.Tensor]:
-        raise NotImplementedError()
+        raise NotImplementedError("Use batch_get_into() instead for performance.")
 
     def getstr(self, key: str) -> Optional[str]:
         data = self.store.get(key)
@@ -114,20 +120,24 @@ class MooncakeStoreConnector(BaseKVConnector):
         return data.decode("utf-8")
 
     def set(self, key: str, tensor: torch.Tensor) -> None:
-        raise NotImplementedError()
+        raise NotImplementedError("Use batch_put_from() instead for performance.")
 
     def batch_put_from(self, keys: List[str], tensors: List[torch.Tensor]) -> None:
         tensor_ptrs = [tensor.data_ptr() for tensor in tensors]
         tensor_sizes = [tensor.untyped_storage().nbytes() for tensor in tensors]
 
         for tensor in tensors:
-            ret_code = self.store.register_buffer(tensor.data_ptr(), tensor.untyped_storage().nbytes())
+            ret_code = self.store.register_buffer(
+                tensor.data_ptr(), tensor.untyped_storage().nbytes()
+            )
             if ret_code:
                 raise RuntimeError(
                     f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
                 )
 
-        results = self.store.batch_put_from(keys, tensor_ptrs, tensor_sizes, self._rep_config)
+        results = self.store.batch_put_from(
+            keys, tensor_ptrs, tensor_sizes, self._rep_config
+        )
         print(results)
 
     def setstr(self, key: str, obj: str) -> None:
@@ -151,9 +161,17 @@ class MooncakeStoreConnector(BaseKVConnector):
         # if not content:
         #     return []
         # return content.split("\n")
-        return [f"{prefix}{key}" for key in
-                ["config.json", "vocab.json", "tokenizer_config.json", "model.safetensors.index.json",
-                 "generation_config.json", "tokenizer.json"]]
+        return [
+            f"{prefix}{key}"
+            for key in [
+                "config.json",
+                "vocab.json",
+                "tokenizer_config.json",
+                "model.safetensors.index.json",
+                "generation_config.json",
+                "tokenizer.json",
+            ]
+        ]
 
     def _register_key_in_index(self, key: str, prefix: str) -> None:
         """Maintain a simple index for list() support."""
@@ -172,19 +190,17 @@ class MooncakeStoreConnector(BaseKVConnector):
     # ------------------------------------------------------------------
 
     def weight_iterator(
-            self, rank: int = 0
+        self, rank: int = 0
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        keys = self.list(f"{self.model_name}/keys/rank_{rank}/")
-        for key in keys:
-            val = self.get(key)
-            if val is not None:
-                name = key.removeprefix(f"{self.model_name}/keys/rank_{rank}/")
-                yield name, val
+        raise NotImplementedError(
+            "MooncakeStoreConnector does not support iterating weights one by one. "
+            "Please use a loading path that leverages `batch_get_into`."
+        )
 
     def pull_files(
-            self,
-            allow_pattern: Optional[List[str]] = None,
-            ignore_pattern: Optional[List[str]] = None,
+        self,
+        allow_pattern: Optional[List[str]] = None,
+        ignore_pattern: Optional[List[str]] = None,
     ) -> None:
         pull_files_from_db(self, self.model_name, allow_pattern, ignore_pattern)
 

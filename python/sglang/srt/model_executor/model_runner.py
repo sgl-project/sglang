@@ -28,13 +28,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
+import huggingface_hub
 import torch
 import torch.distributed as dist
-from torch import nn
-
-import huggingface_hub
-
 from huggingface_hub import snapshot_download
+from torch import nn
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs import (
@@ -2820,7 +2818,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info(f"Saving model to {url}")
         is_local = os.path.isdir(self.model_config.model_path)
         if not is_local:
-             # Download the config files.
+            # Download the config files.
             with get_lock(self.model_config.model_path, self.load_config.download_dir):
                 hf_folder = snapshot_download(
                     self.model_config.model_path,
