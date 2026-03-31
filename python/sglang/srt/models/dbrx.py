@@ -26,6 +26,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    fused_moe_npu,
+)
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -48,7 +51,9 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+
+_is_npu = is_npu()
 
 
 class DbrxRouter(nn.Module):
@@ -142,6 +147,7 @@ class DbrxExperts(nn.Module):
                 "weight_loader": self.weight_loader,
             },
         )
+        self.fused_moe_method = fused_moe if not _is_npu else fused_moe_npu
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, weight_name: str
@@ -177,7 +183,7 @@ class DbrxExperts(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe(
+        final_hidden_states = self.fused_moe_method(
             hidden_states,
             self.ws,
             self.w2s,
@@ -205,7 +211,7 @@ class DbrxAttention(nn.Module):
         self.head_dim = self.d_model // self.total_num_heads
         self.total_num_kv_heads = config.attn_config.kv_n_heads
         self.clip_qkv = config.attn_config.clip_qkv
-        self.rope_theta = config.attn_config.rope_parameters["rope_theta"]
+        self.rope_theta = config.attn_config.rope_theta
         self.max_position = config.max_seq_len
 
         # pylint: disable=invalid-name

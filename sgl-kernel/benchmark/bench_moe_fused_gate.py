@@ -8,12 +8,9 @@ import triton.language as tl
 from sgl_kernel import moe_fused_gate
 
 from sglang.srt.layers.moe.topk import biased_grouped_topk
+from sglang.utils import is_in_ci
 
-# CI environment detection
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 
 def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):

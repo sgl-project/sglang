@@ -348,6 +348,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
+        self.enable_hisparse = server_args.enable_hisparse
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -421,6 +422,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
+
+        # For hisparse (must be set before initialize() so CUDA graph capture can see it)
+        self.hisparse_coordinator = None
 
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
@@ -626,6 +630,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
+
+        # Init hisparse coordinator (must happen before CUDA graph capture)
+        if self.enable_hisparse:
+            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            hisparse_cfg = parse_hisparse_config(self.server_args)
+            self.hisparse_coordinator = HiSparseCoordinator(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                top_k=hisparse_cfg.top_k,
+                device_buffer_size=hisparse_cfg.device_buffer_size,
+                device=self.device,
+                tp_group=(
+                    self.attention_tp_group.cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_group.cpu_group
+                ),
+                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+            )
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
@@ -881,7 +905,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"tp_size {self.tp_size} must be divisible by ep_size {self.moe_ep_size}"
                 )
-            moe_tp_size = self.tp_size // self.moe_ep_size
+            moe_tp_size = self.tp_size // self.moe_ep_size // self.moe_dp_size
 
             moe_intermediate_size = getattr(
                 self.model_config.hf_text_config, "moe_intermediate_size", None
@@ -1179,6 +1203,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
+        # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
+        # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
+        if _is_npu:
+            torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
         # Publish metadata to ModelExpress if running as seed source
@@ -2139,7 +2167,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             is_encoder_decoder=self.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather_,
             seq_len_fill_value=seq_len_fill_value,
-            encoder_len_fill_value=0,
+            encoder_len_fill_value=(
+                getattr(self.model_config.hf_config, "max_source_positions", 0)
+                if self.model_config.is_encoder_decoder
+                else 0
+            ),
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
@@ -2450,6 +2482,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
+
+        # Some draft models (e.g. eagle3) don't have a standard 'layers' attribute
+        if not hasattr(language_model.model, "layers"):
+            logger.warning(
+                "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
+            )
+            return
+
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
@@ -2483,6 +2523,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if attn_layer is not None:
                 self.attention_layers.append(attn_layer)
+            elif hasattr(layer, "mixer"):
+                self.attention_layers.append(None)
 
             moe_block = None
             moe_fusion = None
@@ -2781,6 +2823,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if forward_batch.out_cache_loc_swa is not None:
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
+        forward_batch.hisparse_coordinator = self.hisparse_coordinator
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -2821,6 +2867,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+        # Release the vocab_mask GPU tensor immediately after it has been applied
+        # to the logits. In overlap scheduling, the sampling_info (and its
+        # vocab_mask) can be kept alive by the delay_sample_func closure and
+        # batch_record_buf until the next iteration, causing a steady VRAM leak
+        # when structured output (grammar) is used.
+        sampling_info.vocab_mask = None
 
     def sample(
         self,

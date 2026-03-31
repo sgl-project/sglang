@@ -17,6 +17,8 @@ The entry point of inference server. (SRT = SGLang Runtime)
 This file implements python APIs for the inference engine.
 """
 
+from __future__ import annotations
+
 import asyncio
 import atexit
 import dataclasses
@@ -98,6 +100,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -186,6 +189,7 @@ class Engine(EngineBase):
             template_manager,
             port_args,
             scheduler_init_result,
+            subprocess_watchdog,
         ) = self._launch_subprocesses(
             server_args=server_args,
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
@@ -195,6 +199,8 @@ class Engine(EngineBase):
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
+        if tokenizer_manager is not None:
+            tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
         # Access transfer engine info if bootstrap server is started.
         if scheduler_init_result.engine_info_bootstrap_server is not None:
@@ -202,7 +208,7 @@ class Engine(EngineBase):
                 scheduler_init_result.engine_info_bootstrap_server.transfer_engine_info
             )
             self.parallelism_config = (
-                scheduler_init_result.engine_info_bootstrap.parallelism_config
+                scheduler_init_result.engine_info_bootstrap_server.parallelism_config
             )
 
         # Initialize ZMQ sockets
@@ -509,9 +515,13 @@ class Engine(EngineBase):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
-    ) -> SchedulerInitResult:
+    ) -> Tuple[SchedulerInitResult, Optional[List]]:
         """Launch scheduler processes using multiprocessing.
         Override in subclasses for different backends (e.g. Ray).
+
+        Returns:
+            Tuple of (SchedulerInitResult, scheduler_procs).
+            scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
 
@@ -596,10 +606,13 @@ class Engine(EngineBase):
                     f"terminated with {proc.exitcode}"
                 )
 
-        return SchedulerInitResult(
-            scheduler_infos=scheduler_infos,
-            wait_for_ready=wait_for_ready,
-            wait_for_completion=wait_for_completion,
+        return (
+            SchedulerInitResult(
+                scheduler_infos=scheduler_infos,
+                wait_for_ready=wait_for_ready,
+                wait_for_completion=wait_for_completion,
+            ),
+            scheduler_procs,
         )
 
     @classmethod
@@ -610,17 +623,24 @@ class Engine(EngineBase):
         run_scheduler_process_func: Callable,
         run_detokenizer_process_func: Callable,
         port_args: Optional[PortArgs] = None,
-    ) -> Tuple[TokenizerManager, TemplateManager, PortArgs, SchedulerInitResult]:
+    ) -> Tuple[
+        TokenizerManager,
+        TemplateManager,
+        PortArgs,
+        SchedulerInitResult,
+        Optional[SubprocessWatchdog],
+    ]:
         """Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
 
         Returns:
-            Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result).
+            Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result, subprocess_watchdog).
             engine_info_bootstrap_server is stored on scheduler_init_result if started.
         """
         # Configure global environment
         configure_logger(server_args)
         _set_envs_and_config(server_args)
         server_args.check_server_args()
+        _set_gc(server_args)
 
         # Allocate ports for inter-process communications
         if port_args is None:
@@ -645,7 +665,7 @@ class Engine(EngineBase):
             )
 
         # Launch scheduler processes
-        scheduler_init_result = cls._launch_scheduler_processes(
+        scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
         )
         scheduler_init_result.engine_info_bootstrap_server = (
@@ -670,6 +690,7 @@ class Engine(EngineBase):
                     None,
                     port_args,
                     scheduler_init_result,
+                    None,
                 )
 
             launch_dummy_health_check_server(
@@ -682,6 +703,7 @@ class Engine(EngineBase):
                 None,
                 port_args,
                 scheduler_init_result,
+                None,
             )
 
         # Launch detokenizer process
@@ -712,15 +734,32 @@ class Engine(EngineBase):
             "max_req_input_len"
         ]
 
+        # Set up subprocess liveness watchdog to detect crashes
+        # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+        processes = list(scheduler_procs or [])
+        names = [f"scheduler_{i}" for i in range(len(processes))]
+        processes.append(detoken_proc)
+        names.append("detokenizer")
+        subprocess_watchdog = SubprocessWatchdog(
+            processes=processes, process_names=names
+        )
+        subprocess_watchdog.start()
+
         return (
             tokenizer_manager,
             template_manager,
             port_args,
             scheduler_init_result,
+            subprocess_watchdog,
         )
 
     def shutdown(self):
         """Shutdown the engine"""
+        if (
+            self.tokenizer_manager is not None
+            and self.tokenizer_manager._subprocess_watchdog is not None
+        ):
+            self.tokenizer_manager._subprocess_watchdog.stop()
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
@@ -1204,28 +1243,53 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _set_gc(server_args: ServerArgs):
+    if gc_threshold := server_args.gc_threshold:
+        import gc
+
+        gc.set_threshold(*gc_threshold)
+
+
+def _scheduler_died_error(rank: int, proc) -> RuntimeError:
+    """Build a descriptive error for a scheduler process that died during init."""
+    proc.join(timeout=10)
+    return RuntimeError(
+        f"Rank {rank} scheduler died during initialization "
+        f"(exit code: {proc.exitcode}). "
+        f"If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. "
+        f"Run `dmesg -T | grep -i oom` to check."
+    )
+
+
 def _wait_for_scheduler_ready(
     scheduler_pipe_readers: List,
     scheduler_procs: List,
 ) -> List[Dict]:
-    """Wait for the model to finish loading and return scheduler infos."""
+    """Wait for the model to finish loading and return scheduler infos.
+
+    Uses poll() with timeout instead of blocking recv(), so that child process
+    death (e.g. OOM SIGKILL) is detected promptly instead of hanging forever.
+    """
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise
+        while True:
+            if scheduler_pipe_readers[i].poll(timeout=5.0):
+                try:
+                    data = scheduler_pipe_readers[i].recv()
+                except EOFError:
+                    raise _scheduler_died_error(i, scheduler_procs[i])
+                if data["status"] != "ready":
+                    raise RuntimeError(
+                        "Initialization failed. Please see the error messages above."
+                    )
+                scheduler_infos.append(data)
+                break
 
-        if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-        scheduler_infos.append(data)
+            # Poll timed out — check all processes for early death
+            for j in range(len(scheduler_procs)):
+                if not scheduler_procs[j].is_alive():
+                    raise _scheduler_died_error(j, scheduler_procs[j])
+
     return scheduler_infos
 
 

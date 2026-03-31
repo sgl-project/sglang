@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 import functools
+import importlib.util
+import logging
 import os
 import pathlib
-from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypeAlias,
+    TypeVar,
+    Union,
+)
 
 import torch
+
+from sglang.utils import is_in_ci
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -13,10 +30,7 @@ if TYPE_CHECKING:
 F = TypeVar("F", bound=Callable[..., Any])
 _FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
 
-
-def is_in_ci() -> bool:
-    ci_env_vars = ("SGLANG_IS_IN_CI", "CI", "GITHUB_ACTIONS")
-    return any(os.getenv(env_var, "false").lower() == "true" for env_var in ci_env_vars)
+logger = logging.getLogger(__name__)
 
 
 def should_run_full_tests() -> bool:
@@ -75,10 +89,6 @@ def _resolve_kernel_path() -> pathlib.Path:
 KERNEL_PATH = _resolve_kernel_path()
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
-DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
-DEFAULT_HIP_CFLAGS = [
-    flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
-]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
 
@@ -128,6 +138,7 @@ def load_jit(
     extra_cuda_cflags: List[str] | None = None,
     extra_ldflags: List[str] | None = None,
     extra_include_paths: List[str] | None = None,
+    extra_dependencies: List[str] | None = None,
     build_directory: str | None = None,
 ) -> Module:
     """
@@ -154,6 +165,8 @@ def load_jit(
     :type extra_ldflags: List[str] | None
     :param extra_include_paths: Extra include paths.
     :type extra_include_paths: List[str] | None
+    :param extra_dependencies: Extra dependencies for the JIT module, e.g., cutlass.
+    :type extra_dependencies: List[str] | None
     :param build_directory: The build directory for JIT compilation.
     :type build_directory: str | None
     :return: A just-in-time(JIT) compiled module.
@@ -171,6 +184,11 @@ def load_jit(
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
 
+    for dep in set(extra_dependencies or []):
+        if dep not in _REGISTERED_DEPENDENCIES:
+            raise ValueError(f"Dependency {dep} is not registered.")
+        extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
+
     # include cpp files
     cpp_paths = [(KERNEL_PATH / "csrc" / f).resolve() for f in cpp_files]
     cpp_sources = [f'#include "{path}"' for path in cpp_paths]
@@ -181,55 +199,196 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
-    # Override TVM_FFI_CUDA_ARCH_LIST if it does not exist.
-    env_key = "TVM_FFI_CUDA_ARCH_LIST"
-    env_existed = env_key in os.environ
-    selected_cuda_cflags = DEFAULT_CUDA_CFLAGS
-    if is_hip_runtime():
-        selected_cuda_cflags = DEFAULT_HIP_CFLAGS
-        extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
-    else:
-        extra_cuda_cflags = [
-            f"-DSGL_CUDA_ARCH={_get_cuda_arch_value()}"
-        ] + extra_cuda_cflags
-    if not env_existed:
-        os.environ[env_key] = _get_cuda_arch_list()
-    try:
+    with _jit_compile_context():
         return load_inline(
             "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
             cpp_sources=cpp_sources,
             cuda_sources=cuda_sources,
             extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-            extra_cuda_cflags=selected_cuda_cflags + extra_cuda_cflags,
+            extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
             extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
             extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
             build_directory=build_directory,
         )
+
+
+@dataclass
+class ArchInfo:
+    major: int
+    minor: int
+    suffix: str
+
+    @property
+    def target_name(self) -> str:
+        return f"{self.major}.{self.minor}{self.suffix}"
+
+    @property
+    def jit_flag(self) -> str:
+        return f"-DSGL_CUDA_ARCH={self.major * 100 + self.minor * 10}"
+
+
+@cache_once
+def _init_jit_cuda_arch_once():
+    global _CUDA_ARCH
+    try:
+        device = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device)
+    except Exception:
+        logger.warning("Cannot detect CUDA architecture.")
+        major, minor = 0, 0  # invalid value to trigger compile error if used
+    _CUDA_ARCH = ArchInfo(major, minor, "")
+
+
+@contextmanager
+def _jit_compile_context():
+    if is_hip_runtime():
+        yield  # TODO: support ROCm `TVM_FFI_ROCM_ARCH_LIST` if needed
+        return
+    env_key = "TVM_FFI_CUDA_ARCH_LIST"
+    old_value = os.environ.get(env_key, None)
+    os.environ[env_key] = get_jit_cuda_arch().target_name
+    try:
+        yield
     finally:
-        # Reset TVM_FFI_CUDA_ARCH_LIST to original state (not exist)
-        if not env_existed:
-            del os.environ[env_key]
+        if old_value is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = old_value
 
 
-@cache_once
+# NOTE: this might also be used in __main__.py for compile flags export
+def _get_default_target_flags() -> List[str]:
+    if is_hip_runtime():
+        return ["-DUSE_ROCM", "-std=c++20", "-O3"]
+    else:
+        return [
+            get_jit_cuda_arch().jit_flag,
+            "-std=c++20",
+            "-O3",
+            "--expt-relaxed-constexpr",
+        ]
+
+
+@contextmanager
+def override_jit_cuda_arch(major: int, minor: int, suffix: str = ""):
+    """A context manager to temporarily override CUDA architecture."""
+    global _CUDA_ARCH
+    old_value = get_jit_cuda_arch()
+    _CUDA_ARCH = ArchInfo(major, minor, suffix)
+    try:
+        yield
+    finally:
+        _CUDA_ARCH = old_value
+
+
+def get_jit_cuda_arch() -> ArchInfo:
+    """Get the current CUDA architecture info."""
+    _init_jit_cuda_arch_once()
+    return _CUDA_ARCH
+
+
 def is_arch_support_pdl() -> bool:
-    import torch
-
-    device = torch.cuda.current_device()
-    return torch.cuda.get_device_capability(device)[0] >= 9
-
-
-@cache_once
-def _get_cuda_arch_value() -> int:
-    """Get CUDA arch value for -DSGL_CUDA_ARCH (e.g. 900 for SM 9.0)."""
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    return major * 100 + minor * 10
+    if is_hip_runtime():
+        return False
+    return get_jit_cuda_arch().major >= 9
 
 
-@cache_once
-def _get_cuda_arch_list() -> str:
-    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    return f"{major}.{minor}"
+def _find_package_root(package: str) -> Optional[pathlib.Path]:
+    spec = importlib.util.find_spec(package)
+    if spec is None or spec.origin is None:
+        return None
+    return pathlib.Path(spec.origin).resolve().parent
+
+
+# NOTE: this might also be used in __main__.py for compile flags export
+_REGISTERED_DEPENDENCIES: Dict[str, Callable[[], List[str]]] = {}
+
+
+def register_dependency(name: str):
+    def decorator(f: Callable[[], List[str]]) -> Callable[[], List[str]]:
+        if name in _REGISTERED_DEPENDENCIES:
+            raise ValueError(f"Dependency {name} already registered")
+        _REGISTERED_DEPENDENCIES[name] = f
+        return f
+
+    return decorator
+
+
+@register_dependency("flashinfer")
+def get_flashinfer_include_paths() -> List[str]:
+    include_paths: List[str] = []
+    flashinfer_root = _find_package_root("flashinfer")
+    if flashinfer_root is None:
+        raise RuntimeError(
+            "Cannot find flashinfer package. Please install flashinfer to get"
+            "the required headers for JIT compilation."
+        )
+
+    flashinfer_data = flashinfer_root / "data"
+    candidates = [
+        flashinfer_data / "include",
+        flashinfer_data / "csrc",
+        flashinfer_data / "cutlass" / "include",
+        flashinfer_data / "cutlass" / "tools" / "util" / "include",
+        flashinfer_data / "spdlog" / "include",
+    ]
+
+    for path in candidates:
+        if not path.exists():
+            raise RuntimeError(
+                f"Required header path {path} for flashinfer dependency not found."
+                " Please check your flashinfer installation."
+            )
+        include_paths.append(str(path))
+    return include_paths
+
+
+@register_dependency("cutlass")
+def get_cutlass_include_paths() -> List[str]:
+    include_paths: List[str] = []
+
+    flashinfer_root = _find_package_root("flashinfer")
+    if flashinfer_root is not None:
+        candidates = [
+            flashinfer_root / "data" / "cutlass" / "include",
+            flashinfer_root / "data" / "cutlass" / "tools" / "util" / "include",
+        ]
+        for path in candidates:
+            if path.exists():
+                include_paths.append(str(path))
+
+    deep_gemm_root = _find_package_root("deep_gemm")
+    if deep_gemm_root is not None:
+        candidate = deep_gemm_root / "include"
+        if candidate.exists():
+            include_paths.append(str(candidate))
+
+    # De-duplicate while preserving order.
+    unique_paths = []
+    seen = set()
+    for path in include_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        unique_paths.append(path)
+
+    if not unique_paths:
+        raise RuntimeError(
+            "Cannot find CUTLASS headers required for JIT compilation. "
+            "Please install flashinfer or deep_gemm with CUTLASS headers."
+        )
+    return unique_paths
+
+
+__all__ = [
+    "should_run_full_tests",
+    "get_ci_test_range",
+    "cache_once",
+    "is_hip_runtime",
+    "make_cpp_args",
+    "load_jit",
+    "override_jit_cuda_arch",
+    "get_jit_cuda_arch",
+    "is_arch_support_pdl",
+    "register_dependency",
+]

@@ -23,12 +23,10 @@ from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxV
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
-    preprocess_text,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
-    clip_preprocess_text,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -65,8 +63,8 @@ class FluxPipelineConfig(ImagePipelineConfig):
         default_factory=lambda: ("bf16", "bf16")
     )
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (clip_preprocess_text, preprocess_text),
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None, None),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
@@ -437,6 +435,17 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         default_factory=lambda: (flux2_postprocess_text,)
     )
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
+    text_encoder_extra_args: list[dict] = field(
+        default_factory=lambda: [
+            dict(
+                max_length=512,
+                padding="max_length",
+                truncation=True,
+                return_overflowing_tokens=False,
+                return_length=False,
+            )
+        ]
+    )
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         # flatten to 1-d list
@@ -650,8 +659,8 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
         default_factory=lambda: (Qwen3TextConfig(),)
     )
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,),
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
@@ -681,7 +690,9 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
         texts = [_apply_chat_template(prompt) for prompt in prompts]
 
         tok_kwargs = dict(tok_kwargs or {})
-        max_length = tok_kwargs.pop("max_length", 512)
+        tok_kwargs.pop("max_length", None)
+        # Flux2 Klein uses max_length 512.
+        max_length = 512
         padding = tok_kwargs.pop("padding", "max_length")
         truncation = tok_kwargs.pop("truncation", True)
         return_tensors = tok_kwargs.pop("return_tensors", "pt")

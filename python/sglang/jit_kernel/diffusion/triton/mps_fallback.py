@@ -15,50 +15,12 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from sglang.srt.environ import envs
+from sglang.srt.utils.tensor_bridge import mlx_to_torch, torch_to_mlx, use_mlx
 
-# MLX acceleration – opt-in via SGLANG_USE_MLX=1
-_MLX_AVAILABLE = False
-try:
+_use_mlx = use_mlx()
+
+if _use_mlx:
     import mlx.core as mx
-
-    _MLX_AVAILABLE = True
-except ImportError:
-    pass
-
-_USE_MLX = envs.SGLANG_USE_MLX.get() and _MLX_AVAILABLE
-
-# Dtype mapping for torch <-> MLX tensor bridge
-_TORCH_TO_MLX_DTYPE = (
-    {
-        torch.float32: mx.float32,
-        torch.float16: mx.float16,
-        torch.bfloat16: mx.bfloat16,
-    }
-    if _MLX_AVAILABLE
-    else {}
-)
-
-_MLX_TO_TORCH_DTYPE = {v: k for k, v in _TORCH_TO_MLX_DTYPE.items()}
-
-
-def _torch_to_mlx(tensor: torch.Tensor) -> "mx.array":
-    """Convert a PyTorch tensor to an MLX array (via numpy on CPU)."""
-    t = tensor.cpu().detach()
-    if t.dtype == torch.bfloat16:
-        return mx.array(t.float().numpy(), dtype=mx.bfloat16)
-    return mx.array(t.numpy())
-
-
-def _mlx_to_torch(array: "mx.array", device: torch.device) -> torch.Tensor:
-    """Convert an MLX array to a PyTorch tensor (zero-copy via memoryview)."""
-    torch_dtype = _MLX_TO_TORCH_DTYPE.get(array.dtype, torch.float32)
-    array = mx.contiguous(array)
-    mx.eval(array)
-    tensor = torch.frombuffer(memoryview(array), dtype=torch_dtype).reshape(array.shape)
-    if device.type == "mps":
-        tensor = tensor.to(device)
-    return tensor
 
 
 def fuse_scale_shift_kernel_native(
@@ -92,27 +54,6 @@ def fuse_scale_shift_kernel_native(
     shift = _expand(shift)
 
     return x * (scale_constant + scale) + shift
-
-
-def fuse_scale_shift_gate_select01_kernel_native(
-    x: torch.Tensor,
-    scale0: torch.Tensor,
-    shift0: torch.Tensor,
-    gate0: torch.Tensor,
-    scale1: torch.Tensor,
-    shift1: torch.Tensor,
-    gate1: torch.Tensor,
-    index: torch.Tensor,
-    block_l: int = 128,
-    block_c: int = 128,
-):
-    """Native fallback for fuse_scale_shift_gate_select01_kernel."""
-    idx = index.unsqueeze(-1).bool()
-    scale = torch.where(idx, scale1.unsqueeze(1), scale0.unsqueeze(1))
-    shift = torch.where(idx, shift1.unsqueeze(1), shift0.unsqueeze(1))
-    gate = torch.where(idx, gate1.unsqueeze(1), gate0.unsqueeze(1))
-    y = x * (1 + scale) + shift
-    return y, gate
 
 
 def apply_rotary_embedding_native(
@@ -218,7 +159,7 @@ def rms_norm_fn_native(
 # Uses mx.fast.rms_norm / mx.fast.layer_norm — single fused Metal kernels
 # instead of 7+ separate PyTorch MPS kernel launches.
 
-if _USE_MLX:
+if _use_mlx:
 
     def norm_infer_native(  # noqa: F811
         x: Tensor,
@@ -231,17 +172,17 @@ if _USE_MLX:
         """MLX-accelerated norm_infer (layer norm / rms norm inference)."""
         device = x.device
         orig_dtype = x.dtype
-        x_mx = _torch_to_mlx(x)
+        x_mx = torch_to_mlx(x)
         if is_rms_norm:
             w_mx = (
-                _torch_to_mlx(weight) if weight is not None else mx.ones(x_mx.shape[-1])
+                torch_to_mlx(weight) if weight is not None else mx.ones(x_mx.shape[-1])
             )
             result_mx = mx.fast.rms_norm(x_mx, w_mx, eps)
         else:
-            w_mx = _torch_to_mlx(weight) if weight is not None else None
-            b_mx = _torch_to_mlx(bias) if bias is not None else None
+            w_mx = torch_to_mlx(weight) if weight is not None else None
+            b_mx = torch_to_mlx(bias) if bias is not None else None
             result_mx = mx.fast.layer_norm(x_mx, w_mx, b_mx, eps)
-        result = _mlx_to_torch(result_mx, device).to(orig_dtype)
+        result = mlx_to_torch(result_mx, device).to(orig_dtype)
         if out is not None:
             out.copy_(result)
             return out
@@ -251,13 +192,12 @@ if _USE_MLX:
         x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
     ) -> torch.Tensor:
         """MLX-accelerated triton_one_pass_rms_norm."""
-        shape = x.shape
         device = x.device
         orig_dtype = x.dtype
-        x_mx = _torch_to_mlx(x.reshape(-1, x.shape[-1]))
-        w_mx = _torch_to_mlx(w)
+        x_mx = torch_to_mlx(x)
+        w_mx = torch_to_mlx(w)
         result_mx = mx.fast.rms_norm(x_mx, w_mx, eps)
-        return _mlx_to_torch(result_mx, device).to(orig_dtype).view(shape)
+        return mlx_to_torch(result_mx, device).to(orig_dtype)
 
     def rms_norm_fn_native(  # noqa: F811
         x,
@@ -279,30 +219,25 @@ if _USE_MLX:
         residual_out=None,
     ):
         """MLX-accelerated rms_norm_fn (inference only, no dropout/x1 support)."""
-        x_shape_og = x.shape
         device = x.device
         orig_dtype = x.dtype
-        x_flat = x.reshape(-1, x.shape[-1])
         if residual is not None:
-            residual = residual.reshape(-1, residual.shape[-1]).float()
-            x_flat = x_flat.float() + residual
-            residual_out_val = x_flat.to(
-                torch.float32 if residual_in_fp32 else orig_dtype
-            )
+            x = x.float() + residual.float()
+            residual_out_val = x.to(torch.float32 if residual_in_fp32 else orig_dtype)
         else:
             residual_out_val = None
         if weight is not None and zero_centered_weight:
             w = weight.float() + 1.0
         else:
             w = weight
-        x_mx = _torch_to_mlx(x_flat)
-        w_mx = _torch_to_mlx(w) if w is not None else mx.ones(x_mx.shape[-1])
+        x_mx = torch_to_mlx(x)
+        w_mx = torch_to_mlx(w) if w is not None else mx.ones(x_mx.shape[-1])
         result_mx = mx.fast.rms_norm(x_mx, w_mx, eps)
-        x_hat = _mlx_to_torch(result_mx, device)
+        x_hat = mlx_to_torch(result_mx, device)
         if bias is not None:
             x_hat = x_hat + bias.to(x_hat.device, x_hat.dtype)
         final_dtype = out_dtype if out_dtype is not None else orig_dtype
-        y = x_hat.to(final_dtype).reshape(x_shape_og)
+        y = x_hat.to(final_dtype)
         if residual is not None and residual_out_val is not None:
-            return y, residual_out_val.reshape(x_shape_og)
+            return y, residual_out_val
         return y

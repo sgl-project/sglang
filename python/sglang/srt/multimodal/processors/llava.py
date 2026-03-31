@@ -33,6 +33,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaQwenForCausalLM,
         LlavaMistralForCausalLM,
     ]
+    gpu_image_decode = False  # Llava processes loaded image as PIL image explicitly
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -49,7 +50,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
         try:
             url = image_data.url if isinstance(image_data, ImageData) else image_data
-            image, image_size = load_image(url)
+            image, image_size = load_image(url, False)
             if image_size is not None:
                 # It is a video with multiple images
                 image_hash = hash(url)
