@@ -57,13 +57,13 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**"
+              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
@@ -91,6 +91,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
 
       - name: Install dependencies
         env:
@@ -152,6 +156,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -194,6 +202,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
 
       - name: Install dependencies
         env:
@@ -238,6 +250,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -279,6 +295,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -291,7 +311,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -302,7 +322,6 @@ jobs:
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
@@ -322,6 +341,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
@@ -334,7 +357,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -345,7 +368,6 @@ jobs:
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
@@ -365,16 +387,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Mark repository safe
+        run: |
+          git config --system --add safe.directory ${GITHUB_WORKSPACE}
+
       - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+          pip config set global.trusted-host "${CACHING_URL}"
 
-          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -385,7 +414,6 @@ jobs:
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"

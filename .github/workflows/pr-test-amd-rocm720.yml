@@ -4,9 +4,8 @@ name: PR Test ROCm 7.2 (AMD)
 run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_head_sha && format('[{0}] {1}', inputs.target_stage || inputs.target_stage_select, inputs.pr_head_sha) || format('[{0}]', inputs.target_stage || inputs.target_stage_select)) || '' }}
 
 on:
-  # run rocm 720 pr tests once a day at 2am UTC to avoid overwhelming the CI system
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '30 17 * * *'
   # push:
   #   branches: [ main ]
   #   paths:
@@ -36,18 +35,19 @@ on:
           - ''
           - sgl-kernel-unit-test-amd
           - sgl-kernel-unit-test-2-gpu-amd
-          - stage-a-test-1-amd
+          - stage-a-test-1-gpu-small-amd
           - jit-kernel-unit-test-amd
-          - stage-b-test-small-1-gpu-amd
-          - stage-b-test-small-1-gpu-amd-nondeterministic
-          - stage-b-test-small-1-gpu-amd-mi35x
-          - stage-b-test-large-1-gpu-amd
-          - stage-b-test-large-2-gpu-amd
+          - stage-b-test-1-gpu-small-amd
+          - stage-b-test-1-gpu-small-amd-nondeterministic
+          - stage-b-test-1-gpu-small-amd-mi35x
+          - stage-b-test-1-gpu-large-amd
+          - stage-b-test-2-gpu-large-amd
           - multimodal-gen-test-1-gpu-amd
           - multimodal-gen-test-2-gpu-amd
           - stage-c-test-large-8-gpu-amd
           - stage-c-test-large-8-gpu-amd-mi35x
           - stage-b-test-large-8-gpu-disaggregation-amd
+          - stage-c-test-4-gpu-amd
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
@@ -139,23 +139,25 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
               - "scripts/ci/amd/*"
               - "scripts/ci/utils/*"
-              - "test/**"
+              - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             sgl_kernel:
-              - "sgl-kernel/**"
+              - "sgl-kernel/**/*.!(md|txt)"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             jit_kernel:
               - "python/sglang/jit_kernel/**"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**"
+              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
               - "python/sglang/cli/**"
               - "python/sglang/jit_kernel/diffusion/**"
+              - "python/sglang/jit_kernel/tests/diffusion/**"
+              - "python/sglang/jit_kernel/benchmark/diffusion/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
 
@@ -183,7 +185,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -229,7 +231,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -247,12 +249,12 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  stage-a-test-1-amd:
+  stage-a-test-1-gpu-small-amd:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -271,7 +273,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -284,7 +286,7 @@ jobs:
       - name: Run test
         timeout-minutes: 10
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   jit-kernel-unit-test-amd:
     needs: [check-changes]
@@ -309,7 +311,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -324,12 +326,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" python3 -m pytest -q python/sglang/jit_kernel/tests/test_store_cache.py
 
-  stage-b-test-small-1-gpu-amd:
+  stage-b-test-1-gpu-small-amd:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -349,7 +351,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -361,14 +363,14 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-b-test-small-1-gpu-amd-nondeterministic:
+  stage-b-test-1-gpu-small-amd-nondeterministic:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-nondeterministic,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-nondeterministic,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -387,7 +389,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -399,14 +401,14 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-nondeterministic --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-b-test-small-1-gpu-amd-mi35x:
+  stage-b-test-1-gpu-small-amd-mi35x:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-small-1-gpu-amd-mi35x,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-mi35x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -425,7 +427,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -437,14 +439,14 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-mi35x ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-b-test-large-1-gpu-amd:
+  stage-b-test-1-gpu-large-amd:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-1-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-large-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -464,7 +466,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -476,14 +478,14 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-b-test-large-2-gpu-amd:
+  stage-b-test-2-gpu-large-amd:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-2-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-2-gpu-large-amd,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -503,7 +505,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -515,7 +517,7 @@ jobs:
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
@@ -534,7 +536,7 @@ jobs:
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
         runner: [linux-mi325-1gpu-sglang]
-        part: [0, 1]  # 2 partitions: 11 tests ÷ 2 = ~5-6 tests each
+        part: [0, 1, 2, 3]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -543,7 +545,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -636,12 +638,11 @@ jobs:
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
-            -e HF_TOKEN=${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }} \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2 \
+              --total-partitions 4 \
               -k "not flux_2"
 
           # Post-test diagnostics
@@ -674,7 +675,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -766,7 +767,6 @@ jobs:
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
-            -e HF_TOKEN=${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }} \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
@@ -777,6 +777,62 @@ jobs:
           echo "=== Post-test System Memory Status ==="
           free -h
 
+
+  stage-c-test-4-gpu-amd:
+    needs: [check-changes, stage-b-test-1-gpu-small-amd, stage-b-test-2-gpu-large-amd]
+    if: |
+      always() &&
+      (
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-4-gpu-amd,')) ||
+        (
+          !(inputs.target_stage || inputs.target_stage_select) &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-4gpu-sglang]
+        part: [0]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e NCCL_CUMEM_ENABLE=0 \
+            -e NCCL_NVLS_ENABLE=0 \
+            -e RCCL_MSCCL_ENABLE=0 \
+            -e SGLANG_USE_ROCM700A=1 \
+            -w "/sglang-checkout/test" \
+            python3 run_suite.py \
+              --hw amd \
+              --suite stage-c-test-4-gpu-amd \
+              --auto-partition-id ${{ matrix.part }} \
+              --auto-partition-size 1 \
+              --timeout-per-file 1800 \
+              --enable-retry \
+              --max-attempts 2 \
+              --retry-wait-seconds 120 \
+              --retry-timeout-increase 0 \
+              ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   stage-c-test-large-8-gpu-amd:
     needs: [check-changes]
@@ -805,7 +861,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -841,7 +897,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi35x-gpu-8]
-        part: [0]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -850,7 +906,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
@@ -862,7 +918,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-8-gpu-35x-disaggregation-amd:
@@ -891,7 +947,7 @@ jobs:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
       - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Check Host RDMA Environment
         id: rdma_detect
@@ -987,14 +1043,15 @@ jobs:
         multimodal-gen-test-1-gpu-amd,
         multimodal-gen-test-2-gpu-amd,
 
-        stage-a-test-1-amd,
+        stage-a-test-1-gpu-small-amd,
         jit-kernel-unit-test-amd,
-        stage-b-test-small-1-gpu-amd,
-        stage-b-test-small-1-gpu-amd-nondeterministic,
-        stage-b-test-small-1-gpu-amd-mi35x,
-        stage-b-test-large-1-gpu-amd,
-        stage-b-test-large-2-gpu-amd,
+        stage-b-test-1-gpu-small-amd,
+        stage-b-test-1-gpu-small-amd-nondeterministic,
+        stage-b-test-1-gpu-small-amd-mi35x,
+        stage-b-test-1-gpu-large-amd,
+        stage-b-test-2-gpu-large-amd,
         stage-b-test-large-8-gpu-35x-disaggregation-amd,
+        stage-c-test-4-gpu-amd,
         stage-c-test-large-8-gpu-amd,
         stage-c-test-large-8-gpu-amd-mi35x,
       ]

@@ -26,7 +26,7 @@ def fused_topk_npu(
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
 
-    if not use_grouped_topk:
+    if not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
             k=topk_config.top_k,

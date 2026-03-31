@@ -71,41 +71,21 @@ def _fused_layernorm_scale_shift_gate_select01_kernel(
     seq_idx = row % seq_len
     idx = tl.load(index_ptr + batch_idx * stride_i_b + seq_idx * stride_i_l).to(tl.int1)
 
-    scale0 = tl.load(
-        scale0_ptr + batch_idx * stride_s0_b + cols * stride_s0_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    shift0 = tl.load(
-        shift0_ptr + batch_idx * stride_sh0_b + cols * stride_sh0_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    gate0 = tl.load(
-        gate0_ptr + batch_idx * stride_g0_b + cols * stride_g0_c,
-        mask=mask,
-        other=0.0,
-    )
+    scale0_ptrs = scale0_ptr + batch_idx * stride_s0_b + cols * stride_s0_c
+    shift0_ptrs = shift0_ptr + batch_idx * stride_sh0_b + cols * stride_sh0_c
+    gate0_ptrs = gate0_ptr + batch_idx * stride_g0_b + cols * stride_g0_c
 
-    scale1 = tl.load(
-        scale1_ptr + batch_idx * stride_s1_b + cols * stride_s1_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    shift1 = tl.load(
-        shift1_ptr + batch_idx * stride_sh1_b + cols * stride_sh1_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    gate1 = tl.load(
-        gate1_ptr + batch_idx * stride_g1_b + cols * stride_g1_c,
-        mask=mask,
-        other=0.0,
-    )
+    scale1_ptrs = scale1_ptr + batch_idx * stride_s1_b + cols * stride_s1_c
+    shift1_ptrs = shift1_ptr + batch_idx * stride_sh1_b + cols * stride_sh1_c
+    gate1_ptrs = gate1_ptr + batch_idx * stride_g1_b + cols * stride_g1_c
 
-    scale = tl.where(idx, scale1, scale0)
-    shift = tl.where(idx, shift1, shift0)
-    gate = tl.where(idx, gate1, gate0)
+    scale_ptrs = tl.where(idx, scale1_ptrs, scale0_ptrs)
+    shift_ptrs = tl.where(idx, shift1_ptrs, shift0_ptrs)
+    gate_ptrs = tl.where(idx, gate1_ptrs, gate0_ptrs)
+
+    scale = tl.load(scale_ptrs, mask=mask, other=0.0).to(tl.float32)
+    shift = tl.load(shift_ptrs, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0)
     y = x_hat * (1.0 + scale) + shift
 
     tl.store(out_row_ptr + cols, y, mask=mask)
@@ -192,41 +172,21 @@ def _fused_residual_layernorm_scale_shift_gate_select01_kernel(
     seq_idx = row % seq_len
     idx = tl.load(index_ptr + batch_idx * stride_i_b + seq_idx * stride_i_l).to(tl.int1)
 
-    scale0 = tl.load(
-        scale0_ptr + batch_idx * stride_s0_b + cols * stride_s0_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    shift0 = tl.load(
-        shift0_ptr + batch_idx * stride_sh0_b + cols * stride_sh0_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    gate0 = tl.load(
-        gate0_ptr + batch_idx * stride_g0_b + cols * stride_g0_c,
-        mask=mask,
-        other=0.0,
-    )
+    scale0_ptrs = scale0_ptr + batch_idx * stride_s0_b + cols * stride_s0_c
+    shift0_ptrs = shift0_ptr + batch_idx * stride_sh0_b + cols * stride_sh0_c
+    gate0_ptrs = gate0_ptr + batch_idx * stride_g0_b + cols * stride_g0_c
 
-    scale1 = tl.load(
-        scale1_ptr + batch_idx * stride_s1_b + cols * stride_s1_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    shift1 = tl.load(
-        shift1_ptr + batch_idx * stride_sh1_b + cols * stride_sh1_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    gate1 = tl.load(
-        gate1_ptr + batch_idx * stride_g1_b + cols * stride_g1_c,
-        mask=mask,
-        other=0.0,
-    )
+    scale1_ptrs = scale1_ptr + batch_idx * stride_s1_b + cols * stride_s1_c
+    shift1_ptrs = shift1_ptr + batch_idx * stride_sh1_b + cols * stride_sh1_c
+    gate1_ptrs = gate1_ptr + batch_idx * stride_g1_b + cols * stride_g1_c
 
-    scale = tl.where(idx, scale1, scale0)
-    shift = tl.where(idx, shift1, shift0)
-    gate = tl.where(idx, gate1, gate0)
+    scale_ptrs = tl.where(idx, scale1_ptrs, scale0_ptrs)
+    shift_ptrs = tl.where(idx, shift1_ptrs, shift0_ptrs)
+    gate_ptrs = tl.where(idx, gate1_ptrs, gate0_ptrs)
+
+    scale = tl.load(scale_ptrs, mask=mask, other=0.0).to(tl.float32)
+    shift = tl.load(shift_ptrs, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0)
     y = x_hat * (1.0 + scale) + shift
 
     tl.store(out_row_ptr + cols, y, mask=mask)
@@ -356,94 +316,6 @@ def fuse_scale_shift_kernel_blc_opt(
     tl.store(y_ptr + x_off, y, mask=mask)
 
 
-@triton.jit
-def fuse_scale_shift_gate_select01_kernel_blc_opt(
-    x_ptr,
-    shift0_ptr,
-    scale0_ptr,
-    gate0_ptr,
-    shift1_ptr,
-    scale1_ptr,
-    gate1_ptr,
-    index_ptr,
-    y_ptr,
-    gate_out_ptr,
-    B,
-    L,
-    C,
-    stride_x_b,
-    stride_x_l,
-    stride_x_c,
-    stride_s0_b,
-    stride_s0_c,
-    stride_sc0_b,
-    stride_sc0_c,
-    stride_g0_b,
-    stride_g0_c,
-    stride_s1_b,
-    stride_s1_c,
-    stride_sc1_b,
-    stride_sc1_c,
-    stride_g1_b,
-    stride_g1_c,
-    stride_i_b,
-    stride_i_l,
-    stride_go_b,
-    stride_go_l,
-    stride_go_c,
-    BLOCK_L: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    pid_l = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    pid_b = tl.program_id(2)
-
-    l_offsets = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
-    c_offsets = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-
-    mask_l = l_offsets < L
-    mask_c = c_offsets < C
-    mask = mask_l[:, None] & mask_c[None, :]
-
-    x_off = (
-        pid_b * stride_x_b
-        + l_offsets[:, None] * stride_x_l
-        + c_offsets[None, :] * stride_x_c
-    )
-    x = tl.load(x_ptr + x_off, mask=mask, other=0)
-
-    idx_off = pid_b * stride_i_b + l_offsets * stride_i_l
-    idx = tl.load(index_ptr + idx_off, mask=mask_l, other=0).to(tl.int1)[:, None]
-
-    s0_off = pid_b * stride_s0_b + c_offsets[None, :] * stride_s0_c
-    sc0_off = pid_b * stride_sc0_b + c_offsets[None, :] * stride_sc0_c
-    g0_off = pid_b * stride_g0_b + c_offsets[None, :] * stride_g0_c
-    s1_off = pid_b * stride_s1_b + c_offsets[None, :] * stride_s1_c
-    sc1_off = pid_b * stride_sc1_b + c_offsets[None, :] * stride_sc1_c
-    g1_off = pid_b * stride_g1_b + c_offsets[None, :] * stride_g1_c
-
-    shift0 = tl.load(shift0_ptr + s0_off, mask=mask_c[None, :], other=0)
-    scale0 = tl.load(scale0_ptr + sc0_off, mask=mask_c[None, :], other=0)
-    gate0 = tl.load(gate0_ptr + g0_off, mask=mask_c[None, :], other=0)
-    shift1 = tl.load(shift1_ptr + s1_off, mask=mask_c[None, :], other=0)
-    scale1 = tl.load(scale1_ptr + sc1_off, mask=mask_c[None, :], other=0)
-    gate1 = tl.load(gate1_ptr + g1_off, mask=mask_c[None, :], other=0)
-
-    shift = tl.where(idx, shift1, shift0)
-    scale = tl.where(idx, scale1, scale0)
-    gate = tl.where(idx, gate1, gate0)
-
-    y = x * (1 + scale) + shift
-    tl.store(y_ptr + x_off, y, mask=mask)
-
-    go_off = (
-        pid_b * stride_go_b
-        + l_offsets[:, None] * stride_go_l
-        + c_offsets[None, :] * stride_go_c
-    )
-    tl.store(gate_out_ptr + go_off, gate, mask=mask)
-
-
 def fuse_scale_shift_kernel(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -463,7 +335,10 @@ def fuse_scale_shift_kernel(
         rows = B * L
         x_2d = x.view(rows, C)
         output_2d = output.view(rows, C)
-        grid = lambda META: (rows, triton.cdiv(C, META["BLOCK_N"]))
+
+        def grid(meta):
+            return (rows, triton.cdiv(C, meta["BLOCK_N"]))
+
         num_frames = scale.shape[1]
         assert (
             L % num_frames == 0
@@ -563,78 +438,6 @@ def fuse_scale_shift_kernel(
     return output
 
 
-def fuse_scale_shift_gate_select01_kernel(
-    x: torch.Tensor,
-    scale0: torch.Tensor,
-    shift0: torch.Tensor,
-    gate0: torch.Tensor,
-    scale1: torch.Tensor,
-    shift1: torch.Tensor,
-    gate1: torch.Tensor,
-    index: torch.Tensor,
-    block_l: int = 128,
-    block_c: int = 128,
-):
-    assert x.is_contiguous()
-    B, L, C = x.shape
-    output = torch.empty_like(x)
-    gate_out = torch.empty_like(x)
-
-    if (
-        scale0.dim() != 2
-        or shift0.dim() != 2
-        or gate0.dim() != 2
-        or scale1.dim() != 2
-        or shift1.dim() != 2
-        or gate1.dim() != 2
-    ):
-        raise ValueError("scale0/shift0/gate0/scale1/shift1/gate1 must be 2D [B, C]")
-    if index.dim() != 2:
-        raise ValueError("index must be 2D [B, L]")
-
-    grid = (triton.cdiv(L, block_l), triton.cdiv(C, block_c), B)
-    fuse_scale_shift_gate_select01_kernel_blc_opt[grid](
-        x,
-        shift0,
-        scale0,
-        gate0,
-        shift1,
-        scale1,
-        gate1,
-        index,
-        output,
-        gate_out,
-        B,
-        L,
-        C,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        shift0.stride(0),
-        shift0.stride(1),
-        scale0.stride(0),
-        scale0.stride(1),
-        gate0.stride(0),
-        gate0.stride(1),
-        shift1.stride(0),
-        shift1.stride(1),
-        scale1.stride(0),
-        scale1.stride(1),
-        gate1.stride(0),
-        gate1.stride(1),
-        index.stride(0),
-        index.stride(1),
-        gate_out.stride(0),
-        gate_out.stride(1),
-        gate_out.stride(2),
-        BLOCK_L=block_l,
-        BLOCK_C=block_c,
-        num_warps=4,
-        num_stages=2,
-    )
-    return output, gate_out
-
-
 def fuse_layernorm_scale_shift_gate_select01_kernel(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -680,6 +483,7 @@ def fuse_layernorm_scale_shift_gate_select01_kernel(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(C))
     if C > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    num_warps, num_stages = 4, 4
 
     grid = (B * L,)
     _fused_layernorm_scale_shift_gate_select01_kernel[grid](
@@ -720,6 +524,8 @@ def fuse_layernorm_scale_shift_gate_select01_kernel(
         HAS_WEIGHT=weight is not x_2d,
         HAS_BIAS=bias is not x_2d,
         BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output, gate_out
 
@@ -781,6 +587,7 @@ def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(C))
     if C > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    num_warps, num_stages = 4, 4
 
     grid = (B * L,)
     _fused_residual_layernorm_scale_shift_gate_select01_kernel[grid](
@@ -827,6 +634,8 @@ def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
         HAS_WEIGHT=weight is not x_2d,
         HAS_BIAS=bias is not x_2d,
         BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output, residual_out, gate_out
 
@@ -837,10 +646,6 @@ if current_platform.is_npu():
     fuse_scale_shift_kernel = fuse_scale_shift_native
 
 if current_platform.is_mps():
-    from .mps_fallback import (
-        fuse_scale_shift_gate_select01_kernel_native,
-        fuse_scale_shift_kernel_native,
-    )
+    from .mps_fallback import fuse_scale_shift_kernel_native
 
     fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
-    fuse_scale_shift_gate_select01_kernel = fuse_scale_shift_gate_select01_kernel_native

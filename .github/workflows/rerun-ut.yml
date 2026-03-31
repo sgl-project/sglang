@@ -1,5 +1,5 @@
 name: Rerun UT
-run-name: ${{ inputs.pr_head_sha && format('[rerun-ut] {0}', inputs.pr_head_sha) || '[rerun-ut]' }}
+run-name: ${{ inputs.pr_head_sha && format('[rerun-ut] {0} {1}', inputs.test_command, inputs.pr_head_sha) || format('[rerun-ut] {0}', inputs.test_command) }}
 
 on:
   workflow_dispatch:
@@ -13,9 +13,9 @@ on:
         required: true
         type: choice
         options:
-          - 1-gpu-runner
+          - 1-gpu-h100
           - 1-gpu-5090
-          - 2-gpu-runner
+          - 2-gpu-h100
           - 4-gpu-h100
           - 4-gpu-a10
           - 4-gpu-b200
@@ -41,6 +41,7 @@ env:
 permissions:
   actions: write
   contents: read
+  issues: read
 
 jobs:
   rerun-ut-cuda:
@@ -48,13 +49,14 @@ jobs:
     timeout-minutes: 120
     env:
       RUNNER_LABELS: ${{ inputs.runner_label }}
-      IS_BLACKWELL: ${{ (inputs.runner_label == '1-gpu-5090' || contains(inputs.runner_label, 'b200')) && '1' || '' }}
       SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.runner_label == '8-gpu-h20' && 'mlx5_1,mlx5_2,mlx5_3,mlx5_4' || '' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
         timeout-minutes: 20

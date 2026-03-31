@@ -72,7 +72,7 @@ jobs:
         working-directory: sgl-kernel
         run: |
           pip install twine
-          python3 -m twine upload --skip-existing dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+          python3 -m twine upload --skip-existing dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN_SGLANG_KERNEL }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

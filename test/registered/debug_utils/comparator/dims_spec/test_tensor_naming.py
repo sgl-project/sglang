@@ -13,7 +13,7 @@ from sglang.srt.debug_utils.comparator.dims_spec import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="default", nightly=True)
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu", nightly=True)
 
 
 class TestFindDimIndex:
