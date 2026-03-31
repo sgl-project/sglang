@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -29,7 +30,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -1467,9 +1467,11 @@ def apply_fp8_linear(
             and weight_scale.numel() == 1
             and envs.SGLANG_ENABLE_TORCH_COMPILE.get()
         ):
-            qinput = (input_2d * input_scale.reciprocal()).clamp(
-                min=fp8_min, max=fp8_max
-            ).to(fp8_dtype)
+            qinput = (
+                (input_2d * input_scale.reciprocal())
+                .clamp(min=fp8_min, max=fp8_max)
+                .to(fp8_dtype)
+            )
             x_scale = input_scale
         else:
             qinput, x_scale = scaled_fp8_quant(
