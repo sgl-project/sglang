@@ -464,6 +464,7 @@ class ServerArgs:
     lora_eviction_policy: str = "lru"
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
+    experts_shared_outer_loras: Optional[bool] = None
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -4594,6 +4595,14 @@ class ServerArgs:
             default=ServerArgs.max_lora_chunk_size,
             choices=[16, 32, 64, 128],
             help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
+        )
+        parser.add_argument(
+            "--experts-shared-outer-loras",
+            default=ServerArgs.experts_shared_outer_loras,
+            action="store_true",
+            help="Force shared outer LoRA mode for MoE models. "
+            "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
+            "(expert_dim=1). By default this is auto-detected from adapter weights.",
         )
 
         # Kernel backend
