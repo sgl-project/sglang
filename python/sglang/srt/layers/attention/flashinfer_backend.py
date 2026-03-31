@@ -457,29 +457,50 @@ class FlashInferAttnBackend(AttentionBackend):
             if not isinstance(paged_seq_lens_cpu, list):
                 paged_seq_lens_cpu = paged_seq_lens_cpu.tolist()
             if sum(paged_seq_lens_cpu) > 0:
-                # [prefix_len, 256] -> [padded_prefix_len, 256] -> sum_tokens -> token_indices[page_size, ..., padde_prefix_len + 256 + page_size]
+                # dq_buffer layout is page-aligned: each request occupies
+                # ceil(seq_len/page_size)*page_size slots, starting after a
+                # page_size dummy prefix.  We build dq_page_table (kv_indices)
+                # that maps only the *actual* token positions (skipping padding
+                # gaps), and dq_paged_kernel_lens stores the real seq_lens so
+                # that kv_indptr reflects exact lengths.  This ensures the
+                # flashinfer causal offset = seq_len - q_len (correct), not
+                # page_align(seq_len) - q_len (wrong, leaks future tokens).
                 paged_seq_lens_cpu.append(256)
                 import numpy as np
 
-                paged_seq_lens_cpu = np.array(paged_seq_lens_cpu)
-                paged_seq_lens_cpu_padded = (
-                    (paged_seq_lens_cpu + self.page_size - 1)
+                seq_lens_arr = np.array(paged_seq_lens_cpu)
+                padded_lens = (
+                    (seq_lens_arr + self.page_size - 1)
                     // self.page_size
                     * self.page_size
                 )
-                # Store page-aligned per-request lengths (excluding buffer)
-                # for kv_indptr alignment in call_begin_forward
-                self.dq_paged_kernel_lens = torch.tensor(
-                    paged_seq_lens_cpu_padded[:-1].tolist(),
-                    dtype=torch.int32,
+
+                # Compute page-aligned start offsets in dq_buffer
+                # (skip page_size dummy at the beginning)
+                starts = np.empty(len(seq_lens_arr) + 1, dtype=np.int64)
+                starts[0] = self.page_size
+                np.cumsum(padded_lens, out=starts[1:])
+                starts[1:] += self.page_size
+
+                # Build kv_indices: for each request, only include the
+                # actual data positions [start, start+actual_len), skipping
+                # the padding [start+actual_len, start+padded_len).
+                indices = []
+                for i in range(len(seq_lens_arr)):
+                    indices.append(np.arange(starts[i], starts[i] + seq_lens_arr[i]))
+                self.dq_page_table = torch.tensor(
+                    np.concatenate(indices),
                     device=forward_batch.req_pool_indices.device,
+                    dtype=torch.int32,
                 )
-                total_paged_tokens = sum(paged_seq_lens_cpu_padded)
-                self.dq_page_table = torch.arange(
-                    self.page_size,
-                    total_paged_tokens + self.page_size,
-                    device=forward_batch.req_pool_indices.device,
+
+                # Use actual (non-padded) lengths for kv_indptr so causal
+                # masking computes the correct offset.  Exclude the trailing
+                # 256-token buffer entry.
+                self.dq_paged_kernel_lens = torch.tensor(
+                    seq_lens_arr[:-1].tolist(),
                     dtype=torch.int32,
+                    device=forward_batch.req_pool_indices.device,
                 )
             self.cpu_req_pool_indices = forward_batch.req_pool_indices.to(
                 "cpu", non_blocking=True
@@ -1490,11 +1511,11 @@ class FlashInferIndicesUpdaterPrefill:
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
-            # When using custom_kv_indices (NVFP4 dq_page_table), the dq buffer
-            # layout is page-aligned per request. Use page-aligned lengths for
-            # kv_indptr so that each request's region in dq_page_table matches
-            # the actual dq buffer layout. Causal masking ensures padding tokens
-            # at the end of each request's region are never attended to.
+            # When using custom_kv_indices (NVFP4 dq_page_table), use the
+            # actual (non-padded) seq_lens stored in dq_paged_kernel_lens for
+            # kv_indptr.  The dq_page_table already maps only the real data
+            # positions (skipping page-aligned padding gaps), so kv_indptr
+            # must reflect the exact token count to get correct causal offsets.
             if (
                 custom_kv_indices is not None
                 and self.attn_backend.dq_paged_kernel_lens is not None
