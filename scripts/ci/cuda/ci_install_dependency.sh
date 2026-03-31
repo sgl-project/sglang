@@ -223,18 +223,7 @@ if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
-# Pre-install nvidia wheels torch requires. pypi.nvidia.com sets no-store so pip
-# re-downloads ~830 MB every run. We cache wheels locally and verify with unzip -t.
-NVIDIA_WHEEL_CACHE="/root/.cache/nvidia-wheels"
-mkdir -p "$NVIDIA_WHEEL_CACHE"
-for url in \
-    "https://pypi.nvidia.com/nvidia-cudnn-cu12/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_x86_64.whl" \
-    "https://pypi.nvidia.com/nvidia-nvshmem-cu12/nvidia_nvshmem_cu12-3.3.20-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"; do
-    whl="$NVIDIA_WHEEL_CACHE/$(basename "$url")"
-    [ -f "$whl" ] && unzip -tq "$whl" &>/dev/null || curl -fL -o "$whl" "$url"
-done
-pip install --no-deps "$NVIDIA_WHEEL_CACHE"/nvidia_cudnn_cu12-*.whl \
-    "$NVIDIA_WHEEL_CACHE"/nvidia_nvshmem_cu12-*.whl 2>/dev/null || true
+source "$(dirname "$0")/cache_nvidia_wheels.sh"
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 mark_step_done "Install main package"
