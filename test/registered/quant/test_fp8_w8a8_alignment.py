@@ -14,7 +14,7 @@ import torch
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     FP8_ALIGNMENT,
     CompressedTensorsW8A8Fp8,
-    _pad_to_alignment,
+    pad_to_alignment,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -55,34 +55,34 @@ def _make_layer(weight: torch.Tensor, weight_scale: torch.Tensor) -> SimpleNames
 
 
 class TestPadToAlignment(CustomTestCase):
-    """Unit tests for the _pad_to_alignment helper."""
+    """Unit tests for the pad_to_alignment helper."""
 
     def test_already_aligned_is_noop(self):
         t = torch.zeros(16, 32)
-        result = _pad_to_alignment(t, dim=0, alignment=FP8_ALIGNMENT)
+        result = pad_to_alignment(t, dim=0, alignment=FP8_ALIGNMENT)
         self.assertIs(result, t)
 
     def test_pads_dim0(self):
         t = torch.zeros(13, 32)
-        result = _pad_to_alignment(t, dim=0, alignment=16)
+        result = pad_to_alignment(t, dim=0, alignment=16)
         self.assertEqual(result.shape[0], 16)
         self.assertEqual(result.shape[1], 32)
 
     def test_pads_dim1(self):
         t = torch.zeros(32, 13)
-        result = _pad_to_alignment(t, dim=1, alignment=16)
+        result = pad_to_alignment(t, dim=1, alignment=16)
         self.assertEqual(result.shape[0], 32)
         self.assertEqual(result.shape[1], 16)
 
     def test_pads_to_correct_multiple(self):
         # 1368 = 85 * 16 + 8 → next multiple is 86 * 16 = 1376
         t = torch.zeros(1368, 64)
-        result = _pad_to_alignment(t, dim=0, alignment=16)
+        result = pad_to_alignment(t, dim=0, alignment=16)
         self.assertEqual(result.shape[0], 1376)
 
     def test_pad_values_are_zero(self):
         t = torch.ones(13, 16)
-        result = _pad_to_alignment(t, dim=0, alignment=16)
+        result = pad_to_alignment(t, dim=0, alignment=16)
         # padded rows should be zero
         self.assertTrue(torch.all(result[13:] == 0))
         # original rows should be unchanged

@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import get_bool_env_var, is_hip
 
-__all__ = ["CompressedTensorsW8A8Fp8", "FP8_ALIGNMENT", "_pad_to_alignment"]
+__all__ = ["CompressedTensorsW8A8Fp8", "FP8_ALIGNMENT", "pad_to_alignment"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -42,7 +42,7 @@ if _use_aiter:
 FP8_ALIGNMENT = 16
 
 
-def _pad_to_alignment(
+def pad_to_alignment(
     tensor: torch.Tensor, dim: int, alignment: int = FP8_ALIGNMENT
 ) -> torch.Tensor:
     """Zero-pad tensor along dim to the next multiple of alignment.
@@ -66,18 +66,16 @@ def _pad_weight_to_alignment(
     Returns (weight_t, weight_scale, orig_N) where weight_t is transposed.
     weight_scale is padded along dim-0 when it is per-channel (shape [N, 1]).
     """
-    orig_n, orig_k = weight.shape
-    pad_n = (-orig_n) % FP8_ALIGNMENT
-    pad_k = (-orig_k) % FP8_ALIGNMENT
-    if pad_n or pad_k:
-        weight = F.pad(weight, (0, pad_k, 0, pad_n))
-        if weight_scale is not None:
-            if weight_scale.shape != (orig_n, 1):
-                raise ValueError(
-                    f"Expected per-channel scale shape ({orig_n}, 1), "
-                    f"got {tuple(weight_scale.shape)}"
-                )
-            weight_scale = F.pad(weight_scale, (0, 0, 0, pad_n))
+    orig_n = weight.shape[0]
+    weight = pad_to_alignment(weight, dim=0)
+    weight = pad_to_alignment(weight, dim=1)
+    if weight_scale is not None and weight.shape[0] > orig_n:
+        if weight_scale.shape != (orig_n, 1):
+            raise ValueError(
+                f"Expected per-channel scale shape ({orig_n}, 1), "
+                f"got {tuple(weight_scale.shape)}"
+            )
+        weight_scale = pad_to_alignment(weight_scale, dim=0)
     return weight.t(), weight_scale, orig_n
 
 
