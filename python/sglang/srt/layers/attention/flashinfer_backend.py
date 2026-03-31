@@ -818,8 +818,8 @@ class FlashInferAttnBackend(AttentionBackend):
         # dq_buffer layout is page-aligned: each request occupies
         # ceil(seq_len/page_size)*page_size slots, starting after a page_size
         # dummy prefix. dq_page_table maps only actual token positions and skips
-        # padding gaps; dq_paged_kernel_lens stores real lengths so kv_indptr uses
-        # exact token counts instead of page-aligned lengths.
+        # padding gaps; dq_paged_kernel_lens stores real lengths so FlashInfer
+        # causal offsets use seq_len - q_len, not page_align(seq_len) - q_len.
         seq_lens_with_scratch = paged_seq_lens + [256]
         starts = []
         next_start = self.page_size
@@ -1871,6 +1871,8 @@ class FlashInferIndicesUpdaterPrefill:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
             # Normal extend
+            # custom_kv_indices uses exact dq_paged_kernel_lens so FlashInfer causal
+            # offsets are based on real token counts, not page-aligned padding.
             if (
                 custom_kv_indices is not None
                 and self.attn_backend.dq_paged_kernel_lens is not None
