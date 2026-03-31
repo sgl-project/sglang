@@ -5,6 +5,7 @@ python3 -m unittest test_deepseek_ocr.py
 import json
 import os
 import unittest
+from pathlib import Path
 
 import requests
 from transformers import AutoTokenizer
@@ -22,8 +23,15 @@ class TestDeepSeekOCR(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/DeepSeek-OCR"
-        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            cls.model, use_fast=False, trust_remote_code=True
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.image_path = str(
+            (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
+        )
+        if not os.path.exists(cls.image_path):
+            raise FileNotFoundError(f"Image not found: {cls.image_path}")
         cls.common_args = [
             "--device",
             "xpu",
@@ -50,7 +58,7 @@ class TestDeepSeekOCR(CustomTestCase):
             self.base_url + "/generate",
             json={
                 "text": "<image>\n<|grounding|>Convert the document to pure text.",
-                "image_data": "../../examples/assets/example_image.png",
+                "image_data": self.image_path,
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": max_new_tokens,
@@ -98,8 +106,15 @@ class TestDeepSeekOCRTriton(TestDeepSeekOCR):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/DeepSeek-OCR"
-        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
+        cls.tokenizer = AutoTokenizer.from_pretrained(
+            cls.model, use_fast=False, trust_remote_code=True
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.image_path = str(
+            (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
+        )
+        if not os.path.exists(cls.image_path):
+            raise FileNotFoundError(f"Image not found: {cls.image_path}")
         cls.common_args = [
             "--device",
             "xpu",
