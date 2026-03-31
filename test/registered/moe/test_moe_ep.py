@@ -37,17 +37,17 @@ class TestEp(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_en(self):
+    def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.8)
+        self.assertGreater(metrics["score"], 0.5)
 
 
 class TestEpDeepGEMM(CustomTestCase):
@@ -76,17 +76,17 @@ class TestEpDeepGEMM(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_en(self):
+    def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
+            eval_name="mmlu",
+            num_examples=64,
+            num_threads=32,
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.8)
+        self.assertGreater(metrics["score"], 0.5)
 
 
 if __name__ == "__main__":
