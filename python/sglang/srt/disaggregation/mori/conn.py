@@ -985,17 +985,18 @@ class MoriKVReceiver(CommonKVReceiver):
         mgr: MoriKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        prefill_dp_rank: Optional[int] = None,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
-        self.conclude_state: Optional[KVPoll] = None
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time: Optional[float] = None
-        if self.bootstrap_room is None or self.bootstrap_infos is None:
+
+    def init(
+        self,
+        prefill_dp_rank: int,
+    ):
+        super().init(prefill_dp_rank)
+        if self.bootstrap_room is None:
             return
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
-        self._register_kv_args()
 
     def _register_kv_args(self):
         if self.bootstrap_infos is None:
@@ -1029,7 +1030,7 @@ class MoriKVReceiver(CommonKVReceiver):
                     ]
                 )
 
-    def init(
+    def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
