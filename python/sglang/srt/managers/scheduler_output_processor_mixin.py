@@ -420,7 +420,7 @@ class SchedulerOutputProcessorMixin:
                 num_draft_tokens_per_req,
             )
             # Auto-spec: feed acceptance data to the tuning engine
-            if self.auto_spec and self.auto_spec_engine is not None:
+            if self.auto_spec and self.auto_spec_engine is not None and self.auto_spec_engine.enable_watch:
                 self.auto_spec_engine.update(
                     batch.batch_size(),
                     result.num_accepted_tokens,

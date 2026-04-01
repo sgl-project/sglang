@@ -102,6 +102,8 @@ class AutoSpecEngine:
         # Will be finalized in initialize() after GPU memory is known
         self._initialized = False
 
+        self.enable_watch = True
+
     def initialize(self, gpu_id: int, is_spec_v2: bool = False):
         """Must be called after model loading to finalize based on available GPU memory.
 
@@ -140,6 +142,10 @@ class AutoSpecEngine:
             f"bs_steps_mapping={self.bs_steps_mapping}, "
             f"initial params={self._format_params()}"
         )
+
+        if all(len(value) == 1 for value in self.bs_steps_mapping.values()):
+            self.enable_watch = False
+            logger.info(f"AutoSpecEngine: disable metrics watch for {self.bs_steps_mapping}")
 
     def _init_bs_steps_mapping(self):
         """Load batch-size to step mappings from config file or defaults."""
