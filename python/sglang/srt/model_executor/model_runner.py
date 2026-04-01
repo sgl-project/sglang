@@ -1975,17 +1975,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _warmup_fused_sampling(self):
         """Pre-compile and autotune fused sampling Triton kernels."""
-        if _is_hip:
-            return
-
-        from sglang.srt.layers.fused_sampling import (
-            warmup_fused_temperature_softmax,
-        )
-
-        warmup_fused_temperature_softmax(
-            vocab_size=self.model_config.vocab_size,
-            device=self.device,
-        )
+        pass
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
