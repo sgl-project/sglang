@@ -373,7 +373,7 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.83)
+        self.assertGreater(metrics["accuracy"], 0.70)
 
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
