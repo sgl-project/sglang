@@ -51,6 +51,9 @@ class ForwardMetadata:
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
 
+    # mapped block_tables for swa
+    block_tables_swa: Optional[torch.Tensor] = None
+
     # seq len inputs
     extend_seq_lens_cpu_int: Optional[torch.Tensor] = None
     seq_lens_cpu_int: Optional[torch.Tensor] = None
@@ -205,10 +208,14 @@ class AscendAttnMaskBuilder:
 
 class AscendAttnBackend(AttentionBackend):
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        self.speculative_step_id = speculative_step_id
+        self.speculative_step_offset_npu = torch.tensor(
+            speculative_step_id + 1, device="npu"
+        )
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         if self.use_mla:
@@ -252,6 +259,11 @@ class AscendAttnBackend(AttentionBackend):
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
+        self.is_hybrid_swa = model_runner.is_hybrid_swa
+        if self.is_hybrid_swa:
+            self.full_to_swa_index_mapping = (
+                model_runner.token_to_kv_pool.full_to_swa_index_mapping
+            )
 
         # dllm model config
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
@@ -279,12 +291,30 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
             seq_lens_max += self.speculative_num_draft_tokens
+        elif (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is not None
+        ):
+            seq_lens_max += self.speculative_step_id + 1
         self.forward_metadata.block_tables = (
             forward_batch.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, :seq_lens_max
             ][:, :: self.page_size]
             // self.page_size
         )
+        if self.is_hybrid_swa:
+            self.forward_metadata.block_tables_swa = (
+                (
+                    self.full_to_swa_index_mapping[
+                        forward_batch.req_to_token_pool.req_to_token[
+                            forward_batch.req_pool_indices, :seq_lens_max
+                        ]
+                    ][:, :: self.page_size]
+                    // self.page_size
+                )
+                .to(torch.int32)
+                .contiguous()
+            )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
@@ -308,6 +338,11 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_target_verify():
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
+        elif (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is not None
+        ):
+            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
 
         if (
             self.use_mla
@@ -347,6 +382,12 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
+        if self.is_hybrid_swa:
+            self.graph_metadata["block_tables_swa"] = torch.empty(
+                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -375,6 +416,8 @@ class AscendAttnBackend(AttentionBackend):
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
             metadata.block_tables[bs:, :].fill_(0)
 
+        if self.is_hybrid_swa:
+            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if (
@@ -426,8 +469,19 @@ class AscendAttnBackend(AttentionBackend):
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify():
             max_len += self.speculative_num_draft_tokens
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            max_len += self.speculative_step_id + 1
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
+        if self.is_hybrid_swa:
+            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
+                self.full_to_swa_index_mapping[
+                    self.req_to_token[req_pool_indices[:bs], :max_len]
+                ][:, :: self.page_size]
+                // self.page_size
+            )
+            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables_swa[bs:, :].fill_(0)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
             self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
             // self.page_size
@@ -438,6 +492,8 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
         self.forward_metadata = metadata
@@ -816,13 +872,18 @@ class AscendAttnBackend(AttentionBackend):
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             if sinks is not None:
+                # Use SWA block tables if hybrid SWA is enabled for this layer
+                if self.is_hybrid_swa and layer.sliding_window_size != -1:
+                    block_tables = self.forward_metadata.block_tables_swa
+                else:
+                    block_tables = self.forward_metadata.block_tables
                 attn_out = attention_sinks_prefill_triton(
                     q,
                     k_cache,
                     v_cache,
                     sinks,
                     self.forward_metadata.extend_seq_lens,
-                    self.forward_metadata.block_tables,
+                    block_tables,
                     self.forward_metadata.seq_lens,
                     layer.scaling,
                     layer.sliding_window_size,
@@ -1395,12 +1456,17 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
+            # Use SWA block tables if hybrid SWA is enabled for this layer
+            if self.is_hybrid_swa and layer.sliding_window_size != -1:
+                block_tables = self.forward_metadata.block_tables_swa
+            else:
+                block_tables = self.forward_metadata.block_tables
             attn_out = attention_sinks_triton(
                 q,
                 k_cache,
                 v_cache,
                 sinks,
-                self.forward_metadata.block_tables,
+                block_tables,
                 self.forward_metadata.seq_lens,
                 layer.scaling,
                 layer.sliding_window_size,
@@ -1584,12 +1650,17 @@ class AscendAttnBackend(AttentionBackend):
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             if sinks is not None:
+                # Use SWA block tables if hybrid SWA is enabled for this layer
+                if self.is_hybrid_swa and layer.sliding_window_size != -1:
+                    block_tables = self.forward_metadata.block_tables_swa
+                else:
+                    block_tables = self.forward_metadata.block_tables
                 attn_out = attention_sinks_triton(
                     q,
                     k_cache,
                     v_cache,
                     sinks,
-                    self.forward_metadata.block_tables,
+                    block_tables,
                     self.forward_metadata.seq_lens,
                     layer.scaling,
                     layer.sliding_window_size,
@@ -1849,8 +1920,10 @@ class AscendAttnMultiStepDraftBackend:
         self.speculative_num_steps = speculative_num_steps
 
         self.attn_backends = []
-        for _ in range(self.speculative_num_steps):
-            self.attn_backends.append(AscendAttnBackend(model_runner))
+        for step_id in range(self.speculative_num_steps):
+            self.attn_backends.append(
+                AscendAttnBackend(model_runner, speculative_step_id=step_id)
+            )
 
     def common_template(self, forward_batch: ForwardBatch, call_fn: int):
         assert forward_batch.spec_info is not None

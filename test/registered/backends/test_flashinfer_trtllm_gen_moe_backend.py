@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=600, suite="nightly-4-gpu-b200", nightly=True)
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:
@@ -183,6 +183,12 @@ class TestFlashinferTrtllmGenMoeBackendFP8Routed(
 
 class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
     FlashinferTrtllmGenMoeBackendMXFP8Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm_routed"
+
+
+class TestFlashinferTrtllmGenMoeBackendBF16Routed(
+    FlashinferTrtllmGenMoeBackendBF16Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm_routed"
 

@@ -17,6 +17,7 @@ SGLang Diffusion has the following features:
     - AMD GPUs (MI300X, MI325X)
     - Ascend NPU (A2, A3)
     - Apple Silicon (M-series via MPS)
+    - Moore Threads GPUs (MTT S5000)
 
 ### AMD/ROCm Support
 
@@ -88,7 +89,7 @@ sglang generate \
   --save-output
 ```
 
-For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/cli.md).
+For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/api/cli.md).
 
 ## Contributing
 

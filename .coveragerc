@@ -1,0 +1,16 @@
+[run]
+source = python/sglang/srt
+omit =
+    */test/*
+    */__pycache__/*
+
+[report]
+show_missing = true
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    if TYPE_CHECKING
+
+[html]
+directory = htmlcov

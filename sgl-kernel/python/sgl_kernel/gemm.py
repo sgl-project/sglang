@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from sgl_kernel.utils import _get_cache_buf
@@ -140,71 +140,12 @@ sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
 sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
 
 
-def sgl_per_tensor_quant_fp8(
-    input: torch.Tensor,
-    output_q: torch.Tensor,
-    output_s: torch.Tensor,
-    is_static: bool,
-) -> None:
-    torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default(
-        input, output_q, output_s, is_static
-    )
-
-
 def sgl_per_token_quant_fp8(
     input: torch.Tensor,
     output_q: torch.Tensor,
     output_s: torch.Tensor,
 ) -> None:
     torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(input, output_q, output_s)
-
-
-def cutlass_scaled_fp4_mm(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    block_scale_a: torch.Tensor,
-    block_scale_b: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    from sglang.jit_kernel.nvfp4 import (
-        cutlass_scaled_fp4_mm as jit_cutlass_scaled_fp4_mm,
-    )
-
-    return jit_cutlass_scaled_fp4_mm(
-        a,
-        b,
-        block_scale_a,
-        block_scale_b,
-        alpha,
-        out_dtype,
-    )
-
-
-def scaled_fp4_quant(
-    input: torch.Tensor, input_global_scale: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize input tensor to FP4 and return quantized tensor and scale.
-
-    This function quantizes the last dimension of the given tensor `input`. For
-    every 16 consecutive elements, a single dynamically computed scaling factor
-    is shared. This scaling factor is quantized using the `input_global_scale`
-    and is stored in a swizzled layout (see
-    https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-b-layout-4x).
-
-    Args:
-        input: The input tensor to be quantized to FP4
-        input_global_scale: A scalar scaling factor for the entire tensor.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: The output tensor in FP4 but every
-            two values are packed into a uint8 and float8_e4m3 scaling factors
-            in a sizzled layout.
-    """
-    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as jit_scaled_fp4_quant
-
-    return jit_scaled_fp4_quant(input, input_global_scale)
 
 
 def qserve_w4a8_per_chn_gemm(
@@ -278,73 +219,6 @@ def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
     )
     torch.ops.sgl_kernel.shuffle_rows.default(input_tensor, dst2src_map, output_tensor)
     return output_tensor
-
-
-def scaled_fp4_grouped_quant(
-    input_tensor: torch.Tensor,
-    input_global_scale: torch.Tensor,
-    mask: torch.Tensor,
-):
-    """
-    Quantize input tensor to FP4 and return quantized tensor and scale, for
-    grouped gemm inputs (e.g., grouped_gemm_nt_masked for flashinfer).
-    Args:
-        input: The input tensor to be quantized to FP4, with shape (l, m, k)
-            l is number of groups, m is number of tokens per group, k is number of features.
-        input_global_scale: A scalar scaling factor for the entire tensor, with
-            shape (l,).
-    Outputs:
-        output: The quantized tensor in FP4, with shape (m, k // 2, l) but the physical
-            layout is (l, m, k // 2). `// 2` is because two fp4 values are packed into
-            an uint8.
-        output_scales: The blockscale tensor in FP8-E4M3, with shape (32, 4, rm, 4, rk, l)
-            but the physical layout is (l, rm, rk, 32, 4, 4).
-    Note:
-        For the shape of output_scales, `32 * 4 * rm` is a padded m to nearest multiple of 128.
-        `4 * rk` is a padded `k // 16` to nearest multiple of 4. These layout constants are
-        required by the NVIDIA Blackwell MMA operations.
-    """
-    from sglang.jit_kernel.nvfp4 import (
-        scaled_fp4_grouped_quant as jit_scaled_fp4_grouped_quant,
-    )
-
-    return jit_scaled_fp4_grouped_quant(input_tensor, input_global_scale, mask)
-
-
-def silu_and_mul_scaled_fp4_grouped_quant(
-    input_tensor: torch.Tensor,
-    input_global_scale: torch.Tensor,
-    mask: torch.Tensor,
-):
-    """
-    Quantize input tensor to FP4 and return quantized tensor and scale, for
-    grouped gemm inputs (e.g., grouped_gemm_nt_masked for flashinfer).
-    Args:
-        input: The input tensor to be quantized to FP4, with shape (l, m, k * 2)
-            l is number of groups, m is number of tokens per group, k is number of features.
-        input_global_scale: A scalar scaling factor for the entire tensor, with
-            shape (l,).
-        mask: The mask tensor, with shape (l,)
-    Outputs:
-        output: The quantized tensor in FP4, with shape (m, k // 2, l) but the physical
-            layout is (l, m, k // 2). `// 2` is because two fp4 values are packed into
-            an uint8.
-        output_scales: The blockscale tensor in FP8-E4M3, with shape (32, 4, rm, 4, rk, l)
-            but the physical layout is (l, rm, rk, 32, 4, 4).
-    Note:
-        For the shape of output_scales, `32 * 4 * rm` is a padded m to nearest multiple of 128.
-        `4 * rk` is a padded `k // 16` to nearest multiple of 4. These layout constants are
-        required by the NVIDIA Blackwell MMA operations.
-    """
-    from sglang.jit_kernel.nvfp4 import (
-        silu_and_mul_scaled_fp4_grouped_quant as jit_silu_and_mul_scaled_fp4_grouped_quant,
-    )
-
-    return jit_silu_and_mul_scaled_fp4_grouped_quant(
-        input_tensor,
-        input_global_scale,
-        mask,
-    )
 
 
 # GPTQ kernels

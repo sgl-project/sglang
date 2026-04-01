@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import enum
 import random
+from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -199,6 +200,30 @@ class Platform:
         return True
 
     @classmethod
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        return None
+
+    @classmethod
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        return None, None
+
+    @classmethod
+    def has_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return False
+
+    @classmethod
+    def can_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return False
+
+    @classmethod
+    def should_use_modelopt_fp4_best_performance_kit(cls) -> bool:
+        return False
+
+    @classmethod
+    def warn_if_modelopt_fp4_best_performance_kit_missing(cls) -> None:
+        pass
+
+    @classmethod
     def get_local_torch_device(cls) -> torch.device:
         raise NotImplementedError
 
@@ -379,6 +404,11 @@ class Platform:
     def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
         """Whether to enable DIT layerwise offload by default on the current platform."""
         return True
+
+    @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Apply platform-specific optimizations to VAE after loading."""
+        return vae
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
