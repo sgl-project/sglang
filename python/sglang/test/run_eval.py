@@ -10,6 +10,7 @@ import time
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
+    CompletionSampler,
     Eval,
     make_report,
     set_ulimit,
@@ -60,15 +61,23 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
         if value is not None:
             extra_body[param_name] = value
 
-    sampler = ChatCompletionSampler(
+    common_kwargs = dict(
         model=args.model,
         max_tokens=getattr(args, "max_tokens", 2048),
         top_p=getattr(args, "top_p", 1.0),
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
-        reasoning_effort=getattr(args, "reasoning_effort", None),
-        extra_body=extra_body if extra_body else None,
     )
+
+    api_mode = getattr(args, "api", "chat")
+    if api_mode == "completion":
+        sampler = CompletionSampler(**common_kwargs)
+    else:
+        sampler = ChatCompletionSampler(
+            **common_kwargs,
+            reasoning_effort=getattr(args, "reasoning_effort", None),
+            extra_body=extra_body if extra_body else None,
+        )
 
     # Run eval
     tic = time.perf_counter()
@@ -170,8 +179,15 @@ def run_eval(args):
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
         metrics = result.metrics | {"score": result.score}
+        metrics["latency"] = latency
         print(f"Total latency: {latency:.3f} s")
         print(f"Score: {metrics['score']:.3f}")
+
+        # Compute output throughput from accumulated completion tokens
+        total_completion_tokens = sum(sampler._completion_tokens)
+        if total_completion_tokens > 0 and latency > 0:
+            metrics["output_throughput"] = total_completion_tokens / latency
+            print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
 
         # Report metrics to unified collection framework
         dump_metric(
@@ -195,19 +211,31 @@ def run_eval(args):
         ]
 
         scores_repeat = []
+        latencies = []
+        total_completion_tokens = 0
 
         for f in futures:
             result, latency, sampler = f.result()
             scores_repeat.append(result.score)
+            latencies.append(latency)
+            total_completion_tokens += sum(sampler._completion_tokens)
 
         mean_score = sum(scores_repeat) / len(scores_repeat)
+        mean_latency = sum(latencies) / len(latencies)
+        total_latency = sum(latencies)
         scores_repeat = [f"{s:.3f}" for s in scores_repeat]
         print("=" * 20)
         print(f"Repeat: {args.repeat}, mean: {mean_score:.3f}")
         print(f"Scores: {scores_repeat}")
+        print(f"Mean latency: {mean_latency:.3f} s")
         print("=" * 20)
         metrics = result.metrics | {"scores": scores_repeat}
         metrics = metrics | {"mean_score": mean_score}
+        metrics["latency"] = mean_latency
+
+        if total_completion_tokens > 0 and total_latency > 0:
+            metrics["output_throughput"] = total_completion_tokens / total_latency
+            print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
 
         # Report metrics to unified collection framework
         dump_metric(
@@ -266,6 +294,13 @@ if __name__ == "__main__":
         "--repeat", type=int, default=1, help="repeat the evaluation n times"
     )
     parser.add_argument("--eval-name", type=str, default="mmlu")
+    parser.add_argument(
+        "--api",
+        type=str,
+        default="chat",
+        choices=["chat", "completion"],
+        help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions",
+    )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
