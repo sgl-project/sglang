@@ -95,7 +95,7 @@ if TYPE_CHECKING:
 def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int):
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
     return load_jit(
-        "custom_all_reduce",
+        "custom_all_reduce_pull",
         *args,
         extra_ldflags=["-lcuda"],
         cuda_files=["distributed/custom_all_reduce_pull.cuh"],
@@ -107,7 +107,7 @@ def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int):
 def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int):
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
     return load_jit(
-        "custom_all_reduce",
+        "custom_all_reduce_push",
         *args,
         extra_ldflags=["-lcuda"],
         cuda_files=["distributed/custom_all_reduce_push.cuh"],
@@ -131,6 +131,8 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
 
     @tvm_ffi.register_object("sgl.CustomAllReduce")
     class CustomAllReduceObjReal(tvm_ffi.Object):
+        __slots__ = ("__dict__",)
+
         def __init__(
             self,
             rank: int,

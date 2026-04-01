@@ -35,7 +35,7 @@ def sgemm_lora_a_embedding_fwd(
 
             result = torch.nn.functional.embedding(x_seq, w_seq.T)
             output[token_offset : token_offset + seq_len, :rank] = (
-                scaling_tensor[lora_idx] * result
+                scaling_tensor[lora_idx].item() * result
             )
 
         token_offset += seq_len
@@ -74,9 +74,11 @@ def sgemm_lora_a_fwd(
             x_seq = inputs[token_offset : token_offset + seq_len]
             w_seq = weights[lora_idx, : num_slices * rank]
 
-            result = torch.mm(x_seq, w_seq.T)
-            output[token_offset : token_offset + seq_len, : num_slices * rank] = (
-                scaling_tensor[lora_idx] * result
+            output[token_offset : token_offset + seq_len, : num_slices * rank].addmm_(
+                x_seq,
+                w_seq.T,
+                beta=0,
+                alpha=scaling_tensor[lora_idx].item(),
             )
 
         token_offset += seq_len
@@ -137,7 +139,7 @@ def sgemm_lora_b_fwd(
                 output[
                     token_offset : token_offset + seq_len,
                     slice_start_output:slice_end_output,
-                ].add_(torch.mm(x_slice, w_slice.T))
+                ].addmm_(x_slice, w_slice.T)
 
         token_offset += seq_len
 

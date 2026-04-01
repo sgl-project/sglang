@@ -27,6 +27,9 @@ class TorchNativeLoRABatchInfo(LoRABatchInfo):
     # The index of lora adapter used by each segment, in shape (num_segments,) placed on cpu device
     weight_indices_cpu: Optional[torch.Tensor] = None
 
+    # Scaling factors for each lora adapter, in shape (lora_num,) placed on cpu device
+    scalings_cpu: Optional[torch.Tensor] = None
+
 
 class TorchNativeLoRABackend(BaseLoRABackend):
     name = "torch_native"
@@ -236,6 +239,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         )
 
         bs = forward_batch.batch_size
+        num_segments = len(weight_indices_tensor)
 
         if use_cuda_graph:
             assert (
@@ -243,13 +247,13 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             ), "CUDA Graph batch info is not initialized."
             batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
-            batch_info.num_segments = forward_batch.batch_size
+            batch_info.num_segments = num_segments
         else:
             max_len = max(seg_lens_cpu)
 
             batch_info = TorchNativeLoRABatchInfo(
                 bs=forward_batch.batch_size,
-                num_segments=forward_batch.batch_size,
+                num_segments=num_segments,
                 max_len=max_len,
                 use_cuda_graph=False,
                 seg_lens=torch.empty((bs,), dtype=torch.int32, device=self.device),
@@ -275,7 +279,9 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         batch_info.scalings[: self.max_loras_per_batch].copy_(
             scalings_tensor, non_blocking=True
         )
-        batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
+        batch_info.weight_indices[:num_segments].copy_(
+            weight_indices_tensor, non_blocking=True
+        )
         batch_info.seg_indptr[: len(seg_indptr_cpu)].copy_(
             seg_indptr_cpu, non_blocking=True
         )
@@ -285,5 +291,6 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         batch_info.seg_indptr_cpu = seg_indptr_cpu
         batch_info.seg_lens_cpu = seg_lens_cpu
         batch_info.weight_indices_cpu = weight_indices_tensor
+        batch_info.scalings_cpu = scalings_tensor
 
         self.batch_info = batch_info

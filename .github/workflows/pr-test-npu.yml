@@ -57,19 +57,17 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
-              - "!**/*.md"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**"
+              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - ".github/workflows/pr-test-npu.yml"
-              - "!**/*.md"
 
   # ==================== PR Gate ==================== #
   pr-gate:
@@ -78,7 +76,7 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
-  per-commit-1-npu-a2:
+  stage-b-test-1-npu-a2:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-1
@@ -113,21 +111,8 @@ jobs:
           bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy download through proxy
-          curl -o /tmp/test.jsonl -L https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
-
-      - name: Run registered test
-        timeout-minutes: 240
-        env:
-          SGLANG_USE_MODELSCOPE: true
-          SGLANG_IS_IN_CI: true
-          HF_ENDPOINT: https://hf-mirror.com
-          TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
-          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
-          STREAMS_PER_DEVICE: 32
-        run: |
-          cd test
-          python3 run_suite.py --hw npu --suite per-commit-1-npu-a2 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
         timeout-minutes: 60
@@ -139,10 +124,10 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-1-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          cd test
+          python3 run_suite.py --hw npu --suite stage-b-test-1-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  per-commit-2-npu-a2:
+  stage-b-test-2-npu-a2:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-2
@@ -177,8 +162,8 @@ jobs:
           bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy download through proxy
-          curl -o /tmp/test.jsonl -L https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
         timeout-minutes: 60
@@ -190,10 +175,10 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          cd test
+          python3 run_suite.py --hw npu --suite stage-b-test-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
-  per-commit-4-npu-a3:
+  stage-b-test-4-npu-a3:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-4
@@ -224,8 +209,8 @@ jobs:
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy download through proxy
-          curl -o /tmp/test.jsonl -L https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
         timeout-minutes: 60
@@ -237,10 +222,11 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-4-npu-a3 --timeout-per-file 3600
+          cd test
+          python3 run_suite.py --hw npu --suite stage-b-test-4-npu-a3 --timeout-per-file 3600
 
-  per-commit-16-npu-a3:
+
+  stage-b-test-16-npu-a3:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
@@ -271,8 +257,8 @@ jobs:
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy download through proxy
-          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
         timeout-minutes: 60
@@ -284,8 +270,8 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600
+          cd test
+          python3 run_suite.py --hw npu --suite stage-b-test-16-npu-a3 --timeout-per-file 3600
 
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate]
@@ -316,8 +302,8 @@ jobs:
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy download through proxy
-          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
         timeout-minutes: 60
@@ -362,8 +348,8 @@ jobs:
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy download through proxy
-          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
         timeout-minutes: 60
@@ -382,7 +368,7 @@ jobs:
   multimodal-gen-test-8-npu-a3:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: linux-aarch64-a3-16
+    runs-on: linux-aarch64-a3-8
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
     steps:
@@ -394,19 +380,22 @@ jobs:
           git config --system --add safe.directory ${GITHUB_WORKSPACE}
 
       - name: Install dependencies
+        env:
+          TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
+          PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
+          GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
-          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+          pip config set global.trusted-host "${CACHING_URL}"
 
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3 diffusion
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy download through proxy
-          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+          # copy gsm8k dataset
+          cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
         timeout-minutes: 60
@@ -420,3 +409,45 @@ jobs:
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py --suite 8-npu
+
+  pr-test-finish:
+    needs:
+      [
+        check-changes,
+
+        stage-b-test-1-npu-a2,
+        stage-b-test-2-npu-a2,
+        stage-b-test-4-npu-a3,
+        stage-b-test-16-npu-a3,
+
+        multimodal-gen-test-1-npu-a3,
+        multimodal-gen-test-2-npu-a3,
+        multimodal-gen-test-8-npu-a3,
+      ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          # Convert the 'needs' context to a JSON string
+          json_needs='${{ toJson(needs) }}'
+
+          # Get a list of all job names from the JSON keys
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            # For each job, extract its result
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+
+            # Print the job name and its result
+            echo "$job: $result"
+
+            # Check for failure or cancellation and exit if found
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "The above jobs failed."
+              exit 1
+            fi
+          done
+          # If the loop completes, all jobs were successful
+          echo "All jobs completed successfully"
+          exit 0

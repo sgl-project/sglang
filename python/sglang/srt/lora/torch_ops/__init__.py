@@ -37,7 +37,7 @@ def sgemm_lora_a_embedding_fwd(
             batch_info.weight_indices_cpu,
             batch_info.seg_lens_cpu,
             batch_info.lora_ranks_cpu,
-            batch_info.scalings,
+            batch_info.scalings_cpu,
             vocab_size,
         )
     return output
@@ -66,7 +66,7 @@ def sgemm_lora_a_fwd(
             batch_info.weight_indices_cpu,
             batch_info.seg_lens_cpu,
             batch_info.lora_ranks_cpu,
-            batch_info.scalings,
+            batch_info.scalings_cpu,
             num_slices,
         )
     return output

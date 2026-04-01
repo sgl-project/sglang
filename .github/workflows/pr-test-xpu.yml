@@ -54,13 +54,12 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_xpu.toml"
-              - "test/**"
-              - "sgl-kernel/**"
+              - "test/**/!(*.md)"
+              - "sgl-kernel/**/*.!(md|txt)"
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
-              - "!**/*.md"
 
   # ==================== PR Gate ==================== #
   pr-gate:
