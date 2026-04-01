@@ -3238,6 +3238,7 @@ class ServerArgs:
         ):
 
 
+
             return
         prefill_attention_backend, _ = self.get_attention_backends()
         if prefill_attention_backend != "trtllm_mla":
