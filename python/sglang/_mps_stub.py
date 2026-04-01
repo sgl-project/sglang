@@ -10,113 +10,15 @@ just work.
 from __future__ import annotations
 
 import functools
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
-# Last-resort fallback when neither torch.mps.recommended_max_memory() nor
-# MLX is available.  Uses the conservative end of Apple's 65-75% range.
-_METAL_MEMORY_FRACTION_FALLBACK = 0.65
-
-
-_cached_metal_max_memory: int | None = None
-
 
 def _get_metal_max_memory() -> int:
-    """Return the maximum memory Metal can safely use, in bytes.
+    """Return Metal's recommended max working set size in bytes."""
+    import torch
 
-    Priority chain:
-    1. ``torch.mps.recommended_max_memory()`` — available in PyTorch 2.9+,
-       maps directly to Metal's ``MTLDevice.recommendedMaxWorkingSetSize``.
-    2. ``mx.device_info()["max_recommended_working_set_size"]`` — MLX's
-       equivalent API.  When this path is used, also sets
-       ``mx.set_wired_limit()`` to prevent Metal from paging GPU memory.
-    3. 65% of system RAM — last-resort heuristic fallback.
-
-    Allocating beyond Metal's recommended limit causes GPU paging,
-    instability, and potential machine reboots on Apple Silicon.
-
-    Reference: https://github.com/sgl-project/sglang/issues/21443
-    """
-    global _cached_metal_max_memory
-    if _cached_metal_max_memory is not None:
-        return _cached_metal_max_memory
-
-    # 1. Prefer torch.mps (available in PyTorch 2.9+, no MLX needed).
-    try:
-        import torch
-
-        if hasattr(torch, "mps") and hasattr(torch.mps, "recommended_max_memory"):
-            max_mem = int(torch.mps.recommended_max_memory())
-            if max_mem > 0:
-                logger.info(
-                    "Metal max working set: %.1f GB (system RAM: %.1f GB). "
-                    "Source: torch.mps.recommended_max_memory().",
-                    max_mem / (1 << 30),
-                    _get_system_total_memory() / (1 << 30),
-                )
-                _cached_metal_max_memory = max_mem
-                # Also set wired limit via MLX if available.
-                _try_set_wired_limit(max_mem)
-                return max_mem
-    except (ImportError, AttributeError, Exception) as e:
-        logger.debug("torch.mps.recommended_max_memory() unavailable: %s", e)
-
-    # 2. Fall back to MLX.
-    try:
-        import mlx.core as mx
-
-        if hasattr(mx, "device_info"):
-            device_info = mx.device_info()
-        else:
-            device_info = mx.metal.device_info()
-        max_mem = int(device_info.get("max_recommended_working_set_size", 0))
-        if max_mem > 0:
-            _try_set_wired_limit(max_mem)
-            logger.info(
-                "Metal max working set: %.1f GB (system RAM: %.1f GB). "
-                "Source: MLX device_info().",
-                max_mem / (1 << 30),
-                _get_system_total_memory() / (1 << 30),
-            )
-            _cached_metal_max_memory = max_mem
-            return max_mem
-    except (ImportError, AttributeError, Exception) as e:
-        logger.debug("MLX device_info() unavailable: %s", e)
-
-    # 3. Last-resort heuristic.
-    import psutil
-
-    total = psutil.virtual_memory().total
-    _cached_metal_max_memory = int(total * _METAL_MEMORY_FRACTION_FALLBACK)
-    logger.warning(
-        "Could not query Metal memory limit (torch.mps and MLX both unavailable). "
-        "Using %.0f%% of system RAM (%.1f GB) as a conservative estimate.",
-        _METAL_MEMORY_FRACTION_FALLBACK * 100,
-        _cached_metal_max_memory / (1 << 30),
-    )
-    return _cached_metal_max_memory
-
-
-def _try_set_wired_limit(limit_bytes: int) -> None:
-    """Set MLX wired memory limit if MLX is available. No-op otherwise."""
-    try:
-        import mlx.core as mx
-
-        if hasattr(mx, "set_wired_limit"):
-            mx.set_wired_limit(limit_bytes)
-            logger.debug("Wired memory limit set to %.1f GB.", limit_bytes / (1 << 30))
-    except (ImportError, AttributeError, Exception):
-        pass
-
-
-def _get_system_total_memory() -> int:
-    """Return total system RAM in bytes."""
-    import psutil
-
-    return psutil.virtual_memory().total
+    return int(torch.mps.recommended_max_memory())
 
 
 class Stream:

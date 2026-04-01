@@ -587,12 +587,7 @@ def get_available_gpu_memory(
             free_gpu_memory = psutil.virtual_memory().available
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
-        from sglang._mps_stub import _get_metal_max_memory
-
-        free_gpu_memory = min(
-            psutil.virtual_memory().available,
-            _get_metal_max_memory(),
-        )
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
