@@ -467,6 +467,7 @@ class ServerArgs:
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
     experts_shared_outer_loras: Optional[bool] = None
+    lora_strict_loading: bool = False
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -6294,14 +6295,14 @@ class ServerArgs:
                     "Expected a list or a dictionary."
                 )
 
-            # Expand target modules
+            # Normalize target modules to a set; keep {"all"} as a sentinel
+            # that gets resolved model-awarely in lora_manager.init_lora_shapes().
             if self.lora_target_modules:
                 self.lora_target_modules = set(self.lora_target_modules)
                 if "all" in self.lora_target_modules:
                     assert (
                         len(self.lora_target_modules) == 1
                     ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
-                    self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
