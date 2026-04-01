@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.radix_cache import (
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
-
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
@@ -62,14 +62,48 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                allocator_type=server_args.hicache_storage_backend,
+            from sglang.srt.mem_cache.codec import parse_hicache_l2_codec_config
+
+            l2_cfg = parse_hicache_l2_codec_config(
+                server_args.hicache_storage_backend_extra_config
             )
+            if l2_cfg and l2_cfg.name == "zlib":
+                from sglang.srt.mem_cache.codec.mha_host_pool_zlib import (
+                    MHATokenToKVPoolHostZlib,
+                )
+
+                self.token_to_kv_pool_host = MHATokenToKVPoolHostZlib(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    l2_codec=l2_cfg,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            elif l2_cfg and l2_cfg.name == "kvtc":
+                from sglang.srt.mem_cache.codec.mha_host_pool_kvtc import (
+                    MHATokenToKVPoolHostKVTC,
+                )
+
+                self.token_to_kv_pool_host = MHATokenToKVPoolHostKVTC(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    l2_codec=l2_cfg,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
+            else:
+                self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             self.token_to_kv_pool_host = NSATokenToKVPoolHost(
                 self.kv_cache,
@@ -635,6 +669,46 @@ class HiRadixCache(RadixCache):
         if host_indices is not None:
             node.host_value = host_indices
             assert len(node.host_value) > 0
+            prefix_len = 0
+            cur = node.parent
+            while cur is not None and cur != self.root_node:
+                if cur.key is not None:
+                    prefix_len += len(cur.key)
+                cur = cur.parent
+            node_abs_end = prefix_len + len(node.key)
+            host_value_cpu = node.host_value.detach().cpu()
+            if hasattr(self.token_to_kv_pool_host, "set_page_span"):
+                num_pages = int(len(host_value_cpu) // self.page_size)
+                for p in range(num_pages):
+                    start = p * self.page_size
+                    host_base = int(host_value_cpu[start].item())
+                    self.token_to_kv_pool_host.set_page_span(
+                        host_base,
+                        prefix_len + start,
+                        prefix_len + start + self.page_size,
+                        node_abs_end,
+                    )
+            if get_bool_env_var("SGLANG_KVTC_PAGE_SPAN_LOG", "false"):
+                max_pages = get_int_env_var("SGLANG_KVTC_PAGE_SPAN_LOG_MAX_PAGES", 3)
+                num_pages = min(
+                    max_pages,
+                    int(len(host_value_cpu) // self.page_size),
+                )
+                for p in range(num_pages):
+                    start = p * self.page_size
+                    end = min(start + self.page_size, len(node.key))
+                    host_base = int(host_value_cpu[start].item())
+                    token_ids = node.key.token_ids[start:end]
+                    logger.info(
+                        "HiCache host page span: node_id=%s host_base=%s abs=[%d,%d) page_idx=%d key_len=%d tokens_head=%s",
+                        node.id,
+                        host_base,
+                        prefix_len + start,
+                        prefix_len + end,
+                        p,
+                        len(node.key),
+                        token_ids[:8],
+                    )
             self.ongoing_write_through[node.id] = node
             if not write_back:
                 # no need to lock nodes if write back

@@ -114,6 +114,14 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    KvtcCalibrateReqInput,
+    KvtcCalibrateReqOutput,
+    KvtcRecordDumpReqInput,
+    KvtcRecordDumpReqOutput,
+    KvtcRecordStartReqInput,
+    KvtcRecordStartReqOutput,
+    KvtcRecordStopReqInput,
+    KvtcRecordStopReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -344,6 +352,11 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.kvtc_recording = False
+        self.kvtc_record_max_pages = 0
+        self.kvtc_record_vectors = []
+        self.kvtc_record_shape = None
+        self.kvtc_record_seen_pages = set()
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -1225,6 +1238,10 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
                 (GetLoadsReqInput, self.get_loads),
+                (KvtcCalibrateReqInput, self.kvtc_calibrate),
+                (KvtcRecordStartReqInput, self.kvtc_record_start),
+                (KvtcRecordStopReqInput, self.kvtc_record_stop),
+                (KvtcRecordDumpReqInput, self.kvtc_record_dump),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
@@ -2868,6 +2885,180 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def _kvtc_collect_if_needed(self):
+        if not self.kvtc_recording:
+            return
+        if self.kvtc_record_max_pages > 0 and len(self.kvtc_record_vectors) >= self.kvtc_record_max_pages:
+            return
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
+            self.tree_cache, "full_kv_pool_host", None
+        )
+        if host_pool is None:
+            return
+        try:
+            from sglang.srt.mem_cache.codec.kvtc_calibration import (
+                collect_page_vectors_from_tree,
+            )
+
+            remain = (
+                self.kvtc_record_max_pages - len(self.kvtc_record_vectors)
+                if self.kvtc_record_max_pages > 0
+                else 0
+            )
+            max_pages = remain if remain > 0 else 0
+            vectors, shape, seen = collect_page_vectors_from_tree(
+                self.tree_cache.root_node,
+                host_pool,
+                max_pages,
+                self.kvtc_record_seen_pages,
+            )
+            if vectors:
+                self.kvtc_record_vectors.extend(vectors)
+                self.kvtc_record_shape = shape
+                self.kvtc_record_seen_pages = seen
+        except Exception:
+            logger.exception("KVTC record collection failed.")
+
+    def kvtc_calibrate(self, recv_req: KvtcCalibrateReqInput) -> KvtcCalibrateReqOutput:
+        if not self.enable_hierarchical_cache:
+            return KvtcCalibrateReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+
+        if not self.is_fully_idle():
+            return KvtcCalibrateReqOutput(
+                success=False,
+                message=(
+                    "Reject calibration: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
+            self.tree_cache, "full_kv_pool_host", None
+        )
+        if host_pool is None:
+            return KvtcCalibrateReqOutput(
+                success=False, message="Host pool not found."
+            )
+
+        is_writer_rank = self.tp_rank == 0 and (self.dp_rank is None or self.dp_rank == 0)
+
+        if not is_writer_rank:
+            return KvtcCalibrateReqOutput(
+                success=True,
+                message="",
+                output_path=recv_req.output_path,
+                num_pages=0,
+            )
+
+        try:
+            from sglang.srt.mem_cache.codec.kvtc_calibration import (
+                collect_page_vectors_from_tree,
+                compute_kvtc_params,
+                save_kvtc_params,
+            )
+
+            vectors, shape, _ = collect_page_vectors_from_tree(
+                self.tree_cache.root_node, host_pool, recv_req.max_pages
+            )
+            if not vectors:
+                return KvtcCalibrateReqOutput(
+                    success=False, message="No host pages found for calibration."
+                )
+            params = compute_kvtc_params(
+                vectors,
+                recv_req.ratio,
+                recv_req.output_dtype,
+                shape=shape,
+            )
+            params["shape"] = shape
+            save_kvtc_params(params, recv_req.output_path)
+            return KvtcCalibrateReqOutput(
+                success=True,
+                message="KVTC calibration completed.",
+                output_path=recv_req.output_path,
+                num_pages=len(vectors),
+            )
+        except Exception as e:
+            logger.exception("KVTC calibration failed.")
+            return KvtcCalibrateReqOutput(success=False, message=str(e))
+
+    def kvtc_record_start(self, recv_req: KvtcRecordStartReqInput) -> KvtcRecordStartReqOutput:
+        if not self.enable_hierarchical_cache:
+            return KvtcRecordStartReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+        self.kvtc_recording = True
+        self.kvtc_record_max_pages = recv_req.max_pages
+        self.kvtc_record_vectors = []
+        self.kvtc_record_shape = None
+        self.kvtc_record_seen_pages = set()
+        return KvtcRecordStartReqOutput(
+            success=True,
+            message="KVTC record started.",
+            max_pages=recv_req.max_pages,
+        )
+
+    def kvtc_record_stop(self, recv_req: KvtcRecordStopReqInput) -> KvtcRecordStopReqOutput:
+        if not self.enable_hierarchical_cache:
+            return KvtcRecordStopReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+        self._kvtc_collect_if_needed()
+        self.kvtc_recording = False
+        return KvtcRecordStopReqOutput(
+            success=True,
+            message="KVTC record stopped.",
+            num_pages=len(self.kvtc_record_vectors),
+        )
+
+    def kvtc_record_dump(self, recv_req: KvtcRecordDumpReqInput) -> KvtcRecordDumpReqOutput:
+        if not self.enable_hierarchical_cache:
+            return KvtcRecordDumpReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+        if self.kvtc_recording:
+            self._kvtc_collect_if_needed()
+        if not self.kvtc_record_vectors:
+            return KvtcRecordDumpReqOutput(
+                success=False, message="No recorded pages to dump."
+            )
+        is_writer_rank = self.tp_rank == 0 and (self.dp_rank is None or self.dp_rank == 0)
+        if not is_writer_rank:
+            return KvtcRecordDumpReqOutput(
+                success=True,
+                message="",
+                output_path=recv_req.output_path,
+                num_pages=len(self.kvtc_record_vectors),
+            )
+        try:
+            from sglang.srt.mem_cache.codec.kvtc_calibration import (
+                compute_kvtc_params,
+                save_kvtc_params,
+            )
+
+            params = compute_kvtc_params(
+                self.kvtc_record_vectors,
+                recv_req.ratio,
+                recv_req.output_dtype,
+                max_k=recv_req.max_k,
+                shape=self.kvtc_record_shape,
+            )
+            if self.kvtc_record_shape is not None:
+                params["shape"] = self.kvtc_record_shape
+            save_kvtc_params(params, recv_req.output_path)
+            return KvtcRecordDumpReqOutput(
+                success=True,
+                message="KVTC record dumped.",
+                output_path=recv_req.output_path,
+                num_pages=len(self.kvtc_record_vectors),
+            )
+        except Exception as e:
+            logger.exception("KVTC record dump failed.")
+            return KvtcRecordDumpReqOutput(success=False, message=str(e))
+    
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;

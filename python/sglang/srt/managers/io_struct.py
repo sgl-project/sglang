@@ -1195,6 +1195,60 @@ class PinPrefixReqOutput(BaseReq):
     nodes_pinned: int = 0
     message: str = ""
 
+@dataclass
+class KvtcCalibrateReqInput(BaseReq):
+    output_path: str
+    max_pages: int = 256
+    ratio: float = 4.0
+    output_dtype: str = "float16"
+
+
+@dataclass
+class KvtcCalibrateReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+    output_path: str = ""
+    num_pages: int = 0
+
+
+@dataclass
+class KvtcRecordStartReqInput(BaseReq):
+    max_pages: int = 256
+
+
+@dataclass
+class KvtcRecordStartReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+    max_pages: int = 0
+
+
+@dataclass
+class KvtcRecordStopReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class KvtcRecordStopReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+    num_pages: int = 0
+
+
+@dataclass
+class KvtcRecordDumpReqInput(BaseReq):
+    output_path: str
+    ratio: float = 4.0
+    output_dtype: str = "float16"
+    max_k: int = 256
+
+
+@dataclass
+class KvtcRecordDumpReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+    output_path: str = ""
+    num_pages: int = 0
 
 @dataclass
 class PauseGenerationReqInput(BaseReq):

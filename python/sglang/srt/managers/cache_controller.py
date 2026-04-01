@@ -857,6 +857,16 @@ class HiCacheController:
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
+        from sglang.srt.mem_cache.codec import KVPageMeta
+
+        kv_page_meta = KVPageMeta(
+            page_size=self.page_size,
+            layout=self.mem_pool_host.layout,
+            is_mla_model=self.storage_config.is_mla_model,
+            tp_rank=self.storage_config.tp_rank,
+            tp_size=self.storage_config.tp_size,
+            model_name=self.storage_config.model_name,
+        ).to_dict()
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
@@ -864,7 +874,9 @@ class HiCacheController:
             ]
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys, extra_info={"kv_page_meta": kv_page_meta}
+            )
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             # Check termination
             if (
@@ -908,6 +920,16 @@ class HiCacheController:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
+        from sglang.srt.mem_cache.codec import KVPageMeta
+
+        kv_page_meta = KVPageMeta(
+            page_size=self.page_size,
+            layout=self.mem_pool_host.layout,
+            is_mla_model=self.storage_config.is_mla_model,
+            tp_rank=self.storage_config.tp_rank,
+            tp_size=self.storage_config.tp_size,
+            model_name=self.storage_config.model_name,
+        ).to_dict()
 
         storage_query_count = 0
         hash_value = []
@@ -925,7 +947,9 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys, extra_info={"kv_page_meta": kv_page_meta}
+            )
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
@@ -1019,6 +1043,16 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
+        from sglang.srt.mem_cache.codec import KVPageMeta
+
+        kv_page_meta = KVPageMeta(
+            page_size=self.page_size,
+            layout=self.mem_pool_host.layout,
+            is_mla_model=self.storage_config.is_mla_model,
+            tp_rank=self.storage_config.tp_rank,
+            tp_size=self.storage_config.tp_size,
+            model_name=self.storage_config.model_name,
+        ).to_dict()
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
             batch_host_indices = operation.host_indices[
@@ -1026,7 +1060,9 @@ class HiCacheController:
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys, extra_info={"kv_page_meta": kv_page_meta}
+            )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(

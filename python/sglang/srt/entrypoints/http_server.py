@@ -129,6 +129,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PinPrefixReqInput,
     ProfileReqInput,
+    KvtcRecordDumpReqInput,
+    KvtcRecordStartReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -955,6 +957,62 @@ async def dump_expert_distribution_record_async():
         status_code=200,
     )
 
+@app.api_route("/start_kvtc_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def start_kvtc_record_async(obj: Optional[KvtcRecordStartReqInput] = None):
+    if obj is None:
+        obj = KvtcRecordStartReqInput()
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+    ret = await _global_state.tokenizer_manager.kvtc_record_start(
+        max_pages=obj.max_pages
+    )
+    return ORJSONResponse(
+        content={
+            "status": "ok" if ret.success else "error",
+            "max_pages": ret.max_pages,
+            "message": ret.message,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/stop_kvtc_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def stop_kvtc_record_async():
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+    ret = await _global_state.tokenizer_manager.kvtc_record_stop()
+    return ORJSONResponse(
+        content={
+            "status": "ok" if ret.success else "error",
+            "num_pages": ret.num_pages,
+            "message": ret.message,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/dump_kvtc_record", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def dump_kvtc_record_async(obj: KvtcRecordDumpReqInput):
+    if not _global_state.tokenizer_manager.server_args.admin_api_key:
+        return _admin_api_key_missing_response()
+    ret = await _global_state.tokenizer_manager.kvtc_record_dump(
+        output_path=obj.output_path,
+        ratio=obj.ratio,
+        output_dtype=obj.output_dtype,
+        max_k=obj.max_k,
+    )
+    return ORJSONResponse(
+        content={
+            "status": "ok" if ret.success else "error",
+            "output_path": ret.output_path,
+            "num_pages": ret.num_pages,
+            "message": ret.message,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 @app.post("/update_weights_from_disk")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)

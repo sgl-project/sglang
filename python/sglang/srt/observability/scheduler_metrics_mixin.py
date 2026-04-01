@@ -52,6 +52,7 @@ class PrefillStats:
 
     log_input_tokens: int
     log_hit_tokens: int
+    log_codec_hit_tokens: int
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
@@ -63,9 +64,15 @@ class PrefillStats:
         running_reqs: List[Req],
         enable_priority_scheduling: bool = False,
     ):
+        host_hit_tokens = sum(getattr(r, "host_hit_length", 0) for r in adder.can_run_list)
+        host_pool = getattr(adder.tree_cache, "token_to_kv_pool_host", None) or getattr(
+            adder.tree_cache, "full_kv_pool_host", None
+        )
+        codec_enabled = bool(getattr(host_pool, "codec_name", None)) if host_pool else False
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
+            log_codec_hit_tokens=host_hit_tokens if codec_enabled else 0,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -390,10 +397,18 @@ class SchedulerMetricsMixin:
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"#codec-token: {prefill_stats.log_codec_hit_tokens}, "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
+        if self.enable_hierarchical_cache:
+            host_pool = getattr(self.tree_cache, "token_to_kv_pool_host", None) or getattr(
+                self.tree_cache, "full_kv_pool_host", None
+            )
+            if host_pool is not None:
+                host_used = host_pool.size - host_pool.available_size()
+                msg += f"host_pool: {host_used}/{host_pool.size}, "
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
@@ -422,6 +437,8 @@ class SchedulerMetricsMixin:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
+        if hasattr(self, "_kvtc_collect_if_needed"):
+            self._kvtc_collect_if_needed()
 
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
