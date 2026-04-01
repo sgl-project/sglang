@@ -120,16 +120,49 @@ python3 benchmark/gsm8k/bench_sglang.py \
 
 Recommended model: [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)
 
-Reference results (Qwen3.5-35B-A3B, GSM8K 100 questions, SM120):
+Reference results (Qwen3.5-35B-A3B, 4x RTX PRO 6000 Blackwell SM120, TP=4):
+
+#### GSM8K (1319 questions, max_tokens=10240)
 
 | KV Cache | MTP | Accuracy | Throughput |
 |----------|-----|----------|------------|
+| BF16 | No | 91.3% | - |
 | FP8 (fp8_e4m3) | No | 91.0% | 350.6 tok/s |
-| FP4 (fp4_e2m1) | No | 91.0% | 452.1 tok/s |
+| **FP4 (fp4_e2m1)** | **No** | **91.4%** | **2528 tok/s** |
 | FP8 (fp8_e4m3) | draft_len=3 | 96.0% | 652.2 tok/s |
 | FP4 (fp4_e2m1) | draft_len=3 | 94.0% | 891.3 tok/s |
 
-FP4 shows ~29% throughput improvement over FP8 (no MTP) with no accuracy loss.
+#### GPQA (198 questions, 8 repeats, temperature=0.6, max_tokens=81920)
+
+| KV Cache | Mean Score | Scores (8 rounds) |
+|----------|------------|-------------------|
+| BF16 | 83.5% | 84.3, 83.8, 83.8, 84.3, 80.8, 85.4, 82.3, 82.8 |
+| FP8 (fp8_e4m3) | 82.1% | 82.8, 80.3, 85.4, 81.3, 80.8, 82.3, 80.8, 82.8 |
+| **FP4 (fp4_e2m1)** | **80.1%** | 81.8, 80.3, 79.3, 81.3, 80.3, 80.8, 79.3, 77.8 |
+
+#### LongBench V2 (503 questions, 128K context, no thinking, max_tokens=16384)
+
+| KV Cache | Score | Easy | Hard | Latency |
+|----------|-------|------|------|---------|
+| BF16 (3-round avg) | 52.4% +/- 0.3% | 56.3% | 50.2% | 1146s |
+| **FP4 (fp4_e2m1)** | **49.7%** | 55.7% | 46.3% | 1059s |
+| FP4 (3-round avg, old) | 48.9% +/- 0.5% | 52.8% | 46.7% | 1471s |
+
+#### AIME25 (Majority Vote, n=16 beams, max_tokens=114688)
+
+| KV Cache | Majority Vote | Pass@16 | Problems |
+|----------|---------------|---------|----------|
+| BF16 (B200 x2) | 93.3% (28/30) | 87.9% (422/480) | 30/30 |
+| **FP4 (RTX 6000 x4)** | **(pending retest)** | - | - |
+
+#### Summary
+
+| Benchmark | FP4 | BF16 | FP8 | Delta (vs BF16) |
+|-----------|-----|------|-----|-----------------|
+| GSM8K | 91.4% | 91.3% | 91.0% | +0.1pp |
+| GPQA | 80.1% | 83.5% | 82.1% | -3.4pp |
+| LongBenchV2 128K | 49.7% | 52.4% | - | -2.7pp |
+| AIME25 MV | (pending) | 93.3% | - | - |
 
 ### GPQA Accuracy Check
 
@@ -137,6 +170,19 @@ FP4 shows ~29% throughput improvement over FP8 (no MTP) with no accuracy loss.
 python3 -m sglang.test.run_eval --eval-name gpqa --port 30000 \
   --model <model_path> --num-examples 198 --max-tokens 81920 \
   --repeat 8 --temperature 0.6 --top-p 0.95 --top-k 20 --num-threads 16
+```
+
+### LongBench V2 Accuracy Check
+
+```bash
+# Start server with 128K context settings:
+# --chunked-prefill-size 32768 --max-prefill-tokens 65536
+# --max-running-requests 128 --mem-fraction-static 0.75
+# --cuda-graph-bs 1 2 4 8 16 32 64 128
+
+python3 -m sglang.test.run_eval --eval-name longbench_v2 --port 30000 \
+  --model <model_path> --max-context-length 128000 --max-tokens 16384 \
+  --num-threads 16 --chat-template-kwargs '{"enable_thinking": false}'
 ```
 
 ## Architecture
@@ -174,3 +220,4 @@ These scales are stored in `kv_cache_sf` (scale factor) tensors alongside the FP
 - NVFP4 KV cache is SM120 only (not SM90/SM100)
 - The TRT-LLM context kernel does not support NVFP4 scales, so MTP must use `--speculative-attention-mode decode`
 - FlashInfer prefill with NVFP4 dequantizes to FP8, not native FP4 prefill
+- Radix cache must be disabled (`--disable-radix-cache`)

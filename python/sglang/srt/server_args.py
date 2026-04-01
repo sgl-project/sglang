@@ -1387,13 +1387,7 @@ class ServerArgs:
         # 16. Context parallel
         if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
-        # 17. NVFP4 KV cache: piecewise captures extend batches which invoke
-        #     trtllm_batch_decode_with_kv_cache with kv_cache_sf and can force
-        #     the FP4 to FP8 dequant path during prefill. Keep disabled until
-        #     the FlashInfer path is validated.
-        if self.kv_cache_dtype == "fp4_e2m1":
-            self.disable_piecewise_cuda_graph = True
-        # 18. CUDA Graph debug mode
+        # 17. CUDA Graph debug mode
         if self.debug_cuda_graph:
             self.disable_piecewise_cuda_graph = True
         # 19. DSA prefill context parallelism (attn_cp_size is set later in
