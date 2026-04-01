@@ -22,9 +22,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     wrap_attention_impl_forward,
 )
-from sglang.multimodal_gen.runtime.layers.attention.hybrid_schedule import (
-    HybridAttentionSchedule,
-)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_attn_backend,
     global_force_attn_backend_context_manager,
@@ -39,48 +36,8 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.utils import get_compute_dtype
-
-
-class HybridAttentionImpl(AttentionImpl):
-    """Stable wrapper that holds two attention impls and dispatches per-step.
-
-    ``self.attn_impl`` on the parent module always points to this object,
-    so torch.compile guards on the attribute identity never invalidate.
-    Dispatch reads ``current_timestep`` and ``total_timesteps`` from
-    :class:`ForwardContext` to pick the active impl via the schedule.
-    """
-
-    def __init__(
-        self,
-        high_impl: AttentionImpl,
-        low_impl: AttentionImpl,
-        schedule: HybridAttentionSchedule,
-    ) -> None:
-        # Intentionally skip AttentionImpl.__init__ (abstract).
-        self._high_impl = high_impl
-        self._low_impl = low_impl
-        self._schedule = schedule
-
-    def _get_active_impl(self) -> AttentionImpl:
-        ctx = get_forward_context()
-        target = self._schedule.get_backend_for_step(
-            ctx.current_timestep, ctx.total_timesteps
-        )
-        if target == self._schedule.high_precision_backend:
-            return self._high_impl
-        return self._low_impl
-
-    def preprocess_qkv(self, qkv, attn_metadata):
-        return self._get_active_impl().preprocess_qkv(qkv, attn_metadata)
-
-    def postprocess_output(self, output, attn_metadata):
-        return self._get_active_impl().postprocess_output(output, attn_metadata)
-
-    def forward(self, query, key, value, attn_metadata=None, **kwargs):
-        return self._get_active_impl().forward(
-            query, key, value, attn_metadata=attn_metadata, **kwargs
-        )
 
 
 def _init_hybrid_schedule(
@@ -94,24 +51,17 @@ def _init_hybrid_schedule(
     prefix: str,
     extra_impl_args: dict,
 ) -> None:
-    """Initialize hybrid attention schedule on an attention module if configured.
+    """Register an attention module for hybrid backend swapping.
 
-    Wraps the module's ``attn_impl`` in a :class:`HybridAttentionImpl` that
-    holds both the high-precision and low-precision impls.  The wrapper's
-    identity never changes, so torch.compile guards stay valid.
-
-    At runtime, each wrapper reads the current step from
-    :class:`ForwardContext` and dispatches to the appropriate impl.
+    Creates both a high-precision and low-precision impl, registers the
+    module on the shared ``HybridAttentionSchedule``.
     """
-    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
     server_args = get_global_server_args()
-    if server_args is None or not server_args.hybrid_attention_schedule:
+    if server_args is None or server_args.parsed_hybrid_schedule is None:
         return
 
-    schedule = HybridAttentionSchedule.from_string(
-        server_args.hybrid_attention_schedule
-    )
+    schedule = server_args.parsed_hybrid_schedule
 
     # Force each backend explicitly via the global override so the
     # CLI/default --attention-backend doesn't interfere.
@@ -151,8 +101,9 @@ def _init_hybrid_schedule(
     )
     wrap_attention_impl_forward(low_impl)
 
-    wrapper = HybridAttentionImpl(high_impl, low_impl, schedule)
-    module.attn_impl = wrapper
+    schedule.register_module(module, high_impl, low_impl)
+    # Default to high-precision impl until the first update_current_backend call
+    module.attn_impl = high_impl
 
 
 class UlyssesAttention(nn.Module):
@@ -535,7 +486,6 @@ class USPAttention(nn.Module):
         """
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
-
         if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)

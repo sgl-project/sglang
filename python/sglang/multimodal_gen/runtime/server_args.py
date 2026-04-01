@@ -109,6 +109,7 @@ class ServerArgs:
     attention_backend: str = None
     attention_backend_config: addict.Dict | None = None
     hybrid_attention_schedule: str | None = None
+    parsed_hybrid_schedule: Any = None
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -381,6 +382,15 @@ class ServerArgs:
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
             self._set_default_attention_backend()
+
+        if self.hybrid_attention_schedule:
+            from sglang.multimodal_gen.runtime.layers.attention.hybrid_schedule import (
+                HybridAttentionSchedule,
+            )
+
+            self.parsed_hybrid_schedule = HybridAttentionSchedule.from_string(
+                self.hybrid_attention_schedule
+            )
 
     def _adjust_warmup(self):
         if self.warmup_resolutions is not None:
