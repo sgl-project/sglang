@@ -36,6 +36,7 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
     LoRAType,
+    auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
 )
@@ -77,8 +78,10 @@ class LoRAManager:
             server_args.enable_lora_overlap_loading
         )
 
-        # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
+        self._experts_shared_outer_override: Optional[bool] = (
+            server_args.experts_shared_outer_loras
+        )
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -302,23 +305,33 @@ class LoRAManager:
                 if isinstance(module, FusedMoEWithLoRA) and all(
                     x in self.target_modules for x in ["gate_up_proj", "down_proj"]
                 ):
+                    gate_up_key = (
+                        "gate_up_proj_moe"
+                        if "gate_up_proj_moe" in self.memory_pool.A_buffer
+                        else "gate_up_proj"
+                    )
+                    down_key = (
+                        "down_proj_moe"
+                        if "down_proj_moe" in self.memory_pool.A_buffer
+                        else "down_proj"
+                    )
                     gate_up_a = self.memory_pool.get_tensor(
-                        target_module="gate_up_proj_moe",
+                        target_module=gate_up_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_A,
                     )
                     gate_up_b = self.memory_pool.get_tensor(
-                        target_module="gate_up_proj_moe",
+                        target_module=gate_up_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_B,
                     )
                     down_a = self.memory_pool.get_tensor(
-                        target_module="down_proj_moe",
+                        target_module=down_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_A,
                     )
                     down_b = self.memory_pool.get_tensor(
-                        target_module="down_proj_moe",
+                        target_module=down_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_B,
                     )
@@ -386,6 +399,16 @@ class LoRAManager:
             target_modules=target_modules,
         )
 
+        if self._experts_shared_outer_override is not None:
+            self.experts_shared_outer_loras = self._experts_shared_outer_override
+        else:
+            self.experts_shared_outer_loras = self._detect_shared_outer_loras()
+        if self.experts_shared_outer_loras:
+            logger.info(
+                "Shared outer LoRA mode enabled: gate_up lora_A and "
+                "down lora_B will be shared across experts (expert_dim=1)."
+            )
+
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
@@ -411,6 +434,26 @@ class LoRAManager:
                         f"Failed to load LoRA adapter {lora_ref.lora_name}: {result.error_message}"
                     )
 
+    def _detect_shared_outer_loras(self) -> bool:
+        """Auto-detect shared outer LoRA format from loaded adapter weights.
+
+        MoE adapters with shared outer experts store 3D tensors where
+        dim[0]=1 indicates weights shared across all experts, while
+        dim[0]=num_experts indicates per-expert weights.
+        Returns True if gate_up lora_A has expert_dim=1 (shared).
+        """
+        for adapter in self.loras.values():
+            for layer in adapter.layers:
+                for name, weight in layer.weights.items():
+                    if (
+                        "gate_up_proj" in name
+                        and "lora_A" in name
+                        and weight.dim() == 3
+                    ):
+                        return weight.shape[0] == 1
+            break
+        return False
+
     def init_lora_shapes(
         self,
         max_lora_rank: Optional[int] = None,
@@ -424,9 +467,6 @@ class LoRAManager:
 
         for lora_id, config in self.configs.items():
             # Handle PEFT shorthand strings like "all-linear" or "all".
-            # These cannot be resolved to concrete module names without
-            # inspecting the base model, so we require the user to specify
-            # --lora-target-modules explicitly when such shorthands are used.
             if isinstance(config.target_modules, str):
                 if config.target_modules in ("all-linear", "all"):
                     if target_modules is not None:
@@ -434,14 +474,20 @@ class LoRAManager:
                         # per-adapter inference for this adapter.
                         continue
                     else:
-                        lora_name = self.lora_refs[lora_id].lora_name
-                        raise ValueError(
-                            f"LoRA adapter '{lora_name}' uses "
-                            f"target_modules='{config.target_modules}' which cannot "
-                            "be resolved automatically. Please explicitly specify "
-                            "--lora-target-modules during server startup. You can "
-                            "specify 'all' to enable all supported module types."
+                        # Resolve by scanning the base model for all
+                        # LoRA-compatible linear modules.
+                        adapter_target_modules = auto_detect_lora_target_modules(
+                            self.base_model
                         )
+                        logger.info(
+                            "LoRA adapter '%s' uses target_modules='%s'. "
+                            "Resolved to %s by inspecting the base model.",
+                            self.lora_refs[lora_id].lora_name,
+                            config.target_modules,
+                            sorted(adapter_target_modules),
+                        )
+                        self.target_modules.update(adapter_target_modules)
+                        continue
                 else:
                     raise ValueError(
                         f"SGLang does not recognize target_modules="
@@ -585,6 +631,7 @@ class LoRAManager:
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
+            experts_shared_outer_loras=self.experts_shared_outer_loras,
         )
 
         # Initializing memory pool with base model
@@ -672,16 +719,17 @@ class LoRAManager:
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:
                 layer_id = get_layer_id(module_name)
+                if layer_id is None:
+                    continue
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
                 continue
 
-            # Temporarily workaround for FusedMoE layer
             if isinstance(module, FusedMoE) and all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
                 layer_id = get_layer_id(module_name)
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
-                )
+                lora_module = self.set_lora_module(module_name, module)
+                lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
+                self.lora_modules[layer_id][module_name] = lora_module

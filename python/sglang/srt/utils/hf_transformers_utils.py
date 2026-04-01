@@ -712,6 +712,57 @@ class TokenizerWarningsFilter(logging.Filter):
         return "Calling super().encode with" not in record.getMessage()
 
 
+_is_base_mistral_patched = False
+
+# transformers version where _patch_mistral_regex calls model_info() on every tokenizer load
+_TRANSFORMERS_PATCHED_VERSION = "5.3.0"
+
+
+def _patch_is_base_mistral_in_ci():
+    """Patch transformers' _patch_mistral_regex to avoid HF API calls in CI.
+
+    transformers defines is_base_mistral as a local function inside
+    _patch_mistral_regex, so it cannot be patched via module attribute.
+    Instead we replace the entire _patch_mistral_regex classmethod with a
+    version that simply returns the tokenizer unchanged.
+
+    In CI this prevents exhausting the 3000 req/5min HF API rate limit.
+    """
+    global _is_base_mistral_patched
+    if _is_base_mistral_patched:
+        return
+
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_IS_IN_CI.get():
+        return
+
+    import transformers
+
+    if transformers.__version__ != _TRANSFORMERS_PATCHED_VERSION:
+        logger.warning(
+            "transformers version changed to %s (expected %s), "
+            "_patch_mistral_regex patch skipped — may need update if 429 errors recur",
+            transformers.__version__,
+            _TRANSFORMERS_PATCHED_VERSION,
+        )
+        _is_base_mistral_patched = True  # don't warn repeatedly
+        return
+
+    from transformers import PreTrainedTokenizerFast
+
+    if hasattr(PreTrainedTokenizerFast, "_patch_mistral_regex"):
+
+        @classmethod
+        def _noop_patch_mistral_regex(cls, tokenizer, *args, **kwargs):
+            return tokenizer
+
+        PreTrainedTokenizerFast._patch_mistral_regex = _noop_patch_mistral_regex
+        logger.info("CI: patched _patch_mistral_regex to skip HF API calls")
+
+    _is_base_mistral_patched = True
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -754,6 +805,8 @@ def get_tokenizer(
         client = create_remote_connector(tokenizer_name)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         tokenizer_name = client.get_local_dir()
+
+    _patch_is_base_mistral_in_ci()
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(

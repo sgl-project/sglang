@@ -957,20 +957,18 @@ class NixlKVReceiver(CommonKVReceiver):
         mgr: NixlKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        prefill_dp_rank: Optional[int] = None,
     ):
         self.started_transfer = False
-        self.conclude_state = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
-
-        # Track this room with its bootstrap address for heartbeat monitoring
-        if hasattr(self.kv_mgr, "addr_to_rooms_tracker"):
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
-                self.bootstrap_room
-            )
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
 
     def init(
+        self,
+        prefill_dp_rank: int,
+    ):
+        super().init(prefill_dp_rank)
+
+    def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
@@ -1026,7 +1024,7 @@ class NixlKVReceiver(CommonKVReceiver):
             self.conclude_state = status
             return status
         if not self.started_transfer:
-            return KVPoll.WaitingForInput  # type: ignore
+            return status
 
         now = time.time()
         elapsed = now - self.init_time
