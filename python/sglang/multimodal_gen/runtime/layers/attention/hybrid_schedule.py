@@ -72,7 +72,9 @@ class HybridAttentionSchedule:
         high_name, low_name, first_str, last_str = parts
 
         try:
-            high_backend = AttentionBackendEnum[high_name.upper()]
+        try:
+            high_name_norm = high_name.lower().replace("fa3", "fa").replace("fa4", "fa")
+            high_backend = AttentionBackendEnum[high_name_norm.upper()]
         except KeyError:
             raise ValueError(
                 f"Unknown high-precision attention backend '{high_name}'. "
@@ -80,7 +82,8 @@ class HybridAttentionSchedule:
             )
 
         try:
-            low_backend = AttentionBackendEnum[low_name.upper()]
+            low_name_norm = low_name.lower().replace("fa3", "fa").replace("fa4", "fa")
+            low_backend = AttentionBackendEnum[low_name_norm.upper()]
         except KeyError:
             raise ValueError(
                 f"Unknown low-precision attention backend '{low_name}'. "
