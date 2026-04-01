@@ -830,7 +830,7 @@ class Req(ReqDllmMixin):
         self.init_diffusion_llm(dllm_config)
 
         # For hisparse
-        self.staging = False
+        self.hisparse_staging = False
 
     @property
     def seqlen(self) -> int:

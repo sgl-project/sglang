@@ -158,7 +158,6 @@ done
 ```
 
 ```shell
-export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
@@ -275,7 +274,6 @@ done
 ```
 
 ```shell
-export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
@@ -559,7 +557,6 @@ done
 ```
 
 ```shell
-export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
@@ -760,7 +757,6 @@ done
 ```
 
 ```shell
-export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
@@ -909,7 +905,6 @@ do
         --disaggregation-transfer-backend ascend \
         --disaggregation-mode decode \
         --nnodes 2 --node-rank $i \
-        --prefill-round-robin-balance \
         --dist-init-addr ${D_IP[0]}:10000
         break
     fi
@@ -918,7 +913,6 @@ done
 
 
 ```shell
-export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
@@ -978,7 +972,6 @@ D_IP=('your decode ip1' 'your decode ip2')
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_DP_ROUND_ROBIN=1
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -1054,7 +1047,6 @@ done
 ```
 
 ```shell
-export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
@@ -1973,7 +1965,6 @@ done
 ```
 
 ```shell
-export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
