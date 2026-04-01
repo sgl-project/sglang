@@ -323,7 +323,7 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
     # Replace mlp matmul with torch kernel for better performance for Qwen-vl
-    USE_TORCH_MATMUL_FOR_MLP = EnvBool(False)
+    USE_MATMUL_REPLACE_LINEAR = EnvBool(False)
 
 
     # Quantization
