@@ -10,8 +10,10 @@ from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_fp4_to_fp8 import (
+    FP8_TOTAL_DIM,
     dequant_fp4_paged_decode,
     dequant_fp4_paged_extend,
+    get_fp8_dtype_for_dequant,
 )
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
@@ -336,6 +338,25 @@ class NativeSparseAttnBackend(
             assert (
                 self.nsa_decode_impl == "tilelang"
             ), f"FP4 KV cache requires tilelang decode backend, got {self.nsa_decode_impl}"
+            assert self.nsa_prefill_impl in (
+                "tilelang",
+                "flashmla_auto",
+            ), (
+                f"FP4 KV cache requires tilelang or flashmla_auto prefill backend, "
+                f"got {self.nsa_prefill_impl}"
+            )
+
+        if self.nsa_kv_cache_store_fp4:
+            fp4_init_entries = model_runner.req_to_token_pool.size * self.nsa_index_topk
+            fp8_dtype = get_fp8_dtype_for_dequant()
+            self._fp4_fp8_workspace = torch.empty(
+                (fp4_init_entries, 1, FP8_TOTAL_DIM),
+                dtype=fp8_dtype,
+                device=self.device,
+            )
+            self._fp4_arange_buf = torch.arange(
+                fp4_init_entries, device=self.device, dtype=torch.int32
+            )
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -788,6 +809,18 @@ class NativeSparseAttnBackend(
                 else None
             ),
         }
+
+        if self.nsa_kv_cache_store_fp4:
+            cg_entries = max_num_tokens * self.nsa_index_topk
+            fp8_dtype = get_fp8_dtype_for_dequant()
+            self._fp4_fp8_workspace = torch.empty(
+                (cg_entries, 1, FP8_TOTAL_DIM),
+                dtype=fp8_dtype,
+                device=self.device,
+            )
+            self._fp4_arange_buf = torch.arange(
+                cg_entries, device=self.device, dtype=torch.int32
+            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1591,7 +1624,10 @@ class NativeSparseAttnBackend(
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if self.nsa_kv_cache_store_fp4:
                 kv_cache, page_table_1 = dequant_fp4_paged_decode(
-                    kv_cache, page_table_1
+                    kv_cache,
+                    page_table_1,
+                    fp8_workspace=self._fp4_fp8_workspace,
+                    arange_buf=self._fp4_arange_buf,
                 )
             return self._forward_tilelang(
                 q_all=q_all,

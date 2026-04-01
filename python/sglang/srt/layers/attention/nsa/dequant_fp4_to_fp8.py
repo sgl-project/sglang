@@ -188,8 +188,11 @@ def dequant_fp4_paged_decode(
 
     Returns (kv_fp8, new_page_table_1).
     """
+    assert (
+        page_table_1.ndim == 2
+    ), f"page_table_1 must be 2D (batch, topk), got shape {page_table_1.shape}"
     batch_size = page_table_1.shape[0]
-    topk = page_table_1.shape[-1]
+    topk = page_table_1.shape[1]
     num_entries = batch_size * topk
     flat_indices = page_table_1.reshape(-1)
 

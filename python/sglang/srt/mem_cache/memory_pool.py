@@ -1469,11 +1469,10 @@ class MLATokenToKVPool(KVCache):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
-        # When override_kv_cache_dim is provided with nsa model, we assume the
-        # override kv cache dim is correct and use it directly.
+        # When override_kv_cache_dim is provided, use it directly (covers FP8 and FP4).
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.nsa_kv_cache_store_fp8
+            if override_kv_cache_dim is not None
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -2012,9 +2011,6 @@ class NSATokenToKVPoolFP4(NSATokenToKVPool):
             end_layer=end_layer,
             index_buf_size=index_buf_size,
         )
-        # Parent's MLATokenToKVPool sets kv_cache_dim based on nsa_kv_cache_store_fp8
-        # which is False for FP4.  Force the correct dimension here.
-        self.kv_cache_dim = FP4_KV_CACHE_DIM
         self.nsa_kv_cache_store_fp4 = True
         self.nsa_kv_cache_store_fp8 = False
 
@@ -2068,6 +2064,17 @@ class NSATokenToKVPoolFP4(NSATokenToKVPool):
             loc,
             cache_k_nope,
             cache_k_rope,
+        )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        raise NotImplementedError(
+            "NSATokenToKVPoolFP4 stores data in FP4 format; "
+            "use get_key_buffer() and dequantize explicitly"
         )
 
 
