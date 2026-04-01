@@ -32,6 +32,11 @@ if is_cuda():
     from sglang.srt.layers.fused_sampling import fused_temperature_softmax_inplace
 
     _use_fused_sampling = True
+
+# Batch size threshold for fused Triton kernel vs PyTorch softmax.
+# Below this threshold, PyTorch's native div+softmax is faster.
+# At and above this threshold, the fused Triton kernel wins.
+_FUSED_SAMPLING_BATCH_THRESHOLD = 128
 if is_npu():
     import torch_npu
 
@@ -157,7 +162,12 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
-                if _use_fused_sampling:
+                # Use fused Triton kernel for large batches where it excels;
+                # fall back to PyTorch for small batches where launch overhead dominates.
+                if (
+                    _use_fused_sampling
+                    and logits.shape[0] >= _FUSED_SAMPLING_BATCH_THRESHOLD
+                ):
                     fused_temperature_softmax_inplace(
                         logits, sampling_info.temperatures
                     )
