@@ -3150,16 +3150,15 @@ class ServerArgs:
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
 
-        if is_runai_obj_uri(self.model_path):
-            self.load_format = "runai_streamer"
-        elif is_remote_url(self.model_path):
         if self.load_format == "auto" and self._is_mistral_native_format():
             self.load_format = "mistral"
             logger.info(
                 "Detected Mistral native format checkpoint, setting load_format='mistral'"
             )
 
-        if is_remote_url(self.model_path):
+        if is_runai_obj_uri(self.model_path):
+            self.load_format = "runai_streamer"
+        elif is_remote_url(self.model_path):
             self.load_format = "remote"
 
         if self.custom_weight_loader is None:
