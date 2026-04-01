@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,16 +12,19 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+register_npu_ci(est_time=400, suite="stage-b-test-2-npu-a2", nightly=False)
+register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
+
 TEST_MODEL_MATRIX = {
-    "/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-V2-Lite-W8A8": {
-        "accuracy": 0.34,
-        "latency": 1000,
-        "output_throughput": 6,
+    "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct": {
+        "accuracy": 0.85,
+        "latency": 180,
+        "output_throughput": 20,
     },
 }
 
 
-class TestAscendMlaHicache(CustomTestCase):
+class TestAscendGraphTp2Bf16(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -34,10 +38,7 @@ class TestAscendMlaHicache(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--tp-size",
-            4,
-            "--enable-hierarchical-cache",
-            "--hicache-ratio",
-            1.2,
+            2,
         ]
 
     def test_a_gsm8k(self):
