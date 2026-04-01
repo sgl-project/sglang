@@ -28,11 +28,14 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +56,7 @@ class TransferKVChunk:
     room: int
     prefill_kv_indices: npt.NDArray[np.int32]
     index_slice: slice
-    is_last: bool
+    is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
 
@@ -549,9 +552,8 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: int,
         data: bytes,
     ):
-        socket = self._connect(
-            format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
-        )
+        na = NetworkAddress(remote, dst_port)
+        socket = self._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
 
         socket.send_multipart(
             [
@@ -724,7 +726,9 @@ class MooncakeKVManager(CommonKVManager):
                 # Each prefill sends all its dims to the appropriate offset in decode
                 src_dim_start = 0
                 num_dims_to_send = src_dim
-                dst_dim_start = local_tp_rank_in_group * src_dim
+                writers_per_decode = self.attn_tp_size // dst_attn_tp_size
+                local_writer_idx = local_tp_rank_in_group % writers_per_decode
+                dst_dim_start = local_writer_idx * src_dim
             else:
                 # 1 prefill rank sends to multiple decode ranks
                 # Prefill sends a slice of its dims to each decode rank
@@ -756,9 +760,8 @@ class MooncakeKVManager(CommonKVManager):
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
-        self._connect(
-            format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
-        ).send_multipart(
+        na = NetworkAddress(remote, dst_port)
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
@@ -779,7 +782,12 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
-                local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                # Unique id per prefill sender so decode's response set size matches expected_response_num.
+                prefill_unique_rank = (
+                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                    + self.pp_rank * self.attn_cp_size
+                    + self.attn_cp_rank
+                )
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -795,7 +803,7 @@ class MooncakeKVManager(CommonKVManager):
                                     req.dst_port,
                                     req.room,
                                     KVPoll.Failed,
-                                    local_rank,
+                                    prefill_unique_rank,
                                 )
                                 break
 
@@ -849,7 +857,8 @@ class MooncakeKVManager(CommonKVManager):
                                     )
                             self.record_failure(
                                 kv_chunk.room,
-                                f"Failed to send kv chunk of {kv_chunk.room} to {req.endpoint}:{req.dst_port}",
+                                f"Failed to send kv chunk of {kv_chunk.room} to "
+                                f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
                             )
                             self.update_status(kv_chunk.room, KVPoll.Failed)
                             self.sync_status_to_decode_endpoint(
@@ -857,11 +866,11 @@ class MooncakeKVManager(CommonKVManager):
                                 req.dst_port,
                                 req.room,
                                 KVPoll.Failed,
-                                local_rank,
+                                prefill_unique_rank,
                             )
                             break
 
-                        if kv_chunk.is_last:
+                        if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices is not None:
                                 self.maybe_send_extra(
                                     req,
@@ -888,12 +897,16 @@ class MooncakeKVManager(CommonKVManager):
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
-                                        endpoint, dst_port, room, status, local_rank
+                                        endpoint,
+                                        dst_port,
+                                        room,
+                                        status,
+                                        prefill_unique_rank,
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
-                        if kv_chunk.is_last and req.room in self.request_status:
+                        if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
                 if (
@@ -1038,12 +1051,12 @@ class MooncakeKVManager(CommonKVManager):
         bootstrap_room: int,
         kv_indices: npt.NDArray[np.int32],
         index_slice: slice,
-        is_last: bool,
+        is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last or (is_last and aux_index is not None)
+        assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         if (
             bootstrap_room not in self.request_status
@@ -1072,7 +1085,7 @@ class MooncakeKVManager(CommonKVManager):
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
                 index_slice=index_slice,
-                is_last=is_last,
+                is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
             )
@@ -1134,9 +1147,23 @@ class MooncakeKVSender(CommonKVSender):
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
-        is_last = self.curr_idx == self.num_kv_indices
+        is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if not is_last:
+        # Special handling for cp
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
+            if not is_last_chunk:
+                return
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return
+
+        if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
                 kv_indices,
@@ -1211,15 +1238,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        prefill_dp_rank: Optional[int] = None,
     ):
         self.session_id = mgr.get_session_id()
-        self.conclude_state = None
         self.init_time = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
-
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
@@ -1270,6 +1292,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 )
 
     def init(
+        self,
+        prefill_dp_rank: int,
+    ):
+        super().init(prefill_dp_rank)
+
+    def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,

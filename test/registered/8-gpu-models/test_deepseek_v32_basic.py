@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=360, suite="stage-c-test-8-gpu-h200")
 
-DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
+DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
 class TestDeepseekV32DP(CustomTestCase):
@@ -133,7 +133,7 @@ class TestDeepseekV32TP(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 70)
+            self.assertGreater(speed, 80)
 
 
 if __name__ == "__main__":

@@ -57,8 +57,34 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
         self.forward_metadata = (attn_logits, max_extend_len)
 
-    def get_graph_seq_len_fill_value(self):
+    def get_cpu_graph_seq_len_fill_value(self):
         return 1
+
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+    ):
+        attn_logits = torch.zeros(
+            (
+                bs,
+                self.num_head,
+                8,  # self.num_kv_splits,
+                self.v_head_dim + 1,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        max_extend_len = None
+        self.forward_metadata = (attn_logits, max_extend_len)
+
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        pass
 
     def forward_extend(
         self,

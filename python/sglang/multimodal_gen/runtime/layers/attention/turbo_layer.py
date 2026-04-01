@@ -234,6 +234,7 @@ class MinimalA2AAttnOp(DistributedAttention):
         attention_type: str,
         topk: float,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        prefix: str = "",
     ):
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
@@ -256,6 +257,7 @@ class MinimalA2AAttnOp(DistributedAttention):
             num_heads=num_heads,
             head_size=head_size,
             topk_ratio=topk,
+            prefix=f"{prefix}.impl",
         )
         super(MinimalA2AAttnOp, self).__init__(local_attn)
 

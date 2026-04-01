@@ -52,12 +52,14 @@ if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.tuned_gemm import tgemm
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
 except ImportError:
     flashinfer_cutlass_fused_moe = None
 
@@ -148,6 +150,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         return F.linear(x, layer.weight, bias)
 
@@ -312,18 +317,62 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
                 weight.data = weight.data.transpose(1, 2)
-                weight.data = npu_format_cast(
-                    weight.data,
-                )
+                weight.data = npu_format_cast(weight.data)
 
         return
+
+    def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
+        self,
+        layer: torch.nn.Module,
+        param: torch.nn.Parameter,
+        weight_name: str,
+    ) -> None:
+        """Restore canonical BF16 MoE load shapes before hot weight copy.
+
+        The flashinfer TRT-LLM BF16 postprocess reshapes expert weights into
+        block layout. During weight update, checkpoint tensors are in
+        canonical layout and need a temporary shape restore for copy.
+        """
+        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+            return
+
+        expected_shape = None
+        if weight_name.endswith(".experts.w13_weight"):
+            w13_rows = (
+                2 * layer.intermediate_size_per_partition
+                if layer.moe_runner_config.is_gated
+                else layer.intermediate_size_per_partition
+            )
+            expected_shape = (layer.num_local_experts, w13_rows, layer.hidden_size)
+        elif weight_name.endswith(".experts.w2_weight"):
+            expected_shape = (
+                layer.num_local_experts,
+                layer.hidden_size,
+                layer.intermediate_size_per_partition,
+            )
+
+        if expected_shape is None or tuple(param.data.shape) == expected_shape:
+            return
+
+        expected_numel = expected_shape[0] * expected_shape[1] * expected_shape[2]
+        if param.data.numel() != expected_numel:
+            raise RuntimeError(
+                f"Cannot restore flashinfer TRT-LLM BF16 MoE weight shape for {weight_name}: "
+                f"current shape={tuple(param.data.shape)}, expected shape={expected_shape}."
+            )
+
+        param.data = param.data.reshape(expected_shape)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
         if self.use_flashinfer_trtllm_moe:
-            backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+            backend = (
+                MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
+                if get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                else MoeRunnerBackend.FLASHINFER_TRTLLM
+            )
         elif self.use_triton_kernels:
             backend = MoeRunnerBackend.TRITON_KERNELS
         else:
@@ -384,6 +433,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                activation_type=(
+                    ActivationType.Relu2
+                    if moe_runner_config.activation == "relu2"
+                    else ActivationType.Swiglu
+                ),
             )[0]
             return StandardCombineInput(hidden_states=output)
         elif self.use_flashinfer_trtllm_moe:

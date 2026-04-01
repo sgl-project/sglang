@@ -56,10 +56,8 @@ jobs:
           version=${{ steps.version.outputs.version }}
           echo "Version: ${version}"
 
-          dockerfile=""
           gpu_arch_suffix=""
           if [ "${{ matrix.rocm_version }}" = "rocm700" ]; then
-            dockerfile="docker/rocm.Dockerfile"
             if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
               rocm_tag="rocm700-mi30x"
             elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
@@ -70,7 +68,6 @@ jobs:
             fi
           elif [ "${{ matrix.rocm_version }}" = "rocm720" ]; then
             gpu_arch_suffix="-${{ matrix.rocm_version }}"
-            dockerfile="docker/rocm720.Dockerfile"
             if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
               rocm_tag="rocm720-mi30x"
             elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
@@ -87,5 +84,5 @@ jobs:
           tag=v${version}-${rocm_tag}
 
           # rocm.Dockerfile expects SGL_BRANCH with 'v' prefix for git tag checkout
-          docker build . -f ${dockerfile} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }}${gpu_arch_suffix} --build-arg SGL_BRANCH=v${version} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t lmsysorg/sglang:${tag} --no-cache
+          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }}${gpu_arch_suffix} --build-arg SGL_BRANCH=v${version} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t lmsysorg/sglang:${tag} --no-cache
           docker push lmsysorg/sglang:${tag}

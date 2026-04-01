@@ -179,9 +179,8 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
 
-    # Only allow LoRA on attention projections within text layers for MoE.
     _lora_pattern_moe = re.compile(
-        r"^model\.layers\.(\d+)\.self_attn\.(?:qkv_proj|o_proj)$"
+        r"^(?:model\.layers\.(\d+)\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)|lm_head|model\.embed_tokens)$"
     )
 
     def should_apply_lora(self, module_name: str) -> bool:
@@ -226,10 +225,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         num_experts = self.config.num_experts
 
-        # Cache params_dict to avoid repeated expensive traversal of model parameters
-        if not hasattr(self, "_cached_params_dict"):
-            self._cached_params_dict = dict(self.named_parameters())
-        params_dict = self._cached_params_dict
+        # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.
+        params_dict = dict(self.named_parameters())
+
         for name, loaded_weight in weights:
             name = name.replace(r"model.language_model.", r"model.")
 

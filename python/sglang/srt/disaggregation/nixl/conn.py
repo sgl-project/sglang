@@ -20,7 +20,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
@@ -905,6 +908,20 @@ class NixlKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
+        # Special handling for cp
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
+            if not is_last:
+                return
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return
+
         new_xfer_handles = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
@@ -940,20 +957,18 @@ class NixlKVReceiver(CommonKVReceiver):
         mgr: NixlKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        prefill_dp_rank: Optional[int] = None,
     ):
         self.started_transfer = False
-        self.conclude_state = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
-
-        # Track this room with its bootstrap address for heartbeat monitoring
-        if hasattr(self.kv_mgr, "addr_to_rooms_tracker"):
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
-                self.bootstrap_room
-            )
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
 
     def init(
+        self,
+        prefill_dp_rank: int,
+    ):
+        super().init(prefill_dp_rank)
+
+    def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
@@ -1009,7 +1024,7 @@ class NixlKVReceiver(CommonKVReceiver):
             self.conclude_state = status
             return status
         if not self.started_transfer:
-            return KVPoll.WaitingForInput  # type: ignore
+            return status
 
         now = time.time()
         elapsed = now - self.init_time
@@ -1066,7 +1081,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_aux_data_ptrs,
                         packed_state_data_ptrs,
                         str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
-                        str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii"),
+                        str(self.kv_mgr.attn_tp_size).encode("ascii"),
                         str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                     ]

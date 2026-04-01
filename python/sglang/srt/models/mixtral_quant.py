@@ -115,10 +115,10 @@ class MixtralMoE(nn.Module):
                 f"the number of experts {self.num_total_experts}."
             )
         # Split experts equally between ranks
-        self.expert_indicies = np.array_split(
+        self.expert_indices = np.array_split(
             range(self.num_total_experts), self.tp_size
         )[self.rank].tolist()
-        if not self.expert_indicies:
+        if not self.expert_indices:
             raise ValueError(f"Rank {self.rank} has no experts assigned to it.")
 
         self.experts = nn.ModuleList(
@@ -131,7 +131,7 @@ class MixtralMoE(nn.Module):
                         quant_config=quant_config,
                         prefix=add_prefix(f"experts.{idx}", prefix),
                     )
-                    if idx in self.expert_indicies
+                    if idx in self.expert_indices
                     else None
                 )
                 for idx in range(self.num_total_experts)
@@ -155,7 +155,7 @@ class MixtralMoE(nn.Module):
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
         final_hidden_states = None
-        for expert_idx in self.expert_indicies:
+        for expert_idx in self.expert_indices:
             expert_layer = self.experts[expert_idx]
             expert_mask = selected_experts == expert_idx
             expert_weights = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
@@ -261,7 +261,7 @@ class MixtralDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         # Requires transformers > 4.32.0
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = config.rope_parameters["rope_theta"]
         self.self_attn = MixtralAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,

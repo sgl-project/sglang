@@ -10,6 +10,7 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -66,6 +67,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQLinearMethod",
     "FBGEMMFp8LinearMethod",
     "GPTQLinearAscendMethod",
+    "GPTQMoEAscendMethod",
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
@@ -174,6 +176,13 @@ class LinearBase(torch.nn.Module):
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+
+        if self.quant_method is not None:
+            wrap_method_with_debug_kernel_once(
+                self.quant_method,
+                "apply",
+                op_name=f"sglang.quant_method.{self.quant_method.__class__.__name__}.apply",
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -530,8 +539,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self,
         param: Parameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[int] = None,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
+        if isinstance(loaded_shard_id, tuple):
+            if hasattr(param, "load_merged_column_weight"):
+                return self.weight_loader_v2(param, loaded_weight, loaded_shard_id)
+            raise NotImplementedError(
+                "Shard id with multiple indices is not supported in weight_loader, "
+                "please use weight_loader_v2 instead."
+            )
 
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
@@ -575,8 +591,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             current_shard_offset = 0
             shard_offsets: List[Tuple[int, int, int]] = []
             for i, output_size in enumerate(self.output_sizes):
-                shard_offsets.append((i, current_shard_offset, output_size))
-                current_shard_offset += output_size
+                effective_size = (
+                    output_size // self.tp_size
+                    if self.use_presharded_weights
+                    else output_size
+                )
+                shard_offsets.append((i, current_shard_offset, effective_size))
+                current_shard_offset += effective_size
             packed_dim = getattr(param, "packed_dim", None)
 
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -693,7 +714,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
     def _load_fused_module_from_checkpoint(
-        self, param: BasevLLMParameter, loaded_weight: torch.Tensor
+        self,
+        param: BasevLLMParameter,
+        loaded_weight: torch.Tensor,
+        output_sizes: list[int] | None = None,
     ):
         """
         Handle special case for models where MLP layers are already
@@ -707,7 +731,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         current_shard_offset = 0
         shard_offsets: List[Tuple[int, int, int]] = []
-        for i, output_size in enumerate(self.output_sizes):
+        output_sizes = output_sizes or self.output_sizes
+        for i, output_size in enumerate(output_sizes):
             shard_offsets.append((i, current_shard_offset, output_size))
             current_shard_offset += output_size
 
@@ -777,9 +802,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self,
         param: BasevLLMParameter,
         loaded_weight: torch.Tensor,
-        loaded_shard_id: Optional[int] = None,
+        loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
-        if loaded_shard_id is None:
+        if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(
                     loaded_weight=loaded_weight,
@@ -798,8 +823,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     tp_size=self.tp_size,
                 )
                 return
+            output_sizes = (
+                [self.output_sizes[idx] for idx in loaded_shard_id]
+                if loaded_shard_id
+                else None
+            )
             # TODO: @dsikka - move to parameter.py
-            self._load_fused_module_from_checkpoint(param, loaded_weight)
+            self._load_fused_module_from_checkpoint(
+                param, loaded_weight, output_sizes=output_sizes
+            )
             return
 
         assert loaded_shard_id < len(self.output_sizes)

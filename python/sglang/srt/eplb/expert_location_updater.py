@@ -20,6 +20,7 @@ import torch
 import torch.distributed
 from torch.distributed import P2POp
 
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
@@ -45,6 +46,12 @@ class ExpertLocationUpdater:
         nnodes: int,
         rank: int,
     ):
+        """
+        Update experts' physical location after EPLB.
+
+        Returns a map of layer_id to expert_ids that are missing due to rank
+        failures during fault conditions when elastic EP is enabled.
+        """
         if self._first_execution:
             self._first_execution = False
             torch.get_device_module().empty_cache()
@@ -52,7 +59,7 @@ class ExpertLocationUpdater:
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None
 
-        _update_expert_weights(
+        missing_logical_experts_by_layers = _update_expert_weights(
             routed_experts_weights_of_layer=routed_experts_weights_of_layer,
             old_expert_location_metadata=old_expert_location_metadata,
             new_expert_location_metadata=new_expert_location_metadata,
@@ -64,6 +71,8 @@ class ExpertLocationUpdater:
             new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
         )
+
+        return missing_logical_experts_by_layers
 
 
 def _update_expert_weights(**kwargs):
@@ -101,7 +110,7 @@ def _update_expert_weights_with_canary(
         )
         routed_experts_weights_of_layer[layer_id].append(canary_tensor)
 
-    _update_expert_weights_raw(
+    missing_logical_experts_by_layers = _update_expert_weights_raw(
         routed_experts_weights_of_layer=routed_experts_weights_of_layer,
         old_expert_location_metadata=old_expert_location_metadata,
         new_expert_location_metadata=new_expert_location_metadata,
@@ -119,6 +128,8 @@ def _update_expert_weights_with_canary(
             f"{old_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
             f"{new_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
         )
+
+    return missing_logical_experts_by_layers
 
 
 def _update_expert_weights_raw(
@@ -139,7 +150,10 @@ def _update_expert_weights_raw(
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
     num_gpu_per_node = world_size // nnodes
 
+    missing_logical_experts_by_layers: Dict[int, List[int]] = {}
+
     for layer_id in update_layer_ids:
+        missing_logical_experts_info: List[int] = []
         update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
@@ -153,8 +167,12 @@ def _update_expert_weights_raw(
             num_gpu_per_node=num_gpu_per_node,
             rank=rank,
             world_size=world_size,
+            missing_logical_experts_info=missing_logical_experts_info,
             log_metrics=log_metrics,
         )
+        if len(missing_logical_experts_info) > 0:
+            missing_logical_experts_by_layers[layer_id] = missing_logical_experts_info
+    return missing_logical_experts_by_layers
 
 
 def create_temp_buffers(sample_tensors):
@@ -170,6 +188,7 @@ def update_expert_weights_single_layer(
     num_gpu_per_node: int,
     rank: int,
     world_size: Optional[int] = None,
+    missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
     log_metrics: bool = False,
 ):
@@ -213,6 +232,7 @@ def update_expert_weights_single_layer(
 
         _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
+        _filter_p2p_ops(p2p_op_infos)
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
@@ -433,6 +453,29 @@ def update_expert_weights_single_layer(
         )
 
         return same_node_mapping, cross_node_mapping, need_comm_self_node_dst_ranks
+
+    def _filter_p2p_ops(p2p_op_infos):
+        elastic_ep_state = ElasticEPStateManager.instance()
+        if elastic_ep_state is not None and missing_logical_experts_info is not None:
+            # Filter out inactive P2P ops and record missing expert IDs in missing_logical_experts_info
+            is_active = elastic_ep_state.active_ranks_cpu
+            for i, (logical_expert_id, ops) in enumerate(p2p_op_infos):
+                has_isend = any(op.op == torch.distributed.isend for op in ops)
+                has_irecv = any(op.op == torch.distributed.irecv for op in ops)
+                assert not (has_isend and has_irecv), (
+                    "Each p2p_op_infos entry is expected to contain only send "
+                    "or only recv ops."
+                )
+
+                if has_isend:
+                    p2p_op_infos[i] = (
+                        logical_expert_id,
+                        [op for op in ops if is_active[op.peer]],
+                    )
+                elif has_irecv:
+                    if any(not is_active[op.peer] for op in ops):
+                        missing_logical_experts_info.append(logical_expert_id)
+                        p2p_op_infos[i] = (logical_expert_id, [])
 
     def _execute_p2p_ops(p2p_op_infos):
         sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])

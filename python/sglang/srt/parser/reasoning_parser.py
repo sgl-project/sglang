@@ -25,11 +25,13 @@ class BaseReasoningFormatDetector:
         think_end_token: str,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
+        tool_start_token: Optional[str] = None,
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
+        self.tool_start_token = tool_start_token
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
@@ -66,7 +68,21 @@ class BaseReasoningFormatDetector:
             self.think_end_token not in processed_text
             and self.think_end_token not in self.previous_content
         ):
-            # Assume reasoning was truncated before `</think>` token
+            # Check for tool_start_token interruption
+            if (
+                in_reasoning
+                and self.tool_start_token is not None
+                and self.tool_start_token in processed_text
+            ):
+                # Find the first occurrence of tool_start_token and split there
+                tool_idx = processed_text.find(self.tool_start_token)
+                reasoning_text = processed_text[:tool_idx].strip()
+                # Preserve tool_start_token in normal text
+                normal_text = processed_text[tool_idx:]
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
+            # Assume reasoning was truncated before end token
             return StreamingParseResult(reasoning_text=processed_text)
 
         # Extract reasoning content
@@ -96,9 +112,12 @@ class BaseReasoningFormatDetector:
         current_text = self._buffer
 
         # If the current text is a prefix of the think token, keep buffering
+        tokens_to_check = [self.think_start_token, self.think_end_token]
+        if self.tool_start_token:
+            tokens_to_check.append(self.tool_start_token)
         if any(
             token.startswith(current_text) and token != current_text
-            for token in [self.think_start_token, self.think_end_token]
+            for token in tokens_to_check
         ):
             return StreamingParseResult()
 
@@ -124,6 +143,17 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
+            # Check for tool_start_token interruption
+            if self.tool_start_token and self.tool_start_token in current_text:
+                tool_idx = current_text.find(self.tool_start_token)
+                reasoning_text = current_text[:tool_idx]
+                # Preserve tool_start_token in normal text
+                normal_text = current_text[tool_idx:]
+                self._buffer = ""
+                self._in_reasoning = False
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
             if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""
@@ -238,6 +268,57 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class KimiK2Detector(BaseReasoningFormatDetector):
+    """
+    Detector for Kimi K2 models.
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    Kimi K2 can switch from reasoning to tool-call section with
+    `<|tool_calls_section_begin|>` before emitting `</think>`.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<|tool_calls_section_begin|>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
+class Glm45Detector(BaseReasoningFormatDetector):
+    """
+    Detector for GLM-4.5 models.
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    GLM-4.5 uses `<tool_call>` as the tool start token to switch from reasoning mode to normal mode.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+        )
+
+
 class GptOssDetector(BaseReasoningFormatDetector):
     """
     Detector for T4-style reasoning format (GPT-OSS), using the HarmonyParser.
@@ -337,9 +418,9 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
         return StreamingParseResult(normal_text=self.think_start_token + text)
 
 
-class NanoV3Detector(BaseReasoningFormatDetector):
+class Nemotron3Detector(BaseReasoningFormatDetector):
     """
-    Detector for NanoV3 model.
+    Detector for Nemotron3 model.
     Uses the same reasoning format as DeepSeek-R1: (<think>)*(.*)</think>
 
     """
@@ -350,10 +431,45 @@ class NanoV3Detector(BaseReasoningFormatDetector):
         force_reasoning: bool = False,
         continue_final_message: bool = False,
         previous_content: str = "",
+        force_nonempty_content: bool = False,
     ):
         super().__init__(
             "<think>",
             "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+        self._force_nonempty_content = force_nonempty_content
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        ret = super().detect_and_parse(text)
+        if self._force_nonempty_content and not ret.normal_text:
+            ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
+        return ret
+
+
+class MistralDetector(BaseReasoningFormatDetector):
+    """
+    Detector for Mistral models with reasoning (e.g., Mistral-Small-4-119B-2603).
+    Assumes reasoning format:
+      [THINK]reasoning content[/THINK]answer
+
+    Reasoning is optional — it only appears when reasoning_effort="high" is set.
+    When reasoning_effort="none", the model outputs directly without thinking tokens.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "[THINK]",
+            "[/THINK]",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -375,17 +491,18 @@ class ReasoningParser:
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": Qwen3Detector,
-        "glm45": Qwen3Detector,
+        "glm45": Glm45Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
-        "kimi_k2": Qwen3Detector,
+        "kimi_k2": KimiK2Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "step3": DeepSeekR1Detector,
         "step3p5": DeepSeekR1Detector,
-        "nano_v3": NanoV3Detector,
+        "mistral": MistralDetector,
+        "nemotron_3": Nemotron3Detector,
         "interns1": Qwen3Detector,
     }
 
@@ -420,6 +537,10 @@ class ReasoningParser:
         ):
             kwargs["continue_final_message"] = True
             kwargs["previous_content"] = request.messages[-1].content
+
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
+        if chat_template_kwargs.get("force_nonempty_content") is True:
+            kwargs["force_nonempty_content"] = True
 
         self.detector = detector_class(**kwargs)
 

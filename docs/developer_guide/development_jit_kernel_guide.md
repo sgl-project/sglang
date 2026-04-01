@@ -241,12 +241,18 @@ def _jit_add_constant_module(constant: int) -> Module:
 
 
 def add_constant(src: torch.Tensor, constant: int) -> torch.Tensor:
+    if not src.is_cuda:
+        raise RuntimeError("src must be a CUDA tensor")
+    if src.dtype != torch.int32:
+        raise RuntimeError(f"Unsupported dtype {src.dtype}. Supported: int32")
     dst = torch.empty_like(src)
     module = _jit_add_constant_module(constant)
     module.add_constant(dst, src)
     return dst
 
 ```
+
+Keep the Python wrapper thin, but still validate the basic invariants such as device and dtype before dispatch. In the current JIT/FFI path, invalid tensors are not always rejected safely before launch.
 
 ### STEP 3: Use your kernel
 
@@ -257,3 +263,53 @@ from sglang.jit_kernel.add_constant import add_constant
 ```
 
 For a complete, runnable example, refer to [test_add_constant.py](../../python/sglang/jit_kernel/tests/test_add_constant.py).
+
+## C++ Include Library Reference
+
+The JIT kernel framework provides a set of reusable C++ headers in
+`python/sglang/jit_kernel/include/sgl_kernel/`. Each header is designed
+to be lightweight and self-contained. Below is a summary of each header
+and its key APIs.
+
+### Core Utilities
+
+| Header | Namespace | Purpose |
+|--------|-----------|---------|
+| `utils.h` | `host` | Host-side essentials: `RuntimeCheck`, `Panic`, `div_ceil`, `irange` |
+| `utils.cuh` | `device` / `host` | Type aliases (`fp16_t`, `bf16_t`, ...), `SGL_DEVICE` macro, PDL helpers, `LaunchKernel`, `RuntimeDeviceCheck` |
+| `source_location.h` | (global) | Portable `std::source_location` wrapper for error reporting |
+| `runtime.cuh` | `host::runtime` | CUDA runtime queries: `get_blocks_per_sm`, `get_sm_count`, `get_cc_major`, `get_runtime_version`, `get_available_dynamic_smem_per_block` |
+
+### Tensor Validation
+
+| Header | Namespace | Purpose |
+|--------|-----------|---------|
+| `tensor.h` | `host` | `TensorMatcher`, `SymbolicSize`, `SymbolicDType`, `SymbolicDevice` |
+
+### Math & Type System
+
+| Header | Namespace | Purpose |
+|--------|-----------|---------|
+| `math.cuh` | `device::math` | `max`, `min`, `abs`, `sqrt`, `rsqrt`, `exp`, `sin`, `cos`, constants |
+| `type.cuh` | (global) / `device` | `dtype_trait<T>`, `packed_t<T>`, `device::cast<To>(from)` |
+
+### Memory Access
+
+| Header | Namespace | Purpose |
+|--------|-----------|---------|
+| `vec.cuh` | `device` | `AlignedVector<T, N>` - vectorized load/store (up to 128-bit; 256-bit requires Blackwell GPUs) |
+| `tile.cuh` | `device::tile` | `Memory<T>` - cooperative tiled memory I/O (thread/warp/CTA) |
+
+### Parallel Primitives
+
+| Header | Namespace | Purpose |
+|--------|-----------|---------|
+| `warp.cuh` | `device::warp` | `reduce_sum`, `reduce_max` via `__shfl_xor_sync` |
+| `cta.cuh` | `device::cta` | `reduce_max` across warps via shared memory |
+| `atomic.cuh` | `device::atomic` | `max` - atomic float max (CUDA + ROCm fallback) |
+
+### Reusable Kernel Templates
+
+| Header | Namespace | Purpose |
+|--------|-----------|---------|
+| `impl/norm.cuh` | `host::norm` / `device::norm` | RMSNorm building blocks (warp & CTA paths, `StorageType`) |
