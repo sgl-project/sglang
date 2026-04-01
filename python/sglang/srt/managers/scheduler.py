@@ -2140,6 +2140,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
+        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -2149,31 +2150,35 @@ class Scheduler(
                 else:
                     self.running_batch.merge_batch(new_batch)
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
-        else:
-            if self.last_batch and self.last_batch.forward_mode.is_extend():
-                if self.last_batch.chunked_req is not None:
-                    # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                    # We need to discard it.
-                    chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
-                if self.dllm_config is not None and self.last_batch.reqs:
-                    chunked_req_to_exclude.update(self.last_batch.reqs)
+        if (
+            not self.enable_hisparse
+            and self.last_batch
+            and self.last_batch.forward_mode.is_extend()
+        ):
+            if self.last_batch.chunked_req is not None:
+                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+                # We need to discard it.
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
-                # Filter batch
-                last_bs = self.last_batch.batch_size()
-                self.last_batch.filter_batch(
-                    chunked_req_to_exclude=list(chunked_req_to_exclude)
-                )
-                if self.last_batch.batch_size() < last_bs:
-                    self.running_batch.batch_is_full = False
+            if self.dllm_config is not None and self.last_batch.reqs:
+                chunked_req_to_exclude.update(self.last_batch.reqs)
 
-                # Merge the new batch into the running batch.
-                if not self.last_batch.is_empty():
-                    if self.running_batch.is_empty():
-                        self.running_batch = self.last_batch
-                    else:
-                        # Merge running_batch with prefill batch
-                        self.running_batch.merge_batch(self.last_batch)
+            # Filter batch
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
+                self.running_batch.batch_is_full = False
+
+            # Merge the new batch into the running batch.
+            if not self.last_batch.is_empty():
+                if self.running_batch.is_empty():
+                    self.running_batch = self.last_batch
+                else:
+                    # Merge running_batch with prefill batch
+                    self.running_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate

@@ -1436,6 +1436,18 @@ class ServerArgs:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
+        # HiSparse requires flashmla_sparse for both prefill and decode
+        if self.enable_hisparse:
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "flashmla_sparse"
+            if not user_set_decode:
+                self.nsa_decode_backend = "flashmla_sparse"
+            logger.warning(
+                f"HiSparse enabled: using flashmla_sparse NSA backends "
+                f"(prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend})."
+            )
+            return
+
         if not user_set_prefill and not user_set_decode and is_hip():
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
@@ -6171,6 +6183,17 @@ class ServerArgs:
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+            for attr, label in [
+                ("nsa_prefill_backend", "prefill"),
+                ("nsa_decode_backend", "decode"),
+            ]:
+                backend = getattr(self, attr)
+                if backend is not None and backend != "flashmla_sparse":
+                    raise ValueError(
+                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                        f"but got --nsa-{label}-backend={backend}. "
+                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                    )
 
         assert (
             self.schedule_conservativeness >= 0
