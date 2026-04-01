@@ -278,6 +278,7 @@ class StepLevelCudaGraphRunner:
         self.output_buffer: Optional[torch.Tensor] = None
         self.cached_outputs: Optional[torch.Tensor] = None
         self._fn_output_snapshot: Optional[torch.Tensor] = None
+        self._fn_input_snapshot: Optional[torch.Tensor] = None
 
         # Metadata from pre_block (fixed per resolution)
         self._x_size: Optional[list] = None
@@ -330,20 +331,30 @@ class StepLevelCudaGraphRunner:
         self._patch_size = static_kwargs.get("patch_size", 2)
         self._f_patch_size = static_kwargs.get("f_patch_size", 1)
 
-        # Extract cache_context from the first CachedBlocks wrapper.
-        # This is needed to call set_context() before can_cache().
-        # CachedBlocks wrappers (installed by cache-dit's enable_cache())
-        # have a .cache_context attribute that holds the per-layer-group
-        # CachedContext object.
-        first_layer = dit_model.layers[0]
-        if hasattr(first_layer, "cache_context"):
-            self._cache_context = first_layer.cache_context
-            logger.info("  Found cache_context on CachedBlocks wrapper")
+        # Extract cache_context for calling set_context() before can_cache().
+        # cache-dit's CachedContextManager stores CachedContext objects in its
+        # _cached_context_manager dict. We need one to pass to set_context().
+        # Note: cache-dit does NOT replace dit_model.layers — it creates a
+        # separate CachedBlocks wrapper object. The context_manager and
+        # cache_context are accessible via transformer._context_manager.
+        ctx_mgr = getattr(dit_model, "_context_manager", None)
+        if ctx_mgr is not None:
+            registry = getattr(ctx_mgr, "_cached_context_manager", {})
+            if registry:
+                # Get the first (and typically only) CachedContext
+                for ctx_name, ctx_obj in registry.items():
+                    self._cache_context = ctx_obj
+                    logger.info(
+                        "  Found cache_context '%s' from context_manager registry",
+                        ctx_name,
+                    )
+                    break
+            else:
+                logger.warning(
+                    "  context_manager found but _cached_context_manager is empty"
+                )
         else:
-            logger.warning(
-                "  No cache_context found on first layer — "
-                "can_cache() may fail if cache-dit is enabled"
-            )
+            logger.info("  No _context_manager on transformer (cache-dit not enabled)")
 
         # Create persistent buffers for inputs
         timestep_buffer = timestep.clone()
@@ -389,6 +400,8 @@ class StepLevelCudaGraphRunner:
         )
         self.cached_outputs = torch.empty_like(pre_out.unified)
         self._fn_output_snapshot = torch.empty_like(pre_out.unified)
+        # Buffer to save Fn block INPUT (before Fn execution) for residual calculation
+        self._fn_input_snapshot = torch.empty_like(pre_out.unified)
 
         # --- Phase 2: Capture each segment ---
         logger.info("StepLevel CUDA Graph: Phase 2 — capturing segments")
@@ -524,6 +537,16 @@ class StepLevelCudaGraphRunner:
             self.inter_buffer.copy_(self.cached_outputs)
         else:
             # === DBCache decision path ===
+            # Replicate CachedBlocks_Pattern_3_4_5.forward() sequence:
+            #   1. set_context()     ← before Fn blocks
+            #   2. Fn blocks execute ← graph_fn.replay()
+            #   3. mark_step_begin() ← after Fn, before can_cache
+            #   4. can_cache()       ← decision
+            self._set_cache_context()
+
+            # Save Fn input BEFORE graph_fn executes (for residual calculation)
+            self._fn_input_snapshot.copy_(self.inter_buffer)
+
             self.graph_fn.replay()
 
             # Eager: query DBCache decision
@@ -534,7 +557,6 @@ class StepLevelCudaGraphRunner:
             else:
                 self.graph_middle_full.replay()
                 self.cached_outputs.copy_(self.inter_buffer)
-                self._update_fn_wrapper_cached_output()
 
             # Bn blocks (only if Bn > 0)
             if self.graph_bn is not None:
@@ -545,45 +567,79 @@ class StepLevelCudaGraphRunner:
 
         return self.output_buffer
 
+    def _set_cache_context(self):
+        """Set cache-dit context at the start of each step (before Fn blocks).
+
+        Mirrors CachedBlocks.forward() step 1: set_context().
+        Must be called before graph_fn.replay() and _query_dbcache_decision().
+        """
+        ctx_mgr = getattr(self._transformer, "_context_manager", None)
+        if ctx_mgr is None:
+            return
+
+        # Lazy-initialize _cache_context if not set at capture time.
+        if self._cache_context is None:
+            registry = getattr(ctx_mgr, "_cached_context_manager", {})
+            if registry:
+                for ctx_name, ctx_obj in registry.items():
+                    self._cache_context = ctx_obj
+                    logger.info(
+                        "  Lazy-initialized cache_context '%s' from registry",
+                        ctx_name,
+                    )
+                    break
+
+        if self._cache_context is not None:
+            ctx_mgr.set_context(self._cache_context)
+
     def _query_dbcache_decision(self) -> bool:
         """Call cache-dit's can_cache() in eager mode after Fn blocks replay.
 
-        Saves Fn output snapshot for _update_fn_wrapper_cached_output().
         Returns True if remaining blocks can use cache.
 
-        Must call set_context() + mark_step_begin() before can_cache(),
-        mirroring what CachedBlocks.forward() does internally.
+        Call sequence (mirroring CachedBlocks_Pattern_3_4_5.forward()):
+          1. _set_cache_context()  ← called by replay_step before graph_fn
+          2. save _fn_input_snapshot ← inter_buffer before Fn
+          3. graph_fn.replay()     ← Fn blocks execute, inter_buffer updated
+          4. compute residual = inter_buffer - _fn_input_snapshot
+          5. mark_step_begin()     ← after Fn, before can_cache
+          6. can_cache(residual)   ← decision based on Fn RESIDUAL, not output
+          7. if cache miss: set_Fn_buffer(residual) ← save for next step
         """
+        # Compute Fn residual: fn_output - fn_input
+        # This is what CachedBlocks._get_Fn_residual() does
+        fn_residual = self.inter_buffer - self._fn_input_snapshot
+        # Save Fn output snapshot for cached_outputs update
         self._fn_output_snapshot.copy_(self.inter_buffer)
 
         ctx_mgr = getattr(self._transformer, "_context_manager", None)
         if ctx_mgr is None:
             return False
 
-        # Replicate the CachedBlocks.forward() initialization sequence:
-        # 1. set_context() — sets the active CachedContext object
-        # 2. mark_step_begin() — initializes per-step state
-        # Without these, can_cache() asserts "cached_context must be set before"
-        if self._cache_context is not None:
-            ctx_mgr.set_context(self._cache_context)
-            ctx_mgr.mark_step_begin()
+        # mark_step_begin() AFTER Fn blocks, BEFORE can_cache()
+        ctx_mgr.mark_step_begin()
 
-        return ctx_mgr.can_cache(self.inter_buffer)
+        # Pass RESIDUAL (not raw output) to can_cache — this is what
+        # CachedBlocks.forward() does via _get_Fn_residual()
+        result = ctx_mgr.can_cache(fn_residual)
+
+        if not result:
+            # Cache miss: save Fn residual as baseline for next step's
+            # similarity comparison. This is what CachedBlocks.forward()
+            # does: ctx_mgr.set_Fn_buffer(Fn_hidden_states_residual)
+            ctx_mgr.set_Fn_buffer(fn_residual)
+        else:
+            # Cache hit: increment cached step counter.
+            # Mirrors CachedBlocks.forward(): ctx_mgr.add_cached_step()
+            ctx_mgr.add_cached_step()
+
+        return result
 
     def _update_fn_wrapper_cached_output(self):
-        """Update cache-dit's internal state after a full-compute step.
-
-        The exact attribute name on CachedContextManager must be confirmed
-        by the eager-mode prototype.
-        """
-        ctx_mgr = getattr(self._transformer, "_context_manager", None)
-        if ctx_mgr is None:
-            return
-
-        if hasattr(ctx_mgr, "_cached_residual"):
-            ctx_mgr._cached_residual.copy_(self._fn_output_snapshot)
-        elif hasattr(ctx_mgr, "cached_output"):
-            ctx_mgr.cached_output.copy_(self._fn_output_snapshot)
+        """No longer needed — set_Fn_buffer() is called directly in
+        _query_dbcache_decision(). Kept as placeholder for potential
+        future Bn buffer updates."""
+        pass
 
     def reset(self):
         """Release all captured graphs and buffers."""
@@ -600,6 +656,7 @@ class StepLevelCudaGraphRunner:
         self.output_buffer = None
         self.cached_outputs = None
         self._fn_output_snapshot = None
+        self._fn_input_snapshot = None
         self._transformer = None
         self._cache_context = None
         self._captured = False

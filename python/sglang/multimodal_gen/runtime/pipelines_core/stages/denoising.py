@@ -1063,7 +1063,15 @@ class DenoisingStage(PipelineStage):
             latent_shape = tuple(latents.shape)
             pool = self._get_graph_pool()
 
-            if self._cache_dit_enabled:
+            # Determine which runner type to use.
+            # Check both the runtime flag (_cache_dit_enabled, set after first
+            # non-warmup request) AND the env var (always available).
+            # This ensures warmup requests capture step-level graphs when
+            # cache-dit is configured, even though _cache_dit_enabled hasn't
+            # been set yet (it's only set on the first real request).
+            use_step_level = self._cache_dit_enabled or envs.SGLANG_CACHE_DIT_ENABLED
+
+            if use_step_level:
                 # === Step-level runner (cache-dit compatible) ===
                 step_level_runner = self._step_level_runners.get(latent_shape)
 
