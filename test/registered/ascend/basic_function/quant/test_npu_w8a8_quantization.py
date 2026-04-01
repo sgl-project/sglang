@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m unittest test_ascend_w4a4_quantization.TestAscendW4A4.test_gsm8k
+python3 -m unittest test_ascend_w8a8_quantization.TestAscendW8A8.test_gsm8k
 """
 
 import os
@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -21,18 +22,22 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a2", nightly=False)
+register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+
 if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1,2,3"
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1"
 DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
     7000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
 )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 
-class TestAscendW4A4(CustomTestCase):
+class TestAscendW8A8CompressedTensors(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3-32B-w4a4-LAOS"
+        # TODO: Move model to CI or Modelscope
+        cls.model = "RedHatAI/Qwen2.5-0.5B-Instruct-quantized.w8a8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -40,17 +45,11 @@ class TestAscendW4A4(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--disable-cuda-graph",
                 "--device",
                 "npu",
                 "--attention-backend",
                 "ascend",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-                "--cuda-graph-bs",
-                "64",
-                "--disable-radix-cache",
             ],
         )
 
@@ -64,17 +63,17 @@ class TestAscendW4A4(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=1319,
+            num_questions=200,
             max_new_tokens=512,
-            parallel=64,
+            parallel=128,
             host=f"http://{url.hostname}",
             port=int(url.port),
         )
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.80)
-        self.assertGreaterEqual(metrics["output_throughput"], 1000)
+        self.assertGreaterEqual(metrics["accuracy"], 0.3)
+        self.assertGreaterEqual(metrics["output_throughput"], 700)
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -101,7 +100,7 @@ class TestAscendW4A4(CustomTestCase):
         print(f"Throughput: {throughput} tokens/s")
 
         if is_in_ci():
-            self.assertGreaterEqual(throughput, 35)
+            self.assertGreaterEqual(throughput, 25)
 
 
 if __name__ == "__main__":

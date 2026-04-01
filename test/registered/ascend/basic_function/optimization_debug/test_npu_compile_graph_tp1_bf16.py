@@ -1,9 +1,10 @@
-import logging
+import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,16 +13,21 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-logger = logging.getLogger(__name__)
+register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a2", nightly=False)
+register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
-    "/root/.cache/modelscope/hub/models/Intel/Qwen3-8B-int4-AutoRound": {
-        "accuracy": 0.85,
+    "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct": {
+        "accuracy": 0.84,
+        "latency": 150,
+        "output_throughput": 30,
     },
 }
 
+os.environ["ASCEND_USE_FIA"] = "true"
 
-class TestAscendAutoRoundDense(CustomTestCase):
+
+class TestAscendTp1Bf16(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -31,17 +37,19 @@ class TestAscendAutoRoundDense(CustomTestCase):
         cls.common_args = [
             "--trust-remote-code",
             "--mem-fraction-static",
-            0.8,
+            0.6,
             "--attention-backend",
             "ascend",
-            "--quantization",
-            "auto-round",
+            "--disable-radix-cache",
+            "--enable-torch-compile",
+            "--watchdog-timeout",
+            30000,
         ]
 
     def test_a_gsm8k(self):
         for model in self.models:
             with self.subTest(model=model):
-                logger.info(f"##=== Testing accuracy: {model} ===##")
+                print(f"##=== Testing accuracy: {model} ===##")
 
                 process = popen_launch_server(
                     model,
@@ -58,7 +66,7 @@ class TestAscendAutoRoundDense(CustomTestCase):
                         data_path=None,
                         num_questions=1319,
                         max_new_tokens=512,
-                        parallel=128,
+                        parallel=32,
                         host=f"http://{self.url.hostname}",
                         port=int(self.url.port),
                     )
