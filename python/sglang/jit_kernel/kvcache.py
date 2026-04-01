@@ -11,6 +11,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -46,6 +47,7 @@ def can_use_store_cache(size: int) -> bool:
         return False
 
 
+@register_custom_op(mutates_args=["k_cache", "v_cache"])
 def store_cache(
     k: torch.Tensor,
     v: torch.Tensor,

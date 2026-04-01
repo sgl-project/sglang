@@ -329,7 +329,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 self.num_position_embeddings,
                 self.hidden_size,
                 quant_config=quant_config,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                enable_tp=not use_data_parallel,
+                use_attn_tp_group=is_dp_attention_enabled() and not use_data_parallel,
                 prefix=add_prefix("pos_embed", prefix),
             )
         else:
@@ -1139,6 +1140,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_embeds = embedding[:, :separate_index]
         input_deepstack_embeds = embedding[:, separate_index:]
         return input_embeds, input_deepstack_embeds
+
+    @property
+    def start_layer(self) -> int:
+        return getattr(getattr(self, "model", None), "start_layer", 0)
+
+    @property
+    def end_layer(self) -> int:
+        model = getattr(self, "model", None)
+        end_layer = getattr(model, "end_layer", None)
+        if end_layer is not None:
+            return end_layer
+        cfg = getattr(model, "config", None)
+        return int(getattr(cfg, "num_hidden_layers", 0))
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

@@ -32,9 +32,7 @@ from sglang.test.test_utils import (
 
 register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
-KIMI_K25_MXFP4_MODEL_PATH = os.environ.get(
-    "KIMI_K25_MXFP4_MODEL_PATH", "/data/models/amd/Kimi-K2.5-MXFP4"
-)
+KIMI_K25_MXFP4_MODEL_PATH = "amd/Kimi-K2.5-MXFP4"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 

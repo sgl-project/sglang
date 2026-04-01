@@ -61,11 +61,15 @@ jobs:
           HASH="g$(git rev-parse --short HEAD)"
           BUILD_DATE=$(date -u +%Y%m%d)
 
-          # Increment patch version for nightlies (e.g., v0.5.8 -> 0.5.9)
+          # Increment patch version for nightlies (e.g., v0.5.9 -> 0.5.10)
+          # Must always increment so nightly > latest tag per PEP 440 ordering:
+          #   X.Y.Z.devN < X.Y.Z.rcN < X.Y.Z < X.Y.(Z+1).devN
           VERSION=${TAG#v}  # Remove 'v' prefix
           MAJOR=$(echo "$VERSION" | cut -d. -f1)
           MINOR=$(echo "$VERSION" | cut -d. -f2)
-          PATCH=$(echo "$VERSION" | cut -d. -f3)
+          PATCH_RAW=$(echo "$VERSION" | cut -d. -f3)
+          # Strip pre-release suffixes (rc0, post1, etc.) to get numeric patch
+          PATCH=$(echo "$PATCH_RAW" | sed 's/[^0-9].*//')
           NEXT_PATCH=$((PATCH + 1))
           NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
 

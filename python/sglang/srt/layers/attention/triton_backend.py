@@ -169,7 +169,7 @@ class TritonAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                (max_bs + 1,), dtype=torch.int64, device=model_runner.device
             )
 
             self.mask_indptr = torch.zeros(
