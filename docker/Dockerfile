@@ -114,6 +114,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libczmq4 \
     libczmq-dev \
     libfabric-dev \
+    linux-libc-dev \
     # Package building tools
     devscripts \
     debhelper \
@@ -306,9 +307,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cubloaty \
     google-cloud-storage
 
-# Build and install sgl-model-gateway (install Rust, build, then remove to save space)
+# Build and install sgl-model-gateway (install Rust, build, then remove Rust toolchain)
+# Cleanup runs unconditionally via trap to ensure Rust artifacts don't bloat the layer
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    cleanup() { rm -rf /root/.cargo /root/.rustup /sgl-workspace/sglang/sgl-model-gateway/target /sgl-workspace/sglang/sgl-model-gateway/bindings/python/target /sgl-workspace/sglang/sgl-model-gateway/bindings/python/dist; sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null; } \
+    && trap cleanup EXIT \
+    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && rustc --version && cargo --version \
     && python3 -m pip install maturin \
@@ -316,10 +320,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
     && cd /sgl-workspace/sglang/sgl-model-gateway \
-    && cargo build --release --bin sglang-router --features vendored-openssl \
-    && cp target/release/sglang-router /usr/local/bin/sglang-router \
-    && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
-    && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
+    && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
+    && cp target/release/sgl-model-gateway /usr/local/bin/sgl-model-gateway
 
 RUN --mount=type=cache,target=/root/.cache/pip \
    python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
@@ -448,7 +450,7 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
         ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
-RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
+RUN python3 -m pip install --upgrade "urllib3>=2.6.3" "pillow>=12.1.1"
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
@@ -532,6 +534,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     libnccl-dev \
     # GPG key verification
     gnupg2 \
+    linux-libc-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
