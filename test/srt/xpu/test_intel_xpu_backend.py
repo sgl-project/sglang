@@ -23,7 +23,7 @@ def intel_xpu_benchmark(extra_args=None, min_throughput=None):
                 "--disable-radix",
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.3",
+                "0.2",
                 "--batch-size",
                 "1",
                 "--device",
