@@ -18,6 +18,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 
+_use_fused_sampling = False
 if is_cuda():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
@@ -27,6 +28,10 @@ if is_cuda():
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
+
+    from sglang.srt.layers.fused_sampling import fused_temperature_softmax_inplace
+
+    _use_fused_sampling = True
 if is_npu():
     import torch_npu
 
@@ -152,9 +157,15 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
+                if _use_fused_sampling:
+                    fused_temperature_softmax_inplace(
+                        logits, sampling_info.temperatures
+                    )
+                    probs = logits
+                else:
+                    logits.div_(sampling_info.temperatures)
+                    logits[:] = torch.softmax(logits, dim=-1)
+                    probs = logits
 
                 batch_next_token_ids = self._sample_from_probs(
                     probs, sampling_info, positions, simple_sampling_case

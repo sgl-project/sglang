@@ -1975,7 +1975,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _warmup_fused_sampling(self):
         """Pre-compile and autotune fused sampling Triton kernels."""
-        pass
+        if _is_hip:
+            return
+        from sglang.srt.layers.fused_sampling import warmup_fused_temperature_softmax
+
+        logits_warmup_dtype = (
+            torch.float32 if self.server_args.enable_fp32_lm_head else self.dtype
+        )
+        warmup_fused_temperature_softmax(
+            self.model_config.vocab_size,
+            logits_dtype=logits_warmup_dtype,
+        )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

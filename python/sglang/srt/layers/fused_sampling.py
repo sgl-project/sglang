@@ -297,7 +297,11 @@ def fused_temperature_softmax_inplace(
     if batch_size == 0:
         return
 
-    assert logits.is_contiguous(), "logits must be contiguous for in-place kernel"
+    if not logits.is_contiguous():
+        work = logits.contiguous()
+        fused_temperature_softmax_inplace(work, temperatures)
+        logits.copy_(work)
+        return
 
     temperatures_flat = temperatures.contiguous().view(-1)
     _dispatch_kernel(logits, temperatures_flat, vocab_size, batch_size)
@@ -305,13 +309,17 @@ def fused_temperature_softmax_inplace(
 
 def warmup_fused_temperature_softmax(
     vocab_size: int,
-    device: torch.device = None,
+    device: torch.device | int | None = None,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> None:
     """Pre-compile and autotune kernels at startup so first request has no latency spike.
 
     For multi-pass kernels the out-of-place variant is autotuned (safe — separate
     input/output buffers), and its winning config is reused for the in-place
     variant so that no autotune ever runs on a live logits buffer.
+
+    ``logits_dtype`` should match ``next_token_logits`` at inference (usually
+    ``model_config.dtype``) so Triton specializes the same way as in production.
     """
     global _multi_pass_inplace_config
 
@@ -322,12 +330,13 @@ def warmup_fused_temperature_softmax(
     is_multi_pass = block_size > _MAX_SINGLE_PASS_BLOCK
     label = "multi-pass autotune" if is_multi_pass else "single-pass JIT"
     logger.info(
-        "Warming up fused_temperature_softmax (%s, vocab_size=%d) ...",
+        "Warming up fused_temperature_softmax (%s, vocab_size=%d, logits_dtype=%s) ...",
         label,
         vocab_size,
+        logits_dtype,
     )
 
-    dummy_logits = torch.randn(1, vocab_size, dtype=torch.float32, device=device)
+    dummy_logits = torch.randn(1, vocab_size, dtype=logits_dtype, device=device)
     dummy_temps = torch.ones(1, 1, dtype=torch.float32, device=device)
 
     # 1. Out-of-place kernel: autotune runs here (safe, separate buffers).
@@ -335,18 +344,27 @@ def warmup_fused_temperature_softmax(
 
     # 2. Propagate best config to the in-place kernel (no autotune needed).
     if is_multi_pass:
-        best = _multi_pass_temperature_softmax_kernel.best_config
-        _multi_pass_inplace_config = {
-            "BLOCK_SIZE": best.kwargs["BLOCK_SIZE"],
-            "num_warps": best.num_warps,
-            "num_stages": best.num_stages,
-        }
-        logger.info(
-            "Multi-pass autotune result: BLOCK_SIZE=%d, num_warps=%d, num_stages=%d",
-            _multi_pass_inplace_config["BLOCK_SIZE"],
-            _multi_pass_inplace_config["num_warps"],
-            _multi_pass_inplace_config["num_stages"],
-        )
+        best = getattr(_multi_pass_temperature_softmax_kernel, "best_config", None)
+        if best is not None:
+            _multi_pass_inplace_config = {
+                "BLOCK_SIZE": best.kwargs["BLOCK_SIZE"],
+                "num_warps": best.num_warps,
+            }
+            if best.num_stages is not None:
+                _multi_pass_inplace_config["num_stages"] = best.num_stages
+            ns = _multi_pass_inplace_config.get("num_stages", "default")
+            logger.info(
+                "Multi-pass autotune result: BLOCK_SIZE=%d, num_warps=%d, num_stages=%s",
+                _multi_pass_inplace_config["BLOCK_SIZE"],
+                _multi_pass_inplace_config["num_warps"],
+                ns,
+            )
+        else:
+            _multi_pass_inplace_config = None
+            logger.warning(
+                "Multi-pass fused softmax: autotune did not set best_config; "
+                "using default launch config for in-place kernel."
+            )
 
     # 3. In-place kernel: JIT compile only (uses the config from step 2).
     fused_temperature_softmax_inplace(dummy_logits.clone(), dummy_temps)
