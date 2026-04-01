@@ -153,7 +153,12 @@ class ModelSlimConfig(QuantizationConfig):
                 key = "vision_model"
             elif "visual" in prefix:
                 key = "visual"
-            if "vision_tower" in prefix or "mm_projector" in prefix or "in_proj_qkvz" in prefix or "in_proj_ba" in prefix:
+            if (
+                "vision_tower" in prefix
+                or "mm_projector" in prefix
+                or "in_proj_qkvz" in prefix
+                or "in_proj_ba" in prefix
+            ):
                 prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
                 prefix = prefix.replace(r"attn.proj", r"wo")
                 prefix = prefix.replace(r"in_proj_qkvz", r"in_proj_qkv")
