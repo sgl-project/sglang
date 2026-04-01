@@ -127,6 +127,12 @@ def log_line(message: str) -> None:
     tqdm.write(message)
 
 
+def append_jsonl(path: str, records: Iterable[Dict[str, Any]]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def describe_search_tier(tier: int) -> str:
     descriptions = {
         1: "tier 1: smallest and fastest sanity sweep",
@@ -134,6 +140,60 @@ def describe_search_tier(tier: int) -> str:
         3: "tier 3: largest and slowest full search",
     }
     return descriptions.get(tier, f"tier {tier}")
+
+
+def collect_stale_server_pids(port: int) -> List[int]:
+    patterns = [
+        ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+        ["pgrep", "-f", f"sglang.launch_server.*--port {port}"],
+        ["pgrep", "-f", f"sglang.launch_server.*--port={port}"],
+        ["pgrep", "-f", f"sglang serve .*--port {port}"],
+        ["pgrep", "-f", f"sglang serve .*--port={port}"],
+    ]
+    pids = set()
+    for command in patterns:
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            )
+        except FileNotFoundError:
+            continue
+        if result.returncode not in (0, 1):
+            continue
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
+    return sorted(pids)
+
+
+def kill_pid_or_group(pid: int) -> None:
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+
+    for sig, delay in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 0.0)):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                return
+        if delay:
+            time.sleep(delay)
+
+
+def preclean_stale_server(port: int) -> None:
+    stale_pids = collect_stale_server_pids(port)
+    if not stale_pids:
+        return
+    log_line(f"preclean_port={port} stale_pids={stale_pids}")
+    for pid in stale_pids:
+        kill_pid_or_group(pid)
 
 
 def estimate_binary_search_trials(lower: float, upper: float, tolerance: float) -> int:
@@ -943,6 +1003,7 @@ def run_trial(
 
     try:
         if server_cfg.get("launch", True):
+            preclean_stale_server(port)
             process = launch_server(server_cfg, server_flags, log_path)
         metrics = run_bench_command(
             build_bench_command(
@@ -996,6 +1057,7 @@ def run_candidate(
     server_flags: Dict[str, Any],
     output_dir: str,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    record_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[Dict[str, Any]]:
     mode, values, tolerance = build_qps_plan(benchmark_cfg)
     max_concurrency_values = as_list(benchmark_cfg.get("max_concurrency", [None]))
@@ -1024,6 +1086,8 @@ def run_candidate(
             for qps in values:
                 record = one_trial(qps, max_concurrency)
                 records.append(record)
+                if record_callback is not None:
+                    record_callback(record)
                 if progress_callback is not None:
                     progress_callback(record)
             continue
@@ -1034,6 +1098,8 @@ def run_candidate(
             qps = round((lower + upper) / 2, 4)
             record = one_trial(qps, max_concurrency)
             records.append(record)
+            if record_callback is not None:
+                record_callback(record)
             if progress_callback is not None:
                 progress_callback(record)
             if record.get("metrics") and record["sla_passed"]:
@@ -1169,6 +1235,7 @@ def run_stage(
     dataset_path: str,
     tokenizer_path: str,
     output_dir: str,
+    live_results_path: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     records: List[Dict[str, Any]] = []
     best_record: Optional[Dict[str, Any]] = None
@@ -1206,6 +1273,10 @@ def run_stage(
                     candidate_pbar, candidate_started_at, best_record=best_record
                 )
 
+            def on_record(record: Dict[str, Any]) -> None:
+                if live_results_path is not None:
+                    append_jsonl(live_results_path, [record])
+
             candidate_records = run_candidate(
                 stage_name=stage_name,
                 candidate_id=candidate_id,
@@ -1218,6 +1289,7 @@ def run_stage(
                 server_flags=merged,
                 output_dir=output_dir,
                 progress_callback=on_trial,
+                record_callback=on_record,
             )
             records.extend(candidate_records)
 
@@ -1291,6 +1363,9 @@ def run_auto_benchmark(config_path: str) -> str:
                 else os.path.join(output_dir, scenario["name"])
             )
             os.makedirs(scenario_output_dir, exist_ok=True)
+            live_results_path = os.path.join(scenario_output_dir, "live_results.jsonl")
+            if os.path.exists(live_results_path):
+                os.remove(live_results_path)
             prepared_dataset_path, rows, dataset_summary = prepare_dataset(
                 dataset_cfg=scenario["cfg"],
                 tokenizer_path=tokenizer_path,
@@ -1316,6 +1391,7 @@ def run_auto_benchmark(config_path: str) -> str:
                 dataset_path=prepared_dataset_path,
                 tokenizer_path=tokenizer_path,
                 output_dir=scenario_output_dir,
+                live_results_path=live_results_path,
             )
 
             speculative_cfg = config.get("speculative", {})
@@ -1360,6 +1436,7 @@ def run_auto_benchmark(config_path: str) -> str:
                     dataset_path=prepared_dataset_path,
                     tokenizer_path=tokenizer_path,
                     output_dir=scenario_output_dir,
+                    live_results_path=live_results_path,
                 )
                 all_records.extend(spec_records)
 

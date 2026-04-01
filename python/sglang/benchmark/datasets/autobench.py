@@ -36,7 +36,10 @@ def _load_json_if_needed(value: Any) -> Any:
         return value
     if value[0] not in "[{":
         return value
-    return json.loads(value)
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
 
 
 def _normalize_messages(messages: Any) -> Optional[List[Dict[str, Any]]]:

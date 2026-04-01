@@ -3,7 +3,7 @@ server:
   host: 127.0.0.1
   port: 30000
   env:
-    CUDA_VISIBLE_DEVICES: "0,1,2,3"
+    CUDA_VISIBLE_DEVICES: "0"
   # Optional parallel search sugar:
   # parallel:
   #   # dp_size is auto-derived as visible_gpus / (tp_size * pp_size).
@@ -12,7 +12,7 @@ server:
   base_flags:
     # Replace with a local model path if you have one.
     model_path: Qwen/Qwen3-32B
-    tp_size: 4
+    tp_size: 1
     trust_remote_code: true
     # Keep the baseline close to a pure-TP launch command.
   # Keep CUDA graph enabled for normal performance tuning.
@@ -25,11 +25,11 @@ server:
     schedule_policy: [lpm, fcfs]
 
 dataset:
-  kind: sharegpt
-  # Leave empty to auto-download ShareGPT. Replace with a local dataset path if needed.
-  path: ""
+  kind: random
   num_prompts: 200
-  output_len: 256
+  scenario_names: [chat, summarization]
+  input_len: [1000, 8000]
+  output_len: [1000, 1000]
 
 benchmark:
   backend: auto

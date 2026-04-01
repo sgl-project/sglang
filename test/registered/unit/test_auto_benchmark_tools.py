@@ -5,6 +5,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -14,9 +15,11 @@ from transformers import PreTrainedTokenizerFast
 sys.modules.setdefault("zmq", types.SimpleNamespace())
 
 from sglang.auto_benchmark_lib import (
+    append_jsonl,
     build_candidates,
     build_server_candidates,
     classify_failure,
+    collect_stale_server_pids,
     describe_search_tier,
     estimate_trials_per_candidate,
     expand_dataset_scenarios,
@@ -130,6 +133,22 @@ class TestAutoBenchmarkTools(CustomTestCase):
         )
         self.assertEqual(len(rows), 2)
         self.assertEqual(len(converted_rows), 2)
+
+    def test_invalid_json_like_prompt_falls_back_to_plain_text(self):
+        path = self.tmpdir_path / "jsonlike.autobench.jsonl"
+        path.write_text(
+            json.dumps({"prompt": "[not actually json", "output_len": 8}) + "\n",
+            encoding="utf-8",
+        )
+
+        rows = sample_autobench_requests(
+            dataset_path=str(path),
+            num_requests=0,
+            tokenizer=self.tokenizer,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].prompt, "[not actually json")
 
     def test_prepare_sharegpt_dataset(self):
         sharegpt_path = self._write_sharegpt_json()
@@ -261,6 +280,31 @@ class TestAutoBenchmarkTools(CustomTestCase):
         self.assertIn("tpot=14.8ms", text)
         self.assertIn("tp=4", text)
         self.assertIn("ep=4", text)
+
+    def test_append_jsonl(self):
+        path = self.tmpdir_path / "live_results.jsonl"
+        append_jsonl(
+            str(path),
+            [
+                {"candidate_id": 1, "requested_qps": 2.0},
+                {"candidate_id": 2, "requested_qps": 3.0},
+            ],
+        )
+
+        lines = path.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[0])["candidate_id"], 1)
+        self.assertEqual(json.loads(lines[1])["requested_qps"], 3.0)
+
+    def test_collect_stale_server_pids_dedups(self):
+        def fake_run(command, capture_output, text, check):
+            stdout = "123\n" if command[0] == "lsof" else "123\n456\n"
+            return SimpleNamespace(returncode=0, stdout=stdout)
+
+        with mock.patch(
+            "sglang.auto_benchmark_lib.subprocess.run", side_effect=fake_run
+        ):
+            self.assertEqual(collect_stale_server_pids(30000), [123, 456])
 
 
 if __name__ == "__main__":
