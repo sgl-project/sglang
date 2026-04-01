@@ -78,9 +78,8 @@ def _run_smi(query, query_type="gpu"):
 
 def _get_smi_version():
     """Return nvidia-smi driver version and GPU name, or None on failure."""
-    # Inline nvidia-smi query instead of importing from sglang.srt.utils.common,
-    # because killall.py runs before `pip install -e` and sglang may not be importable
-    # (git clean -ffdx removes sglang.egg-info, breaking editable installs).
+    # Inline nvidia-smi query — killall.py runs before pip install, so sglang
+    # internals may not be importable.
     try:
         result = subprocess.run(
             [
