@@ -61,7 +61,7 @@ runtime_common = [
   "transformers==5.3.0",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
+  "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
 ]
 
@@ -98,6 +98,7 @@ srt_hip = [
 
 diffusion_hip = [
   "sglang[diffusion_common]",
+  "peft>=0.18.0",
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
@@ -142,6 +143,9 @@ diffusion_mps = [
   "cache-dit==1.2.3",
   "addict==2.4.0",
   "av==16.1.0",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+  "xatlas",
 ]
 
 test = [

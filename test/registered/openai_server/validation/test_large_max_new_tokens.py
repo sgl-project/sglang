@@ -22,8 +22,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=41, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=41, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=41, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=41, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestLargeMaxNewTokens(CustomTestCase):
