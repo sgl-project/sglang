@@ -10,25 +10,14 @@ import torch._dynamo.config as dynamo_config
 import torch._inductor.config as inductor_config
 
 
-def compile_with_debug(
+def _torch_compile(
     fn: Callable,
     compile_kwargs: Optional[Dict[str, Any]] = None,
     dynamo_kwargs: Optional[Dict[str, Any]] = None,
     inductor_kwargs: Optional[Dict[str, Any]] = None,
+    debug: bool = False,
 ) -> Callable:
-    """Wrap a function with torch.compile and enable debug output.
-
-    Debug config is applied when compilation actually occurs (on first call).
-    Caching is disabled to ensure fresh compilation with debug output.
-
-    Args:
-        fn: The function to compile.
-        compile_kwargs: Dict of arguments passed to torch.compile
-            (e.g. mode, fullgraph, dynamic).
-        dynamo_kwargs: Dict of extra dynamo config overrides.
-        inductor_kwargs: Dict of extra inductor config overrides merged
-            with debug defaults.
-    """
+    """Compile a function with torch.compile and apply localized compilation config."""
     if compile_kwargs is None:
         compile_kwargs = {}
     if inductor_kwargs is None:
@@ -50,19 +39,24 @@ def compile_with_debug(
             ), inductor_config.patch(
                 **inductor_kwargs,
                 **{
-                    "debug": True,
-                    "trace.enabled": True,
-                    "trace.fx_graph": True,
-                    "trace.fx_graph_transformed": True,
-                    "trace.output_code": True,
-                    "fx_graph_cache": False,
-                    "force_disable_caches": True,
+                    "debug": debug,
+                    "trace.enabled": debug,
+                    "trace.fx_graph": debug,
+                    "trace.fx_graph_transformed": debug,
+                    "trace.output_code": debug,
+                    "fx_graph_cache": False if debug else True,
+                    "force_disable_caches": debug,
                 },
             ):
                 compiled_fn = torch.compile(fn, **compile_kwargs)
                 return compiled_fn(*args, **kwargs)
 
-        return compiled_fn(*args, **kwargs)
+        # Replay with same config
+        with dynamo_config.patch(
+            **dynamo_kwargs,
+        ), inductor_config.patch(
+            **inductor_kwargs):
+            return compiled_fn(*args, **kwargs)
 
     return wrapper
 

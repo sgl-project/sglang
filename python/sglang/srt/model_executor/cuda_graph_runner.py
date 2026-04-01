@@ -77,7 +77,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
-from sglang.srt.utils.torch_compile import compile_with_debug, warmup_compiled_fn
+from sglang.srt.utils.torch_compile import _torch_compile, warmup_compiled_fn
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 try:
@@ -96,12 +96,16 @@ if TYPE_CHECKING:
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
+_COMPILED_REPLAY_PREPARE_WHITELISTED_BACKEND_FQNS = frozenset(
+    {"sglang.srt.layers.attention.trtllm_mha_backend.TRTLLMHAAttnBackend"}
+)
 
-def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+
+def _batch_inplace_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor], use_foreach_copy: bool = True) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
 
     def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
-        if _has_foreach_copy:
+        if _has_foreach_copy and use_foreach_copy:
             torch._foreach_copy_(dsts, srcs)
         else:
             for dst, src in zip(dsts, srcs):
@@ -265,6 +269,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         nsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        use_foreach_copy: bool = True,
     ):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
@@ -346,7 +351,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 srcs.append(src)
 
         # Batch all GPU copies, grouped by dtype pair.
-        _grouped_foreach_copy_(dsts, srcs)
+        _batch_inplace_copy(dsts, srcs, use_foreach_copy=use_foreach_copy)
 
         # CPU tensor copy (cannot be batched with GPU tensors).
         if forward_batch.seq_lens_cpu is not None:
@@ -638,8 +643,9 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
+        # Combo scheduling is needed to have good performance for replay-prepare.
         self.compile_replay_prepare = hasattr(
-            torch._inductor.config, "batch_foreach_copy_fusion"
+            torch._inductor.config, "combo_kernels"
         )
         self.compiled_replay_prepare = None
 
@@ -1068,6 +1074,19 @@ class CudaGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
+    def _get_replay_attn_backend(self):
+        if self.enable_pdmux:
+            return self.model_runner.decode_attn_backend_group[get_current_stream_idx()]
+        return self.model_runner.attn_backend
+
+    def _can_compile_replay_prepare(self):
+        if not self.compile_replay_prepare:
+            return False
+
+        backend_type = type(self._get_replay_attn_backend())
+        backend_fqn = f"{backend_type.__module__}.{backend_type.__qualname__}"
+        return backend_fqn in _COMPILED_REPLAY_PREPARE_WHITELISTED_BACKEND_FQNS
+
     def _populate_from_forward_batch_and_init_attn_backend(
         self,
         forward_batch: ForwardBatch,
@@ -1076,6 +1095,7 @@ class CudaGraphRunner:
         raw_bs: int = 0,
         raw_num_token: int = 0,
         bs: int = 0,
+        use_foreach_copy: bool = True,
     ):
         """Populate input buffers and initialize attention backend metadata."""
         buffers.populate_from_forward_batch(
@@ -1091,6 +1111,7 @@ class CudaGraphRunner:
                 self.model_runner.server_args
             ),
             pp_proxy_tensors=pp_proxy_tensors,
+            use_foreach_copy=use_foreach_copy,
         )
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
@@ -1102,11 +1123,7 @@ class CudaGraphRunner:
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
-        if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
-            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
-        else:
-            attn_backend = self.model_runner.attn_backend
+        attn_backend = self._get_replay_attn_backend()
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1118,7 +1135,7 @@ class CudaGraphRunner:
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         )
 
-    def _populate_from_forward_batch_and_init_attn_backend_fast(
+    def _populate_from_forward_batch_and_init_attn_backend_compiled(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -1126,25 +1143,24 @@ class CudaGraphRunner:
         raw_bs: int = 0,
         raw_num_token: int = 0,
         bs: int = 0,
+        use_foreach_copy: bool = False,
     ):
         """Lazily compile and call _populate_from_forward_batch_and_init_attn_backend."""
-        args = (forward_batch, pp_proxy_tensors, buffers, raw_bs, raw_num_token, bs)
+        args = (forward_batch, pp_proxy_tensors, buffers, raw_bs, raw_num_token, bs, use_foreach_copy)
         if self.compiled_replay_prepare is not None:
             self.compiled_replay_prepare(*args)
             return
 
         logger.info("Compiling cuda graph replay preparation")
-        self.compiled_replay_prepare = compile_with_debug(
+        self.compiled_replay_prepare = _torch_compile(
             self._populate_from_forward_batch_and_init_attn_backend,
             compile_kwargs={
-                "mode": "default",
                 "fullgraph": True,
-                "dynamic": None,
             },
             dynamo_kwargs={"capture_scalar_outputs": True},
             inductor_kwargs={
                 "cpp_wrapper": True,
-                "batch_foreach_copy_fusion": True,
+                "combo_kernels": True,
             },
         )
         warmup_compiled_fn(self.compiled_replay_prepare, *args)
@@ -1174,14 +1190,32 @@ class CudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
 
-        args = (forward_batch, pp_proxy_tensors, buffers, raw_bs, raw_num_token, bs)
         if (
             self.capture_forward_mode.is_decode_or_idle()
-            and self.compile_replay_prepare
+            and self._can_compile_replay_prepare()
         ):
-            self._populate_from_forward_batch_and_init_attn_backend_fast(*args)
+            self._populate_from_forward_batch_and_init_attn_backend_compiled(
+                forward_batch,
+                pp_proxy_tensors,
+                buffers,
+                raw_bs,
+                raw_num_token,
+                bs,
+                False,
+            )
         else:
-            self._populate_from_forward_batch_and_init_attn_backend(*args)
+            args = (
+            )
+            self._populate_from_forward_batch_and_init_attn_backend(
+                forward_batch,
+                pp_proxy_tensors,
+                buffers,
+                raw_bs,
+                raw_num_token,
+                bs,
+                True,
+
+            )
 
         # Store fields
         self.raw_bs = raw_bs
