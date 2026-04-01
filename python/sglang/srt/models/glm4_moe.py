@@ -1115,8 +1115,6 @@ class Glm4MoeForCausalLM(nn.Module):
             return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
