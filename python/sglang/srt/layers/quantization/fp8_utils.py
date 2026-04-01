@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -1456,16 +1457,17 @@ def apply_fp8_linear(
         num_token_padding = output_padding
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             num_token_padding = None
-        # For static per-tensor scales under torch.compile, use pure PyTorch
+        # For static per-tensor scales when using inductor compiler, use pure PyTorch
         # ops instead of the opaque sgl_kernel quant kernel. Inductor fuses
         # these with surrounding ops (RMSNorm, residual add), eliminating
-        # a separate kernel launch per linear layer. Only activates during
-        # inductor tracing (prefill PCG); decode uses the faster custom kernel.
+        # a separate kernel launch per linear layer. Only activates when
+        # piecewise_cuda_graph_compiler=inductor; eager PCG and decode both
+        # use the faster custom kernel.
         if (
             input_scale is not None
             and input_scale.numel() == 1
             and weight_scale.numel() == 1
-            and torch.compiler.is_compiling()
+            and envs.SGLANG_ENABLE_TORCH_COMPILE.get()
         ):
             qinput = (
                 (input_2d * input_scale.reciprocal())
