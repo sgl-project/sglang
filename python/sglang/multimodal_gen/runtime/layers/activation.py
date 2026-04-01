@@ -23,7 +23,7 @@ if _is_cuda:
         silu_and_mul,
     )
 elif _is_hip:
-    from sgl_kernel import silu_and_mul
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 if _is_npu:
     import torch_npu
