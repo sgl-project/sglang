@@ -115,13 +115,23 @@ class RocmPlatform(Platform):
             logger.info("Using AITer backend on ROCm.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend"
 
-        elif selected_backend == AttentionBackendEnum.AITER_SAGE:
+        elif selected_backend == AttentionBackendEnum.AITER_SAGE_FP8:
             if dtype in (torch.float16, torch.bfloat16):
-                logger.info("Using AITER Sage backend on ROCm.")
-                return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sage.AITERSageBackend"
+                logger.info("Using AITER Sage FP8 backend on ROCm.")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sage_fp8.AITERSageFp8Backend"
             else:
                 logger.warning(
-                    "AITER Sage backend only supports bf16/fp16 inputs but got dtype=%s.",
+                    "AITER Sage FP8 backend only supports bf16/fp16 inputs but got dtype=%s.",
+                    dtype,
+                )
+
+        elif selected_backend == AttentionBackendEnum.AITER_SAGE_MXFP4:
+            if dtype in (torch.float16, torch.bfloat16):
+                logger.info("Using AITER Sage MXFP4 backend on ROCm.")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.aiter_sage_mxfp4.AITERSageMxfp4Backend"
+            else:
+                logger.warning(
+                    "AITER Sage MXFP4 backend only supports bf16/fp16 inputs but got dtype=%s.",
                     dtype,
                 )
 
