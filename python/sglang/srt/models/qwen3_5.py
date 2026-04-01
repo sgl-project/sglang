@@ -102,6 +102,13 @@ _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_amx_available = cpu_has_amx_support()
 
+if _is_npu:
+    from sgl_kernel_npu.fla.utils import (
+        fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
+    )
+
+    fused_qkvzba_split_reshape_cat_contiguous = fused_qkvzba_split_reshape_cat_npu
+
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -448,6 +455,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_k_dim,
                 self.head_v_dim,
             )
+            b = b.contiguous()
+            a = a.contiguous()
         elif _is_cpu and _is_amx_available:
             mixed_qkv, z, b, a = (
                 torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
@@ -467,6 +476,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
+            b = b.contiguous()
+            a = a.contiguous()
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
