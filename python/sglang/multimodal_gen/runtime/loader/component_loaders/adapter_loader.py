@@ -6,6 +6,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    _model_construction_lock,
     set_default_torch_dtype,
     skip_init_modules,
 )
@@ -52,7 +53,9 @@ class AdapterLoader(ComponentLoader):
 
         from types import SimpleNamespace
 
-        with set_default_torch_dtype(default_dtype), skip_init_modules():
+        with _model_construction_lock, set_default_torch_dtype(
+            default_dtype
+        ), skip_init_modules():
             connector_cfg = SimpleNamespace(**config)
             model = model_cls(connector_cfg).to(
                 device=target_device, dtype=default_dtype
