@@ -61,7 +61,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_npu
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 
@@ -478,7 +477,10 @@ class Grok1DecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream or torch.cuda.Stream()
 
-        rope_theta, _ = get_rope_config(config)
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_params = getattr(config, "rope_parameters", None)
+            rope_theta = rope_params["rope_theta"] if rope_params else 10000
         self.self_attn = Grok1Attention(
             config=config,
             hidden_size=self.hidden_size,
