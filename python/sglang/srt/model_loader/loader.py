@@ -2930,6 +2930,11 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 "Runai Model Streamer Loader does not support ModelOpt quantization yet"
             )
 
+        assert device_config.device_type in ("cuda", "cpu"), (
+            f"Runai Model Streamer only supports CUDA and CPU, "
+            f"got {device_config.device_type}"
+        )
+
         if device_config.device_type == "cuda":
             self.target_device_str = (
                 device_config.device_type + ":" + str(device_config.gpu_id)
