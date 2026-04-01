@@ -15,6 +15,7 @@
 """Inference-only GLM-4.5, GLM-4.6 and GLM-4.7 model compatible with HuggingFace weights"""
 
 import logging
+import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -1184,7 +1185,6 @@ class Glm4MoeForCausalLM(nn.Module):
             def iter_weights_with_fused_shared_experts(
                 weights: Iterable[Tuple[str, torch.Tensor]],
             ) -> Iterable[Tuple[str, torch.Tensor]]:
-                import re
 
                 pattern = re.compile(
                     r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"

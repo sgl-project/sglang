@@ -15,10 +15,12 @@
 """Inference-only GLM-4.7-Flash model compatible with HuggingFace weights"""
 
 import logging
+import re
 from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from sgl_kernel import dsv3_router_gemm
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -36,6 +38,7 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
@@ -185,7 +188,6 @@ class Glm4MoeLiteGate(nn.Module):
             and self.weight.shape[0] == 256
             and _device_sm >= 90
         ):
-            from sgl_kernel import dsv3_router_gemm
 
             logits = dsv3_router_gemm(hidden_states, self.weight).to(
                 hidden_states.dtype
@@ -499,11 +501,6 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            from sglang.srt.layers.dp_attention import (
-                get_attention_tp_rank,
-                get_attention_tp_size,
-            )
-
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()
         else:
@@ -572,7 +569,6 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             def iter_weights_with_fused_shared_experts(
                 weights: Iterable[Tuple[str, torch.Tensor]],
             ) -> Iterable[Tuple[str, torch.Tensor]]:
-                import re
 
                 pattern = re.compile(
                     r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
@@ -781,7 +777,7 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
 
         # DeepseekV2AttentionMLA.forward_* expects post_load_weights() to populate
         # per-layer packed weights like `w_kc`/`w_vc` (used during CUDA graph capture).
-        # GLM-Lite configs may not set `config.mla`, but this model always uses
+        # GLM-4.7-Flash configs not set `config.mla`, but this model always uses
         # DeepseekV2AttentionMLA, so we must run the post-load processing.
         # Use weight_names=None to ensure we always process all layers. Some checkpoints /
         # naming schemes may not include "kv_b_proj" in `weight_names`, but `w_kc`/`w_vc`
