@@ -19,6 +19,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -38,9 +39,10 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
-if get_bool_env_var("SGLANG_USE_AITER") and _is_hip:
+if _use_aiter:
     try:
         from aiter import fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
 
@@ -149,8 +151,6 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
-        from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
-
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
             and isinstance(self.rotary_emb, MRotaryEmbedding)
@@ -198,7 +198,7 @@ class Qwen3Attention(nn.Module):
         )
         return q, k, v
 
-    def forward_prepare_fused_mrope(self, positions, hidden_states, forward_batch):
+    def forward_prepare_aiter_fused_mrope(self, positions, hidden_states, forward_batch):
         """Fused QK-norm + 3D mRoPE + KV cache write for decode (ROCm/aiter).
 
         The fused HIP kernel replaces split → QK norm → mRoPE → cache write,
@@ -268,14 +268,14 @@ class Qwen3Attention(nn.Module):
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
-        use_fused = (
+        use_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
             and get_global_server_args().rl_on_policy_target is None
         )
 
-        if use_fused:
-            q, k, v = self.forward_prepare_fused_mrope(
+        if use_aiter_fused:
+            q, k, v = self.forward_prepare_aiter_fused_mrope(
                 positions, hidden_states, forward_batch
             )
             save_kv_cache = False
