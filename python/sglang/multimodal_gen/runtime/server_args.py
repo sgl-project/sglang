@@ -943,28 +943,6 @@ class ServerArgs:
             default=None,
             help="Tensor parallelism for decoder role. Default: auto-derive from decoder GPU count.",
         )
-        parser.add_argument(
-            "--encoder-to-denoiser-endpoint",
-            type=str,
-            default=None,
-            help="ZMQ endpoint for encoder->denoiser transfer (e.g., tcp://127.0.0.1:6001). "
-            "Auto-assigned if not specified.",
-        )
-        parser.add_argument(
-            "--denoiser-to-decoder-endpoint",
-            type=str,
-            default=None,
-            help="ZMQ endpoint for denoiser->decoder transfer (e.g., tcp://127.0.0.1:6002). "
-            "Auto-assigned if not specified.",
-        )
-        parser.add_argument(
-            "--decoder-to-encoder-endpoint",
-            type=str,
-            default=None,
-            help="ZMQ endpoint for decoder->encoder result return (e.g., tcp://127.0.0.1:6003). "
-            "Auto-assigned if not specified.",
-        )
-
         # Prompt text file for batch processing
         parser.add_argument(
             "--prompt-file-path",

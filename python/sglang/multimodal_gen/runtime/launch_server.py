@@ -25,6 +25,24 @@ from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 
 
+def _find_available_port(
+    start: int = 10000, avoid: set[int] | None = None, max_attempts: int = 100
+) -> int:
+    """Find an available port starting from *start*, skipping ports in *avoid*."""
+    if avoid is None:
+        avoid = set()
+    port = max(1024, min(start, 65535))
+    for _ in range(max_attempts):
+        if port not in avoid and is_port_available(port):
+            return port
+        port += 1
+        if port > 65535:
+            port = 1024
+    raise RuntimeError(
+        f"No available port found after {max_attempts} attempts (start={start})"
+    )
+
+
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
@@ -235,10 +253,7 @@ def launch_pool_disagg_server(
     host = server_args.host or "127.0.0.1"
 
     def find_port(start):
-        port = start
-        while not is_port_available(port):
-            port += 1
-        return port
+        return _find_available_port(start)
 
     # Allocate endpoints
     port_cursor = server_args.scheduler_port + 3000
@@ -553,15 +568,9 @@ def launch_disagg_role(server_args: ServerArgs):
     # Build role-specific ServerArgs
     # Use a different port for the scheduler's internal ROUTER socket to avoid
     # conflicting with the pool work PULL socket (both bind on scheduler_port).
-    internal_scheduler_port = server_args.scheduler_port + 10000
-    if internal_scheduler_port > 65535:
-        internal_scheduler_port = server_args.scheduler_port - 10000
-        if internal_scheduler_port < 1024:
-            internal_scheduler_port = 1024
-    while not is_port_available(internal_scheduler_port):
-        internal_scheduler_port += 1
-        if internal_scheduler_port > 65535:
-            raise RuntimeError("No available port for internal scheduler")
+    internal_scheduler_port = _find_available_port(
+        start=server_args.scheduler_port + 100, avoid={server_args.scheduler_port}
+    )
 
     role_par = server_args.get_role_parallelism(role_type)
     role_overrides = {

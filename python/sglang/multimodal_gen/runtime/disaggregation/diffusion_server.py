@@ -139,6 +139,11 @@ class DiffusionServer:
         self._denoiser_peers: dict[int, dict] = {}
         self._decoder_peers: dict[int, dict] = {}
 
+        # Monotonic counters for peer registration (safe across register/deregister)
+        self._next_encoder_peer_idx = 0
+        self._next_denoiser_peer_idx = 0
+        self._next_decoder_peer_idx = 0
+
     @property
     def tracker(self) -> RequestTracker:
         return self._tracker
@@ -579,13 +584,16 @@ class DiffusionServer:
         info["free_preallocated_slots"] = list(prealloc) if prealloc else []
 
         if role == RoleType.ENCODER:
-            idx = len(self._encoder_peers)
+            idx = self._next_encoder_peer_idx
+            self._next_encoder_peer_idx += 1
             self._encoder_peers[idx] = info
         elif role == RoleType.DENOISER:
-            idx = len(self._denoiser_peers)
+            idx = self._next_denoiser_peer_idx
+            self._next_denoiser_peer_idx += 1
             self._denoiser_peers[idx] = info
         elif role == RoleType.DECODER:
-            idx = len(self._decoder_peers)
+            idx = self._next_decoder_peer_idx
+            self._next_decoder_peer_idx += 1
             self._decoder_peers[idx] = info
         else:
             idx = 0
