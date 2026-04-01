@@ -20,10 +20,10 @@ from sglang.test.simple_eval_common import (
 def get_thinking_kwargs(args):
     thinking_mode = getattr(args, "thinking_mode", None)
     if thinking_mode in THINKING_MODE_CHOICES:
-        if thinking_mode == "deepseek-v3":
+        if thinking_mode in ["deepseek-v3", "kimi-k2"]:
             thinking_param = "thinking"
         else:
-            # Qwen3
+            # All models other than dpsk v3/kimi_k2
             thinking_param = "enable_thinking"
         return {thinking_param: True}
     return {}
@@ -267,7 +267,7 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-v3", "qwen3"]
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
