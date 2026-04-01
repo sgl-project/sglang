@@ -3263,6 +3263,16 @@ class Scheduler(
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
+        if recv_req.mode == "in_place":
+            # In-place pause: just set the flag and return immediately.
+            # All scheduler state (running_batch, last_batch, chunked_req,
+            # result_queue) is left untouched. On resume, the normal event
+            # loop (get_next_batch_to_run) handles last_batch merge,
+            # chunked_req cleanup, and overlap result processing through
+            # the standard code paths. This avoids duplicating batch
+            # manipulation logic and the accounting bugs that come with it.
+            return
+
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3270,9 +3280,6 @@ class Scheduler(
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
-            if recv_req.mode == "in_place":
-                if self.chunked_req is not None:
-                    chunked_req_to_exclude.add(self.chunked_req)
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
