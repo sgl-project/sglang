@@ -118,13 +118,36 @@ MultimodalDataInputFormat = Union[
     MultimodalDataInputItem,
 ]
 
+@dataclass
+class MiMoAudioMMId():
+    mm_ids: List[List[int]] = None    # [group_size, audio_channel + 1]
+    
+    @classmethod
+    def init_new(cls, mm_ids: List[List[int]]):
+        return cls(
+            mm_ids=mm_ids
+        )
+
+    def flatten_mm_ids(self) -> List[int]:
+        """
+        将二维列表 mm_ids 展平成一维列表
+        原形状: [group_size, audio_channel + 1]
+        输出形状: [group_size * (audio_channel + 1)]
+        """
+        if self.mm_ids is None:
+            return []
+        
+        # 双层列表推导式，安全展平
+        return [item for sublist in self.mm_ids for item in sublist]
+    
+
 
 @dataclass
 class GenerateReqInput(BaseReq):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    input_ids: Optional[Union[List[List[int]], List[int], List[MiMoAudioMMId]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -302,13 +325,13 @@ class GenerateReqInput(BaseReq):
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
                 raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int):
+            if isinstance(self.input_ids[0], int) or isinstance(self.input_ids[0], MiMoAudioMMId):
                 self.is_single = True
                 self.batch_size = 1
             else:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
-            self.input_embeds = None
+            # self.input_embeds = None
         else:
             if isinstance(self.input_embeds[0][0], float):
                 self.is_single = True

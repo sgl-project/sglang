@@ -22,6 +22,8 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 
+from sglang.srt.managers.io_struct import MiMoAudioMMId
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
         EmbeddingBatchResult,
@@ -157,7 +159,7 @@ class SchedulerOutputProcessorMixin:
 
             # Check finish conditions
             logprob_pt = 0
-
+            # import rpdb;rpdb.set_trace("0.0.0.0",5555)
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
@@ -167,6 +169,11 @@ class SchedulerOutputProcessorMixin:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
+                    # 适配 mimoaudio next_token_id 多 group 多 channel 模式
+                    def split_list(lst, n):
+                        return [lst[i:i+n] for i in range(0, len(lst), n)]
+                    if len(next_token_id) > 1:
+                        next_token_id = MiMoAudioMMId(split_list(next_token_id, 9))
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
@@ -398,6 +405,11 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
+            # 适配 mimoaudio next_token_id 多 group 多 channel 模式
+            def split_list(lst, n):
+                return [lst[i:i+n] for i in range(0, len(lst), n)]
+            if len(next_token_id) > 1:
+                next_token_id = MiMoAudioMMId(split_list(next_token_id, 9))
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
@@ -947,7 +959,7 @@ class SchedulerOutputProcessorMixin:
                         if not self.model_config.is_multimodal_gen
                         else False
                     )
-
+            # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
             if should_output:
                 send_token_offset = req.send_token_offset
                 send_output_token_logprobs_offset = (
@@ -1087,6 +1099,7 @@ class SchedulerOutputProcessorMixin:
         dp_ranks = [self.dp_rank] * len(rids) if rids else None
 
         # Send to detokenizer
+        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return

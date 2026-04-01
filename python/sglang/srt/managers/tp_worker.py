@@ -456,6 +456,8 @@ class TpModelWorker(BaseTpWorker):
         #               which requires preparing replay to always be in this function
 
         # Get forward batch from model worker batch
+        # import rpdb
+        # rpdb.set_trace("0.0.0.0", 5555)
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)

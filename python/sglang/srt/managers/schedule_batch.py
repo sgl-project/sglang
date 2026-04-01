@@ -994,6 +994,11 @@ class Req(ReqDllmMixin):
         return False
 
     def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
+        # self.finished_reason = FINISH_MATCHED_TOKEN(matched=0)
+        # matched_pos = len(self.output_ids) - len(new_accepted_tokens) + 0
+        # self.finished_len = matched_pos + 1
+        # return True
         if self.sampling_params.ignore_eos:
             return False
 
@@ -1005,6 +1010,7 @@ class Req(ReqDllmMixin):
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
             if self.eos_token_ids:
                 matched_eos |= token_id in self.eos_token_ids
+            # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
             if self.tokenizer is not None:
                 matched_eos |= token_id == self.tokenizer.eos_token_id
                 if self.tokenizer.additional_stop_token_ids:
@@ -1080,6 +1086,10 @@ class Req(ReqDllmMixin):
                 return
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
+        # 适配 MiMoAudio: normal - new_accepted_tokens is a list, mimoaudio - new_accepted_tokens is MiMoAudioMMId
+        if len(new_accepted_tokens) > 0 and not isinstance(new_accepted_tokens[0], int):
+            new_accepted_tokens = [new_accepted_tokens[0].mm_ids[0][0]]
 
         if self._check_token_based_finish(new_accepted_tokens):
             return
@@ -1214,7 +1224,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
-    input_ids: torch.Tensor = None  # shape: [b], int64
+    input_ids: torch.Tensor = None  # shape: [b], int64   [b, seq_lens, group_size, audio_channel + 1] for mimo audio
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
     ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
@@ -1314,6 +1324,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
+    
+    mimo_audio: Optional[bool] = False
 
     @classmethod
     def init_new(
@@ -1327,6 +1339,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        init_for_mimo_audio: bool = False,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -1352,6 +1365,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
+            mimo_audio=init_for_mimo_audio,
         )
 
     def batch_size(self):
@@ -1447,12 +1461,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = [len(r.fill_ids) for r in reqs]
-        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
-        prefix_lens = [len(r.prefix_indices) for r in reqs]
-        extend_lens = [r.extend_input_len for r in reqs]
+        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
+        if self.mimo_audio:
+            input_ids = [mimo_mm_input.flatten_mm_ids() for r in reqs for mimo_mm_input in r.fill_ids[len(r.prefix_indices) :] ]
+            extend_num_tokens = sum(len(ids) // 9 // 4 for ids in input_ids)
+            seq_lens = [len(r.fill_ids) for r in reqs]
+            orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+            prefix_lens = [len(r.prefix_indices) for r in reqs]
+            extend_lens = [r.extend_input_len for r in reqs]
+        else:
+            input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+            extend_num_tokens = sum(len(ids) for ids in input_ids)
+            seq_lens = [len(r.fill_ids) for r in reqs]
+            orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+            prefix_lens = [len(r.prefix_indices) for r in reqs]
+            extend_lens = [r.extend_input_len for r in reqs]
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1516,6 +1539,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_allocated_len = seq_len
 
             # If input_embeds are available, store them
+            # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
             if req.input_embeds is not None:
                 # If req.input_embeds is already a list, append its content directly
                 input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting

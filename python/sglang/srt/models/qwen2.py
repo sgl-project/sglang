@@ -30,6 +30,9 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
+# from transformers.models.qwen2 import Qwen2RMSNorm as RMSNorm
+from transformers.activations import ACT2FN
+from transformers.configuration_utils import PretrainedConfig
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -100,9 +103,132 @@ class Qwen2MLP(nn.Module):
         return x
 
 
+# class Qwen2MLP(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.config = config
+#         self.hidden_size = config.hidden_size
+#         self.intermediate_size = config.intermediate_size
+#         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+#         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+#         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+#         self.act_fn = ACT2FN[config.hidden_act]
+
+#     def forward(self, x):
+#         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+#         return down_proj
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+
+def _compute_default_rope_parameters(
+    config: Optional[PretrainedConfig] = None,
+    device: Optional["torch.device"] = None,
+    seq_len: Optional[int] = None,
+    **rope_kwargs,
+) -> Tuple["torch.Tensor", float]:
+    if config is not None and len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
+            f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
+        )
+    if len(rope_kwargs) > 0:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    elif config is not None:
+        base = config.rope_theta
+        partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
+    return inv_freq, attention_factor
+
+
+ROPE_INIT_FUNCTIONS = {
+    "default": _compute_default_rope_parameters
+}
+class Qwen2RotaryEmbedding(nn.Module):
+    def __init__(self, config: Qwen2Config, device=None):
+        super().__init__()
+        # BC: "rope_type" was originally "type"
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
+            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
+            # This .to() is needed if the model has been moved to a device after being initialized (because
+            # the buffer is automatically moved, but not the original copy)
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
 class Qwen2Attention(nn.Module):
     def __init__(
         self,
+        config,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -116,6 +242,7 @@ class Qwen2Attention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -157,7 +284,7 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-
+        # self.rotary_emb = Qwen2RotaryEmbedding(config=config)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -175,6 +302,27 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+    
+    def _scaled_dot_product_attention(self, q, k, v):
+        import torch
+        seq_len = q.shape[0]
+        q_reshaped = q.view(seq_len, self.num_heads, self.head_dim).unsqueeze(0).transpose(1, 2)
+        k_reshaped = k.view(seq_len, self.num_kv_heads, self.head_dim).unsqueeze(0).transpose(1, 2)
+        v_reshaped = v.view(seq_len, self.num_kv_heads, self.head_dim).unsqueeze(0).transpose(1, 2)
+        if self.num_kv_heads != self.num_heads:
+            k_reshaped = k_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            v_reshaped = v_reshaped.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+        attn_output_scaled = torch.nn.functional.scaled_dot_product_attention(q_reshaped, k_reshaped, v_reshaped, is_causal=True)
+        return attn_output_scaled.transpose(1, 2).squeeze(0).reshape(seq_len, -1)
+
+    def _compare_two_tensors(self, tensor1, tensor2):
+        import torch
+        diff = tensor1 - tensor2
+        max_diff = torch.max(torch.abs(diff))
+        mean_diff = torch.mean(torch.abs(diff))
+        cosine_sim = torch.nn.functional.cosine_similarity(tensor1, tensor2, dim=-1)
+        # print(f"layer_{self.layer_id} Max diff: {max_diff}, Mean diff: {mean_diff}, Cosine sim: {cosine_sim}")
+        print(f"layer_{self.layer_id} Max diff: {max_diff}, Mean diff: {mean_diff}")
 
     def forward(
         self,
@@ -184,9 +332,35 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # if self.layer_id == 35:
+        #     import rpdb;rpdb.set_trace("0.0.0.0", 5555)
+        #     q = torch.load("/mnt/lustre-client/SGLANG/MiMo-Audio/query_new.pt")
+        #     k = torch.load("/mnt/lustre-client/SGLANG/MiMo-Audio/key_new.pt")
+        #     v = torch.load("/mnt/lustre-client/SGLANG/MiMo-Audio/value_new.pt")
+        # q = q.reshape(1, 374, 32, 128).permute(0, 2, 1, 3)
+        # k = k.reshape(1, 374, 8, 128).permute(0, 2, 1, 3)
+        
+        # positions = positions.unsqueeze(0)  # Add batch dimension to positions
+        # position_embeddings = self.rotary_emb(hidden_states.unsqueeze(0), positions)
+        # cos, sin = position_embeddings
+        # q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        # q = q.permute(0, 2, 1, 3).reshape(374, -1)
+        # k = k.permute(0, 2, 1, 3).reshape(374, -1)
+        
         q, k = self.rotary_emb(positions, q, k)
+        # if self.layer_id == 35:
+        #     torch.save(q, "check_q.pt")
+        #     torch.save(k, "check_k.pt")
+        
         attn_output = self.attn(q, k, v, forward_batch)
+        
+        # if hidden_states.shape[0] > 1:
+        #     scaled_attn_output = self._scaled_dot_product_attention(q, k, v)
+        #     self._compare_two_tensors(attn_output, scaled_attn_output)
         output, _ = self.o_proj(attn_output)
+        # if self.layer_id == 35:
+        #     torch.save(output, "output.pt")
         return output
 
 
@@ -200,6 +374,7 @@ class Qwen2DecoderLayer(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -209,6 +384,7 @@ class Qwen2DecoderLayer(nn.Module):
             config, "dual_chunk_attention_config", None
         )
         self.self_attn = Qwen2Attention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -228,6 +404,7 @@ class Qwen2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
+        # self.mlp = Qwen2MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -246,12 +423,14 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # if self.layer_id == 35:
+        #     import rpdb;rpdb.set_trace("0.0.0.0",5555)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-
+        # torch.save(hidden_states, f"check/hidden_states_after_attn_sdpaattn_{self.layer_id}.pt")
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -346,7 +525,7 @@ class Qwen2Model(nn.Module):
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
             else:
-                hidden_states = input_embeds
+                hidden_states = input_embeds        # qwen2 infer shape [seq_len, hidden_dim]
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -366,6 +545,7 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+            # torch.save(hidden_states, f"check/hidden_states_after_layer_{i}.pt")
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -479,6 +659,9 @@ class Qwen2ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # import traceback
+        # traceback.print_stack()
+        print("forward here\n")
         hidden_states = self.model(
             input_ids,
             positions,
