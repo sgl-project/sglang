@@ -334,11 +334,10 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
 
-        hidden_states, hidden_scales, topk_ids, _, masked_m, _ = dispatch_output
+        hidden_states, _, topk_ids, _, masked_m, _ = dispatch_output
 
         output = cutlass_w4a8_moe_deepep_ll(
             hidden_states,
-            hidden_scales,
             layer.w13_weight,
             layer.w2_weight,
             layer.w13_weight_scale_inv,
