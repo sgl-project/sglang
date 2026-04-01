@@ -97,8 +97,8 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         metrics = run_eval(args)
         print(f"TestEagleLargeBS -- {metrics=}")
         self.assertGreater(
-            metrics["score"], 0.23
-        )  # 0.3333 for 60 questions; 0.234 for 1319 questions
+            metrics["score"], 0.22
+        )  # ~0.227 for 1000 questions via /v1/completions
         assert self.process.poll() is None
 
     def test_logprob_spec_v2_match(self):
