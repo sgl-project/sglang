@@ -234,7 +234,9 @@ def run_pytest(files, filter_expr=None):
         )
 
         is_flaky_ci_assertion = (
-            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+            "SafetensorError" in full_output
+            or "FileNotFoundError" in full_output
+            or "TimeoutError" in full_output
         )
 
         is_oom_error = (
