@@ -72,12 +72,14 @@ suite_xeon = {
 }
 
 # Add Intel XPU tests
-# NOTE: please sort the test cases alphabetically by the test file name
+# NOTE: Intentionally NOT alphabetical. Lighter benchmarks run first because
+# heavy models (e.g. DeepSeek-OCR ~6GB) can leave XPU device memory unreclaimed,
+# causing OOM for subsequent tests on memory-constrained devices.
 suite_xpu = {
     "per-commit-xpu": [
+        TestFile("xpu/test_intel_xpu_backend.py"),
         TestFile("xpu/test_deepseek_ocr.py"),
         # TestFile("xpu/test_internvl.py"),
-        TestFile("xpu/test_intel_xpu_backend.py"),
     ],
 }
 
