@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    DEFAULT_IMAGE_URL,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -50,7 +51,7 @@ class TestDeepSeekOCR(CustomTestCase):
             self.base_url + "/generate",
             json={
                 "text": "<image>\n<|grounding|>Convert the document to pure text.",
-                "image_data": "../../examples/assets/example_image.png",
+                "image_data": DEFAULT_IMAGE_URL,
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": max_new_tokens,
