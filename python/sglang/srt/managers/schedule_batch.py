@@ -830,7 +830,7 @@ class Req(ReqDllmMixin):
         self.init_diffusion_llm(dllm_config)
 
         # For hisparse
-        self.staging = False
+        self.hisparse_staging = False
 
     @property
     def seqlen(self) -> int:
@@ -2382,13 +2382,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
-
-            if (
-                self.forward_mode.is_decode()
-                and not server_args.disable_piecewise_cuda_graph
-                and not self.tree_cache.is_chunk_cache()
-            ):
-                return
 
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():

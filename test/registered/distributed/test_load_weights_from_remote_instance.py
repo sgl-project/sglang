@@ -228,6 +228,8 @@ def init_process_dst(
                 "--remote-instance-weight-loader-backend",
                 remote_instance_loader_backend,
                 "--remote-instance-weight-loader-start-seed-via-transfer-engine",
+                "--engine-info-bootstrap-port",
+                str(6789 + rank),
             ),
         )
     torch.cuda.synchronize()
