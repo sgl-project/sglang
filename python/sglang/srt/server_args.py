@@ -1453,9 +1453,6 @@ class ServerArgs:
             if self.dp_size == 1 and major >= 10:
                 self.nsa_prefill_backend = "trtllm"
                 self.nsa_decode_backend = "trtllm"
-                logger.warning(
-                    "Flashmla is not supported on Blackwell device without DP attention. Set NSA prefill/decode backends to trtllm, which runs fast but loses a little accuracy."
-                )
             else:
                 # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
                 if not user_set_prefill:
@@ -1523,14 +1520,6 @@ class ServerArgs:
                         )
                         logger.warning(
                             f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
-                        )
-                    if self.nsa_prefill_backend == "trtllm":
-                        # We temporarily set the threshold to 128k to avoid IMA error. Should be removed after supporting flashmla prefill impl with trtllm decode impl.
-                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
-                            128 * 1024
-                        )
-                        logger.warning(
-                            "TRTLLM sparse MLA kernel requires MHA as prefill impl, the threshold for dense attention is overridden. This will be fixed in the future."
                         )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
