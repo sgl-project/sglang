@@ -152,18 +152,6 @@ DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
 
-ENCODER_DISAGGREGATION_MODEL_ARCH_CHOICES = [
-    "Qwen2VLForConditionalGeneration",
-    "Qwen3VLForConditionalGeneration",
-    "Qwen2_5_VLForConditionalGeneration",
-    "Qwen3VLMoeForConditionalGeneration",
-    "Qwen3_5ForConditionalGeneration",
-    "Qwen3_5MoeForConditionalGeneration",
-    "Qwen3OmniMoeForConditionalGeneration",
-    "Qwen2AudioForConditionalGeneration",
-    "Qwen2_5OmniForConditionalGeneration",
-]
-
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
@@ -3290,9 +3278,17 @@ class ServerArgs:
         # Validate model type: only support Qwen models for now
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
-        if (
-            self.encoder_only or self.language_only
-        ) and model_arch not in ENCODER_DISAGGREGATION_MODEL_ARCH_CHOICES:
+        if (self.encoder_only or self.language_only) and model_arch not in [
+            "Qwen2VLForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2AudioForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+        ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
             )
