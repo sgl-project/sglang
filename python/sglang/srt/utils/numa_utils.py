@@ -155,7 +155,7 @@ def _is_numa_available() -> bool:
         return False
 
     if not shutil.which("numactl") and envs.SGLANG_NUMA_BIND_V2.get():
-        logger.warning(
+        logger.debug(
             "numactl command not found, skipping NUMA node configuration for GPU. Install numactl (e.g., apt-get install numactl) to enable automatic NUMA binding."
         )
         return False

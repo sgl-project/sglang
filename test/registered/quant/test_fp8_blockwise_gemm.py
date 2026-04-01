@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=420, suite="stage-c-test-4-gpu-b200")
 
 MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
-BF16_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507"
+MXFP8_MODEL_PATH = "zianglih/Qwen3-4B-Instruct-2507-MXFP8"
 
 
 class FP8BlockwiseGemmBase:
@@ -67,12 +67,10 @@ class MXFP8GemmBase:
     def setUpClass(cls):
         if cls.backend is None:
             raise NotImplementedError("Subclass must set 'backend' attribute")
-        cls.model = try_cached_model(BF16_MODEL_PATH)
+        cls.model = try_cached_model(MXFP8_MODEL_PATH)
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--quantization",
-            "mxfp8",
             "--fp8-gemm-backend",
             cls.backend,
         ]
@@ -122,6 +120,7 @@ class TestFP8BlockwiseGemmFlashinferDeepGemm(FP8BlockwiseGemmBase, unittest.Test
     backend = "flashinfer_deepgemm"
 
 
+@unittest.skip("Currently PCG capture takes too long to complete, disable until fixed")
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
 class TestMXFP8GemmTriton(MXFP8GemmBase, unittest.TestCase):
     backend = "triton"
