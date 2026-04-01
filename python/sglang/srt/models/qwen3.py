@@ -198,7 +198,9 @@ class Qwen3Attention(nn.Module):
         )
         return q, k, v
 
-    def forward_prepare_aiter_fused_mrope(self, positions, hidden_states, forward_batch):
+    def forward_prepare_aiter_fused_mrope(
+        self, positions, hidden_states, forward_batch
+    ):
         """Fused QK-norm + 3D mRoPE + KV cache write for decode (ROCm/aiter).
 
         The fused HIP kernel replaces split → QK norm → mRoPE → cache write,
