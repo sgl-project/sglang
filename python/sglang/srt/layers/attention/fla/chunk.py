@@ -36,6 +36,7 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
 ):
+    print("[info] cu_seqlens:", cu_seqlens)
     g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens)
 
     # fused kkt + solve_tril + recompute_w_u
