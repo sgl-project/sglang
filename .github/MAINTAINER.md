@@ -146,9 +146,9 @@ This list is based on the current situation. If you or someone you know would li
 ## CI Maintenance Mode
 When the CI is unhealthy (e.g., the scheduled pr-test on `main` is broken for consecutive runs), the project enters **CI Maintenance Mode** by opening [issue #21065](https://github.com/sgl-project/sglang/issues/21065). While active:
 - All PR CI runs are paused. Resources are allocated to PRs that fix the CI.
-- **Merging PRs is prohibited.** Do not merge any PRs until maintenance mode is lifted. In severe cases, merge permissions may be revoked.
+- **Merging non-CI-fix PRs is prohibited.** Only PRs that fix the CI may be merged. In severe cases, merge permissions may be revoked.
 
 Maintenance mode ends when `pr-test.yml` is all green on `main` and the issue is closed.
 
 ## Suspending Permissions
-If a Merge Oncall bypasses checks to merge a PR that breaks the `main` branch, merges a PR during CI Maintenance Mode, or repeatedly breaks the CI due to various reasons, their privileges will be suspended for at least two days, depending on the severity of the incident.
+If a Merge Oncall bypasses checks to merge a PR that breaks the `main` branch, merges a non-CI-fix PR during CI Maintenance Mode, or repeatedly breaks the CI due to various reasons, their privileges will be suspended for at least two days, depending on the severity of the incident.
