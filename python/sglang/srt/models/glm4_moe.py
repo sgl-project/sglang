@@ -1155,7 +1155,6 @@ class Glm4MoeForCausalLM(nn.Module):
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn=False,
         params_dict=None,
-        is_eagle=False,
     ):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -1221,13 +1220,6 @@ class Glm4MoeForCausalLM(nn.Module):
             nextn_layer_prefix = None
             nextn_spec_weight_names = []
 
-        eagle_ignore_weight_names = []
-        if is_eagle:
-            eagle_ignore_weight_names = [
-                "eagle_draft_tokens_map",
-                "eagle_lm_head.weight",
-            ]
-
         if params_dict is None:
             params_dict = dict(self.named_parameters())
 
@@ -1235,7 +1227,7 @@ class Glm4MoeForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             weight_names.append(name)
 
-            if not is_nextn and not is_eagle:
+            if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
                     if num_nextn_layers > 0 and name.startswith("model.layers"):
@@ -1324,8 +1316,6 @@ class Glm4MoeForCausalLM(nn.Module):
 
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if name in eagle_ignore_weight_names:
                         continue
 
                     if name not in params_dict:
