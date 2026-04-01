@@ -42,6 +42,7 @@ from sglang.srt.utils.common import (
     get_device_name,
     get_device_sm,
     get_int_env_var,
+    get_nvidia_driver_version,
     get_quantization_config,
     human_readable_int,
     is_blackwell_supported,
@@ -213,6 +214,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
+    "cutlass",
     "flashinfer_cudnn",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
@@ -464,6 +466,7 @@ class ServerArgs:
     lora_eviction_policy: str = "lru"
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
+    experts_shared_outer_loras: Optional[bool] = None
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -518,6 +521,7 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+    enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -713,6 +717,7 @@ class ServerArgs:
         "transfer_engine", "nccl", "modelexpress"
     ] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    engine_info_bootstrap_port: int = 6789
     modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
@@ -1349,6 +1354,9 @@ class ServerArgs:
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
+        if self.cuda_graph_max_bs not in capture_bs:
+            capture_bs.append(self.cuda_graph_max_bs)
+
         return capture_bs
 
     def _generate_cpu_graph_batch_sizes(self):
@@ -1751,10 +1759,21 @@ class ServerArgs:
                     and is_triton_kernels_available()
                     and self.quantization is None
                 ):
-                    self.moe_runner_backend = "triton_kernel"
-                    logger.warning(
-                        "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
-                    )
+                    # The triton_kernels package segfaults on Blackwell (B200)
+                    # with NVIDIA driver >= 595. Fall back to triton backend.
+                    if is_blackwell_supported() and get_nvidia_driver_version() >= (
+                        595,
+                    ):
+                        self.moe_runner_backend = "triton"
+                        logger.warning(
+                            "Detected GPT-OSS model on Blackwell with driver >= 595, "
+                            "using triton MOE kernel to avoid triton_kernels SIGSEGV."
+                        )
+                    else:
+                        self.moe_runner_backend = "triton_kernel"
+                        logger.warning(
+                            "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
+                        )
 
             if self.moe_runner_backend == "triton_kernel":
                 assert (
@@ -2080,6 +2099,14 @@ class ServerArgs:
             self.enable_flashinfer_allreduce_fusion = True
             logger.info(
                 f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
+            )
+
+        # Apply enforce_disable_flashinfer_allreduce_fusion after all model-specific adjustments
+        if self.enforce_disable_flashinfer_allreduce_fusion:
+            self.enable_flashinfer_allreduce_fusion = False
+            logger.info(
+                "FlashInfer allreduce fusion is forcibly disabled "
+                "via --enforce-disable-flashinfer-allreduce-fusion."
             )
 
     def _handle_mamba_radix_cache(
@@ -4585,6 +4612,14 @@ class ServerArgs:
             choices=[16, 32, 64, 128],
             help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
         )
+        parser.add_argument(
+            "--experts-shared-outer-loras",
+            default=ServerArgs.experts_shared_outer_loras,
+            action="store_true",
+            help="Force shared outer LoRA mode for MoE models. "
+            "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
+            "(expert_dim=1). By default this is auto-detected from adapter weights.",
+        )
 
         # Kernel backend
         parser.add_argument(
@@ -4675,7 +4710,8 @@ class ServerArgs:
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
             "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
-            "'flashinfer_cutlass' (CUTLASS backend), "
+            "'cutlass' (SGLang CUTLASS kernel), "
+            "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
         )
@@ -4873,6 +4909,11 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+        )
+        parser.add_argument(
+            "--enforce-disable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enforce disable FlashInfer allreduce fusion.",
         )
         parser.add_argument(
             "--enable-aiter-allreduce-fusion",
@@ -5799,6 +5840,13 @@ class ServerArgs:
             help="Start seed server via transfer engine backend for remote instance weight loader.",
         )
         parser.add_argument(
+            "--engine-info-bootstrap-port",
+            type=int,
+            default=ServerArgs.engine_info_bootstrap_port,
+            help="Port for the engine info bootstrap server. Default is 6789. "
+            "Must be set explicitly when running multiple instances on the same node.",
+        )
+        parser.add_argument(
             "--modelexpress-config",
             type=str,
             default=ServerArgs.modelexpress_config,
@@ -5917,7 +5965,7 @@ class ServerArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
-    def url(self):
+    def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
         host = self.host
@@ -5925,7 +5973,13 @@ class ServerArgs:
             host = "127.0.0.1"
         elif host == "::":
             host = "::1"
-        return NetworkAddress(host, self.port).to_url(scheme)
+        return NetworkAddress(host, port if port is not None else self.port).to_url(
+            scheme
+        )
+
+    @property
+    def engine_info_bootstrap_url(self):
+        return self.url(port=self.engine_info_bootstrap_port)
 
     def ssl_verify(self):
         """Return the value for the requests library's ``verify=`` parameter.
