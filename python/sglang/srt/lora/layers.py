@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -711,6 +711,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
 
+        self.experts_shared_outer_loras: bool = False
+        self.quant_method = base_layer.quant_method
+
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
         self.intermediate_size_per_partition = getattr(
@@ -782,6 +785,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             adapter_enabled=adapter_enabled,
             max_lora_rank=max_lora_rank,
             num_experts=self.base_layer.num_experts,
+            experts_shared_outer_loras=self.experts_shared_outer_loras,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
@@ -839,9 +843,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         return B
 
     def slice_moe_lora_a_weights(
-        self, A: torch.Tensor, tp_rank: int, target_module: str
-    ) -> torch.Tensor:
+        self,
+        A: Union[torch.Tensor, Dict[int, torch.Tensor]],
+        tp_rank: int,
+        target_module: str,
+    ):
         """Slice LoRA A weights for MoE with TP.
+
+        Accepts:
+          - 2D tensor [rank, hidden] (single expert)
+          - 3D tensor [num_experts_or_1, rank, hidden]
+          - dict {expert_id: 2D tensor}
 
         Per-expert weight shapes:
           gate_up_proj_moe A: [rank, hidden_size]  — input is full hidden_states, no slice
@@ -849,17 +861,35 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
         if self.tp_size <= 1:
             return A
-        if target_module == "down_proj_moe":
-            shard_size = self.intermediate_size_per_partition
-            start = tp_rank * shard_size
-            end = start + shard_size
-            return A[:, start:end].contiguous()
-        return A
+        if target_module != "down_proj_moe":
+            return A
+        if isinstance(A, dict):
+            return {
+                eid: self._slice_moe_a(w, tp_rank, target_module)
+                for eid, w in A.items()
+            }
+        return self._slice_moe_a(A, tp_rank, target_module)
+
+    def _slice_moe_a(
+        self, A: torch.Tensor, tp_rank: int, target_module: str
+    ) -> torch.Tensor:
+        shard_size = self.intermediate_size_per_partition
+        start = tp_rank * shard_size
+        end = start + shard_size
+        return A[..., start:end].contiguous()
 
     def slice_moe_lora_b_weights(
-        self, B: torch.Tensor, tp_rank: int, target_module: str
-    ) -> torch.Tensor:
+        self,
+        B: Union[torch.Tensor, Dict[int, torch.Tensor]],
+        tp_rank: int,
+        target_module: str,
+    ):
         """Slice LoRA B weights for MoE with TP.
+
+        Accepts:
+          - 2D tensor [output_dim, rank] (single expert)
+          - 3D tensor [num_experts_or_1, output_dim, rank]
+          - dict {expert_id: 2D tensor}
 
         Per-expert weight shapes:
           gate_up_proj_moe B: [intermediate_size*2, rank] — output matches sharded base w13
@@ -867,6 +897,25 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
         if self.tp_size <= 1:
             return B
+        if target_module != "gate_up_proj_moe":
+            return B
+        if isinstance(B, dict):
+            return {
+                eid: self._slice_moe_b_2d(w, tp_rank, target_module)
+                for eid, w in B.items()
+            }
+        if isinstance(B, torch.Tensor) and B.dim() == 3:
+            return torch.stack(
+                [
+                    self._slice_moe_b_2d(B[i], tp_rank, target_module)
+                    for i in range(B.shape[0])
+                ]
+            )
+        return self._slice_moe_b_2d(B, tp_rank, target_module)
+
+    def _slice_moe_b_2d(
+        self, B: torch.Tensor, tp_rank: int, target_module: str
+    ) -> torch.Tensor:
         if target_module == "gate_up_proj_moe":
             shard_size = self.intermediate_size_per_partition
             start = tp_rank * shard_size
