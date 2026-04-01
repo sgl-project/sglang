@@ -55,9 +55,10 @@ BS_LIST = get_benchmark_range(
     ci_range=[16],
 )
 HIDDEN_SIZE_LIST = get_benchmark_range(
-    full_range=[1536, 3072, 4096, 5120, 8192],
-    ci_range=[512, 2048],
+    full_range=[1536, 3072, 4096, 5120, 8192, 12288, 16384],
+    ci_range=[4096],
 )
+NUM_LAYERS = 4
 
 LINE_VALS = ["aot", "jit", "flashinfer", "torch"]
 LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
@@ -81,17 +82,28 @@ configs = list(itertools.product(HIDDEN_SIZE_LIST, BS_LIST))
 )
 def benchmark(hidden_size: int, batch_size: int, provider: str):
     input = torch.randn(
-        (batch_size, hidden_size), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
+        (NUM_LAYERS, batch_size, hidden_size),
+        dtype=DEFAULT_DTYPE,
+        device=DEFAULT_DEVICE,
     )
-    weight = torch.randn(hidden_size, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
+    weight = torch.randn(
+        (NUM_LAYERS, hidden_size),
+        dtype=DEFAULT_DTYPE,
+        device=DEFAULT_DEVICE,
+    )
     FN_MAP = {
         "aot": sglang_aot_rmsnorm,
         "jit": sglang_jit_rmsnorm,
         "flashinfer": flashinfer_rmsnorm,
         "torch": torch_impl_rmsnorm,
     }
-    fn = lambda: FN_MAP[provider](input.clone(), weight)
-    return run_benchmark(fn)
+
+    def f():
+        fn = FN_MAP[provider]
+        for i in range(NUM_LAYERS):
+            fn(input[i], weight[i])
+
+    return run_benchmark(f, scale=NUM_LAYERS)
 
 
 if __name__ == "__main__":
