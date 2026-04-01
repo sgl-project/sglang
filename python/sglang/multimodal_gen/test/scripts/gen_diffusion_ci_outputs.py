@@ -28,9 +28,9 @@ def main():
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["1-gpu", "2-gpu", "1-gpu-b200"],
+        choices=list(SUITES.keys()),
         required=True,
-        help="Test suite to run (1-gpu, 2-gpu, or 1-gpu-b200)",
+        help="Test suite to run (choices: " + ", ".join(list(SUITES.keys())) + ")",
     )
     parser.add_argument(
         "--partition-id",
