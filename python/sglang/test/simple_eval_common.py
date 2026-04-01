@@ -516,7 +516,7 @@ def make_report_from_example_htmls(htmls: List[str]):
 def download_dataset(path, url):
     print(f"Downloading dataset {path} from {url}")
     try:
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=120)
         response.raise_for_status()
 
         total_size = int(response.headers.get("content-length", 0))
