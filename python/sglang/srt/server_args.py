@@ -3238,6 +3238,17 @@ class ServerArgs:
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
                 )
 
+        if self.disaggregation_mode in ("prefill", "decode"):
+            if (
+                envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+                and self.disaggregation_transfer_backend != "mooncake"
+            ):
+                raise ValueError(
+                    f"SGLANG_DISAGG_STAGING_BUFFER requires "
+                    f"disaggregation_transfer_backend='mooncake', "
+                    f"got '{self.disaggregation_transfer_backend}'."
+                )
+
     def _handle_encoder_disaggregation(self):
         if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
