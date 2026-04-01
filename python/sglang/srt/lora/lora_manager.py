@@ -134,9 +134,10 @@ class LoRAManager:
 
         try:
             # load configs
-            new_adapter = LoRAConfig(lora_ref.lora_path)
-            # Filter fake added tokens before validation (ID >= base vocab_size)
-            new_adapter.filter_added_tokens(self.base_hf_config.vocab_size)
+            new_adapter = LoRAConfig(
+                lora_ref.lora_path,
+                base_vocab_size=self.base_hf_config.vocab_size,
+            )
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -491,11 +492,6 @@ class LoRAManager:
                 default=0,
             )
 
-        # Filter fake added tokens from startup adapters (ID >= base vocab_size)
-        base_vocab_size = self.base_hf_config.vocab_size
-        for config in self.configs.values():
-            config.filter_added_tokens(base_vocab_size)
-
         # Auto-infer self.lora_added_vocab_size from loaded LoRA configs
         # This happens automatically without requiring user input
         # if self.lora_added_vocab_size is None:
@@ -567,9 +563,11 @@ class LoRAManager:
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
-            new_adapter = LoRAConfig.from_dict(config_dict, added_tokens_config)
-            # Filter fake added tokens before validation (ID >= base vocab_size)
-            new_adapter.filter_added_tokens(self.base_hf_config.vocab_size)
+            new_adapter = LoRAConfig.from_dict(
+                config_dict,
+                added_tokens_config,
+                base_vocab_size=self.base_hf_config.vocab_size,
+            )
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
