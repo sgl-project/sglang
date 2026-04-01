@@ -31,7 +31,7 @@ def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
-class TestSessionControl(unittest.TestCase):
+class TestSessionControl(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -43,6 +43,8 @@ class TestSessionControl(unittest.TestCase):
             other_args=[
                 "--attention-backend",
                 "triton",
+                "--disable-cuda-graph",
+                "--disable-piecewise-cuda-graph",
             ],
         )
 
