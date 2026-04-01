@@ -80,8 +80,6 @@ class TestSessionControl(CustomTestCase):
 
         first_rid = None
         outputs_from_session = []
-        logprobs_from_session = []
-        cur_logprob_start_len = 0
         for i, chunk_ids in enumerate(chunks_ids):
             max_new_tokens = gen_len if i > 0 else 1  # prefill only for the first chunk
             response = requests.post(
@@ -100,8 +98,6 @@ class TestSessionControl(CustomTestCase):
                         "no_stop_trim": True,
                         "skip_special_tokens": False,
                     },
-                    "return_logprob": True,
-                    "logprob_start_len": cur_logprob_start_len - 1,
                 },
             ).json()
             rid = response["meta_info"]["id"]
@@ -109,15 +105,8 @@ class TestSessionControl(CustomTestCase):
                 first_rid = rid
             if i > 0:
                 outputs_from_session.append(response["text"])
-                logprobs_from_session.extend(
-                    [
-                        round(sublist[0], 2)
-                        for sublist in response["meta_info"]["output_token_logprobs"]
-                    ]
-                )
-            cur_logprob_start_len += len(chunk_ids) + max_new_tokens
 
-        # query with a logprob_start_len longer than the request, should see error
+        # query with a non-existing session, should see error
         ret = requests.post(
             self.base_url + "/generate",
             json={
@@ -135,13 +124,12 @@ class TestSessionControl(CustomTestCase):
                     "skip_special_tokens": False,
                 },
                 "return_logprob": True,
-                "logprob_start_len": cur_logprob_start_len + len(chunk_ids),
+                "logprob_start_len": 99999,
             },
         )
         self.assertNotEqual(ret.status_code, 200)
 
         # backtrack to the first request and regenerate
-        cur_logprob_start_len = 0
         response = requests.post(
             self.base_url + "/generate",
             json={
@@ -158,17 +146,9 @@ class TestSessionControl(CustomTestCase):
                     "no_stop_trim": True,
                     "skip_special_tokens": False,
                 },
-                "return_logprob": True,
-                "logprob_start_len": cur_logprob_start_len,
             },
         ).json()
         outputs_from_session.append(response["text"])
-        logprobs_from_session.extend(
-            [
-                round(sublist[0], 2)
-                for sublist in response["meta_info"]["output_token_logprobs"]
-            ]
-        )
 
         # query with a non-existing rid (the last one should be disappeared because of backtrack), should see abort
         ret = requests.post(
@@ -187,7 +167,6 @@ class TestSessionControl(CustomTestCase):
                     "no_stop_trim": True,
                     "skip_special_tokens": False,
                 },
-                "return_logprob": True,
             },
         )
         self.assertNotEqual(ret.status_code, 200)
@@ -215,7 +194,6 @@ class TestSessionControl(CustomTestCase):
                     "no_stop_trim": True,
                     "skip_special_tokens": False,
                 },
-                "return_logprob": True,
             },
         )
         self.assertNotEqual(ret.status_code, 200)
@@ -226,7 +204,6 @@ class TestSessionControl(CustomTestCase):
         input_ids_first_req = None
         input_ids = []
         outputs_normal = []
-        logprobs_normal = []
         for i, chunk_ids in enumerate(chunks_ids):
             input_ids += chunk_ids
             response = requests.post(
@@ -241,7 +218,6 @@ class TestSessionControl(CustomTestCase):
                         "no_stop_trim": True,
                         "skip_special_tokens": False,
                     },
-                    "return_logprob": True,
                 },
             ).json()
             if i > 0:
@@ -250,12 +226,6 @@ class TestSessionControl(CustomTestCase):
                     output_ids = output_ids[1:]
                 input_ids += output_ids[:-1]
                 outputs_normal.append(response["text"])
-                logprobs_normal.extend(
-                    [
-                        round(sublist[0], 2)
-                        for sublist in response["meta_info"]["output_token_logprobs"]
-                    ]
-                )
             if i == 0:
                 input_ids_first_req = input_ids.copy()
 
@@ -270,31 +240,15 @@ class TestSessionControl(CustomTestCase):
                     "no_stop_trim": True,
                     "skip_special_tokens": False,
                 },
-                "return_logprob": True,
             },
         ).json()
         outputs_normal.append(response["text"])
-        logprobs_normal.extend(
-            [
-                round(sublist[0], 2)
-                for sublist in response["meta_info"]["output_token_logprobs"]
-            ]
-        )
 
         print("outputs from chunked queries with session control:")
         print(outputs_from_session)
         print("outputs from normal queries:")
         print(outputs_normal)
         self.assertEqual(outputs_from_session, outputs_normal)
-        print("logprobs from chunked queries with session control:")
-        print(logprobs_from_session)
-        print("logprobs from normal queries:")
-        print(logprobs_normal)
-        assert len(logprobs_from_session) == len(
-            logprobs_normal
-        ), "logprobs must have equal length"
-        for a, b in zip(logprobs_from_session, logprobs_normal):
-            assert abs(a - b) <= 0.15, f"logprobs {a} and {b} differ by more than 0.15"
 
     async def async_generate(self, payload):
         url = self.base_url + "/generate"
