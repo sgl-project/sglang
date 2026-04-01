@@ -451,7 +451,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 # Hot patch: torch-ROCm
 # The supported Triton version has been hardcoded in Pytorch as version 3.5.1.
 # Rewrite the restriction directly to METADATA file
-RUN sed -i '/Requires-Dist: triton.*/d' `ls -1 /opt/venv/lib/python3.10/site-packages/torch-*dist-info/METADATA`
+RUN sed -i '/Requires-Dist: triton.*/d' /opt/venv/lib/python3.10/site-packages/torch-*dist-info/METADATA
 
 # -----------------------
 # Hot patch: Triton
