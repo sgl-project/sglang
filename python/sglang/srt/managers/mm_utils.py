@@ -17,10 +17,6 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
-from sglang.srt.managers.io_struct import (
-    TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
-)
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
@@ -1754,6 +1750,29 @@ def unwrap_shm_features(obj):
     return obj
 
 
+def can_send_serialized(obj):
+    """
+    Check if the object contains any multimodal tensors that can be sent via shared memory serialization.
+    """
+    if hasattr(obj, "batch") and obj.batch:
+        return can_send_serialized(obj.batch[0])
+    elif hasattr(obj, "mm_inputs") and obj.mm_inputs:
+        mm_items = obj.mm_inputs.get("mm_items", [])
+        for item in mm_items:
+            if isinstance(item.feature, torch.Tensor) and item.feature.is_cpu:
+                return True
+    elif hasattr(obj, "image_inputs") and obj.image_inputs:
+        mm_items = obj.image_inputs.get("mm_items", [])
+        for item in mm_items:
+            if (
+                isinstance(item.precomputed_embeddings, torch.Tensor)
+                and item.precomputed_embeddings.is_cpu
+            ):
+                return True
+
+    return False
+
+
 class MMSendWrapper:
     """
     Wrapper for sending multimodal data, which sharing tensors with processes.
@@ -1761,30 +1780,12 @@ class MMSendWrapper:
 
     def __init__(self, send_to_scheduler: zmq.Socket):
         self.send_to_scheduler = send_to_scheduler
-        server_args = get_global_server_args()
-        self.force_send_pyobj = (
-            _get_is_default_transport()
-            or server_args.skip_tokenizer_init
-            or server_args.keep_mm_feature_on_device
-        )
 
     def serialize(self, obj):
         return [MultiprocessingSerializer.serialize(obj)]
 
-    def has_mm_data(self, obj):
-        if hasattr(obj, "batch"):
-            return self.has_mm_data(obj.batch[0]) if obj.batch else False
-        if isinstance(obj, TokenizedGenerateReqInput):
-            return obj.mm_inputs
-        elif isinstance(obj, TokenizedEmbeddingReqInput):
-            return obj.image_inputs
-        return False
-
     def send_pyobj(self, obj):
-        if self.force_send_pyobj:
-            return self.send_to_scheduler.send_pyobj(obj)
-
-        if self.has_mm_data(obj):
+        if can_send_serialized(obj):
             return self.send_to_scheduler.send_serialized(
                 msg=obj, serialize=self.serialize
             )
