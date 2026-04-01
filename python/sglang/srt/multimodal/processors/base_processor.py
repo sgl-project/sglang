@@ -175,6 +175,8 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    # Per-processor default image limit; subclasses may override.
+    IMAGE_MAX_NUM: Optional[int] = None
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -734,6 +736,19 @@ class BaseMultimodalProcessor(ABC):
         n_image = len(image_data) if image_data else 0
         n_video = len(video_data) if video_data else 0
         n_audio = len(audio_data) if audio_data else 0
+
+        # Enforce image count limit: server arg takes precedence, then per-processor default
+        max_images = (
+            self.server_args.max_images_per_request
+            if self.server_args.max_images_per_request is not None
+            else self.IMAGE_MAX_NUM
+        )
+        if max_images is not None and n_image > max_images:
+            raise ValueError(
+                f"Request contains {n_image} images, but the maximum allowed is "
+                f"{max_images}. Reduce the number of images or increase "
+                f"--max-images-per-request."
+            )
 
         # For MiniCPMO and MiniCPMV or multimodal_tokens not totally align, legacy show path
         if (

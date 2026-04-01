@@ -657,6 +657,7 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    max_images_per_request: Optional[int] = None
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
@@ -5590,6 +5591,14 @@ class ServerArgs:
             "--disable-fast-image-processor",
             action="store_true",
             help="Adopt base image processor instead of fast image processor.",
+        )
+        parser.add_argument(
+            "--max-images-per-request",
+            type=int,
+            default=ServerArgs.max_images_per_request,
+            help="Maximum number of images allowed per request. "
+            "Requests exceeding this limit will be rejected to prevent OOM. "
+            "If not set, per-processor defaults are used when available.",
         )
         parser.add_argument(
             "--keep-mm-feature-on-device",
