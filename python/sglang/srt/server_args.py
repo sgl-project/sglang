@@ -2138,19 +2138,6 @@ class ServerArgs:
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
 
-        # FlashInfer GDN decode is incompatible with no_buffer scheduling.
-        # See https://github.com/sgl-project/sglang/issues/20791
-        if (
-            self.linear_attn_decode_backend == "flashinfer"
-            and self.mamba_scheduler_strategy == "no_buffer"
-        ):
-            raise ValueError(
-                "FlashInfer GDN decode (--linear-attn-decode-backend flashinfer) is not "
-                "compatible with --mamba-scheduler-strategy no_buffer. "
-                "Please use --mamba-scheduler-strategy extra_buffer instead. "
-                "See https://github.com/sgl-project/sglang/issues/20791"
-            )
-
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
                 raise ValueError(
