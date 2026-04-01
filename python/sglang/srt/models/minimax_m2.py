@@ -25,6 +25,7 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -72,6 +73,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     make_layers,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +160,7 @@ def rmsnorm_apply_kernel_serial(
     tl.store(out2_row + offsets2, out2, mask=mask2)
 
 
+@debug_kernel_api
 def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     assert x1.is_cuda and x2.is_cuda
     B, D1 = x1.shape
@@ -196,6 +199,7 @@ def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     return sum_sq
 
 
+@debug_kernel_api
 def rms_apply_serial(
     x1: torch.Tensor,
     x2: torch.Tensor,
@@ -567,7 +571,7 @@ class MiniMaxM2Attention(nn.Module):
 
         # RoPE settings - support partial RoPE
         # FIXME: minimax_m2 config use external config that not compatible with transformers v5
-        self.rope_theta = config.rope_theta
+        self.rope_theta, self.rope_scaling = get_rope_config(config)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.rotary_dim = getattr(
             config, "rotary_dim", self.head_dim
@@ -597,13 +601,12 @@ class MiniMaxM2Attention(nn.Module):
         )
 
         # Setup RoPE with partial rotary dimension
-        rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,  # Use partial rotary dimension
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
-            rope_scaling=rope_scaling,
+            rope_scaling=self.rope_scaling,
         )
 
         # QK Normalization layers
@@ -710,7 +713,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            prefix=add_prefix("block_sparse_moe", prefix),
         )
 
         self.input_layernorm = RMSNorm(
