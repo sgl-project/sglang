@@ -29,10 +29,7 @@ if is_cuda():
         top_p_renorm_prob,
     )
 
-    from sglang.srt.layers.fused_sampling import (
-        fused_temperature_softmax,
-        fused_temperature_softmax_inplace,
-    )
+    from sglang.srt.layers.fused_sampling import fused_temperature_softmax_inplace
 
     _use_fused_sampling = True
 if is_npu():
@@ -44,32 +41,6 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
-
-
-def _sampling_batch_has_active_grammar(sampling_info: SamplingBatchInfo) -> bool:
-    g = sampling_info.grammars
-    return bool(g) and any(x for x in g if x)
-
-
-def _fused_temperature_softmax_to_probs_inplace(
-    logits: torch.Tensor,
-    temperatures: torch.Tensor,
-    *,
-    use_out_of_place: bool,
-) -> None:
-    """Scale by temperature and softmax into ``logits`` (probabilities), in-place.
-
-    When ``use_out_of_place`` is True, run the fused kernel with a separate fp32
-    buffer then ``copy_`` into ``logits``. That matches the legacy path (softmax
-    result stored in ``logits.dtype`` via PyTorch) and avoids writing fp32
-    softmax outputs directly into a bf16/fp16 logits tensor — which can skew
-    probabilities enough that xgrammar-guided decoding samples invalid tokens.
-    """
-    if use_out_of_place:
-        probs = fused_temperature_softmax(logits, temperatures)
-        logits.copy_(probs)
-    else:
-        fused_temperature_softmax_inplace(logits, temperatures)
 
 
 class Sampler(nn.Module):
@@ -187,14 +158,8 @@ class Sampler(nn.Module):
             else:
                 # Standard path: do softmax and sample from probs.
                 if _use_fused_sampling:
-                    # Structured output / xgrammar: keep numerics aligned with the
-                    # reference logits.div_; softmax(logits) path (probs in logits dtype).
-                    _fused_temperature_softmax_to_probs_inplace(
-                        logits,
-                        sampling_info.temperatures,
-                        use_out_of_place=_sampling_batch_has_active_grammar(
-                            sampling_info
-                        ),
+                    fused_temperature_softmax_inplace(
+                        logits, sampling_info.temperatures
                     )
                     probs = logits
                 else:

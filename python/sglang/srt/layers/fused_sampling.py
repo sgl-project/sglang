@@ -38,7 +38,6 @@ def _single_pass_temperature_softmax_kernel(
 ):
     row_idx = tl.program_id(0)
     temp = tl.load(temperatures_ptr + row_idx)
-    inv_temp = 1.0 / temp
 
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < vocab_size
@@ -48,7 +47,7 @@ def _single_pass_temperature_softmax_kernel(
         mask=mask,
         other=float("-inf"),
     )
-    x = (x * inv_temp).to(tl.float32)
+    x = (x / temp).to(tl.float32)
 
     x_max = tl.max(x, axis=0)
     exp_x = tl.exp(x - x_max)
@@ -67,14 +66,13 @@ def _single_pass_temperature_softmax_inplace_kernel(
 ):
     row_idx = tl.program_id(0)
     temp = tl.load(temperatures_ptr + row_idx)
-    inv_temp = 1.0 / temp
 
     row_start = logits_ptr + row_idx * stride
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < vocab_size
 
     x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
-    x = (x * inv_temp).to(tl.float32)
+    x = (x / temp).to(tl.float32)
 
     x_max = tl.max(x, axis=0)
     exp_x = tl.exp(x - x_max)
@@ -118,36 +116,36 @@ def _multi_pass_temperature_softmax_kernel(
 ):
     row_idx = tl.program_id(0)
     temp = tl.load(temperatures_ptr + row_idx)
-    inv_temp = 1.0 / temp
 
     logits_row = logits_ptr + row_idx * logits_stride
     output_row = output_ptr + row_idx * output_stride
 
-    running_max = tl.full([], value=float("-inf"), dtype=tl.float32)
-    running_sum = tl.full([], value=0.0, dtype=tl.float32)
-
+    # Pass 1: find global max (matches PyTorch's first reduction pass)
+    global_max = tl.full([], value=float("-inf"), dtype=tl.float32)
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
         x = tl.load(logits_row + offsets, mask=mask, other=float("-inf"))
-        x = (x * inv_temp).to(tl.float32)
+        x = (x / temp).to(tl.float32)
+        global_max = tl.maximum(global_max, tl.max(x, axis=0))
 
-        block_max = tl.max(x, axis=0)
-        new_max = tl.maximum(running_max, block_max)
-        running_sum = running_sum * tl.exp(running_max - new_max) + tl.sum(
-            tl.exp(x - new_max), axis=0
-        )
-        running_max = new_max
-
-    log_sum = tl.log(running_sum)
-
+    # Pass 2: compute sum of exp(x - max) (matches PyTorch's second pass)
+    sum_exp = tl.full([], value=0.0, dtype=tl.float32)
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
         x = tl.load(logits_row + offsets, mask=mask, other=float("-inf"))
-        x = (x * inv_temp).to(tl.float32)
+        x = (x / temp).to(tl.float32)
+        sum_exp += tl.sum(tl.exp(x - global_max), axis=0)
 
-        prob = tl.exp(x - running_max - log_sum)
+    # Pass 3: normalize (matches PyTorch's exp(x-max)/sum)
+    for start in range(0, vocab_size, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < vocab_size
+        x = tl.load(logits_row + offsets, mask=mask, other=float("-inf"))
+        x = (x / temp).to(tl.float32)
+
+        prob = tl.exp(x - global_max) / sum_exp
         tl.store(output_row + offsets, prob, mask=mask)
 
 
@@ -161,35 +159,35 @@ def _multi_pass_temperature_softmax_inplace_kernel(
 ):
     row_idx = tl.program_id(0)
     temp = tl.load(temperatures_ptr + row_idx)
-    inv_temp = 1.0 / temp
 
     row_start = logits_ptr + row_idx * stride
 
-    running_max = tl.full([], value=float("-inf"), dtype=tl.float32)
-    running_sum = tl.full([], value=0.0, dtype=tl.float32)
-
+    # Pass 1: find global max (matches PyTorch's first reduction pass)
+    global_max = tl.full([], value=float("-inf"), dtype=tl.float32)
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
         x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
-        x = (x * inv_temp).to(tl.float32)
+        x = (x / temp).to(tl.float32)
+        global_max = tl.maximum(global_max, tl.max(x, axis=0))
 
-        block_max = tl.max(x, axis=0)
-        new_max = tl.maximum(running_max, block_max)
-        running_sum = running_sum * tl.exp(running_max - new_max) + tl.sum(
-            tl.exp(x - new_max), axis=0
-        )
-        running_max = new_max
-
-    log_sum = tl.log(running_sum)
-
+    # Pass 2: compute sum of exp(x - max) (matches PyTorch's second pass)
+    sum_exp = tl.full([], value=0.0, dtype=tl.float32)
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
         x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
-        x = (x * inv_temp).to(tl.float32)
+        x = (x / temp).to(tl.float32)
+        sum_exp += tl.sum(tl.exp(x - global_max), axis=0)
 
-        prob = tl.exp(x - running_max - log_sum)
+    # Pass 3: normalize (matches PyTorch's exp(x-max)/sum)
+    for start in range(0, vocab_size, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < vocab_size
+        x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
+        x = (x / temp).to(tl.float32)
+
+        prob = tl.exp(x - global_max) / sum_exp
         tl.store(row_start + offsets, prob, mask=mask)
 
 
