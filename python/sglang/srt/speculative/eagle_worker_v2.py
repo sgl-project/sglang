@@ -262,11 +262,18 @@ class EagleDraftWorker(BaseDraftWorker):
         from sglang.srt.distributed import (
             get_world_group,
         )
+
         if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
             # lazy init main model of eagle mode graph capture till now
             from sglang.srt.hardware_backend.npu.utils import lazy_init_zbal_gva_mem
-            lazy_init_zbal_gva_mem(self.device, self.gpu_id, self.tp_rank, self.target_worker.model_runner.tp_size,
-                                   get_world_group().cpu_group)
+
+            lazy_init_zbal_gva_mem(
+                self.device,
+                self.gpu_id,
+                self.tp_rank,
+                self.target_worker.model_runner.tp_size,
+                get_world_group().cpu_group,
+            )
 
             self.target_worker.model_runner.init_attention_backend()
             self.target_worker.model_runner.init_device_graphs()

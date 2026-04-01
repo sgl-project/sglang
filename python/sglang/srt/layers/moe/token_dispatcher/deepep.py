@@ -40,8 +40,8 @@ if TYPE_CHECKING:
 
 try:
     if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
-        from zbal.zbal_buffer import Buffer
         from zbal.zbal.deepep_adaptor import Config
+        from zbal.zbal_buffer import Buffer
     else:
         from deep_ep import Buffer, Config
 

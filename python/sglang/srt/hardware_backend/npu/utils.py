@@ -1,8 +1,9 @@
 import functools
 import logging
+import sys
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable
-import sys
+
 import torch
 
 from sglang.srt.environ import envs
@@ -190,17 +191,23 @@ def init_zbal(tp_size, gpu_id, tp_rank, do_check=True):
         return 1
 
     global gva_is_inited
-    from zbal import switch_to_allocator, is_mix_alloc, zbal_init
+    from zbal import is_mix_alloc, switch_to_allocator, zbal_init
+
     if is_mix_alloc():
         switch_to_allocator()
         # use lazy init for mix alloc
         return 1
     else:
         if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
-            ret = zbal_init(tp_size, gpu_id, tp_rank, zbal_mem_size * (1024 ** 2),
-                             ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get())
+            ret = zbal_init(
+                tp_size,
+                gpu_id,
+                tp_rank,
+                zbal_mem_size * (1024**2),
+                ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get(),
+            )
         else:
-            ret = zbal_init(tp_size, gpu_id, tp_rank, zbal_mem_size * (1024 ** 2))
+            ret = zbal_init(tp_size, gpu_id, tp_rank, zbal_mem_size * (1024**2))
 
         gva_is_inited = True
 
@@ -211,22 +218,32 @@ def init_zbal(tp_size, gpu_id, tp_rank, do_check=True):
         return ret
 
 
-def lazy_init_zbal_gva_mem(device, gpu_id, world_rank, world_size, cpu_group=None, do_check=True):
+def lazy_init_zbal_gva_mem(
+    device, gpu_id, world_rank, world_size, cpu_group=None, do_check=True
+):
     """
     lazy init zbal gva mem, keep weights and kv remains alloc by dma vmm to avoid memory fragment
     """
-    from zbal import zbal_init, zbal_set_logger_level, is_mix_alloc
+    from zbal import is_mix_alloc, zbal_init
+
     if not is_mix_alloc():
-        logger.info("lazy init is supported only in mix alloc mode, this action will be passed")
+        logger.info(
+            "lazy init is supported only in mix alloc mode, this action will be passed"
+        )
         return 1
 
     global gva_is_inited
     from sglang.srt.utils.common import get_available_gpu_memory
+
     # TODO need to use allgather if you want use total_memory stats from mem_get_info as unbalance os
-    total_memory = 61.2   # 2.5GB for other (workspace & os) outside torch
-    free_gpu_memory = get_available_gpu_memory(device, gpu_id,
-                                               distributed=world_size > 1,
-                                               cpu_group=cpu_group, empty_cache=True)
+    total_memory = 61.2  # 2.5GB for other (workspace & os) outside torch
+    free_gpu_memory = get_available_gpu_memory(
+        device,
+        gpu_id,
+        distributed=world_size > 1,
+        cpu_group=cpu_group,
+        empty_cache=True,
+    )
 
     used_memory = total_memory - free_gpu_memory
 

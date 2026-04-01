@@ -570,6 +570,7 @@ def get_available_gpu_memory(
             torch.npu.empty_cache()
         if envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
             import zbal
+
             if not zbal.is_mix_alloc():
                 free_gpu_memory, total_gpu_memory = zbal.zbal_module.mem_get_info()
             else:
