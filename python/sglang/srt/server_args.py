@@ -726,8 +726,6 @@ class ServerArgs:
     sm_group_num: int = 8
 
     # For Multi-Modal
-    mm_max_concurrent_calls: int = 32
-    mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
     enable_prefix_mm_cache: bool = False
     mm_enable_dp_encoder: bool = False
@@ -5892,18 +5890,6 @@ class ServerArgs:
         )
 
         # For Multi-Modal
-        parser.add_argument(
-            "--mm-max-concurrent-calls",
-            type=int,
-            default=ServerArgs.mm_max_concurrent_calls,
-            help="The max concurrent calls for async mm data processing.",
-        )
-        parser.add_argument(
-            "--mm-per-request-timeout",
-            type=int,
-            default=ServerArgs.mm_per_request_timeout,
-            help="The timeout for each multi-modal request in seconds.",
-        )
         parser.add_argument(
             "--enable-broadcast-mm-inputs-process",
             action="store_true",
