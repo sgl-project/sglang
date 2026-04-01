@@ -395,18 +395,9 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
-        original_mm_items = obj["mm_items"]
-        for mm_item in original_mm_items:
+        mm_items = obj["mm_items"]
+        for mm_item in mm_items:
             mm_item.reconstruct()
-
-        # Check if MM splitting is enabled
-        if not envs.SGLANG_ENABLE_MM_SPLITTING.get():
-            mm_items = original_mm_items
-        else:
-            from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-
-            # Now, `mm_items` contains one item per image.
-            mm_items = get_new_expanded_mm_items(original_mm_items)
 
         ret = MultimodalInputs(
             mm_items=mm_items,

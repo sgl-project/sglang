@@ -1141,6 +1141,11 @@ class BaseMultimodalProcessor(ABC):
                 mm_token_id=mm_token_id,
             )
 
+        # Split bundled items into per-image/video items for better cache granularity
+        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+        all_collected_items = get_new_expanded_mm_items(all_collected_items)
+
         """
         solution for cuda-ipc memory-leak:
         1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
