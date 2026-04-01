@@ -398,7 +398,7 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
         else:
-            if _use_aiter_gfx95:
+            if _use_aiter_gfx95 and self.kv_cache_dtype != "fp4_e2m1":
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
@@ -592,4 +592,5 @@ class DeepseekMLAForwardMixin:
                 server_args.nsa_decode_backend == "tilelang"
                 or server_args.nsa_prefill_backend == "tilelang"
             )
+            and self.kv_cache_dtype != "fp4_e2m1"
         )

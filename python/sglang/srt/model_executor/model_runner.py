@@ -1891,7 +1891,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
-            if hasattr(torch, "float4_e2m1fn_x2"):
+            if _is_hip:
+                self.kv_cache_dtype = torch.uint8
+                self._use_fp4_nsa_kv_cache = True
+                logger.warning("FP4 (E2M1) KV Cache might lead to a accuracy drop!")
+            elif hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
                 logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
             else:

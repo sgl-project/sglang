@@ -322,6 +322,163 @@ def get_mla_kv_buffer_triton(
     )
 
 
+FP4_BLOCK_SIZE = 16
+FP4_NOPE_DIM = 512
+FP4_ROPE_DIM = 64
+FP4_PACKED_NOPE_BYTES = FP4_NOPE_DIM // 2  # 256
+FP4_NUM_SCALE_BLOCKS = FP4_NOPE_DIM // FP4_BLOCK_SIZE  # 32
+FP4_ROPE_BYTES = FP4_ROPE_DIM * 2  # 128 (BF16 = 2 bytes per element)
+FP4_KV_CACHE_DIM = FP4_PACKED_NOPE_BYTES + FP4_NUM_SCALE_BLOCKS + FP4_ROPE_BYTES  # 416
+
+
+@triton.jit
+def set_mla_kv_buffer_fp4_quant_kernel(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_u8_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    rope_u8_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_bytes: tl.constexpr,
+    FP4_BLK: tl.constexpr,
+    FB_PER_PROG: tl.constexpr,
+    N_NOPE_PROGS: tl.constexpr,
+):
+    """Fuse BF16 -> FP4 E2M1 quantization with paged KV write.
+
+    Grid: (n_loc, N_NOPE_PROGS + 1).
+    Programs 0..N_NOPE_PROGS-1 handle nope quantization.
+    Last program copies rope bytes.
+    """
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    HALF_BLK: tl.constexpr = FP4_BLK // 2
+    packed_nope_bytes: tl.constexpr = nope_dim // 2
+    n_fp4_blocks: tl.constexpr = nope_dim // FP4_BLK
+
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    buf_base = kv_buffer_ptr + loc * buffer_stride
+
+    if pid_blk < N_NOPE_PROGS:
+        prog_start = pid_blk * FB_PER_PROG
+        nope_base = cache_k_nope_ptr + pid_loc * nope_stride
+
+        for fb_i in range(FB_PER_PROG):
+            block_id = prog_start + fb_i
+            base_off = block_id * FP4_BLK
+            pair_idx = tl.arange(0, HALF_BLK)
+
+            even_offs = base_off + pair_idx * 2
+            odd_offs = even_offs + 1
+            src_even = tl.load(nope_base + even_offs).to(tl.float32)
+            src_odd = tl.load(nope_base + odd_offs).to(tl.float32)
+
+            amax = tl.maximum(tl.max(tl.abs(src_even)), tl.max(tl.abs(src_odd)))
+            amax = tl.maximum(amax, 1e-12)
+            scale_exp = tl.math.ceil(tl.math.log2(amax / 6.0))
+            inv_scale = 1.0 / tl.math.exp2(scale_exp)
+            scale_u8 = (scale_exp + 127.0).to(tl.uint8)
+
+            se = src_even * inv_scale
+            so = src_odd * inv_scale
+
+            # E2M1 quantize even
+            sign_e = (se < 0.0).to(tl.int32) * 8
+            ae = tl.abs(se)
+            mag_e = (
+                (ae >= 0.25).to(tl.int32)
+                + (ae >= 0.75).to(tl.int32)
+                + (ae >= 1.25).to(tl.int32)
+                + (ae >= 1.75).to(tl.int32)
+                + (ae >= 2.5).to(tl.int32)
+                + (ae >= 3.5).to(tl.int32)
+                + (ae >= 5.0).to(tl.int32)
+            )
+            fp4_e = (sign_e + mag_e).to(tl.uint8)
+
+            # E2M1 quantize odd
+            sign_o = (so < 0.0).to(tl.int32) * 8
+            ao = tl.abs(so)
+            mag_o = (
+                (ao >= 0.25).to(tl.int32)
+                + (ao >= 0.75).to(tl.int32)
+                + (ao >= 1.25).to(tl.int32)
+                + (ao >= 1.75).to(tl.int32)
+                + (ao >= 2.5).to(tl.int32)
+                + (ao >= 3.5).to(tl.int32)
+                + (ao >= 5.0).to(tl.int32)
+            )
+            fp4_o = (sign_o + mag_o).to(tl.uint8)
+
+            packed = (fp4_o << 4) | fp4_e
+
+            tl.store(buf_base + block_id * HALF_BLK + pair_idx, packed)
+            tl.store(buf_base + packed_nope_bytes + block_id, scale_u8)
+    else:
+        # Copy rope bytes (BF16 viewed as uint8)
+        ROPE_BLK: tl.constexpr = rope_bytes
+        rope_offs = tl.arange(0, ROPE_BLK)
+        mask = rope_offs < rope_bytes
+        src = tl.load(
+            cache_k_rope_u8_ptr + pid_loc * rope_u8_stride + rope_offs, mask=mask
+        )
+        tl.store(
+            buf_base + packed_nope_bytes + n_fp4_blocks + rope_offs, src, mask=mask
+        )
+
+
+def set_mla_kv_buffer_triton_fp4_quant(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    """Fuse BF16 MLA K → FP4 E2M1 quantization with paged KV write."""
+    cache_k_nope = cache_k_nope.squeeze(1) if cache_k_nope.ndim == 3 else cache_k_nope
+    cache_k_rope = cache_k_rope.squeeze(1) if cache_k_rope.ndim == 3 else cache_k_rope
+
+    cache_k_nope = cache_k_nope.contiguous()
+    cache_k_rope = cache_k_rope.contiguous()
+
+    nope_dim = cache_k_nope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1]
+    rope_bytes = rope_dim * cache_k_rope.element_size()
+
+    assert nope_dim == FP4_NOPE_DIM, f"nope_dim must be {FP4_NOPE_DIM}, got {nope_dim}"
+    assert rope_dim == FP4_ROPE_DIM, f"rope_dim must be {FP4_ROPE_DIM}, got {rope_dim}"
+    assert nope_dim % FP4_BLOCK_SIZE == 0
+
+    rope_u8 = cache_k_rope.view(torch.uint8)
+
+    FP4_BLK = FP4_BLOCK_SIZE
+    n_fp4_blocks = nope_dim // FP4_BLK
+    FB_PER_PROG = 4
+    N_NOPE_PROGS = n_fp4_blocks // FB_PER_PROG
+    assert n_fp4_blocks % FB_PER_PROG == 0
+
+    n_loc = loc.numel()
+    grid = (n_loc, N_NOPE_PROGS + 1)
+
+    set_mla_kv_buffer_fp4_quant_kernel[grid](
+        kv_buffer,
+        cache_k_nope,
+        rope_u8,
+        loc,
+        kv_buffer.stride(0),
+        cache_k_nope.stride(0),
+        rope_u8.stride(0),
+        nope_dim,
+        rope_bytes,
+        FP4_BLK=FP4_BLK,
+        FB_PER_PROG=FB_PER_PROG,
+        N_NOPE_PROGS=N_NOPE_PROGS,
+        num_warps=1,
+    )
+
+
 def maybe_init_custom_mem_pool(
     device: str,
 ) -> Tuple[bool, Optional[Any], Optional[str]]:

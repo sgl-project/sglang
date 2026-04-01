@@ -260,10 +260,15 @@ class ModelRunnerKVCacheMixin:
 
         # On HIP with TileLang backend, keep the default MLA KV cache dimension.
         # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
+        # FP4 uses its own compact layout (416 bytes) managed by NSATokenToKVPoolFP4.
         if _is_hip and (
             self.server_args.nsa_prefill_backend == "tilelang"
             or self.server_args.nsa_decode_backend == "tilelang"
         ):
+            if getattr(self, "_use_fp4_nsa_kv_cache", False):
+                from sglang.srt.mem_cache.utils import FP4_KV_CACHE_DIM
+
+                return FP4_KV_CACHE_DIM
             return kv_cache_dim
 
         quant_block_size = NSATokenToKVPool.quant_block_size
@@ -571,6 +576,10 @@ class ModelRunnerKVCacheMixin:
                     hisparse_cfg.host_to_device_ratio
                 )
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
+            elif getattr(self, "_use_fp4_nsa_kv_cache", False):
+                from sglang.srt.mem_cache.memory_pool import NSATokenToKVPoolFP4
+
+                self.token_to_kv_pool = NSATokenToKVPoolFP4(**nsa_pool_kwargs)
             else:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:
