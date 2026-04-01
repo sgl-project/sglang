@@ -13,9 +13,9 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
@@ -291,8 +291,8 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = DEFAULT_TARGET_MODEL_EAGLE
-        cls.draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE3
+        cls.draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
         cls.spec_args = [
             "--speculative-algorithm",
             "EAGLE",
@@ -306,6 +306,7 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
             "16",
             "--cuda-graph-max-bs",
             "8",
+            "--dtype=float16",
         ]
         print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
@@ -365,14 +366,14 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
-            parallel=2,
+            parallel=128,
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.20)
+        self.assertGreater(metrics["accuracy"], 0.74)
 
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):

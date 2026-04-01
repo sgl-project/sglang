@@ -19,6 +19,7 @@ from requests.exceptions import RequestException
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.utils import load_diffusion_overlay_registry_from_env
 
 logger = init_logger(__name__)
 
@@ -60,28 +61,12 @@ def _load_model_overlay_registry() -> dict[str, dict[str, Any]]:
     # Built-in registry is the stable default path; env only overrides it.
     normalized = _normalize_model_overlay_registry(BUILTIN_MODEL_OVERLAY_REGISTRY)
 
-    raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
-    if not raw_value:
+    env_registry = load_diffusion_overlay_registry_from_env()
+    if not env_registry:
         _MODEL_OVERLAY_REGISTRY_CACHE = normalized
         return _MODEL_OVERLAY_REGISTRY_CACHE
 
-    try:
-        if raw_value.startswith("{"):
-            payload = json.loads(raw_value)
-        else:
-            with open(os.path.expanduser(raw_value), encoding="utf-8") as f:
-                payload = json.load(f)
-    except Exception as exc:
-        raise ValueError(
-            "Failed to parse SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY"
-        ) from exc
-
-    if not isinstance(payload, dict):
-        raise ValueError(
-            "SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY must be a JSON object"
-        )
-
-    normalized.update(_normalize_model_overlay_registry(payload))
+    normalized.update(_normalize_model_overlay_registry(env_registry))
     _MODEL_OVERLAY_REGISTRY_CACHE = normalized
     return _MODEL_OVERLAY_REGISTRY_CACHE
 
@@ -462,11 +447,23 @@ def materialize_overlay_model(
         ):
             return final_dir
 
+        logger.info(
+            "Materializing overlay model for %s into %s",
+            source_model_id,
+            final_dir,
+        )
+        logger.info(
+            "Overlay source repo: %s, overlay repo: %s@%s",
+            source_model_id,
+            overlay_repo_id,
+            overlay_revision,
+        )
         tmp_dir = final_dir + ".tmp"
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir)
         if os.path.exists(final_dir):
             shutil.rmtree(final_dir)
+        logger.info("Copying overlay metadata into temporary materialized directory")
         shutil.copytree(
             overlay_dir,
             tmp_dir,
@@ -479,10 +476,16 @@ def materialize_overlay_model(
 
         file_mappings = manifest.get("file_mappings", [])
         if file_mappings:
+            logger.info("Applying %d overlay file mappings", len(file_mappings))
             _apply_overlay_file_mappings(
                 source_dir=source_dir,
                 output_dir=tmp_dir,
                 file_mappings=cast(list[dict[str, Any]], file_mappings),
+            )
+        if manifest.get("custom_materializer"):
+            logger.info(
+                "Running custom overlay materializer: %s",
+                manifest["custom_materializer"],
             )
         _run_overlay_custom_materializer(
             overlay_dir=overlay_dir,
@@ -506,6 +509,7 @@ def materialize_overlay_model(
             )
 
         os.replace(tmp_dir, final_dir)
+        logger.info("Overlay materialization finished: %s", final_dir)
 
     return final_dir
 

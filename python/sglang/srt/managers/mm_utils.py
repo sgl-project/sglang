@@ -994,6 +994,8 @@ def embed_mm_inputs(
                     multimodal_model.separate_deepstack_embeds(embedding)
                 )
                 deepstack_embeddings += [deepstack_embedding]
+            else:
+                deepstack_embeddings += [None]
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
@@ -1721,6 +1723,19 @@ def wrap_shm_features(obj):
             ):
                 item.feature = ShmPointerMMData(item.feature)
     return obj
+
+
+def has_shm_features(recv_reqs):
+    """Return True if any request in the list contains ShmPointerMMData."""
+    for req in recv_reqs:
+        if hasattr(req, "batch"):
+            if has_shm_features(req.batch):
+                return True
+        elif hasattr(req, "mm_inputs") and req.mm_inputs:
+            for item in req.mm_inputs.get("mm_items", []):
+                if isinstance(item.feature, ShmPointerMMData):
+                    return True
+    return False
 
 
 def unwrap_shm_features(obj):
