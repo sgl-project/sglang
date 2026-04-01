@@ -143,7 +143,6 @@ test = [
   "pytest",
   "pytest-cov",
   "diff-cover",
-  "runai-model-streamer[gcs]>=0.15.7",
   "sentence_transformers",
   "tabulate",
 ]
@@ -153,7 +152,6 @@ dev = ["sglang[test]"]
 all = [
   "sglang[diffusion]",
   "sglang[tracing]",
-  "sglang[runai]",
 ]
 
 [tool.uv.extra-build-dependencies]
