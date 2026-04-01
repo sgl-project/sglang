@@ -32,6 +32,11 @@ Notes:
 1. `SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY` is only an optional override for
 development and debugging. It accepts either a JSON object or a path to a JSON
 file, and can extend or replace built-in entries for the current process.
+2. On the first load, SGLang will:
+   - download overlay metadata from the overlay repo
+   - download the required files from the original source repo
+   - materialize a local standard component repo under `~/.cache/sgl_diffusion/materialized_models/`
+3. Later loads reuse the materialized local repo. The materialized repo is what the runtime loads as a normal componentized model directory.
 
 
 ## Quick Start

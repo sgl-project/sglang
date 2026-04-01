@@ -49,6 +49,9 @@ import uvloop
 import zmq
 
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
+from sglang.srt.entrypoints.engine_info_bootstrap_server import (
+    EngineInfoBootstrapServer,
+)
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -80,9 +83,6 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tokenizer_manager_multiitem_mixin import ScoreResult
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
-)
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -98,7 +98,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -116,6 +116,7 @@ class SchedulerInitResult:
     scheduler_infos: List[Dict[str, Any]]
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
+    engine_info_bootstrap_server: Optional[Any] = None
 
 
 def init_tokenizer_manager(
@@ -201,11 +202,11 @@ class Engine(EngineBase):
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
-        self.remote_instance_transfer_engine_info = (
-            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
-                scheduler_init_result.scheduler_infos
+        # Access transfer engine info if bootstrap server is started.
+        if scheduler_init_result.engine_info_bootstrap_server is not None:
+            self.remote_instance_transfer_engine_info = (
+                scheduler_init_result.engine_info_bootstrap_server.transfer_engine_info
             )
-        )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -642,9 +643,29 @@ class Engine(EngineBase):
             port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
+        # Start the engine info bootstrap server if per-rank info is needed.
+        engine_info_bootstrap_server = None
+        if (
+            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
+            and server_args.node_rank == 0
+        ):
+            bootstrap_port = server_args.engine_info_bootstrap_port
+            if not is_port_available(bootstrap_port):
+                raise RuntimeError(
+                    f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
+                    f"When running multiple instances on the same node, each instance must use a "
+                    f"different --engine-info-bootstrap-port."
+                )
+            engine_info_bootstrap_server = EngineInfoBootstrapServer(
+                host=server_args.host, port=bootstrap_port
+            )
+
         # Launch scheduler processes
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
+        )
+        scheduler_init_result.engine_info_bootstrap_server = (
+            engine_info_bootstrap_server
         )
 
         if (
@@ -1174,7 +1195,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.6",
+                "0.6.7",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
