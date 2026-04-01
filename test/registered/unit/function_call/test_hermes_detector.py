@@ -1,16 +1,16 @@
 """Unit tests for HermesDetector — no server, no model loading."""
 
 import json
-import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
-class TestHermesDetector(unittest.TestCase):
+class TestHermesDetector(CustomTestCase):
     def setUp(self):
         self.tools = [
             Tool(
@@ -120,6 +120,7 @@ class TestHermesDetector(unittest.TestCase):
     # ==================== Streaming Tests ====================
 
     def test_streaming_single_tool_call(self):
+        detector = HermesDetector()
         chunks = [
             "<tool_",
             'call>{"name": "get_weather",',
@@ -128,19 +129,50 @@ class TestHermesDetector(unittest.TestCase):
         ]
         all_calls = []
         for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            result = detector.parse_streaming_increment(chunk, self.tools)
             all_calls.extend(result.calls)
 
-        # Should have at least the tool name and arguments
-        self.assertTrue(len(all_calls) > 0)
+        # Verify tool name
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "get_weather")
+
+        # Verify parameters
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["city"], "Beijing")
 
     def test_streaming_normal_text_before_tool(self):
-        result = self.detector.parse_streaming_increment(
-            "Hello! Let me help. ", self.tools
-        )
-        self.assertIn("Hello", result.normal_text)
+        detector = HermesDetector()
+        result = detector.parse_streaming_increment("Hello! Let me help. ", self.tools)
+        self.assertEqual(result.normal_text, "Hello! Let me help. ")
         self.assertEqual(len(result.calls), 0)
+
+    def test_streaming_text_then_tool_call(self):
+        detector = HermesDetector()
+        chunks = [
+            "Sure, let me check. ",
+            '<tool_call>{"name": "get_weather",',
+            ' "arguments": {"city": "Tokyo"',
+            "}}</tool_call>",
+        ]
+        all_calls = []
+        all_normal_text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+            all_normal_text += result.normal_text
+
+        self.assertEqual(all_normal_text, "Sure, let me check. ")
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "get_weather")
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["city"], "Tokyo")
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()

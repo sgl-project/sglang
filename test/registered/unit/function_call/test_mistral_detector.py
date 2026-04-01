@@ -1,16 +1,16 @@
 """Unit tests for MistralDetector — no server, no model loading."""
 
 import json
-import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
-class TestMistralDetector(unittest.TestCase):
+class TestMistralDetector(CustomTestCase):
     def setUp(self):
         self.tools = [
             Tool(
@@ -103,16 +103,11 @@ class TestMistralDetector(unittest.TestCase):
         args = json.loads(result.calls[0].parameters)
         self.assertEqual(args["city"], "Beijing")
 
-    def test_compact_format_with_closing_bracket(self):
-        text = '[TOOL_CALLS]get_weather[ARGS]{"city": "Beijing"}'
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-
     def test_compact_format_with_leading_text(self):
         text = 'Let me help. [TOOL_CALLS]get_weather[ARGS]{"city": "Tokyo"}'
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
-        self.assertIn("Let me help.", result.normal_text)
+        self.assertEqual(result.normal_text, "Let me help.")
 
     # ==================== No Tool Call Tests ====================
 
@@ -171,6 +166,58 @@ class TestMistralDetector(unittest.TestCase):
         self.assertIn("[TOOL_CALLS]", info.trigger)
         self.assertEqual(info.end, "}]")
 
+    # ==================== Streaming Tests ====================
+
+    def test_streaming_compact_format(self):
+        detector = MistralDetector()
+        chunks = [
+            "[TOOL_",
+            "CALLS]get_weather",
+            '[ARGS]{"city": "Beijing"}',
+        ]
+        all_calls = []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "get_weather")
+
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["city"], "Beijing")
+
+    def test_streaming_normal_text_before_tool(self):
+        detector = MistralDetector()
+        result = detector.parse_streaming_increment("Let me check. ", self.tools)
+        self.assertEqual(result.normal_text, "Let me check. ")
+        self.assertEqual(len(result.calls), 0)
+
+    def test_streaming_text_then_tool_call(self):
+        detector = MistralDetector()
+        chunks = [
+            "Sure! ",
+            "[TOOL_CALLS]get_weather",
+            '[ARGS]{"city": "Tokyo"}',
+        ]
+        all_calls = []
+        all_normal_text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+            all_normal_text += result.normal_text
+
+        self.assertEqual(all_normal_text, "Sure! ")
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "get_weather")
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["city"], "Tokyo")
+
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()

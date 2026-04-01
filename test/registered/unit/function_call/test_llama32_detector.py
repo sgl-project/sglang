@@ -1,16 +1,16 @@
 """Unit tests for Llama32Detector — no server, no model loading."""
 
 import json
-import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
-class TestLlama32Detector(unittest.TestCase):
+class TestLlama32Detector(CustomTestCase):
     def setUp(self):
         self.tools = [
             Tool(
@@ -130,6 +130,63 @@ class TestLlama32Detector(unittest.TestCase):
         self.assertIn("<|python_tag|>", info.begin)
         self.assertEqual(info.trigger, "<|python_tag|>")
 
+    # ==================== Streaming Tests ====================
+
+    def test_streaming_single_tool_call(self):
+        detector = Llama32Detector()
+        chunks = [
+            "<|python_",
+            'tag|>{"name": "get_weather",',
+            ' "arguments": {"city": "Beijing"',
+            "}}",
+        ]
+        all_calls = []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "get_weather")
+
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["city"], "Beijing")
+
+    def test_streaming_normal_text_before_tool(self):
+        detector = Llama32Detector()
+        result = detector.parse_streaming_increment(
+            "Let me check the weather. ", self.tools
+        )
+        self.assertEqual(result.normal_text, "Let me check the weather. ")
+        self.assertEqual(len(result.calls), 0)
+
+    def test_streaming_text_then_tool_call(self):
+        detector = Llama32Detector()
+        chunks = [
+            "I'll look that up. ",
+            '<|python_tag|>{"name": "get_weather",',
+            ' "arguments": {"city": "Tokyo", "unit": "celsius"',
+            "}}",
+        ]
+        all_calls = []
+        all_normal_text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+            all_normal_text += result.normal_text
+
+        self.assertEqual(all_normal_text, "I'll look that up. ")
+        func_calls = [c for c in all_calls if c.name]
+        self.assertEqual(len(func_calls), 1)
+        self.assertEqual(func_calls[0].name, "get_weather")
+        full_params = "".join(c.parameters for c in all_calls if c.parameters)
+        params = json.loads(full_params)
+        self.assertEqual(params["city"], "Tokyo")
+        self.assertEqual(params["unit"], "celsius")
+
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()
