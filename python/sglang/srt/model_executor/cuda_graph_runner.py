@@ -77,6 +77,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+from sglang.srt.utils.torch_compile import compile_with_debug, warmup_compiled_fn
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 try:
@@ -637,6 +638,11 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
+        self.compile_replay_prepare = hasattr(
+            torch._inductor.config, "batch_foreach_copy_fusion"
+        )
+        self.compiled_replay_prepare = None
+
         # Speculative_inference
         if (
             model_runner.spec_algorithm.is_eagle3()
@@ -1062,31 +1068,16 @@ class CudaGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
-    def replay_prepare(
+    def _populate_from_forward_batch_and_init_attn_backend(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        buffers=None,
+        raw_bs: int = 0,
+        raw_num_token: int = 0,
+        bs: int = 0,
     ):
-        buffers = self.buffers
-        self.recapture_if_needed(forward_batch)
-
-        raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
-
-        # Pad
-        if self.require_mlp_tp_gather:
-            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                else max_num_tokens
-            )
-            index = bisect.bisect_left(self.capture_bs, max_batch_size)
-        else:
-            index = bisect.bisect_left(self.capture_bs, raw_bs)
-        bs = self.capture_bs[index]
-
+        """Populate input buffers and initialize attention backend metadata."""
         buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
             raw_bs=raw_bs,
@@ -1126,6 +1117,71 @@ class CudaGraphRunner:
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         )
+
+    def _populate_from_forward_batch_and_init_attn_backend_fast(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        buffers=None,
+        raw_bs: int = 0,
+        raw_num_token: int = 0,
+        bs: int = 0,
+    ):
+        """Lazily compile and call _populate_from_forward_batch_and_init_attn_backend."""
+        args = (forward_batch, pp_proxy_tensors, buffers, raw_bs, raw_num_token, bs)
+        if self.compiled_replay_prepare is not None:
+            self.compiled_replay_prepare(*args)
+            return
+
+        logger.info("Compiling cuda graph replay preparation")
+        self.compiled_replay_prepare = compile_with_debug(
+            self._populate_from_forward_batch_and_init_attn_backend,
+            compile_kwargs={
+                "mode": "default",
+                "fullgraph": True,
+                "dynamic": None,
+            },
+            dynamo_kwargs={"capture_scalar_outputs": True},
+            inductor_kwargs={
+                "cpp_wrapper": True,
+                "batch_foreach_copy_fusion": True,
+            },
+        )
+        warmup_compiled_fn(self.compiled_replay_prepare, *args)
+
+    def replay_prepare(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        buffers = self.buffers
+        self.recapture_if_needed(forward_batch)
+
+        raw_bs = forward_batch.batch_size
+        raw_num_token = raw_bs * self.num_tokens_per_bs
+
+        # Pad
+        if self.require_mlp_tp_gather:
+            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            max_batch_size = (
+                max_num_tokens / self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
+                else max_num_tokens
+            )
+            index = bisect.bisect_left(self.capture_bs, max_batch_size)
+        else:
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
+        bs = self.capture_bs[index]
+
+        args = (forward_batch, pp_proxy_tensors, buffers, raw_bs, raw_num_token, bs)
+        if (
+            self.capture_forward_mode.is_decode_or_idle()
+            and self.compile_replay_prepare
+        ):
+            self._populate_from_forward_batch_and_init_attn_backend_fast(*args)
+        else:
+            self._populate_from_forward_batch_and_init_attn_backend(*args)
 
         # Store fields
         self.raw_bs = raw_bs

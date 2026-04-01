@@ -98,6 +98,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
+        self.max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
 
         # Workspace allocation
         self.workspace_size = workspace_size_bytes
@@ -218,16 +219,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
-        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
             "page_table": torch.zeros(
                 max_bs,
-                max_num_pages,
+                self.max_num_pages,
                 dtype=torch.int32,
                 device=self.device,
             ),
-            "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+            "swa_page_table": self._alloc_swa_page_table(max_bs, self.max_num_pages),
             "strided_indices": torch.arange(
                 0, self.max_context_len, self.page_size, device=self.device
             ),
@@ -237,20 +243,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
         ):
-            self.decode_cuda_graph_metadata["cu_seqlens_q"] = torch.arange(
-                0, max_bs + 1, dtype=torch.int32, device=self.device
-            )
-            self.decode_cuda_graph_metadata["cu_seqlens_k"] = torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            )
             self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
                 max_bs,
-                max_num_pages,
+                self.max_num_pages,
                 dtype=torch.int32,
                 device=self.device,
             )
             self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = (
-                self._alloc_swa_page_table(max_bs, max_num_pages)
+                self._alloc_swa_page_table(max_bs, self.max_num_pages)
             )
 
             self.target_verify_metadata = {
@@ -269,11 +269,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    max_num_pages,
+                    self.max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
-                "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+                "swa_page_table": self._alloc_swa_page_table(max_bs, self.max_num_pages),
                 "strided_indices": torch.arange(
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
@@ -293,11 +293,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
                 "page_table": torch.zeros(
                     max_bs,
-                    max_num_pages,
+                    self.max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 ),
-                "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
+                "swa_page_table": self._alloc_swa_page_table(max_bs, self.max_num_pages),
                 "strided_indices": torch.arange(
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
@@ -330,11 +330,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
                     : bs + 1
                 ]
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                metadata.cu_seqlens_k = self.decode_cuda_graph_metadata[
+                    "cu_seqlens_k"
+                ][: bs + 1]
+                metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(
                         metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
+                    )
                 )
                 metadata.page_table = self.decode_cuda_graph_metadata[
                     "page_table_draft_decode"
@@ -348,19 +350,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.decode_cuda_graph_metadata[bs] = metadata
             else:
                 # Normal Decode
-                # Get sequence information
-                metadata.cache_seqlens_int32 = seq_lens[:bs].to(torch.int32)
+                # Use pre-allocated buffers to avoid storage aliasing
+                # (which triggers merge_view_inputs overhead in torch.compile)
+                metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.cache_seqlens_int32.copy_(seq_lens[:bs])
                 batch_size = len(seq_lens)
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                metadata.cu_seqlens_k = self.decode_cuda_graph_metadata[
+                    "cu_seqlens_k"
+                ][: bs + 1]
+                metadata.cu_seqlens_k[1:].copy_(
+                    torch.cumsum(
+                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                    )
                 )
 
                 # Precompute maximum sequence length
                 metadata.max_seq_len_k = seq_lens.max().item()
-                # Precompute cumulative sequence lengths
-                metadata.cu_seqlens_q = torch.arange(
-                    0, batch_size + 1, dtype=torch.int32, device=device
-                )
+                # Precompute cumulative sequence lengths (arange values are
+                # already correct from the pre-allocated buffer)
+                metadata.cu_seqlens_q = self.decode_cuda_graph_metadata[
+                    "cu_seqlens_q"
+                ][: batch_size + 1]
                 # Precompute page table
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
@@ -476,6 +488,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata = self.decode_cuda_graph_metadata[bs]
                 max_len = seq_lens_cpu.max().item()
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+                if torch.compiler.is_compiling():
+                    torch._check(max_seq_pages >= 0)
+                    torch._check(max_seq_pages <= self.max_num_pages)
                 metadata.max_seq_len_k = max_len
 
                 metadata.cache_seqlens_int32.copy_(seq_lens)
