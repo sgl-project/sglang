@@ -677,6 +677,25 @@ class BaseMultimodalProcessor(ABC):
         BaseMultimodalProcessor._validate_one_modality(Modality.VIDEO, video_data)
         BaseMultimodalProcessor._validate_one_modality(Modality.AUDIO, audio_data)
 
+    @staticmethod
+    def _enforce_image_limit(
+        n_image: int,
+        max_images_per_request: Optional[int],
+        image_max_num: Optional[int],
+    ):
+        """Enforces the image count limit for a request."""
+        max_images = (
+            max_images_per_request
+            if max_images_per_request is not None
+            else image_max_num
+        )
+        if max_images is not None and n_image > max_images:
+            raise ValueError(
+                f"Request contains {n_image} images, but the maximum allowed is "
+                f"{max_images}. Reduce the number of images or increase "
+                f"--max-images-per-request."
+            )
+
     def _process_loaded_mm_data(self, modality, raw_data, result):
         images, videos, audios = [], [], []
 
@@ -738,17 +757,9 @@ class BaseMultimodalProcessor(ABC):
         n_audio = len(audio_data) if audio_data else 0
 
         # Enforce image count limit: server arg takes precedence, then per-processor default
-        max_images = (
-            self.server_args.max_images_per_request
-            if self.server_args.max_images_per_request is not None
-            else self.IMAGE_MAX_NUM
+        self._enforce_image_limit(
+            n_image, self.server_args.max_images_per_request, self.IMAGE_MAX_NUM
         )
-        if max_images is not None and n_image > max_images:
-            raise ValueError(
-                f"Request contains {n_image} images, but the maximum allowed is "
-                f"{max_images}. Reduce the number of images or increase "
-                f"--max-images-per-request."
-            )
 
         # For MiniCPMO and MiniCPMV or multimodal_tokens not totally align, legacy show path
         if (
