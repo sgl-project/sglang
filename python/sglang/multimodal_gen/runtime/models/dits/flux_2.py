@@ -21,11 +21,22 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
-from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm_with_optional_rope,
+)
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -42,15 +53,25 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
-    query, _ = attn.to_q(hidden_states)
-    key, _ = attn.to_k(hidden_states)
-    value, _ = attn.to_v(hidden_states)
+    if attn.use_fused_qkv:
+        qkv, _ = attn.to_qkv(hidden_states)
+        query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
+    else:
+        query, _ = attn.to_q(hidden_states)
+        key, _ = attn.to_k(hidden_states)
+        value, _ = attn.to_v(hidden_states)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-        encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-        encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
+        if attn.use_fused_added_qkv:
+            added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+            encoder_query, encoder_key, encoder_value = [
+                t.contiguous() for t in added_qkv.chunk(3, dim=-1)
+            ]
+        else:
+            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
+            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
+            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -80,6 +101,7 @@ class Flux2FeedForward(nn.Module):
         inner_dim: Optional[int] = None,
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         if inner_dim is None:
@@ -87,12 +109,22 @@ class Flux2FeedForward(nn.Module):
         dim_out = dim_out or dim
 
         # Flux2SwiGLU will reduce the dimension by half
-        self.linear_in = ColumnParallelLinear(
-            dim, inner_dim * 2, bias=bias, gather_output=True, quant_config=quant_config
+        self.linear_in = MergedColumnParallelLinear(
+            dim,
+            [inner_dim, inner_dim],
+            bias=bias,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_in" if prefix else "linear_in",
         )
         self.act_fn = Flux2SwiGLU()
-        self.linear_out = ColumnParallelLinear(
-            inner_dim, dim_out, bias=bias, gather_output=True, quant_config=quant_config
+        self.linear_out = RowParallelLinear(
+            inner_dim,
+            dim_out,
+            bias=bias,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.linear_out" if prefix else "linear_out",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -117,6 +149,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         out_dim: int = None,
         elementwise_affine: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -125,6 +158,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.query_dim = query_dim
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.heads = out_dim // dim_head if out_dim is not None else num_heads
+        self.tp_size = get_tp_world_size()
+        self.local_heads = divide(self.heads, self.tp_size)
+        self.local_inner_dim = divide(self.inner_dim, self.tp_size)
 
         self.use_bias = bias
         self.dropout = dropout
@@ -132,27 +168,45 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        self.to_q = ColumnParallelLinear(
-            query_dim,
-            self.inner_dim,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-        )
-        self.to_k = ColumnParallelLinear(
-            query_dim,
-            self.inner_dim,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-        )
-        self.to_v = ColumnParallelLinear(
-            query_dim,
-            self.inner_dim,
-            bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
-        )
+        # Fuse Q/K/V into a single linear when using NVFP4: the checkpoint stores them
+        # packed as one tensor, so a fused layer avoids splitting during weight loading.
+        self.use_fused_qkv = isinstance(quant_config, ModelOptFp4Config)
+        self.use_fused_added_qkv = self.use_fused_qkv
+
+        if self.use_fused_qkv:
+            self.to_qkv = MergedColumnParallelLinear(
+                query_dim,
+                [self.inner_dim] * 3,
+                bias=bias,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q" if prefix else "to_q",
+            )
+            self.to_k = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k" if prefix else "to_k",
+            )
+            self.to_v = ColumnParallelLinear(
+                query_dim,
+                self.inner_dim,
+                bias=bias,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v" if prefix else "to_v",
+            )
 
         # QK Norm
         self.norm_q = RMSNorm(dim_head, eps=eps)
@@ -160,12 +214,13 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
 
         self.to_out = torch.nn.ModuleList([])
         self.to_out.append(
-            ColumnParallelLinear(
+            RowParallelLinear(
                 self.inner_dim,
                 self.out_dim,
                 bias=out_bias,
-                gather_output=True,
+                input_is_parallel=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_out.0" if prefix else "to_out.0",
             )
         )
         self.to_out.append(torch.nn.Dropout(dropout))
@@ -173,37 +228,52 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-                quant_config=quant_config,
-            )
-            self.add_k_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-                quant_config=quant_config,
-            )
-            self.add_v_proj = ColumnParallelLinear(
-                added_kv_proj_dim,
-                self.inner_dim,
-                bias=added_proj_bias,
-                gather_output=True,
-                quant_config=quant_config,
-            )
-            self.to_add_out = ColumnParallelLinear(
+            if self.use_fused_added_qkv:
+                # txt_attn.qkv is always BF16 in the NVFP4 checkpoint — no quant needed
+                self.to_added_qkv = MergedColumnParallelLinear(
+                    added_kv_proj_dim,
+                    [self.inner_dim] * 3,
+                    bias=added_proj_bias,
+                    gather_output=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.to_added_qkv" if prefix else "to_added_qkv",
+                )
+            else:
+                self.add_q_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_q_proj" if prefix else "add_q_proj",
+                )
+                self.add_k_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_k_proj" if prefix else "add_k_proj",
+                )
+                self.add_v_proj = ColumnParallelLinear(
+                    added_kv_proj_dim,
+                    self.inner_dim,
+                    bias=added_proj_bias,
+                    gather_output=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.add_v_proj" if prefix else "add_v_proj",
+                )
+            self.to_add_out = RowParallelLinear(
                 self.inner_dim,
                 query_dim,
                 bias=out_bias,
-                gather_output=True,
+                input_is_parallel=True,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out" if prefix else "to_add_out",
             )
 
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -220,37 +290,11 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
         )
 
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = query.unflatten(-1, (self.local_heads, -1))
+        key = key.unflatten(-1, (self.local_heads, -1))
+        value = value.unflatten(-1, (self.local_heads, -1))
 
-        query, key = apply_qk_norm(
-            q=query,
-            k=key,
-            q_norm=self.norm_q,
-            k_norm=self.norm_k,
-            head_dim=self.head_dim,
-            allow_inplace=True,
-        )
-
-        if self.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
-
-            encoder_query, encoder_key = apply_qk_norm(
-                q=encoder_query,
-                k=encoder_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=self.head_dim,
-                allow_inplace=True,
-            )
-
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
-
+        cos_sin_cache = None
         if freqs_cis is not None:
             cos, sin = freqs_cis
             cos_sin_cache = torch.cat(
@@ -260,8 +304,48 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=-1,
             )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
+
+        if self.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (self.local_heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.local_heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.local_heads, -1))
+
+            text_seq_len = encoder_query.shape[1]
+            encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
+                q=encoder_query,
+                k=encoder_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+            query, key = apply_qk_norm_with_optional_rope(
+                q=query,
+                k=key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                position_offset=text_seq_len,
+                allow_inplace=True,
+            )
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+        else:
+            query, key = apply_qk_norm_with_optional_rope(
+                q=query,
+                k=key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                allow_inplace=True,
             )
 
         num_rep = (
@@ -317,6 +401,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -325,21 +410,27 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.query_dim = query_dim
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.heads = out_dim // dim_head if out_dim is not None else num_heads
+        self.tp_size = get_tp_world_size()
+        self.local_heads = divide(self.heads, self.tp_size)
+        self.local_inner_dim = divide(self.inner_dim, self.tp_size)
 
         self.use_bias = bias
         self.dropout = dropout
 
         self.mlp_ratio = mlp_ratio
         self.mlp_hidden_dim = int(query_dim * self.mlp_ratio)
+        self.local_mlp_hidden_dim = divide(self.mlp_hidden_dim, self.tp_size)
         self.mlp_mult_factor = mlp_mult_factor
 
         # Fused QKV projections + MLP input projection
-        self.to_qkv_mlp_proj = ColumnParallelLinear(
+        self.to_qkv_mlp_proj = MergedColumnParallelLinear(
             self.query_dim,
-            self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
+            [self.inner_dim, self.inner_dim, self.inner_dim]
+            + [self.mlp_hidden_dim] * self.mlp_mult_factor,
             bias=bias,
-            gather_output=True,
+            gather_output=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv_mlp_proj" if prefix else "to_qkv_mlp_proj",
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
@@ -347,22 +438,46 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        # Fused attention output projection + MLP output projection
-        self.to_out = ColumnParallelLinear(
+        # Fused attention output + MLP output projection.
+        # Input is [attn_shard | mlp_shard] (independently sharded by
+        # MergedColumnParallelLinear), so patch weight loader to pick the
+        # correct non-contiguous columns per rank.
+        self.to_out = RowParallelLinear(
             self.inner_dim + self.mlp_hidden_dim,
             self.out_dim,
             bias=out_bias,
-            gather_output=True,
+            input_is_parallel=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
+        if self.tp_size > 1:
+            self._patch_to_out_weight_loader()
 
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
         )
+
+    def _patch_to_out_weight_loader(self) -> None:
+        inner_dim, mlp_dim = self.inner_dim, self.mlp_hidden_dim
+        tp_size, tp_rank = self.tp_size, self.to_out.tp_rank
+
+        def _loader(param, loaded_weight):
+            input_dim = getattr(param, "input_dim", None)
+            if input_dim is not None:
+                a = inner_dim // tp_size
+                m = mlp_dim // tp_size
+                attn_cols = loaded_weight.narrow(input_dim, tp_rank * a, a)
+                mlp_cols = loaded_weight.narrow(input_dim, inner_dim + tp_rank * m, m)
+                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
+            else:
+                param.data.copy_(loaded_weight)
+
+        self.to_out.weight_loader = _loader
+        self.to_out.weight.weight_loader = _loader
 
     def forward(
         self,
@@ -376,16 +491,19 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
             hidden_states,
-            [3 * self.inner_dim, self.mlp_hidden_dim * self.mlp_mult_factor],
+            [
+                3 * self.local_inner_dim,
+                self.local_mlp_hidden_dim * self.mlp_mult_factor,
+            ],
             dim=-1,
         )
 
         # Handle the attention logic
         query, key, value = qkv.chunk(3, dim=-1)
 
-        query = query.unflatten(-1, (self.heads, -1))
-        key = key.unflatten(-1, (self.heads, -1))
-        value = value.unflatten(-1, (self.heads, -1))
+        query = query.unflatten(-1, (self.local_heads, -1))
+        key = key.unflatten(-1, (self.local_heads, -1))
+        value = value.unflatten(-1, (self.local_heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
@@ -428,6 +546,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         eps: float = 1e-6,
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -447,6 +566,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
     def forward(
@@ -502,6 +622,7 @@ class Flux2TransformerBlock(nn.Module):
         eps: float = 1e-6,
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
@@ -520,16 +641,27 @@ class Flux2TransformerBlock(nn.Module):
             out_bias=bias,
             eps=eps,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff = Flux2FeedForward(
-            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff" if prefix else "ff",
         )
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff_context = Flux2FeedForward(
-            dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff_context" if prefix else "ff_context",
         )
 
     def forward(
@@ -706,6 +838,30 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
 
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
+    scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
+
+    def post_load_weights(self) -> None:
+        if not isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
+            return
+
+        # BFL/ComfyUI checkpoints store AdaLN modulation params as [scale, shift],
+        # while diffusers expects [shift, scale].
+        for param_name in self.scale_shift_swap_params:
+            parts = param_name.split(".")
+            module = self
+            for part in parts[:-1]:
+                module = getattr(module, part)
+            param = getattr(module, parts[-1], None)
+            if param is None:
+                continue
+            half = param.shape[0] // 2
+            with torch.no_grad():
+                first_half = param[:half].clone()
+                param[:half] = param[half:]
+                param[half:] = first_half
+            logger.info(
+                "Swapped scale/shift order for %s (BFL → diffusers)", param_name
+            )
 
     def __init__(
         self,
@@ -731,6 +887,8 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
         self.guidance_embeds = guidance_embeds
+        quant_config = quant_config if quant_config is not None else config.quant_config
+        self.quant_config = quant_config
 
         # 1. Sinusoidal positional embedding for RoPE on image and text tokens
         self.rotary_emb = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
@@ -775,8 +933,9 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     eps=eps,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -791,8 +950,9 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     eps=eps,
                     bias=False,
                     quant_config=quant_config,
+                    prefix=f"single_transformer_blocks.{i}",
                 )
-                for _ in range(num_single_layers)
+                for i in range(num_single_layers)
             ]
         )
 
@@ -809,6 +969,8 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
             patch_size * patch_size * self.out_channels,
             bias=False,
             gather_output=True,
+            quant_config=quant_config,
+            prefix="proj_out",
         )
 
         self.layer_names = ["transformer_blocks", "single_transformer_blocks"]
@@ -841,9 +1003,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         # 0. Handle input arguments
         if joint_attention_kwargs is not None:
             joint_attention_kwargs = joint_attention_kwargs.copy()
-            lora_scale = joint_attention_kwargs.pop("scale", 1.0)
-        else:
-            lora_scale = 1.0
+            joint_attention_kwargs.pop("scale", 1.0)
 
         num_txt_tokens = encoder_hidden_states.shape[1]
 

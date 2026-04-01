@@ -18,9 +18,10 @@ QWEN3_235B_EAGLE3_MODEL_PATH = (
 class TestQwen3235BFP8(unittest.TestCase):
     """Test class for Qwen3-235B-FP8 performance and accuracy.
 
-    Two variants:
+    Three variants:
     - basic: TP=8
     - eagle3: TP=8 + EP=2 + EAGLE3 speculative decoding
+    - TP8+CP2+EP2: TP=8 + CP=2 + EP=2 context parallel
 
     Each variant runs BOTH:
     - Performance test (using NightlyBenchmarkRunner)
@@ -67,6 +68,42 @@ class TestQwen3235BFP8(unittest.TestCase):
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_qwen3_235b_fp8",
             ),
+        )
+
+    def test_qwen3_235b_fp8_cp(self):
+        """Run performance and accuracy for Qwen3-235B-FP8 with context parallelism."""
+
+        BASE_ARGS = [
+            "--trust-remote-code",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
+        ]
+
+        DP_ARGS = [
+            "--tp=8",
+            "--moe-dp-size=2",
+            "--attn-cp-size=2",
+            "--ep-size=4",
+            "--enable-prefill-context-parallel",
+        ]
+
+        MTP_ARGS = [
+            "--cuda-graph-max-bs=32",
+            "--max-running-requests=32",
+        ]
+        variants = [
+            ModelLaunchSettings(
+                QWEN3_235B_FP8_MODEL_PATH,
+                tp_size=8,
+                extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS,
+                variant="TP8+CP2+EP2",
+            ),
+        ]
+
+        run_combined_tests(
+            models=variants,
+            test_name="Qwen3-235B-FP8 Context Parallel",
+            accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.88),
         )
 
 

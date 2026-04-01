@@ -160,6 +160,10 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
+        if hasattr(layer, "dispatcher"):
+            # Weights are stored as torch.uint8 but semantically MXFP4
+            layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):

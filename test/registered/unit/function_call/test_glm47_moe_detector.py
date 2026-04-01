@@ -10,7 +10,7 @@ from sglang.srt.function_call.glm47_moe_detector import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "default")
+register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
 class TestGlm47MoeDetector(unittest.TestCase):

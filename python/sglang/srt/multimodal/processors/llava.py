@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -16,7 +17,11 @@ from sglang.srt.models.llava import (
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
-from sglang.srt.multimodal.mm_utils import expand2square, process_anyres_image
+from sglang.srt.multimodal.mm_utils import (
+    ensure_numpy,
+    expand2square,
+    process_anyres_image,
+)
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import ImageData, load_image, logger
 from sglang.utils import get_exception_traceback
@@ -29,6 +34,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaQwenForCausalLM,
         LlavaMistralForCausalLM,
     ]
+    gpu_image_decode = False  # Llava processes loaded image as PIL image explicitly
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -45,13 +51,13 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
         try:
             url = image_data.url if isinstance(image_data, ImageData) else image_data
-            image, image_size = load_image(url)
+            image, image_size = load_image(url, False)
             if image_size is not None:
                 # It is a video with multiple images
                 image_hash = hash(url)
                 pixel_values = image_processor(image)["pixel_values"]
-                for _ in range(len(pixel_values)):
-                    pixel_values[_] = pixel_values[_].astype(np.float16)
+                for i in range(len(pixel_values)):
+                    pixel_values[i] = ensure_numpy(pixel_values[i]).astype(np.float16)
                 pixel_values = np.stack(pixel_values, axis=0)
                 return pixel_values, image_hash, image_size
             else:
@@ -75,6 +81,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 else:
                     pixel_values = image_processor(image)["pixel_values"][0]
 
+                pixel_values = ensure_numpy(pixel_values)
                 if isinstance(pixel_values, np.ndarray):
                     pixel_values = pixel_values.astype(np.float16)
 
@@ -90,7 +97,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
     ):
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
+            fut = loop.run_in_executor(
                 self.cpu_executor,
                 LlavaImageProcessor._process_single_image_task,
                 image_data,
@@ -98,6 +105,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 grid_pinpoints,
                 self._processor,
             )
+            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+            return await asyncio.wait_for(fut, timeout=timeout)
         else:
             return self._process_single_image_task(
                 image_data,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     import torch
@@ -21,6 +22,7 @@ def _jit_ngram_embedding_module() -> Module:
     )
 
 
+@debug_kernel_api
 def compute_n_gram_ids(
     ne_n: int,
     ne_k: int,
@@ -66,6 +68,7 @@ def compute_n_gram_ids(
     )
 
 
+@debug_kernel_api
 def update_token_table(
     tokens: torch.Tensor,
     ne_token_table: torch.Tensor,

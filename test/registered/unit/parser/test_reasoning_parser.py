@@ -1,3 +1,5 @@
+"""Unit tests for srt/parser/reasoning_parser.py"""
+
 import unittest
 
 from sglang.srt.parser.reasoning_parser import (
@@ -6,6 +8,7 @@ from sglang.srt.parser.reasoning_parser import (
     Glm45Detector,
     KimiDetector,
     KimiK2Detector,
+    Nemotron3Detector,
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
@@ -13,7 +16,7 @@ from sglang.srt.parser.reasoning_parser import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 class TestStreamingParseResult(CustomTestCase):
@@ -482,8 +485,11 @@ class TestGlm45Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "")
 
-        # Tool interruption should still work - flushes buffered reasoning
-        # Note: buffer preserves original text including <think> tag
+        # Tool interruption should still work - flushes buffered reasoning.
+        # Note: when stream_reasoning=False, the <think> tag is stripped from the
+        # local `current_text` variable but NOT from `self._buffer` (which is never
+        # cleared in the non-streaming path). So the flushed reasoning content
+        # includes the raw <think> tag.
         result = detector.parse_streaming_increment("<tool_call>tool call")
         self.assertEqual(result.reasoning_text, "<think>thinking")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
@@ -510,6 +516,74 @@ class TestGlm45Detector(CustomTestCase):
         result = detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "More reasoning")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
+
+
+class TestNemotron3Detector(CustomTestCase):
+    def setUp(self):
+        self.detector = Nemotron3Detector()
+
+    def test_init(self):
+        """Test Nemotron3Detector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertFalse(self.detector._in_reasoning)
+        self.assertTrue(self.detector.stream_reasoning)
+        self.assertFalse(self.detector._force_nonempty_content)
+
+    def test_detect_and_parse_complete_reasoning(self):
+        """Test parsing complete reasoning block."""
+        text = "<think>Let me think about this</think>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think about this")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_no_thinking(self):
+        """Test parsing without thinking tokens."""
+        text = "Direct answer without thinking."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_detect_and_parse_reasoning_only(self):
+        """Test parsing when output is all reasoning (no content after </think>)."""
+        text = "<think>All reasoning, no answer</think>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "All reasoning, no answer")
+        self.assertEqual(result.normal_text, "")
+
+    def test_force_nonempty_content_swaps_when_no_normal_text(self):
+        """Test force_nonempty_content swaps reasoning to content when content is empty."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        text = "<think>All reasoning, no answer</think>"
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, "All reasoning, no answer")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_force_nonempty_content_no_swap_when_normal_text_exists(self):
+        """Test force_nonempty_content does not swap when content already exists."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        text = "<think>Reasoning here</think>The answer is 42."
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Reasoning here")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_force_nonempty_content_truncated_reasoning(self):
+        """Test force_nonempty_content with truncated reasoning (no end token)."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        text = "<think>Truncated reasoning without end token"
+        result = detector.detect_and_parse(text)
+        # Truncated reasoning has no normal_text, so swap should occur
+        self.assertEqual(result.normal_text, "Truncated reasoning without end token")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_force_nonempty_content_no_thinking_tokens(self):
+        """Test force_nonempty_content with plain text (no thinking tokens)."""
+        detector = Nemotron3Detector(force_nonempty_content=True)
+        text = "Plain text without any thinking."
+        result = detector.detect_and_parse(text)
+        # Normal text already exists, no swap needed
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
 
 
 class TestReasoningParser(CustomTestCase):
@@ -767,7 +841,7 @@ class TestBufferLossBugFix(CustomTestCase):
         5. Buffer is cleared and "answer" is returned directly
         6. The "</" from previous step is lost
 
-        This test verifies the fix where line 108 was changed from:
+        This test verifies the fix where the return was changed from:
         return StreamingParseResult(normal_text=new_text)
         to:
         return StreamingParseResult(normal_text=current_text)
@@ -862,6 +936,302 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertTrue(detector._in_reasoning)
         self.assertTrue(detector.stripped_think_start)
+
+
+class TestGptOssDetector(CustomTestCase):
+    """Test cases for GptOssDetector which delegates to HarmonyParser."""
+
+    def setUp(self):
+        from sglang.srt.parser.reasoning_parser import GptOssDetector
+
+        self.detector = GptOssDetector()
+
+    def test_detect_and_parse_with_analysis_and_final(self):
+        """Test one-shot parsing with analysis (reasoning) and final (normal) blocks."""
+        text = "<|start|><|channel|>analysis<|message|>thinking hard<|end|><|channel|>final<|message|>the answer<|end|>"
+        result = self.detector.detect_and_parse(text)
+        self.assertIn("thinking hard", result.reasoning_text)
+        self.assertIn("the answer", result.normal_text)
+
+    def test_detect_and_parse_normal_only(self):
+        """Test one-shot parsing with only final block."""
+        text = "<|start|><|channel|>final<|message|>just the answer<|end|>"
+        result = self.detector.detect_and_parse(text)
+        self.assertIn("just the answer", result.normal_text)
+
+    def test_streaming_analysis_then_final(self):
+        """Test streaming parse across multiple chunks."""
+        chunks = [
+            "<|start|><|channel|>analysis<|message|>",
+            "reasoning part",
+            "<|end|>",
+            "<|channel|>final<|message|>answer",
+            "<|end|>",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk)
+            all_reasoning += result.reasoning_text
+            all_normal += result.normal_text
+        self.assertIn("reasoning part", all_reasoning)
+        self.assertIn("answer", all_normal)
+
+    def test_streaming_with_tool_call(self):
+        """Test streaming parse with tool call events."""
+        text = "<|start|><|channel|>analysis<|message|>think<|end|><|call|>tool_data<|return|><|channel|>final<|message|>result<|end|>"
+        result = self.detector.detect_and_parse(text)
+        self.assertIn("think", result.reasoning_text)
+        self.assertIn("result", result.normal_text)
+
+
+class TestMiniMaxAppendThinkDetector(CustomTestCase):
+    """Test cases for MiniMaxAppendThinkDetector."""
+
+    def setUp(self):
+        from sglang.srt.parser.reasoning_parser import MiniMaxAppendThinkDetector
+
+        self.detector = MiniMaxAppendThinkDetector()
+
+    def test_detect_and_parse_prepends_think(self):
+        """Test that detect_and_parse prepends <think> to the text."""
+        result = self.detector.detect_and_parse("Hello world")
+        self.assertEqual(result.normal_text, "<think>Hello world")
+
+    def test_streaming_first_chunk_prepends_think(self):
+        """Test that first streaming chunk gets <think> prepended."""
+        result = self.detector.parse_streaming_increment("First chunk")
+        self.assertEqual(result.normal_text, "<think>First chunk")
+
+    def test_streaming_second_chunk_no_prepend(self):
+        """Test that subsequent streaming chunks are passed through."""
+        self.detector.parse_streaming_increment("First")
+        result = self.detector.parse_streaming_increment("Second")
+        self.assertEqual(result.normal_text, "Second")
+
+
+class TestReasoningParserAdvanced(CustomTestCase):
+    """Additional tests for ReasoningParser init edge cases."""
+
+    def test_gpt_oss_model_type(self):
+        """Test that gpt-oss model type creates GptOssDetector."""
+        from sglang.srt.parser.reasoning_parser import GptOssDetector
+
+        parser = ReasoningParser("gpt-oss")
+        self.assertIsInstance(parser.detector, GptOssDetector)
+
+    def test_minimax_append_think_model_type(self):
+        """Test that minimax-append-think creates MiniMaxAppendThinkDetector."""
+        from sglang.srt.parser.reasoning_parser import MiniMaxAppendThinkDetector
+
+        parser = ReasoningParser("minimax-append-think")
+        self.assertIsInstance(parser.detector, MiniMaxAppendThinkDetector)
+
+    def test_qwen3_thinking_forces_reasoning(self):
+        """Test that qwen3-thinking model type forces reasoning mode."""
+        parser = ReasoningParser("qwen3-thinking")
+        self.assertTrue(parser.detector._in_reasoning)
+
+    def test_minimax_forces_reasoning(self):
+        """Test that minimax model type forces reasoning mode.
+
+        minimax maps to Qwen3Detector but ReasoningParser overrides
+        force_reasoning=True, unlike the default Qwen3Detector behavior.
+        """
+        parser = ReasoningParser("minimax")
+        self.assertIsInstance(parser.detector, Qwen3Detector)
+        self.assertTrue(parser.detector._in_reasoning)
+
+    def test_detector_map_aliases(self):
+        """Test that all DetectorMap alias keys create the correct detector type."""
+        # These are aliases that map to existing detector classes
+        alias_tests = {
+            "deepseek-v3": Qwen3Detector,
+            "step3": DeepSeekR1Detector,
+            "step3p5": DeepSeekR1Detector,
+            "interns1": Qwen3Detector,
+        }
+        for model_type, expected_class in alias_tests.items():
+            parser = ReasoningParser(model_type)
+            self.assertIsInstance(
+                parser.detector,
+                expected_class,
+                f"{model_type} should create {expected_class.__name__}",
+            )
+
+    def test_continue_final_message_with_request(self):
+        """Test continue_final_message passes previous content to detector."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageGenericParam,
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[
+                ChatCompletionMessageUserParam(role="user", content="Hi"),
+                ChatCompletionMessageGenericParam(
+                    role="assistant", content="Let me think..."
+                ),
+            ],
+            continue_final_message=True,
+        )
+        parser = ReasoningParser("qwen3", request=request)
+        self.assertTrue(parser.detector.continue_final_message)
+
+    def test_force_nonempty_content_via_chat_template_kwargs(self):
+        """Test that force_nonempty_content is passed via chat_template_kwargs."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[
+                ChatCompletionMessageUserParam(role="user", content="Hi"),
+            ],
+            chat_template_kwargs={"force_nonempty_content": True},
+        )
+        parser = ReasoningParser("nemotron_3", request=request)
+        self.assertTrue(parser.detector._force_nonempty_content)
+
+
+class TestContinueFinalMessage(CustomTestCase):
+    """Test continue_final_message mode for BaseReasoningFormatDetector."""
+
+    def test_continue_with_think_start_in_previous(self):
+        """Test that previous_content with <think> sets _in_reasoning=True."""
+        detector = BaseReasoningFormatDetector(
+            "<think>",
+            "</think>",
+            force_reasoning=False,
+            continue_final_message=True,
+            previous_content="<think>some reasoning",
+        )
+        self.assertTrue(detector._in_reasoning)
+        self.assertEqual(detector.previous_count, len("<think>some reasoning"))
+
+    def test_continue_with_think_end_in_previous(self):
+        """Test that previous_content with </think> sets _in_reasoning=False."""
+        detector = BaseReasoningFormatDetector(
+            "<think>",
+            "</think>",
+            force_reasoning=True,
+            continue_final_message=True,
+            previous_content="<think>done</think>normal",
+        )
+        # think_end_token in previous → _in_reasoning = False
+        self.assertFalse(detector._in_reasoning)
+
+    def test_continue_detect_parse_with_end_in_previous(self):
+        """Test detect_and_parse when think_end_token is in previous_content only.
+        This covers the branch where think_end is NOT in current text
+        but IS in previous_content, so output is treated as normal_text."""
+        detector = BaseReasoningFormatDetector(
+            "<think>",
+            "</think>",
+            force_reasoning=True,
+            continue_final_message=True,
+            previous_content="<think>reasoning</think>",
+        )
+        # _in_reasoning is False (think_end in previous)
+        # But force_reasoning was True → detect_and_parse still enters the
+        # reasoning path because think_start is in previous_content.
+        # However, since _in_reasoning=False and no think_start in new text,
+        # it returns normal_text directly.
+        result = detector.detect_and_parse("new content here")
+        self.assertEqual(result.normal_text, "new content here")
+
+    def test_continue_end_in_previous_new_text_has_start_but_no_end(self):
+        """Test: think_end in previous, new text has think_start but no think_end.
+        This produces: in_reasoning=True (from think_start in text),
+        think_end NOT in processed_text, think_end IN previous_content,
+        so it falls through to the else branch that returns normal_text."""
+        detector = BaseReasoningFormatDetector(
+            "<think>",
+            "</think>",
+            force_reasoning=False,
+            continue_final_message=True,
+            previous_content="earlier <think>old</think>old answer",
+        )
+        # _in_reasoning = False (think_end in previous overrides)
+        self.assertFalse(detector._in_reasoning)
+        # New text has <think> (triggers in_reasoning) but no </think>
+        # think_end IS in previous_content → skips the truncated-reasoning branch
+        # think_end NOT in processed_text → falls to else that returns normal_text
+        result = detector.detect_and_parse("<think>continuing reasoning")
+        self.assertEqual(result.normal_text, "continuing reasoning")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_continue_detect_parse_think_start_in_prev_but_end_also_in_prev(self):
+        """Test detect_and_parse where both think tokens are in previous,
+        and new text contains <think> to re-enter reasoning."""
+        detector = BaseReasoningFormatDetector(
+            "<think>",
+            "</think>",
+            force_reasoning=False,
+            continue_final_message=True,
+            previous_content="<think>old reasoning</think>old answer",
+        )
+        # _in_reasoning = False (end token in previous overrides start)
+        self.assertFalse(detector._in_reasoning)
+        # New text starts a fresh reasoning block
+        result = detector.detect_and_parse("<think>new reasoning</think>new answer")
+        self.assertEqual(result.reasoning_text, "new reasoning")
+        self.assertEqual(result.normal_text, "new answer")
+
+    def test_streaming_returns_empty_when_in_reasoning_and_end_buffered(self):
+        """Test that streaming returns empty when buffer could be partial end token."""
+        detector = BaseReasoningFormatDetector(
+            "<think>", "</think>", force_reasoning=True, stream_reasoning=True
+        )
+        # In reasoning mode, send partial end token
+        result = detector.parse_streaming_increment("</")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+        # This goes through the path where _in_reasoning is True but buffer
+        # is a prefix of think_end_token → returns empty
+
+
+class TestGptOssDetectorToolCall(CustomTestCase):
+    """Test GptOssDetector tool_call raw_text handling."""
+
+    def test_detect_and_parse_tool_call_raw_text(self):
+        """Test that tool_call events use raw_text when available."""
+        from sglang.srt.parser.reasoning_parser import GptOssDetector
+
+        detector = GptOssDetector()
+        # Sequence with CALL...RETURN that produces tool_call events with raw_text
+        text = (
+            "<|start|><|channel|>analysis<|message|>think<|end|>"
+            "<|call|>function_data<|return|>"
+            "<|channel|>final<|message|>result<|end|>"
+        )
+        result = detector.detect_and_parse(text)
+        self.assertIn("think", result.reasoning_text)
+        # Tool call raw_text and/or final result should be in normal_text
+        self.assertIn("result", result.normal_text)
+
+    def test_streaming_tool_call_raw_text(self):
+        """Test streaming parse with tool_call events preserving raw_text."""
+        from sglang.srt.parser.reasoning_parser import GptOssDetector
+
+        detector = GptOssDetector()
+        chunks = [
+            "<|start|><|channel|>analysis<|message|>reason<|end|>",
+            "<|call|>tool_payload<|return|>",
+            "<|channel|>final<|message|>done<|end|>",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk)
+            all_reasoning += result.reasoning_text
+            all_normal += result.normal_text
+        self.assertIn("reason", all_reasoning)
+        self.assertIn("done", all_normal)
 
 
 if __name__ == "__main__":

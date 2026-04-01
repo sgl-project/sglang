@@ -23,7 +23,27 @@ def adapt_config_dict(
         is_moe and (config_dict["moe"].get("num_shared_experts") or 0) > 0
     )
     is_eagle = "eagle" in model.lower()
-    if is_moe:
+    if is_eagle and not is_moe:
+        # Dense EAGLE draft model (e.g. Mistral Small 4 EAGLE).
+        # Uses MLA attention like MistralLarge3 but has no MoE layers.
+        # Set model_type to deepseek_v3 for MLA support, and override
+        # MoE fields so all layers are dense.
+        config_dict["model_type"] = "deepseek_v3"
+        config_dict["architectures"] = ["MistralLarge3ForCausalLMEagle"]
+        num_layers = config_dict.get("num_hidden_layers", 0)
+        config_dict["n_routed_experts"] = 1
+        config_dict["first_k_dense_replace"] = num_layers
+        config_dict["moe_layer_freq"] = 1
+        config_dict["n_shared_experts"] = 0
+        config_dict["n_group"] = 1
+        config_dict["topk_group"] = 1
+        config_dict["num_experts_per_tok"] = 1
+        config_dict["moe_intermediate_size"] = 1
+        config_dict["routed_scaling_factor"] = 1.0
+        config_dict["topk_method"] = None
+        config_dict["scoring_func"] = "softmax"
+        config_dict["routing_method_type"] = 1
+    elif is_moe:
         if is_mistral_large_3:
             config_dict = _remap_moe_args(config_dict)
             config_dict["model_type"] = "deepseek_v3"
@@ -114,13 +134,17 @@ def _remap_mistral_yarn_args(config: dict) -> dict:
         "original_max_position_embeddings": "original_max_position_embeddings",
         "beta": "beta_fast",
         "alpha": "beta_slow",
-        "apply_scale": None,
+        "apply_scale": "apply_yarn_scaling",
     }
     yarn_config = config.get("yarn") or {}
     config["rope_scaling"] = {
-        "rope_type": "yarn",
+        "rope_type": "deepseek_yarn",
         "mscale_all_dim": 1,
     }
+    # Include rope_theta in rope_scaling if present at the top level,
+    # as transformers yarn validation requires it.
+    if "rope_theta" in config:
+        config["rope_scaling"]["rope_theta"] = config["rope_theta"]
     for old_name, new_name in yarn_config_map.items():
         if old_name in yarn_config:
             value = yarn_config.pop(old_name)
