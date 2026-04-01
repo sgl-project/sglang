@@ -297,9 +297,9 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     args_initial = SimpleNamespace(
         num_shots=5,
         data_path=None,
-        num_questions=50,
+        num_questions=200,
         max_new_tokens=512,
-        parallel=10,
+        parallel=64,
         host=f"http://{test_instance.base_host}",
         port=int(test_instance.base_port),
     )
