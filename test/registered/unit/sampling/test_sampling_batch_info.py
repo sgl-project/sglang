@@ -142,10 +142,10 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
 # apply_logits_bias
 class TestApplyLogitsBias(CustomTestCase):
 
-    def test_applies_linear_penalties(self):
-        """Test that pre-accumulated linear penalties are added to logits."""
+    def test_applies_additive_penalties(self):
+        """Test that pre-accumulated additive penalties are added to logits."""
         info = _make_info(batch_size=1)
-        info.acc_linear_penalties = torch.tensor([[-1.0] * VOCAB_SIZE])
+        info.acc_additive_penalties = torch.tensor([[-1.0] * VOCAB_SIZE])
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
         self.assertAlmostEqual(logits[0, 0].item(), -1.0, places=5)
@@ -181,7 +181,7 @@ class TestApplyLogitsBias(CustomTestCase):
     def test_no_bias_no_change(self):
         """Test that logits stay unchanged when no bias sources are set."""
         info = _make_info(batch_size=1)
-        info.acc_linear_penalties = None
+        info.acc_additive_penalties = None
         info.logit_bias = None
         info.vocab_mask = None
         logits = torch.zeros(1, VOCAB_SIZE)
