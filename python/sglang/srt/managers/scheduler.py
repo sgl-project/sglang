@@ -1255,19 +1255,6 @@ class Scheduler(
             "max_req_input_len": self.max_req_input_len,
         }
 
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
-            (
-                remote_instance_transfer_engine_session_id,
-                remote_instance_transfer_engine_weights_info_dict,
-            ) = self.get_remote_instance_transfer_engine_info()
-            result_dict.update(
-                {
-                    "tp_rank": self.tp_rank,
-                    "remote_instance_transfer_engine_session_id": remote_instance_transfer_engine_session_id,
-                    "remote_instance_transfer_engine_weights_info_dict": remote_instance_transfer_engine_weights_info_dict,
-                }
-            )
-
         return result_dict
 
     def run_event_loop(self) -> None:
@@ -2416,6 +2403,13 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
+                # revert matched mamba idx to avoid memory leak, if req is not added
+                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                if not added and req.mamba_pool_idx is not None:
+                    self.tree_cache.req_to_token_pool.mamba_pool.free(
+                        req.mamba_pool_idx.unsqueeze(-1)
+                    )
+                    req.mamba_pool_idx = None
                 break
 
         # Update waiting queue
@@ -3376,9 +3370,6 @@ class Scheduler(
         self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         pass
-
-    def get_remote_instance_transfer_engine_info(self):
-        return self.tp_worker.get_remote_instance_transfer_engine_info()
 
 
 class IdleSleeper:
