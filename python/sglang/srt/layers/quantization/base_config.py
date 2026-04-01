@@ -106,6 +106,20 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ) -> CombineInput:
         raise NotImplementedError
 
+    def get_triton_quant_info(self, layer: torch.nn.Module):
+        """Return a ``TritonMoeQuantInfo`` for the Triton MoE runner.
+
+        Handles base case for UnquantizedFusedMoEMethod.
+        """
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            b13=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+        )
+
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""

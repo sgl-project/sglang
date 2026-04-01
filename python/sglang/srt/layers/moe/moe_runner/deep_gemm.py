@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
@@ -120,6 +120,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         runner_input: DeepGemmRunnerInput,
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
+        hooks: Optional[Any] = None,
     ) -> DeepGemmRunnerOutput:
         if not runner_input.use_masked_gemm:
             hidden_states = self._run_contiguous_gemm(
