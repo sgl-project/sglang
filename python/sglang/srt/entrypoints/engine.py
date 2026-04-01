@@ -180,6 +180,10 @@ class Engine(EngineBase):
         self.server_args = server_args
         logger.info(f"{server_args=}")
 
+        # Pre-initialize tokenizer_manager so the atexit handler in
+        # shutdown() won't hit AttributeError.
+        self.tokenizer_manager = None
+
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -1195,7 +1199,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.6",
+                "0.6.7",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

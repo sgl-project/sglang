@@ -131,5 +131,10 @@ class TestMXFP8GemmFlashinferTrtllm(MXFP8GemmBase, unittest.TestCase):
     backend = "flashinfer_trtllm"
 
 
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+class TestMXFP8GemmFlashinferCutlass(MXFP8GemmBase, unittest.TestCase):
+    backend = "flashinfer_cutlass"
+
+
 if __name__ == "__main__":
     unittest.main()
