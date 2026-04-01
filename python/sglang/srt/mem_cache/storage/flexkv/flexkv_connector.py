@@ -333,8 +333,8 @@ class FlexKVConnector(BaseKVConnector):
                 token_mask=token_mask,
             )
             hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
-            if not update_state_for_load and flexkv_task_id >= 0:
-                self.kv_manager.cancel_tasks([flexkv_task_id])
+            if not update_state_for_load:
+                self.kv_manager.cancel([flexkv_task_id])
 
         if self.tp_group is not None and self.tp_size > 1:
             data = broadcast_pyobj(
@@ -348,7 +348,6 @@ class FlexKVConnector(BaseKVConnector):
 
         if update_state_for_load and rid is not None and hit_length > 0:
             self._pending_loads[rid] = flexkv_task_id
-
         return hit_length
 
     def release_load_state(self, rid: str) -> None:
