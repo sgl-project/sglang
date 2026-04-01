@@ -118,9 +118,10 @@ QUANTIZATION_CHOICES = [
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "quark_int4fp8_moe",
+    "unquant",
 ]
 
-SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
+SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -760,6 +761,16 @@ class ServerArgs:
 
         # Handle deprecated environment variables for prefill delayer.
         self._handle_prefill_delayer_env_compat()
+
+        # Resolve --quantization unquant: explicitly opt out of quantization.
+        # Convert to None now (before model config validation), but record
+        # the intent so auto-detection in _handle_model_specific_adjustments
+        # does not override it.
+        if self.quantization == "unquant":
+            self.quantization = None
+            self._quantization_explicitly_unset = True
+        else:
+            self._quantization_explicitly_unset = False
 
         # Set missing default values.
         self._handle_missing_default_values()
@@ -1626,7 +1637,10 @@ class ServerArgs:
                     and weights_cfg.get("strategy") == "group"
                     and weights_cfg.get("type") == "int"
                 )
-                if self.quantization is None:
+                if (
+                    self.quantization is None
+                    and not self._quantization_explicitly_unset
+                ):
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                     # Because we need this condition for an assertion in
                     # flashinfer_trtllm MoE runner backend.
@@ -1957,7 +1971,11 @@ class ServerArgs:
         ]:
             if is_sm100_supported():
                 quant_method = get_quantization_config(hf_config)
-                if self.quantization is None and quant_method is not None:
+                if (
+                    self.quantization is None
+                    and not self._quantization_explicitly_unset
+                    and quant_method is not None
+                ):
                     self.quantization = quant_method
                 if (
                     (
@@ -2011,7 +2029,11 @@ class ServerArgs:
                     if quantization_config is not None
                     else None
                 )
-                if self.quantization is None and quant_method is not None:
+                if (
+                    self.quantization is None
+                    and not self._quantization_explicitly_unset
+                    and quant_method is not None
+                ):
                     self.quantization = quant_method
                 if (
                     self.quantization == "modelopt_fp4"
