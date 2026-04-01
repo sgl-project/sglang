@@ -54,8 +54,7 @@ def _torch_compile(
         # Replay with same config
         with dynamo_config.patch(
             **dynamo_kwargs,
-        ), inductor_config.patch(
-            **inductor_kwargs):
+        ), inductor_config.patch(**inductor_kwargs):
             return compiled_fn(*args, **kwargs)
 
     return wrapper

@@ -101,7 +101,9 @@ _COMPILED_REPLAY_PREPARE_WHITELISTED_BACKEND_FQNS = frozenset(
 )
 
 
-def _batch_inplace_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor], use_foreach_copy: bool = True) -> None:
+def _batch_inplace_copy(
+    dsts: List[torch.Tensor], srcs: List[torch.Tensor], use_foreach_copy: bool = True
+) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
 
     def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
@@ -644,9 +646,7 @@ class CudaGraphRunner:
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         # Combo scheduling is needed to have good performance for replay-prepare.
-        self.compile_replay_prepare = hasattr(
-            torch._inductor.config, "combo_kernels"
-        )
+        self.compile_replay_prepare = hasattr(torch._inductor.config, "combo_kernels")
         self.compiled_replay_prepare = None
 
         # Speculative_inference
@@ -1146,7 +1146,15 @@ class CudaGraphRunner:
         use_foreach_copy: bool = False,
     ):
         """Lazily compile and call _populate_from_forward_batch_and_init_attn_backend."""
-        args = (forward_batch, pp_proxy_tensors, buffers, raw_bs, raw_num_token, bs, use_foreach_copy)
+        args = (
+            forward_batch,
+            pp_proxy_tensors,
+            buffers,
+            raw_bs,
+            raw_num_token,
+            bs,
+            use_foreach_copy,
+        )
         if self.compiled_replay_prepare is not None:
             self.compiled_replay_prepare(*args)
             return
@@ -1204,8 +1212,7 @@ class CudaGraphRunner:
                 False,
             )
         else:
-            args = (
-            )
+            args = ()
             self._populate_from_forward_batch_and_init_attn_backend(
                 forward_batch,
                 pp_proxy_tensors,
@@ -1214,7 +1221,6 @@ class CudaGraphRunner:
                 raw_num_token,
                 bs,
                 True,
-
             )
 
         # Store fields
