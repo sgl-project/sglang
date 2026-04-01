@@ -365,7 +365,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "ascend"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -1023,7 +1023,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.6")
+        min_version: Minimum version required (e.g., "0.6.7")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -3397,6 +3397,41 @@ class ConcurrentCounter:
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
+
+
+@lru_cache(maxsize=1)
+def get_nvidia_driver_version() -> tuple:
+    """Return the NVIDIA driver version as a tuple of ints, e.g. (595, 58, 3).
+    Returns (0,) on failure."""
+    version_str = get_nvidia_driver_version_str()
+    if version_str is None:
+        return (0,)
+    try:
+        return tuple(int(x) for x in version_str.split("."))
+    except ValueError:
+        return (0,)
+
+
+@lru_cache(maxsize=1)
+def get_nvidia_driver_version_str() -> str:
+    """Return the NVIDIA driver version string, e.g. '595.58.03'.
+    Returns None on failure."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        version_str = result.stdout.strip().split("\n")[0].strip()
+        return version_str if version_str else None
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return None
 
 
 def check_cuda_result(raw_output):

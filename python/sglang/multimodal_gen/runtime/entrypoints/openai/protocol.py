@@ -90,6 +90,8 @@ class VideoGenerationsRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
+    width: Optional[int] = None
+    height: Optional[int] = None
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
