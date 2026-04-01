@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
+        self._model = model_runner.model
+        self._module_state = dict(self._model.named_modules())
+        self._logical_to_packed_mapping = _get_logical_to_packed_mapping(self._model)
         self._snapshot_tensors = None
 
     def handle(self, action: str, checksums: Optional[Dict[str, str]] = None):
@@ -47,10 +50,7 @@ class WeightChecker:
 
         tp_group = ps.get_tp_group()
         tp_rank = ps.get_tensor_model_parallel_rank()
-        model = self._model_runner.model
         actual_state = dict(self._model_state())
-        module_state = dict(model.named_modules())
-        logical_to_packed_mapping = _get_logical_to_packed_mapping(model)
 
         errors = []
         matched_count = 0
@@ -59,8 +59,8 @@ class WeightChecker:
             resolved = _find_logical_tensor_view(
                 name,
                 actual_state,
-                module_state,
-                logical_to_packed_mapping,
+                self._module_state,
+                self._logical_to_packed_mapping,
             )
             if resolved is None:
                 errors.append(f"name={name} TP_rank={tp_rank} missing!")
@@ -128,12 +128,13 @@ class WeightChecker:
 
     def _model_state(self):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)
-        model = self._model_runner.model
-        module_state = dict(model.named_modules())
-        yield from model.named_parameters()
-        for name, buffer in model.named_buffers():
+        yield from self._model.named_parameters()
+        for name, buffer in self._model.named_buffers():
             module_name, _, local_name = name.rpartition(".")
-            if local_name in module_state[module_name]._non_persistent_buffers_set:
+            if (
+                local_name
+                in self._module_state[module_name]._non_persistent_buffers_set
+            ):
                 continue
             yield name, buffer
 
@@ -490,12 +491,16 @@ def _gather_tensor_shards(
     if shard_dim is None or tp_group.world_size == 1:
         return tensor
 
-    all_shards = [torch.empty_like(tensor) for _ in range(tp_group.world_size)]
-    torch.distributed.all_gather(all_shards, tensor, group=tp_group.device_group)
+    gathered = tp_group.all_gather(tensor, dim=shard_dim)
     if replica_group_size > 1:
         assert tp_group.world_size % replica_group_size == 0
-        all_shards = all_shards[::replica_group_size]
-    return torch.cat(all_shards, dim=shard_dim)
+        shard_size = tensor.shape[shard_dim]
+        unique_world_size = tp_group.world_size // replica_group_size
+        unique_shards = torch.split(gathered, shard_size, dim=shard_dim)[
+            :unique_world_size
+        ]
+        return torch.cat(unique_shards, dim=shard_dim)
+    return gathered
 
 
 def _column_parallel_shard_dim(ndim: int) -> Optional[int]:
