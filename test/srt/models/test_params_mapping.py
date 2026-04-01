@@ -10,6 +10,8 @@ from sglang.srt.model_loader.parameter_mapper import ParameterMapper
 _DEEPSEEK_N_ROUTED = 4
 _DEEPSEEK_N_LOCAL = _DEEPSEEK_N_ROUTED + 1  # +1 fused shared expert
 _QWEN3MOE_N = 4
+_GLM4LITE_N_ROUTED = 4
+_GLM4LITE_N_LOCAL = _GLM4LITE_N_ROUTED + 1  # +1 fused shared expert
 
 
 def _make_model(**kwargs):
@@ -27,6 +29,12 @@ def _deepseek_scale_remap(name):
     for s in ["k_scale", "v_scale"]:
         if s in name:
             return name.replace(f"{s[0]}_proj", "attn_mqa")
+    return name
+
+
+def _glm4lite_mutate(name):
+    if "mlp.shared_experts" in name:
+        return name.replace("mlp.shared_experts", f"mlp.experts.{_GLM4LITE_N_ROUTED}")
     return name
 
 
@@ -121,6 +129,32 @@ def deepseek_mapper():
     )
 
 
+@pytest.fixture
+def glm4lite_mapper():
+    """GLM4-MoE-Lite (GLM-4.7): QKV fusion, MLA A-proj fusion, shared expert fusion, custom scale remap."""
+    return ParameterMapper.from_model(
+        _make_model(
+            stacked_params_mapping=[
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+                ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+                ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+            ],
+            expert_params_mapping=FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=_GLM4LITE_N_LOCAL,
+            ),
+            mutate_weight_preload=_glm4lite_mutate,
+            custom_scale_remap=_deepseek_scale_remap,
+        )
+    )
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
@@ -196,6 +230,32 @@ _DEEPSEEK_CASES = [
     # kv_b_proj pass-through (decomposed in post_load_weights)
     ("model.layers.0.self_attn.kv_b_proj.weight",           to_expect("model.layers.0.self_attn.kv_b_proj.weight")),
 ]
+
+_GLM4LITE_CASES = [
+    # QKV fusion (GLM-4.7 uses standard QKV unlike DeepSeek which uses MLA-only)
+    ("model.layers.0.self_attn.q_proj.weight",              to_expect("model.layers.0.self_attn.qkv_proj.weight", "q", 3)),
+    ("model.layers.0.self_attn.k_proj.weight",              to_expect("model.layers.0.self_attn.qkv_proj.weight", "k", 3)),
+    ("model.layers.0.self_attn.v_proj.weight",              to_expect("model.layers.0.self_attn.qkv_proj.weight", "v", 3)),
+    # MLA A-proj fusion (GLM-4.7 also uses MLA with q_lora_rank)
+    ("model.layers.0.self_attn.q_a_proj.weight",            to_expect("model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight", 0, 2)),
+    ("model.layers.0.self_attn.kv_a_proj_with_mqa.weight",  to_expect("model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight", 1, 2)),
+    # Gate/Up fusion (non-expert layers)
+    ("model.layers.0.mlp.gate_proj.weight",                 to_expect("model.layers.0.mlp.gate_up_proj.weight", 0, 2)),
+    ("model.layers.0.mlp.up_proj.weight",                   to_expect("model.layers.0.mlp.gate_up_proj.weight", 1, 2)),
+    # Expert mapping
+    ("model.layers.0.mlp.experts.0.gate_proj.weight",       to_expect("model.layers.0.mlp.experts.w13_weight", "w1", 2, 0, _GLM4LITE_N_LOCAL)),
+    ("model.layers.0.mlp.experts.0.up_proj.weight",         to_expect("model.layers.0.mlp.experts.w13_weight", "w3", 2, 0, _GLM4LITE_N_LOCAL)),
+    ("model.layers.0.mlp.experts.3.down_proj.weight",       to_expect("model.layers.0.mlp.experts.w2_weight", "w2", 1, 3, _GLM4LITE_N_LOCAL)),
+    # Shared expert fusion via mutate_weight_preload
+    ("model.layers.0.mlp.shared_experts.gate_proj.weight",  to_expect("model.layers.0.mlp.experts.w13_weight", "w1", 2, _GLM4LITE_N_ROUTED, _GLM4LITE_N_LOCAL)),
+    ("model.layers.0.mlp.shared_experts.down_proj.weight",  to_expect("model.layers.0.mlp.experts.w2_weight", "w2", 1, _GLM4LITE_N_ROUTED, _GLM4LITE_N_LOCAL)),
+    # Custom scale remap (same as DeepSeek: k_proj/v_proj -> attn_mqa)
+    ("model.layers.0.self_attn.k_proj.k_scale",             to_expect("model.layers.0.self_attn.attn_mqa.k_scale")),
+    ("model.layers.0.self_attn.v_proj.v_scale",             to_expect("model.layers.0.self_attn.attn_mqa.v_scale")),
+    # Pass-through
+    ("model.layers.0.mlp.down_proj.weight",                 to_expect("model.layers.0.mlp.down_proj.weight")),
+    ("model.layers.0.self_attn.kv_b_proj.weight",           to_expect("model.layers.0.self_attn.kv_b_proj.weight")),
+]
 # fmt: on
 
 
@@ -223,3 +283,10 @@ def test_qwen3moe(qwen3moe_mapper, ckpt, expected):
 )
 def test_deepseek(deepseek_mapper, ckpt, expected):
     _assert(deepseek_mapper, ckpt, expected)
+
+
+@pytest.mark.parametrize(
+    "ckpt,expected", _GLM4LITE_CASES, ids=[c[0] for c in _GLM4LITE_CASES]
+)
+def test_glm4lite(glm4lite_mapper, ckpt, expected):
+    _assert(glm4lite_mapper, ckpt, expected)
