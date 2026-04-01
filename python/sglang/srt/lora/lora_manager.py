@@ -136,7 +136,10 @@ class LoRAManager:
 
         try:
             # load configs
-            new_adapter = LoRAConfig(lora_ref.lora_path)
+            new_adapter = LoRAConfig(
+                lora_ref.lora_path,
+                base_vocab_size=self.base_hf_config.vocab_size,
+            )
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -602,7 +605,11 @@ class LoRAManager:
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
-            new_adapter = LoRAConfig.from_dict(config_dict, added_tokens_config)
+            new_adapter = LoRAConfig.from_dict(
+                config_dict,
+                added_tokens_config,
+                base_vocab_size=self.base_hf_config.vocab_size,
+            )
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
