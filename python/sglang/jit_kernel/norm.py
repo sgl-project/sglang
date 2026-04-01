@@ -121,10 +121,10 @@ def fused_inplace_qknorm(
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    output: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
 ) -> None:
-    output = output if output is not None else input
+    out = out if out is not None else input
     hidden_size = input.size(-1)
     if not _is_supported_rmsnorm_hidden_size(hidden_size):
         raise RuntimeError(
@@ -133,7 +133,7 @@ def rmsnorm(
             f"(256, {_RMSNORM_MAX_HIDDEN_SIZE}]."
         )
     module = _jit_rmsnorm_module(hidden_size, input.dtype)
-    module.rmsnorm(input, weight, output, eps)
+    module.rmsnorm(input, weight, out, eps)
 
 
 @debug_kernel_api
