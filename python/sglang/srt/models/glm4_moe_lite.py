@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-Lite model compatible with HuggingFace weights"""
+"""Inference-only GLM-4.7-Flash model compatible with HuggingFace weights"""
 
 import logging
 from typing import Iterable, Optional, Tuple
@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -72,6 +73,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _device_sm = get_device_sm()
@@ -335,12 +337,8 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.config = config
-
-        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        rope_theta = 1000000
-        rope_scaling = None
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 202752)
         self.layer_id = layer_id
 
@@ -429,8 +427,6 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         self.pp_group = get_pp_group()
 
         # DeepseekV2Model.forward expects these attributes to exist.
-        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         self.cp_size = get_attention_tp_size() if self.nsa_enable_prefill_cp else None
         self.gemm_output_zero_allocator_size = 0
@@ -500,8 +496,6 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             }
         )
         self.capture_aux_hidden_states = False
-
-        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
