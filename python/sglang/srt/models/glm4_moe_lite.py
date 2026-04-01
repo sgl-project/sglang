@@ -501,6 +501,33 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         )
         self.capture_aux_hidden_states = False
 
+        # Weight loading mappings for ParameterMapper compatibility
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        # Add A-proj fusion mapping when q_lora_rank is enabled (MLA)
+        self.fuse_qkv_a_proj = hasattr(config, "q_lora_rank") and (
+            config.q_lora_rank is not None
+        )
+        if self.fuse_qkv_a_proj:
+            self.stacked_params_mapping.extend(
+                [
+                    ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
+                    ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
+                ]
+            )
+        self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=config.n_routed_experts + self.num_fused_shared_experts,
+        )
+
         from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
@@ -543,6 +570,22 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
+
+    def mutate_weight_preload(self, name: str) -> str:
+        """GLM4-MoE-Lite: shared expert fusion."""
+        if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            return name.replace(
+                "mlp.shared_experts",
+                f"mlp.experts.{self.config.n_routed_experts}",
+            )
+        return name
+
+    def custom_scale_remap(self, name: str) -> str:
+        """GLM4-MoE-Lite: k_proj/v_proj -> attn_mqa for MLA kv scale."""
+        for s in ["k_scale", "v_scale"]:
+            if s in name:
+                return name.replace(f"{s[0]}_proj", "attn_mqa")
+        return name
 
     def load_weights(
         self,

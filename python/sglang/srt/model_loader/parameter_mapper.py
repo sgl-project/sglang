@@ -33,7 +33,7 @@ checkpoint format and SGLang's internal parameter naming, handling:
 
 Supported Models:
     Dense: Llama, Qwen2, Qwen3, GLM4
-    MoE:   DeepSeekV2/V3/R1, Qwen3-MoE, GLM4-MoE
+    MoE:   DeepSeekV2/V3/R1, Qwen3-MoE, GLM4-MoE, GLM4-MoE-Lite (GLM-4.7)
 
 Example:
     >>> mapper = ParameterMapper.from_model(model)
@@ -230,7 +230,10 @@ class ParameterMapper:
 
     @classmethod
     def from_model(cls, model) -> "ParameterMapper":
-        """Create a ParameterMapper from a model instance."""
+        """Create a ParameterMapper from a model instance; currently supports
+        DeepseekV2ForCausalLM, Glm4ForCausalLM, Glm4MoeForCausalLM,
+        Glm4MoeLiteForCausalLM, LlamaForCausalLM, Qwen2ForCausalLM,
+        Qwen3ForCausalLM, Qwen3MoeForCausalLM."""
         stacked_mapping = list(getattr(model, "stacked_params_mapping", []) or [])
         expert_mapping = list(getattr(model, "expert_params_mapping", []) or [])
 
