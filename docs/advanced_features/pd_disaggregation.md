@@ -33,7 +33,7 @@ For deploying PD disaggregation at scale with load balancing and fault tolerance
 uv pip install mooncake-transfer-engine
 ```
 
-On multi-homed hosts (separate management and RoCE data-plane IPs), Mooncake uses the same address as `--host` when `--disaggregation-mode` is `prefill` or `decode`, so peers reach you on the intended interface. You can still override with `SGLANG_HOST_IP` or `HOST_IP` if the transfer engine must use a different address than HTTP.
+On multi-homed hosts (separate management and RoCE data-plane IPs), Mooncake uses the same address as `--host` when `--disaggregation-mode` is `prefill` or `decode`, so peers reach you on the intended interface. You can still override with `SGLANG_HOST_IP` or `HOST_IP` if the transfer engine must use a different address than HTTP. If you prefer NIC pinning for auto-detection, set `SGLANG_LOCAL_IP_NIC` to the target network interface name.
 
 ### Usage
 
