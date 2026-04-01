@@ -42,6 +42,7 @@ from sglang.srt.utils.common import (
     get_device_name,
     get_device_sm,
     get_int_env_var,
+    get_nvidia_driver_version,
     get_quantization_config,
     human_readable_int,
     is_blackwell_supported,
@@ -213,6 +214,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
+    "cutlass",
     "flashinfer_cudnn",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
@@ -464,6 +466,7 @@ class ServerArgs:
     lora_eviction_policy: str = "lru"
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
+    experts_shared_outer_loras: Optional[bool] = None
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -1351,6 +1354,9 @@ class ServerArgs:
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
+        if self.cuda_graph_max_bs not in capture_bs:
+            capture_bs.append(self.cuda_graph_max_bs)
+
         return capture_bs
 
     def _generate_cpu_graph_batch_sizes(self):
@@ -1429,6 +1435,18 @@ class ServerArgs:
     def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
+
+        # HiSparse requires flashmla_sparse for both prefill and decode
+        if self.enable_hisparse:
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "flashmla_sparse"
+            if not user_set_decode:
+                self.nsa_decode_backend = "flashmla_sparse"
+            logger.warning(
+                f"HiSparse enabled: using flashmla_sparse NSA backends "
+                f"(prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend})."
+            )
+            return
 
         if not user_set_prefill and not user_set_decode and is_hip():
             self.nsa_prefill_backend = "tilelang"
@@ -1753,10 +1771,21 @@ class ServerArgs:
                     and is_triton_kernels_available()
                     and self.quantization is None
                 ):
-                    self.moe_runner_backend = "triton_kernel"
-                    logger.warning(
-                        "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
-                    )
+                    # The triton_kernels package segfaults on Blackwell (B200)
+                    # with NVIDIA driver >= 595. Fall back to triton backend.
+                    if is_blackwell_supported() and get_nvidia_driver_version() >= (
+                        595,
+                    ):
+                        self.moe_runner_backend = "triton"
+                        logger.warning(
+                            "Detected GPT-OSS model on Blackwell with driver >= 595, "
+                            "using triton MOE kernel to avoid triton_kernels SIGSEGV."
+                        )
+                    else:
+                        self.moe_runner_backend = "triton_kernel"
+                        logger.warning(
+                            "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
+                        )
 
             if self.moe_runner_backend == "triton_kernel":
                 assert (
@@ -4595,6 +4624,14 @@ class ServerArgs:
             choices=[16, 32, 64, 128],
             help="Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance.",
         )
+        parser.add_argument(
+            "--experts-shared-outer-loras",
+            default=ServerArgs.experts_shared_outer_loras,
+            action="store_true",
+            help="Force shared outer LoRA mode for MoE models. "
+            "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
+            "(expert_dim=1). By default this is auto-detected from adapter weights.",
+        )
 
         # Kernel backend
         parser.add_argument(
@@ -4685,7 +4722,8 @@ class ServerArgs:
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
             "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
-            "'flashinfer_cutlass' (CUTLASS backend), "
+            "'cutlass' (SGLang CUTLASS kernel), "
+            "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
         )
@@ -6145,6 +6183,17 @@ class ServerArgs:
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+            for attr, label in [
+                ("nsa_prefill_backend", "prefill"),
+                ("nsa_decode_backend", "decode"),
+            ]:
+                backend = getattr(self, attr)
+                if backend is not None and backend != "flashmla_sparse":
+                    raise ValueError(
+                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                        f"but got --nsa-{label}-backend={backend}. "
+                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                    )
 
         assert (
             self.schedule_conservativeness >= 0

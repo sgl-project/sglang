@@ -1725,6 +1725,19 @@ def wrap_shm_features(obj):
     return obj
 
 
+def has_shm_features(recv_reqs):
+    """Return True if any request in the list contains ShmPointerMMData."""
+    for req in recv_reqs:
+        if hasattr(req, "batch"):
+            if has_shm_features(req.batch):
+                return True
+        elif hasattr(req, "mm_inputs") and req.mm_inputs:
+            for item in req.mm_inputs.get("mm_items", []):
+                if isinstance(item.feature, ShmPointerMMData):
+                    return True
+    return False
+
+
 def unwrap_shm_features(obj):
     """
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.

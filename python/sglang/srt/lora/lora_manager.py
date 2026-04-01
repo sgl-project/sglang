@@ -78,8 +78,10 @@ class LoRAManager:
             server_args.enable_lora_overlap_loading
         )
 
-        # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
+        self._experts_shared_outer_override: Optional[bool] = (
+            server_args.experts_shared_outer_loras
+        )
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -134,7 +136,10 @@ class LoRAManager:
 
         try:
             # load configs
-            new_adapter = LoRAConfig(lora_ref.lora_path)
+            new_adapter = LoRAConfig(
+                lora_ref.lora_path,
+                base_vocab_size=self.base_hf_config.vocab_size,
+            )
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -303,23 +308,33 @@ class LoRAManager:
                 if isinstance(module, FusedMoEWithLoRA) and all(
                     x in self.target_modules for x in ["gate_up_proj", "down_proj"]
                 ):
+                    gate_up_key = (
+                        "gate_up_proj_moe"
+                        if "gate_up_proj_moe" in self.memory_pool.A_buffer
+                        else "gate_up_proj"
+                    )
+                    down_key = (
+                        "down_proj_moe"
+                        if "down_proj_moe" in self.memory_pool.A_buffer
+                        else "down_proj"
+                    )
                     gate_up_a = self.memory_pool.get_tensor(
-                        target_module="gate_up_proj_moe",
+                        target_module=gate_up_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_A,
                     )
                     gate_up_b = self.memory_pool.get_tensor(
-                        target_module="gate_up_proj_moe",
+                        target_module=gate_up_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_B,
                     )
                     down_a = self.memory_pool.get_tensor(
-                        target_module="down_proj_moe",
+                        target_module=down_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_A,
                     )
                     down_b = self.memory_pool.get_tensor(
-                        target_module="down_proj_moe",
+                        target_module=down_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_B,
                     )
@@ -387,6 +402,16 @@ class LoRAManager:
             target_modules=target_modules,
         )
 
+        if self._experts_shared_outer_override is not None:
+            self.experts_shared_outer_loras = self._experts_shared_outer_override
+        else:
+            self.experts_shared_outer_loras = self._detect_shared_outer_loras()
+        if self.experts_shared_outer_loras:
+            logger.info(
+                "Shared outer LoRA mode enabled: gate_up lora_A and "
+                "down lora_B will be shared across experts (expert_dim=1)."
+            )
+
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
@@ -411,6 +436,26 @@ class LoRAManager:
                     raise RuntimeError(
                         f"Failed to load LoRA adapter {lora_ref.lora_name}: {result.error_message}"
                     )
+
+    def _detect_shared_outer_loras(self) -> bool:
+        """Auto-detect shared outer LoRA format from loaded adapter weights.
+
+        MoE adapters with shared outer experts store 3D tensors where
+        dim[0]=1 indicates weights shared across all experts, while
+        dim[0]=num_experts indicates per-expert weights.
+        Returns True if gate_up lora_A has expert_dim=1 (shared).
+        """
+        for adapter in self.loras.values():
+            for layer in adapter.layers:
+                for name, weight in layer.weights.items():
+                    if (
+                        "gate_up_proj" in name
+                        and "lora_A" in name
+                        and weight.dim() == 3
+                    ):
+                        return weight.shape[0] == 1
+            break
+        return False
 
     def init_lora_shapes(
         self,
@@ -560,7 +605,11 @@ class LoRAManager:
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
-            new_adapter = LoRAConfig.from_dict(config_dict, added_tokens_config)
+            new_adapter = LoRAConfig.from_dict(
+                config_dict,
+                added_tokens_config,
+                base_vocab_size=self.base_hf_config.vocab_size,
+            )
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -589,6 +638,7 @@ class LoRAManager:
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
+            experts_shared_outer_loras=self.experts_shared_outer_loras,
         )
 
         # Initializing memory pool with base model
@@ -683,11 +733,10 @@ class LoRAManager:
                 )
                 continue
 
-            # Temporarily workaround for FusedMoE layer
             if isinstance(module, FusedMoE) and all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
                 layer_id = get_layer_id(module_name)
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
-                )
+                lora_module = self.set_lora_module(module_name, module)
+                lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
+                self.lora_modules[layer_id][module_name] = lora_module
