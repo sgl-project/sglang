@@ -726,8 +726,6 @@ class ServerArgs:
     sm_group_num: int = 8
 
     # For Multi-Modal
-    mm_max_concurrent_calls: int = 32
-    mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
     enable_prefix_mm_cache: bool = False
     mm_enable_dp_encoder: bool = False
@@ -1435,6 +1433,18 @@ class ServerArgs:
     def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
+
+        # HiSparse requires flashmla_sparse for both prefill and decode
+        if self.enable_hisparse:
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "flashmla_sparse"
+            if not user_set_decode:
+                self.nsa_decode_backend = "flashmla_sparse"
+            logger.warning(
+                f"HiSparse enabled: using flashmla_sparse NSA backends "
+                f"(prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend})."
+            )
+            return
 
         if not user_set_prefill and not user_set_decode and is_hip():
             self.nsa_prefill_backend = "tilelang"
@@ -5881,18 +5891,6 @@ class ServerArgs:
 
         # For Multi-Modal
         parser.add_argument(
-            "--mm-max-concurrent-calls",
-            type=int,
-            default=ServerArgs.mm_max_concurrent_calls,
-            help="The max concurrent calls for async mm data processing.",
-        )
-        parser.add_argument(
-            "--mm-per-request-timeout",
-            type=int,
-            default=ServerArgs.mm_per_request_timeout,
-            help="The timeout for each multi-modal request in seconds.",
-        )
-        parser.add_argument(
             "--enable-broadcast-mm-inputs-process",
             action="store_true",
             default=ServerArgs.enable_broadcast_mm_inputs_process,
@@ -6171,6 +6169,17 @@ class ServerArgs:
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+            for attr, label in [
+                ("nsa_prefill_backend", "prefill"),
+                ("nsa_decode_backend", "decode"),
+            ]:
+                backend = getattr(self, attr)
+                if backend is not None and backend != "flashmla_sparse":
+                    raise ValueError(
+                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                        f"but got --nsa-{label}-backend={backend}. "
+                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                    )
 
         assert (
             self.schedule_conservativeness >= 0
