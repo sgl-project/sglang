@@ -168,31 +168,6 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
-def flush_cache_with_retry(
-    base_url: str,
-    timeout: float = 30.0,
-    poll_interval: float = 0.5,
-) -> bool:
-    """Flush device cache, polling until success or timeout.
-
-    flush_cache only succeeds when the scheduler is fully idle, but
-    HiCache async ops (write-through, backup) may still be in-flight
-    after a request completes.  We poll with a short interval so idle
-    is detected quickly, while the generous timeout accommodates slow
-    CI environments.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            response = requests.post(f"{base_url}/flush_cache", timeout=10)
-            if response.status_code == 200:
-                return True
-        except requests.RequestException:
-            pass
-        time.sleep(poll_interval)
-    return False
-
-
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -2082,6 +2057,35 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
 
 
 class CustomTestCase(unittest.TestCase):
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        # Wrap the effective setUpClass so that tearDownClass is called
+        # even when setUpClass fails. Python's unittest skips tearDownClass
+        # if setUpClass raises, which can leak resources (ports, processes).
+        setup = cls.setUpClass
+        if getattr(setup, "_safe_setup_wrapped", False):
+            return
+
+        orig_func = setup.__func__
+
+        def safe_setUpClass(klass):
+            try:
+                orig_func(klass)
+            except Exception:
+                # Best-effort cleanup; suppress teardown errors so the
+                # original setUpClass exception propagates clearly.
+                try:
+                    klass.tearDownClass()
+                except Exception:
+                    pass
+                raise
+
+        # Set sentinel on the raw function so that bound method attribute
+        # lookup (which delegates to __func__) can detect it in subclasses.
+        safe_setUpClass._safe_setup_wrapped = True
+        cls.setUpClass = classmethod(safe_setUpClass)
 
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
