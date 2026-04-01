@@ -17,6 +17,7 @@ sys.modules.setdefault("zmq", types.SimpleNamespace())
 from sglang.auto_benchmark_lib import (
     append_jsonl,
     build_candidates,
+    build_qps_plan,
     build_server_candidates,
     classify_failure,
     collect_stale_server_pids,
@@ -26,6 +27,8 @@ from sglang.auto_benchmark_lib import (
     format_best_progress,
     infer_backend,
     prepare_dataset,
+    rendered_launch_command,
+    run_candidate,
 )
 from sglang.benchmark.datasets.autobench import sample_autobench_requests
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -169,6 +172,15 @@ class TestAutoBenchmarkTools(CustomTestCase):
         self.assertEqual(summary["num_requests"], 2)
         self.assertEqual(len(rows), 2)
 
+    def test_prepare_custom_dataset_requires_path(self):
+        with self.assertRaisesRegex(ValueError, "dataset.path is required"):
+            prepare_dataset(
+                dataset_cfg={"kind": "custom"},
+                tokenizer_path=str(self.tokenizer_dir),
+                model=None,
+                output_path=str(self.tmpdir_path / "missing.autobench.jsonl"),
+            )
+
     def test_infer_backend(self):
         prompt_rows = [SimpleNamespace(prompt="tok_1 tok_2")]
         chat_rows = [SimpleNamespace(prompt=[{"role": "user", "content": "tok_1"}])]
@@ -255,6 +267,12 @@ class TestAutoBenchmarkTools(CustomTestCase):
         self.assertIn("default", describe_search_tier(2))
         self.assertIn("slowest", describe_search_tier(3))
 
+    def test_build_qps_plan_accepts_numeric_request_rate(self):
+        mode, values, tolerance = build_qps_plan({"request_rate": 3.5})
+        self.assertEqual(mode, "fixed")
+        self.assertEqual(values, [3.5])
+        self.assertEqual(tolerance, 0.0)
+
     def test_format_best_progress(self):
         text = format_best_progress(
             {
@@ -305,6 +323,64 @@ class TestAutoBenchmarkTools(CustomTestCase):
             "sglang.auto_benchmark_lib.subprocess.run", side_effect=fake_run
         ):
             self.assertEqual(collect_stale_server_pids(30000), [123, 456])
+
+    def test_rendered_launch_command_includes_env(self):
+        text = rendered_launch_command(
+            {
+                "env": {
+                    "CUDA_VISIBLE_DEVICES": "0",
+                    "HF_TOKEN": "secret-value",
+                },
+                "extra_args": [],
+            },
+            {"model_path": "Qwen/Qwen3-32B", "tp_size": 1, "port": 30000},
+        )
+
+        self.assertIn("CUDA_VISIBLE_DEVICES=0", text)
+        self.assertIn("--model-path Qwen/Qwen3-32B", text)
+        self.assertNotIn("HF_TOKEN", text)
+
+    def test_run_candidate_binary_search_avoids_rounding_loop(self):
+        benchmark_cfg = {
+            "qps": {"lower": 1.0, "upper": 1.00000001, "tolerance": 1e-12},
+            "max_concurrency": [None],
+        }
+        calls = []
+
+        def fake_run_trial(**kwargs):
+            calls.append(kwargs["request_rate"])
+            return {
+                "stage": "base",
+                "candidate_id": kwargs["candidate_id"],
+                "requested_qps": kwargs["request_rate"],
+                "max_concurrency": kwargs["max_concurrency"],
+                "server_flags": kwargs["server_flags"],
+                "sla_passed": True,
+                "metrics": {
+                    "output_throughput": 1.0,
+                    "mean_ttft_ms": 1.0,
+                    "mean_tpot_ms": 1.0,
+                },
+            }
+
+        with mock.patch(
+            "sglang.auto_benchmark_lib.run_trial", side_effect=fake_run_trial
+        ):
+            records = run_candidate(
+                stage_name="base",
+                candidate_id=0,
+                server_cfg={"host": "127.0.0.1", "port": 30000},
+                benchmark_cfg=benchmark_cfg,
+                dataset_summary={"num_requests": 1},
+                backend="sglang-oai",
+                dataset_path="/tmp/fake.jsonl",
+                tokenizer_path=str(self.tokenizer_dir),
+                server_flags={"model_path": "/model"},
+                output_dir=str(self.tmpdir_path),
+            )
+
+        self.assertLess(len(calls), 40)
+        self.assertEqual(len(records), len(calls))
 
 
 if __name__ == "__main__":

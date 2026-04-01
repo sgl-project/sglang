@@ -89,6 +89,7 @@ PROGRESS_FLAG_ALIASES = {
     "speculative_eagle_topk": "eagle_topk",
     "speculative_num_draft_tokens": "draft_tok",
 }
+SENSITIVE_ENV_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -203,12 +204,19 @@ def estimate_binary_search_trials(lower: float, upper: float, tolerance: float) 
     trials = 0
     lo, hi = float(lower), float(upper)
     while hi - lo > tolerance:
-        qps = round((lo + hi) / 2, 4)
+        qps = pick_qps_midpoint(lo, hi)
         if qps <= lo or qps >= hi:
             break
         hi = qps
         trials += 1
     return max(trials, 1)
+
+
+def pick_qps_midpoint(lower: float, upper: float) -> float:
+    midpoint = round((lower + upper) / 2, 4)
+    if lower < midpoint < upper:
+        return midpoint
+    return (lower + upper) / 2
 
 
 def estimate_trials_per_candidate(benchmark_cfg: Dict[str, Any]) -> int:
@@ -523,6 +531,8 @@ def normalize_dataset_cfg(
             f"Unsupported dataset kind: {cfg['kind']}. "
             f"Supported: {sorted(SUPPORTED_DATASETS)}"
         )
+    if cfg["kind"] == "custom" and not cfg.get("path"):
+        raise ValueError("dataset.path is required when dataset.kind=custom.")
     return cfg
 
 
@@ -636,6 +646,7 @@ def prepare_dataset(
     model: Optional[str],
     output_path: str,
 ) -> Tuple[str, List[Any], Dict[str, Any]]:
+    dataset_cfg = normalize_dataset_cfg(dataset_cfg, {})
     if dataset_cfg["kind"] == "custom" and looks_like_autobench(
         dataset_cfg.get("path", "")
     ):
@@ -798,6 +809,8 @@ def build_candidates(
 
 def build_qps_plan(benchmark_cfg: Dict[str, Any]) -> Tuple[str, List[float], float]:
     qps_cfg = benchmark_cfg.get("qps", benchmark_cfg.get("request_rate"))
+    if isinstance(qps_cfg, (int, float)):
+        return "fixed", [float(qps_cfg)], 0.0
     if isinstance(qps_cfg, list):
         return "fixed", [float(value) for value in qps_cfg], 0.0
     if isinstance(qps_cfg, dict) and "values" in qps_cfg:
@@ -855,13 +868,17 @@ def launch_server(
     env = os.environ.copy()
     env.update({key: str(value) for key, value in server_cfg.get("env", {}).items()})
     log_file = open(log_path, "w", encoding="utf-8")
-    process = subprocess.Popen(
-        command,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        env=env,
-        start_new_session=True,
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    except Exception:
+        log_file.close()
+        raise
     process._autobench_log_file = log_file  # type: ignore[attr-defined]
     return process
 
@@ -1095,7 +1112,9 @@ def run_candidate(
         lower, upper = values
         best: Optional[Dict[str, Any]] = None
         while upper - lower > tolerance:
-            qps = round((lower + upper) / 2, 4)
+            qps = pick_qps_midpoint(lower, upper)
+            if qps <= lower or qps >= upper:
+                break
             record = one_trial(qps, max_concurrency)
             records.append(record)
             if record_callback is not None:
@@ -1114,9 +1133,9 @@ def run_candidate(
 
 
 def write_jsonl(path: str, records: Iterable[Dict[str, Any]]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for record in records:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if os.path.exists(path):
+        os.remove(path)
+    append_jsonl(path, records)
 
 
 def write_csv(path: str, records: Sequence[Dict[str, Any]]) -> None:
@@ -1148,7 +1167,12 @@ def rendered_launch_command(
     command.extend(cli_args(server_flags))
     command.extend(str(item) for item in server_cfg.get("extra_args", []))
 
-    parts: List[str] = []
+    env_parts = []
+    for key, value in sorted(server_cfg.get("env", {}).items()):
+        if any(marker in key.upper() for marker in SENSITIVE_ENV_MARKERS):
+            continue
+        env_parts.append(f"{key}={shlex.quote(str(value))}")
+    parts: List[str] = env_parts
     i = 0
     while i < len(command):
         token = str(command[i])

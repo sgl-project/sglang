@@ -27,6 +27,20 @@ The implementation lives in:
 
 If those are not true yet, fix them before running a large search.
 
+## Remote Run Logging
+
+If the benchmark is executed on a remote machine, the progress bar output must be
+mirrored back to a local file for humans to watch.
+
+Required behavior:
+- start the remote run with a persistent terminal/session log, for example with `script -q -f`
+- continuously sync that remote session log back to a local `progress.log`
+- tell the user the local log path up front
+- keep final result files synced back locally after the run ends
+
+This is important because long searches can run for hours, and people need a
+stable local file they can tail without logging into the remote box.
+
 ## Most Important Rule
 
 If the user wants the best command for a **real production or real workload scenario**, the benchmark must use **their real request distribution**.
