@@ -129,8 +129,6 @@ Reference results (Qwen3.5-35B-A3B, 4x RTX PRO 6000 Blackwell SM120, TP=4):
 | BF16 | No | 91.3% | - |
 | FP8 (fp8_e4m3) | No | 91.0% | 350.6 tok/s |
 | **FP4 (fp4_e2m1)** | **No** | **91.4%** | **2528 tok/s** |
-| FP8 (fp8_e4m3) | draft_len=3 | 96.0% | 652.2 tok/s |
-| FP4 (fp4_e2m1) | draft_len=3 | 94.0% | 891.3 tok/s |
 
 #### GPQA (198 questions, 8 repeats, temperature=0.6, max_tokens=81920)
 
