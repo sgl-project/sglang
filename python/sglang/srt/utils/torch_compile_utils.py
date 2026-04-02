@@ -46,6 +46,24 @@ def get_default_compile_mode() -> str:
     return os.environ.get("SGLANG_TORCH_COMPILE_MODE", "default")
 
 
+def merge_mode_options(
+    mode: Optional[str] = None, options: Optional[dict] = None
+) -> dict:
+    """Merge a ``torch.compile`` *mode*'s defaults with explicit *options*.
+
+    ``torch.compile`` raises if both ``mode`` and ``options`` are given.
+    This helper expands the mode into its option defaults (via
+    ``torch._inductor.list_mode_options``) and layers explicit options on
+    top, returning a single merged dict suitable for ``options=``.
+    """
+    from torch._inductor import list_mode_options
+
+    base = list_mode_options(mode or "default")
+    if options:
+        base.update(options)
+    return base
+
+
 def _resolve_base_compile_config(obj: object) -> tuple[str, dict, object]:
     """Resolve class-level + global default config for any object with a ``compile_config`` ClassVar."""
     mode = get_default_compile_mode()
@@ -168,12 +186,14 @@ class CompilableRegionMixin:
         Uses ``_REGION_DYNAMIC[region_name]`` when present, falling back to
         *compile_dynamic*.  Override in subclasses for further customisation.
         """
-        dynamic = self._REGION_DYNAMIC.get(region_name, compile_dynamic)
+        compile_dynamic = self._REGION_DYNAMIC.get(region_name, compile_dynamic)
+
+        # Merge compile_mode and compile_options.
+        merged_options = merge_mode_options(compile_mode, compile_options)
         return torch.compile(
             getattr(self, method_name),
-            mode=compile_mode,
-            options=compile_options,
-            dynamic=dynamic,
+            options=merged_options,
+            dynamic=compile_dynamic,
         )
 
     def enter_region_compile(

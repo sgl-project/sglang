@@ -42,10 +42,13 @@ class MultiPlatformOp(nn.Module):
         compile_options: Optional[dict] = None,
         compile_dynamic: bool = False,
     ) -> Callable:
+        from sglang.srt.utils.torch_compile_utils import merge_mode_options
+
+        # Merge compile_mode and compile_options.
+        merged_options = merge_mode_options(compile_mode, compile_options)
         return torch.compile(
             getattr(self, method_name),
-            mode=compile_mode,
-            options=compile_options,
+            options=merged_options,
             dynamic=compile_dynamic,
         )
 

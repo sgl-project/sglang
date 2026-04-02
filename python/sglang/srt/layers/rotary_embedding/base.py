@@ -196,14 +196,22 @@ class RotaryEmbedding(MultiPlatformOp):
     def _get_local_torch_compile_forward_method(
         self,
         method_name: str,
+        compile_mode: Optional[str] = None,
         compile_options: Optional[dict] = None,
         compile_dynamic: bool = False,
     ) -> Callable:
-        # num_tokens and cache_loc shapes vary across CUDA graph buckets
+        from sglang.srt.utils.torch_compile_utils import merge_mode_options
+
+        # forward_native can handled KV cache fusion.
+        # cache_loc varies across calls;
+        compile_dynamic = False
+
+        # Merge compile_mode and compile_options.
+        merged_options = merge_mode_options(compile_mode, compile_options)
         return torch.compile(
             getattr(self, method_name),
-            options=compile_options,
-            dynamic=None,
+            options=merged_options,
+            dynamic=compile_dynamic,
         )
 
     def forward_native(

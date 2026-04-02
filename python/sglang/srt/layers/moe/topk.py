@@ -286,7 +286,7 @@ class TopK(MultiPlatformOp):
     _MOE_OVERRIDE_KEYWORDS = ("FusedMoE",)
 
     def enter_torch_compile(self, num_tokens, compile_scope="full",
-                            override_layers=None, compile_options=None,
+                            override_layers=None, compile_mode=None, compile_options=None,
                             compile_dynamic=False):
         if self.is_torch_compile:
             return
@@ -313,6 +313,7 @@ class TopK(MultiPlatformOp):
             num_tokens=num_tokens,
             compile_scope=compile_scope,
             override_layers=override_layers,
+            compile_mode=compile_mode,
             compile_options=compile_options,
             compile_dynamic=compile_dynamic,
         )
