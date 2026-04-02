@@ -639,6 +639,7 @@ class ServerArgs:
     torch_compile_max_bs: int = 32
     torch_compile_scope: str = "full"
     torch_compile_override_layers: Optional[List[str]] = None
+    torch_compile_op_config: Optional[str] = None
     piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     piecewise_cuda_graph_compiler: str = "eager"
@@ -5527,6 +5528,16 @@ class ServerArgs:
             help="Override decode torch.compile layer switching with an exact-class-name "
             "allowlist. Requires --enable-torch-compile. Example: "
             "`--torch-compile-override-layers UnquantizedFusedMoEMethod RMSNorm`.",
+        )
+        parser.add_argument(
+            "--torch-compile-op-config",
+            type=str,
+            default=ServerArgs.torch_compile_op_config,
+            help='Per-MultiPlatformOp torch.compile config as a JSON string mapping '
+            'class names to {"mode": ..., "options": {...}}. Overrides the class-level '
+            "defaults. Example: "
+            """'{"UnquantizedFusedMoEMethod": {"mode": "max-autotune", """
+            """"options": {"max_autotune_gemm": true}}}'.""",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-max-tokens",
