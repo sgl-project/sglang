@@ -122,6 +122,11 @@ class CompilableRegionMixin:
 
     compile_config: ClassVar[CompileConfig] = CompileConfig()
 
+    # Per-region ``dynamic`` kwarg for ``torch.compile``.  Subclasses set this
+    # to override the default ``compile_dynamic`` for specific regions, e.g.
+    # ``_REGION_DYNAMIC = {"QKNorm": False, "RopeKV": None}``.
+    _REGION_DYNAMIC: ClassVar[Dict[str, object]] = {}
+
     def get_compilable_regions(self) -> dict[str, str]:
         """Return {region_name: method_name} for compilable sub-functions."""
         return {}
@@ -136,14 +141,15 @@ class CompilableRegionMixin:
     ) -> Callable:
         """Return the compiled callable for *method_name*.
 
-        Override in subclasses to customise ``torch.compile`` kwargs per
-        region (e.g. force ``dynamic=None``).
+        Uses ``_REGION_DYNAMIC[region_name]`` when present, falling back to
+        *compile_dynamic*.  Override in subclasses for further customisation.
         """
+        dynamic = self._REGION_DYNAMIC.get(region_name, compile_dynamic)
         return torch.compile(
             getattr(self, method_name),
             mode=compile_mode,
             options=compile_options,
-            dynamic=compile_dynamic,
+            dynamic=dynamic,
         )
 
     def enter_region_compile(

@@ -239,6 +239,41 @@ class TestCompilableRegionMixin(CustomTestCase):
         mod = _Bare()
         self.assertEqual(mod.get_compilable_regions(), {})
 
+    def test_region_dynamic_overrides_compile_dynamic(self):
+        """_REGION_DYNAMIC on the class overrides the compile_dynamic kwarg."""
+
+        class _DynamicRegion(nn.Module, CompilableRegionMixin):
+            _REGION_DYNAMIC = {"StaticRegion": False, "DefaultRegion": None}
+
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(4))
+
+            def get_compilable_regions(self):
+                return {
+                    "StaticRegion": "_static_fn",
+                    "DefaultRegion": "_default_fn",
+                    "FallbackRegion": "_fallback_fn",
+                }
+
+            def _static_fn(self, x):
+                return x * self.weight
+
+            def _default_fn(self, x):
+                return x + self.weight
+
+            def _fallback_fn(self, x):
+                return x - self.weight
+
+        mod = _DynamicRegion()
+        # All three regions should enter and leave cleanly.
+        for region in ("StaticRegion", "DefaultRegion", "FallbackRegion"):
+            mod.enter_region_compile(region, compile_dynamic=True)
+            self.assertTrue(mod.is_region_compiled(region))
+        for region in ("StaticRegion", "DefaultRegion", "FallbackRegion"):
+            mod.leave_region_compile(region)
+            self.assertFalse(mod.is_region_compiled(region))
+
 
 class _OpWithCustomConfig(_ForwardTrackerOp):
     compile_config = CompileConfig(

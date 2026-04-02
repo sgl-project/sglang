@@ -100,6 +100,8 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
+    # NOTE: CompilableRegionMixin is intentionally not handled here.
+    # Piecewise capture only supports full-scope compile via MultiPlatformOp.
     for sub in model._modules.values():
         if isinstance(sub, MultiPlatformOp):
             if reverse:

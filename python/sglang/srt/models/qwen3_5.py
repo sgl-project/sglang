@@ -635,22 +635,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module, CompilableRegionMixin):
         )
         return {"QKNorm": qk_method, "RopeKV": "_rope_kv"}
 
-    def _get_region_compile_method(
-        self,
-        region_name: str,
-        method_name: str,
-        compile_mode: Optional[str] = None,
-        compile_options: Optional[dict] = None,
-        compile_dynamic: bool = False,
-    ):
-        dynamic = self._REGION_DYNAMIC.get(region_name)
-        return torch.compile(
-            getattr(self, method_name),
-            mode=compile_mode,
-            options=compile_options,
-            dynamic=dynamic,
-        )
-
     def _qk_norm(self, q, k):
         q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
         k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)

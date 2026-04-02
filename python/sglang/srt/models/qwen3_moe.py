@@ -601,22 +601,6 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
     def get_compilable_regions(self) -> dict[str, str]:
         return {"QKNorm": "_qk_norm", "RopeKV": "_rope_kv"}
 
-    def _get_region_compile_method(
-        self,
-        region_name: str,
-        method_name: str,
-        compile_mode: Optional[str] = None,
-        compile_options: Optional[dict] = None,
-        compile_dynamic: bool = False,
-    ):
-        dynamic = self._REGION_DYNAMIC.get(region_name)
-        return torch.compile(
-            getattr(self, method_name),
-            mode=compile_mode,
-            options=compile_options,
-            dynamic=dynamic,
-        )
-
     def _qk_norm(self, q, k):
         """Compilable region: qk-norm (dynamic=False)."""
         q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
