@@ -289,8 +289,6 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        if isinstance(self.quant_method, UnquantizedFusedMoEMethod):
-            self.quant_method.create_native_activation_fn(self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
 
         self.should_fuse_routed_scaling_factor_in_topk = isinstance(

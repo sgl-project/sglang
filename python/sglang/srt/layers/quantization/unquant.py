@@ -169,7 +169,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self._cache_permute_indices = dict({})
-        self.native_activation_fn = None
 
     def create_weights(
         self,
@@ -321,24 +320,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 weight.data = npu_format_cast(weight.data)
 
         return
-
-    def create_native_activation_fn(self, moe_runner_config: MoeRunnerConfig) -> None:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-            _swiglu_gpt_oss_sigmoid_alpha,
-        )
-
-        if moe_runner_config.activation == "silu":
-            if moe_runner_config.gemm1_alpha and moe_runner_config.gemm1_clamp_limit:
-                self.native_activation_fn = _swiglu_gpt_oss_sigmoid_alpha
-            else:
-                from sglang.srt.layers.activation import SiluAndMul
-
-                self.native_activation_fn = SiluAndMul().forward_native
-        elif moe_runner_config.activation == "gelu":
-            assert moe_runner_config.gemm1_alpha is None and moe_runner_config.gemm1_clamp_limit is None, "gemm1_alpha and gemm1_clamp_limit are not supported for gelu"
-            from sglang.srt.layers.activation import GeluAndMul
-
-            self.native_activation_fn = GeluAndMul().forward_native
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,
@@ -698,47 +679,5 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
-    
-    @staticmethod
-    def create_native_activation_fn_args(x, alpha, limit) -> tuple:
-        if alpha is None and limit is not None:
-            return (x, limit)
-        elif alpha is None and limit is None:
-            return (x,)
-        else:
-            return (x, alpha, limit)
 
-
-    def forward_native(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
-    ) -> CombineInput:
-        from sglang.srt.layers.moe.fused_moe_native import (
-            fused_moe_forward_native_grouped_mm,
-        )
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        from sglang.srt.layers.moe.topk import TopKOutputChecker
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-        moe_runner_config = self.moe_runner_config
-
-        if not TopKOutputChecker.format_is_standard(topk_output):
-            raise TypeError(
-                f"forward_native requires StandardTopKOutput but received "
-                f"{type(topk_output).__name__}. When torch-compile overrides a "
-                f"FusedMoE method, TopK must also be overridden so it produces "
-                f"StandardTopKOutput. Add 'TopK' to --torch-compile-override-layers."
-            )
-
-        output = fused_moe_forward_native_grouped_mm(
-            layer=layer,
-            hidden_states=x,
-            topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
-            activation_fn=self.native_activation_fn,
-            activation_fn_args=UnquantizedFusedMoEMethod.create_native_activation_fn_args,
-            weights_pre_transposed=self.use_triton_kernels,
-        )
-        return StandardCombineInput(hidden_states=output)
+    forward_native = forward_cpu
