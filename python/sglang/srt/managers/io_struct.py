@@ -269,6 +269,7 @@ class GenerateReqInput(BaseReq):
 
         self._validate_inputs()
         self._determine_batch_size()
+        self._validate_sampling_params_type()
         self._handle_parallel_sampling()
 
         if self.is_single:
@@ -317,31 +318,44 @@ class GenerateReqInput(BaseReq):
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
-    def _handle_parallel_sampling(self):
-        """Handle parallel sampling parameters and adjust batch size if needed."""
-        get_sampling_param_n = (
-            lambda sampling_params: sampling_params.get("n", 1)
-            if isinstance(sampling_params, dict)
-            else sampling_params.n
+    def _validate_sampling_params_type(self):
+        """Validate sampling_params stays on the public request shape."""
+        if self.sampling_params is None or isinstance(self.sampling_params, dict):
+            return
+
+        if isinstance(self.sampling_params, list):
+            invalid_types = {
+                type(sampling_params).__name__
+                for sampling_params in self.sampling_params
+                if not isinstance(sampling_params, dict)
+            }
+            if not invalid_types:
+                return
+            raise TypeError(
+                "sampling_params must be a dict or list of dicts, "
+                f"got list containing {', '.join(sorted(invalid_types))}."
+            )
+
+        raise TypeError(
+            "sampling_params must be a dict or list of dicts, "
+            f"got {type(self.sampling_params).__name__}."
         )
 
+    def _handle_parallel_sampling(self):
+        """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
         if self.sampling_params is None:
             self.parallel_sample_num = 1
             return
-
-        sampling_params_list = (
-            self.sampling_params
-            if isinstance(self.sampling_params, list)
-            else [self.sampling_params]
-        )
-        self.parallel_sample_num = get_sampling_param_n(sampling_params_list[0])
-        for sampling_params in sampling_params_list[1:]:
-            sample_n = get_sampling_param_n(sampling_params)
-            if self.parallel_sample_num != sample_n:
-                raise ValueError(
-                    "The parallel_sample_num should be the same for all samples in sample params."
-                )
+        elif isinstance(self.sampling_params, dict):
+            self.parallel_sample_num = self.sampling_params.get("n", 1)
+        else:  # isinstance(self.sampling_params, list):
+            self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+            for sampling_params in self.sampling_params:
+                if self.parallel_sample_num != sampling_params.get("n", 1):
+                    raise ValueError(
+                        "The parallel_sample_num should be the same for all samples in sample params."
+                    )
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -483,8 +497,6 @@ class GenerateReqInput(BaseReq):
         if self.sampling_params is None:
             self.sampling_params = [{}] * num
         elif isinstance(self.sampling_params, dict):
-            self.sampling_params = [self.sampling_params] * num
-        elif isinstance(self.sampling_params, SamplingParams):
             self.sampling_params = [self.sampling_params] * num
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
