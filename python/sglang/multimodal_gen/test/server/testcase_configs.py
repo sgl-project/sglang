@@ -807,7 +807,21 @@ ONE_GPU_CASES_C = [
             modality="image",
         ),
         T2I_sampling_params,
-    )
+    ),
+    DiffusionTestCase(
+        "qwen_image_nunchaku_int4_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+            modality="image",
+            extras=[
+                "--enable-svdquant",
+                "--transformer-weights-path nunchaku-ai/nunchaku-qwen-image",
+                "--quantization-precision int4",
+                "--quantization-rank 32",
+            ],
+        ),
+        T2I_sampling_params,
+    ),
 ]
 
 TWO_GPU_CASES_A = [

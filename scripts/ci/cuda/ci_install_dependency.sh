@@ -312,6 +312,11 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 fi
+
+if [ "$IS_BLACKWELL" = "1" ]; then
+    $PIP_CMD install nunchaku $PIP_INSTALL_SUFFIX
+fi
+
 $PIP_CMD uninstall xformers || true
 
 mark_step_done "Install extra dependency"

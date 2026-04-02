@@ -8,6 +8,7 @@ are handled here behind a small helper/adapter layer.
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable, Optional
@@ -96,6 +97,8 @@ class _NunchakuQuantAdapter(_TransformerQuantAdapter):
             )
 
     def prepare(self) -> None:
+        if self.safetensors_list:
+            self.nunchaku_config.transformer_weights_path = self.safetensors_list[0]
         self.nunchaku_config.model_cls = self.model_cls
         _NunchakuQuantAdapter._validate_nunchaku_checkpoint_matches_model(
             nunchaku_config=self.nunchaku_config,
@@ -165,6 +168,40 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         )
 
 
+def _filter_nunchaku_safetensors(
+    safetensors_list: list[str], nunchaku_config: NunchakuConfig
+) -> list[str]:
+    """Filter safetensors files to match the requested nunchaku precision and rank."""
+    precision = nunchaku_config.precision
+    rank = nunchaku_config.rank
+    # Map CLI precision values back to filename conventions
+    fname_precision = "fp4" if precision == "nvfp4" else precision
+    pattern = re.compile(
+        rf"svdq-{re.escape(fname_precision)}_r{rank}(?:-[^/]*)?\.safetensors$"
+    )
+
+    matched = [f for f in safetensors_list if pattern.search(os.path.basename(f))]
+    if matched:
+        logger.info(
+            "nunchaku: filtered %d/%d safetensors to precision=%s rank=%d: %s",
+            len(matched),
+            len(safetensors_list),
+            precision,
+            rank,
+            [os.path.basename(f) for f in matched],
+        )
+        return matched
+
+    logger.warning(
+        "nunchaku: no safetensors matched precision=%s rank=%d, "
+        "falling back to all %d files",
+        precision,
+        rank,
+        len(safetensors_list),
+    )
+    return safetensors_list
+
+
 def resolve_transformer_safetensors_to_load(
     server_args: ServerArgs, component_model_path: str
 ) -> list[str]:
@@ -178,6 +215,14 @@ def resolve_transformer_safetensors_to_load(
             safetensors_list = [quantized_path]
         else:
             safetensors_list = _list_safetensors_files(quantized_path)
+            nunchaku_cfg = getattr(server_args, "nunchaku_config", None)
+            if (
+                isinstance(nunchaku_cfg, NunchakuConfig)
+                and len(safetensors_list) > 1
+            ):
+                safetensors_list = _filter_nunchaku_safetensors(
+                    safetensors_list, nunchaku_cfg
+                )
     else:
         safetensors_list = _list_safetensors_files(component_model_path)
 
