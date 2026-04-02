@@ -758,7 +758,9 @@ class NixlKVManager(CommonKVManager):
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
 
-            notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}"
+            notif = (
+                f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
+            )
             decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
 
             if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
@@ -799,7 +801,7 @@ class NixlKVManager(CommonKVManager):
                         dst_info.dst_state_data_ptrs,
                         req.dst_state_indices,
                         dst_info.gpu_id,
-                        f"{req.room}_state_{self.kv_args.pp_rank}",
+                        f"{req.room}_state_{self.kv_args.engine_rank}",
                         decode_tp_size,
                     )
                     if state_xfer_handle is not None:
