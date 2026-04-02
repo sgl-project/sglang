@@ -284,7 +284,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
 ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
-RUN apt-get update && apt-get install protobuf-compiler -y \
+RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/* \
     && python3 -m pip install --no-cache-dir maturin \
     && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
