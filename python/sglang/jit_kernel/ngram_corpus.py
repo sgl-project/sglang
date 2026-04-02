@@ -1,36 +1,12 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
+import tvm_ffi
 
 from sglang.jit_kernel.utils import cache_once, load_jit
-
-if TYPE_CHECKING:
-    from tvm_ffi.module import Module
-
-
-@cache_once
-def _jit_ngram_corpus_module() -> Module:
-    return load_jit(
-        "ngram_corpus",
-        cpp_files=[
-            "ngram_corpus/result.cpp",
-            "ngram_corpus/trie.cpp",
-            "ngram_corpus/ngram.cpp",
-            "ngram_corpus/ngram_corpus_ffi.h",
-        ],
-        cpp_wrappers=[
-            ("ngram_create", "&NgramCorpusFfi::create"),
-            ("ngram_destroy", "&NgramCorpusFfi::destroy"),
-            ("ngram_async_insert", "&NgramCorpusFfi::async_insert"),
-            ("ngram_batch_match", "&NgramCorpusFfi::batch_match"),
-            ("ngram_synchronize", "&NgramCorpusFfi::synchronize"),
-            ("ngram_reset", "&NgramCorpusFfi::reset"),
-        ],
-    )
-
 
 _MATCH_TYPE_MAP = {"BFS": 0, "PROB": 1}
 
@@ -46,64 +22,67 @@ def _to_csr(batch_tokens: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
     return tokens_flat, offsets_t
 
 
-def ngram_create(
-    capacity: int,
-    max_trie_depth: int,
-    min_bfs_breadth: int,
-    max_bfs_breadth: int,
-    draft_token_num: int,
-    match_type: str,
-) -> int:
-    mt = _MATCH_TYPE_MAP.get(match_type)
-    if mt is None:
-        raise ValueError(
-            f"Unknown match_type: '{match_type}'. Must be 'BFS' or 'PROB'."
-        )
-    out_handle = torch.zeros(1, dtype=torch.int64)
-    _jit_ngram_corpus_module().ngram_create(
-        capacity,
-        max_trie_depth,
-        min_bfs_breadth,
-        max_bfs_breadth,
-        draft_token_num,
-        mt,
-        out_handle,
+@cache_once
+def get_ngram_corpus_cls():
+    module = load_jit(
+        "ngram_corpus",
+        cpp_files=[
+            "ngram_corpus/result.cpp",
+            "ngram_corpus/trie.cpp",
+            "ngram_corpus/ngram.cpp",
+            "ngram_corpus/ngram_corpus_ffi.cpp",
+        ],
+        header_only=False,
     )
-    return out_handle.item()
+    module.register_once()
 
+    @tvm_ffi.register_object("sgl.NgramCorpus")
+    class NgramCorpusFFI(tvm_ffi.Object):
+        __slots__ = ("__dict__",)
 
-def ngram_destroy(handle: int) -> None:
-    _jit_ngram_corpus_module().ngram_destroy(handle)
+        def __init__(
+            self,
+            capacity: int,
+            max_trie_depth: int,
+            min_bfs_breadth: int,
+            max_bfs_breadth: int,
+            draft_token_num: int,
+            match_type: str,
+        ) -> None:
+            mt = _MATCH_TYPE_MAP.get(match_type)
+            if mt is None:
+                raise ValueError(
+                    f"Unknown match_type: '{match_type}'. Must be 'BFS' or 'PROB'."
+                )
+            self.__ffi_init__(
+                capacity,
+                max_trie_depth,
+                min_bfs_breadth,
+                max_bfs_breadth,
+                draft_token_num,
+                mt,
+            )
+            self._draft_token_num = draft_token_num
 
+        def insert(self, batch_tokens: List[List[int]]) -> None:
+            tokens_flat, offsets = _to_csr(batch_tokens)
+            self.async_insert(tokens_flat, offsets)  # type: ignore
 
-def ngram_async_insert(handle: int, batch_tokens: List[List[int]]) -> None:
-    tokens_flat, offsets = _to_csr(batch_tokens)
-    _jit_ngram_corpus_module().ngram_async_insert(handle, tokens_flat, offsets)
+        def match(
+            self,
+            batch_tokens: List[List[int]],
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            tokens_flat, offsets = _to_csr(batch_tokens)
+            batch_size = len(batch_tokens)
+            d = self._draft_token_num
 
+            out_tokens = torch.zeros(batch_size * d, dtype=torch.int32)
+            out_mask = torch.zeros(batch_size * d * d, dtype=torch.uint8)
 
-def ngram_batch_match(
-    handle: int,
-    batch_tokens: List[List[int]],
-    draft_token_num: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    tokens_flat, offsets = _to_csr(batch_tokens)
-    batch_size = len(batch_tokens)
+            self.batch_match(tokens_flat, offsets, out_tokens, out_mask)  # type: ignore
 
-    out_tokens = torch.zeros(batch_size * draft_token_num, dtype=torch.int32)
-    out_mask = torch.zeros(
-        batch_size * draft_token_num * draft_token_num, dtype=torch.uint8
-    )
+            return out_tokens.numpy().astype(np.int64), out_mask.numpy().astype(
+                np.int64
+            )
 
-    _jit_ngram_corpus_module().ngram_batch_match(
-        handle, tokens_flat, offsets, out_tokens, out_mask
-    )
-
-    return out_tokens.numpy().astype(np.int64), out_mask.numpy().astype(np.int64)
-
-
-def ngram_synchronize(handle: int) -> None:
-    _jit_ngram_corpus_module().ngram_synchronize(handle)
-
-
-def ngram_reset(handle: int) -> None:
-    _jit_ngram_corpus_module().ngram_reset(handle)
+    return NgramCorpusFFI

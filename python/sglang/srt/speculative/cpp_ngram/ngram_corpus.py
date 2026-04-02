@@ -5,14 +5,7 @@ from typing import List, Tuple
 
 import numpy as np
 
-from sglang.jit_kernel.ngram_corpus import (
-    ngram_async_insert,
-    ngram_batch_match,
-    ngram_create,
-    ngram_destroy,
-    ngram_reset,
-    ngram_synchronize,
-)
+from sglang.jit_kernel.ngram_corpus import get_ngram_corpus_cls
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +19,9 @@ class NgramCorpus:
         draft_token_num=8,
         match_type="BFS",
         capacity=1000000,
-    ):
-        self._handle = ngram_create(
+    ) -> None:
+        cls = get_ngram_corpus_cls()
+        self._obj = cls(
             capacity=capacity,
             max_trie_depth=max_trie_depth,
             min_bfs_breadth=min_bfs_breadth,
@@ -35,25 +29,20 @@ class NgramCorpus:
             draft_token_num=draft_token_num,
             match_type=match_type,
         )
-
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
 
-    def __del__(self):
-        if hasattr(self, "_handle"):
-            ngram_destroy(self._handle)
-
     def batch_put(self, batch_tokens: List[List[int]]):
-        ngram_async_insert(self._handle, batch_tokens)
+        self._obj.insert(batch_tokens)
 
     def synchronize(self):
-        ngram_synchronize(self._handle)
+        self._obj.synchronize()  # type: ignore
 
     def reset(self):
-        ngram_reset(self._handle)
+        self._obj.reset()  # type: ignore
 
     def batch_get(self, batch_tokens: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
-        return ngram_batch_match(self._handle, batch_tokens, self.draft_token_num)
+        return self._obj.match(batch_tokens)
 
     def leaf_paths_from_mask(
         self, tokens: List[int], tree_mask: List[List[int]]
