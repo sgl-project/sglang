@@ -14,6 +14,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def _get_available_metal_memory() -> int:
+    """Return remaining MPS budget under Metal's recommended working set size."""
+    import torch
+
+    return max(
+        0,
+        int(torch.mps.recommended_max_memory()) - int(torch.mps.driver_allocated_memory()),
+    )
+
+
 class Stream:
     """Minimal stand-in for ``torch.cuda.Stream``.
 
