@@ -1297,6 +1297,7 @@ class NativeSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                is_prefill=True,
             )
 
         if k is not None:
@@ -1929,6 +1930,7 @@ class NativeSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
@@ -1990,6 +1992,13 @@ class NativeSparseAttnBackend(
 
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
+        elif is_prefill:
+            page_table_1 = transform_index_page_table_prefill(
+                page_table=metadata.page_table_1,
+                topk_indices=topk_indices,
+                extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
+                page_size=1,
+            )
         else:
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,

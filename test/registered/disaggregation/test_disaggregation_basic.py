@@ -8,7 +8,7 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -81,18 +81,17 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["score"], 0.62)
 
     def test_logprob(self):
         prompt = "The capital of france is "
@@ -260,18 +259,17 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
 
         # Expect lots of failure but the server cannot crash
         try:
-            metrics = run_eval_few_shot_gsm8k(args)
+            metrics = run_eval(args)
             print(f"Evaluation metrics: {metrics}")
         except Exception as e:
             print(f"Test encountered expected errors: {e}")
@@ -362,18 +360,17 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.74)
+        self.assertGreater(metrics["score"], 0.74)
 
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
@@ -440,18 +437,17 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["score"], 0.62)
 
 
 if __name__ == "__main__":
