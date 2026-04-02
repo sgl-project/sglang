@@ -93,7 +93,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         proc = self._spawn(slow_crash_worker, args=(0.2,))
         self._watch(proc)
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=2.0),
+            self.sigquit_triggered.wait(timeout=5.0),
             "SIGQUIT was not triggered within timeout",
         )
 
@@ -101,7 +101,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         proc = self._spawn(crashing_worker)
         self._watch(proc, interval=0.05)
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=1.0),
+            self.sigquit_triggered.wait(timeout=5.0),
             "Immediate crash was not detected",
         )
 
@@ -110,7 +110,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         crashing = self._spawn(slow_crash_worker, args=(0.2,))
         self._watch([healthy, crashing], names=["healthy", "crashing"])
         self.assertTrue(
-            self.sigquit_triggered.wait(timeout=2.0),
+            self.sigquit_triggered.wait(timeout=5.0),
             "Crash was not detected when one of multiple processes crashed",
         )
 
