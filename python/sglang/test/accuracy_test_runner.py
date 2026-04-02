@@ -150,22 +150,127 @@ def _run_simple_eval(
             kill_process_tree(process.pid)
 
 
-def _run_few_shot_eval(
+# Cached uv venv for NeMo Skills (persists across variants within a process).
+_nemo_venv_dir: Optional[str] = None
+_nemo_data_prepared: set = set()
+
+
+def _get_nemo_venv() -> Tuple[str, dict]:
+    """Get or create a uv venv with nemo_skills installed.
+
+    Returns (venv_python_path, env_dict) reusable across calls.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    global _nemo_venv_dir
+
+    if _nemo_venv_dir is not None:
+        venv_python = f"{_nemo_venv_dir}/venv/bin/python"
+        env = {
+            **dict(os.environ),
+            "NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK": "1",
+            "OPENAI_API_KEY": "dummy",
+            "VIRTUAL_ENV": f"{_nemo_venv_dir}/venv",
+            "PATH": f"{_nemo_venv_dir}/venv/bin:" + os.environ.get("PATH", ""),
+        }
+        return venv_python, env
+
+    _nemo_venv_dir = tempfile.mkdtemp(prefix="nemo_skills_")
+    print(f"Creating NeMo Skills venv in {_nemo_venv_dir}...")
+
+    # Create venv
+    result = subprocess.run(
+        ["uv", "venv", f"{_nemo_venv_dir}/venv", "--python", "3.12"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        subprocess.run(
+            ["uv", "venv", f"{_nemo_venv_dir}/venv"],
+            capture_output=True,
+            text=True,
+        )
+
+    # Install nemo_skills
+    print("Installing nemo_skills...")
+    pip_result = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            f"{_nemo_venv_dir}/venv/bin/python",
+            "git+https://github.com/NVIDIA/NeMo-Skills.git",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if pip_result.returncode != 0:
+        raise RuntimeError(f"Failed to install nemo_skills: {pip_result.stderr[-500:]}")
+
+    print("NeMo Skills installed successfully")
+    return _get_nemo_venv()
+
+
+def _ensure_nemo_data_prepared(
+    venv_python: str, env: dict, dataset: str
+) -> Tuple[bool, Optional[str]]:
+    """Prepare NeMo Skills dataset data if not already done.
+
+    Uses the venv python so data lands inside the venv's nemo_skills package.
+    """
+    import subprocess
+
+    if dataset in _nemo_data_prepared:
+        return True, None
+
+    print(f"Preparing {dataset} data (this may take a few minutes for VLM datasets)...")
+    result = subprocess.run(
+        [venv_python, "-m", "nemo_skills.dataset.prepare", dataset],
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    if result.returncode != 0:
+        return False, f"Failed to prepare {dataset} data (exit {result.returncode})"
+
+    _nemo_data_prepared.add(dataset)
+    return True, None
+
+
+def _run_nemo_skills_eval(
     model: ModelLaunchSettings,
     base_url: str,
-    num_questions: Optional[int] = None,
-    num_shots: int = 8,
-    max_tokens: int = 512,
+    dataset: str,
+    max_tokens: Optional[int] = None,
+    repeat: Optional[int] = None,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
-    """Run evaluation using few_shot backend (few_shot_gsm8k.py).
+    """Run evaluation using NeMo Skills (ns eval) for benchmarks like mmmu-pro.
+
+    Uses an isolated uv venv (shared across variants) so nemo_skills dependencies
+    don't interfere with the system python / sglang server.
 
     Returns:
         Tuple of (success, error_message, metrics_dict)
     """
-    from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_eval
+    import subprocess
+    import tempfile
 
     process = None
     try:
+        # Get or create the shared venv (once per process)
+        venv_python, env = _get_nemo_venv()
+
+        # Prepare dataset (once per process, cached)
+        ok, err = _ensure_nemo_data_prepared(venv_python, env, dataset)
+        if not ok:
+            return False, err, None
+
         process = popen_launch_server(
             model.model_path,
             base_url,
@@ -174,27 +279,154 @@ def _run_few_shot_eval(
             env=model.env,
         )
 
-        args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=None,
-            num_questions=num_questions or 200,
-            max_new_tokens=max_tokens,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(base_url.split(":")[-1]),
+        port = int(base_url.split(":")[-1])
+        server_address = f"http://127.0.0.1:{port}/v1"
+        repeat_val = repeat or 1
+        max_tokens_val = max_tokens or 32768
+        benchmark_spec = f"{dataset}:{repeat_val}"
+
+        # Build ns eval command using venv python
+        # Note: nemo_skills.pipeline.eval requires the "eval" subcommand
+        output_dir = tempfile.mkdtemp(prefix="ns_eval_output_")
+        cmd = [
+            venv_python,
+            "-m",
+            "nemo_skills.pipeline.eval",
+            "eval",
+            f"--benchmarks={benchmark_spec}",
+            "--server_type=sglang",
+            f"--model={model.model_path}",
+            f"--server_address={server_address}",
+            f"--output_dir={output_dir}",
+            f"++inference.tokens_to_generate={max_tokens_val}",
+        ]
+
+        if temperature is not None:
+            cmd.append(f"++inference.temperature={temperature}")
+        if top_p is not None:
+            cmd.append(f"++inference.top_p={top_p}")
+
+        # Add VLM-specific config
+        if dataset in ("mmmu-pro", "mmmu_pro"):
+            cmd.append("++prompt_config=vlm/mmmu-pro")
+            cmd.append("++max_concurrent_requests=512")
+            cmd.append("++max_samples=500")
+
+        print(f"Running: {' '.join(cmd)}")
+        eval_result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=7200,
+            env=env,
         )
 
-        metrics = run_few_shot_eval(args)
+        print(eval_result.stdout[-2000:] if eval_result.stdout else "(no stdout)")
+        if eval_result.stderr:
+            print(eval_result.stderr[-1000:])
 
-        # Normalize metrics format (few_shot returns "accuracy", simple_eval returns "score")
-        if "accuracy" in metrics and "score" not in metrics:
-            metrics["score"] = metrics["accuracy"]
+        if eval_result.returncode != 0:
+            return (
+                False,
+                f"ns eval failed (exit {eval_result.returncode}): {eval_result.stderr[-500:]}",
+                None,
+            )
 
-        return True, None, metrics
+        # Parse results
+        summarize_result = subprocess.run(
+            [
+                venv_python,
+                "-m",
+                "nemo_skills.pipeline.summarize_results",
+                f"{output_dir}/eval-results",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
 
+        output = summarize_result.stdout + "\n" + eval_result.stdout
+        print(f"Summary: {summarize_result.stdout[:1000]}")
+
+        # Parse accuracy from output (format varies, look for common patterns)
+        import re
+
+        score = None
+        for line in output.split("\n"):
+            match = re.search(r"(?:accuracy|score)[:\s]+([0-9.]+)", line, re.IGNORECASE)
+            if match:
+                score = float(match.group(1))
+
+        if score is None:
+            # Try to find it in eval-results directory
+            import glob
+            import json
+
+            for result_file in glob.glob(
+                f"{output_dir}/eval-results/**/*.json", recursive=True
+            ):
+                try:
+                    with open(result_file) as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        score = (
+                            data.get("accuracy")
+                            or data.get("score")
+                            or data.get("mean_score")
+                        )
+                        if score is not None:
+                            break
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        if score is None:
+            # Last resort: compute accuracy directly from JSONL output
+            import glob
+            import json
+
+            for jsonl_file in sorted(
+                glob.glob(f"{output_dir}/eval-results/**/*.jsonl*", recursive=True)
+            ):
+                correct = 0
+                total = 0
+                try:
+                    with open(jsonl_file) as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            entry = json.loads(line)
+                            expected = entry.get("expected_answer", "")
+                            generation = entry.get("generation", "")
+                            # Extract "Answer: X" from the end of generation
+                            answer_match = re.search(
+                                r"Answer:\s*([A-J])", generation, re.IGNORECASE
+                            )
+                            if answer_match:
+                                predicted = answer_match.group(1).upper()
+                                if predicted == expected.upper():
+                                    correct += 1
+                            total += 1
+                except (json.JSONDecodeError, KeyError, OSError):
+                    continue
+                if total > 0:
+                    score = correct / total
+                    print(
+                        f"Computed accuracy from {jsonl_file}: "
+                        f"{correct}/{total} = {score:.4f}"
+                    )
+                    break
+
+        if score is None:
+            return False, "Could not parse accuracy from ns eval output", None
+
+        return True, None, {"score": score}
+
+    except subprocess.TimeoutExpired:
+        return False, "NeMo Skills eval timed out", None
     except Exception as e:
-        return False, f"Few-shot evaluation exception: {str(e)}", None
-
+        return False, f"NeMo Skills eval exception: {str(e)}", None
     finally:
         if process:
             kill_process_tree(process.pid)
@@ -224,18 +456,17 @@ def run_accuracy_test(
     print(f"{'='*60}\n")
 
     # Run evaluation based on dataset type
-    # Use few_shot_eval for gsm8k by default for backward compatibility.
-    # Use simple_eval when any extended params are set that few_shot_eval doesn't support.
-    has_extended_params = any(
-        getattr(params, field) is not None
-        for field in ("thinking_mode", "temperature", "top_p", "top_k", "repeat")
-    )
-    if params.dataset == "gsm8k" and not has_extended_params:
-        success, error, metrics = _run_few_shot_eval(
+    # - NeMo Skills: mmmu-pro (and other VLM evals needing ns eval)
+    # - simple_eval: everything else (gsm8k, gpqa, mmlu, mmmu, etc.)
+    if params.dataset in ("mmmu-pro", "mmmu_pro"):
+        success, error, metrics = _run_nemo_skills_eval(
             model=model,
             base_url=base_url,
-            num_questions=params.num_examples,
-            max_tokens=params.max_tokens or 512,
+            dataset="mmmu-pro",
+            max_tokens=params.max_tokens,
+            repeat=params.repeat or 1,
+            temperature=params.temperature,
+            top_p=params.top_p,
         )
     else:
         success, error, metrics = _run_simple_eval(

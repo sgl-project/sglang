@@ -16,6 +16,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
+    gpu_image_decode = False  # KimiK2.5VL HF processor does not support tensor inputs
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)

@@ -314,7 +314,7 @@ mod model_info_tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/get_server_info")
+            .uri("/server_info")
             .body(Body::empty())
             .unwrap();
 
@@ -445,7 +445,7 @@ mod model_info_tests {
 
         let req = Request::builder()
             .method("GET")
-            .uri("/get_server_info")
+            .uri("/server_info")
             .body(Body::empty())
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();

@@ -430,6 +430,7 @@ class MOVADenoisingStage(PipelineStage):
                     logger=logger,
                     metrics=metrics,
                     perf_dump_path_provided=perf_dump_path_provided,
+                    record_as_step=True,
                 ):
                     pair_t = paired_timesteps[idx_step]
                     if getattr(pair_t, "shape", None) == (2,):
