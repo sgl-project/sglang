@@ -34,6 +34,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_hf_text_config,
     get_sparse_attention_config,
 )
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ class ModelConfig:
         self._validate_quantize_and_serve_config()
 
         # Get hf config
+        self._maybe_pull_model_for_runai(self.model_path)
         self._maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
@@ -491,6 +493,11 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                self.scaling = compute_mla_mscale_scaling(
+                    self.hf_config.rope_scaling, self.scaling
+                )
         elif (
             "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
             or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
@@ -1142,6 +1149,13 @@ class ModelConfig:
         }
 
         return default_sampling_params
+
+    def _maybe_pull_model_for_runai(self, model: str) -> None:
+        if is_runai_obj_uri(model):
+            # local path for loading the config
+            self.model_path = ObjectStorageModel.get_path(model)
+            # remote path for loading the weights
+            self.model_weights = model
 
     def _maybe_pull_model_tokenizer_from_remote(self) -> None:
         """
