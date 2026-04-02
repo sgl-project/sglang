@@ -879,7 +879,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module, CompilableRegionMixin):
                     [self.q_size, self.kv_size, self.kv_size], dim=-1
                 )
             q, k = self._apply_qk_norm(q, k)
-            is_compiled = self.rotary_emb.is_torch_compile
+            is_rope_compiled = self.rotary_emb.is_torch_compile
             fused_kv_arg = (
                 create_fused_set_kv_buffer_arg(
                     value=v,
@@ -887,7 +887,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module, CompilableRegionMixin):
                     forward_batch=forward_batch,
                 )
                 if enable_fused_set_kv_buffer(
-                    forward_batch, is_compiled=is_compiled
+                    forward_batch, is_compiled=is_rope_compiled
                 )
                 and self.compatible_with_fused_kv_buffer
                 else None
@@ -897,10 +897,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module, CompilableRegionMixin):
             )
             # MRoPE forward_triton (2D positions) silently drops fused_set_kv_buffer_arg,
             # so the fused KV write only actually executes in the compiled path.
-            self._did_fused_kv_write_last_call = fused_kv_arg is not None and is_compiled
-        save_kv_cache = not self._did_fused_kv_write_last_call
+            self._did_fused_kv_write_last_call = fused_kv_arg is not None and is_rope_compiled
 
-        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=not self._did_fused_kv_write_last_call)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
