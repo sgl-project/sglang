@@ -165,13 +165,9 @@ class LlavaBaseForCausalLM(nn.Module):
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
-            # Got List[List[str]] extend it to List[str]
-            # The length of the List should be equal to batch size
-            modalities_list = []
+            # Compute max image offset per request to determine need_vision
             max_image_offset = []
             for im in image_inputs:
-                if im:
-                    modalities_list.extend([item.modality for item in im.mm_items])
                 if im and im.image_offsets:
                     max_image_offset.append(
                         np.max(np.array(im.image_offsets) + np.array(im.image_pad_len))
@@ -184,6 +180,19 @@ class LlavaBaseForCausalLM(nn.Module):
 
             if need_vision.any():
                 bs = forward_batch.batch_size
+
+                # Build per-image lists filtered by need_vision
+                modalities_list = []
+                is_multi_image = []  # per-image flag for anyres vs pad
+                for i in range(bs):
+                    if need_vision[i] and image_inputs[i]:
+                        items = image_inputs[i].mm_items
+                        n = len(items)
+                        modalities_list.extend([item.modality for item in items])
+                        has_video = any(item.is_video() for item in items)
+                        for _ in range(n):
+                            is_multi_image.append(n > 1 or has_video)
+
                 pixel_values = flatten_nested_list(
                     [
                         [item.feature for item in image_inputs[i].mm_items]
@@ -191,12 +200,12 @@ class LlavaBaseForCausalLM(nn.Module):
                         if need_vision[i]
                     ]
                 )
+                # Per-image sizes (each entry is [(w,h)] for one image)
                 image_sizes = [
-                    flatten_nested_list(
-                        [item.image_sizes for item in image_inputs[i].mm_items]
-                    )
+                    item.image_sizes
                     for i in range(bs)
                     if need_vision[i]
+                    for item in image_inputs[i].mm_items
                 ]
 
                 ########## Encode Image ########
@@ -225,10 +234,7 @@ class LlavaBaseForCausalLM(nn.Module):
                     new_image_features = []
                     height = width = self.num_patches_per_side
                     for image_idx, image_feature in enumerate(image_features):
-                        if (
-                            modalities_list[image_idx] == Modality.VIDEO
-                            or len(image_features) > 1
-                        ):
+                        if is_multi_image[image_idx]:
                             image_aspect_ratio = "pad"  # multi image or video
                         else:
                             image_aspect_ratio = (
@@ -385,6 +391,7 @@ class LlavaBaseForCausalLM(nn.Module):
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
                 extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
                 prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+                # Fill in the image features using flat indexing (one pt per image)
                 pt = 0
                 for i in range(bs):
                     if not need_vision[i]:
@@ -393,20 +400,25 @@ class LlavaBaseForCausalLM(nn.Module):
                     start_idx = extend_start_loc_cpu[i]
                     seq_len = extend_seq_lens[i]
                     prefix_len = prefix_lens_cpu[i]
+                    n_images = len(image_inputs[i].image_offsets)
 
-                    # Multiple images
-                    for image_idx, image_offset in enumerate(
-                        image_inputs[i].image_offsets
-                    ):
+                    for j in range(n_images):
+                        image_offset = image_inputs[i].image_offsets[j]
+
                         if (
-                            image_offset + image_inputs[i].image_pad_len[image_idx]
+                            image_offset + image_inputs[i].image_pad_len[j]
                             <= prefix_len
                         ):
+                            pt += 1
                             continue
                         if image_offset >= prefix_len + seq_len:
+                            pt += n_images - j
                             break
 
-                        tmp_image_feature = image_features[pt][image_idx]
+                        tmp_image_feature = image_features[pt]
+                        # Squeeze batch dim from per-image features [1, feat, hidden]
+                        if tmp_image_feature.ndim == 3:
+                            tmp_image_feature = tmp_image_feature[0]
                         pad_len = tmp_image_feature.shape[0]
 
                         input_offset = image_offset - prefix_len
@@ -429,7 +441,7 @@ class LlavaBaseForCausalLM(nn.Module):
                             print(
                                 f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
                             )
-                    pt += 1
+                        pt += 1
 
             return self.language_model(
                 input_ids, positions, forward_batch, input_embeds=input_embeds

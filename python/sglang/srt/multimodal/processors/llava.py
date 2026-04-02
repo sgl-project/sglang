@@ -204,6 +204,9 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         # Create one item per image for better cache granularity
         mm_items = []
         for pixel_v, image_s in zip(pixel_values, image_sizes):
+            # Ensure ndim=4 so the model forward takes the correct encode branch
+            if isinstance(pixel_v, np.ndarray) and pixel_v.ndim == 3:
+                pixel_v = np.expand_dims(pixel_v, 0)
             mm_items.append(
                 MultimodalDataItem(
                     feature=pixel_v,
