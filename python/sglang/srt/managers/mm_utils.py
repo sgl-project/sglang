@@ -994,6 +994,8 @@ def embed_mm_inputs(
                     multimodal_model.separate_deepstack_embeds(embedding)
                 )
                 deepstack_embeddings += [deepstack_embedding]
+            else:
+                deepstack_embeddings += [None]
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
@@ -1509,7 +1511,7 @@ def get_new_expanded_mm_items(original_mm_items):
                 total_feature_len = feature_len
                 for i in range(num_items):
                     start, end = slice_indices[i], slice_indices[i + 1]
-                    new_item = copy.deepcopy(item)
+                    new_item = copy.copy(item)
                     if item.feature is not None:
                         new_item.feature = _slice_value(item.feature, start, end)
                     if item.precomputed_embeddings is not None:
@@ -1600,7 +1602,7 @@ def get_new_expanded_mm_items(original_mm_items):
                         frame_start_indices[video_idx + 1],
                     )
 
-                    new_item = copy.deepcopy(item)
+                    new_item = copy.copy(item)
                     if item.feature is not None:
                         new_item.feature = _slice_value(item.feature, start, end)
                     if item.precomputed_embeddings is not None:
@@ -1721,6 +1723,19 @@ def wrap_shm_features(obj):
             ):
                 item.feature = ShmPointerMMData(item.feature)
     return obj
+
+
+def has_shm_features(recv_reqs):
+    """Return True if any request in the list contains ShmPointerMMData."""
+    for req in recv_reqs:
+        if hasattr(req, "batch"):
+            if has_shm_features(req.batch):
+                return True
+        elif hasattr(req, "mm_inputs") and req.mm_inputs:
+            for item in req.mm_inputs.get("mm_items", []):
+                if isinstance(item.feature, ShmPointerMMData):
+                    return True
+    return False
 
 
 def unwrap_shm_features(obj):

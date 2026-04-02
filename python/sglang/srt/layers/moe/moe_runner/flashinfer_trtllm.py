@@ -31,7 +31,6 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
     is_flashinfer_available,
-    is_sm120_supported,
     next_power_of_2,
 )
 
@@ -41,7 +40,7 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-if is_flashinfer_available() and is_sm120_supported():
+if is_flashinfer_available():
     from flashinfer import fp4_quantize
 elif is_cuda_alike():
     from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
@@ -362,7 +361,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             symm_output = torch.empty(
                 hidden_states.shape[0],
                 hidden_states.shape[1],
-                dtype=torch.bfloat16,
+                dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
 
@@ -442,9 +441,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
             )
+        # TODO: Once https://github.com/flashinfer-ai/flashinfer/issues/2703 is fixed, pass output to moe kernel and remove this copy.
         symm_output.copy_(output)
         output = symm_output
     else:
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
         assert quant_info.w13_input_scale is not None
         assert quant_info.output1_scales_scalar is not None
         assert quant_info.output1_scales_gate_scalar is not None
@@ -564,7 +565,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     """FlashInfer TRTLLM FP4 MoE forward pass.
 
     This function handles the FP4 TRTLLM MoE path that was previously in
-    FlashInferFP4MoE.forward_impl and ModelOptNvFp4FusedMoEMethod.apply.
+    ModelOptNvFp4FusedMoEMethod.apply.
     """
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 
@@ -638,7 +639,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
         routed_scaling_factor=runner_config.routed_scaling_factor,
-        tile_tokens_dim=None,
         routing_method_type=(
             routing_method_type
             if routing_method_type is not None

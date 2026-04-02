@@ -45,9 +45,6 @@ class NGRAMWorker:
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
-        self.max_match_window_size: int = (
-            server_args.speculative_ngram_max_match_window_size
-        )
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
@@ -65,8 +62,6 @@ class NGRAMWorker:
         self._init_preallocated_tensors()
 
         self.ngram_corpus = NgramCorpus(
-            min_match_window_size=server_args.speculative_ngram_min_match_window_size,
-            max_match_window_size=server_args.speculative_ngram_max_match_window_size,
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
             match_type=server_args.speculative_ngram_match_type,
@@ -166,7 +161,7 @@ class NGRAMWorker:
             check_token = self._efficient_concat_last_n(
                 req.origin_input_ids,
                 req.output_ids + prev_tokens,
-                self.max_match_window_size,
+                self.max_trie_depth,
             )
             batch_tokens.append(check_token)
             i += 1
