@@ -153,6 +153,40 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         validator.validate(single_call)
         validator.validate(multi_call)
 
+    def test_specific_tool_choice_no_parallel(self):
+        """Test that parallel_tool_calls=False sets maxItems=1"""
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="get_weather")
+        )
+        schema = get_json_schema_constraint(
+            self.tools, tool_choice, parallel_tool_calls=False
+        )
+
+        self.assertIsNotNone(schema)
+        self.assertEqual(schema["maxItems"], 1)
+
+        single_call = [
+            {"name": "get_weather", "parameters": {"location": "NYC"}},
+        ]
+        multi_call = [
+            {"name": "get_weather", "parameters": {"location": "NYC"}},
+            {"name": "get_weather", "parameters": {"location": "LA"}},
+        ]
+
+        validator = jsonschema.Draft202012Validator(schema)
+        validator.validate(single_call)
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate(multi_call)
+
+    def test_required_tool_choice_no_parallel(self):
+        """Test that required + parallel_tool_calls=False sets maxItems=1"""
+        schema = get_json_schema_constraint(
+            self.tools, "required", parallel_tool_calls=False
+        )
+
+        self.assertIsNotNone(schema)
+        self.assertEqual(schema["maxItems"], 1)
+
     def test_nonexistent_tool_choice(self):
         """Test schema generation for nonexistent tool"""
         tool_choice = ToolChoice(
