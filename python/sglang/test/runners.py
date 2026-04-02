@@ -574,8 +574,6 @@ class SRTRunner:
         speculative_num_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
-        speculative_ngram_min_match_window_size: Optional[int] = None,
-        speculative_ngram_max_match_window_size: Optional[int] = None,
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
         torchao_config: Optional[str] = None,
@@ -606,12 +604,7 @@ class SRTRunner:
             spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
         elif speculative_algorithm == "NGRAM":
             spec_kwargs["speculative_algorithm"] = speculative_algorithm
-            spec_kwargs["speculative_ngram_min_match_window_size"] = (
-                speculative_ngram_min_match_window_size
-            )
-            spec_kwargs["speculative_ngram_max_match_window_size"] = (
-                speculative_ngram_max_match_window_size
-            )
+            spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
 
         self.engine = Engine(
             model_path=model_path,

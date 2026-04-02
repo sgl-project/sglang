@@ -185,6 +185,7 @@ class CompletionSampler(SamplerBase):
         temperature: float = 0.0,
         top_p: float = 1.0,
         max_tokens: int = 2048,
+        stop: Optional[List[str]] = None,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -195,9 +196,10 @@ class CompletionSampler(SamplerBase):
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
+        self.stop = stop
         self._completion_tokens: list[int] = []
         print(
-            f"CompletionSampler initialized with {self.model=} {self.temperature=} {self.max_tokens=}"
+            f"CompletionSampler initialized with {self.model=} {self.temperature=} {self.max_tokens=} {self.stop=}"
         )
 
     def _pack_message(self, role: str, content: Any):
@@ -219,6 +221,7 @@ class CompletionSampler(SamplerBase):
                     temperature=self.temperature,
                     top_p=self.top_p,
                     max_tokens=self.max_tokens,
+                    stop=self.stop,
                 )
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)

@@ -273,6 +273,7 @@ def handle_rerun_stage(
         "multimodal-gen-test-2-gpu",
         "multimodal-gen-component-accuracy-1-gpu",
         "multimodal-gen-component-accuracy-2-gpu",
+        "multimodal-gen-test-1-b200",
     ]
 
     # Valid AMD stage names that support target_stage
