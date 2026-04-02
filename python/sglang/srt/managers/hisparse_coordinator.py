@@ -123,7 +123,7 @@ class HiSparseCoordinator:
         self.decode_producer_stream = stream
 
     def admit_request_into_staging(self, req: Req) -> None:
-        req.staging = True
+        req.hisparse_staging = True
         logical_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
@@ -224,7 +224,7 @@ class HiSparseCoordinator:
             _, _, req = self.ack_staging_queue.pop(0)
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
-            req.staging = False
+            req.hisparse_staging = False
             self._skip_first_backup[req.req_pool_idx] = True
             finish_count -= 1
             ready_reqs.append(req)
@@ -494,7 +494,7 @@ class HiSparseCoordinator:
         """Remove a request from the staging queue and free its host resources.
 
         Must be called when aborting a request that has been admitted into staging
-        but has not yet completed (i.e. req.staging is True).
+        but has not yet completed (i.e. req.hisparse_staging is True).
         """
         # Remove from staging queue
         self.ack_staging_queue = [
@@ -510,10 +510,10 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
-        req.staging = False
+        req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
-        if req.staging:
+        if req.hisparse_staging:
             self.abort_staging_request(req)
         else:
             self.request_finished(req)
@@ -556,14 +556,14 @@ class HiSparseCoordinator:
         layer_id: int,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
-        # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32.
+        # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32 or int64.
         if req_pool_indices.dtype != torch.int64:
             raise ValueError(
                 f"req_pool_indices dtype {req_pool_indices.dtype} is not int64 as expected"
             )
-        if seq_lens.dtype != torch.int32:
+        if seq_lens.dtype not in (torch.int32, torch.int64):
             raise ValueError(
-                f"seq_lens dtype {seq_lens.dtype} is not int32 as expected"
+                f"seq_lens dtype {seq_lens.dtype} is not int32 or int64 as expected"
             )
         if top_k_result.dtype != torch.int32:
             raise ValueError(

@@ -168,31 +168,6 @@ def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Ima
             time.sleep(2**i)
 
 
-def flush_cache_with_retry(
-    base_url: str,
-    timeout: float = 30.0,
-    poll_interval: float = 0.5,
-) -> bool:
-    """Flush device cache, polling until success or timeout.
-
-    flush_cache only succeeds when the scheduler is fully idle, but
-    HiCache async ops (write-through, backup) may still be in-flight
-    after a request completes.  We poll with a short interval so idle
-    is detected quickly, while the generous timeout accommodates slow
-    CI environments.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            response = requests.post(f"{base_url}/flush_cache", timeout=10)
-            if response.status_code == 200:
-                return True
-        except requests.RequestException:
-            pass
-        time.sleep(poll_interval)
-    return False
-
-
 def is_in_ci():
     """Return whether it is in CI runner."""
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -2093,9 +2068,11 @@ class CustomTestCase(unittest.TestCase):
         if getattr(setup, "_safe_setup_wrapped", False):
             return
 
-        def safe_setUpClass(klass, _orig=setup):
+        orig_func = setup.__func__
+
+        def safe_setUpClass(klass):
             try:
-                _orig.__func__(klass)
+                orig_func(klass)
             except Exception:
                 # Best-effort cleanup; suppress teardown errors so the
                 # original setUpClass exception propagates clearly.
