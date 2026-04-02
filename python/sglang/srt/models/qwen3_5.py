@@ -1554,18 +1554,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             fused_expert_params_mapping += [
                 (
                     "experts.w13_",
-                    f"experts.{num_experts_base}.gate_proj.",
-                    num_experts_base,
-                    "w1",
-                ),
-                (
-                    "experts.w13_",
-                    f"experts.{num_experts_base}.up_proj.",
-                    num_experts_base,
-                    "w3",
-                ),
-                (
-                    "experts.w13_",
                     f"experts.{num_experts_base}.gate_up_proj.",
                     num_experts_base,
                     "w1",
