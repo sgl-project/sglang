@@ -5,7 +5,7 @@ from sglang.srt.managers.io_struct import FlushCacheReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
 class TestSchedulerFlushCache(unittest.TestCase):

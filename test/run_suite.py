@@ -114,6 +114,44 @@ NIGHTLY_SUITES = {
 }
 
 
+OTHER_SUITES = {
+    HWBackend.CPU: [
+        "default",
+    ],
+    HWBackend.CUDA: [
+        "stress",
+        "weekly-8-gpu-h200",
+    ],
+}
+
+
+_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
+
+
+def _all_valid_suites() -> set:
+    valid = set()
+    for suite_dict in (PER_COMMIT_SUITES, NIGHTLY_SUITES, OTHER_SUITES):
+        for backend, suites in suite_dict.items():
+            if backend in _SUITE_CHECKED_BACKENDS:
+                valid.update(suites)
+    return valid
+
+
+def validate_all_suites(all_tests: List[CIRegistry]):
+    """Fail fast if any test is registered to a non-existent suite."""
+    valid = _all_valid_suites()
+    errors = []
+    for t in all_tests:
+        if t.backend not in _SUITE_CHECKED_BACKENDS:
+            continue
+        if t.suite not in valid:
+            errors.append(f"  {t.filename}: suite='{t.suite}'")
+    if errors:
+        raise ValueError(
+            "Tests registered to non-existent suites:\n" + "\n".join(errors)
+        )
+
+
 def filter_tests(
     ci_tests: List[CIRegistry], hw: HWBackend, suite: str, nightly: bool = False
 ) -> List[CIRegistry]:
@@ -210,6 +248,7 @@ def run_a_suite(args):
     sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
+    validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:
