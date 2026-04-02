@@ -183,7 +183,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
 
         self.num_fused_shared_experts = self._determine_num_fused_shared_experts(
-            config
+            config,
+            quant_config,
         )
         if self.num_fused_shared_experts > 0:
             rank0_log(
@@ -256,7 +257,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
 
-    def _determine_num_fused_shared_experts(self, config: PretrainedConfig) -> int:
+    def _determine_num_fused_shared_experts(self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig]) -> int:
         """Determine if shared expert can be fused with router experts (topk+1).
         Fusion requires shared_expert_intermediate_size == moe_intermediate_size,
         support_shared_expert_fusion=True (e.g. Qwen3.5 MoE), and Aiter on HIP.
@@ -266,7 +267,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             or getattr(config, "shared_expert_intermediate_size", 0) <= 0
             or config.shared_expert_intermediate_size != config.moe_intermediate_size
             or not _use_aiter
-            or getattr(config, "quant_config", None) is not None
+            or quant_config is not None
         ):
             return 0
         return 1
