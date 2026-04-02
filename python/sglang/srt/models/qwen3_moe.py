@@ -633,8 +633,7 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
             q, k = self._qk_norm(q, k)
             q, k = self._rope_kv(q, k, positions, fused_kv_arg)
             self._did_fused_kv_write_last_call = fused_kv_arg is not None
-        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
-        elif use_fused:
+        elif self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
             theta = self.rope_theta
             positions = (
                 positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
