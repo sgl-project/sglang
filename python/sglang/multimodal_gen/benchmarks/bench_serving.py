@@ -390,7 +390,11 @@ def calculate_metrics(
 
     num_success = len(success_outputs)
     latencies = [o.latency for o in success_outputs]
-    peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
+    peak_memories = [
+        o.peak_memory_mb
+        for o in success_outputs
+        if isinstance(o.peak_memory_mb, (int, float)) and o.peak_memory_mb > 0
+    ]
 
     metrics = {
         "duration": total_duration,
