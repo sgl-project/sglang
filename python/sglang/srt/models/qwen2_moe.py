@@ -195,13 +195,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
         self.num_experts = config.num_experts
-        num_shared_experts = 0
         if config.get("n_shared_experts", 0) > 0:
             # config defines the number of shared experts
             num_shared_experts = config.n_shared_experts 
         elif config.get("shared_expert_intermediate_size", 0) > 0:
              # n_shared_experts is not defined, but shared_expert_intermediate_size is defined, so we use 1 as the number of shared experts
             num_shared_experts = 1
+        else:
+            num_shared_experts = 0
         self.num_shared_experts = num_shared_experts
         self.enable_shared_expert_fusion = False # default to False
         if _use_aiter:
