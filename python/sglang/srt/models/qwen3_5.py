@@ -1473,7 +1473,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.enable_fused_moe = True if _use_aiter else False
         self.num_fused_shared_experts = (
-            0 if not enable_fused_moe else self._get_num_fused_shared_experts()
+            0 if not self.enable_fused_moe else self._get_num_fused_shared_experts()
         )
 
     def _get_num_fused_shared_experts(self):
