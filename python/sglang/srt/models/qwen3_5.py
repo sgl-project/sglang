@@ -1720,14 +1720,34 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             )
                         else:
                             param = params_dict[name_mapped]
-                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
                             param = params_dict[name_mapped]
                             if f"{num_experts_base}.gate_up_proj" in name:
                                 loaded_weight = loaded_weight.chunk(2, dim=-2)
-                                weight_loader(param, loaded_weight[0], name_mapped, "w1", expert_id)
-                                weight_loader(param, loaded_weight[1], name_mapped, "w3", expert_id)
+                                weight_loader(
+                                    param,
+                                    loaded_weight[0],
+                                    name_mapped,
+                                    "w1",
+                                    expert_id,
+                                )
+                                weight_loader(
+                                    param,
+                                    loaded_weight[1],
+                                    name_mapped,
+                                    "w3",
+                                    expert_id,
+                                )
                             else:
-                                weight_loader(param, loaded_weight, name_mapped, shard_id, expert_id)
+                                weight_loader(
+                                    param,
+                                    loaded_weight,
+                                    name_mapped,
+                                    shard_id,
+                                    expert_id,
+                                )
                     else:
                         # Skip loading extra parameters for GPTQ models.
                         if (
