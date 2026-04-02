@@ -158,7 +158,10 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
             ]
-            if self.hf_config.architectures[0] in mm_disabled_models:
+            if (
+                self.hf_config.architectures[0] in mm_disabled_models
+                and self.model_impl != ModelImpl.TRANSFORMERS
+            ):
                 enable_multimodal = False
                 logger.info(
                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
@@ -177,8 +180,14 @@ class ModelConfig:
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        self.is_multimodal = enable_multimodal and is_multimodal_model(
-            self.hf_config.architectures
+        has_multimodal_subconfig = (
+            self.hf_config is not self.hf_text_config
+            or hasattr(self.hf_config, "vision_config")
+            or hasattr(self.hf_config, "audio_config")
+        )
+        self.is_multimodal = enable_multimodal and (
+            is_multimodal_model(self.hf_config.architectures)
+            or has_multimodal_subconfig
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
