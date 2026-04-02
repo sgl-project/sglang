@@ -210,13 +210,12 @@ class StageProfiler:
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:
             if (
-                self.stage_name.startswith("denoising_step_")
+                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+                and self.stage_name.startswith("denoising_step_")
                 and torch.get_device_module().is_available()
-                and os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
             ):
                 torch.get_device_module().synchronize()
             self.start_time = time.perf_counter()
-
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -224,9 +223,9 @@ class StageProfiler:
             return False
 
         if (
-            self.stage_name.startswith("denoising_step_")
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+            and self.stage_name.startswith("denoising_step_")
             and torch.get_device_module().is_available()
-            and os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
         ):
             torch.get_device_module().synchronize()
         execution_time_s = time.perf_counter() - self.start_time
