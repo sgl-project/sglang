@@ -490,6 +490,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata = self.decode_cuda_graph_metadata[bs]
                 max_len = seq_lens_cpu.max().item()
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+                # This is needed to avoid GuardOnDataDependentSymNode when setting capture_scalar_outputs=True in Dynamo
                 if torch.compiler.is_compiling():
                     torch._check(max_seq_pages >= 0)
                     torch._check(max_seq_pages <= self.max_num_pages)
