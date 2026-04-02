@@ -47,6 +47,7 @@ def _dequant_fp4_to_fp8_paged_kernel(
     in_scale_ptr,
     in_rope_ptr,
     page_table_ptr,
+    new_pt_ptr,
     output_stride_0: int,
     in_packed_stride_0: int,
     in_scale_stride_0: int,
@@ -58,11 +59,21 @@ def _dequant_fp4_to_fp8_paged_kernel(
     DIM_NOPE: tl.constexpr,
     DIM_ROPE: tl.constexpr,
     IS_FNUZ: tl.constexpr,
+    TOPK: tl.constexpr,
+    PT_STRIDE: tl.constexpr,
+    WRITE_PT: tl.constexpr,
 ):
     """One program per token: load FP4, dequant, store FP8 directly."""
     token_id = tl.program_id(0)
 
     src_token_id = tl.load(page_table_ptr + token_id)
+
+    if WRITE_PT:
+        batch_idx = token_id // TOPK
+        topk_idx = token_id % TOPK
+        pt_val = tl.where(src_token_id >= 0, token_id, -1)
+        tl.store(new_pt_ptr + batch_idx * PT_STRIDE + topk_idx, pt_val)
+
     src_token_id = tl.maximum(src_token_id, 0)
 
     pack_offs = tl.arange(0, PACKED_NOPE_BYTES)
@@ -108,11 +119,17 @@ def dequantize_fp4_to_fp8_paged(
     page_indices: torch.Tensor,
     fp8_dtype: torch.dtype,
     output: torch.Tensor | None = None,
+    new_page_table: torch.Tensor | None = None,
+    topk: int = 0,
 ) -> torch.Tensor:
     """Gather FP4 pages and dequantize to a contiguous FP8 buffer.
 
     If *output* is provided it must have shape (>=num_tokens, 1, FP8_TOTAL_DIM)
     and the correct FP8 dtype.  The slice [:num_tokens] will be written.
+
+    If *new_page_table* is provided (pre-allocated [max_bs, 2048] int32),
+    the kernel fuses page-table remapping: for each token it writes the
+    sequential index (or -1 for invalid) directly into new_page_table.
     """
     num_tokens = page_indices.shape[0]
     if num_tokens == 0:
@@ -122,7 +139,10 @@ def dequantize_fp4_to_fp8_paged(
             (0, 1, FP8_TOTAL_DIM), dtype=fp8_dtype, device=fp4_buffer.device
         )
 
-    if output is not None and output.shape[0] >= num_tokens:
+    if output is not None:
+        assert (
+            output.shape[0] >= num_tokens
+        ), f"Pre-allocated output buffer too small: {output.shape[0]} < {num_tokens}"
         out = output[:num_tokens]
     else:
         out = torch.empty(
@@ -130,6 +150,9 @@ def dequantize_fp4_to_fp8_paged(
             dtype=fp8_dtype,
             device=fp4_buffer.device,
         )
+
+    write_pt = new_page_table is not None
+    pt_stride = new_page_table.stride(0) if write_pt else 1
 
     quant_flat = fp4_buffer.view(-1, fp4_buffer.shape[-1])
 
@@ -149,6 +172,7 @@ def dequantize_fp4_to_fp8_paged(
         in_scale,
         in_rope,
         page_indices,
+        new_page_table if write_pt else page_indices,
         out_flat.stride(0),
         in_packed.stride(0),
         in_scale.stride(0),
@@ -160,6 +184,9 @@ def dequantize_fp4_to_fp8_paged(
         DIM_NOPE=FP4_NOPE_DIM,
         DIM_ROPE=FP4_ROPE_DIM,
         IS_FNUZ=_is_fp8_fnuz,
+        TOPK=topk if topk > 0 else 1,
+        PT_STRIDE=pt_stride,
+        WRITE_PT=write_pt,
         num_warps=1,
         num_stages=0,
     )
@@ -178,22 +205,20 @@ def dequant_fp4_paged_decode(
     kv_cache_fp4: torch.Tensor,
     page_table_1: torch.Tensor,
     fp8_workspace: torch.Tensor | None = None,
-    arange_buf: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dequant FP4→FP8 for decode (small page_table, CUDA-graph safe).
+    new_page_table: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Dequant FP4→FP8 for decode, fusing page-table remap in the kernel.
 
-    Pre-allocated buffers avoid per-step torch.empty / torch.arange:
-      fp8_workspace – (max_entries, 1, 576) FP8, reused across steps
-      arange_buf    – int32 arange(0..max), e.g. _arange_buf from backend
+    Pre-allocated buffers (CUDA-graph safe, zero dynamic allocation):
+      fp8_workspace  – (max_entries, 1, 576) FP8, reused across steps
+      new_page_table – (max_bs, 2048) int32, kernel writes remapped indices
 
-    Returns (kv_fp8, new_page_table_1).
+    Returns kv_fp8.  new_page_table is written in-place by the kernel.
     """
     assert (
         page_table_1.ndim == 2
     ), f"page_table_1 must be 2D (batch, topk), got shape {page_table_1.shape}"
-    batch_size = page_table_1.shape[0]
     topk = page_table_1.shape[1]
-    num_entries = batch_size * topk
     flat_indices = page_table_1.reshape(-1)
 
     fp8_dtype = get_fp8_dtype_for_dequant()
@@ -202,19 +227,11 @@ def dequant_fp4_paged_decode(
         flat_indices,
         fp8_dtype,
         output=fp8_workspace,
+        new_page_table=new_page_table,
+        topk=topk,
     )
 
-    if arange_buf is not None and arange_buf.numel() >= num_entries:
-        sequential = arange_buf[:num_entries].reshape(batch_size, topk)
-    else:
-        sequential = torch.arange(
-            num_entries, device=page_table_1.device, dtype=page_table_1.dtype
-        ).reshape(batch_size, topk)
-
-    valid_mask = page_table_1 >= 0
-    new_page_table_1 = torch.where(valid_mask, sequential, page_table_1)
-
-    return temp_kv_fp8, new_page_table_1
+    return temp_kv_fp8
 
 
 def dequant_fp4_paged_extend(

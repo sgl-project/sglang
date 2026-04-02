@@ -347,15 +347,16 @@ class NativeSparseAttnBackend(
             )
 
         if self.nsa_kv_cache_store_fp4:
-            fp4_init_entries = model_runner.req_to_token_pool.size * self.nsa_index_topk
+            max_bs = model_runner.req_to_token_pool.size
+            fp4_init_entries = max_bs * self.nsa_index_topk
             fp8_dtype = get_fp8_dtype_for_dequant()
             self._fp4_fp8_workspace = torch.empty(
                 (fp4_init_entries, 1, FP8_TOTAL_DIM),
                 dtype=fp8_dtype,
                 device=self.device,
             )
-            self._fp4_arange_buf = torch.arange(
-                fp4_init_entries, device=self.device, dtype=torch.int32
+            self._fp4_new_page_table = torch.full(
+                (max_bs, 2048), -1, dtype=torch.int32, device=self.device
             )
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
@@ -818,8 +819,8 @@ class NativeSparseAttnBackend(
                 dtype=fp8_dtype,
                 device=self.device,
             )
-            self._fp4_arange_buf = torch.arange(
-                cg_entries, device=self.device, dtype=torch.int32
+            self._fp4_new_page_table = torch.full(
+                (max_num_tokens, 2048), -1, dtype=torch.int32, device=self.device
             )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -1623,12 +1624,15 @@ class NativeSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if self.nsa_kv_cache_store_fp4:
-                kv_cache, page_table_1 = dequant_fp4_paged_decode(
+                bs = page_table_1.shape[0]
+                pt_valid = page_table_1[:, : self.nsa_index_topk]
+                kv_cache = dequant_fp4_paged_decode(
                     kv_cache,
-                    page_table_1,
+                    pt_valid,
                     fp8_workspace=self._fp4_fp8_workspace,
-                    arange_buf=self._fp4_arange_buf,
+                    new_page_table=self._fp4_new_page_table,
                 )
+                page_table_1 = self._fp4_new_page_table[:bs]
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
