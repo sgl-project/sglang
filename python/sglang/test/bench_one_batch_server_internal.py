@@ -609,7 +609,7 @@ def run_one_case(
         last_gen_throughput = -1
         acc_length = -1
     else:
-        response = requests.get(url + "/get_server_info", timeout=DEFAULT_TIMEOUT)
+        response = requests.get(url + "/server_info", timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         server_info = response.json()
         internal_state = server_info.get("internal_states", [{}])
@@ -793,7 +793,7 @@ def run_benchmark_internal(
         skip_max_running_requests_threshold = float("inf")
     else:
         model_name = None
-        response = requests.get(base_url + "/get_server_info", timeout=DEFAULT_TIMEOUT)
+        response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         server_info = response.json()
         if "tokenizer_path" in server_info:

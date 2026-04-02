@@ -120,8 +120,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
-    PinPrefixReqInput,
-    PinPrefixReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -142,7 +140,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    has_shm_features,
+    init_mm_embedding_cache,
+    unwrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
@@ -1181,7 +1183,6 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
-                (PinPrefixReqInput, self.pin_prefix_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -1501,6 +1502,27 @@ class Scheduler(
         # so that ShmPointerMMData metadata (not full tensor data) is what
         # gets serialized during broadcast_pyobj.
         if recv_reqs:
+            # Barrier for the non-DP-attention path only: there is a single
+            # broadcast_pyobj on tp_cpu_group where the source rank returns
+            # the original objects immediately while other ranks are still in
+            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
+            # the source can call materialize() / shm_unlink before others
+            # open the segment.  recv_reqs is consistent across all ranks
+            # here (same broadcast), so the guard is deadlock-free.
+            #
+            # Under DP-attention no barrier is needed: the control_reqs
+            # broadcast on tp_cpu_group (step 3) is a collective that forces
+            # every rank to complete the earlier attn_tp / attn_cp work_reqs
+            # deserializations (steps 1-2, which call shm_open) before any
+            # rank returns from step 3.  POSIX guarantees shm_unlink only
+            # removes the name; already-open handles stay valid.
+            if (
+                not self.server_args.enable_dp_attention
+                and self.tp_size > 1
+                and self.model_config.is_multimodal
+                and has_shm_features(recv_reqs)
+            ):
+                barrier(group=self.tp_cpu_group)
             for req in recv_reqs:
                 unwrap_shm_features(req)
 
@@ -2140,6 +2162,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
+        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -2149,31 +2172,35 @@ class Scheduler(
                 else:
                     self.running_batch.merge_batch(new_batch)
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
-        else:
-            if self.last_batch and self.last_batch.forward_mode.is_extend():
-                if self.last_batch.chunked_req is not None:
-                    # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                    # We need to discard it.
-                    chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
-                if self.dllm_config is not None and self.last_batch.reqs:
-                    chunked_req_to_exclude.update(self.last_batch.reqs)
+        if (
+            not self.enable_hisparse
+            and self.last_batch
+            and self.last_batch.forward_mode.is_extend()
+        ):
+            if self.last_batch.chunked_req is not None:
+                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+                # We need to discard it.
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
-                # Filter batch
-                last_bs = self.last_batch.batch_size()
-                self.last_batch.filter_batch(
-                    chunked_req_to_exclude=list(chunked_req_to_exclude)
-                )
-                if self.last_batch.batch_size() < last_bs:
-                    self.running_batch.batch_is_full = False
+            if self.dllm_config is not None and self.last_batch.reqs:
+                chunked_req_to_exclude.update(self.last_batch.reqs)
 
-                # Merge the new batch into the running batch.
-                if not self.last_batch.is_empty():
-                    if self.running_batch.is_empty():
-                        self.running_batch = self.last_batch
-                    else:
-                        # Merge running_batch with prefill batch
-                        self.running_batch.merge_batch(self.last_batch)
+            # Filter batch
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
+                self.running_batch.batch_is_full = False
+
+            # Merge the new batch into the running batch.
+            if not self.last_batch.is_empty():
+                if self.running_batch.is_empty():
+                    self.running_batch = self.last_batch
+                else:
+                    # Merge running_batch with prefill batch
+                    self.running_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
         # won't go through the decode step. This keeps running_batch accurate
@@ -2979,37 +3006,6 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def pin_prefix_wrapped(self, recv_req: PinPrefixReqInput):
-        if not hasattr(self.tree_cache, "pin_prefix"):
-            return PinPrefixReqOutput(
-                success=False,
-                nodes_pinned=0,
-                message="PIN requires --enable-hierarchical-cache",
-            )
-        if getattr(self.tree_cache, "_max_pinned_tokens", 0) <= 0:
-            return PinPrefixReqOutput(
-                success=False,
-                nodes_pinned=0,
-                message="Pinning is disabled (SGLANG_HICACHE_MAX_PINNED_RATIO is 0)",
-            )
-        nodes_pinned, reject_reason = self.tree_cache.pin_prefix(
-            recv_req.token_ids, recv_req.ttl_seconds
-        )
-        if nodes_pinned == 0:
-            return PinPrefixReqOutput(
-                success=False,
-                nodes_pinned=0,
-                message=reject_reason or "No matching prefix found in cache to pin",
-            )
-        msg = f"Pinned {nodes_pinned} nodes (ttl={recv_req.ttl_seconds}s)"
-        if reject_reason:
-            msg += f"; {reject_reason}"
-        return PinPrefixReqOutput(
-            success=True,
-            nodes_pinned=nodes_pinned,
-            message=msg,
-        )
-
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if self.is_fully_idle():
@@ -3233,6 +3229,16 @@ class Scheduler(
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
+        if recv_req.mode == "in_place":
+            # In-place pause: just set the flag and return immediately.
+            # All scheduler state (running_batch, last_batch, chunked_req,
+            # result_queue) is left untouched. On resume, the normal event
+            # loop (get_next_batch_to_run) handles last_batch merge,
+            # chunked_req cleanup, and overlap result processing through
+            # the standard code paths. This avoids duplicating batch
+            # manipulation logic and the accounting bugs that come with it.
+            return
+
         if self.enable_overlap and self.last_batch:
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3240,9 +3246,6 @@ class Scheduler(
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
-            if recv_req.mode == "in_place":
-                if self.chunked_req is not None:
-                    chunked_req_to_exclude.add(self.chunked_req)
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )

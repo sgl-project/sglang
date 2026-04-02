@@ -36,6 +36,7 @@ SUITES = {
         "../unit/test_lora_format_adapter.py",
         "../unit/test_server_args.py",
         "../unit/test_input_validation.py",
+        "../unit/test_resolve_prompts.py",
         # add new unit tests here
     ],
     "1-gpu": [
@@ -50,6 +51,9 @@ SUITES = {
         "test_server_2_gpu_a.py",
         "test_server_2_gpu_b.py",
         # add new 2-gpu test files here
+    ],
+    "1-gpu-b200": [
+        "test_server_c.py",
     ],
 }
 
@@ -79,7 +83,7 @@ def parse_args():
         type=str,
         required=True,
         choices=list(SUITES.keys()),
-        help="The test suite to run (e.g., 1-gpu, 2-gpu)",
+        help="The test suite to run (valid names are defined in SUITES)",
     )
     parser.add_argument(
         "--partition-id",
@@ -234,7 +238,9 @@ def run_pytest(files, filter_expr=None):
         )
 
         is_flaky_ci_assertion = (
-            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+            "SafetensorError" in full_output
+            or "FileNotFoundError" in full_output
+            or "TimeoutError" in full_output
         )
 
         is_oom_error = (
