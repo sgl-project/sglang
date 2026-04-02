@@ -79,7 +79,9 @@ def quant_fp8(weight, strategy, block_size=None):
     if strategy == "block":
         return block_fp8(weight, block_size)
     else:
-        raise ValueError(f"Only 'block' strategy supported for Z-Image. Got: {strategy}")
+        raise ValueError(
+            f"Only 'block' strategy supported for Z-Image. Got: {strategy}"
+        )
 
 
 # Z-Image-Turbo specific exclusion list
@@ -88,32 +90,32 @@ def quant_fp8(weight, strategy, block_size=None):
 # 2. Modulation layers (adaLN, sensitive, small)
 # 3. Final output layers (sensitive)
 ZIMAGE_ALWAYS_EXCLUDE = {
-    "norm",           # RMSNorm, LayerNorm weights
-    "embed",          # patch/position embeddings
-    "modulation",     # adaLN modulation (includes adaLN_modulation)
-    "all_final_layer",# final projection layers
-    "time_in",        # timestep embedding
-    "proj_out.weight",# output projection
-    "layernorm",      # any layernorm
+    "norm",  # RMSNorm, LayerNorm weights
+    "embed",  # patch/position embeddings
+    "modulation",  # adaLN modulation (includes adaLN_modulation)
+    "all_final_layer",  # final projection layers
+    "time_in",  # timestep embedding
+    "proj_out.weight",  # output projection
+    "layernorm",  # any layernorm
 }
 
 # FFN-specific exclusion (disabled by default for Z-Image)
 FFN_EXCLUDE = {
-    "feed_forward",   # SwiGLU FFN layers (w1, w2, w3)
+    "feed_forward",  # SwiGLU FFN layers (w1, w2, w3)
 }
 
 # FLUX-specific exclusions (not needed for Z-Image, listed for reference)
 FLUX_ONLY_EXCLUDE = {
-    "router",         # MoE router (FLUX-specific)
-    "mlp.gate.",      # MoE gate (FLUX-specific)
-    "net",            # FLUX FFN (net.0.proj pattern)
-    "lm_head",        # Language model head (not in DiT)
-    "eh_proj",        # FLUX-specific
-    "txt_mod",        # FLUX double-stream text modulation
-    "img_mod",        # FLUX double-stream image modulation
-    "txt_in",         # FLUX text input projection
-    "img_in",         # FLUX image input projection
-    "vector_in",      # FLUX vector input
+    "router",  # MoE router (FLUX-specific)
+    "mlp.gate.",  # MoE gate (FLUX-specific)
+    "net",  # FLUX FFN (net.0.proj pattern)
+    "lm_head",  # Language model head (not in DiT)
+    "eh_proj",  # FLUX-specific
+    "txt_mod",  # FLUX double-stream text modulation
+    "img_mod",  # FLUX double-stream image modulation
+    "txt_in",  # FLUX text input projection
+    "img_in",  # FLUX image input projection
+    "vector_in",  # FLUX vector input
 }
 
 
@@ -156,8 +158,13 @@ class ConversionResult:
 
 
 def process_file(
-    input_path, output_path, filename, strategy, block_size,
-    exclude_feed_forward, result_collector
+    input_path,
+    output_path,
+    filename,
+    strategy,
+    block_size,
+    exclude_feed_forward,
+    result_collector,
 ):
     if not filename.endswith(".safetensors"):
         return
@@ -201,8 +208,12 @@ def process_file(
 
 
 def convert_fp8(
-    input_path, output_path, strategy, block_size=None,
-    max_workers=4, exclude_feed_forward=False
+    input_path,
+    output_path,
+    strategy,
+    block_size=None,
+    max_workers=4,
+    exclude_feed_forward=False,
 ):
     input_path = os.path.abspath(input_path)
     os.makedirs(output_path, exist_ok=True)
@@ -295,27 +306,40 @@ if __name__ == "__main__":
         description="Convert Z-Image-Turbo DiT to FP8 (with FFN quantization enabled by default)"
     )
     parser.add_argument(
-        "--model-dir", type=str, required=True,
+        "--model-dir",
+        type=str,
+        required=True,
         help="Path to the transformer subdirectory of Z-Image-Turbo",
     )
     parser.add_argument(
-        "--save-dir", type=str, required=True,
+        "--save-dir",
+        type=str,
+        required=True,
         help="Path to save the FP8 converted model",
     )
     parser.add_argument(
-        "--strategy", type=str, default="block", choices=["block"],
+        "--strategy",
+        type=str,
+        default="block",
+        choices=["block"],
         help="Quantization strategy (only 'block' supported for Z-Image on H20)",
     )
     parser.add_argument(
-        "--block-size", type=int, nargs=2, default=[128, 128],
+        "--block-size",
+        type=int,
+        nargs=2,
+        default=[128, 128],
         help="Block size for block quantization (default: 128 128)",
     )
     parser.add_argument(
-        "--max-workers", type=int, default=4,
+        "--max-workers",
+        type=int,
+        default=4,
         help="Number of worker threads for parallel processing",
     )
     parser.add_argument(
-        "--exclude-feed-forward", action="store_true",
+        "--exclude-feed-forward",
+        action="store_true",
         help="Exclude feed_forward (FFN) layers from FP8 (for A/B comparison)",
     )
     args = parser.parse_args()

@@ -588,6 +588,7 @@ class RopeEmbedder:
 @dataclass
 class PreBlockOutput:
     """Output of forward_pre_block, separating GPU tensors from metadata."""
+
     unified: torch.Tensor
     unified_freqs_cis: Tuple[torch.Tensor, torch.Tensor]
     adaln_input: torch.Tensor
@@ -946,9 +947,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                     )
             else:
                 # Normal ZImageTransformerBlock
-                layer.attention.attn.skip_sequence_parallel = (
-                    use_full_unified_sequence
-                )
+                layer.attention.attn.skip_sequence_parallel = use_full_unified_sequence
             unified = layer(
                 unified,
                 unified_freqs_cis,

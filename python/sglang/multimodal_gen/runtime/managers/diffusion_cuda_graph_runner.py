@@ -463,6 +463,7 @@ class StepLevelCudaGraphRunner:
 
         # Capture bn_blocks (only if Bn > 0)
         if self.bn_blocks > 0:
+
             def bn_fn():
                 out = dit_model.forward_bn_blocks(
                     self.inter_buffer,
@@ -643,7 +644,13 @@ class StepLevelCudaGraphRunner:
 
     def reset(self):
         """Release all captured graphs and buffers."""
-        for attr in ("graph_pre", "graph_fn", "graph_middle_full", "graph_bn", "graph_post"):
+        for attr in (
+            "graph_pre",
+            "graph_fn",
+            "graph_middle_full",
+            "graph_bn",
+            "graph_post",
+        ):
             graph = getattr(self, attr, None)
             if graph is not None:
                 del graph

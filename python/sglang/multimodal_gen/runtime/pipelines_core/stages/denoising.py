@@ -58,11 +58,11 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.diffusion_cuda_graph_runner import (
     DiffusionCudaGraphRunner,
     StepLevelCudaGraphRunner,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -1197,7 +1197,9 @@ class DenoisingStage(PipelineStage):
                                         latents=latent_model_input,
                                         static_kwargs=static_kwargs,
                                     )
-                                    self._step_level_runners[latent_shape] = step_level_runner
+                                    self._step_level_runners[latent_shape] = (
+                                        step_level_runner
+                                    )
                                 else:
                                     step_is_all_cached = (
                                         scm_mask is not None and scm_mask[i] == 0

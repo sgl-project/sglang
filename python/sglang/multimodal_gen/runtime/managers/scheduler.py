@@ -7,7 +7,6 @@ import pickle
 from collections import deque
 from typing import Any, List
 
-import torch
 import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
