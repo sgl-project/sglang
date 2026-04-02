@@ -134,6 +134,19 @@ def append_jsonl(path: str, records: Iterable[Dict[str, Any]]) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def read_jsonl(path: str) -> List[Dict[str, Any]]:
+    if not path or not os.path.isfile(path):
+        return []
+    records: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
+
+
 def describe_search_tier(tier: int) -> str:
     descriptions = {
         1: "tier 1: smallest and fastest sanity sweep",
@@ -141,6 +154,29 @@ def describe_search_tier(tier: int) -> str:
         3: "tier 3: largest and slowest full search",
     }
     return descriptions.get(tier, f"tier {tier}")
+
+
+def install_interrupt_handlers() -> Dict[signal.Signals, Any]:
+    previous = {}
+
+    def handler(signum, _frame):  # type: ignore[no-untyped-def]
+        raise KeyboardInterrupt(f"Interrupted by signal {signum}")
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, handler)
+        except Exception:
+            continue
+    return previous
+
+
+def restore_interrupt_handlers(previous: Dict[signal.Signals, Any]) -> None:
+    for sig, handler in previous.items():
+        try:
+            signal.signal(sig, handler)
+        except Exception:
+            continue
 
 
 def collect_stale_server_pids(port: int) -> List[int]:
@@ -824,6 +860,36 @@ def build_qps_plan(benchmark_cfg: Dict[str, Any]) -> Tuple[str, List[float], flo
     raise ValueError("benchmark.qps must be a list or a {lower, upper, tolerance} map.")
 
 
+def trial_key(
+    stage_name: str,
+    candidate_id: int,
+    request_rate: float,
+    max_concurrency: Optional[int],
+    server_flags: Dict[str, Any],
+) -> str:
+    return json.dumps(
+        {
+            "stage": stage_name,
+            "candidate_id": candidate_id,
+            "requested_qps": request_rate,
+            "max_concurrency": max_concurrency,
+            "server_flags": canonicalize_flags(server_flags),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+
+def record_trial_key(record: Dict[str, Any]) -> str:
+    return trial_key(
+        stage_name=str(record.get("stage", "")),
+        candidate_id=int(record.get("candidate_id", 0)),
+        request_rate=float(record.get("requested_qps", 0.0)),
+        max_concurrency=record.get("max_concurrency"),
+        server_flags=record.get("server_flags", {}),
+    )
+
+
 def meets_sla(result: Dict[str, Any], benchmark_cfg: Dict[str, Any]) -> bool:
     sla = benchmark_cfg.get("sla", {})
     max_ttft_ms = sla.get("max_ttft_ms")
@@ -1075,35 +1141,52 @@ def run_candidate(
     output_dir: str,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     record_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    existing_records: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     mode, values, tolerance = build_qps_plan(benchmark_cfg)
     max_concurrency_values = as_list(benchmark_cfg.get("max_concurrency", [None]))
     records: List[Dict[str, Any]] = []
+    existing_by_key = {
+        record_trial_key(record): deepcopy(record)
+        for record in (existing_records or [])
+    }
 
     def one_trial(
         request_rate: float, max_concurrency: Optional[int]
-    ) -> Dict[str, Any]:
-        return run_trial(
+    ) -> Tuple[Dict[str, Any], bool]:
+        key = trial_key(
             stage_name=stage_name,
             candidate_id=candidate_id,
-            server_cfg=server_cfg,
-            benchmark_cfg=benchmark_cfg,
-            dataset_summary=dataset_summary,
-            backend=backend,
-            dataset_path=dataset_path,
-            tokenizer_path=tokenizer_path,
-            server_flags=server_flags,
-            output_dir=output_dir,
             request_rate=request_rate,
             max_concurrency=max_concurrency,
+            server_flags=server_flags,
+        )
+        if key in existing_by_key:
+            return deepcopy(existing_by_key[key]), True
+        return (
+            run_trial(
+                stage_name=stage_name,
+                candidate_id=candidate_id,
+                server_cfg=server_cfg,
+                benchmark_cfg=benchmark_cfg,
+                dataset_summary=dataset_summary,
+                backend=backend,
+                dataset_path=dataset_path,
+                tokenizer_path=tokenizer_path,
+                server_flags=server_flags,
+                output_dir=output_dir,
+                request_rate=request_rate,
+                max_concurrency=max_concurrency,
+            ),
+            False,
         )
 
     for max_concurrency in max_concurrency_values:
         if mode == "fixed":
             for qps in values:
-                record = one_trial(qps, max_concurrency)
+                record, reused = one_trial(qps, max_concurrency)
                 records.append(record)
-                if record_callback is not None:
+                if record_callback is not None and not reused:
                     record_callback(record)
                 if progress_callback is not None:
                     progress_callback(record)
@@ -1115,9 +1198,9 @@ def run_candidate(
             qps = pick_qps_midpoint(lower, upper)
             if qps <= lower or qps >= upper:
                 break
-            record = one_trial(qps, max_concurrency)
+            record, reused = one_trial(qps, max_concurrency)
             records.append(record)
-            if record_callback is not None:
+            if record_callback is not None and not reused:
                 record_callback(record)
             if progress_callback is not None:
                 progress_callback(record)
@@ -1195,10 +1278,15 @@ def write_markdown_summary(
     records: Sequence[Dict[str, Any]],
     best: Optional[Dict[str, Any]],
     server_cfg: Dict[str, Any],
+    interrupted: bool = False,
 ) -> None:
     lines = [f"# Auto Benchmark Summary: {scenario['display_name']}", ""]
     lines.append(f"- Dataset kind: `{dataset_cfg['kind']}`")
     lines.append(f"- Requests: `{dataset_summary['num_requests']}`")
+    if interrupted:
+        lines.append(
+            "- Status: `partial` (interrupted before the full search completed)"
+        )
     if dataset_cfg["kind"] == "random":
         lines.append(
             f"- Random distribution: input `{dataset_cfg['random_input_len']}`, output `{dataset_cfg['random_output_len']}`"
@@ -1260,9 +1348,15 @@ def run_stage(
     tokenizer_path: str,
     output_dir: str,
     live_results_path: Optional[str] = None,
+    existing_records: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     records: List[Dict[str, Any]] = []
-    best_record: Optional[Dict[str, Any]] = None
+    existing_stage_records = [
+        deepcopy(record)
+        for record in (existing_records or [])
+        if record.get("stage") == stage_name
+    ]
+    current_best: Optional[Dict[str, Any]] = best_record(existing_stage_records)
     stage_label = f"{scenario_name} {stage_name}"
     candidate_pbar, candidate_started_at = make_progress_bar(
         desc=f"{stage_label} candidates",
@@ -1286,15 +1380,15 @@ def run_stage(
             )
 
             def on_trial(record: Dict[str, Any]) -> None:
-                nonlocal best_record
+                nonlocal current_best
                 if record.get("metrics") and (
-                    best_record is None
-                    or result_sort_key(record) > result_sort_key(best_record)
+                    current_best is None
+                    or result_sort_key(record) > result_sort_key(current_best)
                 ):
-                    best_record = record
-                advance_progress(trial_pbar, trial_started_at, best_record=best_record)
+                    current_best = record
+                advance_progress(trial_pbar, trial_started_at, best_record=current_best)
                 refresh_progress_eta(
-                    candidate_pbar, candidate_started_at, best_record=best_record
+                    candidate_pbar, candidate_started_at, best_record=current_best
                 )
 
             def on_record(record: Dict[str, Any]) -> None:
@@ -1314,22 +1408,54 @@ def run_stage(
                 output_dir=output_dir,
                 progress_callback=on_trial,
                 record_callback=on_record,
+                existing_records=existing_stage_records,
             )
             records.extend(candidate_records)
 
             advance_progress(
                 candidate_pbar,
                 candidate_started_at,
-                best_record=best_record,
+                best_record=current_best,
             )
     finally:
         if trial_pbar.total is not None and trial_pbar.n < trial_pbar.total:
             trial_pbar.total = trial_pbar.n
-            refresh_progress_eta(trial_pbar, trial_started_at, best_record)
+            refresh_progress_eta(trial_pbar, trial_started_at, current_best)
         candidate_pbar.close()
         trial_pbar.close()
 
-    return records, best_record
+    return records, current_best
+
+
+def persist_scenario_outputs(
+    scenario_output_dir: str,
+    scenario: Dict[str, Any],
+    scenario_cfg: Dict[str, Any],
+    dataset_summary: Dict[str, Any],
+    records: Sequence[Dict[str, Any]],
+    server_cfg: Dict[str, Any],
+    interrupted: bool = False,
+) -> Optional[Dict[str, Any]]:
+    if not records:
+        return None
+    results_jsonl = os.path.join(scenario_output_dir, "results.jsonl")
+    results_csv = os.path.join(scenario_output_dir, "results.csv")
+    best = best_record(records)
+    write_jsonl(results_jsonl, records)
+    write_csv(results_csv, records)
+    write_markdown_summary(
+        path=os.path.join(scenario_output_dir, "summary.md"),
+        scenario=scenario,
+        dataset_cfg=scenario_cfg,
+        dataset_summary=dataset_summary,
+        records=records,
+        best=best,
+        server_cfg=server_cfg,
+        interrupted=interrupted,
+    )
+    log_line(f"results_jsonl={results_jsonl}")
+    log_line(f"results_csv={results_csv}")
+    return best
 
 
 def run_auto_benchmark(config_path: str) -> str:
@@ -1359,8 +1485,10 @@ def run_auto_benchmark(config_path: str) -> str:
     scenarios = expand_dataset_scenarios(dataset_cfg)
     tier = int(search_cfg.get("tier", 2))
     max_candidates = search_cfg.get("max_candidates")
+    resume_enabled = bool(search_cfg.get("resume", True))
     base_candidates = build_server_candidates(server_cfg, tier, max_candidates)
     scenario_records: List[Dict[str, Any]] = []
+    interrupted = False
     print_run_plan(
         config_path=config_path,
         output_dir=output_dir,
@@ -1379,6 +1507,7 @@ def run_auto_benchmark(config_path: str) -> str:
         position=0,
         leave=True,
     )
+    previous_handlers = install_interrupt_handlers()
     try:
         for scenario in scenarios:
             scenario_output_dir = (
@@ -1388,14 +1517,27 @@ def run_auto_benchmark(config_path: str) -> str:
             )
             os.makedirs(scenario_output_dir, exist_ok=True)
             live_results_path = os.path.join(scenario_output_dir, "live_results.jsonl")
-            if os.path.exists(live_results_path):
+            if os.path.exists(live_results_path) and not resume_enabled:
                 os.remove(live_results_path)
-            prepared_dataset_path, rows, dataset_summary = prepare_dataset(
-                dataset_cfg=scenario["cfg"],
-                tokenizer_path=tokenizer_path,
-                model=model,
-                output_path=os.path.join(scenario_output_dir, "prepared_dataset.jsonl"),
+            prepared_dataset_path = os.path.join(
+                scenario_output_dir, "prepared_dataset.jsonl"
             )
+            existing_records = read_jsonl(live_results_path)
+            if resume_enabled and os.path.exists(prepared_dataset_path):
+                rows = load_autobench_rows(
+                    dataset_path=prepared_dataset_path,
+                    tokenizer_path=tokenizer_path,
+                    num_prompts=0,
+                )
+                dataset_summary = summarize_rows(rows)
+            else:
+                prepared_dataset_path, rows, dataset_summary = prepare_dataset(
+                    dataset_cfg=scenario["cfg"],
+                    tokenizer_path=tokenizer_path,
+                    model=model,
+                    output_path=prepared_dataset_path,
+                )
+
             backend = infer_backend(benchmark_cfg.get("backend", "auto"), rows)
             log_line(f"scenario={scenario['display_name']}")
             log_line(f"prepared_dataset={prepared_dataset_path}")
@@ -1403,56 +1545,18 @@ def run_auto_benchmark(config_path: str) -> str:
                 f"dataset_summary={json.dumps(dataset_summary, ensure_ascii=False)}"
             )
             log_line(f"selected_backend={backend}")
-
-            all_records, best_base = run_stage(
-                scenario_name=scenario["display_name"],
-                stage_name="base",
-                candidates=base_candidates,
-                server_cfg=server_cfg,
-                benchmark_cfg=benchmark_cfg,
-                dataset_summary=dataset_summary,
-                backend=backend,
-                dataset_path=prepared_dataset_path,
-                tokenizer_path=tokenizer_path,
-                output_dir=scenario_output_dir,
-                live_results_path=live_results_path,
-            )
-
-            speculative_cfg = config.get("speculative", {})
-            if speculative_cfg.get("enabled"):
-                if best_base is None:
-                    raise ValueError(
-                        "Speculative search requires at least one successful base run."
-                    )
-                if not speculative_cfg.get("draft_model_path"):
-                    raise ValueError("speculative.draft_model_path is required.")
-
-                spec_base_flags = deepcopy(best_base["server_flags"])
-                spec_base_flags.update(deepcopy(speculative_cfg.get("base_flags", {})))
-                spec_base_flags["speculative_algorithm"] = speculative_cfg.get(
-                    "algorithm", "EAGLE"
-                )
-                spec_base_flags["speculative_draft_model_path"] = speculative_cfg[
-                    "draft_model_path"
-                ]
-                spec_candidates = build_candidates(
-                    base_flags=canonicalize_flags(spec_base_flags),
-                    search_space=deepcopy(speculative_cfg.get("search_space", {})),
-                    tier=tier,
-                    max_candidates=max_candidates,
-                )
+            if resume_enabled and existing_records:
                 log_line(
-                    f"Planned speculative candidates for scenario={scenario['display_name']}:"
+                    f"resume=true loaded_records={len(existing_records)} "
+                    f"scenario={scenario['display_name']}"
                 )
-                for index, candidate in enumerate(spec_candidates, start=1):
-                    log_line(
-                        f"  [{index}/{len(spec_candidates)}] "
-                        f"{json.dumps(merge_host_port(server_cfg, candidate), ensure_ascii=False)}"
-                    )
-                spec_records, _ = run_stage(
+
+            all_records: List[Dict[str, Any]] = []
+            try:
+                all_records, best_base = run_stage(
                     scenario_name=scenario["display_name"],
-                    stage_name="speculative",
-                    candidates=spec_candidates,
+                    stage_name="base",
+                    candidates=base_candidates,
                     server_cfg=server_cfg,
                     benchmark_cfg=benchmark_cfg,
                     dataset_summary=dataset_summary,
@@ -1461,36 +1565,93 @@ def run_auto_benchmark(config_path: str) -> str:
                     tokenizer_path=tokenizer_path,
                     output_dir=scenario_output_dir,
                     live_results_path=live_results_path,
+                    existing_records=existing_records,
                 )
-                all_records.extend(spec_records)
 
-            results_jsonl = os.path.join(scenario_output_dir, "results.jsonl")
-            results_csv = os.path.join(scenario_output_dir, "results.csv")
-            write_jsonl(results_jsonl, all_records)
-            write_csv(results_csv, all_records)
-            write_markdown_summary(
-                path=os.path.join(scenario_output_dir, "summary.md"),
-                scenario=scenario,
-                dataset_cfg=scenario["cfg"],
-                dataset_summary=dataset_summary,
-                records=all_records,
-                best=best_record(all_records),
-                server_cfg=server_cfg,
-            )
-            scenario_records.append(
-                {
-                    "scenario_name": scenario["display_name"],
-                    "scenario_dir": scenario_output_dir,
-                    "best_record": best_record(all_records),
-                }
-            )
-            log_line(f"results_jsonl={results_jsonl}")
-            log_line(f"results_csv={results_csv}")
+                speculative_cfg = config.get("speculative", {})
+                if speculative_cfg.get("enabled"):
+                    if best_base is None:
+                        raise ValueError(
+                            "Speculative search requires at least one successful base run."
+                        )
+                    if not speculative_cfg.get("draft_model_path"):
+                        raise ValueError("speculative.draft_model_path is required.")
+
+                    spec_base_flags = deepcopy(best_base["server_flags"])
+                    spec_base_flags.update(
+                        deepcopy(speculative_cfg.get("base_flags", {}))
+                    )
+                    spec_base_flags["speculative_algorithm"] = speculative_cfg.get(
+                        "algorithm", "EAGLE"
+                    )
+                    spec_base_flags["speculative_draft_model_path"] = speculative_cfg[
+                        "draft_model_path"
+                    ]
+                    spec_candidates = build_candidates(
+                        base_flags=canonicalize_flags(spec_base_flags),
+                        search_space=deepcopy(speculative_cfg.get("search_space", {})),
+                        tier=tier,
+                        max_candidates=max_candidates,
+                    )
+                    log_line(
+                        f"Planned speculative candidates for scenario={scenario['display_name']}:"
+                    )
+                    for index, candidate in enumerate(spec_candidates, start=1):
+                        log_line(
+                            f"  [{index}/{len(spec_candidates)}] "
+                            f"{json.dumps(merge_host_port(server_cfg, candidate), ensure_ascii=False)}"
+                        )
+                    spec_records, _ = run_stage(
+                        scenario_name=scenario["display_name"],
+                        stage_name="speculative",
+                        candidates=spec_candidates,
+                        server_cfg=server_cfg,
+                        benchmark_cfg=benchmark_cfg,
+                        dataset_summary=dataset_summary,
+                        backend=backend,
+                        dataset_path=prepared_dataset_path,
+                        tokenizer_path=tokenizer_path,
+                        output_dir=scenario_output_dir,
+                        live_results_path=live_results_path,
+                        existing_records=read_jsonl(live_results_path),
+                    )
+                    all_records.extend(spec_records)
+            except KeyboardInterrupt:
+                interrupted = True
+                log_line(
+                    f"interrupt_received=true scenario={scenario['display_name']} "
+                    "saving partial results before exit"
+                )
+            finally:
+                persisted_records = all_records
+                live_records = read_jsonl(live_results_path)
+                if len(live_records) > len(persisted_records):
+                    persisted_records = live_records
+                best = persist_scenario_outputs(
+                    scenario_output_dir=scenario_output_dir,
+                    scenario=scenario,
+                    scenario_cfg=scenario["cfg"],
+                    dataset_summary=dataset_summary,
+                    records=persisted_records,
+                    server_cfg=server_cfg,
+                    interrupted=interrupted,
+                )
+                if best is not None:
+                    scenario_records.append(
+                        {
+                            "scenario_name": scenario["display_name"],
+                            "scenario_dir": scenario_output_dir,
+                            "best_record": best,
+                        }
+                    )
+            if interrupted:
+                break
             advance_progress(scenario_pbar, scenario_started_at)
     finally:
         scenario_pbar.close()
+        restore_interrupt_handlers(previous_handlers)
 
-    if len(scenarios) > 1:
+    if scenario_records and len(scenarios) > 1:
         summary_rows = []
         for item in scenario_records:
             record = item["best_record"]
@@ -1555,6 +1716,8 @@ def run_auto_benchmark(config_path: str) -> str:
                 )
         with open(os.path.join(output_dir, "SUMMARY.md"), "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
+    if interrupted:
+        log_line(f"interrupted=true partial_output_dir={output_dir}")
     return output_dir
 
 

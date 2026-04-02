@@ -32,14 +32,57 @@ If those are not true yet, fix them before running a large search.
 If the benchmark is executed on a remote machine, the progress bar output must be
 mirrored back to a local file for humans to watch.
 
+Scope note:
+- use the remote-log mirroring workflow only when the benchmark is running in a
+  different machine or a different remote container than the one the agent is
+  actively operating in
+- if the agent itself is already running inside the target container where auto
+  benchmark is executing, do not add a separate log-return loop just for parity;
+  inspect the live log files and result files directly in the current container
+- in other words, "remote container" needs mirrored local logs, while "current
+  container" should use direct local inspection
+
 Required behavior:
 - start the remote run with a persistent terminal/session log, for example with `script -q -f`
-- continuously sync that remote session log back to a local `progress.log`
+- continuously sync a cleaned version of that remote session log back to a local
+  `progress.log`; this local `progress.log` should already have terminal control
+  sequences removed, because `script` + `tqdm` progress bars will otherwise leave
+  ANSI cursor-control bytes and carriage-return redraws that look like garbled text
+- if the benchmark itself is executed inside a remote container, the cleaned local
+  `progress.log` must be refreshed automatically at least once every 30
+  seconds while the run is active; do not rely on one-off manual polling
 - tell the user the local log path up front
 - keep final result files synced back locally after the run ends
 
 This is important because long searches can run for hours, and people need a
 stable local file they can tail without logging into the remote box.
+
+Recommended cleanup pipeline for the local mirrored log:
+
+```bash
+perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\r/\n/g; s/\x08//g;' raw_progress.log \
+  > progress.log
+```
+
+Recommended remote-container sync pattern:
+
+```bash
+while true; do
+  ssh <remote-host> "tail -n 200 <remote-progress-log>" > raw_progress.log
+  perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\r/\n/g; s/\x08//g;' raw_progress.log \
+    > progress.log
+  sleep 2
+done
+```
+
+Use a persistent local background job, tmux pane, or equivalent long-lived sync
+process so that humans can watch the cleaned local log in real time. A faster
+cadence like `sleep 2` is preferred for active monitoring, but the cleaned local
+`progress.log` must not go more than 30 seconds without a refresh while the run
+is active.
+
+Do not make the cleaned log optional. The default local progress artifact should
+be the cleaned `progress.log` that humans actually read.
 
 ## Most Important Rule
 
@@ -193,6 +236,34 @@ When it is set together with tier 3, the workflow still enumerates the full cart
 That makes it useful as a safety valve, but it also means tier 3 is no longer truly exhaustive unless you remove the cap or raise it high enough.
 
 The reference configs now default to tier 2.
+
+## Interrupt And Resume
+
+Long searches may need to be stopped and resumed later.
+
+Use:
+
+```yaml
+search:
+  tier: 2
+  resume: true
+```
+
+Behavior:
+- every completed trial is appended to `live_results.jsonl`
+- if the process receives `SIGINT` or `SIGTERM`, it will first save partial
+  `results.jsonl`, `results.csv`, and `summary.md`
+- on the next run with the same config and `search.resume: true`, completed
+  trials are reused and only unfinished trials are executed
+- resume works per scenario directory, so it is safest to keep the same
+  `benchmark.output_dir`
+
+Notes:
+- resume assumes the candidate order and dataset are unchanged
+- for maximum safety, reuse the same prepared dataset or keep the same dataset
+  seed/config
+- `SIGKILL` cannot be handled gracefully, so only the already-written
+  `live_results.jsonl` can be reused after a hard kill
 
 YAML key order matters. Put the most important search keys first.
 

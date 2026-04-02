@@ -382,6 +382,64 @@ class TestAutoBenchmarkTools(CustomTestCase):
         self.assertLess(len(calls), 40)
         self.assertEqual(len(records), len(calls))
 
+    def test_run_candidate_resume_skips_existing_fixed_trials(self):
+        benchmark_cfg = {
+            "qps": [1.0, 2.0],
+            "max_concurrency": [None],
+        }
+        existing_records = [
+            {
+                "stage": "base",
+                "candidate_id": 0,
+                "requested_qps": 1.0,
+                "max_concurrency": None,
+                "server_flags": {"model_path": "/model"},
+                "sla_passed": True,
+                "metrics": {
+                    "output_throughput": 1.0,
+                    "mean_ttft_ms": 1.0,
+                    "mean_tpot_ms": 1.0,
+                },
+            }
+        ]
+        calls = []
+
+        def fake_run_trial(**kwargs):
+            calls.append(kwargs["request_rate"])
+            return {
+                "stage": "base",
+                "candidate_id": kwargs["candidate_id"],
+                "requested_qps": kwargs["request_rate"],
+                "max_concurrency": kwargs["max_concurrency"],
+                "server_flags": kwargs["server_flags"],
+                "sla_passed": True,
+                "metrics": {
+                    "output_throughput": 2.0,
+                    "mean_ttft_ms": 2.0,
+                    "mean_tpot_ms": 2.0,
+                },
+            }
+
+        with mock.patch(
+            "sglang.auto_benchmark_lib.run_trial", side_effect=fake_run_trial
+        ):
+            records = run_candidate(
+                stage_name="base",
+                candidate_id=0,
+                server_cfg={"host": "127.0.0.1", "port": 30000},
+                benchmark_cfg=benchmark_cfg,
+                dataset_summary={"num_requests": 1},
+                backend="sglang-oai",
+                dataset_path="/tmp/fake.jsonl",
+                tokenizer_path=str(self.tokenizer_dir),
+                server_flags={"model_path": "/model"},
+                output_dir=str(self.tmpdir_path),
+                existing_records=existing_records,
+            )
+
+        self.assertEqual(calls, [2.0])
+        self.assertEqual([record["requested_qps"] for record in records], [1.0, 2.0])
+
 
 if __name__ == "__main__":
     unittest.main()

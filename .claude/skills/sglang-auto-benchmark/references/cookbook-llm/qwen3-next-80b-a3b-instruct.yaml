@@ -70,6 +70,7 @@ benchmark:
 search:
   tier: 2
   max_candidates: 24
+  resume: true
 speculative:
   enabled: false
   algorithm: EAGLE
