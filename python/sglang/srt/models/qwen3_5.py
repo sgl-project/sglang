@@ -1471,9 +1471,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
-        self.num_fused_shared_experts = (
-            self._get_num_fused_shared_experts() if _use_aiter else 0
-        )
+        self.num_fused_shared_experts = 0
+        if _use_aiter:
+            self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
