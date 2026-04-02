@@ -372,8 +372,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
-        gate_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, gate_logits)
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
         if self.num_fused_shared_experts > 0 and TopKOutputChecker.format_is_standard(
             topk_output
         ):
