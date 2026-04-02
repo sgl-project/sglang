@@ -1153,7 +1153,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
-
+        
+        num_experts = self.config.num_experts
+        
         def load_fused_expert_weights(
             name: str,
             params_dict: dict,
