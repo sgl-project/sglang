@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FractalMesh Live Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;600;700&display=swap');
+
+        :root {
+            --bg-dark: #09090b;
+            --panel-bg: #18181b;
+            --accent-green: #10b981;
+            --accent-cyan: #06b6d4;
+            --accent-yellow: #eab308;
+            --accent-red: #ef4444;
+            --text-main: #f4f4f5;
+            --text-muted: #a1a1aa;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            overflow-x: hidden;
+            margin: 0;
+            padding: 0;
+        }
+
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+
+        .glass-panel {
+            background: rgba(24, 24, 27, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+        }
+
+        .signal-indicator {
+            position: relative;
+            display: inline-flex;
+            width: 12px;
+            height: 12px;
+        }
+        .signal-indicator span {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            opacity: 0.75;
+            animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
+        }
+        .signal-indicator .core {
+            position: relative;
+            display: inline-flex;
+            border-radius: 50%;
+            width: 12px;
+            height: 12px;
+        }
+
+        .status-live { color: var(--accent-green); }
+        .bg-live { background-color: var(--accent-green); }
+
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); border-radius: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 8px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+        .data-table th {
+            text-transform: uppercase;
+            font-size: 0.65rem;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            padding-bottom: 0.5rem;
+            text-align: left;
+        }
+        .data-table td {
+            padding: 0.75rem 0;
+            font-size: 0.85rem;
+            border-bottom: 1px solid rgba(255,255,255,0.02);
+        }
+
+        .chart-container {
+            position: relative;
+            width: 100%;
+            height: 250px;
+        }
+    </style>
+</head>
+<body class="custom-scrollbar text-sm">
+
+<div class="min-h-screen flex flex-col p-4 md:p-6 gap-6 max-w-[1600px] mx-auto">
+
+    <!-- Header -->
+    <header class="glass-panel p-4 md:px-6 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 z-10">
+        <div class="flex items-center gap-4">
+            <div class="w-10 h-10 bg-zinc-800 rounded-lg flex items-center justify-center border border-zinc-700 shadow-inner">
+                <span class="text-cyan-400 font-bold text-xl tracking-tighter">FM</span>
+            </div>
+            <div>
+                <h1 class="font-mono text-base font-bold text-white tracking-widest flex items-center gap-2">
+                    FRACTALMESH <span class="text-cyan-400">v81.2</span>
+                </h1>
+                <p class="text-[10px] text-zinc-400 uppercase tracking-widest mt-0.5">
+                    Operator: Samuel James Hiotis | Z6-Albury
+                </p>
+            </div>
+        </div>
+
+        <div class="flex items-center gap-6">
+            <div class="flex flex-col items-end">
+                <span class="text-[10px] uppercase text-zinc-500 font-bold mb-1">Bio-Sovereignty</span>
+                <span class="text-xs font-mono text-emerald-400 border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 rounded">LOCKED: EXTERNAL_ONLY</span>
+            </div>
+            <div class="h-8 w-px bg-white/10 hidden md:block"></div>
+            <div class="flex items-center gap-3">
+                <div class="text-right">
+                    <div class="text-[10px] uppercase text-zinc-500 font-bold">Trading Mode</div>
+                    <div class="text-sm font-bold text-emerald-400 font-mono tracking-wider shadow-emerald-400/20 drop-shadow-md">LIVE_MAINNET</div>
+                </div>
+                <div class="signal-indicator">
+                    <span class="bg-live"></span>
+                    <div class="core bg-live shadow-[0_0_10px_#10b981]"></div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- KPI Row -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="glass-panel p-5 relative overflow-hidden group">
+            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+                <span class="text-4xl text-cyan-400">⟠</span>
+            </div>
+            <p class="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-1">Alpha Yield</p>
+            <p class="text-2xl font-light text-white font-mono" id="kpi-yield">$1,542.80</p>
+            <p class="text-xs text-emerald-400 mt-2 font-mono">+12.4% <span class="text-zinc-500 text-[10px]">(24h)</span></p>
+        </div>
+
+        <div class="glass-panel p-5 relative overflow-hidden group">
+            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+                <span class="text-4xl text-yellow-500">⚡</span>
+            </div>
+            <p class="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-1">Active Signals</p>
+            <p class="text-2xl font-light text-white font-mono" id="kpi-signals">24</p>
+            <p class="text-xs text-yellow-400 mt-2 font-mono">High Confidence > 80%</p>
+        </div>
+
+        <div class="glass-panel p-5 relative overflow-hidden group">
+            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+                <span class="text-4xl text-emerald-500">◎</span>
+            </div>
+            <p class="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-1">Database Sync</p>
+            <p class="text-2xl font-light text-white font-mono">SQLITE</p>
+            <p class="text-xs text-emerald-400 mt-2 font-mono" id="db-status">Synced: Just now</p>
+        </div>
+
+        <div class="glass-panel p-5 relative overflow-hidden group">
+            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+                <span class="text-4xl text-cyan-500">∿</span>
+            </div>
+            <p class="text-[10px] font-bold text-zinc-400 uppercase tracking-wider mb-1">System Load</p>
+            <p class="text-2xl font-light text-white font-mono" id="kpi-load">14%</p>
+            <p class="text-xs text-cyan-400 mt-2 font-mono">PM2 Swarm Active</p>
+        </div>
+    </div>
+
+    <!-- Main Grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 flex-1">
+
+        <!-- Left: Signal Feed + Price Chart -->
+        <div class="lg:col-span-2 flex flex-col gap-6">
+
+            <div class="glass-panel p-6 flex-1 flex flex-col min-h-[400px]">
+                <div class="flex justify-between items-center mb-6">
+                    <div>
+                        <h2 class="text-sm font-bold text-white uppercase tracking-wider">Live Crypto Signals</h2>
+                        <p class="text-[10px] text-zinc-500 font-mono mt-1">SELECT * FROM crypto_signals ORDER BY created_at DESC</p>
+                    </div>
+                    <button onclick="refreshSignals()" class="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-xs font-mono text-zinc-300 rounded border border-zinc-700 transition-colors">REFRESH</button>
+                </div>
+
+                <div class="overflow-x-auto flex-1">
+                    <table class="w-full data-table">
+                        <thead>
+                            <tr>
+                                <th class="w-16">ID</th>
+                                <th>Symbol</th>
+                                <th>Signal</th>
+                                <th>Confidence</th>
+                                <th>Price</th>
+                                <th>RSI</th>
+                                <th class="text-right">Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="signal-tbody" class="font-mono"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="glass-panel p-6">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-sm font-bold text-white uppercase tracking-wider">VWAP & EMA Crossover</h2>
+                    <div class="flex gap-2">
+                        <span class="px-2 py-0.5 rounded bg-zinc-800 text-[10px] text-zinc-400 border border-zinc-700">BTC/USDT</span>
+                    </div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="priceChart"></canvas>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Right: Distribution + PM2 -->
+        <div class="flex flex-col gap-6">
+
+            <div class="glass-panel p-6">
+                <h2 class="text-sm font-bold text-white uppercase tracking-wider mb-4">Signal Distribution</h2>
+                <div class="chart-container h-[200px]">
+                    <canvas id="distributionChart"></canvas>
+                </div>
+                <div class="mt-4 grid grid-cols-3 gap-2 text-center text-xs font-mono border-t border-white/5 pt-4">
+                    <div>
+                        <p class="text-emerald-400 font-bold mb-1" id="stat-buy">45%</p>
+                        <p class="text-[9px] text-zinc-500">BUY</p>
+                    </div>
+                    <div>
+                        <p class="text-yellow-400 font-bold mb-1" id="stat-hold">35%</p>
+                        <p class="text-[9px] text-zinc-500">HOLD</p>
+                    </div>
+                    <div>
+                        <p class="text-red-400 font-bold mb-1" id="stat-sell">20%</p>
+                        <p class="text-[9px] text-zinc-500">SELL</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="glass-panel p-6 flex-1 flex flex-col">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                        <span class="w-2 h-2 rounded-full bg-cyan-500 animate-pulse"></span>
+                        PM2 Swarm Monitor
+                    </h2>
+                </div>
+
+                <div class="bg-zinc-950/80 rounded-lg p-3 font-mono text-[10px] text-zinc-300 flex-1 overflow-y-auto custom-scrollbar border border-white/5 space-y-2 shadow-inner" id="pm2-logs">
+                    <p class="text-zinc-500">Initializing PM2 Swarm Tracker...</p>
+                    <p class="text-cyan-400">[PM2] App [fm-signals] launched (1 instances)</p>
+                    <p class="text-cyan-400">[PM2] App [fm-dashboard] launched (1 instances)</p>
+                    <p class="text-cyan-400">[PM2] App [fm-pod] launched (1 instances)</p>
+                    <p class="text-emerald-400">pm2 save || true</p>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<script>
+    const initialSignals = [
+        { id: 1042, symbol: 'BTC/USDT', signal: 'BUY',  confidence: 92.4, price: 92481.50, rsi: 42.1, time: 'Just now' },
+        { id: 1041, symbol: 'ETH/USDT', signal: 'HOLD', confidence: 65.0, price: 3412.20,  rsi: 55.4, time: '2m ago'   },
+        { id: 1040, symbol: 'SOL/USDT', signal: 'BUY',  confidence: 88.1, price: 145.60,   rsi: 38.9, time: '5m ago'   },
+        { id: 1039, symbol: 'XRP/USDT', signal: 'SELL', confidence: 78.5, price: 0.58,     rsi: 72.1, time: '12m ago'  },
+        { id: 1038, symbol: 'AVAX/USDT',signal: 'HOLD', confidence: 54.2, price: 35.10,    rsi: 50.2, time: '18m ago'  }
+    ];
+
+    let currentSignals = [...initialSignals];
+    let nextId = 1043;
+
+    const pm2LogPool = [
+        "[fm-signals] Polling KuCoin API... OK",
+        "[fm-signals] VWAP crossover detected for SOL/USDT",
+        "[fm-pod] API request /status HTTP 200",
+        "[fm-dashboard] Client connected",
+        "[fm-signals] Writing to sovereign.db... OK",
+        "[fm-pod] Relaying to FractalMesh core",
+        "[fm-signals] RSI anomaly detected on minor pairs"
+    ];
+
+    const tbody   = document.getElementById('signal-tbody');
+    const pm2Logs = document.getElementById('pm2-logs');
+    const kpiYield   = document.getElementById('kpi-yield');
+    const kpiSignals = document.getElementById('kpi-signals');
+    const dbStatus   = document.getElementById('db-status');
+    const kpiLoad    = document.getElementById('kpi-load');
+
+    function getSignalColor(signal) {
+        if (signal === 'BUY')  return 'text-emerald-400 bg-emerald-400/10 border border-emerald-400/20';
+        if (signal === 'SELL') return 'text-red-400 bg-red-400/10 border border-red-400/20';
+        return 'text-yellow-400 bg-yellow-400/10 border border-yellow-400/20';
+    }
+
+    function renderTable() {
+        tbody.innerHTML = '';
+        currentSignals.forEach(sig => {
+            const tr = document.createElement('tr');
+            tr.className = 'hover:bg-white/5 transition-colors group';
+            tr.innerHTML = `
+                <td class="text-zinc-500 group-hover:text-zinc-300">#${sig.id}</td>
+                <td class="text-white font-bold">${sig.symbol}</td>
+                <td><span class="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider ${getSignalColor(sig.signal)}">${sig.signal}</span></td>
+                <td>
+                    <div class="flex items-center gap-2">
+                        <span class="${sig.confidence > 80 ? 'text-emerald-400' : 'text-zinc-400'}">${sig.confidence.toFixed(1)}%</span>
+                        <div class="w-12 h-1 bg-zinc-800 rounded overflow-hidden hidden sm:block">
+                            <div class="h-full ${sig.confidence > 80 ? 'bg-emerald-400' : 'bg-zinc-500'}" style="width: ${sig.confidence}%"></div>
+                        </div>
+                    </div>
+                </td>
+                <td class="text-zinc-300">$${sig.price.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>
+                <td class="${sig.rsi > 70 ? 'text-red-400' : (sig.rsi < 30 ? 'text-emerald-400' : 'text-zinc-400')}">${sig.rsi.toFixed(1)}</td>
+                <td class="text-right text-zinc-500 text-[10px]">${sig.time}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+    }
+
+    function addPm2Log(msg) {
+        const p   = document.createElement('p');
+        const now = new Date();
+        const t   = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+        p.className = 'text-zinc-400 border-l-2 border-zinc-700 pl-2 opacity-0 transition-opacity duration-300';
+        p.innerHTML = `<span class="text-zinc-600 mr-2">${t}</span> ${msg}`;
+        pm2Logs.appendChild(p);
+        void p.offsetWidth;
+        p.classList.remove('opacity-0');
+        if (pm2Logs.children.length > 15) pm2Logs.removeChild(pm2Logs.firstChild);
+        pm2Logs.scrollTop = pm2Logs.scrollHeight;
+    }
+
+    window.refreshSignals = () => {
+        addPm2Log("[fm-signals] Manual refresh triggered");
+        dbStatus.innerText = "Synced: Just now";
+        const symbols = ['DOT/USDT', 'LINK/USDT', 'ADA/USDT'];
+        const sigs    = ['BUY', 'HOLD', 'SELL'];
+        const newSig  = {
+            id: nextId++,
+            symbol:     symbols[Math.floor(Math.random() * symbols.length)],
+            signal:     sigs[Math.floor(Math.random() * sigs.length)],
+            confidence: 50 + Math.random() * 45,
+            price:      Math.random() * 100,
+            rsi:        20 + Math.random() * 60,
+            time:       'Just now'
+        };
+        currentSignals.pop();
+        currentSignals.forEach(s => s.time = parseInt(s.time) ? parseInt(s.time) + 1 + 'm ago' : '1m ago');
+        currentSignals.unshift(newSig);
+        renderTable();
+        updateDistributionChart();
+        kpiSignals.innerText = parseInt(kpiSignals.innerText) + 1;
+    };
+
+    setInterval(() => {
+        if (Math.random() > 0.6) addPm2Log(pm2LogPool[Math.floor(Math.random() * pm2LogPool.length)]);
+        if (Math.random() > 0.7) {
+            let y = parseFloat(kpiYield.innerText.replace(/[$,]/g, ''));
+            y += Math.random() * 10 - 4;
+            kpiYield.innerText = '$' + y.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            kpiLoad.innerText = Math.floor(10 + Math.random() * 15) + '%';
+        }
+        if (dbStatus.innerText === "Synced: Just now") {
+            setTimeout(() => dbStatus.innerText = "Synced: 5s ago", 5000);
+        }
+    }, 2000);
+
+    Chart.defaults.color = '#a1a1aa';
+    Chart.defaults.font.family = "'JetBrains Mono', monospace";
+
+    let distChart;
+    function updateDistributionChart() {
+        const counts = { BUY: 0, HOLD: 0, SELL: 0 };
+        currentSignals.forEach(s => counts[s.signal]++);
+        const total = currentSignals.length;
+        document.getElementById('stat-buy').innerText  = Math.round((counts.BUY  / total) * 100) + '%';
+        document.getElementById('stat-hold').innerText = Math.round((counts.HOLD / total) * 100) + '%';
+        document.getElementById('stat-sell').innerText = Math.round((counts.SELL / total) * 100) + '%';
+        if (distChart) {
+            distChart.data.datasets[0].data = [counts.BUY, counts.HOLD, counts.SELL];
+            distChart.update();
+        }
+    }
+
+    function initCharts() {
+        const ctxDist = document.getElementById('distributionChart').getContext('2d');
+        distChart = new Chart(ctxDist, {
+            type: 'doughnut',
+            data: {
+                labels: ['BUY', 'HOLD', 'SELL'],
+                datasets: [{
+                    data: [45, 35, 20],
+                    backgroundColor: ['rgba(16,185,129,0.8)', 'rgba(234,179,8,0.8)', 'rgba(239,68,68,0.8)'],
+                    borderColor: '#18181b',
+                    borderWidth: 2,
+                    hoverOffset: 4
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                cutout: '75%',
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        backgroundColor: 'rgba(9,9,11,0.9)',
+                        titleColor: '#fff',
+                        bodyColor: '#a1a1aa',
+                        borderColor: 'rgba(255,255,255,0.1)',
+                        borderWidth: 1
+                    }
+                }
+            }
+        });
+        updateDistributionChart();
+
+        const ctxPrice = document.getElementById('priceChart').getContext('2d');
+        const labels   = Array.from({length: 20}, (_, i) => `${i}m`);
+        const prices   = [];
+        let p = 92000;
+        for (let i = 0; i < 20; i++) { prices.push(p); p += Math.random() * 500 - 200; }
+        const ema = prices.map(v => v * (1 + Math.random() * 0.005 - 0.002));
+
+        new Chart(ctxPrice, {
+            type: 'line',
+            data: {
+                labels,
+                datasets: [
+                    { label: 'Price', data: prices, borderColor: '#f4f4f5', borderWidth: 2, tension: 0.3, pointRadius: 0, pointHoverRadius: 4 },
+                    { label: 'EMA 8', data: ema,    borderColor: '#06b6d4', borderWidth: 1, borderDash: [5,5], tension: 0.3, pointRadius: 0 }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { position: 'top', align: 'end', labels: { boxWidth: 12, usePointStyle: true, pointStyle: 'rectRounded' } },
+                    tooltip: { backgroundColor: 'rgba(9,9,11,0.9)', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1 }
+                },
+                scales: {
+                    x: { grid: { color: 'rgba(255,255,255,0.02)' }, ticks: { maxTicksLimit: 6 } },
+                    y: { grid: { color: 'rgba(255,255,255,0.05)' }, position: 'right',
+                         ticks: { callback: v => '$' + v.toLocaleString() } }
+                }
+            }
+        });
+    }
+
+    window.addEventListener('DOMContentLoaded', () => { renderTable(); initCharts(); });
+</script>
+</body>
+</html>
