@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import itertools
 import os
-import subprocess
-import sys
 from typing import Optional
 
 import pytest
@@ -12,6 +10,8 @@ import torch.distributed as dist
 import triton
 
 from sglang.jit_kernel.all_reduce import fused_parallel_qknorm
+from sglang.jit_kernel.tests.test_custom_all_reduce import multiprocess_test
+from sglang.jit_kernel.tests.utils import multiprocess_main
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -32,25 +32,6 @@ DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 TEST_CONFIG = list(itertools.product(Q_K_DIMS, BATCH_SIZES, DTYPES))
 
 
-def run_torchrun(nproc: int, timeout: int = 300) -> None:
-    cmd = [
-        "torchrun",
-        f"--nproc_per_node={nproc}",
-        __file__,
-    ]
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=timeout,
-    )
-    assert result.returncode == 0, (
-        f"torchrun (nproc={nproc}) failed with rc={result.returncode}\n"
-        f"{result.stdout}"
-    )
-
-
 @pytest.mark.parametrize("nproc", [2, 4, 8])
 def test_tp_qknorm(nproc: int) -> None:
     device_count = torch.cuda.device_count()
@@ -58,7 +39,7 @@ def test_tp_qknorm(nproc: int) -> None:
         pytest.skip(
             f"Requires at least {nproc} GPUs, but only {device_count} available"
         )
-    run_torchrun(nproc)
+    multiprocess_test(__file__, nproc)
 
 
 def init_distributed():
@@ -184,7 +165,4 @@ def worker_main() -> None:
 
 
 if __name__ == "__main__":
-    if "LOCAL_RANK" in os.environ:
-        worker_main()
-    else:
-        sys.exit(pytest.main([__file__, "-v", "-s"]))
+    multiprocess_main(__file__, worker_main)
