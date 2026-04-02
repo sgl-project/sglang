@@ -161,7 +161,7 @@ class NVFP4QuantizeUtil:
             from flashinfer import fp4_quantize
         except ImportError:
             raise ImportError(
-                "flashinfer is installed correctly. Please install flashinfer to use NVFP4 KV cache."
+                "flashinfer is required for NVFP4 KV cache. Please install flashinfer."
             )
         global_scale_inv = 1.0 / global_scale
         if isinstance(global_scale_inv, float):
