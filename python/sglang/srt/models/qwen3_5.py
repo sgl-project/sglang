@@ -1750,7 +1750,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                     expert_id,
                                 )
                             else:
-                                # load to experts.w2_weight, shard_id = w2, expert_id = 512
+                                # load down_proj to experts.w2_weight, shard_id = w2, expert_id = 512
+                                # Or load gate_proj and up_proj to experts.w13_weight, shard_id = w1/w3, expert_id = 512
                                 weight_loader(
                                     param,
                                     loaded_weight,
