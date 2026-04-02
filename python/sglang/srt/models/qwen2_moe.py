@@ -221,12 +221,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             layer_id=layer_id,
         )
 
-        ep_redundant = get_global_server_args().ep_num_redundant_experts
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             num_experts=config.num_experts
-            + ep_redundant
+            + get_global_server_args().ep_num_redundant_experts
             + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
