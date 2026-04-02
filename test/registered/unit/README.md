@@ -32,7 +32,9 @@ Tests can use CPU or GPU — the key criterion is **no server process**.
    diff-cover coverage.xml --compare-branch=origin/main --fail-under=60
    ```
 
-## Example
+## Examples
+
+### Basic unit test
 
 ```python
 """Unit tests for <module> — no server, no model loading."""
@@ -56,6 +58,30 @@ class TestTargetClass(CustomTestCase):
 if __name__ == "__main__":
     unittest.main()
 ```
+
+### Stubbing GPU-only imports for CPU tests
+
+Some modules (e.g. `scheduler.py`, `io_struct.py`) transitively import packages like
+`sgl_kernel` that require a GPU to initialize. To run pure-mock tests against these
+modules on CPU-only CI, stub the problematic package **before** importing it.
+
+`maybe_stub_sgl_kernel()` in `test_utils.py` does this for `sgl_kernel`: it's a no-op
+on GPU machines, and on CPU it installs a `sys.meta_path` finder that auto-creates empty
+stub modules for all `sgl_kernel.*` submodules.
+
+```python
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
+
+from sglang.srt.managers.io_struct import FlushCacheReqInput
+from sglang.srt.managers.scheduler import Scheduler
+
+register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+```
+
+The same pattern can be applied to other GPU-only packages: try importing the real package, and if it fails, register a `sys.meta_path` finder that stubs it. See `maybe_stub_sgl_kernel()` in `python/sglang/test/test_utils.py` for the implementation.
 
 ## Rules
 
