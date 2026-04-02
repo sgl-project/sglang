@@ -6,7 +6,7 @@ import os
 import unittest
 from pathlib import Path
 
-from test_deepseek_ocr import TestDeepSeekOCR
+import test_deepseek_ocr as deepseek_ocr
 from transformers import AutoTokenizer
 
 from sglang.test.test_utils import (
@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDeepSeekOCRTriton(TestDeepSeekOCR):
+class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
     @classmethod
     def setUpClass(cls):
         cls._cleanup_xpu_memory()
