@@ -177,7 +177,7 @@ def _filter_nunchaku_safetensors(
     # Map CLI precision values back to filename conventions
     fname_precision = "fp4" if precision == "nvfp4" else precision
     pattern = re.compile(
-        rf"svdq-{re.escape(fname_precision)}_r{rank}(?:-[^/]*)?\.safetensors$"
+        rf"^svdq-{re.escape(fname_precision)}_r{rank}(?:-[^/]*)?\.safetensors$"
     )
 
     matched = [f for f in safetensors_list if pattern.search(os.path.basename(f))]

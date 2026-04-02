@@ -815,9 +815,9 @@ ONE_GPU_CASES_C = [
             modality="image",
             extras=[
                 "--enable-svdquant",
-                "--transformer-weights-path nunchaku-ai/nunchaku-qwen-image",
-                "--quantization-precision int4",
-                "--quantization-rank 32",
+                "--transformer-weights-path=nunchaku-ai/nunchaku-qwen-image",
+                "--quantization-precision=int4",
+                "--quantization-rank=32",
             ],
         ),
         T2I_sampling_params,
