@@ -220,7 +220,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
-        if config.shared_expert_intermediate_size > 0:
+        # When enable_fused_moe is True, the shared expert is fused into the MoE
+        # kernel as an extra expert (appended via _append_shared_to_topk_output),
+        # so we must NOT create a separate shared_expert MLP here — otherwise
+        # _forward_shared_experts() would compute it a second time and its
+        # output would be double-counted in forward().
+        if (config.shared_expert_intermediate_size > 0 and not self.enable_fused_moe):
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
