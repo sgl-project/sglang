@@ -5,6 +5,7 @@ import torch
 import triton
 from common_utils import get_model_config
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -181,8 +182,8 @@ def benchmark(
     else:
         bench_lambda = lambda: api_func(**api_kwargs)
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(bench_lambda, quantiles=quantiles)
     return ms, min_ms, max_ms
 
 

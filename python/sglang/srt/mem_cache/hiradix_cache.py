@@ -8,15 +8,18 @@ import os
 import threading
 import time
 from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
+    InitLoadBackParams,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -41,7 +44,6 @@ from sglang.srt.mem_cache.radix_cache import (
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
-from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -54,16 +56,6 @@ class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
-        if server_args.hicache_io_backend == "direct":
-            # FIXME: move this logic into server_args parsing
-            if server_args.hicache_mem_layout == "page_first":
-                server_args.hicache_mem_layout = "page_first_direct"
-                logger.warning(
-                    "Page first layout is not supported with direct IO backend, switching to page first direct layout"
-                )
-
-        if not server_args.disable_hicache_numa_detect:
-            bind_to_closest_numa_node_cuda()
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
@@ -167,18 +159,6 @@ class HiRadixCache(RadixCache):
         atexit.register(self.shutdown)
 
         self.evictable_host_leaves = set()
-
-        # Pin budget: max tokens that can be pinned = ratio * host pool capacity.
-        pin_ratio = envs.SGLANG_HICACHE_MAX_PINNED_RATIO.get()
-        if pin_ratio < 0 or pin_ratio >= 1:
-            raise ValueError(
-                f"SGLANG_HICACHE_MAX_PINNED_RATIO must be in [0, 1), got {pin_ratio}"
-            )
-        self._max_pinned_tokens = int(self.token_to_kv_pool_host.size * pin_ratio)
-        self.pinned_size_ = 0
-        logger.info(
-            "Pin budget: %d tokens (ratio=%.3f)", self._max_pinned_tokens, pin_ratio
-        )
 
         super().__init__(params=params)
 
@@ -596,7 +576,6 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
-        self.pinned_size_ = 0
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -640,7 +619,7 @@ class HiRadixCache(RadixCache):
                 node_id=node.id,
             )
         if host_indices is not None:
-            node.host_value = host_indices
+            node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
             self.ongoing_write_through[node.id] = node
             if not write_back:
@@ -736,79 +715,6 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    def _is_pinned(self, node: TreeNode) -> bool:
-        """Check if a node has an active (non-expired) pin."""
-        return node.pin_expiry > 0 and time.monotonic() <= node.pin_expiry
-
-    def _clear_pin(self, node: TreeNode):
-        """Clear expired pin state and release host_ref_counter hold."""
-        if node.pin_expiry > 0:
-            self.pinned_size_ = max(0, self.pinned_size_ - len(node.key))
-            node.host_ref_counter = max(0, node.host_ref_counter - 1)
-        node.pin_expiry = 0.0
-        node.pin_ttl = 0
-
-    def pin_prefix(
-        self, token_ids: List[int], ttl_seconds: int = 300
-    ) -> Tuple[int, Optional[str]]:
-        """Pin nodes along a prefix path. Returns (nodes_pinned, reject_reason)."""
-        if self.disable or not token_ids:
-            return (0, None)
-
-        key, _ = self.maybe_bigram_convert(self._to_radix_key(token_ids))
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
-        if len(key) == 0:
-            return (0, None)
-
-        expiry = time.monotonic() + ttl_seconds
-        nodes_pinned = 0
-        budget_exceeded = False
-        node = self.root_node
-        child_key = self.get_child_key_fn(key)
-
-        while len(key) > 0 and child_key in node.children:
-            child = node.children[child_key]
-            prefix_len = self.key_match_fn(child.key, key)
-
-            # First pin on this node: check budget, then acquire hold
-            if child.pin_expiry == 0:
-                if self.pinned_size_ + len(child.key) > self._max_pinned_tokens:
-                    budget_exceeded = True
-                    break
-                child.host_ref_counter += 1
-                self.pinned_size_ += len(child.key)
-
-                # Eagerly back up to host so eviction finds pinned nodes
-                # already backuped and never enters the write_back drain
-                # path, which would leak lock_ref on in-flight
-                # write-through entries. No-op under write_back policy.
-                self._inc_hit_count(child)
-
-            # Extend expiry and store TTL for refresh-on-hit
-            child.pin_expiry = max(child.pin_expiry, expiry)
-            child.pin_ttl = max(child.pin_ttl, ttl_seconds)
-            nodes_pinned += 1
-
-            if prefix_len < len(child.key):
-                break
-
-            node = child
-            key = key[prefix_len:]
-            if len(key):
-                child_key = self.get_child_key_fn(key)
-
-        logger.info(
-            "[PIN] pin_prefix: nodes_pinned=%d, ttl=%ds", nodes_pinned, ttl_seconds
-        )
-        if budget_exceeded:
-            msg = f"Pin budget exhausted ({self.pinned_size_}/{self._max_pinned_tokens} tokens pinned)"
-            if nodes_pinned == 0:
-                return (0, msg)
-            return (nodes_pinned, f"prefix partially pinned; {msg}")
-        return (nodes_pinned, None)
-
     def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
         """Convert raw token_ids to a RadixKey for tree walking.
 
@@ -817,9 +723,9 @@ class HiRadixCache(RadixCache):
         """
         return RadixKey(token_ids=list(token_ids))
 
-    def inc_lock_ref(self, node: TreeNode):
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
-            return 0
+            return IncLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -831,11 +737,13 @@ class HiRadixCache(RadixCache):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
             node = node.parent
-        return delta
+        return IncLockRefResult(delta=delta)
 
-    def dec_lock_ref(self, node: TreeNode):
+    def dec_lock_ref(
+        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         if self.disable:
-            return 0
+            return DecLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -851,7 +759,7 @@ class HiRadixCache(RadixCache):
                     node is self.root_node
                 ), f"This request holds the node from another tree"
             node = node.parent
-        return delta
+        return DecLockRefResult(delta=delta)
 
     def _update_host_leaf_status(self, node: TreeNode):
         if not node.evicted or node.lock_ref > 0:
@@ -884,26 +792,6 @@ class HiRadixCache(RadixCache):
 
             if x.lock_ref > 0:
                 continue
-
-            if self._is_pinned(x):
-                # Still active: demote to host if possible
-                if x.backuped:
-                    num_evicted += self._evict_backuped(x)
-                    continue
-                written = self.write_backup(x, write_back=True)
-                if written > 0:
-                    num_evicted += written
-                    write_back_nodes.append(x)
-                    continue  # backup succeeded, pin holds on host
-                # Host full -- drop pin so GPU can be freed
-                self._clear_pin(x)
-                logger.warning(
-                    "[PIN] evict: can't backup node %d to host, releasing pin",
-                    x.id,
-                )
-            elif x.pin_expiry > 0:
-                # Expired pin: clear and fall through to normal eviction
-                self._clear_pin(x)
 
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
@@ -970,11 +858,6 @@ class HiRadixCache(RadixCache):
             if not x.evicted:
                 continue
 
-            # Expire stale pins before checking host_ref_counter
-            if x.pin_expiry > 0 and time.monotonic() > x.pin_expiry:
-                self._clear_pin(x)
-
-            # node is protected from eviction as it has ongoing prefetch, backup, or pin
             if x.host_ref_counter > 0:
                 continue
 
@@ -1011,7 +894,8 @@ class HiRadixCache(RadixCache):
             ancester_node = node
 
         # protect the ancestor nodes from eviction
-        delta = self.inc_lock_ref(ancester_node)
+        result = self.inc_lock_ref(ancester_node)
+        delta = result.delta
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
@@ -1060,11 +944,10 @@ class HiRadixCache(RadixCache):
 
     def init_load_back(
         self,
-        last_node: TreeNode,
-        host_hit_length: int,
-        mem_quota: Optional[int] = None,
+        params: InitLoadBackParams,
     ):
-        _ = host_hit_length  # unused, but kept for compatibility
+        last_node = params.last_host_node
+        mem_quota = params.mem_quota
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
@@ -1087,6 +970,9 @@ class HiRadixCache(RadixCache):
         Return the consumer index for the schedule batch manager to track.
         """
         return self.cache_controller.start_loading()
+
+    def flush_write_through_acks(self) -> None:
+        self.writing_check()
 
     def check_hicache_events(self):
         self.writing_check()
@@ -1350,9 +1236,6 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            # Refresh pin TTL on host insert hit
-            if self._is_pinned(node):
-                node.pin_expiry = time.monotonic() + node.pin_ttl
             prefix_len = self.key_match_fn(node.key, key)
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
@@ -1388,9 +1271,6 @@ class HiRadixCache(RadixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
-            # Refresh pin TTL on cache hit
-            if self._is_pinned(child):
-                child.pin_expiry = time.monotonic() + child.pin_ttl
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -1415,11 +1295,6 @@ class HiRadixCache(RadixCache):
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
-        new_node.pin_expiry = child.pin_expiry
-        new_node.pin_ttl = child.pin_ttl
-        # If child is pinned, new parent inherits a host_ref_counter hold
-        if child.pin_expiry > 0:
-            new_node.host_ref_counter += 1
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
 

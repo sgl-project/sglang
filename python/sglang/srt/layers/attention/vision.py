@@ -22,6 +22,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     print_info_once,
 )
 from sglang.srt.utils.multi_stream_utils import (
@@ -32,6 +33,7 @@ from sglang.srt.utils.multi_stream_utils import (
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
@@ -366,8 +368,8 @@ class VisionTritonAttention(nn.Module):
                 k,
                 v,
                 output,
-                cu_seqlens.cuda(),
-                seq_lens.cuda(),
+                cu_seqlens.to(q.device),
+                seq_lens.to(q.device),
                 max_seqlen,
                 is_causal=False,
             )
@@ -886,7 +888,9 @@ class VisionAttention(nn.Module):
         Priority: server args override > constructor arg > platform default.
 
         Platform defaults:
-        - CUDA: "triton_attn"
+        - CUDA (Hopper SM90): "fa3"
+        - CUDA (Blackwell SM100): "fa4"
+        - CUDA (other): "triton_attn"
         - Non-CUDA: "sdpa"
         """
         override_backend = get_global_server_args().mm_attention_backend
@@ -898,6 +902,8 @@ class VisionAttention(nn.Module):
             major, minor = get_device_capability()
             if major == 9:
                 backend = "fa3"
+            elif major == 10:
+                backend = "fa4"
             else:
                 backend = "triton_attn"
         elif _is_hip:
@@ -905,6 +911,8 @@ class VisionAttention(nn.Module):
                 backend = "aiter_attn"
             else:
                 backend = "triton_attn"
+        elif _is_xpu:
+            backend = "triton_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell_supported():

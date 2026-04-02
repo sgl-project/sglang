@@ -86,6 +86,65 @@ if _is_npu:
     import torch_npu
 
 
+def _forward_with_allreduce_fusion(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    post_residual_addition: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    use_attn_tp_group: bool = True,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Shared allreduce-fused RMSNorm logic usable by any norm."""
+    if residual is not None:
+        from sglang.srt.distributed import (
+            get_attn_tensor_model_parallel_world_size,
+            get_moe_expert_parallel_world_size,
+            get_moe_tensor_parallel_world_size,
+            tensor_model_parallel_all_reduce,
+            tensor_model_parallel_fused_allreduce_rmsnorm,
+        )
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_allreduce_residual_rmsnorm,
+        )
+
+        if use_attn_tp_group:
+            world_size = get_attn_tensor_model_parallel_world_size()
+        else:
+            if get_moe_expert_parallel_world_size() > 1:
+                world_size = get_moe_expert_parallel_world_size()
+            else:
+                world_size = get_moe_tensor_parallel_world_size()
+
+        if world_size > 1:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+
+            # Prefer AITER fused AR+RMSNorm when enabled on AMD.
+            if _use_aiter:
+                fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, residual, weight, norm_module.variance_epsilon
+                )
+                if fused_result is not None:
+                    return fused_result
+            else:
+                fused_result = flashinfer_allreduce_residual_rmsnorm(
+                    input_tensor=x,
+                    residual=residual,
+                    weight=weight,
+                    eps=norm_module.variance_epsilon,
+                    use_attn_tp_group=use_attn_tp_group,
+                )
+                if fused_result[0] is not None:
+                    return fused_result
+
+            # For AITER route, preserve correctness when fused path is unavailable.
+            if _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion:
+                x = tensor_model_parallel_all_reduce(x)
+                return norm_module.forward(x, residual, None)
+
+    return norm_module.forward(x, residual, post_residual_addition)
+
+
 class RMSNorm(MultiPlatformOp):
     def __init__(
         self,
@@ -302,50 +361,12 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Forward method with allreduce fusion, prioritizing flashinfer fused operations
-        """
-        if residual is not None:
-            from sglang.srt.distributed import (
-                get_tensor_model_parallel_world_size,
-                tensor_model_parallel_all_reduce,
-                tensor_model_parallel_fused_allreduce_rmsnorm,
-            )
-            from sglang.srt.layers.flashinfer_comm_fusion import (
-                flashinfer_allreduce_residual_rmsnorm,
-            )
-
-            if get_tensor_model_parallel_world_size() > 1:
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-
-                # Prefer AITER fused AR+RMSNorm when enabled on AMD.
-                if _use_aiter:
-                    fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
-                        x, residual, self.weight, self.variance_epsilon
-                    )
-                    if fused_result is not None:
-                        return fused_result
-                else:
-                    fused_result = flashinfer_allreduce_residual_rmsnorm(
-                        input_tensor=x,
-                        residual=residual,
-                        weight=self.weight,
-                        eps=self.variance_epsilon,
-                    )
-                    if fused_result[0] is not None:
-                        return fused_result
-
-                # For AITER route, preserve correctness when fused path is unavailable.
-                if (
-                    _use_aiter
-                    and get_global_server_args().enable_aiter_allreduce_fusion
-                ):
-                    x = tensor_model_parallel_all_reduce(x)
-                    return self.forward(x, residual, None)
-
-        return self.forward(x, residual, post_residual_addition)
+        """Forward with allreduce fusion, prioritizing flashinfer fused operations."""
+        return _forward_with_allreduce_fusion(
+            self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
+        )
 
 
 class LayerNorm(MultiPlatformOp):
@@ -413,8 +434,9 @@ class LayerNorm(MultiPlatformOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         if _is_cpu_amx_available:
+            bias_data = self.bias.data if self.use_bias else None
             return torch.ops.sgl_kernel.layernorm_cpu(
-                x, self.weight.data, self.variance_epsilon
+                x, self.weight.data, bias_data, self.variance_epsilon
             )
         else:
             return self.forward_native(x)
@@ -429,10 +451,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
-
-        # Re-dispatch
-        if _is_hip:
-            self._forward_method = self.forward_native
 
     def _forward_impl(
         self,
@@ -478,6 +496,47 @@ class GemmaRMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual, post_residual_addition)
 
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not _has_vllm_rms_norm:
+            return self.forward_native(x, residual, post_residual_addition)
+
+        w = self.weight.data + 1.0
+        if _use_aiter:
+            # aiter API: rms_norm(input, weight, eps) -> output
+            #            fused_add_rms_norm(output, input, residual, residual_out, weight, eps)
+            if residual is not None:
+                output = torch.empty_like(x)
+                residual_out = torch.empty_like(x)
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                fused_add_rms_norm(
+                    output, x, residual, residual_out, w, self.variance_epsilon
+                )
+                return output, residual_out
+            return rms_norm(x, w, self.variance_epsilon)
+        else:
+            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
+            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
+            if not x.is_contiguous():
+                x = x.contiguous()
+            if residual is not None:
+                out = torch.empty_like(x)
+                residual_out = torch.empty_like(x)
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+                fused_add_rms_norm(
+                    out, x, residual_out, residual, w, self.variance_epsilon
+                )
+                return out, residual_out
+            out = torch.empty_like(x)
+            rms_norm(out, x, w, self.variance_epsilon)
+            return out
+
     def forward_cpu(
         self,
         x: torch.Tensor,
@@ -521,6 +580,24 @@ class GemmaRMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual, post_residual_addition)
+
+    def forward_with_allreduce_fusion(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
+        # TODO(brayden): we can see if TRTLLM allreduce fusion can provide gemma-style norm
+        return _forward_with_allreduce_fusion(
+            self,
+            x,
+            residual,
+            post_residual_addition,
+            self.weight + 1.0,
+            use_attn_tp_group=True,
+        )
 
 
 class Gemma3RMSNorm(MultiPlatformOp):

@@ -1,0 +1,347 @@
+name: PR Test - Multimodal Gen
+
+on:
+  workflow_call:
+    inputs:
+      multimodal_gen:
+        required: true
+        type: string
+      sgl_kernel:
+        required: true
+        type: string
+      b200_runner:
+        required: true
+        type: string
+      continue_on_error:
+        required: false
+        type: string
+        default: 'false'
+      pr_head_sha:
+        required: false
+        type: string
+        default: ''
+      git_ref:
+        required: false
+        type: string
+        default: ''
+      target_stage:
+        required: false
+        type: string
+        default: ''
+      test_parallel_dispatch:
+        required: false
+        type: string
+        default: 'false'
+      caller_needs_failure:
+        required: false
+        type: string
+        default: 'false'
+      skip_stage_health_check:
+        required: false
+        type: string
+        default: 'false'
+
+# Workflow-level env is NOT inherited from the caller in reusable workflows.
+# The github context (including github.event_name) IS inherited from the caller.
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == 'true' }}
+
+jobs:
+  multimodal-gen-test-1-gpu:
+    if: |
+      (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
+      (
+        !inputs.target_stage &&
+        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+        inputs.multimodal_gen == 'true'
+      )
+    runs-on: 1-gpu-h100
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+      - name: Run diffusion server tests
+        timeout-minutes: 240
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 1-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2 \
+            $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
+  multimodal-gen-test-2-gpu:
+    if: |
+      (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
+      (
+        !inputs.target_stage &&
+        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+        inputs.multimodal_gen == 'true'
+      )
+    runs-on: 2-gpu-h100
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion server tests
+        timeout-minutes: 240
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 2-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2 \
+            $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
+
+  multimodal-gen-component-accuracy-1-gpu:
+    if: |
+      (inputs.target_stage == 'multimodal-gen-component-accuracy-1-gpu') ||
+      (
+        !inputs.target_stage &&
+        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+        inputs.multimodal_gen == 'true'
+      )
+    runs-on: 1-gpu-h100
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion component accuracy tests (1-GPU)
+        timeout-minutes: 240
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+        run: |
+          cd python
+          if [ "${{ inputs.continue_on_error }}" = "true" ]; then
+            exit_code=0
+            python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_a.py || exit_code=$?
+            python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_b.py || exit_code=$?
+            exit $exit_code
+          fi
+          python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_a.py
+          python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_b.py
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
+  multimodal-gen-component-accuracy-2-gpu:
+    if: |
+      (inputs.target_stage == 'multimodal-gen-component-accuracy-2-gpu') ||
+      (
+        !inputs.target_stage &&
+        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+        inputs.multimodal_gen == 'true'
+      )
+    runs-on: 2-gpu-h100
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion component accuracy tests (2-GPU)
+        timeout-minutes: 240
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+        run: |
+          cd python
+          if [ "${{ inputs.continue_on_error }}" = "true" ]; then
+            exit_code=0
+            torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_a.py || exit_code=$?
+            torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_b.py || exit_code=$?
+            exit $exit_code
+          fi
+          torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_a.py
+          torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_b.py
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
+  multimodal-gen-test-1-b200:
+    if: |
+      (inputs.target_stage == 'multimodal-gen-test-1-b200') ||
+      (
+        !inputs.target_stage &&
+        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+        inputs.multimodal_gen == 'true'
+      )
+    runs-on: ${{ inputs.b200_runner }}
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion server tests
+        timeout-minutes: 240
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite 1-gpu-b200 \
+            $CONTINUE_ON_ERROR_FLAG
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
+  multimodal-gen-unit-test:
+    if: |
+      (inputs.target_stage == 'multimodal-gen-unit-test') ||
+      (
+        !inputs.target_stage &&
+        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+        inputs.multimodal_gen == 'true'
+      )
+    runs-on: 1-gpu-h100
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Download artifacts
+        if: inputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion unit tests
+        timeout-minutes: 60
+        run: |
+          cd python
+          python3 sglang/multimodal_gen/test/run_suite.py --suite unit

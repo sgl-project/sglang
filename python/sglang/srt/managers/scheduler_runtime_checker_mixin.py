@@ -371,6 +371,9 @@ class SchedulerRuntimeCheckerMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
             if queue_size:
                 return
+        elif self.enable_hisparse:
+            if self.hisparse_coordinator.has_ongoing_staging():
+                return
 
         self.check_memory()
         self.check_tree_cache()

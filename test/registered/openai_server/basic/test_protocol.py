@@ -30,8 +30,8 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=3, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=3, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestModelCard(unittest.TestCase):
@@ -191,6 +191,30 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertEqual(request.reasoning_effort, "high")
         self.assertEqual(request.chat_template_kwargs, {"thinking": True})
+
+    def test_chat_completion_reasoning_effort_none(self):
+        """Test reasoning_effort='none' disables thinking"""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="none",
+        )
+        self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_reasoning_effort_none_from_reasoning_dict(self):
+        """Test reasoning_effort='none' via nested reasoning dict"""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={"effort": "none"},
+        )
+        self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
 
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""

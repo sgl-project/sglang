@@ -42,8 +42,11 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -125,10 +128,6 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
-        self.pin_expiry: float = (
-            0.0  # absolute expiry time (time.monotonic()), 0 = not pinned
-        )
-        self.pin_ttl: int = 0  # original TTL in seconds, for refresh-on-hit
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
 
@@ -609,9 +608,9 @@ class RadixCache(BasePrefixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
-    def inc_lock_ref(self, node: TreeNode):
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
-            return 0
+            return IncLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -622,11 +621,13 @@ class RadixCache(BasePrefixCache):
             node.lock_ref += 1
             self._update_leaf_status(node)
             node = node.parent
-        return delta
+        return IncLockRefResult(delta=delta)
 
-    def dec_lock_ref(self, node: TreeNode):
+    def dec_lock_ref(
+        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         if self.disable:
-            return 0
+            return DecLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -641,7 +642,7 @@ class RadixCache(BasePrefixCache):
                     node is self.root_node
                 ), f"This request holds the node from another tree"
             node = node.parent
-        return delta
+        return DecLockRefResult(delta=delta)
 
     def evictable_size(self):
         return self.evictable_size_

@@ -155,6 +155,24 @@ class DiffGenerator:
             f"{self.server_args.scheduler_endpoint}."
         )
 
+    @staticmethod
+    def _resolve_image_paths_per_prompt(
+        prompts: list[str], image_paths: str | list[str] | None
+    ) -> list[str | list[str] | None]:
+        if len(prompts) <= 1:
+            return [image_paths]
+
+        if not isinstance(image_paths, list) or len(image_paths) <= 1:
+            return [image_paths for _ in prompts]
+
+        if len(image_paths) != len(prompts):
+            raise ValueError(
+                "When using multiple prompts with multiple input images, "
+                "provide either one shared image or exactly one image per prompt."
+            )
+
+        return [[image_path] for image_path in image_paths]
+
     def generate(
         self,
         sampling_params_kwargs: dict | None = None,
@@ -165,7 +183,10 @@ class DiffGenerator:
         multiple prompts, or None when every request failed.
         """
         # 1. prepare requests
-        prompts = self._resolve_prompts(sampling_params_kwargs.get("prompt"))
+        prompts = self._resolve_prompts(
+            sampling_params_kwargs.get("prompt"),
+            sampling_params_kwargs.get("prompt_path"),
+        )
         user_output_file_name = sampling_params_kwargs.get("output_file_name")
 
         if len(prompts) > 1 and user_output_file_name is not None:
@@ -181,11 +202,16 @@ class DiffGenerator:
         )
 
         requests: list[Req] = []
-        for p in prompts:
+        image_paths_per_prompt = self._resolve_image_paths_per_prompt(
+            prompts, sampling_params_orig.image_path
+        )
+
+        for i, p in enumerate(prompts):
             sampling_params = dataclasses.replace(
                 sampling_params_orig,
                 prompt=p,
                 output_file_name=user_output_file_name,
+                image_path=image_paths_per_prompt[i],
             )
             sampling_params._set_output_file_name()
             req = prepare_request(
@@ -311,10 +337,14 @@ class DiffGenerator:
             return None
         return results[0] if len(results) == 1 else results
 
-    def _resolve_prompts(self, prompt: str | list[str] | None) -> list[str]:
+    def _resolve_prompts(
+        self,
+        prompt: str | list[str] | None,
+        prompt_path: str | None = None,
+    ) -> list[str]:
         """Collect prompts from the argument or from a prompt file."""
-        if self.server_args.prompt_file_path is not None:
-            path = self.server_args.prompt_file_path
+        path = prompt_path or self.server_args.prompt_file_path
+        if path is not None:
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Prompt text file not found: {path}")
             with open(path, encoding="utf-8") as f:

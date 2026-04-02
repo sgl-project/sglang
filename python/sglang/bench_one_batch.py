@@ -71,6 +71,7 @@ from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -87,6 +88,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 
 def start_profile(profile_activities, profile_record_shapes=False, rank_print=print):
@@ -261,7 +263,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
-    model_runner = ModelRunner(
+    runner_kwargs = dict(
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
         gpu_id=gpu_id,
@@ -274,6 +276,16 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
+
+    _use_mlx = use_mlx()
+    if _use_mlx:
+        from sglang.srt.hardware_backend.mlx.model_runner_stub import (
+            MlxModelRunnerStub,
+        )
+
+        model_runner = MlxModelRunnerStub(**runner_kwargs)
+    else:
+        model_runner = ModelRunner(**runner_kwargs)
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
         server_args.tokenizer_path,
@@ -282,10 +294,26 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     )
     if server_args.tp_size > 1:
         dist.barrier()
+
+    if _use_mlx:
+        model_runner = _MlxBenchRunner(model_runner, server_args)
+    else:
+        model_runner = _TorchBenchRunner(model_runner)
+
     return model_runner, tokenizer
 
 
 def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
+    if custom_prompts:
+        custom_input_len = len(custom_prompts)
+        bs = bench_args.batch_size[0]
+        if custom_input_len > bs:
+            logging.warning(
+                f"Custom input size ({custom_input_len}) is larger than batch_size ({bs}). "
+                f"Using the first {bs} prompts."
+            )
+            custom_prompts = custom_prompts[:bs]
+
     prompts = (
         custom_prompts
         if custom_prompts
@@ -326,11 +354,12 @@ def prepare_extend_inputs_for_correctness_test(
     for i in range(len(reqs)):
         req: Req = reqs[i]
         req.fill_ids += input_ids[i][bench_args.cut_len :]
-        req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-            i, : bench_args.cut_len
-        ].to(req.prefix_indices.dtype)
-        req.logprob_start_len = -1
-        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+        if model_runner is not None:
+            req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
+                i, : bench_args.cut_len
+            ].to(req.prefix_indices.dtype)
+            req.logprob_start_len = -1
+            req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
     return reqs
 
 
@@ -375,6 +404,9 @@ class TreeCacheNamespace(SimpleNamespace):
 
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()
+
+    def evict(self, params: EvictParams):
+        pass
 
 
 @torch.no_grad
@@ -429,6 +461,69 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             disable_overlap_schedule=model_runner.server_args.disable_overlap_schedule,
             offload_tags=set(),
         )
+
+
+class _TorchBenchRunner:
+    """Wraps ModelRunner for the standard PyTorch benchmark path."""
+
+    def __init__(self, model_runner):
+        self.torch_runner = model_runner
+
+    def clear(self):
+        self.torch_runner.req_to_token_pool.clear()
+        self.torch_runner.token_to_kv_pool_allocator.clear()
+
+    def extend(self, reqs):
+        return extend(reqs, self.torch_runner)
+
+    def decode(self, next_token_ids, batch):
+        return decode(next_token_ids, batch, self.torch_runner)
+
+    def cleanup(self, batch):
+        pass
+
+    def synchronize(self):
+        synchronize(self.torch_runner.device)
+
+    def max_batch_size(self, input_len, output_len):
+        return self.torch_runner.max_total_num_tokens // (input_len + output_len)
+
+
+class _MlxBenchRunner:
+    """Wraps MlxModelRunner for the MLX benchmark path."""
+
+    def __init__(self, model_runner, server_args):
+        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
+
+        self.mlx_runner = MlxModelRunner(
+            model_path=server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+        )
+        self.fake_torch_runner = model_runner
+
+    def clear(self):
+        self.mlx_runner.clear()
+
+    def extend(self, reqs):
+        req_ids = [str(req.rid) for req in reqs]
+        token_ids_list = [[int(t) for t in req.fill_ids] for req in reqs]
+        next_token_ids = self.mlx_runner.prefill_batch(req_ids, token_ids_list)
+        return torch.tensor(next_token_ids), None, req_ids
+
+    def decode(self, next_token_ids, req_ids):
+        next_token_ids = self.mlx_runner.decode_batch(req_ids)
+        return torch.tensor(next_token_ids), None
+
+    def cleanup(self, batch):
+        if isinstance(batch, list):
+            for req_id in batch:
+                self.mlx_runner.remove_request(req_id)
+
+    def synchronize(self):
+        pass
+
+    def max_batch_size(self, input_len, output_len):
+        return self.fake_torch_runner.max_total_num_tokens // (input_len + output_len)
 
 
 def _read_prompts_from_file(prompt_file, rank_print):
@@ -490,25 +585,29 @@ def correctness_test(
 
     if bench_args.cut_len > 0:
         # Prefill
-        next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
+        next_token_ids, next_token_logits, batch = model_runner.extend(reqs)
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
-    # Prepare extend inputs
-    reqs = prepare_extend_inputs_for_correctness_test(
-        bench_args, input_ids, reqs, model_runner
-    )
+        # Prepare extend inputs
+        torch_runner = getattr(model_runner, "torch_runner", None)
+        reqs = prepare_extend_inputs_for_correctness_test(
+            bench_args, input_ids, reqs, torch_runner
+        )
 
     # Extend (prefill w/ KV cache)
-    next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
+    next_token_ids, next_token_logits, batch = model_runner.extend(reqs)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
 
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
     for _ in range(bench_args.output_len[0] - 1):
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
+        next_token_ids, _ = model_runner.decode(next_token_ids, batch)
         next_token_ids_list = next_token_ids.tolist()
         for i in range(len(reqs)):
             output_ids[i].append(next_token_ids_list[i])
+
+    # Clean up
+    model_runner.cleanup(batch)
 
     # Print output texts
     for i in range(len(reqs)):
@@ -528,7 +627,6 @@ def latency_test_run_once(
     batch_size,
     input_len,
     output_len,
-    device,
     log_decode_step,
     profile,
     profile_record_shapes,
@@ -539,15 +637,14 @@ def latency_test_run_once(
     profile_start_step=None,
     profile_steps=None,
 ):
-    max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
+    max_batch_size = model_runner.max_batch_size(input_len, output_len)
     if batch_size > max_batch_size:
         rank_print(
             f"skipping ({batch_size}, {input_len}, {output_len}) due to max batch size limit"
         )
         return
 
-    model_runner.req_to_token_pool.clear()
-    model_runner.token_to_kv_pool_allocator.clear()
+    model_runner.clear()
 
     measurement_results = {
         "run_name": run_name,
@@ -567,10 +664,10 @@ def latency_test_run_once(
             rank_print=rank_print,
         )
 
-    synchronize(device)
+    model_runner.synchronize()
     tic = time.perf_counter()
-    next_token_ids, _, batch = extend(reqs, model_runner)
-    synchronize(device)
+    next_token_ids, _, batch = model_runner.extend(reqs)
+    model_runner.synchronize()
     prefill_latency = time.perf_counter() - tic
 
     if enable_profile_prefill:
@@ -603,7 +700,7 @@ def latency_test_run_once(
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
     profiler = None
     for i in range(output_len - 1):
-        synchronize(device)
+        model_runner.synchronize()
         # Start profiler at the specified step
         if enable_profile_decode and i == profile_start:
             profiler = start_profile(
@@ -613,8 +710,8 @@ def latency_test_run_once(
             )
 
         tic = time.perf_counter()
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        synchronize(device)
+        next_token_ids, _ = model_runner.decode(next_token_ids, batch)
+        model_runner.synchronize()
         latency = time.perf_counter() - tic
 
         # Stop profiler after the specified number of steps
@@ -656,6 +753,8 @@ def latency_test_run_once(
     )
     measurement_results["total_latency"] = tot_latency
     measurement_results["overall_throughput"] = throughput
+
+    model_runner.cleanup(batch)
     return measurement_results
 
 
@@ -698,7 +797,6 @@ def latency_test(
         bench_args.batch_size[0],
         bench_args.input_len[0],
         min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
-        server_args.device,
         log_decode_step=0,
         profile=False,
         profile_record_shapes=False,
@@ -750,7 +848,6 @@ def latency_test(
             bs,
             il,
             ol,
-            server_args.device,
             bench_args.log_decode_step,
             bench_args.profile if tp_rank == 0 else None,
             bench_args.profile_record_shapes if tp_rank == 0 else None,
