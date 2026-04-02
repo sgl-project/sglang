@@ -2069,23 +2069,25 @@ def maybe_stub_sgl_kernel():
     except (ImportError, OSError):
         pass
 
-    import types
+    import importlib.abc
+    import importlib.machinery
 
-    class _SglKernelFinder:
-        def find_module(self, fullname, path=None):
-            if fullname == "sgl_kernel" or fullname.startswith("sgl_kernel."):
-                return self
+    class _SglKernelLoader(importlib.abc.Loader):
+        def create_module(self, spec):
             return None
 
-        def load_module(self, fullname):
-            if fullname in sys.modules:
-                return sys.modules[fullname]
-            mod = types.ModuleType(fullname)
-            mod.__path__ = []
-            mod.__package__ = fullname
-            mod.__loader__ = self
-            sys.modules[fullname] = mod
-            return mod
+        def exec_module(self, module):
+            pass
+
+    class _SglKernelFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "sgl_kernel" or fullname.startswith("sgl_kernel."):
+                return importlib.machinery.ModuleSpec(
+                    fullname,
+                    _SglKernelLoader(),
+                    is_package=True,
+                )
+            return None
 
     sys.meta_path.insert(0, _SglKernelFinder())
 
