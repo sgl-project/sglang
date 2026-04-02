@@ -1,0 +1,24 @@
+{
+  "_comment": "B200-only comparison cases (requires SM100+).",
+  "test_image_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png",
+  "cases": [
+    {
+      "id": "flux2_dev_nvfp4_t2i_1024",
+      "model": "black-forest-labs/FLUX.2-dev-NVFP4",
+      "task": "text-to-image",
+      "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
+      "width": 1024,
+      "height": 1024,
+      "num_inference_steps": 50,
+      "guidance_scale": 4.0,
+      "seed": 42,
+      "num_gpus": 1,
+      "frameworks": {
+        "sglang": {
+          "serve_args": "--enable-torch-compile --warmup --dit-layerwise-offload false",
+          "extra_env": {}
+        }
+      }
+    }
+  ]
+}

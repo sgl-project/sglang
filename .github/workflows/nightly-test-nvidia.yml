@@ -27,6 +27,7 @@ on:
           - 'nightly-test-perf-8-gpu-b200'
           - 'nightly-test-kernel-1-gpu-h100'
           - 'nightly-test-diffusion-comparison'
+          - 'nightly-test-diffusion-comparison-b200'
           - 'nightly-test-kernel-8-gpu-h200'
   workflow_call:
     inputs:
@@ -716,6 +717,70 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
 
+  # Diffusion cross-framework comparison (B200 / NVFP4)
+  nightly-test-diffusion-comparison-b200:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-diffusion-comparison-b200')
+    runs-on: 4-gpu-b200
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run cross-framework comparison (B200)
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          PYTHONUNBUFFERED: "1"
+        timeout-minutes: 210
+        run: |
+          python3 -u scripts/ci/utils/diffusion/run_comparison.py \
+            --config scripts/ci/utils/diffusion/comparison_configs_b200.json \
+            --output comparison-results.json
+
+      - name: Generate dashboard
+        if: always()
+        env:
+          GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python3 scripts/ci/utils/diffusion/generate_diffusion_dashboard.py \
+            --results comparison-results.json \
+            --output dashboard.md \
+            --charts-dir comparison-charts \
+            --fetch-history \
+            --step-summary
+
+      - name: Publish to sglang-ci-data
+        if: always()
+        env:
+          GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python3 scripts/ci/utils/diffusion/publish_comparison_results.py \
+            --results comparison-results.json \
+            --dashboard dashboard.md \
+            --charts-dir comparison-charts
+
+      - name: Upload comparison artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-comparison-b200-${{ github.run_id }}
+          path: |
+            comparison-results.json
+            dashboard.md
+            comparison-charts/
+            comparison-logs/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
   # Consolidate performance metrics from all jobs
   consolidate-metrics:
     if: github.repository == 'sgl-project/sglang' && always()
@@ -778,6 +843,7 @@ jobs:
       - nightly-test-perf-4-gpu-b200
       - nightly-test-specialized-8-gpu-b200
       - nightly-test-diffusion-comparison
+      - nightly-test-diffusion-comparison-b200
       - consolidate-metrics
     runs-on: ubuntu-latest
     steps:
