@@ -1,7 +1,7 @@
-// FractalMesh PM2 Ecosystem — v600 Nexus Unified
+// FractalMesh PM2 Ecosystem — v10003.42 APEX OMNI-MATRIX
 // Samuel James Hiotis | ABN 56628117363 | Albury NSW
 // Usage: pm2 start ecosystem.config.js --env production
-// Agents: 14 processes | Memory budget: 250MB total
+// Agents: 26 nodes | Memory budget: ~1.6GB total
 
 const ROOT = process.env.FRACTALMESH_HOME || require('path').join(process.env.HOME, 'fmsaas');
 
@@ -321,13 +321,13 @@ module.exports = {
             time:       true,
         },
 
-        // ── v10003.38 UNIFIED HARMONIC ANCHOR NODES ───────────────────
+        // ── v10003.42 APEX OMNI-MATRIX NODES ─────────────────────────
 
-        // Cloudflared tunnel — wraps binary in bash to avoid PM2 crash loop
+        // Cloudflare tunnel — bash wrapper prevents PM2 crash loop
         {
             name:              'fm-cloudflared',
-            script:            'bash',
-            args:              ['-c', 'exec cloudflared tunnel --no-autoupdate run --token $CLOUDFLARED_TOKEN'],
+            script:            'tunnels/start_tunnel.sh',
+            cwd:               ROOT,
             autorestart:       true,
             watch:             false,
             max_memory_restart:'100M',
@@ -339,7 +339,7 @@ module.exports = {
             time:       true,
         },
 
-        // Secure pulse event bus (port 5060)
+        // Secure HMAC-signed pulse event bus (port 5060)
         {
             name:              'fm-bus',
             script:            'agents/fm_pulse_bus.py',
@@ -356,6 +356,45 @@ module.exports = {
             },
             error_file: `${ROOT}/logs/fm-bus-error.log`,
             out_file:   `${ROOT}/logs/fm-bus-out.log`,
+            time:       true,
+        },
+
+        // React/Flask API gateway (port 8080)
+        {
+            name:              'fm-gateway',
+            script:            'agents/fm_dashboard.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'100M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-gateway-error.log`,
+            out_file:   `${ROOT}/logs/fm-gateway-out.log`,
+            time:       true,
+        },
+
+        // External LLM directive bridge (port 8090)
+        {
+            name:              'fm-integrator',
+            script:            'agents/fm_mesh_integrator.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'100M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                INTEGRATOR_PORT:  '8090',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-integrator-error.log`,
+            out_file:   `${ROOT}/logs/fm-integrator-out.log`,
             time:       true,
         },
 
@@ -376,26 +415,6 @@ module.exports = {
             },
             error_file: `${ROOT}/logs/fm-gitops-error.log`,
             out_file:   `${ROOT}/logs/fm-gitops-out.log`,
-            time:       true,
-        },
-
-        // External mesh integrator / LLM directive bridge (port 8091)
-        {
-            name:              'fm-integrator',
-            script:            'agents/fm_mesh_integrator.py',
-            interpreter:       '/usr/bin/python3',
-            cwd:               ROOT,
-            autorestart:       true,
-            watch:             false,
-            max_memory_restart:'120M',
-            env_production: {
-                FRACTALMESH_HOME: ROOT,
-                INTEGRATOR_PORT:  '8091',
-                NODE_ENV:         'production',
-                PYTHONUNBUFFERED: '1',
-            },
-            error_file: `${ROOT}/logs/fm-integrator-error.log`,
-            out_file:   `${ROOT}/logs/fm-integrator-out.log`,
             time:       true,
         },
 
@@ -436,5 +455,47 @@ module.exports = {
             out_file:   `${ROOT}/logs/fm-warden-out.log`,
             time:       true,
         },
+
+        // ── APEX OMNI-MATRIX EXTENDED SWARM ──────────────────────────
+
+        ...[
+            ['fm-dork-engine',    'fm_dork_engine',    '80M'],
+            ['fm-contract-forge', 'fm_contract_forge', '80M'],
+            ['fm-wigle-oracle',   'fm_wigle_oracle',   '80M'],
+            ['fm-tokenomics',     'fm_live_tokenomics','80M'],
+            ['fm-workspace',      'fm_workspace_sync', '80M'],
+            ['fm-device',         'fm_device_bridge',  '80M'],
+            ['fm-enochian',       'fm_enochian_hash',  '50M'],
+            ['fm-stripe-gate',    'fm_stripe_gateway', '80M'],
+            ['fm-salvage',        'fm_salvage_crew',   '50M'],
+            ['fm-auto-advert',    'fm_auto_advert',    '50M'],
+            ['fm-oversight',      'fm_oversight',      '50M'],
+            ['fm-rl-quad',        'fm_rl_quad',        '50M'],
+            ['fm-azr-rl',         'fm_azr_rl',         '50M'],
+            ['fm-bounty',         'fm_bounty',         '50M'],
+            ['fm-domain',         'fm_domain',         '50M'],
+            ['fm-toolkit',        'fm_toolkit',        '50M'],
+            ['fm-synthwave',      'fm_synthwave',      '50M'],
+            ['fm-affiliate',      'fm_affiliate',      '50M'],
+            ['fm-ipfs',           'fm_ipfs',           '50M'],
+            ['fm-immortality',    'fm_immortality',    '50M'],
+            ['fm-healer',         'fm_healer',         '50M'],
+        ].map(([name, script, mem]) => ({
+            name,
+            script:            `agents/${script}.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart: mem,
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/${name}-error.log`,
+            out_file:   `${ROOT}/logs/${name}-out.log`,
+            time:       true,
+        })),
     ],
 };
