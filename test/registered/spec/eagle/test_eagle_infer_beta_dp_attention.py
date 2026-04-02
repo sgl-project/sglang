@@ -33,7 +33,7 @@ def test_gsm8k(base_url: str, model: str):
         num_threads=128,
     )
     metrics = run_eval(args)
-    server_info = requests.get(base_url + "/get_server_info")
+    server_info = requests.get(base_url + "/server_info")
     avg_spec_accept_length = server_info.json()["internal_states"][0][
         "avg_spec_accept_length"
     ]
