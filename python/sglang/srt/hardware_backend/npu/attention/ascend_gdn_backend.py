@@ -38,6 +38,10 @@ class AscendGDNAttnBackend(GDNAttnBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        # transpose last two dim for _init_npu_conv_state
+        self.conv_states_shape = torch.Size(
+            (*self.conv_states_shape[:-2], self.conv_states_shape[-1], self.conv_states_shape[-2])
+        )
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = AscendGDNKernelDispatcher(
@@ -60,10 +64,10 @@ class AscendGDNAttnBackend(GDNAttnBackend):
         if forward_mode.is_target_verify():
             seq_len = spec_info.draft_token_num
             self.actual_seq_lengths = self.actual_seq_lengths * seq_len
-            start_indices = cache_indices * seq_len
-            offset = torch.arange(seq_len, device=start_indices.device)
-            ranges = start_indices.unsqueeze(1) + offset
-            self.ssm_state_indices = ranges.flatten().to(torch.int32)
+            # indices
+            self.ssm_state_indices = torch.arange(
+                cache_indices.shape[0] * seq_len, dtype=torch.int32, device=cache_indices.device
+            )
         else:
             self.ssm_state_indices = cache_indices
 
@@ -262,7 +266,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
                 mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
+                conv_states.transpose(1, 2)[conv_dst[mask_indices]] = mixed_qkv_to_track
             kernel_size = layer.conv_weights.shape[-1]
             conv_states_for_prefill = conv_states[:, -(kernel_size - 1) :, :]
             conv_states_tmp = conv_states_for_prefill.transpose(1, 2).contiguous()

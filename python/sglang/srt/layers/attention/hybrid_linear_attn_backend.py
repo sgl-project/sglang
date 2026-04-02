@@ -32,7 +32,7 @@ if not is_cpu():
 if is_npu():
     from sgl_kernel_npu.mamba.mamba_state_update_triton import (
         conv_state_rollback,
-        move_intermediate_cache_dynamic_h_block,
+        move_intermediate_cache,
     )
 
 logger = logging.getLogger(__name__)
@@ -487,12 +487,9 @@ class MambaAttnBackendBase(AttentionBackend):
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
             )
-            start_indices = mamba_indices * spec_info.draft_token_num
-            offset = torch.arange(
-                spec_info.draft_token_num, device=start_indices.device
+            ssm_state_indices = torch.arange(
+                mamba_indices.shape[0] * spec_info.draft_token_num, dtype=torch.int32, device=mamba_indices.device
             )
-            ranges = start_indices.unsqueeze(1) + offset
-            ssm_state_indices = ranges.flatten().to(torch.int32)
             self.state_indices_list_gdn[bs - 1][
                 : len(mamba_indices) * spec_info.draft_token_num
             ].copy_(ssm_state_indices)
@@ -547,14 +544,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
-            start_indices = (
-                mamba_indices[: bs - num_padding] * spec_info.draft_token_num
+            ssm_state_indices = torch.arange(
+                len(mamba_indices[:bs - num_padding]) * spec_info.draft_token_num,
+                dtype=torch.int32, device=mamba_indices.device
             )
-            offset = torch.arange(
-                spec_info.draft_token_num, device=start_indices.device
-            )
-            ranges = start_indices.unsqueeze(1) + offset
-            ssm_state_indices = ranges.flatten().to(torch.int32)
             self.state_indices_list_gdn[bs - 1][
                 : len(mamba_indices[: bs - num_padding]) * spec_info.draft_token_num
             ].copy_(ssm_state_indices)
@@ -1001,18 +994,21 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
         if is_npu():
-            valid_state_indices = state_indices_tensor.to(torch.int64)  # [N]
+            dst_indices_tensor = state_indices_tensor.to(torch.int64)  # [N]
+            src_indices_tensor = torch.arange(dst_indices_tensor.shape[0],
+                                              device=dst_indices_tensor.device,
+                                              dtype=torch.int64)
             last_steps = accepted_steps.to(torch.int64)  # [N]
 
-            move_intermediate_cache_dynamic_h_block(
-                ssm_states, intermediate_state_cache, valid_state_indices, last_steps
+            move_intermediate_cache(
+                ssm_states, intermediate_state_cache, dst_indices_tensor, src_indices_tensor, last_steps
             )
 
             draft_token_num = intermediate_state_cache.shape[2]
-            if valid_state_indices.numel() > 0:
+            if dst_indices_tensor.numel() > 0:
                 conv_state_rollback(
                     conv_states,
-                    valid_state_indices,
+                    dst_indices_tensor,
                     last_steps,
                     draft_token_num,
                 )

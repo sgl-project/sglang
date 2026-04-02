@@ -2140,7 +2140,7 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda()
+                is_cuda(), is_npu()
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
