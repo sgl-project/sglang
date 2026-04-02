@@ -930,7 +930,6 @@ class Qwen2MoeForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            raw_weight_name = name
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -962,7 +961,6 @@ class Qwen2MoeForCausalLM(nn.Module):
                 if name not in params_dict:
                     continue
 
-                rank0_log(f"load_weights: {raw_weight_name} -> {name}")
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -973,7 +971,6 @@ class Qwen2MoeForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    rank0_log(f"load_weights: {raw_weight_name} -> {name}")
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -992,7 +989,6 @@ class Qwen2MoeForCausalLM(nn.Module):
                         continue
 
                     if name in params_dict.keys():
-                        rank0_log(f"load_weights: {raw_weight_name} -> {name}")
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
