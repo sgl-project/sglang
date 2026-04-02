@@ -267,6 +267,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             or getattr(config, "shared_expert_intermediate_size", 0) <= 0
             or config.shared_expert_intermediate_size != config.moe_intermediate_size
             or not _use_aiter
+            or quant_config is not None
         ):
             return 0
         return 1
