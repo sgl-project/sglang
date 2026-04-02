@@ -13,14 +13,14 @@
 # ==============================================================================
 
 """
-Regression test for Qwen3-VL-30B-A3B-Instruct LoRA logprob accuracy.
+Regression test for gpt-oss-20b LoRA logprob accuracy.
 
 Compares SGLang LoRA logprobs against reference training logprobs from a
 pre-computed dataset. The LoRA adapter and reference data are downloaded from:
-https://huggingface.co/datasets/yushengsu/lora-diff-Qwen3-VL-30B-A3B-Instruct
+https://huggingface.co/datasets/yushengsu/lora-diff-gpt-oss-20b
 
 Usage:
-    python -m unittest test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff
+    python -m unittest test_lora_gpt_oss_20b_logprob_diff
 """
 
 import multiprocessing as mp
@@ -35,12 +35,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
-    est_time=160,
+    est_time=300,
     suite="stage-c-test-4-gpu-b200",
 )
 
-BASE_MODEL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-VL-30B-A3B-Instruct"
+BASE_MODEL = "lmsys/gpt-oss-20b-bf16"
+LORA_HF_REPO = "yushengsu/lora-diff-gpt-oss-20b"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 4
@@ -70,9 +70,9 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
-class TestLoRAQwen3VL_30B_A3B_Instruct_LogprobDiff(CustomTestCase):
+class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
 
-    def test_lora_qwen3_vl_30b_a3b_instruct_logprob_accuracy(self):
+    def test_lora_gpt_oss_20b_logprob_accuracy(self):
         adapter_path = snapshot_download(
             LORA_HF_REPO,
             repo_type="dataset",
