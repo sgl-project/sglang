@@ -28,8 +28,6 @@ struct NgramCorpusFfi {
   static void create(
       int64_t capacity,
       int64_t max_trie_depth,
-      int64_t min_match_window_size,
-      int64_t max_match_window_size,
       int64_t min_bfs_breadth,
       int64_t max_bfs_breadth,
       int64_t draft_token_num,
@@ -39,8 +37,6 @@ struct NgramCorpusFfi {
     param.enable = true;
     param.enable_router_mode = false;
     param.max_trie_depth = static_cast<size_t>(max_trie_depth);
-    param.min_match_window_size = static_cast<size_t>(min_match_window_size);
-    param.max_match_window_size = static_cast<size_t>(max_match_window_size);
     param.min_bfs_breadth = static_cast<size_t>(min_bfs_breadth);
     param.max_bfs_breadth = static_cast<size_t>(max_bfs_breadth);
     param.draft_token_num = static_cast<size_t>(draft_token_num);

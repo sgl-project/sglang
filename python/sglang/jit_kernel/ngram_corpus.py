@@ -49,8 +49,6 @@ def _to_csr(batch_tokens: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
 def ngram_create(
     capacity: int,
     max_trie_depth: int,
-    min_match_window_size: int,
-    max_match_window_size: int,
     min_bfs_breadth: int,
     max_bfs_breadth: int,
     draft_token_num: int,
@@ -65,8 +63,6 @@ def ngram_create(
     _jit_ngram_corpus_module().ngram_create(
         capacity,
         max_trie_depth,
-        min_match_window_size,
-        max_match_window_size,
         min_bfs_breadth,
         max_bfs_breadth,
         draft_token_num,
