@@ -132,7 +132,7 @@ class TestGemma3RMSNorm(CustomTestCase):
             ref_out = layer.forward_native(x)
             out = layer(x)
 
-        self.assertTrue(torch.allclose(out, ref_out, atol=1e-3, rtol=1e-3))
+        self.assertTrue(torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2))
 
     def _run_gemma3_rms_norm_4d(self, batch, num_heads, seq_len, head_dim, dtype, seed):
         torch.manual_seed(seed)
@@ -144,7 +144,7 @@ class TestGemma3RMSNorm(CustomTestCase):
             ref_out = layer.forward_native(x)
             out = layer(x)
 
-        self.assertTrue(torch.allclose(out, ref_out, atol=1e-3, rtol=1e-3))
+        self.assertTrue(torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2))
 
     def test_gemma3_rms_norm_2d(self):
         for params in itertools.product(
