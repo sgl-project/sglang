@@ -40,6 +40,10 @@ def slow_crash_worker(delay: float = 0.5):
     os._exit(42)
 
 
+def noop_worker():
+    pass
+
+
 class TestSubprocessWatchdog(CustomTestCase):
     def setUp(self):
         self.sigquit_triggered = threading.Event()
@@ -120,7 +124,7 @@ class TestSubprocessWatchdog(CustomTestCase):
         self.assertFalse(self.sigquit_triggered.is_set())
 
     def test_normal_exit_no_sigquit(self):
-        proc = self._spawn(lambda: None)
+        proc = self._spawn(noop_worker)
         proc.join(timeout=2)
         self._watch(proc)
         time.sleep(0.3)
@@ -131,7 +135,6 @@ class TestSubprocessWatchdog(CustomTestCase):
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
     import unittest
 
     unittest.main()
