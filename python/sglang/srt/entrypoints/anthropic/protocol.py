@@ -97,6 +97,16 @@ class AnthropicCountTokensResponse(BaseModel):
     input_tokens: int
 
 
+class AnthropicThinkingParam(BaseModel):
+    """Thinking configuration for extended thinking support.
+
+    See: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking
+    """
+
+    type: Literal["enabled", "disabled"]
+    budget_tokens: Optional[int] = None
+
+
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request"""
 
@@ -108,6 +118,7 @@ class AnthropicMessagesRequest(BaseModel):
     stream: Optional[bool] = False
     system: Optional[str | list[AnthropicContentBlock]] = None
     temperature: Optional[float] = None
+    thinking: Optional[AnthropicThinkingParam] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
@@ -131,8 +142,12 @@ class AnthropicMessagesRequest(BaseModel):
 class AnthropicDelta(BaseModel):
     """Delta for streaming responses"""
 
-    type: Optional[Literal["text_delta", "input_json_delta"]] = None
+    type: Optional[
+        Literal["text_delta", "thinking_delta", "signature_delta", "input_json_delta"]
+    ] = None
     text: Optional[str] = None
+    thinking: Optional[str] = None
+    signature: Optional[str] = None
     partial_json: Optional[str] = None
 
     # Message delta fields

@@ -184,7 +184,28 @@ class AnthropicServing:
             content_parts = []
             tool_calls = []
 
+            # For assistant messages, reconstruct thinking blocks as <think>
+            # tags so the chat template receives the correct format for
+            # multi-turn conversations with reasoning models.
+            if msg.role == "assistant":
+                thinking_parts = [
+                    block.thinking
+                    for block in msg.content
+                    if block.type == "thinking" and block.thinking
+                ]
+                if thinking_parts:
+                    combined = "\n".join(thinking_parts)
+                    content_parts.append(
+                        {
+                            "type": "text",
+                            "text": f"<think>\n{combined}\n</think>",
+                        }
+                    )
+
             for block in msg.content:
+                if block.type in ("thinking", "redacted_thinking"):
+                    # Already handled above for assistant messages
+                    continue
                 if block.type == "text" and block.text:
                     content_parts.append({"type": "text", "text": block.text})
 
@@ -262,6 +283,24 @@ class AnthropicServing:
             request_data["top_k"] = anthropic_request.top_k
         if anthropic_request.stop_sequences is not None:
             request_data["stop"] = anthropic_request.stop_sequences
+
+        # Wire thinking param through to the OpenAI layer.
+        # We use the `reasoning` dict which is normalized by
+        # ChatCompletionRequest.normalize_reasoning_inputs() to set the
+        # correct model-specific chat_template_kwargs via
+        # _get_reasoning_from_request().
+        if anthropic_request.thinking is not None:
+            if anthropic_request.thinking.type == "enabled":
+                request_data["reasoning"] = {"enabled": True}
+                request_data["separate_reasoning"] = True
+                request_data["stream_reasoning"] = True
+                if anthropic_request.thinking.budget_tokens is not None:
+                    logger.warning("budget_tokens is not supported and will be ignored")
+            else:
+                # type == "disabled"
+                request_data["reasoning_effort"] = "none"
+                request_data["separate_reasoning"] = False
+                request_data["stream_reasoning"] = False
 
         # Enable usage in stream so we can report it
         if anthropic_request.stream:
@@ -428,6 +467,7 @@ class AnthropicServing:
         first_chunk = True
         content_block_index = 0
         content_block_open = False
+        thinking_block_open = False
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -442,6 +482,20 @@ class AnthropicServing:
             if data_str == "[DONE]":
                 # Close any open content block
                 if content_block_open:
+                    # Emit signature_delta before closing a thinking block
+                    if thinking_block_open:
+                        sig_event = AnthropicStreamEvent(
+                            type="content_block_delta",
+                            index=content_block_index,
+                            delta=AnthropicDelta(
+                                type="signature_delta",
+                                signature="",
+                            ),
+                        )
+                        yield _wrap_sse_event(
+                            sig_event.model_dump_json(exclude_none=True),
+                            "content_block_delta",
+                        )
                     stop_event = AnthropicStreamEvent(
                         type="content_block_stop",
                         index=content_block_index,
@@ -498,6 +552,15 @@ class AnthropicServing:
             if first_chunk:
                 first_chunk = False
 
+                # Extract cache token info if available
+                cache_read = None
+                if (
+                    chunk.usage
+                    and chunk.usage.prompt_tokens_details
+                    and chunk.usage.prompt_tokens_details.cached_tokens
+                ):
+                    cache_read = chunk.usage.prompt_tokens_details.cached_tokens
+
                 start_event = AnthropicStreamEvent(
                     type="message_start",
                     message=AnthropicMessagesResponse(
@@ -509,6 +572,7 @@ class AnthropicServing:
                                 chunk.usage.prompt_tokens if chunk.usage else 0
                             ),
                             output_tokens=0,
+                            cache_read_input_tokens=cache_read,
                         ),
                     ),
                 )
@@ -550,6 +614,21 @@ class AnthropicServing:
                     if tc_func and tc_func.name:
                         # Close previous content block if open
                         if content_block_open:
+                            # Emit signature_delta if closing a thinking block
+                            if thinking_block_open:
+                                sig_event = AnthropicStreamEvent(
+                                    type="content_block_delta",
+                                    index=content_block_index,
+                                    delta=AnthropicDelta(
+                                        type="signature_delta",
+                                        signature="",
+                                    ),
+                                )
+                                yield _wrap_sse_event(
+                                    sig_event.model_dump_json(exclude_none=True),
+                                    "content_block_delta",
+                                )
+                                thinking_block_open = False
                             stop_event = AnthropicStreamEvent(
                                 type="content_block_stop",
                                 index=content_block_index,
@@ -608,8 +687,68 @@ class AnthropicServing:
                         )
                 continue
 
+            # Handle reasoning/thinking content deltas
+            if delta.reasoning_content is not None and delta.reasoning_content != "":
+                # Start a thinking content block if needed
+                if not thinking_block_open:
+                    start_event = AnthropicStreamEvent(
+                        type="content_block_start",
+                        index=content_block_index,
+                        content_block=AnthropicContentBlock(
+                            type="thinking", thinking=""
+                        ),
+                    )
+                    yield _wrap_sse_event(
+                        start_event.model_dump_json(exclude_none=True),
+                        "content_block_start",
+                    )
+                    thinking_block_open = True
+                    content_block_open = True
+
+                # Emit thinking delta
+                delta_event = AnthropicStreamEvent(
+                    type="content_block_delta",
+                    index=content_block_index,
+                    delta=AnthropicDelta(
+                        type="thinking_delta",
+                        thinking=delta.reasoning_content,
+                    ),
+                )
+                yield _wrap_sse_event(
+                    delta_event.model_dump_json(exclude_none=True),
+                    "content_block_delta",
+                )
+                continue
+
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
+                # Close thinking block if transitioning to text
+                if thinking_block_open:
+                    # Emit signature_delta before closing thinking block
+                    sig_event = AnthropicStreamEvent(
+                        type="content_block_delta",
+                        index=content_block_index,
+                        delta=AnthropicDelta(
+                            type="signature_delta",
+                            signature="",
+                        ),
+                    )
+                    yield _wrap_sse_event(
+                        sig_event.model_dump_json(exclude_none=True),
+                        "content_block_delta",
+                    )
+                    stop_event = AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    )
+                    yield _wrap_sse_event(
+                        stop_event.model_dump_json(exclude_none=True),
+                        "content_block_stop",
+                    )
+                    content_block_index += 1
+                    thinking_block_open = False
+                    content_block_open = False
+
                 # Start a text content block if needed
                 if not content_block_open:
                     start_event = AnthropicStreamEvent(
@@ -652,6 +791,16 @@ class AnthropicServing:
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
 
+        # Add thinking content block if reasoning_content is present
+        if choice.message.reasoning_content:
+            content.append(
+                AnthropicContentBlock(
+                    type="thinking",
+                    thinking=choice.message.reasoning_content,
+                    signature="",
+                )
+            )
+
         # Add text content
         if choice.message.content:
             content.append(
@@ -678,6 +827,15 @@ class AnthropicServing:
         # Map stop reason
         stop_reason = STOP_REASON_MAP.get(choice.finish_reason or "stop", "end_turn")
 
+        # Extract cache token info if available
+        cache_read = None
+        if (
+            response.usage
+            and response.usage.prompt_tokens_details
+            and response.usage.prompt_tokens_details.cached_tokens
+        ):
+            cache_read = response.usage.prompt_tokens_details.cached_tokens
+
         return AnthropicMessagesResponse(
             id=f"msg_{uuid.uuid4().hex}",
             content=content,
@@ -685,7 +843,10 @@ class AnthropicServing:
             stop_reason=stop_reason,
             usage=AnthropicUsage(
                 input_tokens=response.usage.prompt_tokens if response.usage else 0,
-                output_tokens=response.usage.completion_tokens if response.usage else 0,
+                output_tokens=(
+                    response.usage.completion_tokens if response.usage else 0
+                ),
+                cache_read_input_tokens=cache_read,
             ),
         )
 
