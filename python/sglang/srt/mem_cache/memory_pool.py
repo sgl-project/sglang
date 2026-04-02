@@ -337,6 +337,13 @@ class MambaPool:
     def available_size(self):
         return len(self.free_slots)
 
+    def used_memory_gb(self) -> float:
+        """Return the memory in GB currently consumed by in-use Mamba pool slots."""
+        used_slots = self.size - len(self.free_slots)
+        if self.size == 0:
+            return 0.0
+        return used_slots * (self.mem_usage / self.size)
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None

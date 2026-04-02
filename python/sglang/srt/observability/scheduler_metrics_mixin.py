@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import (
     GetLoadsReqInput,
     GetLoadsReqOutput,
     LoRAMetrics,
+    MambaMetrics,
     MemoryMetrics,
     QueueMetrics,
     SpeculativeMetrics,
@@ -457,6 +458,17 @@ class SchedulerMetricsMixin:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
+                mamba_pool = self.req_to_token_pool.mamba_pool
+                self.stats.mamba_pool_slots_used = (
+                    mamba_pool.size - mamba_pool.available_size()
+                )
+                self.stats.mamba_pool_slots_total = mamba_pool.size
+                self.stats.mamba_pool_utilization = (
+                    self.stats.mamba_pool_slots_used / mamba_pool.size
+                    if mamba_pool.size > 0
+                    else 0.0
+                )
+                self.stats.mamba_pool_memory_used_gb = mamba_pool.used_memory_gb()
 
             priority_enabled = self.enable_priority_scheduling
             self.stats.num_queue_reqs = QueueCount.from_reqs(
@@ -691,6 +703,17 @@ class SchedulerMetricsMixin:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
+                mamba_pool = self.req_to_token_pool.mamba_pool
+                self.stats.mamba_pool_slots_used = (
+                    mamba_pool.size - mamba_pool.available_size()
+                )
+                self.stats.mamba_pool_slots_total = mamba_pool.size
+                self.stats.mamba_pool_utilization = (
+                    self.stats.mamba_pool_slots_used / mamba_pool.size
+                    if mamba_pool.size > 0
+                    else 0.0
+                )
+                self.stats.mamba_pool_memory_used_gb = mamba_pool.used_memory_gb()
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = QueueCount.from_reqs(
@@ -969,6 +992,18 @@ class SchedulerMetricsMixin:
                     utilization=self.stats.lora_pool_utilization,
                 )
 
+        mamba = None
+        if include_all or "mamba" in include:
+            if self.is_hybrid_ssm:
+                mamba = MambaMetrics(
+                    pool_slots_used=self.stats.mamba_pool_slots_used,
+                    pool_slots_total=self.stats.mamba_pool_slots_total,
+                    pool_utilization=round(self.stats.mamba_pool_utilization, 4),
+                    pool_memory_used_gb=round(
+                        self.stats.mamba_pool_memory_used_gb, 3
+                    ),
+                )
+
         disaggregation = None
         if include_all or "disagg" in include:
             mode_str = "null"
@@ -1025,6 +1060,7 @@ class SchedulerMetricsMixin:
             memory=memory,
             speculative=speculative,
             lora=lora,
+            mamba=mamba,
             disaggregation=disaggregation,
             queues=queues,
         )

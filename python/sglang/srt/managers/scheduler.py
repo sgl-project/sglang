@@ -708,6 +708,8 @@ class Scheduler(
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
         )
+        if self.is_hybrid_ssm and self.enable_metrics:
+            self.metrics_collector.enable_hybrid_ssm_metrics()
 
         self.sliding_window_size = None
         if self.is_hybrid_swa:

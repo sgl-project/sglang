@@ -1804,6 +1804,24 @@ class LoRAMetrics:
 
 
 @dataclass
+class MambaMetrics:
+    """SSM (Mamba) pool metrics for hybrid GDN models."""
+
+    pool_slots_used: int = field(
+        metadata={"metric": ("gauge", "Mamba state slots in use")}
+    )
+    pool_slots_total: int = field(
+        metadata={"metric": ("gauge", "Total Mamba state slots")}
+    )
+    pool_utilization: float = field(
+        metadata={"metric": ("gauge", "Mamba pool utilization ratio")}
+    )
+    pool_memory_used_gb: float = field(
+        metadata={"metric": ("gauge", "Mamba pool memory used in GB")}
+    )
+
+
+@dataclass
 class DisaggregationMetrics:
     """PD disaggregation metrics."""
 
@@ -1903,6 +1921,7 @@ class GetLoadsReqOutput(BaseReq):
     memory: Optional[MemoryMetrics] = None
     speculative: Optional[SpeculativeMetrics] = None
     lora: Optional[LoRAMetrics] = None
+    mamba: Optional[MambaMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
 

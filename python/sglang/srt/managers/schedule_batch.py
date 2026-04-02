@@ -629,6 +629,7 @@ class Req(ReqDllmMixin):
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        self.mamba_svd_applied: bool = False
 
         # Check finish
         self.tokenizer = None
@@ -1163,6 +1164,7 @@ class Req(ReqDllmMixin):
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.mamba_svd_applied = False
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
@@ -2029,6 +2031,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.attn_cp_metadata = None
         if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
             self.nsa_cp_metadata = None
+
+        # Apply low-rank SVD to newly-prefilled Mamba temporal states
+        svd_rank = get_global_server_args().mamba_svd_rank
+        if svd_rank is not None and hasattr(self.req_to_token_pool, "mamba_pool"):
+            from sglang.srt.mem_cache.svd_compress import (
+                apply_svd_lowrank_to_temporal_state,
+            )
+
+            temporal = self.req_to_token_pool.mamba_pool.mamba_cache.temporal
+            for req in self.reqs:
+                if req.mamba_pool_idx is not None and not req.mamba_svd_applied:
+                    apply_svd_lowrank_to_temporal_state(
+                        temporal, req.mamba_pool_idx, rank=svd_rank
+                    )
+                    req.mamba_svd_applied = True
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path

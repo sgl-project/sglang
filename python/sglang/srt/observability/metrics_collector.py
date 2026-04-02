@@ -84,6 +84,11 @@ class SchedulerStats:
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
+    # SSM (Mamba) pool metrics
+    mamba_pool_slots_used: int = 0
+    mamba_pool_slots_total: int = 0
+    mamba_pool_utilization: float = 0.0
+    mamba_pool_memory_used_gb: float = 0.0
     decode_sum_seq_lens: int = 0
     gen_throughput: float = 0.0
     num_queue_reqs: QueueCount = field(default_factory=QueueCount)
@@ -182,6 +187,7 @@ class SchedulerMetricsCollector:
         self.labels = labels
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
+        self.enable_hybrid_ssm = False
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
 
@@ -797,6 +803,36 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+    def enable_hybrid_ssm_metrics(self):
+        """Register SSM (Mamba) pool Prometheus gauges. Called after is_hybrid_ssm is known."""
+        from prometheus_client import Gauge
+
+        self.enable_hybrid_ssm = True
+        self.mamba_pool_slots_used = Gauge(
+            name="sglang:mamba_pool_slots_used",
+            documentation="Number of Mamba state slots currently in use.",
+            labelnames=self.labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mamba_pool_slots_total = Gauge(
+            name="sglang:mamba_pool_slots_total",
+            documentation="Total number of Mamba state slots available.",
+            labelnames=self.labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mamba_pool_utilization = Gauge(
+            name="sglang:mamba_pool_utilization",
+            documentation="Mamba pool utilization ratio (used/total). 1.0 means pool is full.",
+            labelnames=self.labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mamba_pool_memory_used_gb = Gauge(
+            name="sglang:mamba_pool_memory_used_gb",
+            documentation="Memory in GB currently used by Mamba state slots.",
+            labelnames=self.labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
@@ -1037,6 +1073,17 @@ class SchedulerMetricsCollector:
             self._log_gauge(self.lora_pool_slots_used, stats.lora_pool_slots_used)
             self._log_gauge(self.lora_pool_slots_total, stats.lora_pool_slots_total)
             self._log_gauge(self.lora_pool_utilization, stats.lora_pool_utilization)
+
+        # SSM (Mamba) pool metrics (only logged if hybrid SSM is enabled)
+        if self.enable_hybrid_ssm:
+            self._log_gauge(self.mamba_pool_slots_used, stats.mamba_pool_slots_used)
+            self._log_gauge(self.mamba_pool_slots_total, stats.mamba_pool_slots_total)
+            self._log_gauge(
+                self.mamba_pool_utilization, stats.mamba_pool_utilization
+            )
+            self._log_gauge(
+                self.mamba_pool_memory_used_gb, stats.mamba_pool_memory_used_gb
+            )
 
         # HiCache host-tier metrics (only logged if hierarchical cache is enabled)
         if self.enable_hierarchical_cache:
