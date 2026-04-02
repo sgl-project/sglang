@@ -2019,6 +2019,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
+        self._warmup_fused_sampling()
+
+    def _warmup_fused_sampling(self):
+        """Pre-compile and autotune fused sampling Triton kernels."""
+        if _is_hip:
+            return
+        from sglang.srt.layers.fused_sampling import warmup_fused_temperature_softmax
+
+        logits_warmup_dtype = (
+            torch.float32 if self.server_args.enable_fp32_lm_head else self.dtype
+        )
+        warmup_fused_temperature_softmax(
+            self.model_config.vocab_size,
+            logits_dtype=logits_warmup_dtype,
+        )
+
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
         if self.server_args.disable_flashinfer_autotune:
@@ -2030,6 +2046,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if backend_str not in [
             "flashinfer_trtllm",
+            # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
+            # "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
