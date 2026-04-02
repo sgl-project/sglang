@@ -1692,22 +1692,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 params_dict,
                                 loaded_weight[0],
                                 "w1",
-                                (
-                                    num_experts
-                                    if not self.enable_fused_moe
-                                    else num_experts + self.num_fused_shared_experts
-                                ),
+                                num_experts,
                             )
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
                                 loaded_weight[1],
                                 "w3",
-                                (
-                                    num_experts
-                                    if not self.enable_fused_moe
-                                    else num_experts + self.num_fused_shared_experts
-                                ),
+                                num_experts,
                             )
                         elif "experts.down_proj" in name:
                             # experts.down_proj contains all 512 routed experts, excluding shared experts
@@ -1716,11 +1708,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 params_dict,
                                 loaded_weight,
                                 shard_id,
-                                (
-                                    num_experts
-                                    if not self.enable_fused_moe
-                                    else num_experts + self.num_fused_shared_experts
-                                ),
+                                num_experts
                             )
                         elif self.enable_fused_moe:
                             # shared experts should be loaded to experts.w13_weight and experts.w2_weight
