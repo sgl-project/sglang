@@ -1194,7 +1194,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
-            raw_weight_name = name
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
