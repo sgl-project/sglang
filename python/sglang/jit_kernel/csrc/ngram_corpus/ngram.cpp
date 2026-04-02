@@ -1,10 +1,9 @@
 #include "ngram.h"
 
+#include "trie.h"
 #include <limits>
 #include <stdexcept>
 #include <string>
-
-#include "trie.h"
 
 namespace ngram {
 
