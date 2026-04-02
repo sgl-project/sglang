@@ -63,6 +63,12 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import CompilableRegionMixin, MultiPlatformOp
+from sglang.srt.utils.torch_compile_utils import (
+    CompileConfig,
+    get_default_compile_options,
+    parse_compile_op_config,
+    resolve_compile_config,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -103,25 +109,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
-
-def _get_inductor_groupedmm_compile_options():
-    compile_options = {
-        "max_autotune_gemm_backends": os.environ.get(
-            "TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS", "TRITON"
-        ),
-        "max_autotune_gemm": True,
-        # "trace.enabled": True,
-    }
-    if hasattr(torch._inductor.config, "combo_kernels"):
-        compile_options["combo_kernels"] = True
-    if hasattr(torch._inductor.config, "triton"):
-        triton_cfg = torch._inductor.config.triton
-        if hasattr(triton_cfg, "enable_pdl"):
-            compile_options["triton.enable_pdl"] = True
-    return compile_options
-
-
-INDUCTOR_COMPILE_OPTIONS = _get_inductor_groupedmm_compile_options()
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
@@ -441,7 +428,7 @@ def _to_torch(
     num_tokens: int,
     compile_scope: str = "full",
     override_layers: Optional[Collection[str]] = None,
-    compile_options: Optional[dict] = None,
+    compile_overrides: Optional[Dict[str, CompileConfig]] = None,
     compile_dynamic: bool = False,
 ):
     for sub in model._modules.values():
@@ -449,11 +436,13 @@ def _to_torch(
             if reverse:
                 sub.leave_torch_compile()
             else:
+                cfg = resolve_compile_config(sub, compile_overrides)
                 sub.enter_torch_compile(
                     num_tokens=num_tokens,
                     compile_scope=compile_scope,
                     override_layers=override_layers,
-                    compile_options=compile_options,
+                    compile_mode=cfg.mode,
+                    compile_options=cfg.options,
                     compile_dynamic=compile_dynamic,
                 )
 
@@ -469,7 +458,7 @@ def _to_torch(
                 else:
                     sub.enter_region_compile(
                         region_name,
-                        compile_options=compile_options,
+                        compile_options=get_default_compile_options(),
                         compile_dynamic=compile_dynamic,
                     )
 
@@ -480,7 +469,7 @@ def _to_torch(
                 num_tokens,
                 compile_scope=compile_scope,
                 override_layers=override_layers,
-                compile_options=compile_options,
+                compile_overrides=compile_overrides,
                 compile_dynamic=compile_dynamic,
             )
 
@@ -493,6 +482,7 @@ def patch_model(
     tp_group: GroupCoordinator,
     compile_scope: str = "full",
     override_layers: Optional[List[str]] = None,
+    compile_op_config: Optional[str] = None,
 ):
     """Patch the model to make it compatible with with torch.compile"""
     backup_ca_comm = None
@@ -500,6 +490,7 @@ def patch_model(
         frozenset(override_layers) if override_layers is not None else None
     )
     compile_dynamic = _is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE")
+    compile_overrides = parse_compile_op_config(compile_op_config)
 
     try:
         if enable_compile:
@@ -509,7 +500,7 @@ def patch_model(
                 num_tokens=num_tokens,
                 compile_scope=compile_scope,
                 override_layers=override_layer_set,
-                compile_options=INDUCTOR_COMPILE_OPTIONS,
+                compile_overrides=compile_overrides,
                 compile_dynamic=compile_dynamic,
             )
             backup_ca_comm = tp_group.ca_comm
@@ -524,10 +515,9 @@ def patch_model(
             else:
                 yield torch.compile(
                     torch.no_grad()(model.forward),
-                    options=INDUCTOR_COMPILE_OPTIONS,
-                    # mode=os.environ.get(
-                    #     "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                    # ),
+                    mode=os.environ.get(
+                        "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+                    ),
                     dynamic=compile_dynamic,
                 )
         else:
@@ -540,7 +530,7 @@ def patch_model(
                 num_tokens=num_tokens,
                 compile_scope=compile_scope,
                 override_layers=override_layer_set,
-                compile_options=INDUCTOR_COMPILE_OPTIONS,
+                compile_overrides=compile_overrides,
                 compile_dynamic=compile_dynamic,
             )
             tp_group.ca_comm = backup_ca_comm
@@ -900,6 +890,7 @@ class CudaGraphRunner:
                     tp_group=self.model_runner.tp_group,
                     compile_scope=self.model_runner.server_args.torch_compile_scope,
                     override_layers=self.model_runner.server_args.torch_compile_override_layers,
+                    compile_op_config=self.model_runner.server_args.torch_compile_op_config,
                 ) as forward:
                     (
                         graph,

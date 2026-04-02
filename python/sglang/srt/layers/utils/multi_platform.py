@@ -1,9 +1,10 @@
-from typing import Callable, Collection, Optional, Tuple
+from typing import Callable, ClassVar, Collection, Optional, Tuple
 
 import torch
 from torch import nn
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils.torch_compile_utils import CompileConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -111,6 +112,8 @@ class CompilableRegionMixin:
 
 
 class MultiPlatformOp(nn.Module):
+    compile_config: ClassVar[CompileConfig] = CompileConfig()
+
     def __init__(self):
         super().__init__()
         self._forward_method: Callable = self.dispatch_forward()
@@ -122,11 +125,13 @@ class MultiPlatformOp(nn.Module):
     def _get_local_torch_compile_forward_method(
         self,
         method_name: str,
+        compile_mode: Optional[str] = None,
         compile_options: Optional[dict] = None,
         compile_dynamic: bool = False,
     ) -> Callable:
         return torch.compile(
             getattr(self, method_name),
+            mode=compile_mode,
             options=compile_options,
             dynamic=compile_dynamic,
         )
@@ -145,6 +150,7 @@ class MultiPlatformOp(nn.Module):
         num_tokens: int,
         compile_scope: str = "full",
         override_layers: Optional[Collection[str]] = None,
+        compile_mode: Optional[str] = None,
         compile_options: Optional[dict] = None,
         compile_dynamic: bool = False,
     ) -> Tuple[bool, Optional[Callable]]:
@@ -157,6 +163,7 @@ class MultiPlatformOp(nn.Module):
                 return False, None
             return True, self._get_local_torch_compile_forward_method(
                 "forward_native",
+                compile_mode=compile_mode,
                 compile_options=compile_options,
                 compile_dynamic=compile_dynamic,
             )
@@ -191,6 +198,7 @@ class MultiPlatformOp(nn.Module):
         num_tokens: int,
         compile_scope: str = "full",
         override_layers: Optional[Collection[str]] = None,
+        compile_mode: Optional[str] = None,
         compile_options: Optional[dict] = None,
         compile_dynamic: bool = False,
     ):
@@ -206,6 +214,7 @@ class MultiPlatformOp(nn.Module):
             num_tokens=num_tokens,
             compile_scope=compile_scope,
             override_layers=override_layers,
+            compile_mode=compile_mode,
             compile_options=compile_options,
             compile_dynamic=compile_dynamic,
         )
