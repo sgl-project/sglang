@@ -77,19 +77,25 @@ def _run_smi(query, query_type="gpu"):
 
 
 def _get_smi_version():
-    """Return nvidia-smi driver version and CUDA version, or None on failure."""
+    """Return nvidia-smi driver version and GPU name, or None on failure."""
+    # Inline nvidia-smi query — killall.py runs before pip install, so sglang
+    # internals may not be importable.
     try:
-        out = subprocess.check_output(
+        result = subprocess.run(
             [
                 "nvidia-smi",
                 "--query-gpu=driver_version",
                 "--format=csv,noheader,nounits",
             ],
+            capture_output=True,
             text=True,
+            check=True,
             timeout=10,
         )
-        driver = out.strip().splitlines()[0].strip() if out.strip() else "unknown"
-    except (subprocess.SubprocessError, FileNotFoundError, IndexError):
+        driver = result.stdout.strip().split("\n")[0].strip() or None
+    except (subprocess.SubprocessError, FileNotFoundError):
+        driver = None
+    if driver is None:
         return None
     try:
         out = subprocess.check_output(
