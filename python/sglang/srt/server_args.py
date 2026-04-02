@@ -434,6 +434,7 @@ class ServerArgs:
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
+    enable_debug_error_responses: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
@@ -4482,6 +4483,11 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--enable-debug-error-responses",
+            action="store_true",
+            help="Return raw exception details in HTTP error responses instead of sanitized messages. For development use only.",
         )
         parser.add_argument(
             "--reasoning-parser",

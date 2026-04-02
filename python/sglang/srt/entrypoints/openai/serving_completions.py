@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import secrets
 import time
+import traceback
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -29,6 +31,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
@@ -373,7 +376,29 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 yield f"data: {final_usage_data}\n\n"
 
         except Exception as e:
-            error = self.create_streaming_error_response(str(e))
+            error_id = secrets.token_hex(6)
+            tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            logger.error(
+                "Streaming error [error_id=%s]: %s\n%s",
+                error_id,
+                e,
+                tb,
+            )
+            if (
+                isinstance(self.tokenizer_manager.server_args, ServerArgs)
+                and self.tokenizer_manager.server_args.enable_debug_error_responses
+            ):
+                error = self.create_streaming_error_response(
+                    str(e),
+                    err_type="InternalServerError",
+                    status_code=500,
+                )
+            else:
+                error = self.create_streaming_error_response(
+                    f"Internal server error. Please contact the administrator. Error ID: {error_id}",
+                    err_type="InternalServerError",
+                    status_code=500,
+                )
             yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"

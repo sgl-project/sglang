@@ -367,7 +367,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
                 return result
             except Exception as e:
-                return self.create_error_response(str(e))
+                return self._sanitize_internal_error(e)
         return self.create_error_response("Unknown error")
 
     async def _make_request(
@@ -738,7 +738,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         except Exception as e:
             logger.exception("Background request failed for %s", request.request_id)
-            response = self.create_error_response(str(e))
+            response = self._sanitize_internal_error(e)
 
         if isinstance(response, ORJSONResponse):
             # If the request has failed, update the status to "failed"

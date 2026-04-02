@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
+import traceback
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -125,12 +127,7 @@ class OpenAIServingBase(ABC):
                 status_code=400,
             )
         except Exception as e:
-            logger.exception(f"Error in request: {e}")
-            return self.create_error_response(
-                message=f"Internal server error: {str(e)}",
-                err_type="InternalServerError",
-                status_code=500,
-            )
+            return self._sanitize_internal_error(e)
 
     @abstractmethod
     def _request_id_prefix(self) -> str:
@@ -205,6 +202,31 @@ class OpenAIServingBase(ABC):
     def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
+
+    def _sanitize_internal_error(self, e: Exception) -> ORJSONResponse:
+        """Sanitize internal errors, logging full details server-side."""
+        error_id = secrets.token_hex(6)
+        tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        logger.error(
+            "Internal error [error_id=%s]: %s\n%s",
+            error_id,
+            e,
+            tb,
+        )
+        if (
+            isinstance(self.tokenizer_manager.server_args, ServerArgs)
+            and self.tokenizer_manager.server_args.enable_debug_error_responses
+        ):
+            return self.create_error_response(
+                message=str(e),
+                err_type="InternalServerError",
+                status_code=500,
+            )
+        return self.create_error_response(
+            message=f"Internal server error. Please contact the administrator. Error ID: {error_id}",
+            err_type="InternalServerError",
+            status_code=500,
+        )
 
     def create_error_response(
         self,

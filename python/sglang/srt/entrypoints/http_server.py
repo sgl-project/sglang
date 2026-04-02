@@ -21,9 +21,11 @@ import asyncio
 import dataclasses
 import logging
 import os
+import secrets
 import tempfile
 import threading
 import time
+import traceback
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -1721,7 +1723,58 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Catch-all handler for unhandled exceptions."""
+    if _global_state and hasattr(_global_state, "tokenizer_manager"):
+        server_args = _global_state.tokenizer_manager.server_args
+        if (
+            isinstance(server_args, ServerArgs)
+            and server_args.enable_debug_error_responses
+        ):
+            return ORJSONResponse(
+                {"error": {"message": str(exc)}},
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+    message = _sanitize_error_message(exc)
+    return ORJSONResponse(
+        {"error": {"message": message}},
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+    )
+
+
+def _sanitize_error_message(e: Exception) -> str:
+    """Generate a sanitized error message with a unique error_id for correlation."""
+    error_id = secrets.token_hex(6)
+    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    logger.error(
+        "Internal error [error_id=%s]: %s\n%s",
+        error_id,
+        e,
+        tb,
+    )
+    return (
+        f"Internal server error. Please contact the administrator. Error ID: {error_id}"
+    )
+
+
 def _create_error_response(e):
+    if isinstance(e, Exception) and not isinstance(e, (ValueError, TypeError)):
+        if _global_state and hasattr(_global_state, "tokenizer_manager"):
+            server_args = _global_state.tokenizer_manager.server_args
+            if (
+                isinstance(server_args, ServerArgs)
+                and server_args.enable_debug_error_responses
+            ):
+                return ORJSONResponse(
+                    {"error": {"message": str(e)}},
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+        message = _sanitize_error_message(e)
+        return ORJSONResponse(
+            {"error": {"message": message}},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
     )
