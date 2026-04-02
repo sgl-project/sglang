@@ -2056,6 +2056,40 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
         dist.destroy_process_group()
 
 
+def maybe_stub_sgl_kernel():
+    """Stub sgl_kernel if it cannot be imported (e.g. no GPU).
+
+    Must be called before any import that transitively depends on sgl_kernel.
+    On machines with a working sgl_kernel this is a no-op.
+    """
+    try:
+        import sgl_kernel  # noqa: F401
+
+        return
+    except (ImportError, OSError):
+        pass
+
+    import types
+
+    class _SglKernelFinder:
+        def find_module(self, fullname, path=None):
+            if fullname == "sgl_kernel" or fullname.startswith("sgl_kernel."):
+                return self
+            return None
+
+        def load_module(self, fullname):
+            if fullname in sys.modules:
+                return sys.modules[fullname]
+            mod = types.ModuleType(fullname)
+            mod.__path__ = []
+            mod.__package__ = fullname
+            mod.__loader__ = self
+            sys.modules[fullname] = mod
+            return mod
+
+    sys.meta_path.insert(0, _SglKernelFinder())
+
+
 class CustomTestCase(unittest.TestCase):
 
     def __init_subclass__(cls, **kwargs):
