@@ -1515,8 +1515,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("in_proj_ba.", "in_proj_a.", 1),
         ]
 
-        text_config = getattr(self.config, "text_config", self.config)
-        num_experts_base = text_config.num_experts
+        num_experts = self.config.num_experts
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -1525,9 +1524,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=(
-                self.config.num_experts
+                num_experts
                 if not self.enable_fused_moe 
-                else num_experts_base + self.num_fused_shared_experts
+                else num_experts + self.num_fused_shared_experts  # map shared experts to routed experts
             ),
         )
 
@@ -1549,23 +1548,27 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
 
-        num_experts = self.config.num_experts
         if self.enable_fused_moe:
+            """
+            When shared experts are fused, we need to map the shared experts to routed experts.
+
+            mlp.share_expert.gate_up_proj.weight  --> experts.512.gate_up_proj.weight -> experts.w13_weight, expert_id = 512
+            mlp.share_expert.down_proj.weight  --> experts.512.down_proj.weight -> experts.w2_weight, expert_id = 512
+            """
             fused_expert_params_mapping += [
                 (
                     "experts.w13_",
-                    f"experts.{num_experts_base}.gate_up_proj.",
-                    num_experts_base,
+                    f"experts.{num_experts}.gate_up_proj.",
+                    num_experts,
                     "w1",
                 ),
                 (
                     "experts.w2_",
-                    f"experts.{num_experts_base}.down_proj.",
-                    num_experts_base,
+                    f"experts.{num_experts}.down_proj.",
+                    num_experts,
                     "w2",
                 ),
             ]
-            num_experts = num_experts_base + self.num_fused_shared_experts
 
         def load_fused_expert_weights(
             name: str,
@@ -1624,9 +1627,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
             if self.enable_fused_moe:
                 if "mlp.shared_expert." in name:
+                    # Firstly map mlp.shared_expert.xx_proj to mlp.experts.512.xx_proj
                     name = name.replace(
                         "mlp.shared_expert.",
-                        f"mlp.experts.{num_experts_base}.",
+                        f"mlp.experts.{num_experts}.",
                     )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1677,7 +1681,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if is_fused_expert:
+                        # is_fused_expert is True, the checkpoint contains gate_up_proj and down_proj for each expert
                         if "experts.gate_up_proj" in name:
+                            # experts.gate_up_proj contains all 512 routed experts, excluding shared experts
+                            # split into w1 and w3
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
                             load_fused_expert_weights(
                                 name_mapped,
@@ -1687,7 +1694,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 (
                                     num_experts
                                     if not self.enable_fused_moe
-                                    else num_experts_base
+                                    else num_experts
                                     + self.num_fused_shared_experts
                                 ),
                             )
@@ -1699,11 +1706,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 (
                                     num_experts
                                     if not self.enable_fused_moe
-                                    else num_experts_base
+                                    else num_experts
                                     + self.num_fused_shared_experts
                                 ),
                             )
                         elif "experts.down_proj" in name:
+                            # experts.down_proj contains all 512 routed experts, excluding shared experts
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -1712,18 +1720,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 (
                                     num_experts
                                     if not self.enable_fused_moe
-                                    else num_experts_base
+                                    else num_experts
                                     + self.num_fused_shared_experts
                                 ),
                             )
-                        else:
+                        elif self.enable_fused_moe:
+                            # shared experts should be loaded to experts.w13_weight and experts.w2_weight
                             param = params_dict[name_mapped]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
                             param = params_dict[name_mapped]
-                            if f"{num_experts_base}.gate_up_proj" in name:
+                            if f"{num_experts}.gate_up_proj" in name:
+                                # split into w1 and w3
                                 loaded_weight = loaded_weight.chunk(2, dim=-2)
+                                # load to experts.w13_weight, shard_id = w1, expert_id = 512
                                 weight_loader(
                                     param,
                                     loaded_weight[0],
@@ -1731,6 +1742,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                     "w1",
                                     expert_id,
                                 )
+                                # load to experts.w13_weight, shard_id = w3, expert_id = 512
                                 weight_loader(
                                     param,
                                     loaded_weight[1],
@@ -1739,6 +1751,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                     expert_id,
                                 )
                             else:
+                                # load to experts.w2_weight, shard_id = w2, expert_id = 512
                                 weight_loader(
                                     param,
                                     loaded_weight,
