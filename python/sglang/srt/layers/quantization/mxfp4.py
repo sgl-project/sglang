@@ -298,7 +298,7 @@ class Mxfp4Config(QuantizationConfig):
                 return Mxfp4DynamicQuantMoEMethod()
         else:
             if self.is_checkpoint_mxfp4_serialized:
-                raise NotImplementedError("Mxfp4 attention layer is not implemented")
+                return None
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -332,6 +332,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+        )
+
         self.num_experts = num_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8

@@ -33,8 +33,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
-    from aiter.ops.shuffle import shuffle_weight
-    from aiter.utility.fp4_utils import e8m0_shuffle
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
 OCP_MX_BLOCK_SIZE = 32
 
@@ -52,7 +51,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 "For MX(FP4) Fused MoE layers, only per-group scales "
                 "for weights and activations are supported. Found "
                 f"{weight_qscheme}, {input_qscheme}"
-            )  # noqa E501
+            )
 
         self.static_input_scales = not self.input_quant.get("is_dynamic")
         self.with_bias = False
@@ -73,8 +72,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        # Add the quantization method used (per tensor/grouped/channel)
-        # to ensure the weight scales are loaded in properly
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
@@ -133,35 +130,85 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
+        # WEIGHT_BIAS (zeros, matching standard mxfp4 path for CUDA graph compat)
+        w13_weight_bias = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_bias", w13_weight_bias)
+        set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+
+        w2_weight_bias = torch.nn.Parameter(
+            torch.zeros(num_experts, hidden_size, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_bias", w2_weight_bias)
+        set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+
+        self.hidden_pad = 0
+        self.intermediate_pad = 0
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        float_dtype = torch.get_default_dtype()
+        if not _use_aiter:
+            return
 
-        # Pre-shuffle weight scales
-        s0, s1, _ = layer.w13_weight_scale.shape
-        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-        # layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale, requires_grad=False)
-        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        # Convert bias to float32 (matching standard path)
+        if layer.w13_weight_bias is not None:
+            layer.w13_weight_bias.data = layer.w13_weight_bias.data.to(torch.float32)
+        if layer.w2_weight_bias is not None:
+            layer.w2_weight_bias.data = layer.w2_weight_bias.data.to(torch.float32)
 
-        s0, s1, _ = layer.w2_weight_scale.shape
-        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-        # layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
-        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+        # Interleave w1 (gate) and w3 (up) halves in w13 for Swiglu activation
+        e, n, k = layer.w13_weight.shape
+        layer.w13_weight.view(torch.uint8).copy_(
+            layer.w13_weight.data.view(torch.uint8)
+            .view(e, n // 2, 2, k)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(e, n, k)
+        )
+        layer.w13_weight_scale.data = (
+            layer.w13_weight_scale.data.view(e, n // 2, 2, -1)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(e, n, -1)
+        )
 
-        # Pre-shuffle weight
-        if _is_shuffle_moe_mxfp4:
-            layer.w13_weight.data = shuffle_weight(
-                layer.w13_weight.contiguous(), (16, 16)
-            )
-            layer.w2_weight.data = shuffle_weight(
-                layer.w2_weight.contiguous(), (16, 16)
-            )
-            layer.w13_weight.is_shuffled = True
-            layer.w2_weight.is_shuffled = True
+        # Interleave bias halves too
+        layer.w13_weight_bias.data = (
+            layer.w13_weight_bias.data.view(-1, n // 2, 2)
+            .permute(0, 2, 1)
+            .contiguous()
+            .view(-1, n)
+        )
+
+        # Shuffle weights using CUDA-graph-compatible a16w4 functions
+        layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
+        shuffled_w13_scale = shuffle_scale_a16w4(
+            layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+            e,
+            True,
+        )
+
+        layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
+        shuffled_w2_scale = shuffle_scale_a16w4(
+            layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+            e,
+            False,
+        )
+
+        layer.w13_weight_scale = torch.nn.Parameter(
+            shuffled_w13_scale, requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            shuffled_w2_scale, requires_grad=False
+        )
 
         if hasattr(layer, "dispatcher"):
-            # Weights are stored as torch.uint8 but semantically MXFP4
             layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
 
     def create_moe_runner(
@@ -182,9 +229,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         moe_runner_config = self.moe_runner_config
         topk_weights, topk_ids, _ = topk_output
         if _is_hip:
-            topk_weights = topk_weights.to(
-                torch.float32
-            )  # aiter's moe_sorting requires topk_weights to be FP32
+            topk_weights = topk_weights.to(torch.float32)
 
         if hasattr(torch, "float4_e2m1fn_x2"):
             w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
@@ -192,10 +237,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         else:
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
-
-        if hasattr(layer.w13_weight, "is_shuffled"):
-            w13_weight.is_shuffled = True
-            w2_weight.is_shuffled = True
 
         output = fused_moe(
             x,
@@ -206,12 +247,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             quant_type=QuantType.per_1x32,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            activation=(
-                ActivationType.Silu
-                if moe_runner_config.activation == "silu"
-                else ActivationType.Gelu
-            ),
-            doweight_stage1=False,
+            activation=ActivationType.Swiglu,
+            doweight_stage1=moe_runner_config.apply_router_weight_on_input,
             expert_mask=layer.expert_mask_gpu,
+            hidden_pad=self.hidden_pad,
+            intermediate_pad=self.intermediate_pad,
+            bias1=layer.w13_weight_bias,
+            bias2=layer.w2_weight_bias,
         )
         return StandardCombineInput(hidden_states=output)

@@ -291,6 +291,21 @@ class FusedMoE(torch.nn.Module):
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
 
+        # Pre-compute expert_mask for CUDA graph compatibility (EP mode)
+        if (
+            _use_aiter
+            and getattr(self.dispatcher, "local_expert_mapping", None) is not None
+        ):
+            expert_mask = (
+                (
+                    (self.dispatcher.local_expert_mapping >= 0)
+                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
+                )
+                .to(torch.int32)
+                .to(device="cuda")
+            )
+            self.register_buffer("expert_mask_gpu", expert_mask)
+
         self.should_fuse_routed_scaling_factor_in_topk = isinstance(
             self.quant_method, ModelOptNvFp4FusedMoEMethod
         ) or (
@@ -438,8 +453,11 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                if not is_bias and self.use_triton_kernels:
-                    # do not transpose for bias
+                is_packed = (
+                    loaded_weight.dtype == torch.uint8
+                    and expert_data.dtype == torch.uint8
+                )
+                if not is_bias and self.use_triton_kernels and not is_packed:
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
@@ -512,7 +530,11 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not is_bias and not self.use_presharded_weights:
-                if self.use_triton_kernels:
+                is_packed = (
+                    loaded_weight.dtype == torch.uint8
+                    and expert_data.dtype == torch.uint8
+                )
+                if self.use_triton_kernels and not is_packed:
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
@@ -576,7 +598,7 @@ class FusedMoE(torch.nn.Module):
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
-            not expert_id
+            expert_id is None
             and self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
             and self.quant_config.is_static_cfg()
@@ -725,7 +747,8 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if self.use_triton_kernels:
+        is_packed_fp4 = param.data.dtype == torch.uint8
+        if self.use_triton_kernels and not is_packed_fp4:
             is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
@@ -994,15 +1017,6 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-        if _use_aiter and self.dispatcher.local_expert_mapping is not None:
-            self.expert_mask_gpu = (
-                (
-                    (self.dispatcher.local_expert_mapping >= 0)
-                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
-                )
-                .to(torch.int32)
-                .to(device="cuda")
-            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,

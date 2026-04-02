@@ -125,7 +125,9 @@ def _is_equal_or_regex_match(
 def b_dynamic_mxfp4_quant(x):
     h, b, d = x.shape
     x, x_scales = dynamic_mxfp4_quant(x.reshape(-1, d))
-    return x.view(h, b, d // 2), x_scales.view(h, b, d // 32)
+    x_out = x.view(h, b, d // 2).contiguous()
+    s_out = x_scales.contiguous().view(h, b, d // 32).contiguous()
+    return x_out, s_out
 
 
 def mxfp4_to_f32(x, is_3d):

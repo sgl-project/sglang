@@ -1,9 +1,10 @@
-"""Kimi K2.5 MXFP4 tests (8-GPU, MI35x)
+"""GLM-5 MXFP4 tests (4-GPU, MI35x)
 
-Tests Quark MXFP4 (W4A4) quantization for Kimi K2.5:
-- Model: amd/Kimi-K2.5-MXFP4 (quant_method=quark, per-expert FP4)
-- Architecture: KimiK25ForConditionalGeneration (DeepSeek V2 based)
-- 256 routed experts, hidden_size=7168, TP=8
+Tests two MXFP4 quantization formats for GLM-5:
+- Quark format (amd/GLM-5-MXFP4): quant_method=quark, per-expert FP4
+- Standard format (usableteapot/glm5-mxfp4): quant_method=mxfp4, per-expert FP4
+
+Both use GlmMoeDsaForCausalLM with NSA attention and 256 routed experts.
 """
 
 import os
@@ -27,40 +28,48 @@ register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 SERVER_LAUNCH_TIMEOUT = 3600
 
-KIMI_SERVE_ARGS = [
+GLM5_SERVE_ARGS = [
     "--tp",
-    "8",
+    "4",
+    "--nsa-prefill-backend",
+    "tilelang",
+    "--nsa-decode-backend",
+    "aiter",
     "--cuda-graph-max-bs",
-    "16",
+    "64",
     "--disable-radix-cache",
     "--mem-fraction-static",
     "0.85",
     "--trust-remote-code",
+    "--tool-call-parser",
+    "glm47",
+    "--reasoning-parser",
+    "glm45",
     "--model-loader-extra-config",
     '{"enable_multithread_load": true, "num_threads": 8}',
 ]
 
-KIMI_SERVE_ENV = {
+GLM5_SERVE_ENV = {
     "SGLANG_USE_AITER": "1",
     "SAFETENSORS_FAST_GPU": "1",
 }
 
 
-class TestKimiK25QuarkMXFP4(CustomTestCase):
-    """Kimi K2.5 with Quark MXFP4 quantization (amd/Kimi-K2.5-MXFP4)."""
+class _GLM5MXFP4Base(CustomTestCase):
+    """Base class for GLM-5 MXFP4 tests."""
 
-    model = "amd/Kimi-K2.5-MXFP4"
+    model: str = ""
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         env = os.environ.copy()
-        env.update(KIMI_SERVE_ENV)
+        env.update(GLM5_SERVE_ENV)
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=KIMI_SERVE_ARGS,
+            other_args=GLM5_SERVE_ARGS,
             env=env,
         )
 
@@ -87,6 +96,18 @@ class TestKimiK25QuarkMXFP4(CustomTestCase):
             )
             if is_in_amd_ci():
                 self.assertGreater(speed, 10)
+
+
+class TestGLM5QuarkMXFP4(_GLM5MXFP4Base):
+    """GLM-5 with Quark MXFP4 quantization (amd/GLM-5-MXFP4)."""
+
+    model = "amd/GLM-5-MXFP4"
+
+
+class TestGLM5StandardMXFP4(_GLM5MXFP4Base):
+    """GLM-5 with standard MXFP4 quantization (usableteapot/glm5-mxfp4)."""
+
+    model = "usableteapot/glm5-mxfp4"
 
 
 if __name__ == "__main__":

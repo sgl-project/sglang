@@ -2055,8 +2055,10 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
-    # for quark model load
-    packed_modules_mapping = {}
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
 
     def __init__(
         self,
@@ -2158,6 +2160,22 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             disable_reason = "Deepseek V3/R1 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
+        elif (
+            self.quant_config
+            and self.quant_config.get_name() == "mxfp4"
+            and getattr(self.quant_config, "is_checkpoint_mxfp4_serialized", False)
+        ):
+            disable_reason = "MXFP4 serialized model has quantized routed experts but BF16 shared experts."
+        elif (
+            self.quant_config
+            and self.quant_config.get_name() == "quark"
+            and getattr(self.quant_config, "quant_config", {})
+            .get("global_quant_config", {})
+            .get("weight", {})
+            .get("dtype")
+            == "fp4"
+        ):
+            disable_reason = "Quark MXFP4 model has quantized routed experts but BF16 shared experts."
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
