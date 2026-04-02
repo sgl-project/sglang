@@ -360,20 +360,15 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
 
-    For SM100, flashinfer_trtllm is the default backend.
+    For MXFP8, Triton remains the default path. We only route to FlashInfer
+    when backend is explicitly set to flashinfer_cutlass or flashinfer_trtllm.
     """
     backend = get_fp8_gemm_runner_backend()
-    if backend.is_auto():
-        if is_sm100_supported() and is_flashinfer_available():
-            return flashinfer_mxfp8_blockscaled_linear
-        else:
-            return triton_mxfp8_blockscaled_linear
-    elif backend.is_flashinfer_trtllm():
+    if backend.is_flashinfer_trtllm():
         return flashinfer_mxfp8_blockscaled_linear
     elif backend.is_flashinfer_cutlass():
         return flashinfer_mxfp8_blockscaled_linear
-    else:
-        return triton_mxfp8_blockscaled_linear
+    return triton_mxfp8_blockscaled_linear
 
 
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
@@ -984,10 +979,7 @@ def flashinfer_mxfp8_blockscaled_linear(
     # Ensure transposed tensors are contiguous for FlashInfer's internal runner.
     weight_t = weight.contiguous().t()
 
-    if (
-        get_fp8_gemm_runner_backend().is_auto()
-        or get_fp8_gemm_runner_backend().is_flashinfer_trtllm()
-    ):
+    if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
 
         weight_scale_t = weight_scale.contiguous().view(-1)
         output = flashinfer_mm_mxfp8(
