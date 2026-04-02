@@ -63,7 +63,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.utils.torch_compile_utils import CompilableRegionMixin
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
     is_prefill_context_parallel_enabled,
@@ -89,6 +88,7 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.torch_compile_utils import CompilableRegionMixin
 
 _is_cuda = is_cuda()
 
@@ -594,31 +594,25 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
 
     # -- CompilableRegionMixin interface ----------------------------------
 
-    # Split into two compile regions so Inductor can lower each to a single
-    # kernel (fused as one region it emits 3 kernels; split → 2 total).
     _REGION_DYNAMIC = {"QKNorm": False, "RopeKV": None}
 
     def get_compilable_regions(self) -> dict[str, str]:
-        return {"QKNorm": "_qk_norm", "RopeKV": "_rope_kv"}
+        return {"QKNorm": "_apply_qk_norm_native", "RopeKV": "_rope_kv_native"}
 
-    def _qk_norm(self, q, k):
-        """Compilable region: qk-norm (dynamic=False)."""
+    def _apply_qk_norm_native(self, q, k):
         q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
         k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
         return q, k
 
-    def _rope_kv(self, q, k, positions, fused_kv_arg):
-        """Compilable region: rope + kv-cache-write (dynamic=None)."""
-        q, k = self.rotary_emb(
-            positions, q, k, fused_set_kv_buffer_arg=fused_kv_arg
-        )
+    def _rope_kv_native(self, q, k, positions, fused_kv_arg):
+        q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_kv_arg)
         return q, k
 
     # -- apply_qk_norm_rope ---------------------------------------------
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
 
-        if self.is_region_compiled("QKNorm") or self.is_region_compiled("RopeKV"):
+        if self.is_region_compiled("QKNorm") and self.is_region_compiled("RopeKV"):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             fused_kv_arg = (
                 create_fused_set_kv_buffer_arg(
@@ -630,8 +624,9 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
                 and self.compatible_with_fused_kv_buffer
                 else None
             )
-            q, k = self._qk_norm(q, k)
-            q, k = self._rope_kv(q, k, positions, fused_kv_arg)
+            q, k = self._apply_qk_norm_native(q, k)
+            q, k = self._rope_kv_native(q, k, positions, fused_kv_arg)
+            # In this branch kv cache is fused with rope, if allowed
             self._did_fused_kv_write_last_call = fused_kv_arg is not None
         elif self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
             theta = self.rope_theta
