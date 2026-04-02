@@ -166,6 +166,10 @@ jobs:
       )
     runs-on: 1-gpu-h100
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -193,19 +197,19 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd python
-          if [ "${{ inputs.continue_on_error }}" = "true" ]; then
-            exit_code=0
-            python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_a.py || exit_code=$?
-            python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_b.py || exit_code=$?
-            exit $exit_code
-          fi
-          python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_a.py
-          python3 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_1_gpu_b.py
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite component-accuracy-1-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2 \
+            $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-component-accuracy-2-gpu:
     if: |
@@ -217,6 +221,10 @@ jobs:
       )
     runs-on: 2-gpu-h100
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -244,19 +252,19 @@ jobs:
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd python
-          if [ "${{ inputs.continue_on_error }}" = "true" ]; then
-            exit_code=0
-            torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_a.py || exit_code=$?
-            torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_b.py || exit_code=$?
-            exit $exit_code
-          fi
-          torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_a.py
-          torchrun --nproc_per_node=2 -m pytest -s -v sglang/multimodal_gen/test/server/test_accuracy_2_gpu_b.py
+          python3 sglang/multimodal_gen/test/run_suite.py \
+            --suite component-accuracy-2-gpu \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions 2 \
+            $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
+        with:
+          artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-unit-test:
     if: |
