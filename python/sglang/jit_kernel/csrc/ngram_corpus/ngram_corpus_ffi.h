@@ -17,6 +17,7 @@ static std::atomic<int64_t> g_next_id{0};
 static std::mutex g_map_mutex;
 
 inline ngram::Ngram& get_instance(int64_t handle) {
+  std::lock_guard<std::mutex> lock(g_map_mutex);
   auto it = g_instances.find(handle);
   if (it == g_instances.end()) {
     throw std::runtime_error("Invalid ngram handle: " + std::to_string(handle));
@@ -95,6 +96,16 @@ struct NgramCorpusFfi {
 
     auto* out_tok = static_cast<int32_t*>(out_tokens.data_ptr());
     auto* out_msk = static_cast<uint8_t*>(out_mask.data_ptr());
+    if (result.token.size() > static_cast<size_t>(out_tokens.size(0))) {
+      throw std::runtime_error(
+          "out_tokens buffer too small: " + std::to_string(out_tokens.size(0)) + " < " +
+          std::to_string(result.token.size()));
+    }
+    if (result.mask.size() > static_cast<size_t>(out_mask.size(0))) {
+      throw std::runtime_error(
+          "out_mask buffer too small: " + std::to_string(out_mask.size(0)) + " < " +
+          std::to_string(result.mask.size()));
+    }
     std::memcpy(out_tok, result.token.data(), result.token.size() * sizeof(int32_t));
     std::memcpy(out_msk, result.mask.data(), result.mask.size() * sizeof(uint8_t));
   }
