@@ -288,7 +288,26 @@ class GenerateReqInput(BaseReq):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
             )
-        self._validate_sampling_params_type()
+        if self.sampling_params is None or isinstance(self.sampling_params, dict):
+            return
+
+        if isinstance(self.sampling_params, list):
+            invalid_types = {
+                type(sampling_params).__name__
+                for sampling_params in self.sampling_params
+                if not isinstance(sampling_params, dict)
+            }
+            if not invalid_types:
+                return
+            raise TypeError(
+                "sampling_params must be a dict or list of dicts, "
+                f"got list containing {', '.join(sorted(invalid_types))}."
+            )
+
+        raise TypeError(
+            "sampling_params must be a dict or list of dicts, "
+            f"got {type(self.sampling_params).__name__}."
+        )
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
@@ -317,29 +336,6 @@ class GenerateReqInput(BaseReq):
             else:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
-
-    def _validate_sampling_params_type(self):
-        """Validate sampling_params stays on the public request shape."""
-        if self.sampling_params is None or isinstance(self.sampling_params, dict):
-            return
-
-        if isinstance(self.sampling_params, list):
-            invalid_types = {
-                type(sampling_params).__name__
-                for sampling_params in self.sampling_params
-                if not isinstance(sampling_params, dict)
-            }
-            if not invalid_types:
-                return
-            raise TypeError(
-                "sampling_params must be a dict or list of dicts, "
-                f"got list containing {', '.join(sorted(invalid_types))}."
-            )
-
-        raise TypeError(
-            "sampling_params must be a dict or list of dicts, "
-            f"got {type(self.sampling_params).__name__}."
-        )
 
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
