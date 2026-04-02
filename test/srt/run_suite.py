@@ -166,7 +166,7 @@ def auto_partition(files, rank, size):
     return [files[i] for i in indices]
 
 
-def _sanity_check_suites(suites):
+def _sanity_check_suites(suites, selected_suite=None):
     dir_base = Path(__file__).parent
     disk_files = set(
         [
@@ -176,17 +176,28 @@ def _sanity_check_suites(suites):
         ]
     )
 
+    # Only check the selected suite(s) to avoid cross-platform failures
+    # (e.g., XPU runners don't have ascend test files on disk and vice versa)
+    if selected_suite and selected_suite != "all":
+        check_suites = {selected_suite: suites[selected_suite]}
+        if "__not_in_ci__" in suites:
+            check_suites["__not_in_ci__"] = suites["__not_in_ci__"]
+    else:
+        check_suites = suites
+
     suite_files = set(
-        [test_file.name for _, suite in suites.items() for test_file in suite]
+        [test_file.name for _, suite in check_suites.items() for test_file in suite]
     )
 
-    missing_files = sorted(list(disk_files - suite_files))
-    missing_text = "\n".join(f'TestFile("{x}"),' for x in missing_files)
-    assert len(missing_files) == 0, (
-        f"Some test files are not in test suite. "
-        f"If this is intentional, please add the following to `not_in_ci` section:\n"
-        f"{missing_text}"
-    )
+    # Only check for orphan files when validating all suites
+    if selected_suite is None or selected_suite == "all":
+        missing_files = sorted(list(disk_files - suite_files))
+        missing_text = "\n".join(f'TestFile("{x}"),' for x in missing_files)
+        assert len(missing_files) == 0, (
+            f"Some test files are not in test suite. "
+            f"If this is intentional, please add the following to `not_in_ci` section:\n"
+            f"{missing_text}"
+        )
 
     nonexistent_files = sorted(list(suite_files - disk_files))
     nonexistent_text = "\n".join(f'TestFile("{x}"),' for x in nonexistent_files)
@@ -195,12 +206,12 @@ def _sanity_check_suites(suites):
     ), f"Some test files in test suite do not exist on disk:\n{nonexistent_text}"
 
     not_in_ci_files = set(
-        [test_file.name for test_file in suites.get("__not_in_ci__", [])]
+        [test_file.name for test_file in check_suites.get("__not_in_ci__", [])]
     )
     in_ci_files = set(
         [
             test_file.name
-            for suite_name, suite in suites.items()
+            for suite_name, suite in check_suites.items()
             if suite_name != "__not_in_ci__"
             for test_file in suite
         ]
@@ -271,7 +282,7 @@ def main():
     args = arg_parser.parse_args()
     print(f"{args=}")
 
-    _sanity_check_suites(suites)
+    _sanity_check_suites(suites, selected_suite=args.suite)
 
     if args.suite == "all":
         files = glob.glob("**/test_*.py", recursive=True)
