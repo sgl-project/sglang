@@ -139,6 +139,7 @@ test = [
   "pandas",
   "parameterized",
   "peft>=0.18.0",
+  "polars",
   "pytest",
   "pytest-cov",
   "diff-cover",
