@@ -174,7 +174,6 @@ class Scheduler:
         with trace_slice(
             req.trace_ctx,
             DiffStage.SCHEDULER_DISPATCH,
-            level=1,
             thread_finish_flag=True,
         ):
             return self.worker.execute_forward(reqs)

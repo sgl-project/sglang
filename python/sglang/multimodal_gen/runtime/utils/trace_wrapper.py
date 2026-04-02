@@ -8,14 +8,22 @@ start/end bookkeeping.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from enum import Enum
+from dataclasses import dataclass
 
 
-class DiffStage(str, Enum):
+@dataclass(frozen=True)
+class DiffStageConfig:
+    """A named trace stage with a default nesting level."""
+
+    stage_name: str
+    level: int = 0
+
+
+class DiffStage:
     """Named trace stages for the diffusion pipeline."""
 
-    SCHEDULER_DISPATCH = "scheduler_dispatch"
-    GPU_FORWARD = "gpu_forward"
+    SCHEDULER_DISPATCH = DiffStageConfig("scheduler_dispatch", level=1)
+    GPU_FORWARD = DiffStageConfig("gpu_forward", level=2)
 
 
 @contextmanager
@@ -34,16 +42,16 @@ def trace_req(trace_ctx):
 
 
 @contextmanager
-def trace_slice(trace_ctx, stage: DiffStage, *, level: int = 1, **kwargs):
+def trace_slice(trace_ctx, stage: DiffStageConfig, **kwargs):
     """Context manager for a single trace slice (span).
 
     Usage::
 
-        with trace_slice(req.trace_ctx, DiffStage.GPU_FORWARD, level=2):
+        with trace_slice(req.trace_ctx, DiffStage.GPU_FORWARD):
             result = pipeline.forward(req, server_args)
     """
-    trace_ctx.trace_slice_start(stage.value, level=level)
+    trace_ctx.trace_slice_start(stage.stage_name, level=stage.level)
     try:
         yield trace_ctx
     finally:
-        trace_ctx.trace_slice_end(stage.value, level=level, **kwargs)
+        trace_ctx.trace_slice_end(stage.stage_name, level=stage.level, **kwargs)

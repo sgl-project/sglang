@@ -228,7 +228,7 @@ class GPUWorker:
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
-            with trace_slice(req.trace_ctx, DiffStage.GPU_FORWARD, level=2):
+            with trace_slice(req.trace_ctx, DiffStage.GPU_FORWARD):
                 result = self.pipeline.forward(req, self.server_args)
 
             if isinstance(result, Req):
