@@ -50,7 +50,7 @@ class TestQueueCount(CustomTestCase):
     """Unit tests for QueueCount (no server needed)."""
 
     def test_queue_count_from_reqs(self):
-        """QueueCount correctly counts per-priority breakdown."""
+        """QueueCount correctly counts per-priority breakdown (bucketed to strings)."""
         reqs = [
             Mock(priority=1),
             Mock(priority=1),
@@ -60,7 +60,8 @@ class TestQueueCount(CustomTestCase):
         ]
         qc = QueueCount.from_reqs(reqs, enable_priority_scheduling=True)
         self.assertEqual(qc.total, 5)
-        self.assertEqual(qc.by_priority, {1: 2, 5: 2, 10: 1})
+        # Keys are now strings produced by transform_priority()
+        self.assertEqual(qc.by_priority, {"1": 2, "5": 2, "10": 1})
 
     def test_queue_count_from_reqs_disabled(self):
         """Priority scheduling disabled → no breakdown."""
@@ -74,6 +75,22 @@ class TestQueueCount(CustomTestCase):
         qc = QueueCount.from_reqs([], enable_priority_scheduling=True)
         self.assertEqual(qc.total, 0)
         self.assertEqual(qc.by_priority, {})
+
+    def test_queue_count_out_of_range_priorities_are_bucketed(self):
+        """Out-of-range priorities are bucketed to prevent unbounded cardinality."""
+        reqs = [
+            Mock(priority=-5),
+            Mock(priority=-100),
+            Mock(priority=99999),
+            Mock(priority=31),
+            Mock(priority=0),
+            Mock(priority=None),
+        ]
+        qc = QueueCount.from_reqs(reqs, enable_priority_scheduling=True)
+        self.assertEqual(qc.total, 6)
+        # -5 and -100 both map to "LOW", 99999 and 31 both map to "HIGH",
+        # 0 maps to "0", None maps to "UNKNOWN"
+        self.assertEqual(qc.by_priority, {"LOW": 2, "HIGH": 2, "0": 1, "UNKNOWN": 1})
 
 
 class TestPriorityMetrics(CustomTestCase):
