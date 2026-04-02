@@ -180,10 +180,25 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> StreamingResponse:
+    ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming completion request"""
+        generator = self._generate_completion_stream(
+            adapted_request, request, raw_request
+        )
+
+        # Kick-start the generator to trigger validation before HTTP 200 is sent.
+        try:
+            first_chunk = await generator.__anext__()
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        async def prepend_first_chunk():
+            yield first_chunk
+            async for chunk in generator:
+                yield chunk
+
         return StreamingResponse(
-            self._generate_completion_stream(adapted_request, request, raw_request),
+            prepend_first_chunk(),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
