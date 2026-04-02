@@ -320,5 +320,121 @@ module.exports = {
             out_file:   `${ROOT}/logs/fm-dashboard-out.log`,
             time:       true,
         },
+
+        // ── v10003.38 UNIFIED HARMONIC ANCHOR NODES ───────────────────
+
+        // Cloudflared tunnel — wraps binary in bash to avoid PM2 crash loop
+        {
+            name:              'fm-cloudflared',
+            script:            'bash',
+            args:              ['-c', 'exec cloudflared tunnel --no-autoupdate run --token $CLOUDFLARED_TOKEN'],
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'100M',
+            env_production: {
+                NODE_ENV: 'production',
+            },
+            error_file: `${ROOT}/logs/fm-cloudflared-error.log`,
+            out_file:   `${ROOT}/logs/fm-cloudflared-out.log`,
+            time:       true,
+        },
+
+        // Secure pulse event bus (port 5060)
+        {
+            name:              'fm-bus',
+            script:            'agents/fm_pulse_bus.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'50M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                BUS_PORT:         '5060',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-bus-error.log`,
+            out_file:   `${ROOT}/logs/fm-bus-out.log`,
+            time:       true,
+        },
+
+        // GitOps webhook runner (port 8092)
+        {
+            name:              'fm-gitops-runner',
+            script:            'agents/fm_gitops_runner.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'100M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                GITOPS_PORT:      '8092',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-gitops-error.log`,
+            out_file:   `${ROOT}/logs/fm-gitops-out.log`,
+            time:       true,
+        },
+
+        // External mesh integrator / LLM directive bridge (port 8091)
+        {
+            name:              'fm-integrator',
+            script:            'agents/fm_mesh_integrator.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'120M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                INTEGRATOR_PORT:  '8091',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-integrator-error.log`,
+            out_file:   `${ROOT}/logs/fm-integrator-out.log`,
+            time:       true,
+        },
+
+        // Harmonic φ-logic/memory engine
+        {
+            name:              'fm-harmonic',
+            script:            'modules/harmonic_logic_memory.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'70M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-harmonic-error.log`,
+            out_file:   `${ROOT}/logs/fm-harmonic-out.log`,
+            time:       true,
+        },
+
+        // Network topology warden
+        {
+            name:              'fm-warden',
+            script:            'modules/network_topology_warden.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'80M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-warden-error.log`,
+            out_file:   `${ROOT}/logs/fm-warden-out.log`,
+            time:       true,
+        },
     ],
 };
