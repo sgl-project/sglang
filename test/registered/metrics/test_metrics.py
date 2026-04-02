@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=32, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=95, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -32,6 +32,17 @@ class TestEnableMetrics(CustomTestCase):
         self._execute_core(
             other_args=[],
             verify_metrics_extra=None,
+            expect_mfu_metrics=True,
+            enable_mfu_metrics=True,
+        )
+
+    def test_mfu_metrics_gate_disabled(self):
+        """MFU metrics should not be emitted when the gate is disabled."""
+        self._execute_core(
+            other_args=[],
+            verify_metrics_extra=None,
+            expect_mfu_metrics=False,
+            enable_mfu_metrics=False,
         )
 
     def test_metrics_2gpu(self):
@@ -71,19 +82,30 @@ class TestEnableMetrics(CustomTestCase):
         self._execute_core(
             other_args=["--tp", "2", "--dp", "2", "--enable-dp-attention"],
             verify_metrics_extra=_verify_metrics_extra,
+            expect_mfu_metrics=True,
+            enable_mfu_metrics=True,
         )
 
-    def _execute_core(self, other_args, verify_metrics_extra):
+    def _execute_core(
+        self,
+        other_args,
+        verify_metrics_extra,
+        expect_mfu_metrics: bool,
+        enable_mfu_metrics: bool,
+    ):
         with (
             envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.override(True),
             envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.override(True),
             envs.SGLANG_TEST_RETRACT.override(True),
         ):
+            launch_args = ["--enable-metrics", "--cuda-graph-max-bs", 2, *other_args]
+            if enable_mfu_metrics:
+                launch_args.insert(1, "--enable-mfu-metrics")
             process = popen_launch_server(
                 _MODEL_NAME,
                 DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=["--enable-metrics", "--cuda-graph-max-bs", 2, *other_args],
+                other_args=launch_args,
             )
 
         try:
@@ -125,13 +147,13 @@ class TestEnableMetrics(CustomTestCase):
             print(f"metrics_text=\n{metrics_text}")
 
             metrics = _parse_prometheus_metrics(metrics_text)
-            self._verify_metrics_common(metrics_text, metrics)
+            self._verify_metrics_common(metrics_text, metrics, expect_mfu_metrics)
             if verify_metrics_extra is not None:
                 verify_metrics_extra(metrics)
         finally:
             kill_process_tree(process.pid)
 
-    def _verify_metrics_common(self, metrics_text, metrics):
+    def _verify_metrics_common(self, metrics_text, metrics, expect_mfu_metrics: bool):
         essential_metrics = [
             "sglang:num_running_reqs",
             "sglang:num_used_tokens",
@@ -154,6 +176,13 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:routing_key_running_req_count",
             "sglang:routing_key_all_req_count",
         ]
+        mfu_metrics = [
+            "sglang:estimated_flops_per_gpu_total",
+            "sglang:estimated_read_bytes_per_gpu_total",
+            "sglang:estimated_write_bytes_per_gpu_total",
+        ]
+        if expect_mfu_metrics:
+            essential_metrics.extend(mfu_metrics)
         for metric in essential_metrics:
             self.assertIn(metric, metrics_text, f"Missing metric: {metric}")
 
@@ -185,6 +214,39 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
+
+        if expect_mfu_metrics:
+            # Estimated perf metrics may have multiple series (e.g., by rank). Ensure
+            # that at least one series for this model has a positive accumulated value.
+            for metric_name in mfu_metrics:
+                values = [
+                    sample.value
+                    for sample in metrics.get(metric_name, [])
+                    if sample.labels.get("model_name") == _MODEL_NAME
+                ]
+                self.assertTrue(
+                    values, f"{metric_name}: no samples for model {_MODEL_NAME}"
+                )
+                self.assertGreater(
+                    sum(values),
+                    0,
+                    f"{metric_name}: expected positive total for model {_MODEL_NAME}",
+                )
+        else:
+            # With only --enable-metrics (without --enable-mfu-metrics), MFU
+            # counters should not emit positive values.
+            for metric_name in mfu_metrics:
+                values = [
+                    sample.value
+                    for sample in metrics.get(metric_name, [])
+                    if sample.labels.get("model_name") == _MODEL_NAME
+                ]
+                if values:
+                    self.assertEqual(
+                        sum(values),
+                        0,
+                        f"{metric_name}: expected no positive samples with MFU metrics gate disabled",
+                    )
 
 
 def _parse_prometheus_metrics(metrics_text: str) -> Dict[str, List[Sample]]:

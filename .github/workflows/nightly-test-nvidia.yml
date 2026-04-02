@@ -27,6 +27,7 @@ on:
           - 'nightly-test-perf-8-gpu-b200'
           - 'nightly-test-kernel-1-gpu-h100'
           - 'nightly-test-diffusion-comparison'
+          - 'nightly-test-kernel-8-gpu-h200'
   workflow_call:
     inputs:
       ref:
@@ -62,8 +63,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -97,8 +96,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -114,6 +111,36 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
 
+  nightly-test-kernel-8-gpu-h200:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-kernel-8-gpu-h200')
+    runs-on: 8-gpu-h200
+    timeout-minutes: 240
+    env:
+      SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
+      SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+      SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run multi-GPU jit kernel nightly suite
+        timeout-minutes: 90
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-kernel-8-gpu-h200 --nightly --continue-on-error
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
   # General tests - 4 GPU H100
   nightly-test-general-4-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-4-gpu-h100')
@@ -125,8 +152,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -158,8 +183,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -242,8 +265,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -275,8 +296,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -348,8 +367,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -375,8 +392,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -415,8 +430,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -442,8 +455,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -487,8 +498,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -501,7 +510,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GPU_CONFIG: "1-gpu-h100"
 
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
@@ -547,8 +556,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -561,7 +568,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GPU_CONFIG: "2-gpu-h100"
 
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
@@ -603,8 +610,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
@@ -632,8 +637,6 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - uses: ./.github/actions/check-maintenance
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         run: |
