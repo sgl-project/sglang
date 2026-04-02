@@ -1017,6 +1017,7 @@ class DenoisingStage(PipelineStage):
                         logger=logger,
                         metrics=batch.metrics,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
+                        record_as_step=True,
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
