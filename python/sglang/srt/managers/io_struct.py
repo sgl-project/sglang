@@ -269,7 +269,6 @@ class GenerateReqInput(BaseReq):
 
         self._validate_inputs()
         self._determine_batch_size()
-        self._validate_sampling_params_type()
         self._handle_parallel_sampling()
 
         if self.is_single:
@@ -289,6 +288,7 @@ class GenerateReqInput(BaseReq):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
             )
+        self._validate_sampling_params_type()
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
