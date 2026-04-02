@@ -154,15 +154,60 @@ class NVFP4QuantizeUtil:
     _nvfp4_quant_sm100_module = None
 
     @staticmethod
+    def _pytorch_fp4_quantize(
+        tensor_2d: torch.Tensor,
+        global_scale_inv: torch.Tensor,
+    ):
+        """Pure-PyTorch FP4 E2M1 quantize for SM90 (where flashinfer fp4_quantize is SM100+-only).
+
+        Produces the same packed-uint8 + FP8-E4M3FN-scale format as the flashinfer
+        fp4_quantize(sf_vec_size=16, sf_use_ue8m0=False, is_sf_swizzled_layout=False).
+
+        Args:
+            tensor_2d: [M, N] bfloat16/float16 input (already reshaped to 2D).
+            global_scale_inv: [1] float32 (= 1/global_scale, same as passed to fp4_quantize).
+
+        Returns:
+            fp4_packed: [M, N//2] uint8 — low nibble = even element, high nibble = odd.
+            fp8_scales: [M, N//16] uint8 — raw bytes of FP8 E4M3FN block scale values.
+        """
+        M, N = tensor_2d.shape
+        dev = tensor_2d.device
+
+        # Scale the input by the global inverse scale.
+        x = tensor_2d.float() * global_scale_inv.float()  # [M, N]
+
+        # Partition into blocks of 16 elements and compute per-block max.
+        x_blocks = x.reshape(M, N // 16, 16)  # [M, N//16, 16]
+        block_max = x_blocks.abs().amax(dim=-1)  # [M, N//16]
+
+        # Block scale = max / 6.0 (6.0 = max representable FP4 E2M1 value).
+        # Clamp to FP8 E4M3FN range [0, 448]; 1e-30 floor avoids division by zero.
+        block_scale = (block_max / 6.0).clamp(min=1e-30, max=448.0)  # [M, N//16]
+
+        # Normalize and flatten for vectorised quantisation.
+        x_norm = (x_blocks / block_scale.unsqueeze(-1)).reshape(M * N)  # [M*N]
+
+        # FP4 E2M1 code = sign_bit | magnitude_bucket.
+        # magnitude_bucket = number of E2M1_BOUNDS entries that abs(x) is >= to.
+        bounds = E2M1_BOUNDS.to(dev)  # [7]
+        sign_bits = (x_norm < 0).to(torch.uint8)  # 0 or 1
+        magnitude = x_norm.abs().unsqueeze(-1) >= bounds  # [M*N, 7]
+        magnitude_bits = magnitude.sum(dim=-1).to(torch.uint8)  # [M*N]
+        fp4_codes = ((sign_bits << 3) | magnitude_bits).reshape(M, N)  # [M, N]
+
+        # Pack pairs: byte[j] = code[2j] (low nibble) | code[2j+1]<<4 (high nibble).
+        fp4_packed = (fp4_codes[:, 0::2] | (fp4_codes[:, 1::2] << 4)).to(torch.uint8)
+
+        # Block scales as raw FP8 E4M3FN bytes.
+        fp8_scales = block_scale.to(torch.float8_e4m3fn).view(torch.uint8)  # [M, N//16]
+
+        return fp4_packed, fp8_scales
+
+    @staticmethod
     def fi_nvfp4_quantize(tensor: torch.Tensor, global_scale: torch.Tensor):
         # input and output shape [B, M, N]
         # return uint8 cache and fp8 block scales
-        try:
-            from flashinfer import fp4_quantize
-        except ImportError:
-            raise ImportError(
-                "flashinfer is installed correctly. Please install flashinfer to use NVFP4 KV cache."
-            )
         global_scale_inv = 1.0 / global_scale
         if isinstance(global_scale_inv, float):
             global_scale_inv = torch.tensor(
@@ -173,15 +218,33 @@ class NVFP4QuantizeUtil:
         ), "global_scale and tensor must be on the same device"
         b, m, n = tensor.shape
         tensor_reshaped = tensor.reshape(b * m, n)
-        tensor_fp4, tensor_fp4_sf = fp4_quantize(
-            tensor_reshaped,
-            global_scale_inv,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=False,
-            is_sf_8x4_layout=False,
-            enable_pdl=None,
-        )
+
+        # flashinfer fp4_quantize requires SM100+ (Blackwell).  On SM90 (Hopper) and
+        # earlier it silently returns all-zero output.  Use the pure-PyTorch fallback.
+        major, _ = torch.cuda.get_device_capability(tensor.device)
+        if major >= 10:
+            try:
+                from flashinfer import fp4_quantize
+            except ImportError:
+                raise ImportError(
+                    "flashinfer is not installed correctly. Please install flashinfer to use NVFP4 KV cache."
+                )
+            tensor_fp4, tensor_fp4_sf = fp4_quantize(
+                tensor_reshaped,
+                global_scale_inv,
+                sf_vec_size=16,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=False,
+                is_sf_8x4_layout=False,
+                enable_pdl=None,
+            )
+            tensor_fp4_sf = tensor_fp4_sf.reshape(b * m, n // 16)
+        else:
+            # SM90 fallback: pure-PyTorch FP4 E2M1 quantisation.
+            tensor_fp4, tensor_fp4_sf = NVFP4QuantizeUtil._pytorch_fp4_quantize(
+                tensor_reshaped, global_scale_inv
+            )
+
         tensor_fp4 = tensor_fp4.view(b, m, tensor_fp4.shape[-1])
         tensor_fp4_sf = tensor_fp4_sf.view(b, m, tensor_fp4_sf.shape[-1]).view(
             torch.float8_e4m3fn

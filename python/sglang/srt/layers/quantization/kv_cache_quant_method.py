@@ -142,18 +142,23 @@ class NVFP4Method(KVCacheQuantMethod):
     name = "nvfp4"
     scale_block_size = 16
 
-    def __init__(self, num_layers: int, device: str, sm_version: int = 120):
+    def __init__(
+        self,
+        num_layers: int,
+        device: str,
+        sm_version: int = 120,
+        native_prefill: bool = False,
+    ):
         self.num_layers = num_layers
         self.device = device
         self.sm_version = sm_version
+        self.native_prefill = native_prefill
         # Per-layer global FP32 scales; filled by load_scales_from_model()
         self.k_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
         self.v_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
 
     def needs_dequant_workspace(self) -> bool:
-        return (
-            True  # prefill uses FP8 dequant workspace; future native FP4 kernel → False
-        )
+        return not self.native_prefill
 
     def needs_global_scale(self) -> bool:
         return True
@@ -248,9 +253,14 @@ class NVFP4Method(KVCacheQuantMethod):
             )
             for _ in range(layer_num)
         ]
-        # Shared dequant workspace — one copy, reused per layer during prefill
-        dq_k_buffer = torch.zeros((m, n, k), dtype=dq_dtype, device=device)
-        dq_v_buffer = torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+        # Shared dequant workspace — only needed for the dequant-to-FP8 prefill path.
+        # When native_prefill is enabled, skip allocation to save GPU memory.
+        if not self.native_prefill:
+            dq_k_buffer = torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+            dq_v_buffer = torch.zeros((m, n, k), dtype=dq_dtype, device=device)
+        else:
+            dq_k_buffer = None
+            dq_v_buffer = None
 
         return {
             "k_buffer": k_buffer,
@@ -296,7 +306,28 @@ class NVFP4Method(KVCacheQuantMethod):
         v_scales: Tensor,
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
-        """Dequantize FP4 KV (indexed tokens) → FP8 E4M3."""
+        """Dequantize FP4 KV (indexed tokens) → FP8 E4M3.
+
+        NOTE: Dequant values can exceed FP8 E4M3FN range (±448), causing NaN.
+        Prefer dequantize_prev_kv_bf16() for SM90 decode.
+        """
+        k_bf16, v_bf16 = self.dequantize_prev_kv_bf16(
+            k_fp4, k_scales, v_fp4, v_scales, layer_id
+        )
+        return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
+
+    def dequantize_prev_kv_bf16(
+        self,
+        k_fp4: Tensor,
+        k_scales: Tensor,
+        v_fp4: Tensor,
+        v_scales: Tensor,
+        layer_id: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Dequantize FP4 KV (indexed tokens) → BF16.
+
+        Returns full-precision BF16 tensors, avoiding FP8 overflow/NaN issues.
+        """
         from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
 
         cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
@@ -307,7 +338,7 @@ class NVFP4Method(KVCacheQuantMethod):
         v_bf16 = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
             v_fp4.view(torch.uint8), v_scales, cur_v_scale
         )
-        return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
+        return k_bf16, v_bf16
 
     def compute_cell_size(
         self, head_num: int, head_dim: int, num_layers: int, kv_size: int

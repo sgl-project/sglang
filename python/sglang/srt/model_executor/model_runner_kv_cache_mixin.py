@@ -669,6 +669,7 @@ class ModelRunnerKVCacheMixin:
                         num_layers=len(hybrid_full_layer_ids),
                         device=self.device,
                         sm_version=sm_version,
+                        native_prefill=self.server_args.enable_nvfp4_native_prefill,
                     )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
@@ -704,6 +705,7 @@ class ModelRunnerKVCacheMixin:
                         num_layers=self.num_effective_layers,
                         device=self.device,
                         sm_version=sm_version,
+                        native_prefill=self.server_args.enable_nvfp4_native_prefill,
                     )
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,

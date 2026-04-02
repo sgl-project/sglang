@@ -328,6 +328,7 @@ class ServerArgs:
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
     fp4_kv_cache_recipe: str = "nvfp4"
+    enable_nvfp4_native_prefill: bool = False
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -2496,12 +2497,18 @@ class ServerArgs:
                             "torch_native",
                             "flex_attention",
                             "trtllm_mha",
+                            # flashinfer: supported via BatchAttention for NVFP4 decode (SM90+)
+                            "flashinfer",
                         ]
+                        # Use the effective backend (prefill == decode here)
+                        effective_backend = (
+                            self.attention_backend or self.prefill_attention_backend_str
+                        )
                         assert (
-                            self.attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES
+                            effective_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES
                         ), (
                             f"KV4 MHA expects attention_backend to be one of "
-                            f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.attention_backend}"
+                            f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {effective_backend}"
                         )
         else:
             raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
@@ -3817,6 +3824,14 @@ class ServerArgs:
             '"nvfp4" uses two-level scaling (per-tensor FP32 + per-block FP8 E4M3), '
             "requires SM100/SM120 (Blackwell). "
             '"mxfp4" uses MX block scaling, for other hardware.',
+        )
+        parser.add_argument(
+            "--enable-nvfp4-native-prefill",
+            action="store_true",
+            help="If set, the flashinfer prefill kernel directly consumes NVFP4 KV cache "
+            "without dequantizing to FP8. Requires a flashinfer build with native FP4 "
+            "prefill support. Only effective when --kv-cache-dtype=fp4_e2m1 and "
+            "--fp4-kv-cache-recipe=nvfp4.",
         )
         parser.add_argument(
             "--enable-fp32-lm-head",

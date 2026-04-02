@@ -139,27 +139,38 @@ class FlashInferAttnBackend(AttentionBackend):
         self.is_dllm_model = self.dllm_config is not None
 
         self.is_nvfp4_kvcache = model_runner.kv_cache_dtype == torch.float4_e2m1fn_x2
+        self.enable_nvfp4_native_prefill = (
+            self.is_nvfp4_kvcache
+            and model_runner.server_args.enable_nvfp4_native_prefill
+        )
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
         self.transfer_cur_chunk_kv = False
-        # For nvfp4 kv cache, we don't use flashinfer-decode, and we use fp8 kv cache for prefill, so set kv_cache_dtype_alias
-        # to pass the checks
-        self.kv_cache_dtype_alias = (
-            model_runner.kv_cache_dtype
-            if not self.is_nvfp4_kvcache
-            else torch.float8_e4m3fn
-        )
+        # For nvfp4 kv cache, set kv_cache_dtype_alias to pass the flashinfer type checks:
+        # - Native prefill path: pass float4_e2m1fn_x2 so begin_forward uses the FP4 kernel.
+        # - Dequant-to-FP8 prefill path (legacy): pass float8_e4m3fn since the dq_buffer is FP8.
+        # Decode goes through BatchDecodeWithPagedKVCacheWrapper with kv_data_type=uint8 for NVFP4.
+        if not self.is_nvfp4_kvcache:
+            self.kv_cache_dtype_alias = model_runner.kv_cache_dtype
+        elif self.enable_nvfp4_native_prefill:
+            self.kv_cache_dtype_alias = torch.float4_e2m1fn_x2
+        else:
+            self.kv_cache_dtype_alias = torch.float8_e4m3fn
 
         # Parse constants
-        self.decode_use_tensor_cores = should_use_tensor_core(
-            kv_cache_dtype=self.kv_cache_dtype_alias,
-            num_attention_heads=model_runner.model_config.num_attention_heads
-            // get_attention_tp_size(),
-            num_kv_heads=model_runner.model_config.get_num_kv_heads(
-                get_attention_tp_size()
-            ),
-        )
+        # NVFP4 decode requires tensor cores path (FA2 prefill kernel handles uint8 KV).
+        if self.is_nvfp4_kvcache:
+            self.decode_use_tensor_cores = True
+        else:
+            self.decode_use_tensor_cores = should_use_tensor_core(
+                kv_cache_dtype=self.kv_cache_dtype_alias,
+                num_attention_heads=model_runner.model_config.num_attention_heads
+                // get_attention_tp_size(),
+                num_kv_heads=model_runner.model_config.get_num_kv_heads(
+                    get_attention_tp_size()
+                ),
+            )
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -450,6 +461,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dq_page_table = None
         self.dq_paged_kernel_lens = None
         self.cpu_req_pool_indices = None
+        if self.enable_nvfp4_native_prefill:
+            # Native FP4 prefill: use the regular req_to_token-based kv_indices.
+            # No dq_page_table, dq_paged_kernel_lens, or cpu_req_pool_indices needed.
+            return
         if (
             self.is_nvfp4_kvcache
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -571,6 +586,10 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged = (
                     not self.enable_deterministic and not is_in_piecewise_cuda_graph()
                 )
+                # Native FP4 prefill always uses the paged path so kv_block_scales
+                # can be passed to run(); ragged would need a separate fix path.
+                if self.enable_nvfp4_native_prefill:
+                    use_ragged = False
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             # Process multi-item scoring in attention backend instead of ForwardBatch
@@ -601,8 +620,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix,
                 multi_item_params,
             )
-        # For none-ragged case, we transfer current chunk into dq kv table
-        self.transfer_cur_chunk_kv = not self.forward_metadata.use_ragged
+            # For none-ragged case, we transfer current chunk into dq kv table
+            self.transfer_cur_chunk_kv = not self.forward_metadata.use_ragged
 
     def init_cuda_graph_state(
         self,
@@ -868,40 +887,57 @@ class FlashInferAttnBackend(AttentionBackend):
 
         assert not (
             self.is_nvfp4_kvcache and layer.is_cross_attention
-        ), "NVFP4 dequant KV cache is not supported for cross-attention"
+        ), "NVFP4 KV cache is not supported for cross-attention"
 
         # We perform dequant for chunk prefill/cache reuse.
         pool = forward_batch.token_to_kv_pool
         if self.is_nvfp4_kvcache:
-            if self.dq_page_table is not None:
-                # For paged path (not use_ragged), the paged attention uses the dq buffer for
-                # ALL tokens (prefix + current chunk). Current chunk must be written to dq workspace.
-                # For ragged path (use_ragged), flashinfer handles new-to-new with raw k/v; dq not used.
-                transfer_cur_kv = not self.forward_metadata.use_ragged
-                k_cur_fp8 = (
-                    k.to(torch.float8_e4m3fn)
-                    if (k is not None and transfer_cur_kv)
-                    else None
+            if self.enable_nvfp4_native_prefill:
+                # Native FP4 path: pass raw FP4 KV directly to the prefill kernel.
+                # No dequant, no dq_page_table — uses the standard req_to_token kv_indices.
+                raw = pool.get_raw_kv_buffer(layer.layer_id)
+                k_paged = raw["k"].view(torch.float4_e2m1fn_x2).view(
+                    -1, layer.tp_k_head_num, layer.head_dim // 2
                 )
-                v_cur_fp8 = (
-                    v.to(torch.float8_e4m3fn)
-                    if (v is not None and transfer_cur_kv)
-                    else None
+                v_paged = raw["v"].view(torch.float4_e2m1fn_x2).view(
+                    -1, layer.tp_v_head_num, layer.head_dim // 2
                 )
-                pool.dequant_kv_for_extend(
-                    layer.layer_id,
-                    forward_batch.req_to_token_pool.req_to_token,
-                    self.cpu_req_pool_indices,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.extend_seq_lens_cpu,
-                    self.page_size,
-                    k_cur_fp8=k_cur_fp8,
-                    v_cur_fp8=v_cur_fp8,
-                )
-            k_buffer_dq, v_buffer_dq = pool.get_dq_kv_buffer()
-            k_paged = k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim)
-            v_paged = v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim)
-            kv_cache = (k_paged, v_paged)
+                # Per-block FP8 scales (one scale per NVFP4_SF_VEC_SIZE=16 FP4 values).
+                # Shape: [total_slots, num_kv_heads, head_dim // 16], dtype float8_e4m3fn.
+                # Indexed via the same kv_indices as k_paged/v_paged.
+                k_sf = raw["k_scale"]
+                v_sf = raw["v_scale"]
+                kv_cache = (k_paged, v_paged)
+            else:
+                if self.dq_page_table is not None:
+                    # For paged path (not use_ragged), the paged attention uses the dq buffer for
+                    # ALL tokens (prefix + current chunk). Current chunk must be written to dq workspace.
+                    # For ragged path (use_ragged), flashinfer handles new-to-new with raw k/v; dq not used.
+                    transfer_cur_kv = not self.forward_metadata.use_ragged
+                    k_cur_fp8 = (
+                        k.to(torch.float8_e4m3fn)
+                        if (k is not None and transfer_cur_kv)
+                        else None
+                    )
+                    v_cur_fp8 = (
+                        v.to(torch.float8_e4m3fn)
+                        if (v is not None and transfer_cur_kv)
+                        else None
+                    )
+                    pool.dequant_kv_for_extend(
+                        layer.layer_id,
+                        forward_batch.req_to_token_pool.req_to_token,
+                        self.cpu_req_pool_indices,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.extend_seq_lens_cpu,
+                        self.page_size,
+                        k_cur_fp8=k_cur_fp8,
+                        v_cur_fp8=v_cur_fp8,
+                    )
+                k_buffer_dq, v_buffer_dq = pool.get_dq_kv_buffer()
+                k_paged = k_buffer_dq.view(-1, layer.tp_k_head_num, layer.head_dim)
+                v_paged = v_buffer_dq.view(-1, layer.tp_v_head_num, layer.head_dim)
+                kv_cache = (k_paged, v_paged)
         else:
             kv_cache = pool.get_kv_buffer(layer.layer_id)
 
@@ -912,31 +948,62 @@ class FlashInferAttnBackend(AttentionBackend):
                 # For NVFP4, global scales are auto-resolved from pool.quant_method.
                 pool.set_kv_buffer(layer, cache_loc, k, v, layer.k_scale, layer.v_scale)
 
-            # We need to process the paged part for nvfp4 kv cache
-            o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                kv_cache,
-                causal=not layer.is_cross_attention,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
+            window_left_val = (
+                layer.sliding_window_size
+                if not (
+                    self.forward_metadata.multi_item_params
+                    and self.forward_metadata.multi_item_params.is_enabled()
+                )
+                else -1
             )
+            if self.enable_nvfp4_native_prefill:
+                # Use run() instead of the deprecated forward() so we can pass
+                # kv_block_scales (per-block FP8 scales for two-level NVFP4 dequant).
+                # Replicate the attribute setup that forward() normally does.
+                prefill_wrapper_paged._causal = not layer.is_cross_attention
+                prefill_wrapper_paged._sm_scale = layer.scaling
+                prefill_wrapper_paged._window_left = window_left_val
+                prefill_wrapper_paged._logits_soft_cap = logits_soft_cap
+                # layer.k_scale_float is None for NVFP4 (only set for FP8 KV cache).
+                # Use pool.quant_method.k_scales_gpu which includes any hardware-specific
+                # adjustments (e.g. the 6× scale factor required on SM100).
+                qm = pool.quant_method
+                _k_scale = (
+                    qm.k_scales_gpu[layer.layer_id].item()
+                    if hasattr(qm, "k_scales_gpu")
+                    else layer.k_scale_float
+                )
+                _v_scale = (
+                    qm.v_scales_gpu[layer.layer_id].item()
+                    if hasattr(qm, "v_scales_gpu")
+                    else layer.v_scale_float
+                )
+                o = prefill_wrapper_paged.run(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    kv_cache,
+                    k_scale=_k_scale,
+                    v_scale=_v_scale,
+                    kv_block_scales=(k_sf, v_sf),
+                )
+            else:
+                # We need to process the paged part for nvfp4 kv cache
+                o = prefill_wrapper_paged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    kv_cache,
+                    causal=not layer.is_cross_attention,
+                    sm_scale=layer.scaling,
+                    # Disable sliding window attention for multi-item scoring:
+                    # - Sliding window could cut across item boundaries, breaking semantic coherence
+                    # - Multi-item sequences need full attention to properly handle delimiter tokens
+                    # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                    #   provide more precise attention control than simple sliding windows
+                    # - Item-aware masking takes precedence over window-based masking
+                    window_left=window_left_val,
+                    logits_soft_cap=logits_soft_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
             # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
@@ -1026,17 +1093,44 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        pool = forward_batch.token_to_kv_pool
 
+        if self.is_nvfp4_kvcache:
+            # NVFP4: pass raw uint8 FP4 pool buffers + per-block FP8 scales.
+            # Pool buffers are 3D: [total_slots, num_kv_heads, head_dim//2].
+            # FlashInfer NHD layout infers page_size from shape[1], so we must
+            # unsqueeze dim 1 to produce [total_slots, 1, nkh, d//2] (page_size=1).
+            # Block scales likewise need unsqueeze so shape[1]==1.
+            raw = pool.get_raw_kv_buffer(layer.layer_id)
+            k_buf = raw["k"].unsqueeze(1)                              # [m, 1, nkh, d//2] uint8
+            v_buf = raw["v"].unsqueeze(1)
+            k_sf_buf = raw["k_scale"].view(torch.uint8).unsqueeze(1)  # [m, 1, nkh, d//16] uint8
+            v_sf_buf = raw["v_scale"].view(torch.uint8).unsqueeze(1)
+            q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            # layer.k_scale_float is None for NVFP4 (only set for FP8 KV cache).
+            # Global dequant scales live in pool.quant_method.k_scales_gpu[layer_id].
+            qm = pool.quant_method
+            _k_scale = qm.k_scales_gpu[layer.layer_id].item() if hasattr(qm, "k_scales_gpu") else None
+            _v_scale = qm.v_scales_gpu[layer.layer_id].item() if hasattr(qm, "v_scales_gpu") else None
+            o = decode_wrapper.run(
+                q_3d,
+                (k_buf, v_buf),
+                k_scale=_k_scale,
+                v_scale=_v_scale,
+                kv_block_scales=(k_sf_buf, v_sf_buf),
+            )
+
+        else:
+            # BF16/FP8 KV: use standard BatchDecodeWithPagedKVCacheWrapper forward.
+            o = decode_wrapper.forward(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                pool.get_kv_buffer(layer.layer_id),
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
@@ -1061,7 +1155,13 @@ class FlashInferIndicesUpdaterDecode:
             get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.data_type = attn_backend.kv_cache_dtype_alias
+        # NVFP4 decode uses BatchDecodeWithPagedKVCacheWrapper with kv_data_type=uint8
+        # (raw packed FP4 pool buffers). Other dtypes use the native kv_cache_dtype_alias.
+        self.data_type = (
+            torch.uint8
+            if attn_backend.is_nvfp4_kvcache
+            else attn_backend.kv_cache_dtype_alias
+        )
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
