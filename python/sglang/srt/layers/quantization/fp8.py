@@ -1369,7 +1369,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.process_weights_hip_scale_padding(layer)
 
             # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            ):
                 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                     align_fp8_moe_weights_for_flashinfer_trtllm,
                 )
@@ -1619,7 +1622,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 local_num_experts=num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
                 routing_method_type=int(
-                    getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
+                    getattr(layer, "routing_method_type", None)
+                    or RoutingMethodType.DeepSeekV3
                 ),
                 block_quant=self.block_quant,
                 use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),

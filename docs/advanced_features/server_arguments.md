@@ -212,7 +212,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--api-key` | Set API key of the server. It is also used in the OpenAI API compatible server. | `None` | Type: str |
-| `--admin-api-key` | Set **admin API key** for administrative/control endpoints (e.g., weights update, cache flush, `/get_server_info`). Endpoints marked as admin-only require `Authorization: Bearer <admin_api_key>` when this is set. | `None` | Type: str |
+| `--admin-api-key` | Set **admin API key** for administrative/control endpoints (e.g., weights update, cache flush, `/server_info`). Endpoints marked as admin-only require `Authorization: Bearer <admin_api_key>` when this is set. | `None` | Type: str |
 | `--served-model-name` | Override the model name returned by the v1/models endpoint in OpenAI API server. | `None` | Type: str |
 | `--weight-version` | Version identifier for the model weights. Defaults to 'default' if not specified. | `default` | Type: str |
 | `--chat-template` | The builtin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | `None` | Type: str |
@@ -295,12 +295,10 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Ngram speculative decoding
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--speculative-ngram-min-match-window-size` | The minimum window size for pattern matching in ngram speculative decoding. | `1` | Type: int |
-| `--speculative-ngram-max-match-window-size` | The maximum window size for pattern matching in ngram speculative decoding. | `12` | Type: int |
 | `--speculative-ngram-min-bfs-breadth` | The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding. | `1` | Type: int |
 | `--speculative-ngram-max-bfs-breadth` | The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding. | `10` | Type: int |
 | `--speculative-ngram-match-type` | Ngram tree-building mode. `BFS` selects recency-based expansion and `PROB` selects frequency-based expansion. This setting is forwarded to the ngram cache implementation. | `BFS` | `BFS`, `PROB` |
-| `--speculative-ngram-max-trie-depth` | The max trie depth for ngram speculative decoding. | `18` | Type: int |
+| `--speculative-ngram-max-trie-depth` | Maximum suffix length stored and matched by the ngram trie. | `18` | Type: int |
 | `--speculative-ngram-capacity` | The cache capacity for ngram speculative decoding. | `10000000` | Type: int |
 
 ## Multi-layer Eagle speculative decoding

@@ -506,8 +506,6 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
 
     # Speculative decoding (ngram)
-    speculative_ngram_min_match_window_size: int = 1
-    speculative_ngram_max_match_window_size: int = 12
     speculative_ngram_min_bfs_breadth: int = 1
     speculative_ngram_max_bfs_breadth: int = 10
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
@@ -1426,15 +1424,10 @@ class ServerArgs:
             )
 
         if self.kv_cache_dtype == "auto":
-            # TODO: Temporarily set default dtype on B200 as bfloat16 to avoid performance regression.
-            # TODO: Remove this after the performance regression is fixed. (Ref: https://github.com/sgl-project/sglang/issues/21291)
-            if quantization == "modelopt_fp4" and major >= 10 and self.dp_size > 1:
+            if major >= 10:
                 self.kv_cache_dtype = "fp8_e4m3"
             else:
                 self.kv_cache_dtype = "bfloat16"
-            # self.kv_cache_dtype = (
-            #     "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
-            # )
             logger.warning(
                 f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
             )
@@ -1465,7 +1458,7 @@ class ServerArgs:
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            if self.dp_size == 1 and major >= 10:
+            if major >= 10:
                 self.nsa_prefill_backend = "trtllm"
                 self.nsa_decode_backend = "trtllm"
             else:
@@ -3108,8 +3101,10 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
-                self.speculative_num_draft_tokens = (
-                    self.speculative_ngram_max_match_window_size
+                self.speculative_num_draft_tokens = 12
+                logger.warning(
+                    "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
+                    "You can override this by explicitly setting --speculative-num-draft-tokens."
                 )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
@@ -4851,18 +4846,6 @@ class ServerArgs:
         )
 
         # Speculative decoding (ngram)
-        parser.add_argument(
-            "--speculative-ngram-min-match-window-size",
-            type=int,
-            default=ServerArgs.speculative_ngram_min_match_window_size,
-            help="The minimum window size for pattern matching in ngram speculative decoding.",
-        )
-        parser.add_argument(
-            "--speculative-ngram-max-match-window-size",
-            type=int,
-            default=ServerArgs.speculative_ngram_max_match_window_size,
-            help="The maximum window size for pattern matching in ngram speculative decoding.",
-        )
         parser.add_argument(
             "--speculative-ngram-min-bfs-breadth",
             type=int,

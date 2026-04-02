@@ -149,7 +149,7 @@ class TestQwen35FP4MTP(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["score"], ACC_THRESHOLDS[self.model]["gsm8k"])
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -226,7 +226,7 @@ class TestQwen35FP4MTPV2(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["score"], ACC_THRESHOLDS[self.model]["gsm8k"])
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
