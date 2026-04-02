@@ -276,7 +276,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             or config.shared_expert_intermediate_size != config.moe_intermediate_size
             or get_moe_a2a_backend().is_deepep()
         ):
-            # Falled back to non-fused version, return 0 shared_experts.
+            # Fall back to non-fused version, return 0 shared_experts.
             return 0
         # Return 1 shared_expert for qwen model.
         return 1
