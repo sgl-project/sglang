@@ -167,10 +167,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
         is_nextn: bool = False,
-        support_shared_experts: bool = False,
+        support_shared_expert_fusion: bool = False,
     ):
         # By default, fuse shared experts to routed experts are not supported except Qwen3.5 MoE for now.
         super().__init__()
+        self.support_shared_expert_fusion = support_shared_expert_fusion
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
         self.num_experts = config.num_experts
@@ -186,8 +187,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         if self.num_fused_shared_experts > 0:
             rank0_log(
-                "Shared experts fusion enabled for Qwen2 MoE "
-                "(topk+1 experts per token)."
+                "Shared experts fusion enabled (topk+1 experts per token)."
             )
 
         self.topk = TopK(
@@ -258,8 +258,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _determine_num_fused_shared_experts(self, config: PretrainedConfig) -> int:
         """Determine if shared expert can be fused with router experts (topk+1).
-        Fusion requires shared_expert_intermediate_size == moe_intermediate_size.
+        Fusion requires shared_expert_intermediate_size == moe_intermediate_size,
+        support_shared_expert_fusion=True (e.g. Qwen3.5 MoE), and Aiter on HIP.
         """
+        if not self.support_shared_expert_fusion:
+            return 0
         if get_global_server_args().disable_shared_experts_fusion:
             return 0
         if getattr(config, "shared_expert_intermediate_size", 0) <= 0:
