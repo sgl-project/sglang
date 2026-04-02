@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -193,6 +193,27 @@ class RotaryEmbedding(MultiPlatformOp):
         cos, sin = cos_sin.chunk(2, dim=-1)
         return cos, sin
 
+    def _get_local_torch_compile_forward_method(
+        self,
+        method_name: str,
+        compile_mode: Optional[str] = None,
+        compile_options: Optional[dict] = None,
+        compile_dynamic: bool = False,
+    ) -> Callable:
+        from sglang.srt.utils.torch_compile_utils import merge_mode_options
+
+        # forward_native can handled KV cache fusion.
+        # cache_loc varies across calls so we need dynamic compilation;
+        compile_dynamic = True
+
+        # Merge compile_mode and compile_options.
+        merged_options = merge_mode_options(compile_mode, compile_options)
+        return torch.compile(
+            getattr(self, method_name),
+            options=merged_options,
+            dynamic=compile_dynamic,
+        )
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -202,10 +223,6 @@ class RotaryEmbedding(MultiPlatformOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for native implementation"
-
         if offsets is not None:
             positions = positions + offsets
 
@@ -233,6 +250,15 @@ class RotaryEmbedding(MultiPlatformOp):
         key_pass = key[..., self.rotary_dim :]
         key_rot = self._apply_rotary_emb_wrapped(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+
+        if fused_set_kv_buffer_arg is not None:
+            cache_loc = fused_set_kv_buffer_arg.cache_loc
+            k_buffer = fused_set_kv_buffer_arg.k_buffer
+            v_buffer = fused_set_kv_buffer_arg.v_buffer
+            value = fused_set_kv_buffer_arg.value
+            k_buffer.index_put_([cache_loc], key.view(-1, k_buffer.shape[-1]))
+            v_buffer.index_put_([cache_loc], value.view(-1, v_buffer.shape[-1]))
+
         return query, key
 
     def forward_npu(

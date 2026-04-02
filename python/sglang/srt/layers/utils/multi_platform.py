@@ -1,8 +1,10 @@
-from typing import Callable
+from typing import Callable, ClassVar, Collection, Optional, Tuple
 
+import torch
 from torch import nn
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils.torch_compile_utils import CompileConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -23,6 +25,8 @@ _is_musa = is_musa()
 
 
 class MultiPlatformOp(nn.Module):
+    compile_config: ClassVar[CompileConfig] = CompileConfig()
+
     def __init__(self):
         super().__init__()
         self._forward_method: Callable = self.dispatch_forward()
@@ -31,7 +35,89 @@ class MultiPlatformOp(nn.Module):
         self._original_forward_method = None
         self.is_torch_compile = False
 
-    def enter_torch_compile(self, num_tokens: int):
+    def _get_local_torch_compile_forward_method(
+        self,
+        method_name: str,
+        compile_mode: Optional[str] = None,
+        compile_options: Optional[dict] = None,
+        compile_dynamic: bool = False,
+    ) -> Callable:
+        from sglang.srt.utils.torch_compile_utils import merge_mode_options
+
+        # Merge compile_mode and compile_options.
+        merged_options = merge_mode_options(compile_mode, compile_options)
+        return torch.compile(
+            getattr(self, method_name),
+            options=merged_options,
+            dynamic=compile_dynamic,
+        )
+
+    def _matches_override_layers(
+        self, override_layers: Collection[str]
+    ) -> bool:
+        """Check if any class in the MRO matches the override allowlist.
+
+        This lets `--torch-compile-override-layers RotaryEmbedding` match all
+        subclasses (YaRNScalingRotaryEmbedding, Llama3RotaryEmbedding, etc.)."""
+        return any(cls.__name__ in override_layers for cls in type(self).__mro__)
+
+    def _get_torch_compile_forward_method(
+        self,
+        num_tokens: int,
+        compile_scope: str = "full",
+        override_layers: Optional[Collection[str]] = None,
+        compile_mode: Optional[str] = None,
+        compile_options: Optional[dict] = None,
+        compile_dynamic: bool = False,
+    ) -> Tuple[bool, Optional[Callable]]:
+        class_name = self.__class__.__name__
+
+        if compile_scope == "local":
+            if override_layers is None or not self._matches_override_layers(
+                override_layers
+            ):
+                return False, None
+            return True, self._get_local_torch_compile_forward_method(
+                "forward_native",
+                compile_mode=compile_mode,
+                compile_options=compile_options,
+                compile_dynamic=compile_dynamic,
+            )
+
+        if override_layers is not None:
+            # Class-name allowlist from `--torch-compile-override-layers`,
+            # e.g. `UnquantizedFusedMoEMethod RMSNorm`. Matches any class in
+            # the MRO so that base-class names also cover subclasses.
+            if not self._matches_override_layers(override_layers):
+                return False, None
+            return True, self.forward_native
+
+        # Default fallback
+        if "FusedMoE" in class_name:
+            if num_tokens == 1:
+                from sglang.srt.layers.moe.fused_moe_native import (
+                    fused_moe_forward_native,
+                )
+
+                return True, fused_moe_forward_native
+            return True, self._forward_method
+
+        if "TopK" in class_name:
+            if num_tokens == 1:
+                return True, self.forward_native
+            return True, self._forward_method
+
+        return True, self.forward_native
+
+    def enter_torch_compile(
+        self,
+        num_tokens: int,
+        compile_scope: str = "full",
+        override_layers: Optional[Collection[str]] = None,
+        compile_mode: Optional[str] = None,
+        compile_options: Optional[dict] = None,
+        compile_dynamic: bool = False,
+    ):
         # Skip if Op is already entered compile mode.
         # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
         # among layers and `enter_torch_compile` will be called many times.
@@ -40,22 +126,21 @@ class MultiPlatformOp(nn.Module):
         if self.is_torch_compile:
             return
 
-        self._original_forward_method = self._forward_method
-        # NOTE: Temporarily workaround MoE
-        # The performance of torch.compile on this layer is not always good when bs > 1,
-        # so we decide to only use torch.compile when bs=1
-        if "FusedMoE" in self.__class__.__name__:
-            if num_tokens == 1:
-                from sglang.srt.layers.moe.fused_moe_native import (
-                    fused_moe_forward_native,
-                )
+        should_switch, forward_method = self._get_torch_compile_forward_method(
+            num_tokens=num_tokens,
+            compile_scope=compile_scope,
+            override_layers=override_layers,
+            compile_mode=compile_mode,
+            compile_options=compile_options,
+            compile_dynamic=compile_dynamic,
+        )
+        if not should_switch:
+            return
 
-                self._forward_method = fused_moe_forward_native
-        elif "TopK" in self.__class__.__name__:
-            if num_tokens == 1:
-                self._forward_method = self.forward_native
-        else:
-            self._forward_method = self.forward_native
+        self._original_forward_method = self._forward_method
+        # NOTE: By default we keep the existing bs=1-only special handling for MoE
+        # and TopK, unless a CLI allowlist explicitly opts a class into compile mode.
+        self._forward_method = forward_method
         self.is_torch_compile = True
 
     def leave_torch_compile(self):

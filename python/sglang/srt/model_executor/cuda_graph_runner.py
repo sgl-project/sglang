@@ -23,7 +23,16 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Collection,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 import tqdm
@@ -54,6 +63,14 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.utils.torch_compile_utils import (
+    CompilableRegionMixin,
+    CompileConfig,
+    _UNSET,
+    parse_compile_op_config,
+    resolve_compile_config,
+    resolve_region_compile_config,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -95,7 +112,6 @@ if TYPE_CHECKING:
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
-
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
 
@@ -131,6 +147,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     num_token_non_padded: torch.Tensor
     custom_mask: torch.Tensor
     next_token_logits_buffer: torch.Tensor
+    out_cache_loc_swa: Optional[torch.Tensor]
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     global_num_tokens_gpu: torch.Tensor
@@ -158,6 +175,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        is_hybrid_swa: bool = False,
         ne_token_table: Optional[torch.Tensor] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
@@ -166,6 +184,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            out_cache_loc_swa = (
+                torch.zeros((max_num_token,), dtype=torch.int64)
+                if is_hybrid_swa
+                else None
+            )
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -237,6 +260,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
@@ -268,6 +292,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            if self.out_cache_loc_swa is not None:
+                self.out_cache_loc_swa.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -288,6 +314,13 @@ class DecodeInputBuffers(ForwardInputBuffers):
             forward_batch.out_cache_loc,
             forward_batch.positions,
         ]
+
+        if (
+            self.out_cache_loc_swa is not None
+            and forward_batch.out_cache_loc_swa is not None
+        ):
+            dsts.append(self.out_cache_loc_swa[:raw_num_token])
+            srcs.append(forward_batch.out_cache_loc_swa)
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
@@ -391,15 +424,66 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
-def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
+def _to_torch(
+    model: torch.nn.Module,
+    reverse: bool,
+    num_tokens: int,
+    compile_scope: str = "full",
+    override_layers: Optional[Collection[str]] = None,
+    compile_overrides: Optional[Dict[str, CompileConfig]] = None,
+    compile_dynamic: bool = False,
+):
     for sub in model._modules.values():
         if isinstance(sub, MultiPlatformOp):
             if reverse:
                 sub.leave_torch_compile()
             else:
-                sub.enter_torch_compile(num_tokens=num_tokens)
+                cfg = resolve_compile_config(sub, compile_overrides)
+                effective_dynamic = (
+                    cfg.dynamic if cfg.dynamic is not _UNSET else compile_dynamic
+                )
+                sub.enter_torch_compile(
+                    num_tokens=num_tokens,
+                    compile_scope=compile_scope,
+                    override_layers=override_layers,
+                    compile_mode=cfg.mode,
+                    compile_options=cfg.options,
+                    compile_dynamic=effective_dynamic,
+                )
+
+        # CompilableRegionMixin: compile named sub-regions in local scope.
+        # In full scope the outer torch.compile traces through these methods
+        # normally, so region-level compile is skipped to avoid nesting.
+        if compile_scope == "local" and isinstance(sub, CompilableRegionMixin):
+            for region_name in sub.get_compilable_regions():
+                if override_layers is not None and region_name not in override_layers:
+                    continue
+                if reverse:
+                    sub.leave_region_compile(region_name)
+                else:
+                    cfg = resolve_region_compile_config(
+                        sub, region_name, compile_overrides
+                    )
+                    effective_dynamic = (
+                        cfg.dynamic if cfg.dynamic is not _UNSET else compile_dynamic
+                    )
+                    sub.enter_region_compile(
+                        region_name,
+                        compile_mode=cfg.mode,
+                        compile_options=cfg.options,
+                        compile_dynamic=effective_dynamic,
+                    )
+
         if isinstance(sub, torch.nn.Module):
-            _to_torch(sub, reverse, num_tokens)
+            _to_torch(
+                sub,
+                reverse,
+                num_tokens,
+                compile_scope=compile_scope,
+                override_layers=override_layers,
+                compile_overrides=compile_overrides,
+                compile_dynamic=compile_dynamic,
+            )
 
 
 @contextmanager
@@ -408,30 +492,59 @@ def patch_model(
     enable_compile: bool,
     num_tokens: int,
     tp_group: GroupCoordinator,
+    compile_scope: str = "full",
+    override_layers: Optional[List[str]] = None,
+    compile_op_config: Optional[str] = None,
 ):
     """Patch the model to make it compatible with with torch.compile"""
     backup_ca_comm = None
+    override_layer_set = (
+        frozenset(override_layers) if override_layers is not None else None
+    )
+    compile_dynamic = _is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE")
+    compile_overrides = parse_compile_op_config(compile_op_config)
 
     try:
         if enable_compile:
-            _to_torch(model, reverse=False, num_tokens=num_tokens)
+            _to_torch(
+                model,
+                reverse=False,
+                num_tokens=num_tokens,
+                compile_scope=compile_scope,
+                override_layers=override_layer_set,
+                compile_overrides=compile_overrides,
+                compile_dynamic=compile_dynamic,
+            )
             backup_ca_comm = tp_group.ca_comm
             # Use custom-allreduce here.
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
-            yield torch.compile(
-                torch.no_grad()(model.forward),
-                mode=os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                ),
-                dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
-            )
+            if compile_dynamic:
+                logger.warning("SGLANG_TORCH_DYNAMIC_SHAPE is set to True")
+            if compile_scope == "local":
+                yield torch.no_grad()(model.forward)
+            else:
+                yield torch.compile(
+                    torch.no_grad()(model.forward),
+                    mode=os.environ.get(
+                        "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+                    ),
+                    dynamic=compile_dynamic,
+                )
         else:
             yield model.forward
     finally:
         if enable_compile:
-            _to_torch(model, reverse=True, num_tokens=num_tokens)
+            _to_torch(
+                model,
+                reverse=True,
+                num_tokens=num_tokens,
+                compile_scope=compile_scope,
+                override_layers=override_layer_set,
+                compile_overrides=compile_overrides,
+                compile_dynamic=compile_dynamic,
+            )
             tp_group.ca_comm = backup_ca_comm
 
 
@@ -629,6 +742,7 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            is_hybrid_swa=getattr(self.model_runner, "is_hybrid_swa", False),
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
@@ -786,6 +900,9 @@ class CudaGraphRunner:
                     bs in self.compile_bs,
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
+                    compile_scope=self.model_runner.server_args.torch_compile_scope,
+                    override_layers=self.model_runner.server_args.torch_compile_override_layers,
+                    compile_op_config=self.model_runner.server_args.torch_compile_op_config,
                 ) as forward:
                     (
                         graph,
@@ -847,6 +964,11 @@ class CudaGraphRunner:
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        out_cache_loc_swa = (
+            buffers.out_cache_loc_swa[:num_tokens]
+            if buffers.out_cache_loc_swa is not None
+            else None
+        )
         positions = buffers.positions[:num_tokens]
         if self.is_encoder_decoder:
             encoder_lens = buffers.encoder_lens[:bs]
@@ -941,6 +1063,7 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=seq_lens.sum().item(),
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,

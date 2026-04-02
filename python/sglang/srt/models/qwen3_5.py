@@ -79,6 +79,10 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
@@ -94,6 +98,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
+from sglang.srt.utils.torch_compile_utils import CompilableRegionMixin
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -619,8 +624,46 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen3_5AttentionDecoderLayer(nn.Module):
+class Qwen3_5AttentionDecoderLayer(nn.Module, CompilableRegionMixin):
     """Qwen3.5 Decoder Layer with Full Attention."""
+
+    _REGION_DYNAMIC = {"QKNorm": False, "RopeKV": None}
+
+    def get_compilable_regions(self) -> dict[str, str]:
+        qk_method = (
+            "_split_gate_apply_qk_norm_native"
+            if self.attn_output_gate
+            else "_apply_qk_norm_native"
+        )
+        return {"QKNorm": qk_method, "RopeKV": "_rope_kv_native"}
+
+    def _apply_qk_norm_native(self, q, k):
+        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
+        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
+        return q, k
+
+    def _split_gate_apply_qk_norm_native(self, qkv):
+        """Compilable region: split qkv with output gate + qk-norm.
+
+        Fuses the non-contiguous copies from split/chunk/reshape with the
+        qk-norm into a single compiled kernel, so Inductor can emit strided
+        loads from qkv directly instead of separate copy kernels.
+        """
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        orig_shape = q_gate.shape[:-1]
+        q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+        q, gate = torch.chunk(q_gate, 2, dim=-1)
+        q = q.reshape(*orig_shape, -1)
+        gate = gate.reshape(*orig_shape, -1)
+
+        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
+        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
+
+        return q, k, v, gate
+
+    def _rope_kv_native(self, q, k, positions, fused_kv_arg):
+        q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_kv_arg)
+        return q, k
 
     def __init__(
         self,
@@ -673,6 +716,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
+        self.compatible_with_fused_kv_buffer = True
+        self._did_fused_kv_write_last_call = False
 
         attn_quant_config = (
             None
@@ -796,21 +841,64 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Full attention forward pass."""
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+        gate = None
+        if self.is_region_compiled("QKNorm") and self.is_region_compiled("RopeKV"):
+            if self.attn_output_gate:
+                q, k, v, gate = self._split_gate_apply_qk_norm_native(qkv)
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k = self._apply_qk_norm_native(q, k)
+            fused_kv_arg = (
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if enable_fused_set_kv_buffer(forward_batch, is_compiled=True)
+                and self.compatible_with_fused_kv_buffer
+                else None
             )
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            q, k = self._rope_kv_native(q, k, positions, fused_kv_arg)
+            # In this branch kv cache is fused with rope, if allowed
+            self._did_fused_kv_write_last_call = fused_kv_arg is not None
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.attn_output_gate:
+                q_gate, k, v = qkv.split(
+                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+                )
+                orig_shape = q_gate.shape[:-1]
+                q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+                q, gate = torch.chunk(q_gate, 2, dim=-1)
+                q = q.reshape(*orig_shape, -1)
+                gate = gate.reshape(*orig_shape, -1)
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self._apply_qk_norm(q, k)
+            is_rope_compiled = self.rotary_emb.is_torch_compile
+            fused_kv_arg = (
+                create_fused_set_kv_buffer_arg(
+                    value=v,
+                    layer=self.attn,
+                    forward_batch=forward_batch,
+                )
+                if enable_fused_set_kv_buffer(
+                    forward_batch, is_compiled=is_rope_compiled
+                )
+                and self.compatible_with_fused_kv_buffer
+                else None
+            )
+            q, k = self.rotary_emb(
+                positions, q, k, fused_set_kv_buffer_arg=fused_kv_arg
+            )
+            # MRoPE forward_triton (2D positions) silently drops fused_set_kv_buffer_arg,
+            # so the fused KV write only actually executes in the compiled path.
+            self._did_fused_kv_write_last_call = (
+                fused_kv_arg is not None and is_rope_compiled
+            )
 
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(
+            q, k, v, forward_batch, save_kv_cache=not self._did_fused_kv_write_last_call
+        )
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
