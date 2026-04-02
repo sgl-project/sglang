@@ -2077,7 +2077,9 @@ def maybe_stub_sgl_kernel():
             return None
 
         def exec_module(self, module):
-            pass
+            from unittest.mock import MagicMock
+
+            module.__getattr__ = lambda name: MagicMock()
 
     class _SglKernelFinder(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path, target=None):
