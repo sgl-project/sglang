@@ -59,7 +59,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission --jq '.permission') || PERM="none"
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission --jq '.permission') || {
+            PERM="none"
+            echo "::warning::Failed to check commenter permission, defaulting to none"
+          }
           if [[ "$PERM" == "admin" || "$PERM" == "maintain" || "$PERM" == "write" ]]; then
             echo "safe_to_checkout_pr=true" >> $GITHUB_OUTPUT
           else
