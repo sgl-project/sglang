@@ -27,6 +27,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 # Compatibility shim: flash-attn-4 registers a bare ``flash_attn`` namespace
 # that makes ``is_flash_attn_2_available()`` return True, but lacks the v2 API
@@ -488,6 +489,9 @@ def get_config(
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
+    if is_runai_obj_uri(model):
+        model = ObjectStorageModel.get_path(model)
+
     if is_remote_url(model):
         # BaseConnector implements __del__() to clean up the local dir.
         # Since config files need to exist all the time, so we DO NOT use
@@ -714,16 +718,19 @@ class TokenizerWarningsFilter(logging.Filter):
 
 _is_base_mistral_patched = False
 
-# transformers version where is_base_mistral calls model_info() on every tokenizer load
+# transformers version where _patch_mistral_regex calls model_info() on every tokenizer load
 _TRANSFORMERS_PATCHED_VERSION = "5.3.0"
 
 
 def _patch_is_base_mistral_in_ci():
-    """Patch transformers' is_base_mistral to avoid HF API calls in CI.
+    """Patch transformers' _patch_mistral_regex to avoid HF API calls in CI.
 
-    transformers calls model_info() inside _patch_mistral_regex -> is_base_mistral
-    for every tokenizer load, which hits HF API even with HF_HUB_OFFLINE=1.
-    In CI this exhausts the 3000 req/5min rate limit and causes 429 errors.
+    transformers defines is_base_mistral as a local function inside
+    _patch_mistral_regex, so it cannot be patched via module attribute.
+    Instead we replace the entire _patch_mistral_regex classmethod with a
+    version that simply returns the tokenizer unchanged.
+
+    In CI this prevents exhausting the 3000 req/5min HF API rate limit.
     """
     global _is_base_mistral_patched
     if _is_base_mistral_patched:
@@ -739,18 +746,23 @@ def _patch_is_base_mistral_in_ci():
     if transformers.__version__ != _TRANSFORMERS_PATCHED_VERSION:
         logger.warning(
             "transformers version changed to %s (expected %s), "
-            "is_base_mistral patch skipped — may need update if 429 errors recur",
+            "_patch_mistral_regex patch skipped — may need update if 429 errors recur",
             transformers.__version__,
             _TRANSFORMERS_PATCHED_VERSION,
         )
         _is_base_mistral_patched = True  # don't warn repeatedly
         return
 
-    import transformers.tokenization_utils_tokenizers as tut
+    from transformers import PreTrainedTokenizerFast
 
-    if hasattr(tut, "is_base_mistral"):
-        tut.is_base_mistral = lambda *a, **kw: False
-        logger.info("CI: patched is_base_mistral to skip HF API calls")
+    if hasattr(PreTrainedTokenizerFast, "_patch_mistral_regex"):
+
+        @classmethod
+        def _noop_patch_mistral_regex(cls, tokenizer, *args, **kwargs):
+            return tokenizer
+
+        PreTrainedTokenizerFast._patch_mistral_regex = _noop_patch_mistral_regex
+        logger.info("CI: patched _patch_mistral_regex to skip HF API calls")
 
     _is_base_mistral_patched = True
 
@@ -789,6 +801,9 @@ def get_tokenizer(
         _ensure_gguf_version()
         kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
+
+    if is_runai_obj_uri(tokenizer_name):
+        tokenizer_name = ObjectStorageModel.get_path(tokenizer_name)
 
     if is_remote_url(tokenizer_name):
         # BaseConnector implements __del__() to clean up the local dir.

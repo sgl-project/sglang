@@ -55,15 +55,10 @@ class SchedulerOutputProcessorMixin:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
-            - None if HiCache is not enabled
-            - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
-            - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
+            - None if no cached tokens at all
+            - {"device": X, "host": Y} without storage breakdown
+            - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
-        # Only show details if HiCache is enabled
-        if not getattr(self, "enable_hierarchical_cache", False):
-            return None
-
-        # Only show if there are any cached tokens
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
@@ -78,6 +73,13 @@ class SchedulerOutputProcessorMixin:
                 details["storage"] = req.cached_tokens_storage
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
+
+        if req.cached_tokens > 0:
+            return {
+                "device": req.cached_tokens,
+                "host": 0,
+            }
+
         return None
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
