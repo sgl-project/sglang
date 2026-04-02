@@ -89,6 +89,8 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    get_bool_env_var,
+    is_hip,
     make_layers,
     rank0_log,
     use_intel_amx_backend,
@@ -100,6 +102,8 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -163,7 +167,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         prefix: str = "",
         is_nextn: bool = False,
+        support_shared_experts: bool = False,
     ):
+        # By default, fuse shared experts to routed experts are not supported except Qwen3.5 MoE for now.
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
@@ -259,6 +265,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if getattr(config, "shared_expert_intermediate_size", 0) <= 0:
             return 0
         if config.shared_expert_intermediate_size != config.moe_intermediate_size:
+            return 0
+        if not _use_aiter:
+            # Only Aiter is tested for now. This is to avoid failure on other platform.
             return 0
         return 1
 
