@@ -432,56 +432,6 @@ def _run_nemo_skills_eval(
             kill_process_tree(process.pid)
 
 
-def _run_few_shot_eval(
-    model: ModelLaunchSettings,
-    base_url: str,
-    num_questions: Optional[int] = None,
-    num_shots: int = 8,
-    max_tokens: int = 512,
-) -> Tuple[bool, Optional[str], Optional[dict]]:
-    """Run evaluation using few_shot backend (few_shot_gsm8k.py).
-
-    Returns:
-        Tuple of (success, error_message, metrics_dict)
-    """
-    from sglang.test.few_shot_gsm8k import run_eval as run_few_shot_eval
-
-    process = None
-    try:
-        process = popen_launch_server(
-            model.model_path,
-            base_url,
-            other_args=model.extra_args,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env=model.env,
-        )
-
-        args = SimpleNamespace(
-            num_shots=num_shots,
-            data_path=None,
-            num_questions=num_questions or 200,
-            max_new_tokens=max_tokens,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(base_url.split(":")[-1]),
-        )
-
-        metrics = run_few_shot_eval(args)
-
-        # Normalize metrics format (few_shot returns "accuracy", simple_eval returns "score")
-        if "accuracy" in metrics and "score" not in metrics:
-            metrics["score"] = metrics["accuracy"]
-
-        return True, None, metrics
-
-    except Exception as e:
-        return False, f"Few-shot evaluation exception: {str(e)}", None
-
-    finally:
-        if process:
-            kill_process_tree(process.pid)
-
-
 def run_accuracy_test(
     model: ModelLaunchSettings,
     params: AccuracyTestParams,
@@ -507,12 +457,7 @@ def run_accuracy_test(
 
     # Run evaluation based on dataset type
     # - NeMo Skills: mmmu-pro (and other VLM evals needing ns eval)
-    # - few_shot_eval: gsm8k (default, backward compatible)
-    # - simple_eval: everything else (gpqa, mmmu, etc.)
-    has_extended_params = any(
-        getattr(params, field) is not None
-        for field in ("thinking_mode", "temperature", "top_p", "top_k", "repeat")
-    )
+    # - simple_eval: everything else (gsm8k, gpqa, mmlu, mmmu, etc.)
     if params.dataset in ("mmmu-pro", "mmmu_pro"):
         success, error, metrics = _run_nemo_skills_eval(
             model=model,
@@ -522,13 +467,6 @@ def run_accuracy_test(
             repeat=params.repeat or 1,
             temperature=params.temperature,
             top_p=params.top_p,
-        )
-    elif params.dataset == "gsm8k" and not has_extended_params:
-        success, error, metrics = _run_few_shot_eval(
-            model=model,
-            base_url=base_url,
-            num_questions=params.num_examples,
-            max_tokens=params.max_tokens or 512,
         )
     else:
         success, error, metrics = _run_simple_eval(

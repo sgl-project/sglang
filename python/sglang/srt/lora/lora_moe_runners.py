@@ -71,17 +71,22 @@ if _is_cuda or _is_hip or _is_xpu:
 class LoRAInfo:
     """LoRA weights and dispatch info for MoE computation."""
 
-    # LoRA weights: [num_loras, num_experts, dim1, dim2]
+    # LoRA weights: [num_loras, num_experts_or_1, dim1, dim2]
+    # When experts_shared_outer_loras=True:
+    #   gate_up_lora_a: [num_loras, 1, max_rank, hidden_dim] (shared)
+    #   down_lora_b: [num_loras, 1, hidden_dim, max_rank] (shared)
     gate_up_lora_a_weights: (
         torch.Tensor
-    )  # [num_loras, num_experts, max_rank, hidden_dim]
+    )  # [num_loras, num_experts_or_1, max_rank, hidden_dim]
     gate_up_lora_b_weights: (
         torch.Tensor
     )  # [num_loras, num_experts, gate_up_dim, max_rank]
     down_lora_a_weights: (
         torch.Tensor
     )  # [num_loras, num_experts, max_rank, intermediate_dim]
-    down_lora_b_weights: torch.Tensor  # [num_loras, num_experts, hidden_dim, max_rank]
+    down_lora_b_weights: (
+        torch.Tensor
+    )  # [num_loras, num_experts_or_1, hidden_dim, max_rank]
 
     # Indice pointers of each segment in shape (num_segments + 1, )
     seg_indptr: torch.Tensor
@@ -95,6 +100,7 @@ class LoRAInfo:
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
+    experts_shared_outer_loras: bool = False
 
     fully_sharded: bool = False
     tp_size: int = 1
@@ -469,16 +475,11 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         r = lora_info.max_lora_rank
         gate_up_a = lora_info.gate_up_lora_a_weights
+        if lora_info.experts_shared_outer_loras:
+            gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
         gate_up_b = lora_info.gate_up_lora_b_weights
         inter_size = gate_up_b.shape[2] // 2
 
-        # Split packed gate_up weights into separate gate and up slices.
-        # gate_up_lora_a has shape [max_loras, num_experts, 2*r, hidden_dim]
-        # where the first r rows are gate_lora_a and the next r are up_lora_a.
-        # gate_up_lora_b has shape [max_loras, num_experts, 2*inter_size, r]
-        # where the first inter_size rows are gate_lora_b and the rest up_lora_b.
-        # Using num_slices=2 lets the kernel handle gate and up independently,
-        # keeping the rank dimension at r so shrink and expand both match.
         lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
         lora_b_stacked = [
             gate_up_b[:, :, :inter_size, :],
@@ -542,8 +543,12 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         if lora_info.max_lora_rank == 0:
             return
 
+        down_lora_b = lora_info.down_lora_b_weights
+        if lora_info.experts_shared_outer_loras:
+            down_lora_b = down_lora_b.expand(-1, lora_info.num_experts, -1, -1)
+
         lora_a_stacked = [lora_info.down_lora_a_weights]
-        lora_b_stacked = [lora_info.down_lora_b_weights]
+        lora_b_stacked = [down_lora_b]
 
         if lora_info.fully_sharded and lora_info.tp_size > 1:
             shard_size = lora_info.hidden_size // lora_info.tp_size

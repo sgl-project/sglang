@@ -148,6 +148,7 @@ class CommonKVManager(BaseKVManager):
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
@@ -326,7 +327,6 @@ class CommonKVManager(BaseKVManager):
             host = self.bootstrap_host
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
-        bootstrap_server_url = bootstrap_na.to_host_port_str()
         url = f"{bootstrap_na.to_url()}/route"
         payload = {
             "attn_tp_size": self.attn_tp_size,
@@ -477,6 +477,14 @@ class CommonKVSender(BaseKVSender):
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
 
+    def abort(self):
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            "Aborted by AbortReq.",
+        )
+        # Explicitly set the status to failure since this request has been aborted
+        self.conclude_state = KVPoll.Failed
+
 
 class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
@@ -494,15 +502,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
-        self.bootstrap_infos = None
-        self.prefill_info = None
-        self.prefill_dp_rank = None
-        self.target_tp_rank = None
-        self.target_tp_ranks = None
-        self.target_cp_ranks = None
-        self.target_pp_ranks = None
-        self.required_dst_info_num = None
-        self.required_prefill_response_num = None
+        self.require_staging: bool = False
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -530,6 +530,12 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
         )
+
+        if self.kv_mgr.enable_staging:
+            self.require_staging = (
+                self.prefill_info.attn_tp_size != 0
+                and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
+            )
 
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()
@@ -665,6 +671,14 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
+
+    def abort(self):
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            "Aborted by AbortReq.",
+        )
+        # Explicitly set the status to failure since this request has been aborted
+        self.conclude_state = KVPoll.Failed
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
