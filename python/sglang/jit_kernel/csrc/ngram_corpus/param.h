@@ -17,13 +17,10 @@ struct Param {
   bool enable_router_mode;
   size_t min_bfs_breadth;
   size_t max_bfs_breadth;
-  size_t min_match_window_size;
-  size_t max_match_window_size;
   size_t max_trie_depth;
   size_t draft_token_num;
   std::string match_type;
 
-  std::vector<size_t> batch_min_match_window_size;
   std::vector<size_t> batch_draft_token_num;
 
   size_t get_draft_token_num(size_t batch_size) const {
@@ -34,16 +31,6 @@ struct Param {
       }
     }
     return draft_token_num - 1;
-  }
-
-  size_t get_min_match_window_size(size_t batch_size) const {
-    if (batch_size < batch_min_match_window_size.size()) {
-      if (batch_min_match_window_size[batch_size] !=
-          std::numeric_limits<decltype(batch_min_match_window_size)::value_type>::max()) {
-        return batch_min_match_window_size[batch_size];
-      }
-    }
-    return min_match_window_size;
   }
 
   std::vector<size_t> parse(const std::string& value) {
@@ -96,10 +83,6 @@ struct Param {
     return result;
   }
 
-  void resetBatchMinMatchWindowSize(const std::string& value) {
-    batch_min_match_window_size = parse(value);
-  }
-
   void resetBatchReturnTokenNum(const std::string& value) {
     batch_draft_token_num = parse(value);
   }
@@ -108,13 +91,8 @@ struct Param {
     std::stringstream ss;
     ss << "enable = " << enable << ", enable_router_mode = " << enable_router_mode
        << ", min_bfs_breadth = " << min_bfs_breadth << ", max_bfs_breadth = " << max_bfs_breadth
-       << ", min_match_window_size = " << min_match_window_size << ", max_match_window_size = " << max_match_window_size
        << ", max_trie_depth = " << max_trie_depth << ", draft_token_num = " << draft_token_num
        << ", match_type = " << match_type;
-    ss << ", batch_min_match_window_size(" << batch_min_match_window_size.size() << ") = ";
-    for (int i = 0; i < batch_min_match_window_size.size(); ++i) {
-      ss << i << "|" << batch_min_match_window_size[i] << ",";
-    }
     ss << ", batch_draft_token_num(" << batch_draft_token_num.size() << ") = ";
     for (int i = 0; i < batch_draft_token_num.size(); ++i) {
       ss << i << "|" << batch_draft_token_num[i] << ",";
