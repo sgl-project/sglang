@@ -334,7 +334,6 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         token_id_map = {
             Modality.IMAGE: mm_inputs.im_token_id,
-            Modality.MULTI_IMAGES: mm_inputs.im_token_id,
             Modality.AUDIO: mm_inputs.audio_token_id,
             Modality.VIDEO: mm_inputs.video_token_id,
         }

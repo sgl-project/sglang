@@ -137,7 +137,6 @@ class MultimodalSpecialTokens:
     def get_token_id_by_modality(self, modality: Modality) -> Optional[int]:
         return {
             Modality.IMAGE: self.image_token_id,
-            Modality.MULTI_IMAGES: self.image_token_id,
             Modality.VIDEO: self.video_token_id,
             Modality.AUDIO: self.audio_token_id,
         }.get(modality)
@@ -998,7 +997,8 @@ class BaseMultimodalProcessor(ABC):
         self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
         """
-        Create mm_items directly from processor output, with one item for each modality
+        Create mm_items from processor output. Initially creates one item per modality;
+        these are later split into per-image/video items by get_new_expanded_mm_items.
 
         Note that the data_dict can be passed via offline engine api
         """

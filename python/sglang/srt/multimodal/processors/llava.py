@@ -198,9 +198,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             raise ValueError(f"Invalid image data: {image_data}")
         modality = Modality.IMAGE
         if isinstance(request_obj.modalities, list):
-            if request_obj.modalities[0] == "multi-images":
-                modality = Modality.MULTI_IMAGES
-            elif request_obj.modalities[0] == "video":
+            if request_obj.modalities[0] == "video":
                 modality = Modality.VIDEO
 
         # Create one item per image for better cache granularity

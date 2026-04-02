@@ -63,10 +63,10 @@ class LlavaBaseForCausalLM(nn.Module):
         pad_values = [item.pad_value for item in image_inputs.mm_items]
 
         # hardcode for spatial_unpad + anyres
-        if any(
-            item.modality == Modality.MULTI_IMAGES or item.modality == Modality.VIDEO
-            for item in image_inputs.mm_items
-        ):
+        # Multi-image or video → use "pad" mode (no anyres)
+        image_items = [item for item in image_inputs.mm_items if item.is_image()]
+        has_video = any(item.is_video() for item in image_inputs.mm_items)
+        if len(image_items) > 1 or has_video:
             image_aspect_ratio = "pad"
         else:
             image_aspect_ratio = "anyres"
@@ -225,15 +225,15 @@ class LlavaBaseForCausalLM(nn.Module):
                     new_image_features = []
                     height = width = self.num_patches_per_side
                     for image_idx, image_feature in enumerate(image_features):
-                        if modalities_list[image_idx] == Modality.IMAGE:
+                        if (
+                            modalities_list[image_idx] == Modality.VIDEO
+                            or len(image_features) > 1
+                        ):
+                            image_aspect_ratio = "pad"  # multi image or video
+                        else:
                             image_aspect_ratio = (
                                 self.config.image_aspect_ratio
                             )  # single image
-                        elif (
-                            modalities_list[image_idx] == Modality.MULTI_IMAGES
-                            or modalities_list[image_idx] == Modality.VIDEO
-                        ):
-                            image_aspect_ratio = "pad"  # multi image
                         # image_aspect_ratio = (
                         #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
                         # )
