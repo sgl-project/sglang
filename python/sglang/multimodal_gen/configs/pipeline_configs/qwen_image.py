@@ -254,6 +254,49 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         txt_cos_sin_cache = torch.cat([txt_cos_half, txt_sin_half], dim=-1)
         return img_cos_sin_cache, txt_cos_sin_cache
 
+    @staticmethod
+    def _expand_cond_tensor_batch(
+        tensor: torch.Tensor, target_batch_size: int, cond_name: str
+    ) -> torch.Tensor:
+        current_batch_size = tensor.shape[0]
+        if current_batch_size == target_batch_size:
+            return tensor
+
+        if target_batch_size % current_batch_size != 0:
+            raise ValueError(
+                f"QwenImage expects `{cond_name}` batch size ({current_batch_size}) "
+                f"to divide target batch size ({target_batch_size})."
+            )
+
+        repeat_factor = target_batch_size // current_batch_size
+        return tensor.repeat_interleave(repeat_factor, dim=0).contiguous()
+
+    @classmethod
+    def _expand_cond_batch(
+        cls,
+        cond: list[torch.Tensor] | torch.Tensor | None,
+        batch,
+        cond_name: str,
+    ) -> list[torch.Tensor] | torch.Tensor | None:
+        if cond is None:
+            return None
+
+        target_batch_size = batch.batch_size
+        if isinstance(cond, list):
+            return [
+                cls._expand_cond_tensor_batch(tensor, target_batch_size, cond_name)
+                for tensor in cond
+            ]
+        return cls._expand_cond_tensor_batch(cond, target_batch_size, cond_name)
+
+    def get_pos_prompt_embeds(self, batch):
+        return self._expand_cond_batch(batch.prompt_embeds, batch, "prompt_embeds")
+
+    def get_neg_prompt_embeds(self, batch):
+        return self._expand_cond_batch(
+            batch.negative_prompt_embeds, batch, "negative_prompt_embeds"
+        )
+
     def _prepare_cond_kwargs(self, batch, prompt_embeds, rotary_emb, device, dtype):
         batch_size = prompt_embeds[0].shape[0]
         height = batch.height
@@ -292,12 +335,12 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_cond_kwargs(
-            batch, batch.prompt_embeds, rotary_emb, device, dtype
+            batch, self.get_pos_prompt_embeds(batch), rotary_emb, device, dtype
         )
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_cond_kwargs(
-            batch, batch.negative_prompt_embeds, rotary_emb, device, dtype
+            batch, self.get_neg_prompt_embeds(batch), rotary_emb, device, dtype
         )
 
     def post_denoising_loop(self, latents, batch):
