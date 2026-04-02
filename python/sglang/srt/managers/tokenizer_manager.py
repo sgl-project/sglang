@@ -2415,9 +2415,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             return span_attrs
 
         # Token usage attributes
-        span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
-            recv_obj.completion_tokens[i]
-        )
+        if not isinstance(recv_obj, BatchEmbeddingOutput):
+            span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
+                recv_obj.completion_tokens[i]
+            )
         span_attrs[SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] = recv_obj.prompt_tokens[
             i
         ]
