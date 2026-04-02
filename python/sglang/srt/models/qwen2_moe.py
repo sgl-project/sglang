@@ -195,10 +195,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
         self.num_experts = config.num_experts
-        if config.get("n_shared_experts", 0) > 0:
+        if hasattr(config, "n_shared_experts"):
             # config defines the number of shared experts
             num_shared_experts = config.n_shared_experts
-        elif config.get("shared_expert_intermediate_size", 0) > 0:
+        elif hasattr(config, "shared_expert_intermediate_size") and config.shared_expert_intermediate_size > 0:
             # n_shared_experts is not defined, but shared_expert_intermediate_size is defined, so we use 1 as the number of shared experts
             num_shared_experts = 1
         else:
