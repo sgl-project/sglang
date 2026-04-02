@@ -30,7 +30,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_available_gpu_memory, get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer, GapTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -490,6 +490,11 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
 
+            # GPU memory
+            self.stats.available_gpu_memory_gb = (
+                self._get_available_gpu_memory_gb()
+            )
+
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
@@ -735,6 +740,11 @@ class SchedulerMetricsMixin:
                 running_routing_keys + waiting_routing_keys
             )
 
+            # GPU memory
+            self.stats.available_gpu_memory_gb = (
+                self._get_available_gpu_memory_gb()
+            )
+
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
@@ -891,6 +901,16 @@ class SchedulerMetricsMixin:
             ts_tic=time.perf_counter(),
         )
 
+    def _get_available_gpu_memory_gb(self: Scheduler) -> float:
+        """Get available GPU memory in GB, returning 0.0 on failure."""
+        try:
+            return get_available_gpu_memory(
+                self.device, self.gpu_id, empty_cache=False
+            )
+        except Exception as e:
+            logger.debug(f"Failed to get available GPU memory: {e}")
+            return 0.0
+
     def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
         """
         Get comprehensive load metrics for /v1/loads endpoint.
@@ -945,6 +965,9 @@ class SchedulerMetricsMixin:
                     ),
                     graph_gb=round(self.tp_worker.model_runner.graph_mem_usage, 3),
                     token_capacity=int(self.max_total_num_tokens),
+                    available_gpu_memory_gb=round(
+                        self._get_available_gpu_memory_gb(), 3
+                    ),
                 )
             except AttributeError as e:
                 logger.debug(f"Memory metrics not available: {e}")
