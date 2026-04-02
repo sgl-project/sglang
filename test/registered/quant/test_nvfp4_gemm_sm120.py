@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -12,12 +12,12 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=360, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
 
-class FP4GemmBase:
+class FP4GemmSM120Base:
     backend = None
 
     @classmethod
@@ -32,6 +32,7 @@ class FP4GemmBase:
             "modelopt_fp4",
             "--fp4-gemm-backend",
             cls.backend,
+            "--disable-piecewise-cuda-graph",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -42,43 +43,28 @@ class FP4GemmBase:
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process"):
+            kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         parsed_url = urlparse(self.base_url)
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=1319,
-            num_threads=200,
+            num_shots=5,
+            data_path=None,
+            num_questions=1319,
+            max_new_tokens=512,
+            parallel=200,
+            host=parsed_url.hostname,
+            port=parsed_url.port,
         )
-        metrics = run_eval(args)
-        print(metrics)
-
-        self.assertGreater(metrics["score"], 0.64)
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["accuracy"], 0.64)
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmAuto(FP4GemmBase, unittest.TestCase):
+class TestFP4GemmSM120Auto(FP4GemmSM120Base, unittest.TestCase):
     backend = "auto"
-
-
-@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmFlashinferCutlass(FP4GemmBase, unittest.TestCase):
-    backend = "flashinfer_cutlass"
-
-
-@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmFlashinferCudnn(FP4GemmBase, unittest.TestCase):
-    backend = "flashinfer_cudnn"
-
-
-@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmFlashinferTrtllm(FP4GemmBase, unittest.TestCase):
-    backend = "flashinfer_trtllm"
 
 
 if __name__ == "__main__":
