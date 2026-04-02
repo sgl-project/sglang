@@ -20,7 +20,7 @@ def _get_available_metal_memory() -> int:
 
     return max(
         0,
-        int(torch.mps.recommended_max_memory()) - int(torch.mps.driver_allocated_memory()),
+        torch.mps.recommended_max_memory() - torch.mps.driver_allocated_memory(),
     )
 
 
@@ -152,7 +152,7 @@ def get_device_properties(device: Any = 0) -> _MPSDeviceProperties:  # noqa: ARG
         import torch
 
         _cached_props = _MPSDeviceProperties(
-            total_memory=int(torch.mps.recommended_max_memory()),
+            total_memory=torch.mps.recommended_max_memory(),
         )
     return _cached_props
 

@@ -49,7 +49,7 @@ class MpsPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        return int(torch.mps.recommended_max_memory())
+        return torch.mps.recommended_max_memory()
 
     @classmethod
     def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
