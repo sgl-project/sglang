@@ -82,38 +82,15 @@ suite_xpu = {
 }
 
 # Add Ascend NPU tests
-# TODO: Set accurate estimate time
-# NOTE: please sort the test cases alphabetically by the test file name
+# NOTE: Most ascend tests were moved to test/registered/ascend/ in PR #20751.
+# Only tests that still exist under test/srt/ascend/ are listed here.
 suite_ascend = {
     "per-commit-1-npu-a2": [
-        TestFile("ascend/test_ascend_autoround_dense.py", 400),
-        TestFile("ascend/test_ascend_autoround_moe.py", 400),
-        TestFile("ascend/test_ascend_gptq_moe.py", 400),
-        TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
-        TestFile("ascend/test_ascend_hicache_mha.py", 400),
-        TestFile("ascend/test_ascend_sampling_backend.py", 400),
-        TestFile("ascend/test_ascend_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
         TestFile("ascend/test_embed_interpolate_unittest.py", 400),
     ],
-    "per-commit-2-npu-a2": [
-        TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
-    ],
-    "per-commit-4-npu-a3": [
-        TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_hicache_mla.py", 400),
-        TestFile("ascend/test_ascend_tp4_bf16.py", 400),
-        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
-        TestFile("ascend/test_llada2_mini_ascend.py", 800),
-    ],
-    "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 3600),
-    ],
+    "per-commit-2-npu-a2": [],
+    "per-commit-4-npu-a3": [],
+    "per-commit-16-npu-a3": [],
 }
 
 suites.update(suite_amd)
