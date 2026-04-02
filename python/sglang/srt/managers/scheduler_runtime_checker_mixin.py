@@ -270,6 +270,38 @@ class SchedulerRuntimeCheckerMixin:
                 msg,
             )
 
+    def _check_request_lifecycle_consistency(self: Scheduler):
+        # Check that no request is present in multiple places at the same time,
+        # which would indicate a lifecycle management bug.
+        err_rids: dict[str, set[str]] = {}
+        conflicts_rids: dict[str, str] = {}
+
+        def check_reqs(reqs: Sequence[Req], container_name: str):
+            for req in reqs:
+                if req.rid in conflicts_rids:
+                    err_rids.setdefault(req.rid, set()).update(
+                        {conflicts_rids[req.rid]} | {container_name}
+                    )
+                else:
+                    conflicts_rids[req.rid] = container_name
+
+        # can add more req containers to check here if needed
+        check_reqs(self.waiting_queue, "waiting_queue")
+        check_reqs(self.running_batch.reqs, "running_batch")
+        check_reqs(self.grammar_manager.grammar_queue, "grammar_queue")
+
+        if err_rids:
+            lines = ["Duplicate rid detected in scheduler request containers."]
+            for rid, container_names in sorted(err_rids.items()):
+                lines.append(f"rid={rid}, containers={sorted(container_names)}")
+            raise_error_or_warn(
+                self,
+                envs.SGLANG_ENABLE_STRICT_REQUEST_LIFECYCLE_CHECK.get(),
+                "count_request_lifecycle_warnings",
+                "\n".join(lines),
+                log_interval=100,
+            )
+
     def check_memory(self: Scheduler):
         if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
@@ -358,6 +390,8 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        self._check_request_lifecycle_consistency()
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return
