@@ -129,6 +129,8 @@ class FutureMap:
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         if self.spec_algo.is_ngram():
+            # FIXME: ngram draft requires synced token ids to query the ngram table,
+            # so future resolve is skipped. Remove once precomputed draft is supported.
             return
         if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
@@ -161,11 +163,10 @@ class FutureMap:
             return start <= stop
 
     def store_to_map(
-        self,
-        future_indices: FutureIndices,
-        batch_result: GenerationBatchResult,
+        self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
         if self.spec_algo.is_ngram():
+            # FIXME: same as resolve_future — remove once precomputed draft is supported.
             return
         if self.spec_algo.is_none():
             intv = future_indices.interval
