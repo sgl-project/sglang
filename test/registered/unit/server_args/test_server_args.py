@@ -51,6 +51,23 @@ class TestPrepareServerArgs(CustomTestCase):
             ["TopK", "UnquantizedFusedMoEMethod"],
         )
 
+    def test_prepare_server_args_with_torch_compile_op_config(self):
+        with patch.object(ServerArgs, "__post_init__", lambda self: None):
+            server_args = prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--torch-compile-op-config",
+                    '{"RMSNorm": {"mode": "max-autotune", "options": {"combo_kernels": true}}}',
+                ]
+            )
+
+        self.assertIsNotNone(server_args.torch_compile_op_config)
+        parsed = json.loads(server_args.torch_compile_op_config)
+        self.assertIn("RMSNorm", parsed)
+        self.assertEqual(parsed["RMSNorm"]["mode"], "max-autotune")
+        self.assertEqual(parsed["RMSNorm"]["options"], {"combo_kernels": True})
+
     def test_prepare_server_args_with_local_torch_compile_scope(self):
         with patch.object(ServerArgs, "__post_init__", lambda self: None):
             server_args = prepare_server_args(

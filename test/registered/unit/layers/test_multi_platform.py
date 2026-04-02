@@ -6,6 +6,11 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.utils import CompilableRegionMixin, MultiPlatformOp
+from sglang.srt.utils.torch_compile_utils import (
+    CompileConfig,
+    parse_compile_op_config,
+    resolve_compile_config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -231,6 +236,121 @@ class TestCompilableRegionMixin(CustomTestCase):
 
         mod = _Bare()
         self.assertEqual(mod.get_compilable_regions(), {})
+
+
+class _OpWithCustomConfig(_ForwardTrackerOp):
+    compile_config = CompileConfig(
+        mode="max-autotune", options={"max_autotune_gemm": True}
+    )
+
+
+class _OpWithModeOnly(_ForwardTrackerOp):
+    compile_config = CompileConfig(mode="max-autotune-no-cudagraphs")
+
+
+class _SubOpInheritsConfig(_OpWithCustomConfig):
+    """Subclass that inherits parent's compile_config."""
+
+    pass
+
+
+class TestCompileConfig(CustomTestCase):
+    """Tests for per-op CompileConfig resolution chain."""
+
+    def test_global_defaults_when_no_class_or_override(self):
+        op = DummyLayer()
+        cfg = resolve_compile_config(op)
+        self.assertIsInstance(cfg.mode, str)
+        self.assertIsInstance(cfg.options, dict)
+
+    @patch.dict("os.environ", {"SGLANG_TORCH_COMPILE_MODE": "max-autotune-no-cudagraphs"})
+    def test_global_mode_from_env(self):
+        op = DummyLayer()
+        cfg = resolve_compile_config(op)
+        self.assertEqual(cfg.mode, "max-autotune-no-cudagraphs")
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_global_mode_fallback_to_default(self):
+        op = DummyLayer()
+        cfg = resolve_compile_config(op)
+        self.assertEqual(cfg.mode, "default")
+
+    def test_class_level_config_overrides_global(self):
+        op = _OpWithCustomConfig()
+        cfg = resolve_compile_config(op)
+        self.assertEqual(cfg.mode, "max-autotune")
+        self.assertEqual(cfg.options, {"max_autotune_gemm": True})
+
+    def test_class_level_partial_override_inherits_global_options(self):
+        op = _OpWithModeOnly()
+        cfg = resolve_compile_config(op)
+        self.assertEqual(cfg.mode, "max-autotune-no-cudagraphs")
+        self.assertIsInstance(cfg.options, dict)
+        self.assertNotEqual(cfg.options, {"max_autotune_gemm": True})
+
+    def test_subclass_inherits_parent_compile_config(self):
+        op = _SubOpInheritsConfig()
+        cfg = resolve_compile_config(op)
+        self.assertEqual(cfg.mode, "max-autotune")
+        self.assertEqual(cfg.options, {"max_autotune_gemm": True})
+
+    def test_server_override_beats_class_default(self):
+        op = _OpWithCustomConfig()
+        overrides = {
+            "_OpWithCustomConfig": CompileConfig(
+                mode="eager", options={"combo_kernels": True}
+            )
+        }
+        cfg = resolve_compile_config(op, overrides)
+        self.assertEqual(cfg.mode, "eager")
+        self.assertEqual(cfg.options, {"combo_kernels": True})
+
+    def test_server_override_partial_mode_keeps_class_options(self):
+        op = _OpWithCustomConfig()
+        overrides = {"_OpWithCustomConfig": CompileConfig(mode="eager")}
+        cfg = resolve_compile_config(op, overrides)
+        self.assertEqual(cfg.mode, "eager")
+        self.assertEqual(cfg.options, {"max_autotune_gemm": True})
+
+    def test_server_override_matches_via_mro(self):
+        op = _SubOpInheritsConfig()
+        overrides = {
+            "_OpWithCustomConfig": CompileConfig(mode="eager"),
+        }
+        cfg = resolve_compile_config(op, overrides)
+        self.assertEqual(cfg.mode, "eager")
+
+    def test_server_override_own_name_preferred_over_parent(self):
+        op = _SubOpInheritsConfig()
+        overrides = {
+            "_SubOpInheritsConfig": CompileConfig(mode="sub-mode"),
+            "_OpWithCustomConfig": CompileConfig(mode="parent-mode"),
+        }
+        cfg = resolve_compile_config(op, overrides)
+        self.assertEqual(cfg.mode, "sub-mode")
+
+    def test_unrelated_override_does_not_apply(self):
+        op = DummyLayer()
+        overrides = {"_OpWithCustomConfig": CompileConfig(mode="nope")}
+        cfg = resolve_compile_config(op)
+        self.assertNotEqual(cfg.mode, "nope")
+
+    def test_parse_compile_op_config_none(self):
+        self.assertIsNone(parse_compile_op_config(None))
+        self.assertIsNone(parse_compile_op_config(""))
+
+    def test_parse_compile_op_config_full(self):
+        raw = '{"RMSNorm": {"mode": "max-autotune", "options": {"combo_kernels": true}}}'
+        result = parse_compile_op_config(raw)
+        self.assertIn("RMSNorm", result)
+        self.assertEqual(result["RMSNorm"].mode, "max-autotune")
+        self.assertEqual(result["RMSNorm"].options, {"combo_kernels": True})
+
+    def test_parse_compile_op_config_mode_only(self):
+        raw = '{"TopK": {"mode": "max-autotune-no-cudagraphs"}}'
+        result = parse_compile_op_config(raw)
+        self.assertEqual(result["TopK"].mode, "max-autotune-no-cudagraphs")
+        self.assertIsNone(result["TopK"].options)
 
 
 if __name__ == "__main__":
