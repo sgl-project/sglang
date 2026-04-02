@@ -154,11 +154,10 @@ class KVArgsRegisterInfo:
                 if len(msg) > 11 and len(msg[11]) > 0
                 else []
             ),
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
-            # staging consumes msg[12] (base_ptr) and msg[13] (total_size)
             enable_hisparse=(
-                msg[14].decode("ascii") == "1" if len(msg) > 14 else False
+                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
             ),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
         )
 
 
@@ -1803,9 +1802,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
+                        enable_hisparse,
                         packed_staging_base_ptr,
                         staging_total_size_str,
-                        enable_hisparse,
                     ]
                 )
 
