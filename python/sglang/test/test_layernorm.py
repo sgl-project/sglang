@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.layernorm import GemmaRMSNorm, LayerNorm, RMSNorm
+from sglang.srt.layers.layernorm import Gemma3RMSNorm, GemmaRMSNorm, LayerNorm, RMSNorm
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -107,6 +107,71 @@ class TestGemmaRMSNorm(CustomTestCase):
                 seed=params[4],
             ):
                 self._run_gemma_rms_norm_test(*params)
+
+
+class TestGemma3RMSNorm(CustomTestCase):
+    DTYPES = [torch.half, torch.bfloat16]
+    NUM_TOKENS = [7, 83, 4096]
+    HIDDEN_SIZES = [128, 768, 5120, 8192]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        torch.set_default_device("cuda")
+
+    def _run_gemma3_rms_norm_2d(self, num_tokens, hidden_size, dtype, seed):
+        torch.manual_seed(seed)
+        layer = Gemma3RMSNorm(hidden_size).to(dtype=dtype)
+        layer.weight.data.normal_(mean=0.0, std=0.1)
+        scale = 1 / (2 * hidden_size)
+        x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+
+        with torch.inference_mode():
+            ref_out = layer.forward_native(x)
+            out = layer(x)
+
+        self.assertTrue(torch.allclose(out, ref_out, atol=1e-3, rtol=1e-3))
+
+    def _run_gemma3_rms_norm_4d(self, batch, num_heads, seq_len, head_dim, dtype, seed):
+        torch.manual_seed(seed)
+        layer = Gemma3RMSNorm(head_dim).to(dtype=dtype)
+        layer.weight.data.normal_(mean=0.0, std=0.1)
+        x = torch.randn(batch, num_heads, seq_len, head_dim, dtype=dtype) * 0.01
+
+        with torch.inference_mode():
+            ref_out = layer.forward_native(x)
+            out = layer(x)
+
+        self.assertTrue(torch.allclose(out, ref_out, atol=1e-3, rtol=1e-3))
+
+    def test_gemma3_rms_norm_2d(self):
+        for params in itertools.product(
+            self.NUM_TOKENS, self.HIDDEN_SIZES, self.DTYPES, self.SEEDS
+        ):
+            with self.subTest(
+                num_tokens=params[0],
+                hidden_size=params[1],
+                dtype=params[2],
+                seed=params[3],
+            ):
+                self._run_gemma3_rms_norm_2d(*params)
+
+    def test_gemma3_rms_norm_4d(self):
+        for batch, num_heads, seq_len, head_dim, dtype in itertools.product(
+            [1, 2], [8, 16], [7, 64], [128], self.DTYPES
+        ):
+            with self.subTest(
+                batch=batch,
+                num_heads=num_heads,
+                seq_len=seq_len,
+                head_dim=head_dim,
+                dtype=dtype,
+            ):
+                self._run_gemma3_rms_norm_4d(
+                    batch, num_heads, seq_len, head_dim, dtype, seed=0
+                )
 
 
 class TestLayerNorm(CustomTestCase):

@@ -623,7 +623,9 @@ class Gemma3RMSNorm(MultiPlatformOp):
         return self.forward_native(x)
 
     def forward_cuda(self, x):
-        return self.forward_native(x)
+        orig_shape = x.shape
+        out = gemma_rmsnorm(x.reshape(-1, orig_shape[-1]), self.weight.data, self.eps)
+        return out.reshape(orig_shape)
 
     def forward_npu(self, x):
         output, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.eps)
