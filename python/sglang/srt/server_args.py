@@ -68,6 +68,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ LOAD_FORMAT_CHOICES = [
     "remote_instance",
     "fastsafetensors",
     "private",
+    "runai_streamer",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -745,6 +747,8 @@ class ServerArgs:
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
 
+        self._maybe_download_model_for_runai()
+
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
 
@@ -845,6 +849,17 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+    def _maybe_download_model_for_runai(self):
+        if is_runai_obj_uri(self.model_path):
+            ObjectStorageModel.download_and_get_path(self.model_path)
+
+        if (
+            self.tokenizer_path is not None
+            and is_runai_obj_uri(self.tokenizer_path)
+            and self.tokenizer_path != self.model_path
+        ):
+            ObjectStorageModel.download_and_get_path(self.tokenizer_path)
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -3130,7 +3145,9 @@ class ServerArgs:
                 "Detected Mistral native format checkpoint, setting load_format='mistral'"
             )
 
-        if is_remote_url(self.model_path):
+        if is_runai_obj_uri(self.model_path):
+            self.load_format = "runai_streamer"
+        elif is_remote_url(self.model_path):
             self.load_format = "remote"
 
         if self.custom_weight_loader is None:
@@ -6075,11 +6092,12 @@ class ServerArgs:
         }, "moe_dense_tp_size only support 1 and None currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        assert ":" not in self.served_model_name, (
-            "served_model_name cannot contain a colon (':') character. "
-            "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
-            f"Invalid value: '{self.served_model_name}'"
-        )
+        if not is_runai_obj_uri(self.served_model_name):
+            assert ":" not in self.served_model_name, (
+                "served_model_name cannot contain a colon (':') character. "
+                "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
+                f"Invalid value: '{self.served_model_name}'"
+            )
 
         # Check LoRA
         self.check_lora_server_args()

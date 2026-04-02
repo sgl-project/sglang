@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -94,18 +94,18 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=1400,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=1400,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
 
 class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
