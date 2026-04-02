@@ -8,14 +8,14 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
 )
@@ -45,6 +45,8 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
         ]
@@ -62,6 +64,8 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
             "--base-gpu-id",
@@ -77,18 +81,17 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["score"], 0.62)
 
     def test_logprob(self):
         prompt = "The capital of france is "
@@ -220,6 +223,8 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
         ]
@@ -237,6 +242,8 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
             "--base-gpu-id",
@@ -252,18 +259,17 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
 
         # Expect lots of failure but the server cannot crash
         try:
-            metrics = run_eval_few_shot_gsm8k(args)
+            metrics = run_eval(args)
             print(f"Evaluation metrics: {metrics}")
         except Exception as e:
             print(f"Test encountered expected errors: {e}")
@@ -283,8 +289,8 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = DEFAULT_TARGET_MODEL_EAGLE
-        cls.draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE3
+        cls.draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
         cls.spec_args = [
             "--speculative-algorithm",
             "EAGLE",
@@ -298,6 +304,7 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
             "16",
             "--cuda-graph-max-bs",
             "8",
+            "--dtype=float16",
         ]
         print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
 
@@ -317,6 +324,8 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
         ] + cls.spec_args
@@ -334,6 +343,8 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
             "--base-gpu-id",
@@ -349,18 +360,17 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=2,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.20)
+        self.assertGreater(metrics["score"], 0.74)
 
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
@@ -391,6 +401,8 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
         ]
@@ -408,6 +420,8 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
             "--base-gpu-id",
@@ -423,18 +437,17 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["score"], 0.62)
 
 
 if __name__ == "__main__":

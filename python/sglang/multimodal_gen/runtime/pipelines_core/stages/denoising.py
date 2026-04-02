@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, S
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
@@ -809,20 +810,29 @@ class DenoisingStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
         if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
-            latents = self.server_args.pipeline_config.gather_latents_for_sp(latents)
+            latents = self.server_args.pipeline_config.gather_latents_for_sp(
+                latents, batch=batch
+            )
             if trajectory_tensor is not None:
                 # trajectory_tensor shapes:
                 # - video: [b, num_steps, c, t_local, h, w] -> gather on dim=3
                 # - image: [b, num_steps, s_local, d] -> gather on dim=2
                 trajectory_tensor = trajectory_tensor.to(get_local_torch_device())
-                gather_dim = 3 if trajectory_tensor.dim() >= 5 else 2
-                trajectory_tensor = sequence_model_parallel_all_gather(
-                    trajectory_tensor, dim=gather_dim
-                )
-                if gather_dim == 2 and hasattr(batch, "raw_latent_shape"):
-                    orig_s = batch.raw_latent_shape[1]
-                    if trajectory_tensor.shape[2] > orig_s:
-                        trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
+                if isinstance(self.server_args.pipeline_config, ZImagePipelineConfig):
+                    trajectory_tensor = (
+                        self.server_args.pipeline_config.gather_latents_for_sp(
+                            trajectory_tensor, batch=batch
+                        )
+                    )
+                else:
+                    gather_dim = 3 if trajectory_tensor.dim() >= 5 else 2
+                    trajectory_tensor = sequence_model_parallel_all_gather(
+                        trajectory_tensor, dim=gather_dim
+                    )
+                    if gather_dim == 2 and hasattr(batch, "raw_latent_shape"):
+                        orig_s = batch.raw_latent_shape[1]
+                        if trajectory_tensor.shape[2] > orig_s:
+                            trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
 
     def step_profile(self):

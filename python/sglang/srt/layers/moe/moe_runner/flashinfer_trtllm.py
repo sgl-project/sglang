@@ -8,13 +8,16 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 # Import to register custom ops for torch.compile compatibility
-import sglang.srt.layers.moe.flashinfer_trtllm_moe  # noqa: F401
-from sglang.kernel_api_logging import debug_torch_op
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
+    trtllm_fp8_block_scale_moe_wrapper,
+    trtllm_fp8_block_scale_routed_moe_wrapper,
+    trtllm_fp8_per_tensor_scale_moe_wrapper,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -28,7 +31,6 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
     is_flashinfer_available,
-    is_sm120_supported,
     next_power_of_2,
 )
 
@@ -38,22 +40,12 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-if is_flashinfer_available() and is_sm120_supported():
+if is_flashinfer_available():
     from flashinfer import fp4_quantize
 elif is_cuda_alike():
     from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
-
-_trtllm_fp8_block_scale_routed_moe_wrapper = debug_torch_op(
-    "trtllm_fp8_block_scale_routed_moe_wrapper"
-)
-_trtllm_fp8_block_scale_moe_wrapper = debug_torch_op(
-    "trtllm_fp8_block_scale_moe_wrapper"
-)
-_trtllm_fp8_per_tensor_scale_moe = debug_torch_op(
-    "trtllm_fp8_per_tensor_scale_moe_wrapper"
-)
 
 
 def align_fp8_moe_weights_for_flashinfer_trtllm(
@@ -386,7 +378,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 topk_weights=topk_output.topk_weights,
             )
 
-            output = _trtllm_fp8_block_scale_routed_moe_wrapper(
+            output = trtllm_fp8_block_scale_routed_moe_wrapper(
                 topk_ids=packed_topk_ids,
                 routing_bias=None,
                 hidden_states=a_q,
@@ -419,7 +411,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
-            output = _trtllm_fp8_block_scale_moe_wrapper(
+            output = trtllm_fp8_block_scale_moe_wrapper(
                 routing_logits=(
                     router_logits.to(torch.float32)
                     if routing_method_type == RoutingMethodType.DeepSeekV3
@@ -476,7 +468,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         # Move kernel call outside context manager to avoid graph breaks
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
-        output = _trtllm_fp8_per_tensor_scale_moe(
+        output = trtllm_fp8_per_tensor_scale_moe_wrapper(
             routing_logits=router_logits.to(torch.bfloat16),
             routing_bias=routing_bias_cast,
             hidden_states=a_q,
@@ -571,7 +563,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     """FlashInfer TRTLLM FP4 MoE forward pass.
 
     This function handles the FP4 TRTLLM MoE path that was previously in
-    FlashInferFP4MoE.forward_impl and ModelOptNvFp4FusedMoEMethod.apply.
+    ModelOptNvFp4FusedMoEMethod.apply.
     """
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 
@@ -645,7 +637,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
         routed_scaling_factor=runner_config.routed_scaling_factor,
-        tile_tokens_dim=None,
         routing_method_type=(
             routing_method_type
             if routing_method_type is not None

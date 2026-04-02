@@ -28,10 +28,14 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls.lb_port = base_port
         cls.prefill_port = f"{int(base_port) + 100}"
         cls.decode_port = f"{int(base_port) + 200}"
+        cls.bootstrap_port = f"{int(base_port) + 500}"
         cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
         cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
+        cls.base_url = cls.lb_url
+        print(
+            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
+        )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
 
         # config transfer backend and rdma devices
@@ -246,11 +250,13 @@ def get_rdma_devices_args():
     )
 
     rdma_devices = []
+    base_gpu = min(gpu_indices)
     for gpu_idx in gpu_indices:
-        nic_index = min(gpu_idx // gpus_per_rdma, n_rdma - 1)
+        nic_index = min((gpu_idx - base_gpu) // gpus_per_rdma, n_rdma - 1)
         rdma_devices.append(rdma_all_devices[nic_index])
 
     if not rdma_devices:
         return ",".join(_pick_default_pair(rdma_all_devices))
 
-    return ",".join(rdma_devices)
+    # Deduplicate while preserving order
+    return ",".join(dict.fromkeys(rdma_devices))
