@@ -5,11 +5,13 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.layers.utils import CompilableRegionMixin, MultiPlatformOp
+from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.utils.torch_compile_utils import CompilableRegionMixin
 from sglang.srt.utils.torch_compile_utils import (
     CompileConfig,
     parse_compile_op_config,
     resolve_compile_config,
+    resolve_region_compile_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -351,6 +353,104 @@ class TestCompileConfig(CustomTestCase):
         result = parse_compile_op_config(raw)
         self.assertEqual(result["TopK"].mode, "max-autotune-no-cudagraphs")
         self.assertIsNone(result["TopK"].options)
+
+
+class _RegionModuleWithConfig(nn.Module, CompilableRegionMixin):
+    compile_config = CompileConfig(mode="reduce-overhead", options={"combo_kernels": True})
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(4))
+
+    def get_compilable_regions(self):
+        return {"AlphaRegion": "_alpha", "BetaRegion": "_beta"}
+
+    def _alpha(self, x):
+        return x * self.weight
+
+    def _beta(self, x):
+        return x + self.weight
+
+
+class TestRegionCompileConfig(CustomTestCase):
+    """Tests for per-region CompileConfig resolution chain."""
+
+    def test_global_defaults_when_no_class_config(self):
+        mod = _DummyRegionModule()
+        cfg = resolve_region_compile_config(mod, "TestRegion")
+        self.assertIsInstance(cfg.mode, str)
+        self.assertIsInstance(cfg.options, dict)
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_global_mode_fallback(self):
+        mod = _DummyRegionModule()
+        cfg = resolve_region_compile_config(mod, "TestRegion")
+        self.assertEqual(cfg.mode, "default")
+
+    @patch.dict("os.environ", {"SGLANG_TORCH_COMPILE_MODE": "max-autotune"})
+    def test_global_mode_from_env(self):
+        mod = _DummyRegionModule()
+        cfg = resolve_region_compile_config(mod, "TestRegion")
+        self.assertEqual(cfg.mode, "max-autotune")
+
+    def test_class_config_overrides_global(self):
+        mod = _RegionModuleWithConfig()
+        cfg = resolve_region_compile_config(mod, "AlphaRegion")
+        self.assertEqual(cfg.mode, "reduce-overhead")
+        self.assertEqual(cfg.options, {"combo_kernels": True})
+
+    def test_class_config_applies_to_all_regions(self):
+        mod = _RegionModuleWithConfig()
+        cfg_a = resolve_region_compile_config(mod, "AlphaRegion")
+        cfg_b = resolve_region_compile_config(mod, "BetaRegion")
+        self.assertEqual(cfg_a.mode, cfg_b.mode)
+        self.assertEqual(cfg_a.options, cfg_b.options)
+
+    def test_server_override_by_region_name(self):
+        mod = _RegionModuleWithConfig()
+        overrides = {"AlphaRegion": CompileConfig(mode="eager")}
+        cfg = resolve_region_compile_config(mod, "AlphaRegion", overrides)
+        self.assertEqual(cfg.mode, "eager")
+        self.assertEqual(cfg.options, {"combo_kernels": True})
+
+    def test_server_override_does_not_affect_other_regions(self):
+        mod = _RegionModuleWithConfig()
+        overrides = {"AlphaRegion": CompileConfig(mode="eager")}
+        cfg = resolve_region_compile_config(mod, "BetaRegion", overrides)
+        self.assertEqual(cfg.mode, "reduce-overhead")
+
+    def test_server_override_options(self):
+        mod = _RegionModuleWithConfig()
+        overrides = {
+            "AlphaRegion": CompileConfig(options={"triton.enable_pdl": True})
+        }
+        cfg = resolve_region_compile_config(mod, "AlphaRegion", overrides)
+        self.assertEqual(cfg.mode, "reduce-overhead")
+        self.assertEqual(cfg.options, {"triton.enable_pdl": True})
+
+    def test_server_override_full(self):
+        mod = _RegionModuleWithConfig()
+        overrides = {
+            "AlphaRegion": CompileConfig(mode="eager", options={"key": "val"})
+        }
+        cfg = resolve_region_compile_config(mod, "AlphaRegion", overrides)
+        self.assertEqual(cfg.mode, "eager")
+        self.assertEqual(cfg.options, {"key": "val"})
+
+    def test_no_overrides_returns_class_default(self):
+        mod = _RegionModuleWithConfig()
+        cfg = resolve_region_compile_config(mod, "AlphaRegion", overrides=None)
+        self.assertEqual(cfg.mode, "reduce-overhead")
+        self.assertEqual(cfg.options, {"combo_kernels": True})
+
+    def test_enter_region_compile_accepts_mode(self):
+        mod = _DummyRegionModule()
+        mod.enter_region_compile(
+            "TestRegion", compile_mode="reduce-overhead"
+        )
+        self.assertTrue(mod.is_region_compiled("TestRegion"))
+        mod.leave_region_compile("TestRegion")
+        self.assertFalse(mod.is_region_compiled("TestRegion"))
 
 
 if __name__ == "__main__":

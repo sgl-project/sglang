@@ -62,7 +62,8 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
-from sglang.srt.layers.utils import CompilableRegionMixin, get_layer_id
+from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.utils.torch_compile_utils import CompilableRegionMixin
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
     is_prefill_context_parallel_enabled,
@@ -604,12 +605,14 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
         self,
         region_name: str,
         method_name: str,
+        compile_mode: Optional[str] = None,
         compile_options: Optional[dict] = None,
         compile_dynamic: bool = False,
     ):
         dynamic = self._REGION_DYNAMIC.get(region_name)
         return torch.compile(
             getattr(self, method_name),
+            mode=compile_mode,
             options=compile_options,
             dynamic=dynamic,
         )

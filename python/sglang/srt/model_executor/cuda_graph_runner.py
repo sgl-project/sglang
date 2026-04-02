@@ -62,12 +62,13 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
-from sglang.srt.layers.utils import CompilableRegionMixin, MultiPlatformOp
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils.torch_compile_utils import (
+    CompilableRegionMixin,
     CompileConfig,
-    get_default_compile_options,
     parse_compile_op_config,
     resolve_compile_config,
+    resolve_region_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -456,9 +457,13 @@ def _to_torch(
                 if reverse:
                     sub.leave_region_compile(region_name)
                 else:
+                    cfg = resolve_region_compile_config(
+                        sub, region_name, compile_overrides
+                    )
                     sub.enter_region_compile(
                         region_name,
-                        compile_options=get_default_compile_options(),
+                        compile_mode=cfg.mode,
+                        compile_options=cfg.options,
                         compile_dynamic=compile_dynamic,
                     )
 

@@ -67,7 +67,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id, CompilableRegionMixin
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.utils.torch_compile_utils import CompilableRegionMixin
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -638,12 +639,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module, CompilableRegionMixin):
         self,
         region_name: str,
         method_name: str,
+        compile_mode: Optional[str] = None,
         compile_options: Optional[dict] = None,
         compile_dynamic: bool = False,
     ):
         dynamic = self._REGION_DYNAMIC.get(region_name)
         return torch.compile(
             getattr(self, method_name),
+            mode=compile_mode,
             options=compile_options,
             dynamic=dynamic,
         )
