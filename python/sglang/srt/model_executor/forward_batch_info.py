@@ -52,16 +52,23 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
+from sglang.srt.utils import (
+    is_cuda,
+    is_hip,
+    is_npu,
+    support_triton,
+)
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -409,11 +416,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
+    attn_cp_metadata: Optional[ContextParallelMetadata] = None
     # Record the split metadata of the sequence number of NSA context parallels.
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+
+    # For hisparse
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
@@ -704,15 +715,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         else:  # target_verify or draft_decode
             seq_positions = batch.spec_info.positions.view(batch_size, -1)
-            mrope_deltas = [
-                (
-                    torch.tensor([0], dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
+            # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
+            if all(mm_input is None for mm_input in mm_inputs):
+                mrope_delta_tensor = torch.zeros(
+                    (batch_size, 1), dtype=torch.int64, device=device
                 )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            else:
+                mrope_deltas = [
+                    (
+                        torch.zeros(1, dtype=torch.int64)
+                        if mm_inputs[i] is None
+                        else mm_inputs[i].mrope_position_delta.squeeze(0)
+                    )
+                    for i in range(batch_size)
+                ]
+                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
             next_input_positions = (
                 (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
             )
@@ -1175,6 +1192,13 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def clamp_position(seq_lens):
+def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
+
+
+if is_cuda() or is_hip():
+    from sglang.jit_kernel.clamp_position import clamp_position_cuda
+
+    clamp_position = clamp_position_cuda
+else:
+    clamp_position = _clamp_position_native

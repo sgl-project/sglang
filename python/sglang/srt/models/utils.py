@@ -24,16 +24,18 @@ import torch
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import get_current_device_stream_fast, is_cuda
+from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -120,7 +122,8 @@ def enable_fused_set_kv_buffer(
         and pool.dtype == torch.bfloat16
         and (is_compiled or not is_swa)
         and (not (is_compiled and is_swa) or forward_batch.out_cache_loc_swa is not None)
-    )
+        and not is_prefill_context_parallel_enabled()
+    ) or (_is_hip and not is_prefill_context_parallel_enabled())
 
 
 def create_fused_set_kv_buffer_arg(
@@ -135,23 +138,45 @@ def create_fused_set_kv_buffer_arg(
 
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
-    assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
 
-    cache_loc = forward_batch.out_cache_loc
-    if isinstance(token_to_kv_pool, SWAKVPool):
-        _, is_swa_layer = token_to_kv_pool.layers_mapping[layer_id]
-        if is_swa_layer:
-            cache_loc = forward_batch.out_cache_loc_swa
+    if not _is_hip:
+        assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
 
-    if cache_loc is None:
-        return None
+        cache_loc = forward_batch.out_cache_loc
+        if isinstance(token_to_kv_pool, SWAKVPool):
+            _, is_swa_layer = token_to_kv_pool.layers_mapping[layer_id]
+            if is_swa_layer:
+                cache_loc = forward_batch.out_cache_loc_swa
 
-    return FusedSetKVBufferArg(
-        value=value,
-        k_buffer=k_buffer.view(k_buffer.shape[0], -1),
-        v_buffer=v_buffer.view(v_buffer.shape[0], -1),
-        cache_loc=cache_loc,
-    )
+        if cache_loc is None:
+            return None
+
+        return FusedSetKVBufferArg(
+            value=value,
+            k_buffer=k_buffer.view(k_buffer.shape[0], -1),
+            v_buffer=v_buffer.view(v_buffer.shape[0], -1),
+            cache_loc=cache_loc,
+        )
+    else:
+        page_size = token_to_kv_pool.page_size
+        slot_mapping_swa = (
+            token_to_kv_pool.full_to_swa_index_mapping.long()
+            if layer.sliding_window_size > 0
+            else None
+        )
+        return {
+            "v": value.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+            "k_scale": layer.k_scale,
+            "v_scale": layer.v_scale,
+            "key_cache": k_buffer.view(
+                -1, page_size, layer.tp_k_head_num, layer.qk_head_dim
+            ),
+            "value_cache": v_buffer.view(
+                -1, page_size, layer.tp_v_head_num, layer.v_head_dim
+            ),
+            "slot_mapping": forward_batch.out_cache_loc,
+            "swa_slot_mapping": slot_mapping_swa,
+        }
 
 
 def permute_inv(perm: torch.Tensor) -> torch.Tensor:

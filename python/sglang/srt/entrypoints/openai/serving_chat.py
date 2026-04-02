@@ -602,10 +602,25 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> StreamingResponse:
+    ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming chat completion request"""
+        generator = self._generate_chat_stream(adapted_request, request, raw_request)
+
+        # Kick-start the generator to trigger validation before HTTP 200 is sent.
+        # If validation fails (e.g., context length exceeded), we can still return
+        # a proper HTTP 400 error response instead of streaming it as SSE payload.
+        try:
+            first_chunk = await generator.__anext__()
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        async def prepend_first_chunk():
+            yield first_chunk
+            async for chunk in generator:
+                yield chunk
+
         return StreamingResponse(
-            self._generate_chat_stream(adapted_request, request, raw_request),
+            prepend_first_chunk(),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
@@ -635,6 +650,7 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
 
+        stream_started = False
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -650,22 +666,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
-                finish_reason = content["meta_info"].get("finish_reason", None)
                 choice_logprobs = None
                 if request.logprobs:
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    total_output_logprobs = len(
-                        content["meta_info"]["output_token_logprobs"]
-                    )
-                    # When finish_reason is set and all logprobs have been sent,
-                    # any remaining text is just buffered text being flushed by the
-                    # detokenizer (it holds back text at word boundaries). Return None
-                    # for logprobs since no new tokens were generated for this text.
-                    if n_prev_token < total_output_logprobs or finish_reason is None:
+                    total_output_logprobs = content["meta_info"][
+                        "output_token_logprobs_length"
+                    ]
+                    if n_prev_token < total_output_logprobs:
                         choice_logprobs = self._process_streaming_logprobs(
-                            content, n_prev_token
+                            content, n_prev_token, total_output_logprobs
                         )
                     n_prev_tokens[index] = total_output_logprobs
+
+                finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
@@ -702,6 +715,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         model=request.model,
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
+                    stream_started = True
 
                 stream_buffer = stream_buffers.get(index, "")
                 delta = content["text"][len(stream_buffer) :]
@@ -882,6 +896,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
+            if not stream_started:
+                raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
@@ -1174,15 +1190,18 @@ class OpenAIServingChat(OpenAIServingBase):
         return ToolCallProcessingResult(None, text, finish_reason)
 
     def _process_streaming_logprobs(
-        self, content: Dict[str, Any], n_prev_token: int
+        self,
+        content: Dict[str, Any],
+        n_prev_token: int,
+        total_output_logprobs: int,
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
         logprobs = to_openai_style_logprobs(
             output_token_logprobs=content["meta_info"]["output_token_logprobs"][
-                n_prev_token:
+                n_prev_token:total_output_logprobs
             ],
             output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
-                n_prev_token:
+                n_prev_token:total_output_logprobs
             ],
         )
 
@@ -1267,6 +1286,12 @@ class OpenAIServingChat(OpenAIServingBase):
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking") is not False
+            )
+        if self.reasoning_parser in ["mimo"]:
+            # Models that require explicit enable thinking (enable_thinking=True)
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
             )
         if self.reasoning_parser in ["mistral"]:
             # Mistral models only reason when reasoning_effort is explicitly

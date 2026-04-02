@@ -180,10 +180,25 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> StreamingResponse:
+    ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming completion request"""
+        generator = self._generate_completion_stream(
+            adapted_request, request, raw_request
+        )
+
+        # Kick-start the generator to trigger validation before HTTP 200 is sent.
+        try:
+            first_chunk = await generator.__anext__()
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        async def prepend_first_chunk():
+            yield first_chunk
+            async for chunk in generator:
+                yield chunk
+
         return StreamingResponse(
-            self._generate_completion_stream(adapted_request, request, raw_request),
+            prepend_first_chunk(),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
@@ -208,6 +223,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
 
+        stream_started = False
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -244,32 +260,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         input_top_logprobs = None
 
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    total_output_logprobs = len(
-                        content["meta_info"]["output_token_logprobs"]
-                    )
-                    output_logprobs_slice = content["meta_info"][
-                        "output_token_logprobs"
-                    ][n_prev_token:]
-                    finish_reason_for_logprobs = content["meta_info"]["finish_reason"]
-
-                    # When finish_reason is set and all logprobs have been sent,
-                    # any remaining text is just buffered text being flushed by the
-                    # detokenizer (it holds back text at word boundaries). Return None
-                    # for logprobs since no new tokens were generated for this text.
+                    total_output_logprobs = content["meta_info"][
+                        "output_token_logprobs_length"
+                    ]
                     if (
-                        len(output_logprobs_slice) == 0
-                        and finish_reason_for_logprobs is not None
-                        and input_token_logprobs is None
+                        n_prev_token < total_output_logprobs
+                        or input_token_logprobs is not None
                     ):
-                        logprobs = None
-                    else:
                         logprobs = to_openai_style_logprobs(
                             input_token_logprobs=input_token_logprobs,
                             input_top_logprobs=input_top_logprobs,
-                            output_token_logprobs=output_logprobs_slice,
+                            output_token_logprobs=content["meta_info"][
+                                "output_token_logprobs"
+                            ][n_prev_token:total_output_logprobs],
                             output_top_logprobs=content["meta_info"].get(
                                 "output_top_logprobs", []
-                            )[n_prev_token:],
+                            )[n_prev_token:total_output_logprobs],
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
@@ -322,6 +328,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
+                stream_started = True
 
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
@@ -383,6 +390,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 yield f"data: {final_usage_data}\n\n"
 
         except Exception as e:
+            if not stream_started:
+                raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 

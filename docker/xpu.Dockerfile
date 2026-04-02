@@ -48,7 +48,7 @@ RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \
     . /home/sdp/miniforge3/bin/activate && \
     conda activate py${PYTHON_VERSION} && \
-    pip3 install torch==2.10.0+xpu torchao torchvision torchaudio triton-xpu==3.6.0 --index-url https://download.pytorch.org/whl/xpu
+    pip3 install torch==2.10.0+xpu torchao torchvision torchaudio==2.10.0+xpu triton-xpu==3.6.0 --index-url https://download.pytorch.org/whl/xpu
 
 RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \
