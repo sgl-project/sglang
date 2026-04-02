@@ -221,7 +221,7 @@ async def _send_round(
 def _get_page_size(base_url: str) -> int:
     """Query server for page_size used by radix cache."""
     try:
-        resp = requests.get(f"{base_url}/get_server_info", timeout=10)
+        resp = requests.get(f"{base_url}/server_info", timeout=10)
         resp.raise_for_status()
         info = resp.json()
         return info.get("page_size", 1)

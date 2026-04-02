@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -36,30 +36,30 @@ class TestDeepseekTP2(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
-        self.assertGreater(metrics["accuracy"], 0.62)
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.62)
 
     def test_gsm8k_bs1(self):
         # test torch compile accuracy for bs=1
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=10,
-            max_new_tokens=512,
-            parallel=1,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=10,
+            num_threads=1,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
-        self.assertGreater(metrics["accuracy"], 0.62)
+        metrics = run_eval(args)
+        self.assertGreater(metrics["score"], 0.62)
 
 
 if __name__ == "__main__":
