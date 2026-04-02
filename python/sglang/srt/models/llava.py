@@ -53,6 +53,9 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.utils import add_prefix, flatten_nested_list, logger
 
+_KNOWN_BROKEN_AUTOMODEL_CONFIG = "VoxtralRealtimeTextConfig"
+_KNOWN_BROKEN_AUTOMODEL_ERROR = "Could not find VoxtralRealtimeTextModel"
+
 
 class LlavaBaseForCausalLM(nn.Module):
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
@@ -659,7 +662,13 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         for config_cls in auto_model_type._model_mapping.keys():
             try:
                 archs = auto_model_type._model_mapping.get(config_cls, None)
-            except Exception as exc:
+            except ValueError as exc:
+                if (
+                    auto_model_type is not AutoModel
+                    or config_cls.__name__ != _KNOWN_BROKEN_AUTOMODEL_CONFIG
+                    or _KNOWN_BROKEN_AUTOMODEL_ERROR not in str(exc)
+                ):
+                    raise
                 logger.warning(
                     "Skipping broken %s mapping for config %s: %s",
                     auto_model_type.__name__,
