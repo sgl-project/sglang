@@ -128,28 +128,31 @@ OTHER_SUITES = {
 _SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
 
-def _all_valid_suites() -> set:
-    valid = set()
+def _valid_suites_by_backend() -> dict:
+    """Build a mapping from backend to its set of valid suite names."""
+    result = {}
     for suite_dict in (PER_COMMIT_SUITES, NIGHTLY_SUITES, OTHER_SUITES):
         for backend, suites in suite_dict.items():
-            if backend in _SUITE_CHECKED_BACKENDS:
-                valid.update(suites)
-    return valid
+            if backend not in result:
+                result[backend] = set()
+            result[backend].update(suites)
+    return result
 
 
 def validate_all_suites(all_tests: List[CIRegistry]):
-    """Fail fast if any test is registered to a non-existent suite."""
-    valid = _all_valid_suites()
+    """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
+    valid_by_backend = _valid_suites_by_backend()
     errors = []
     for t in all_tests:
         if t.backend not in _SUITE_CHECKED_BACKENDS:
             continue
+        valid = valid_by_backend.get(t.backend, set())
         if t.suite not in valid:
-            errors.append(f"  {t.filename}: suite='{t.suite}'")
+            errors.append(
+                f"  {t.filename}: backend={t.backend.name}, suite='{t.suite}'"
+            )
     if errors:
-        raise ValueError(
-            "Tests registered to non-existent suites:\n" + "\n".join(errors)
-        )
+        raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
 
 
 def filter_tests(
