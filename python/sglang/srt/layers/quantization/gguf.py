@@ -748,6 +748,11 @@ class GGUFLinearAscendMethod(LinearMethodBase):
 
         layer.dequantized_weight = dequant_weight
 
+        if hasattr(layer, "qweight"):
+            del layer.qweight
+        if hasattr(layer, "qweight_type"):
+            del layer.qweight_type
+
     def apply(
         self,
         layer: torch.nn.Module,
