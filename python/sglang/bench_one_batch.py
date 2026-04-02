@@ -530,49 +530,12 @@ def _read_prompts_from_file(prompt_file, rank_print):
     """Read custom prompts from the file specified by `--prompt-filename`."""
     if not prompt_file:
         return []
-
-    if prompt_file == "sharegpt":
-        from sglang.benchmark.datasets.common import (
-            SHAREGPT_FILENAME,
-            SHAREGPT_REPO_ID,
-        )
-        from sglang.benchmark.utils import download_and_cache_hf_file
-
-        prompt_file = download_and_cache_hf_file(
-            repo_id=SHAREGPT_REPO_ID,
-            filename=SHAREGPT_FILENAME,
-        )
-        rank_print(f"Downloaded ShareGPT dataset to {prompt_file}")
-
     if not os.path.exists(prompt_file):
         rank_print(
             f"Custom prompt file {prompt_file} not found. Using default inputs..."
         )
         return []
-
-    if prompt_file.endswith(".json"):
-        with open(prompt_file, "r") as pf:
-            dataset = json.load(pf)
-
-        prompts = []
-        for data in dataset:
-            if max_prompts is not None and len(prompts) >= max_prompts:
-                break
-            conversations = data.get("conversations", data.get("conversation", []))
-            if len(conversations) >= 1:
-                prompts.append(conversations[0]["value"])
-
-        rank_print(f"Loaded {len(prompts)} prompts from ShareGPT JSON")
-        return prompts
-
     with open(prompt_file, "r") as pf:
-        if max_prompts is not None:
-            lines = []
-            for line in pf:
-                lines.append(line)
-                if len(lines) >= max_prompts:
-                    break
-            return lines
         return pf.readlines()
 
 
@@ -673,7 +636,6 @@ def latency_test_run_once(
     tp_rank,
     profile_start_step=None,
     profile_steps=None,
-    benchmark = False,
 ):
     max_batch_size = model_runner.max_batch_size(input_len, output_len)
     if batch_size > max_batch_size:
@@ -848,15 +810,9 @@ def latency_test(
 
     rank_print("Benchmark ...")
 
-    custom_inputs = _read_prompts_from_file(
-        bench_args.prompt_filename,
-        rank_print,
-        max_prompts=max(bench_args.batch_size),
-    )
+    custom_inputs = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
     custom_inputs = [tokenizer.encode(p.strip()) for p in custom_inputs]
     custom_input_len = len(custom_inputs)
-
-    torch.cuda.cudart().cudaProfilerStart()
 
     # Run the sweep
     result_list = []
@@ -901,7 +857,6 @@ def latency_test(
             tp_rank,
             bench_args.profile_start_step,
             bench_args.profile_steps,
-            benchmark=True,
         )
         if ret is not None:
             result_list.append(ret)

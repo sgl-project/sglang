@@ -40,7 +40,6 @@ class BenchArgs:
     num_prompts: int = 1000
     sharegpt_output_len: Optional[int] = None
     sharegpt_context_len: Optional[int] = None
-    no_shuffle: bool = False
     random_input_len: int = 1024
     random_output_len: int = 1024
     random_range_ratio: float = 0.0
@@ -93,11 +92,6 @@ class BenchArgs:
             type=int,
             default=BenchArgs.sharegpt_context_len,
             help="The context length of the model for the ShareGPT dataset. Requests longer than the context length will be dropped.",
-        )
-        parser.add_argument(
-            "--no-shuffle",
-            action="store_true",
-            help="Disable shuffling for the ShareGPT dataset.",
         )
         parser.add_argument(
             "--random-input-len",

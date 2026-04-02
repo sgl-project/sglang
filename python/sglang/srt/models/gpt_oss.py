@@ -85,7 +85,6 @@ from sglang.srt.utils import (
     is_sm90_supported,
     make_layers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
@@ -393,7 +392,9 @@ class GptOssAttention(nn.Module):
                         layer=self.attn,
                         forward_batch=forward_batch,
                     )
-                    if enable_fused_set_kv_buffer(forward_batch, is_compiled=_is_compiled)
+                    if enable_fused_set_kv_buffer(
+                        forward_batch, is_compiled=_is_compiled
+                    )
                     else None
                 ),
             }
@@ -409,7 +410,9 @@ class GptOssAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch, is_compiled=_is_compiled),
+            save_kv_cache=not enable_fused_set_kv_buffer(
+                forward_batch, is_compiled=_is_compiled
+            ),
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -440,7 +443,8 @@ class GptOssDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta, rope_scaling = get_rope_config(config)
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads

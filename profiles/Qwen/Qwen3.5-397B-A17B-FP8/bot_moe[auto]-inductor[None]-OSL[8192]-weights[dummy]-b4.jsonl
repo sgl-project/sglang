@@ -1,1 +1,0 @@
-{"backend": "engine", "successful_requests": 4, "total_latency": 56.21100432399544, "total_input_tokens": 935, "total_output_tokens": 32768, "request_throughput": 0.07116044354846145, "input_throughput": 16.633753679452866, "output_throughput": 582.9463535489962, "total_throughput": 599.580107228449, "last_gen_throughput": 581.5786560154758}
