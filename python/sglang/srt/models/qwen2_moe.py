@@ -92,7 +92,6 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
     make_layers,
-    rank0_log,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -186,10 +185,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config,
             quant_config,
         )
-        if self.num_fused_shared_experts > 0:
-            rank0_log(
-                "Shared experts fusion enabled (topk+1 experts per token)."
-            )
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
