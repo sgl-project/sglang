@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import sys
 from dataclasses import dataclass
 
 import pytest
@@ -391,4 +392,4 @@ def _layernorm_guard_misc_worker(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

@@ -5,17 +5,26 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import is_npu
-
-if not is_npu():
-    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
-
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.utils import is_cuda, is_hip
+
+# sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+if _is_cuda or _is_hip:
+    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+else:
+
+    def transfer_kv_all_layer_mla(*args, **kwargs):
+        raise RuntimeError(
+            "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
+            "It is not available on this backend."
+        )
 
 
 class HiSparseNSATokenToKVPool(NSATokenToKVPool):

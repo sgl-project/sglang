@@ -1,7 +1,6 @@
 import os
 import random
 import tempfile
-import time
 import unittest
 from typing import Dict
 
@@ -14,7 +13,6 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    flush_cache_with_retry,
     popen_launch_pd_server,
 )
 
@@ -116,8 +114,12 @@ class DisaggregationHiCacheBase(PDDisaggregationServerBase):
         self.send_request(self.gen_prompt(1), max_tokens=150)
 
         # Flush device cache to force remote storage access.
-        time.sleep(2)
-        flush_cache_with_retry(self.prefill_url)
+        res = requests.post(
+            f"{self.prefill_url}/flush_cache",
+            params={"timeout": 30},
+            timeout=40,
+        )
+        res.raise_for_status()
 
 
 class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):

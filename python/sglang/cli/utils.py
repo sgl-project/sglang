@@ -5,8 +5,22 @@ import subprocess
 from functools import lru_cache
 
 from sglang.srt.environ import envs
+from sglang.utils import (
+    has_diffusion_overlay_registry_match,
+    is_known_non_diffusers_diffusion_model,
+    load_diffusion_overlay_registry_from_env,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _load_overlay_registry() -> dict:
+    return load_diffusion_overlay_registry_from_env()
+
+
+def _is_overlay_diffusion_model(model_path: str) -> bool:
+    return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
@@ -29,19 +43,16 @@ def get_is_diffusion_model(model_path: str) -> bool:
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
     """
-    try:
-        from sglang.multimodal_gen.registry import (
-            is_known_non_diffusers_multimodal_model,
-        )
-    except ImportError:
-        is_known_non_diffusers_multimodal_model = lambda _: False
+    if _is_overlay_diffusion_model(model_path):
+        # short-circuit, if applicable for the overlay mechanism (diffusion-only)
+        return True
 
     if os.path.isdir(model_path):
         if _is_diffusers_model_dir(model_path):
             return True
-        return is_known_non_diffusers_multimodal_model(model_path)
+        return is_known_non_diffusers_diffusion_model(model_path)
 
-    if is_known_non_diffusers_multimodal_model(model_path):
+    if is_known_non_diffusers_diffusion_model(model_path):
         return True
 
     try:

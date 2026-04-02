@@ -477,7 +477,10 @@ class Grok1DecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream or torch.cuda.Stream()
 
-        rope_theta = config.rope_parameters["rope_theta"]
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_params = getattr(config, "rope_parameters", None)
+            rope_theta = rope_params["rope_theta"] if rope_params else 10000
         self.self_attn = Grok1Attention(
             config=config,
             hidden_size=self.hidden_size,
