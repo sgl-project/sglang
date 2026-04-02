@@ -17,7 +17,6 @@ static std::atomic<int64_t> g_next_id{0};
 static std::mutex g_map_mutex;
 
 inline ngram::Ngram& get_instance(int64_t handle) {
-  std::lock_guard<std::mutex> lock(g_map_mutex);
   auto it = g_instances.find(handle);
   if (it == g_instances.end()) {
     throw std::runtime_error("Invalid ngram handle: " + std::to_string(handle));
@@ -26,7 +25,7 @@ inline ngram::Ngram& get_instance(int64_t handle) {
 }
 
 struct NgramCorpusFfi {
-  static int64_t create(
+  static void create(
       int64_t capacity,
       int64_t max_trie_depth,
       int64_t min_match_window_size,
@@ -34,7 +33,8 @@ struct NgramCorpusFfi {
       int64_t min_bfs_breadth,
       int64_t max_bfs_breadth,
       int64_t draft_token_num,
-      int64_t match_type) {
+      int64_t match_type,
+      const tvm::ffi::TensorView out_handle) {
     ngram::Param param;
     param.enable = true;
     param.enable_router_mode = false;
@@ -51,7 +51,7 @@ struct NgramCorpusFfi {
 
     std::lock_guard<std::mutex> lock(g_map_mutex);
     g_instances[id] = std::move(instance);
-    return id;
+    *static_cast<int64_t*>(out_handle.data_ptr()) = id;
   }
 
   static void destroy(int64_t handle) {

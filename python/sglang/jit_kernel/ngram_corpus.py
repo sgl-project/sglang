@@ -61,8 +61,8 @@ def ngram_create(
         raise ValueError(
             f"Unknown match_type: '{match_type}'. Must be 'BFS' or 'PROB'."
         )
-    module = _jit_ngram_corpus_module()
-    return module.ngram_create(
+    out_handle = torch.zeros(1, dtype=torch.int64)
+    _jit_ngram_corpus_module().ngram_create(
         capacity,
         max_trie_depth,
         min_match_window_size,
@@ -71,7 +71,9 @@ def ngram_create(
         max_bfs_breadth,
         draft_token_num,
         mt,
+        out_handle,
     )
+    return out_handle.item()
 
 
 def ngram_destroy(handle: int) -> None:
