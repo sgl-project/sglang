@@ -1,8 +1,15 @@
 import itertools
+import sys
 
 import pytest
 import torch
 import triton
+
+from sglang.jit_kernel.utils import get_ci_test_range
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=15, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def sglang_jit_qknorm_across_heads(
@@ -46,7 +53,8 @@ def torch_impl_qknorm_across_heads(
 
 BS_LIST = [2**n for n in range(0, 14)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
-HIDDEN_DIM_LIST = [512, 1024, 2048, 4096]
+BS_LIST = get_ci_test_range(BS_LIST, [1, 9, 256, 4109])
+HIDDEN_DIM_LIST = get_ci_test_range([512, 1024, 2048, 4096], [512, 2048, 4096])
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
@@ -72,4 +80,4 @@ def test_qknorm_across_heads(batch_size: int, hidden_dim: int) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

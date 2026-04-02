@@ -22,6 +22,11 @@ class NPUACLFormat(IntEnum):
     ACL_FORMAT_FRACTAL_NZ = 29
 
 
+class FusedMoEMode(IntEnum):
+    FUSED_DEEP_MOE = 1
+    DISPATCH_FFN_COMBINE = 2
+
+
 def _call_once(fn: Callable):
 
     @functools.wraps(fn)
@@ -102,6 +107,28 @@ def init_npu_backend():
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
+def _is_nz_aligned(tensor: torch.Tensor) -> bool:
+    """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
+
+    Ascend FRACTAL_NZ requires:
+      BF16 / FP16 : both dims divisible by 16
+      INT8         : k % 16 == 0  and  n % 32 == 0
+      INT4         : k % 16 == 0  and  n % 64 == 0
+      FP4          : both dims divisible by 64
+    """
+    if tensor.dim() < 2:
+        return False
+    k, n = tensor.shape[-2], tensor.shape[-1]
+    if tensor.dtype in (torch.bfloat16, torch.float16):
+        return k % 16 == 0 and n % 16 == 0
+    if tensor.dtype == torch.int8:
+        return k % 16 == 0 and n % 32 == 0
+    if tensor.dtype in (torch.uint8, torch.int32):
+        # INT4 is typically packed into uint8/int32; be conservative
+        return k % 16 == 0 and n % 64 == 0
+    return True
+
+
 def npu_format_cast(
     tensor: torch.Tensor,
     acl_format: NPUACLFormat = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
@@ -124,9 +151,26 @@ def npu_format_cast(
         return tensor
 
     if tensor.device == torch.device("cpu"):
-        return torch.ops.npu.npu_format_cast(tensor.npu(), acl_format.value).cpu()
-    else:
-        return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
+        logger.warning_once(
+            "Warning: The conversion from 'ND' to 'NZ' does not work on the CPU. "
+            "Please disable offloading, otherwise the performance will be "
+            "significantly reduced."
+        )
+        return tensor
+
+    if acl_format == NPUACLFormat.ACL_FORMAT_FRACTAL_NZ and not _is_nz_aligned(tensor):
+        k, n = tensor.shape[-2], tensor.shape[-1]
+        logger.warning_once(
+            "Skipping FRACTAL_NZ format cast: tensor shape (%d, %d) dtype %s "
+            "is not aligned to NZ requirements. Falling back to 'ND' format, "
+            "which may reduce NPU performance.",
+            k,
+            n,
+            tensor.dtype,
+        )
+        return tensor
+
+    return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
 def get_indexer_weight_stream():

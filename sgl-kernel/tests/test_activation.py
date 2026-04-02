@@ -1,5 +1,7 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/tests/test_activation.py
 
+import sys
+
 import pytest
 import sgl_kernel
 import torch
@@ -36,4 +38,4 @@ def test_fused_gelu_mul(dim, batch_size, seq_len):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

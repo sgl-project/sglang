@@ -2,7 +2,7 @@
 
 You can install SGLang using one of the methods below.
 This page primarily applies to common NVIDIA GPU platforms.
-For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md), and [Intel XPU](../platforms/xpu.md).
+For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend/ascend_npu.md), and [Intel XPU](../platforms/xpu.md).
 
 ## Method 1: With pip or uv
 
@@ -29,13 +29,13 @@ uv pip install torch==X.Y.Z torchvision torchaudio --index-url https://download.
 uv pip install sglang
 ```
 
-3. Install the `sgl_kernel` wheel for CUDA 13 from [the sgl-project whl releases](https://github.com/sgl-project/whl/blob/gh-pages/cu130/sgl-kernel/index.html). Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang install (you can find this by running `uv pip show sgl_kernel`). Examples:
+3. Install the `sglang-kernel` wheel for CUDA 13 from [the sgl-project whl releases](https://github.com/sgl-project/whl/blob/gh-pages/cu130/sglang-kernel/index.html). Replace `X.Y.Z` with the `sglang-kernel` version required by your SGLang install (you can find this by running `uv pip show sglang-kernel`). Examples:
 ```bash
 # x86_64
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
+uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sglang_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
 
 # aarch64
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
+uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sglang_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
 ```
 
 ### **Quick fixes to common problems**

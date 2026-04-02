@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
@@ -26,6 +26,8 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
         "--max-running-requests",
         "128",
         "--cuda-graph-max-bs",
+        "64",
+        "--page-size",
         "64",
         "--mem-fraction-static",
         "0.75",

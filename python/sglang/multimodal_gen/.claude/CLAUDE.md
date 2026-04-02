@@ -96,7 +96,11 @@ python -m pytest python/sglang/multimodal_gen/test/
 # Dependencies assumed already installed via `pip install -e "python[diffusion]"`
 ```
 
-## Perf Measurement
+## Performance Tuning
+
+For questions about optimal performance, fastest commands, VRAM reduction, or best flag combinations for a given model/GPU setup, **read the [sglang-diffusion-performance skill](skills/sglang-diffusion-performance/SKILL.md)**. It contains a complete table of lossless and lossy optimization flags with trade-offs, quick recipes, and tuning tips.
+
+### Perf Measurement
 
 Look for `Pixel data generated successfully in xxxx seconds` in console output. With warmup enabled, use the line containing `warmup excluded` for accurate timing.
 

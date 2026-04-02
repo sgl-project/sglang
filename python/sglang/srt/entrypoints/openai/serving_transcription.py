@@ -22,7 +22,7 @@ import logging
 import math
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, Optional, Union
+from typing import TYPE_CHECKING, AsyncGenerator, List, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -32,9 +32,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     TranscriptionRequest,
     TranscriptionResponse,
+    TranscriptionSegment,
     TranscriptionStreamChoice,
     TranscriptionStreamResponse,
     TranscriptionUsage,
+    TranscriptionVerboseResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -43,6 +45,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+# Whisper timestamp token constants
+TIMESTAMP_BASE_TOKEN_ID = 50365  # <|0.00|>
+TIMESTAMP_BASE_OFFSET = 0.02  # Each token step = 0.02 seconds
 
 
 class OpenAIServingTranscription(OpenAIServingBase):
@@ -72,6 +78,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
             "language": request.language,  # Pass to WhisperProcessor for language-specific decoding
         }
 
+        if request.timestamp_granularities:
+            sampling_params["timestamp_granularities"] = request.timestamp_granularities
+
         # For Whisper, we pass audio_data and let the processor handle it
         adapted_request = GenerateReqInput(
             text="",  # Empty text - Whisper processor will set proper decoder tokens
@@ -89,12 +98,82 @@ class OpenAIServingTranscription(OpenAIServingBase):
         try:
             import soundfile as sf
 
-            audio_array, sr = sf.read(io.BytesIO(audio_data))
-            duration = len(audio_array) / sr
-            return duration
+            info = sf.info(io.BytesIO(audio_data))
+            return info.duration
         except Exception as e:
             logger.warning(f"Could not calculate audio duration: {e}")
             return 0.0
+
+    def _parse_segments(
+        self, output_ids: List[int], tokenizer
+    ) -> tuple[str, List[TranscriptionSegment]]:
+        """Parse timestamp tokens from output_ids into segments.
+
+        The decoder prompt ends with <|0.00|>, so the first segment starts at
+        t=0.  The model then outputs:
+            text_tokens <|end_ts|> [<|start_ts|> text_tokens <|end_ts|> ...]
+        Each timestamp token marks the end of the current segment; its value
+        also becomes the start of the next segment.
+        """
+        # Token IDs for special tokens we want to strip from segment text
+        eos_token_id = getattr(tokenizer, "eos_token_id", 50257)
+
+        segments = []
+        full_text_parts = []
+        current_text_tokens = []
+        current_start = 0.0  # First segment starts at 0.0 (from prompt <|0.00|>)
+        seg_id = 0
+
+        for token_id in output_ids:
+            if token_id >= TIMESTAMP_BASE_TOKEN_ID:
+                # This is a timestamp token — marks the end of current segment
+                timestamp = (token_id - TIMESTAMP_BASE_TOKEN_ID) * TIMESTAMP_BASE_OFFSET
+
+                if current_text_tokens:
+                    text = tokenizer.decode(
+                        current_text_tokens, skip_special_tokens=True
+                    ).strip()
+                    if text:
+                        segments.append(
+                            TranscriptionSegment(
+                                id=seg_id,
+                                start=round(current_start, 2),
+                                end=round(timestamp, 2),
+                                text=text,
+                            )
+                        )
+                        full_text_parts.append(text)
+                        seg_id += 1
+                    current_text_tokens = []
+
+                # Next segment starts at this timestamp
+                current_start = timestamp
+
+            elif token_id == eos_token_id:
+                # Skip end-of-text token
+                continue
+            else:
+                # Regular text token
+                current_text_tokens.append(token_id)
+
+        # Handle any trailing text tokens without a closing timestamp
+        if current_text_tokens:
+            text = tokenizer.decode(
+                current_text_tokens, skip_special_tokens=True
+            ).strip()
+            if text:
+                segments.append(
+                    TranscriptionSegment(
+                        id=seg_id,
+                        start=round(current_start, 2),
+                        end=round(current_start, 2),
+                        text=text,
+                    )
+                )
+                full_text_parts.append(text)
+
+        full_text = " ".join(full_text_parts)
+        return full_text, segments
 
     async def create_transcription(
         self,
@@ -105,7 +184,14 @@ class OpenAIServingTranscription(OpenAIServingBase):
         temperature: float,
         stream: bool,
         raw_request: Request,
-    ) -> Union[TranscriptionResponse, StreamingResponse, Response, ORJSONResponse]:
+        timestamp_granularities: Optional[List[str]] = None,
+    ) -> Union[
+        TranscriptionResponse,
+        TranscriptionVerboseResponse,
+        StreamingResponse,
+        Response,
+        ORJSONResponse,
+    ]:
         """Main entry point for transcription requests."""
         # Calculate audio duration for usage reporting
         audio_duration_s = self._get_audio_duration(audio_data)
@@ -117,6 +203,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             language=language,
             response_format=response_format,
             temperature=temperature,
+            timestamp_granularities=timestamp_granularities,
             stream=stream,
             audio_duration_s=audio_duration_s,
         )
@@ -129,7 +216,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: TranscriptionRequest,
         raw_request: Request,
-    ) -> Union[TranscriptionResponse, ErrorResponse, ORJSONResponse, Response]:
+    ) -> Union[
+        TranscriptionResponse,
+        TranscriptionVerboseResponse,
+        ErrorResponse,
+        ORJSONResponse,
+        Response,
+    ]:
         """Handle non-streaming transcription request."""
         try:
             ret = await self.tokenizer_manager.generate_request(
@@ -139,14 +232,26 @@ class OpenAIServingTranscription(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         text = ret.get("text", "")
+        usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
         # Build response based on format
         if request.response_format == "text":
             return Response(content=text, media_type="text/plain")
 
-        # JSON format
-        usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
+        if request.response_format == "verbose_json":
+            output_ids = ret.get("output_ids", [])
+            tokenizer = self.tokenizer_manager.tokenizer
+            parsed_text, segments = self._parse_segments(output_ids, tokenizer)
 
+            return TranscriptionVerboseResponse(
+                language=request.language or "en",
+                duration=round(request.audio_duration_s, 2),
+                text=parsed_text or text,
+                segments=segments,
+                usage=usage,
+            )
+
+        # Default JSON format
         return TranscriptionResponse(text=text, usage=usage)
 
     async def _handle_streaming_request(
