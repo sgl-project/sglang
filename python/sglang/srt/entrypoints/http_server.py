@@ -43,6 +43,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.entrypoints.engine import _launch_subprocesses
+from sglang.srt.entrypoints.anthropic.protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicMessagesRequest,
+)
+from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
@@ -675,6 +680,27 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     )
     ret = await generate_request(req, raw_request)
     return ORJSONResponse({"predictions": ret})
+
+
+##### Anthropic-compatible API endpoints #####
+
+
+@app.post("/v1/messages")
+async def anthropic_v1_messages(
+    request: AnthropicMessagesRequest, raw_request: Request
+):
+    """Anthropic-compatible Messages API endpoint."""
+    anthropic_serving = AnthropicServing(_global_state.tokenizer_manager)
+    return await anthropic_serving.handle_messages(request, raw_request)
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_v1_count_tokens(
+    request: AnthropicCountTokensRequest, raw_request: Request
+):
+    """Anthropic-compatible token counting endpoint."""
+    anthropic_serving = AnthropicServing(_global_state.tokenizer_manager)
+    return await anthropic_serving.handle_count_tokens(request, raw_request)
 
 
 def _create_error_response(e):
