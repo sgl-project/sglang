@@ -127,9 +127,9 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: list[int]
     dst_state_dim_per_tensor: list[int]
-    staging: Optional[StagingRegisterInfo] = None
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
+    staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
