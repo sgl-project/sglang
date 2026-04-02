@@ -16,6 +16,7 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -117,6 +118,7 @@ def inplace_fused_experts(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    hidden_states_quant: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -148,6 +150,7 @@ def inplace_fused_experts(
         gemm1_limit,
         filter_expert,
         swiglu_limit=swiglu_limit,
+        hidden_states_quant=hidden_states_quant,
     )
 
 
@@ -243,6 +246,14 @@ def fused_experts(
     )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
+
+        if isinstance(hidden_states, torch.Tensor):
+            hidden_states_quant = None
+        else:
+            hidden_states_quant = hidden_states[1]
+            a1_scale = hidden_states[2]
+            hidden_states = hidden_states[0]
+
         inplace_fused_experts(
             hidden_states,
             w1,
@@ -271,6 +282,7 @@ def fused_experts(
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
+            hidden_states_quant=hidden_states_quant,
         )
         return hidden_states
     else:
@@ -436,6 +448,7 @@ def _fused_moe_kernel_sequence(
     filter_expert: bool,
     hooks: Optional[Any] = None,
     swiglu_limit: Optional[float] = None,
+    hidden_states_quant: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -506,6 +519,7 @@ def _fused_moe_kernel_sequence(
         block_shape=block_shape,
         c_sorted=down_moe_use_tma,
         filter_expert=filter_expert,
+        hidden_states_quant=hidden_states_quant,
     )
 
     if hooks and hooks.after_gate_up:
@@ -527,6 +541,7 @@ def _fused_moe_kernel_sequence(
     )
 
     # Activation function with multiplication
+    hidden_states_quant_for_gemm2 = None
     if activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
@@ -600,7 +615,15 @@ def _fused_moe_kernel_sequence(
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
             else:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                if use_fp8_w8a8 and block_shape is not None and _is_cuda:
+                    intermediate_cache2, a2_scale = sglang_per_token_group_quant_fp8(
+                        intermediate_cache1.view(-1, N).contiguous(),
+                        group_size=block_shape[1],
+                        fuse_silu_and_mul=True,
+                    )
+                    hidden_states_quant_for_gemm2 = intermediate_cache2
+                else:
+                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         elif _is_musa:
             intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
@@ -699,6 +722,7 @@ def _fused_moe_kernel_sequence(
         filter_expert=filter_expert,
         fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
         router_topk=topk,
+        hidden_states_quant=hidden_states_quant_for_gemm2,
     )
 
     if hooks and hooks.after_down:
@@ -815,6 +839,7 @@ def fused_experts_impl(
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
     swiglu_limit: Optional[float] = None,
+    hidden_states_quant: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -890,6 +915,7 @@ def fused_experts_impl(
         filter_expert=filter_expert,
         hooks=None,
         swiglu_limit=swiglu_limit,
+        hidden_states_quant=hidden_states_quant,
     )
 
 

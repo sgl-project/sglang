@@ -634,9 +634,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             # [num_tokens, hidden_size // 32] (no transpose).
             a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
         else:
-            a_q, a_sf = per_token_group_quant_fp8(
-                hidden_states, quant_info.weight_block_k
-            )
+            if isinstance(hidden_states, torch.Tensor):  # wili, original code
+                a_q, a_sf = per_token_group_quant_fp8(
+                    hidden_states, quant_info.weight_block_k
+                )
+            else:  # wili, `hidden_states` is already FP8 quantized
+                hidden_states, a_q, a_sf = hidden_states
             a_sf_t = a_sf.t().contiguous()
 
         # Allocate output inside symmetric memory context

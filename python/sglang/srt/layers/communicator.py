@@ -100,6 +100,10 @@ if _use_aiter:
         from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
             fused_rms_mxfp4_quant,
         )
+if _is_cuda:
+    from sglang.srt.layers.quantization.fp8_kernel import (
+        sglang_fused_rms_fp8_group_quant,
+    )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
@@ -481,11 +485,13 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        quant_format: Optional[str] = None,
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
+            quant_format=quant_format,
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
@@ -580,6 +586,30 @@ class LayerCommunicator:
                             self.input_layernorm.weight.data,
                             self.input_layernorm.variance_epsilon,
                         )
+                    elif _is_cuda and ("fp8" in quant_format):
+                        hidden_states_quant, hidden_states_unquant, _, _res = (
+                            sglang_fused_rms_fp8_group_quant(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                self.input_layernorm.variance_epsilon,
+                                group_size=128,
+                                dtype_quant=torch.float8_e4m3fn,
+                                res1=None,
+                                quant_eps=1e-10,
+                                gemma_style=self.input_layernorm.__class__.__name__.startswith(
+                                    "Gemma"
+                                ),
+                                column_major_scales=True,
+                                scale_tma_aligned=False,
+                                output_unquantized_inp1=True,
+                                emulate_bf16_requant=False,
+                            )
+                        )
+                        hidden_states = (
+                            hidden_states_unquant,
+                            hidden_states_quant[0],
+                            hidden_states_quant[1],
+                        )
 
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
@@ -627,6 +657,30 @@ class LayerCommunicator:
                             self.input_layernorm.weight.data,
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
+                        )
+                    elif _is_cuda and ("fp8" in quant_format):
+                        hidden_states_quant, hidden_states_unquant, _, residual = (
+                            sglang_fused_rms_fp8_group_quant(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                self.input_layernorm.variance_epsilon,
+                                group_size=128,
+                                dtype_quant=torch.float8_e4m3fn,
+                                res1=residual,
+                                quant_eps=1e-10,
+                                gemma_style=self.input_layernorm.__class__.__name__.startswith(
+                                    "Gemma"
+                                ),
+                                column_major_scales=True,
+                                scale_tma_aligned=False,
+                                output_unquantized_inp1=True,
+                                emulate_bf16_requant=False,
+                            )
+                        )
+                        hidden_states = (
+                            hidden_states_unquant,
+                            hidden_states_quant[0],
+                            hidden_states_quant[1],
                         )
                     else:
                         hidden_states, residual = self.input_layernorm(
@@ -946,7 +1000,30 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+            # wili, original code
+            # hidden_states, residual = layernorm(hidden_states, residual)
+            # wili, modified code for mlp
+            hidden_states_quant, hidden_states_unquant, _, residual = (
+                sglang_fused_rms_fp8_group_quant(
+                    hidden_states,
+                    layernorm.weight,
+                    layernorm.variance_epsilon,
+                    group_size=128,
+                    dtype_quant=torch.float8_e4m3fn,
+                    res1=residual,
+                    quant_eps=1e-10,
+                    gemma_style=layernorm.__class__.__name__.startswith("Gemma"),
+                    column_major_scales=True,
+                    scale_tma_aligned=False,
+                    output_unquantized_inp1=True,
+                    emulate_bf16_requant=False,
+                )
+            )
+            hidden_states = (
+                hidden_states_unquant,
+                hidden_states_quant[0],
+                hidden_states_quant[1],
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -1021,7 +1098,30 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states, residual = layernorm(hidden_states, residual)
+                # wili, original code
+                # hidden_states, residual = layernorm(hidden_states, residual)
+                # wili, modified code for mlp
+                hidden_states_quant, hidden_states_unquant, _, residual = (
+                    sglang_fused_rms_fp8_group_quant(
+                        hidden_states,
+                        layernorm.weight,
+                        layernorm.variance_epsilon,
+                        group_size=128,
+                        dtype_quant=torch.float8_e4m3fn,
+                        res1=residual,
+                        quant_eps=1e-10,
+                        gemma_style=layernorm.__class__.__name__.startswith("Gemma"),
+                        column_major_scales=True,
+                        scale_tma_aligned=False,
+                        output_unquantized_inp1=True,
+                        emulate_bf16_requant=False,
+                    )
+                )
+                hidden_states = (
+                    hidden_states_unquant,
+                    hidden_states_quant[0],
+                    hidden_states_quant[1],
+                )
         return hidden_states, residual
 
     @staticmethod

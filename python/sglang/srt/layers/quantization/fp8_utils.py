@@ -650,9 +650,9 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
-
-    output_dtype = input.dtype
+    # assert input_scale is None  # wili, original code
+    # output_dtype = input.dtype  # wili, original code
+    output_dtype = torch.bfloat16  # wili, hard-coding output to bfloat16
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
@@ -675,13 +675,16 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     if not _is_musa:
-        q_input, x_scale = sglang_per_token_group_quant_fp8(
-            input_2d,
-            block_size[1],
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        )
+        if input_scale is None:
+            q_input, x_scale = sglang_per_token_group_quant_fp8(
+                input_2d,
+                block_size[1],
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+        else:
+            q_input, x_scale = input_2d, input_scale
     else:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d,
@@ -819,19 +822,23 @@ def triton_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
+    # assert input_scale is None  # wili, original code
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
-
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
-    )
+    if input_scale is None:
+        q_input, x_scale = per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=False
+        )
+    else:
+        q_input, x_scale = input, input_scale
     output = w8a8_block_fp8_matmul_triton(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype
     )
     if bias is not None:
         output += bias
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    return output.to(dtype=torch.bfloat16).view(
+        *output_shape
+    )  # wili, hard-coding output to bfloat16
 
 
 @lru_cache(maxsize=1)

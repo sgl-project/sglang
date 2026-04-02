@@ -273,7 +273,7 @@ def matmul_persistent(
     K, N = b.shape
 
     # DeepGEMM has minimum dimension requirements for TMA descriptors
-    MIN_DEEPGEMM_DIM = 16
+    MIN_DEEPGEMM_DIM = 2048  # wili, For large TP
 
     if (
         _ENABLE_MM_DEEPGEMM

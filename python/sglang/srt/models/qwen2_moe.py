@@ -73,6 +73,7 @@ from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -190,6 +191,21 @@ class Qwen2MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
+        self.fused_silu_fp8_block_k = None
+        down_proj_quant_method = getattr(self.down_proj, "quant_method", None)
+        down_proj_quant_config = getattr(down_proj_quant_method, "quant_config", None)
+        down_proj_block_size = getattr(
+            down_proj_quant_config, "weight_block_size", None
+        )
+        if (
+            _is_cuda
+            and getattr(down_proj_quant_method, "__class__", None) is not None
+            and down_proj_quant_method.__class__.__name__ == "Fp8LinearMethod"
+            and getattr(down_proj_quant_method, "block_quant", False)
+            and down_proj_block_size is not None
+        ):
+            self.fused_silu_fp8_block_k = down_proj_block_size[1]
+
     def forward(
         self,
         x,
@@ -197,7 +213,15 @@ class Qwen2MoeMLP(nn.Module):
         use_reduce_scatter: bool = False,
     ):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.fused_silu_fp8_block_k is None:
+            x = self.act_fn(gate_up)
+        else:
+            x_q, x_scale = sglang_per_token_group_quant_fp8(
+                gate_up.contiguous(),
+                group_size=self.fused_silu_fp8_block_k,
+                fuse_silu_and_mul=True,
+            )
+            x = (x_q, x_scale)
         x, _ = self.down_proj(
             x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
         )
@@ -376,12 +400,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         shared_output = None
+
+        if isinstance(hidden_states, torch.Tensor):
+            hidden_states_gate = hidden_states
+            hidden_states_shared_expert = hidden_states
+        else:
+            assert len(hidden_states) == 3, "quantized output should have 3 members"
+            hidden_states_gate = hidden_states[0]  # unquantized output
+            hidden_states_shared_expert = hidden_states[1:3]  # quantized output
+
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
+            shared_output = self.shared_expert(hidden_states_shared_expert)
             if self.shared_expert_gate is not None:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
-                        hidden_states,
+                        hidden_states_gate,
                         self.shared_expert_gate.weight,
                         self.shared_expert_gate.bias,
                         True,
@@ -389,7 +422,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     )
                 else:
                     shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
+                        F.sigmoid(self.shared_expert_gate(hidden_states_gate))
                         * shared_output
                     )
 
@@ -438,13 +471,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
+        if isinstance(hidden_states, torch.Tensor):
+            hidden_states_unquant = hidden_states
+        else:
+            assert len(hidden_states) == 3, "quantized output should have 3 members"
+            hidden_states_unquant = hidden_states[0]  # unquantized output
+
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        router_logits, _ = self.gate(hidden_states_unquant)
+        topk_output = self.topk(hidden_states_unquant, router_logits)
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
-            topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+            topk_output = self._append_shared_to_topk_output(
+                topk_output, hidden_states_unquant
+            )
         return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(
@@ -469,13 +510,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        if isinstance(hidden_states, torch.Tensor):
+            num_tokens, hidden_dim = hidden_states.shape
+            hidden_states = hidden_states.view(-1, hidden_dim)
+            leading_dim = hidden_states.shape[0]
+        else:
+            assert len(hidden_states) == 3, "quantized output should have 3 members"
+            hidden_states_unquant = hidden_states[0]
+            num_tokens, hidden_dim = hidden_states_unquant.shape
+            hidden_states = (
+                hidden_states_unquant.view(-1, hidden_dim),
+                hidden_states[1],
+                hidden_states[2],
+            )
+            leading_dim = hidden_states_unquant.shape[0]
 
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
-        if hidden_states.shape[0] == 0:
+        if not isinstance(hidden_states, tuple) and hidden_states.shape[0] == 0:
             # M=0 guard for idle DP ranks: skip shared_experts and gate
             # (which crash on empty tensors in FP4 GEMM), but still call
             # self.experts() to participate in alltoall collective.

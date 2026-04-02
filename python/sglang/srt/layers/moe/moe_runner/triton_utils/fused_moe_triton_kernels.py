@@ -731,6 +731,7 @@ def invoke_fused_moe_kernel(
     router_topk: int = 1,
     fuse_add_to_output: bool = False,
     add_output_mask: Optional[torch.Tensor] = None,
+    hidden_states_quant: torch.Tensor = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -755,7 +756,10 @@ def invoke_fused_moe_kernel(
             assert len(block_shape) == 2
             block_n, block_k = block_shape[0], block_shape[1]
             if _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                if hidden_states_quant is not None:
+                    A = hidden_states_quant
+                else:
+                    A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:
                 A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
