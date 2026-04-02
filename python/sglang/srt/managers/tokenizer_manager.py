@@ -44,7 +44,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
-from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -268,11 +267,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # images even with skip_tokenizer_init=False.
             self.mm_processor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor, transport_mode
-            )
-            self.mm_data_processor = AsyncMMDataProcessor(
-                self.mm_processor,
-                max_concurrent_calls=self.server_args.mm_max_concurrent_calls,
-                timeout_s=self.server_args.mm_per_request_timeout,
             )
 
             if server_args.skip_tokenizer_init:
@@ -729,10 +723,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
                 if mm_inputs is None:
-                    mm_inputs: Dict = await self.mm_data_processor.process(
+                    mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
-                        input_text_or_ids=(input_text or input_ids),
+                        input_text=(input_text or input_ids),
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
@@ -743,10 +737,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ):
                 # In language_only mode with zmq_to_scheduler, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs: Dict = await self.mm_data_processor.process(
+                mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
                     audio_data=obj.audio_data,
-                    input_text_or_ids=(input_text or input_ids),
+                    input_text=(input_text or input_ids),
                     request_obj=obj,
                     max_req_input_len=self.max_req_input_len,
                 )

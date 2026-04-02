@@ -798,7 +798,7 @@ if not current_platform.is_hip():
         )
     )
 
-# TODO: enable on 4090/5090/b200
+# TODO: enable on 4090/5090
 ONE_GPU_CASES_C = [
     DiffusionTestCase(
         "flux_2_nvfp4_t2i",
