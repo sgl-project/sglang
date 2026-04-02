@@ -1471,10 +1471,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
-        self.enable_fused_moe = True if _use_aiter else False
         self.num_fused_shared_experts = (
-            0 if not self.enable_fused_moe else self._get_num_fused_shared_experts()
+            self._get_num_fused_shared_experts() if _use_aiter else 0
         )
+
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
 
     def _get_num_fused_shared_experts(self):
         if not (
@@ -1525,9 +1526,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ckpt_up_proj_name="up_proj",
             num_experts=(
                 num_experts
-                if not self.enable_fused_moe
-                else num_experts
-                + self.num_fused_shared_experts  # map shared experts to routed experts
+                if not self.enable_shared_expert_fusion
+                else num_experts + self.num_fused_shared_experts
             ),
         )
 
@@ -1549,7 +1549,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
 
-        if self.enable_fused_moe:
+        if self.enable_shared_expert_fusion:
             """
             When shared experts are fused, we need to map the shared experts to routed experts.
 
@@ -1568,6 +1568,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     f"experts.{num_experts}.down_proj.",
                     num_experts,
                     "w2",
+                ),
+                ## shared experts may contain gate_proj and up_proj instead of gate_up_proj
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.up_proj.",
+                    num_experts,
+                    "w3",
                 ),
             ]
 
@@ -1626,7 +1639,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ):
                 continue
 
-            if self.enable_fused_moe:
+            if self.enable_shared_expert_fusion:
                 if "mlp.shared_expert." in name:
                     # Firstly map mlp.shared_expert.xx_proj to mlp.experts.512.xx_proj
                     name = name.replace(
@@ -1708,9 +1721,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 params_dict,
                                 loaded_weight,
                                 shard_id,
-                                num_experts
+                                num_experts,
                             )
-                        elif self.enable_fused_moe:
+                        elif self.enable_shared_expert_fusion:
                             # shared experts should be loaded to experts.w13_weight and experts.w2_weight
                             param = params_dict[name_mapped]
                             weight_loader = getattr(
