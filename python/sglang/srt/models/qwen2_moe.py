@@ -179,7 +179,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         self.num_experts = config.num_experts
         self.num_fused_shared_experts = 0
-        self.enable_fused_moe = True if (support_shared_expert_fusion and _use_aiter) else False
+        self.enable_fused_moe = (
+            True if (support_shared_expert_fusion and _use_aiter) else False
+        )
         if self.enable_fused_moe:
             self.num_fused_shared_experts = self._determine_num_fused_shared_experts(
                 config, quant_config
@@ -225,7 +227,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # so we must NOT create a separate shared_expert MLP here — otherwise
         # _forward_shared_experts() would compute it a second time and its
         # output would be double-counted in forward().
-        if (config.shared_expert_intermediate_size > 0 and not self.enable_fused_moe):
+        if config.shared_expert_intermediate_size > 0 and not self.enable_fused_moe:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,

@@ -1525,8 +1525,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ckpt_up_proj_name="up_proj",
             num_experts=(
                 num_experts
-                if not self.enable_fused_moe 
-                else num_experts + self.num_fused_shared_experts  # map shared experts to routed experts
+                if not self.enable_fused_moe
+                else num_experts
+                + self.num_fused_shared_experts  # map shared experts to routed experts
             ),
         )
 
@@ -1694,8 +1695,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 (
                                     num_experts
                                     if not self.enable_fused_moe
-                                    else num_experts
-                                    + self.num_fused_shared_experts
+                                    else num_experts + self.num_fused_shared_experts
                                 ),
                             )
                             load_fused_expert_weights(
@@ -1706,8 +1706,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 (
                                     num_experts
                                     if not self.enable_fused_moe
-                                    else num_experts
-                                    + self.num_fused_shared_experts
+                                    else num_experts + self.num_fused_shared_experts
                                 ),
                             )
                         elif "experts.down_proj" in name:
@@ -1720,8 +1719,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 (
                                     num_experts
                                     if not self.enable_fused_moe
-                                    else num_experts
-                                    + self.num_fused_shared_experts
+                                    else num_experts + self.num_fused_shared_experts
                                 ),
                             )
                         elif self.enable_fused_moe:
