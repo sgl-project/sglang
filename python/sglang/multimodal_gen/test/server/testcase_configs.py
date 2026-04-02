@@ -491,6 +491,31 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "zimage_image_t2i_fp8_full_cuda_graph",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            modality="image",
+            extras=[
+                "--transformer-path tjusc/Z-Image-Turbo-fp8",
+                "--enable-diffusion-cuda-graph",
+            ],
+        ),
+        T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "zimage_image_t2i_fp8_full_cuda_graph_cache_dit",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            modality="image",
+            enable_cache_dit=True,
+            extras=[
+                "--transformer-path tjusc/Z-Image-Turbo-fp8",
+                "--enable-diffusion-cuda-graph",
+            ],
+        ),
+        T2I_sampling_params,
+    ),
     # Multi-LoRA test case for Z-Image-Turbo
     DiffusionTestCase(
         "zimage_image_t2i_multi_lora",
