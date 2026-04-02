@@ -288,7 +288,6 @@ class GenerateReqInput(BaseReq):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
             )
-        invalid_sampling_params_type = None
         if self.sampling_params is not None and not isinstance(
             self.sampling_params, dict
         ):
@@ -299,17 +298,15 @@ class GenerateReqInput(BaseReq):
                     if not isinstance(sampling_params, dict)
                 }
                 if invalid_types:
-                    invalid_sampling_params_type = (
-                        f"list containing {', '.join(sorted(invalid_types))}"
+                    raise TypeError(
+                        "sampling_params must be a dict or list of dicts, "
+                        f"got list containing {', '.join(sorted(invalid_types))}."
                     )
             else:
-                invalid_sampling_params_type = type(self.sampling_params).__name__
-
-        if invalid_sampling_params_type is not None:
-            raise TypeError(
-                "sampling_params must be a dict or list of dicts, "
-                f"got {invalid_sampling_params_type}."
-            )
+                raise TypeError(
+                    "sampling_params must be a dict or list of dicts, "
+                    f"got {type(self.sampling_params).__name__}."
+                )
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
