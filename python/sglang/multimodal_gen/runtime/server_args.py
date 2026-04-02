@@ -202,6 +202,9 @@ class ServerArgs:
 
     scheduler_port: int = 5555
 
+    # Strict port mode: fail if requested port is unavailable instead of auto-selecting
+    strict_ports: bool = False
+
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
 
@@ -230,6 +233,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     @property
     def broker_port(self) -> int:
@@ -384,17 +388,35 @@ class ServerArgs:
             )
 
     def _adjust_network_ports(self):
-        self.port = self.settle_port(self.port)
-        initial_scheduler_port = self.scheduler_port + (
-            random.randint(0, 100) if self.scheduler_port == 5555 else 0
-        )
-        self.scheduler_port = self.settle_port(initial_scheduler_port)
-        initial_master_port = (
-            self.master_port
-            if self.master_port is not None
-            else (30005 + random.randint(0, 100))
-        )
-        self.master_port = self.settle_port(initial_master_port, 37)
+        if self.strict_ports:
+            # Strict mode: fail if port is unavailable
+            if not is_port_available(self.port):
+                raise RuntimeError(
+                    f"Port {self.port} is unavailable and --strict-ports is enabled. "
+                    f"Either use a different port or remove --strict-ports to allow auto-selection."
+                )
+            if not is_port_available(self.scheduler_port):
+                raise RuntimeError(
+                    f"Scheduler port {self.scheduler_port} is unavailable and --strict-ports is enabled. "
+                    f"Either use a different port or remove --strict-ports to allow auto-selection."
+                )
+            if self.master_port is not None and not is_port_available(self.master_port):
+                raise RuntimeError(
+                    f"Master port {self.master_port} is unavailable and --strict-ports is enabled. "
+                    f"Either use a different port or remove --strict-ports to allow auto-selection."
+                )
+        else:
+            self.port = self.settle_port(self.port)
+            initial_scheduler_port = self.scheduler_port + (
+                random.randint(0, 100) if self.scheduler_port == 5555 else 0
+            )
+            self.scheduler_port = self.settle_port(initial_scheduler_port)
+            initial_master_port = (
+                self.master_port
+                if self.master_port is not None
+                else (30005 + random.randint(0, 100))
+            )
+            self.master_port = self.settle_port(initial_master_port, 37)
 
     def _adjust_parallelism(self):
         if self.tp_size is None:
@@ -779,6 +801,12 @@ class ServerArgs:
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--strict-ports",
+            action=StoreBoolean,
+            default=ServerArgs.strict_ports,
+            help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
+        )
+        parser.add_argument(
             "--webui",
             action=StoreBoolean,
             default=ServerArgs.webui,
@@ -832,6 +860,15 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+        parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
         )
         parser.add_argument(
             "--backend",
