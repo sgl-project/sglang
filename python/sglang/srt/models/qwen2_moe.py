@@ -196,6 +196,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         self.num_experts = config.num_experts
         self.num_shared_experts = 0
+        self.num_fused_shared_experts = 0
         if hasattr(config, "n_shared_experts"):
             # config defines the number of shared experts
             self.num_shared_experts = config.n_shared_experts
@@ -212,6 +213,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.enable_shared_expert_fusion = (
                 support_shared_expert_fusion and can_fuse_shared_expert(config)
             )
+        if self.enable_shared_expert_fusion:
+            self.num_fused_shared_experts = self.num_shared_experts
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -224,21 +227,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             top_k=(
                 config.num_experts_per_tok
                 if not self.enable_shared_expert_fusion
-                else config.num_experts_per_tok + self.num_shared_experts
+                else config.num_experts_per_tok + self.num_fused_shared_experts
             ),
             num_experts=(
                 config.num_experts + get_global_server_args().ep_num_redundant_experts
                 if not self.enable_shared_expert_fusion
                 else config.num_experts
                 + get_global_server_args().ep_num_redundant_experts
-                + self.num_shared_experts
+                + self.num_fused_shared_experts
             ),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
-            num_fused_shared_experts=self.num_shared_experts,
+            num_fused_shared_experts=self.num_fused_shared_experts,
         )
 
         self.gate = ReplicatedLinear(
@@ -322,12 +325,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         M = topk_output.topk_ids.shape[0]
         shared_expert_id = self.num_experts
         shared_ids = torch.full(
-            (M, self.num_shared_experts),
+            (M, self.num_fused_shared_experts),
             shared_expert_id,
             dtype=topk_output.topk_ids.dtype,
             device=topk_output.topk_ids.device,
         )
-        shared_weights = shared_weights.expand(M, self.num_shared_experts).to(
+        shared_weights = shared_weights.expand(M, self.num_fused_shared_experts).to(
             topk_output.topk_weights.dtype
         )
         fused_topk_ids = torch.cat([topk_output.topk_ids, shared_ids], dim=-1)
