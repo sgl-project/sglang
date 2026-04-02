@@ -9,11 +9,12 @@ from sglang.srt.utils.auth import (
     decide_request_auth,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
-class TestAuthDecision(unittest.TestCase):
+class TestAuthDecision(CustomTestCase):
     def test_allowed_default(self):
         decision = AuthDecision(allowed=True)
         self.assertTrue(decision.allowed)
@@ -30,7 +31,7 @@ class TestAuthDecision(unittest.TestCase):
             decision.allowed = False
 
 
-class TestAuthLevel(unittest.TestCase):
+class TestAuthLevel(CustomTestCase):
     def test_enum_values(self):
         self.assertEqual(AuthLevel.NORMAL.value, "normal")
         self.assertEqual(AuthLevel.ADMIN_OPTIONAL.value, "admin_optional")
@@ -38,10 +39,11 @@ class TestAuthLevel(unittest.TestCase):
 
     def test_is_string_enum(self):
         self.assertIsInstance(AuthLevel.NORMAL, str)
-        self.assertEqual(str(AuthLevel.NORMAL), "AuthLevel.NORMAL")
+        # str mixin allows direct comparison with string values
+        self.assertEqual(AuthLevel.NORMAL, "normal")
 
 
-class TestAuthLevelDecorator(unittest.TestCase):
+class TestAuthLevelDecorator(CustomTestCase):
     def test_decorator_sets_auth_level(self):
         @auth_level(AuthLevel.ADMIN_FORCE)
         def my_endpoint():
@@ -57,7 +59,7 @@ class TestAuthLevelDecorator(unittest.TestCase):
         self.assertEqual(my_endpoint(), 42)
 
 
-class TestDecideRequestAuth(unittest.TestCase):
+class TestDecideRequestAuth(CustomTestCase):
     """Tests for the pure decide_request_auth function."""
 
     # ==================== Always-Allowed Paths ====================
