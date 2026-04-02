@@ -261,16 +261,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         Fusion requires shared_expert_intermediate_size == moe_intermediate_size,
         support_shared_expert_fusion=True (e.g. Qwen3.5 MoE), and Aiter on HIP.
         """
-        if not self.support_shared_expert_fusion:
-            return 0
-        if get_global_server_args().disable_shared_experts_fusion:
-            return 0
-        if getattr(config, "shared_expert_intermediate_size", 0) <= 0:
-            return 0
-        if config.shared_expert_intermediate_size != config.moe_intermediate_size:
-            return 0
-        if not _use_aiter:
-            # Only Aiter is tested for now. This is to avoid failure on other platform.
+        if (not self.support_shared_expert_fusion
+            or get_global_server_args().disable_shared_experts_fusion is True
+            or getattr(config, "shared_expert_intermediate_size", 0) <= 0
+            or config.shared_expert_intermediate_size != config.moe_intermediate_size
+            or not _use_aiter
+            or getattr(config, "quant_config", None) is not None
+        ):
             return 0
         return 1
 
