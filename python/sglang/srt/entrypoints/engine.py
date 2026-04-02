@@ -66,6 +66,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    MiMoAudioMMId,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -270,7 +271,9 @@ class Engine(EngineBase):
         prompt: Optional[Union[List[str], str]] = None,
         sampling_params: Optional[Union[List[Dict], Dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        input_ids: Optional[
+            Union[List[List[int]], List[int], List[MiMoAudioMMId]]
+        ] = None,
         # The image input. It can be an image instance, file name, URL, or base64 encoded string.
         # Can be formatted as:
         # - Single image for a single request

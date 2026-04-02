@@ -1681,11 +1681,14 @@ class Scheduler(
 
         if session_id is None:
             # Normal non-session request
+            # 这里如果input_embeds不为None的话就把input_ids和长度都设置为input_embeds的长度
+            # 但是我的len(input_embeds)不是实际长度，所以需要修改一下
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
-                seq_length = len(recv_req.input_embeds)
-                fake_input_ids = [1] * seq_length
-                recv_req.input_ids = fake_input_ids
+                # seq_length = len(recv_req.input_embeds)
+                # fake_input_ids = [1] * seq_length
+                # recv_req.input_ids = fake_input_ids
+                pass
 
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
@@ -2438,6 +2441,11 @@ class Scheduler(
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
+        # 如果 config 是 MiMoAudio的话 创建 自定义形状的 input_ids [b, seq_lens, group_size, audio_channel + 1]
+        if "MiMoAudioModel" in self.model_config.hf_config.architectures:
+            init_for_mimo_audio = True
+        else:
+            init_for_mimo_audio = False
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -2448,6 +2456,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            init_for_mimo_audio=init_for_mimo_audio,
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
@@ -2673,6 +2682,15 @@ class Scheduler(
             #       we shall still keep the original outputs, e.g. next_token_ids
             #       in the GenerationBatchOutput for processing after copy_done.
             batch.output_ids = future_indices_or_next_token_ids
+            if batch_result.output_ids is not None:
+                for req_idx, req in enumerate(batch.reqs):
+                    info_key = "aux_output_tokens"
+                    if req.is_chunked <= 0:
+                        if info_key not in req.aux_output_infos:
+                            req.aux_output_infos[info_key] = []
+                        req.aux_output_infos[info_key].append(
+                            batch_result.output_ids[req_idx].tolist()
+                        )
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that

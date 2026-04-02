@@ -320,11 +320,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
-        output_strs = (
-            self._decode_batch_token_id_output(recv_obj)
-            if len(recv_obj.rids) > 0
-            else []
-        )
+        if len(recv_obj.output_ids) > 0 and not isinstance(recv_obj.output_ids[0], int):
+            # 说明此处是 MiMoAudioMMId，无需在此解码
+            output_strs = "[MiMoAudioMMId output, no decoding needed]"
+            routed_experts = None
+            pass
+        else:
+            output_strs = (
+                self._decode_batch_token_id_output(recv_obj)
+                if len(recv_obj.rids) > 0
+                else []
+            )
+            routed_experts = self._extract_routed_experts(recv_obj)
+
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,

@@ -1282,6 +1282,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+            self.model_sample_itself = hasattr(self.model, "sample")
 
     def update_expert_location(
         self,
@@ -2367,6 +2368,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.graph_runner = None
         self.graph_mem_usage = 0
 
+        # manually disable cuda graph
+        # return
+
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
@@ -2411,6 +2415,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
+        # self.server_args.disable_piecewise_cuda_graph = True
 
         if self.server_args.disable_piecewise_cuda_graph:
             logger.info(
@@ -2849,22 +2854,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 axis=-1,
             )
 
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
-        # Sample the next tokens
-        next_token_ids = self.sampler(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
-        )
-        self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
+        def sample_func(logits_output, forward_batch):
+            self._preprocess_logits(logits_output, forward_batch.sampling_info)
+            # Sample the next tokens
+            next_token_ids = self.sampler(
+                logits_output,
+                forward_batch.sampling_info,
+                forward_batch.return_logprob,
+                forward_batch.top_logprobs_nums,
+                forward_batch.token_ids_logprobs,
+                # For prefill, we only use the position of the last token.
+                (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                ),
+            )
+            return next_token_ids
+
+        if self.model_sample_itself:
+            next_token_ids = self.model.sample(
+                forward_batch, sample_func, logits_output
+            )
+        else:
+            next_token_ids = sample_func(logits_output, forward_batch)
+            self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
 
     def compute_logprobs_only(
