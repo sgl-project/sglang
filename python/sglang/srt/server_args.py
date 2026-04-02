@@ -5533,11 +5533,12 @@ class ServerArgs:
             "--torch-compile-op-config",
             type=str,
             default=ServerArgs.torch_compile_op_config,
-            help='Per-MultiPlatformOp torch.compile config as a JSON string mapping '
-            'class names to {"mode": ..., "options": {...}}. Overrides the class-level '
-            "defaults. Example: "
-            """'{"UnquantizedFusedMoEMethod": {"mode": "max-autotune", """
-            """"options": {"max_autotune_gemm": true}}}'.""",
+            help='Per-op/region torch.compile config as a JSON string mapping '
+            'class or region names to {"mode": ..., "options": {...}, "dynamic": ...}. '
+            '"dynamic" accepts true, false, or null (let Dynamo decide). '
+            "Overrides the class-level defaults. Example: "
+            """'{"RMSNorm": {"mode": "max-autotune", "dynamic": false}, """
+            """"QKNorm": {"dynamic": null}}'.""",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-max-tokens",

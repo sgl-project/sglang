@@ -12,6 +12,10 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
+# Sentinel for "not set" — distinct from ``None`` which is a valid
+# ``torch.compile(dynamic=None)`` value meaning "let Dynamo decide".
+_UNSET = object()
+
 
 @dataclass
 class CompileConfig:
@@ -19,10 +23,14 @@ class CompileConfig:
 
     Fields set to ``None`` inherit from the next level in the resolution
     chain: server-arg override > class default > global default.
+
+    ``dynamic`` uses :data:`_UNSET` (not ``None``) to signal "inherit",
+    because ``None`` is a meaningful ``torch.compile`` value.
     """
 
     mode: Optional[str] = None
     options: Optional[dict] = None
+    dynamic: object = _UNSET
 
 
 def get_default_compile_options() -> dict:
@@ -38,10 +46,11 @@ def get_default_compile_mode() -> str:
     return os.environ.get("SGLANG_TORCH_COMPILE_MODE", "default")
 
 
-def _resolve_base_compile_config(obj: object) -> tuple[str, dict]:
+def _resolve_base_compile_config(obj: object) -> tuple[str, dict, object]:
     """Resolve class-level + global default config for any object with a ``compile_config`` ClassVar."""
     mode = get_default_compile_mode()
     options = get_default_compile_options()
+    dynamic = _UNSET
 
     cls_config = getattr(type(obj), "compile_config", None)
     if cls_config is not None:
@@ -49,16 +58,22 @@ def _resolve_base_compile_config(obj: object) -> tuple[str, dict]:
             mode = cls_config.mode
         if cls_config.options is not None:
             options = cls_config.options
+        if cls_config.dynamic is not _UNSET:
+            dynamic = cls_config.dynamic
 
-    return mode, options
+    return mode, options, dynamic
 
 
-def _apply_override(mode: str, options: dict, ovr: CompileConfig) -> tuple[str, dict]:
+def _apply_override(
+    mode: str, options: dict, dynamic: object, ovr: CompileConfig
+) -> tuple[str, dict, object]:
     if ovr.mode is not None:
         mode = ovr.mode
     if ovr.options is not None:
         options = ovr.options
-    return mode, options
+    if ovr.dynamic is not _UNSET:
+        dynamic = ovr.dynamic
+    return mode, options, dynamic
 
 
 def resolve_compile_config(
@@ -66,15 +81,17 @@ def resolve_compile_config(
     overrides: Optional[Dict[str, CompileConfig]] = None,
 ) -> CompileConfig:
     """Resolve compile config for *op*: server-arg override > class default > global default."""
-    mode, options = _resolve_base_compile_config(op)
+    mode, options, dynamic = _resolve_base_compile_config(op)
 
     if overrides:
         for cls in type(op).__mro__:
             if cls.__name__ in overrides:
-                mode, options = _apply_override(mode, options, overrides[cls.__name__])
+                mode, options, dynamic = _apply_override(
+                    mode, options, dynamic, overrides[cls.__name__]
+                )
                 break
 
-    return CompileConfig(mode=mode, options=options)
+    return CompileConfig(mode=mode, options=options, dynamic=dynamic)
 
 
 def resolve_region_compile_config(
@@ -86,12 +103,14 @@ def resolve_region_compile_config(
 
     Resolution: server-arg override (by region name) > class compile_config > global default.
     """
-    mode, options = _resolve_base_compile_config(mixin)
+    mode, options, dynamic = _resolve_base_compile_config(mixin)
 
     if overrides and region_name in overrides:
-        mode, options = _apply_override(mode, options, overrides[region_name])
+        mode, options, dynamic = _apply_override(
+            mode, options, dynamic, overrides[region_name]
+        )
 
-    return CompileConfig(mode=mode, options=options)
+    return CompileConfig(mode=mode, options=options, dynamic=dynamic)
 
 
 def parse_compile_op_config(
@@ -105,6 +124,7 @@ def parse_compile_op_config(
         name: CompileConfig(
             mode=cfg.get("mode"),
             options=cfg.get("options"),
+            dynamic=cfg["dynamic"] if "dynamic" in cfg else _UNSET,
         )
         for name, cfg in parsed.items()
     }
@@ -122,9 +142,13 @@ class CompilableRegionMixin:
 
     compile_config: ClassVar[CompileConfig] = CompileConfig()
 
-    # Per-region ``dynamic`` kwarg for ``torch.compile``.  Subclasses set this
-    # to override the default ``compile_dynamic`` for specific regions, e.g.
-    # ``_REGION_DYNAMIC = {"QKNorm": False, "RopeKV": None}``.
+    # Model-author default for the ``dynamic`` kwarg passed to
+    # ``torch.compile`` for each region.  This captures properties inherent
+    # to the region's code (e.g. QKNorm must be static-shape for Inductor
+    # to optimize) rather than user/operator preferences.
+    # Takes precedence over the global ``compile_dynamic`` and
+    # ``CompileConfig.dynamic`` resolved from ``--torch-compile-op-config``.
+    # Example: ``_REGION_DYNAMIC = {"AlphaRegion": False, "BetaRegion": None}``
     _REGION_DYNAMIC: ClassVar[Dict[str, object]] = {}
 
     def get_compilable_regions(self) -> dict[str, str]:

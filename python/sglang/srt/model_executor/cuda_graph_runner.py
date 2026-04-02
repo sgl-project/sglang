@@ -66,6 +66,7 @@ from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils.torch_compile_utils import (
     CompilableRegionMixin,
     CompileConfig,
+    _UNSET,
     parse_compile_op_config,
     resolve_compile_config,
     resolve_region_compile_config,
@@ -438,13 +439,16 @@ def _to_torch(
                 sub.leave_torch_compile()
             else:
                 cfg = resolve_compile_config(sub, compile_overrides)
+                effective_dynamic = (
+                    cfg.dynamic if cfg.dynamic is not _UNSET else compile_dynamic
+                )
                 sub.enter_torch_compile(
                     num_tokens=num_tokens,
                     compile_scope=compile_scope,
                     override_layers=override_layers,
                     compile_mode=cfg.mode,
                     compile_options=cfg.options,
-                    compile_dynamic=compile_dynamic,
+                    compile_dynamic=effective_dynamic,
                 )
 
         # CompilableRegionMixin: compile named sub-regions in local scope.
@@ -460,11 +464,14 @@ def _to_torch(
                     cfg = resolve_region_compile_config(
                         sub, region_name, compile_overrides
                     )
+                    effective_dynamic = (
+                        cfg.dynamic if cfg.dynamic is not _UNSET else compile_dynamic
+                    )
                     sub.enter_region_compile(
                         region_name,
                         compile_mode=cfg.mode,
                         compile_options=cfg.options,
-                        compile_dynamic=compile_dynamic,
+                        compile_dynamic=effective_dynamic,
                     )
 
         if isinstance(sub, torch.nn.Module):

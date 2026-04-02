@@ -9,6 +9,7 @@ from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils.torch_compile_utils import CompilableRegionMixin
 from sglang.srt.utils.torch_compile_utils import (
     CompileConfig,
+    _UNSET,
     parse_compile_op_config,
     resolve_compile_config,
     resolve_region_compile_config,
@@ -372,6 +373,43 @@ class TestCompileConfig(CustomTestCase):
         cfg = resolve_compile_config(op)
         self.assertNotEqual(cfg.mode, "nope")
 
+    def test_dynamic_defaults_to_unset(self):
+        op = DummyLayer()
+        cfg = resolve_compile_config(op)
+        self.assertIs(cfg.dynamic, _UNSET)
+
+    def test_class_level_dynamic_overrides_global(self):
+        class _OpDynamic(_ForwardTrackerOp):
+            compile_config = CompileConfig(dynamic=False)
+
+        op = _OpDynamic()
+        cfg = resolve_compile_config(op)
+        self.assertIs(cfg.dynamic, False)
+
+    def test_class_level_dynamic_none_is_preserved(self):
+        class _OpDynNone(_ForwardTrackerOp):
+            compile_config = CompileConfig(dynamic=None)
+
+        op = _OpDynNone()
+        cfg = resolve_compile_config(op)
+        self.assertIsNone(cfg.dynamic)
+
+    def test_server_override_dynamic_beats_class_default(self):
+        class _OpDynamic(_ForwardTrackerOp):
+            compile_config = CompileConfig(dynamic=False)
+
+        op = _OpDynamic()
+        overrides = {"_OpDynamic": CompileConfig(dynamic=None)}
+        cfg = resolve_compile_config(op, overrides)
+        self.assertIsNone(cfg.dynamic)
+
+    def test_server_override_dynamic_only_keeps_class_mode(self):
+        op = _OpWithCustomConfig()
+        overrides = {"_OpWithCustomConfig": CompileConfig(dynamic=False)}
+        cfg = resolve_compile_config(op, overrides)
+        self.assertEqual(cfg.mode, "max-autotune")
+        self.assertIs(cfg.dynamic, False)
+
     def test_parse_compile_op_config_none(self):
         self.assertIsNone(parse_compile_op_config(None))
         self.assertIsNone(parse_compile_op_config(""))
@@ -388,6 +426,21 @@ class TestCompileConfig(CustomTestCase):
         result = parse_compile_op_config(raw)
         self.assertEqual(result["TopK"].mode, "max-autotune-no-cudagraphs")
         self.assertIsNone(result["TopK"].options)
+
+    def test_parse_compile_op_config_dynamic_false(self):
+        raw = '{"RMSNorm": {"dynamic": false}}'
+        result = parse_compile_op_config(raw)
+        self.assertIs(result["RMSNorm"].dynamic, False)
+
+    def test_parse_compile_op_config_dynamic_null(self):
+        raw = '{"RMSNorm": {"dynamic": null}}'
+        result = parse_compile_op_config(raw)
+        self.assertIsNone(result["RMSNorm"].dynamic)
+
+    def test_parse_compile_op_config_dynamic_absent_is_unset(self):
+        raw = '{"RMSNorm": {"mode": "default"}}'
+        result = parse_compile_op_config(raw)
+        self.assertIs(result["RMSNorm"].dynamic, _UNSET)
 
 
 class _RegionModuleWithConfig(nn.Module, CompilableRegionMixin):
@@ -486,6 +539,34 @@ class TestRegionCompileConfig(CustomTestCase):
         self.assertTrue(mod.is_region_compiled("TestRegion"))
         mod.leave_region_compile("TestRegion")
         self.assertFalse(mod.is_region_compiled("TestRegion"))
+
+    def test_dynamic_defaults_to_unset(self):
+        mod = _DummyRegionModule()
+        cfg = resolve_region_compile_config(mod, "TestRegion")
+        self.assertIs(cfg.dynamic, _UNSET)
+
+    def test_class_level_dynamic_applies_to_regions(self):
+        class _RegionDyn(nn.Module, CompilableRegionMixin):
+            compile_config = CompileConfig(dynamic=False)
+
+            def get_compilable_regions(self):
+                return {"R": "_r"}
+
+            def _r(self, x):
+                return x
+
+        mod = _RegionDyn()
+        cfg = resolve_region_compile_config(mod, "R")
+        self.assertIs(cfg.dynamic, False)
+
+    def test_server_override_dynamic_per_region(self):
+        mod = _RegionModuleWithConfig()
+        overrides = {"AlphaRegion": CompileConfig(dynamic=None)}
+        cfg = resolve_region_compile_config(mod, "AlphaRegion", overrides)
+        self.assertIsNone(cfg.dynamic)
+        # Other regions unaffected
+        cfg_b = resolve_region_compile_config(mod, "BetaRegion", overrides)
+        self.assertIs(cfg_b.dynamic, _UNSET)
 
 
 if __name__ == "__main__":
