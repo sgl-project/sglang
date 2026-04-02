@@ -234,7 +234,6 @@ class RMSNorm(CustomOp):
         out = out.view(shape)
         return out
 
-
     def extra_repr(self) -> str:
         return f"hidden_size={self.hidden_size}, eps={self.variance_epsilon}"
 
@@ -433,6 +432,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs):
+        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -534,6 +538,11 @@ class _NormScaleShift(CustomOp):
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
+    def forward_xpu(self, *args, **kwargs):
+        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
