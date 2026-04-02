@@ -113,13 +113,31 @@ class TimestepEmbedder(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         # Use MergedColumnParallelLinear for gate and up projection (fused)
         self.w13 = MergedColumnParallelLinear(
-            dim, [hidden_dim, hidden_dim], bias=False, gather_output=False
+            dim,
+            [hidden_dim, hidden_dim],
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w13",
         )
-        self.w2 = RowParallelLinear(hidden_dim, dim, bias=False, input_is_parallel=True)
+        self.w2 = RowParallelLinear(
+            hidden_dim,
+            dim,
+            bias=False,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w2",
+        )
         self.act = SiluAndMul()
 
     def forward(self, x):
@@ -408,7 +426,12 @@ class ZImageTransformerBlock(nn.Module):
             if hasattr(self.feed_forward, "net") and len(self.feed_forward.net) > 2:
                 self.feed_forward.net[2].act_unsigned = quant_config.act_unsigned
         else:
-            self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim)
+            self.feed_forward = FeedForward(
+                dim=dim,
+                hidden_dim=hidden_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.feed_forward",
+            )
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)

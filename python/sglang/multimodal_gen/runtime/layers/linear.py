@@ -615,6 +615,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
                 return
+            elif isinstance(param, BlockQuantScaleParameter):
+                # Already-merged block scale (e.g., from hf_to_custom_state_dict
+                # which concatenated w1 + w3 scales along dim 0).
+                # The merged tensor already matches the model's expected shape.
+                # We cannot use _load_fused_module_from_checkpoint here because
+                # it splits by output_sizes (element units), not block units.
+                param.data.copy_(loaded_weight)
+                return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)
                 return
@@ -627,21 +635,20 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_size = self.tp_size
 
         if isinstance(param, BlockQuantScaleParameter):
-            raise NotImplementedError("FP8 is not implemented yet")
-            # FIXME(will): add fp8 support
-            # from vllm.model_executor.layers.quantization.fp8 import (
-            #     Fp8LinearMethod, Fp8MoEMethod)
-            # assert self.quant_method is not None
-            # assert isinstance(self.quant_method,
-            #                   (Fp8LinearMethod, Fp8MoEMethod))
-            # weight_block_size = self.quant_method.quant_config.weight_block_size
-            # assert weight_block_size is not None
-            # block_n, _ = weight_block_size[0], weight_block_size[1]
-            # shard_offset = (
-            #     (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) //
-            #     block_n) // tp_size
-            # shard_size = ((self.output_sizes[loaded_shard_id] + block_n - 1) //
-            #               block_n // tp_size)
+            # Per-shard loading (used with TP or when checkpoint has
+            # separate w1/w3 scales that are loaded one-by-one).
+            assert self.quant_method is not None
+            weight_block_size = self.quant_method.quant_config.weight_block_size
+            assert weight_block_size is not None
+            block_n = weight_block_size[0]
+            shard_offset = (
+                sum(self.output_sizes[:loaded_shard_id]) + block_n - 1
+            ) // block_n // tp_size
+            shard_size = (
+                (self.output_sizes[loaded_shard_id] + block_n - 1)
+                // block_n
+                // tp_size
+            )
         else:
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
             shard_size = self.output_sizes[loaded_shard_id] // tp_size
