@@ -114,6 +114,14 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "Representative text encoder accuracy is already covered by zimage_image_t2i for the same source component and topology"
         ),
     },
+    "zimage_image_t2i_fp8_full": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative VAE accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TEXT_ENCODER: ComponentSkip(
+            "Representative text encoder accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+    },
     "zimage_image_t2i_multi_lora": {
         ComponentType.VAE: ComponentSkip(
             "Representative VAE accuracy is already covered by zimage_image_t2i for the same source component and topology"
