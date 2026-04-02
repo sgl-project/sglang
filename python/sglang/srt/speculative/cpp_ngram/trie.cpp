@@ -19,7 +19,7 @@ Trie::Trie(size_t capacity, const Param& param) : param_(param) {
 }
 
 void Trie::insert(const int32_t* tokens, size_t len) {
-  for (size_t i = 0; i + param_.min_match_window_size < len; ++i) {
+  for (size_t i = 0; i < len; ++i) {
     auto start = tokens + i;
     auto end = start + std::min(len - i, param_.max_trie_depth);
 
@@ -100,14 +100,13 @@ void Trie::reset() {
   root_ = getNode();
 }
 
-std::vector<std::pair<TrieNode*, int32_t>>
-Trie::match(const int32_t* context, size_t len, size_t min_window, size_t max_window) const {
+std::vector<std::pair<TrieNode*, int32_t>> Trie::match(const int32_t* context, size_t len) const {
   std::vector<std::pair<TrieNode*, int32_t>> result;
-  result.reserve(max_window - min_window);
-  for (int32_t match_window_size = std::min(len, max_window); match_window_size >= static_cast<int32_t>(min_window);
-       --match_window_size) {
-    auto start = context + len - match_window_size;
-    auto end = start + match_window_size;
+  const auto max_match_depth = std::min(len, param_.max_trie_depth);
+  result.reserve(max_match_depth);
+  for (size_t match_depth = max_match_depth; match_depth > 0; --match_depth) {
+    auto start = context + len - match_depth;
+    auto end = start + match_depth;
     auto cursor = root_;
     while (start != end) {
       auto iter = cursor->child.find(*start);
@@ -118,8 +117,8 @@ Trie::match(const int32_t* context, size_t len, size_t min_window, size_t max_wi
       ++start;
       cursor = iter->second;
     }
-    if (cursor) {
-      result.emplace_back(std::make_pair(cursor, match_window_size));
+    if (cursor != nullptr && !cursor->child.empty()) {
+      result.emplace_back(cursor, static_cast<int32_t>(match_depth));
     }
   }
   return result;
@@ -127,10 +126,10 @@ Trie::match(const int32_t* context, size_t len, size_t min_window, size_t max_wi
 
 Result Trie::buildRecency(
     const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
-  auto anchors = match(context, len, param.min_match_window_size, param.max_match_window_size);
+  auto anchors = match(context, len);
 
-  double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) /
-                             (param.max_match_window_size - param.min_match_window_size + 1);
+  const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
+  double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
 
   std::vector<Node> tree(draft_token_num + 1);
   int root = 0;
@@ -138,7 +137,7 @@ Result Trie::buildRecency(
 
   for (auto [node, depth] : anchors) {
     std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;
-    queue.push({root, (param.max_match_window_size - depth) * bfs_breadth_scale + param.min_bfs_breadth, node});
+    queue.push({root, (max_match_depth - depth) * bfs_breadth_scale + param.min_bfs_breadth, node});
     while (queue.size() && cursor <= static_cast<int>(draft_token_num)) {
       auto front = queue.front();
       queue.pop();
@@ -168,7 +167,7 @@ Result Trie::buildRecency(
 
 Result Trie::buildFrequency(
     const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
-  auto anchors = match(context, len, param.min_match_window_size, param.max_match_window_size);
+  auto anchors = match(context, len);
 
   struct CompareByLastDouble {
     bool operator()(

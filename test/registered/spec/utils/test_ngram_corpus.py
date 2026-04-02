@@ -12,8 +12,6 @@ register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 def _make_corpus(match_type="BFS", **kwargs):
     defaults = dict(
         max_trie_depth=12,
-        min_match_window_size=1,
-        max_match_window_size=10,
         min_bfs_breadth=1,
         max_bfs_breadth=8,
         draft_token_num=8,
@@ -239,9 +237,7 @@ class TestNgramCorpusSqueeze(CustomTestCase):
         self.assertEqual(len(ids), 8, "Should still produce draft_token_num outputs")
 
     def test_eviction_preserves_recent(self):
-        corpus = _make_corpus(
-            "BFS", capacity=500, max_trie_depth=6, max_match_window_size=5
-        )
+        corpus = _make_corpus("BFS", capacity=500, max_trie_depth=6)
 
         old_seq = list(range(1000, 1050))
         corpus.batch_put([old_seq])
@@ -357,7 +353,6 @@ class TestFrequencyBoosting(CustomTestCase):
             draft_token_num=2,
             max_bfs_breadth=1,
             min_bfs_breadth=1,
-            max_match_window_size=3,
             max_trie_depth=5,
         )
         corpus.batch_put([[1, 2, 3, 10, 11]])
@@ -386,7 +381,6 @@ class TestRecencyOrdering(CustomTestCase):
             draft_token_num=2,
             max_bfs_breadth=1,
             min_bfs_breadth=1,
-            max_match_window_size=3,
             max_trie_depth=5,
         )
         corpus.batch_put([[1, 2, 3, 10, 11]])
@@ -422,7 +416,7 @@ class TestSingleTokenContext(CustomTestCase):
     """Verify behavior with minimum-length context."""
 
     def test_single_token_query(self):
-        corpus = _make_corpus("BFS", min_match_window_size=1)
+        corpus = _make_corpus("BFS")
         corpus.batch_put([[5, 10, 20, 30]])
         corpus.synchronize()
 
@@ -436,7 +430,7 @@ class TestLongContext(CustomTestCase):
     """Verify behavior when query context exceeds max_trie_depth."""
 
     def test_context_longer_than_max_trie_depth(self):
-        corpus = _make_corpus("BFS", max_trie_depth=6, max_match_window_size=5)
+        corpus = _make_corpus("BFS", max_trie_depth=6)
         seq = list(range(1, 20))
         corpus.batch_put([seq])
         corpus.synchronize()
@@ -446,6 +440,23 @@ class TestLongContext(CustomTestCase):
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 15, "First token should be last context token")
         self.assertIn(16, ids_list, "Should match via suffix despite long context")
+
+    def test_matches_longest_stored_suffix(self):
+        corpus = _make_corpus("BFS", max_trie_depth=6, draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 4, 5, 6, 7]])
+        corpus.batch_put([[99, 3, 4, 5, 6, 8]])
+        corpus.synchronize()
+
+        ids, _ = corpus.batch_get([[2, 3, 4, 5, 6]])
+        ids_list = ids.tolist()
+        self.assertIn(
+            7, ids_list, "Longest stored suffix should contribute a continuation"
+        )
+        self.assertIn(
+            8,
+            ids_list,
+            "Shorter matching suffixes should still contribute continuations",
+        )
 
 
 class TestDraftBudgetSaturation(CustomTestCase):
@@ -538,9 +549,7 @@ class TestSqueezeEvictsOld(CustomTestCase):
     """Verify that squeeze actually evicts old data, not just preserves recent."""
 
     def test_old_data_evicted(self):
-        corpus = _make_corpus(
-            "BFS", capacity=150, max_trie_depth=6, max_match_window_size=5
-        )
+        corpus = _make_corpus("BFS", capacity=150, max_trie_depth=6)
 
         old_seq = list(range(5000, 5030))
         corpus.batch_put([old_seq])
