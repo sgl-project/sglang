@@ -44,7 +44,8 @@ def intel_xpu_benchmark(extra_args=None, min_throughput=None):
                 "--device",
                 "xpu",
             ]
-            full_args = common_args + (extra_args or [])
+            ci_args = ["--input", "64", "--output", "4"] if is_in_ci() else []
+            full_args = common_args + ci_args + (extra_args or [])
 
             model = test_func(self)
             try:
