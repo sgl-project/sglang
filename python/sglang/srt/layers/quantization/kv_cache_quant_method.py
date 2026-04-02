@@ -301,10 +301,10 @@ class NVFP4Method(KVCacheQuantMethod):
 
         cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
         cur_v_scale = self.v_scales_gpu[layer_id : layer_id + 1]
-        k_bf16 = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
+        k_bf16 = NVFP4QuantizeUtil.dequantize(
             k_fp4.view(torch.uint8), k_scales, cur_k_scale
         )
-        v_bf16 = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
+        v_bf16 = NVFP4QuantizeUtil.dequantize(
             v_fp4.view(torch.uint8), v_scales, cur_v_scale
         )
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
