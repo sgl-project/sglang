@@ -1936,13 +1936,12 @@ def _wait_and_warmup(
     # The server is ready for requests
     scheme = "https" if server_args.ssl_certfile else "http"
     logger.info(
-        "\n"
-        "----------------------------------------------\n"
-        "  SGLang Server Ready!\n"
+        f"\n----------------------------------------------\n"
+        f"  SGLang Server Ready!\n"
         f"  Model:    {server_args.served_model_name}\n"
         f"  API:      {scheme}://{server_args.host}:{server_args.port}\n"
         f"  TP: {server_args.tp_size}, DP: {server_args.dp_size}\n"
-        "----------------------------------------------"
+        f"----------------------------------------------"
     )
 
     if server_args.delete_ckpt_after_loading:

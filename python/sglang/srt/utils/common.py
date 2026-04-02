@@ -1121,8 +1121,8 @@ def configure_logger(server_args, prefix: str = ""):
     level = getattr(logging, server_args.log_level.upper())
 
     # Use colored formatter for terminal output
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(_ColoredFormatter(fmt, datefmt=datefmt, stream=sys.stdout))
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(_ColoredFormatter(fmt, datefmt=datefmt, stream=sys.stderr))
     logging.basicConfig(
         level=level,
         handlers=[handler],
