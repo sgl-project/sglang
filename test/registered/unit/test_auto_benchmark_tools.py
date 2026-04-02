@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from transformers import PreTrainedTokenizerFast
 sys.modules.setdefault("zmq", types.SimpleNamespace())
 
 from sglang.auto_benchmark_lib import (
+    SearchDeadlineExceeded,
     append_jsonl,
     build_candidates,
     build_qps_plan,
@@ -28,6 +30,7 @@ from sglang.auto_benchmark_lib import (
     infer_backend,
     prepare_dataset,
     rendered_launch_command,
+    resolve_max_candidates,
     run_candidate,
 )
 from sglang.benchmark.datasets.autobench import sample_autobench_requests
@@ -263,15 +266,34 @@ class TestAutoBenchmarkTools(CustomTestCase):
             "max_concurrency": [None, 8, 16],
         }
 
-        self.assertEqual(estimate_trials_per_candidate(benchmark_cfg), 18)
+        self.assertEqual(estimate_trials_per_candidate(benchmark_cfg), 15)
         self.assertIn("default", describe_search_tier(2))
         self.assertIn("slowest", describe_search_tier(3))
 
+    def test_resolve_max_candidates_defaults_to_eight(self):
+        self.assertEqual(resolve_max_candidates({}), 8)
+        self.assertIsNone(resolve_max_candidates({"max_candidates": None}))
+
+    def test_resolve_max_candidates_rejects_non_positive_values(self):
+        with self.assertRaisesRegex(ValueError, "search.max_candidates"):
+            resolve_max_candidates({"max_candidates": 0})
+
     def test_build_qps_plan_accepts_numeric_request_rate(self):
-        mode, values, tolerance = build_qps_plan({"request_rate": 3.5})
+        mode, values, tolerance, max_rounds = build_qps_plan({"request_rate": 3.5})
         self.assertEqual(mode, "fixed")
         self.assertEqual(values, [3.5])
         self.assertEqual(tolerance, 0.0)
+        self.assertEqual(max_rounds, 0)
+
+    def test_build_qps_plan_clamps_binary_rounds(self):
+        mode, values, tolerance, max_rounds = build_qps_plan(
+            {"qps": {"lower": 1.0, "upper": 16.0, "tolerance": 0.1, "max_rounds": 99}}
+        )
+
+        self.assertEqual(mode, "search")
+        self.assertEqual(values, [1.0, 16.0])
+        self.assertEqual(tolerance, 0.1)
+        self.assertEqual(max_rounds, 5)
 
     def test_format_best_progress(self):
         text = format_best_progress(
@@ -381,6 +403,70 @@ class TestAutoBenchmarkTools(CustomTestCase):
 
         self.assertLess(len(calls), 40)
         self.assertEqual(len(records), len(calls))
+
+    def test_run_candidate_binary_search_respects_max_rounds(self):
+        benchmark_cfg = {
+            "qps": {"lower": 1.0, "upper": 32.0, "tolerance": 1e-12, "max_rounds": 2},
+            "max_concurrency": [None],
+        }
+        calls = []
+
+        def fake_run_trial(**kwargs):
+            calls.append(kwargs["request_rate"])
+            return {
+                "stage": "base",
+                "candidate_id": kwargs["candidate_id"],
+                "requested_qps": kwargs["request_rate"],
+                "max_concurrency": kwargs["max_concurrency"],
+                "server_flags": kwargs["server_flags"],
+                "sla_passed": True,
+                "metrics": {
+                    "output_throughput": 1.0,
+                    "mean_ttft_ms": 1.0,
+                    "mean_tpot_ms": 1.0,
+                },
+            }
+
+        with mock.patch(
+            "sglang.auto_benchmark_lib.run_trial", side_effect=fake_run_trial
+        ):
+            records = run_candidate(
+                stage_name="base",
+                candidate_id=0,
+                server_cfg={"host": "127.0.0.1", "port": 30000},
+                benchmark_cfg=benchmark_cfg,
+                dataset_summary={"num_requests": 1},
+                backend="sglang-oai",
+                dataset_path="/tmp/fake.jsonl",
+                tokenizer_path=str(self.tokenizer_dir),
+                server_flags={"model_path": "/model"},
+                output_dir=str(self.tmpdir_path),
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(records), 2)
+
+    def test_run_candidate_stops_when_search_budget_is_exhausted(self):
+        benchmark_cfg = {
+            "qps": {"lower": 1.0, "upper": 2.0, "tolerance": 0.1},
+            "max_concurrency": [None],
+        }
+
+        with self.assertRaises(SearchDeadlineExceeded):
+            run_candidate(
+                stage_name="base",
+                candidate_id=0,
+                server_cfg={"host": "127.0.0.1", "port": 30000},
+                benchmark_cfg=benchmark_cfg,
+                dataset_summary={"num_requests": 1},
+                backend="sglang-oai",
+                dataset_path="/tmp/fake.jsonl",
+                tokenizer_path=str(self.tokenizer_dir),
+                server_flags={"model_path": "/model"},
+                output_dir=str(self.tmpdir_path),
+                search_deadline=time.time() - 1.0,
+                search_budget_hours=0.1,
+            )
 
     def test_run_candidate_resume_skips_existing_fixed_trials(self):
         benchmark_cfg = {

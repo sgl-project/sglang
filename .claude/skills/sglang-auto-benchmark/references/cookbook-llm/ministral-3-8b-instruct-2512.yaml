@@ -15,11 +15,9 @@ server:
     trust_remote_code: true
     tool_call_parser: mistral
     model_path: mistralai/Ministral-3-8B-Instruct-2512
+    mem_fraction_static: 0.82
+    schedule_policy: lpm
   search_space:
-    mem_fraction_static:
-    - 0.82
-    - 0.85
-    - 0.88
     chunked_prefill_size:
     - 4096
     - 8192
@@ -27,15 +25,12 @@ server:
     - 64
     - 96
     - 128
-    schedule_policy:
-    - lpm
-    - fcfs
   command_prefix:
   - sglang
   - serve
 dataset:
   kind: random
-  num_prompts: 200
+  num_prompts: 80
   scenario_names:
   - chat
   - summarization
@@ -64,7 +59,7 @@ benchmark:
   output_dir: ./auto_benchmark_results/cookbook-llm/ministral-3-8b-instruct-2512
 search:
   tier: 2
-  max_candidates: 24
+  max_candidates: 8  # Cap search breadth so full searches stay tractable.
   resume: true
 speculative:
   enabled: false

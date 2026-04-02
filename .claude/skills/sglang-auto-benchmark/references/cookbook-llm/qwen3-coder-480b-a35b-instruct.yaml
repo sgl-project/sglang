@@ -16,11 +16,9 @@ server:
     ep_size: 2
     moe_runner_backend: triton
     model_path: Qwen/Qwen3-Coder-480B-A35B-Instruct
+    mem_fraction_static: 0.82
+    schedule_policy: lpm
   search_space:
-    mem_fraction_static:
-    - 0.82
-    - 0.85
-    - 0.88
     prefill_attention_backend:
     - flashinfer
     decode_attention_backend:
@@ -32,15 +30,12 @@ server:
     - 32
     - 48
     - 64
-    schedule_policy:
-    - lpm
-    - fcfs
     ep_size:
     - 1
     - 2
 dataset:
   kind: random
-  num_prompts: 200
+  num_prompts: 80
   scenario_names:
   - chat
   - summarization
@@ -69,7 +64,7 @@ benchmark:
   output_dir: ./auto_benchmark_results/cookbook-llm/qwen3-coder-480b-a35b-instruct
 search:
   tier: 2
-  max_candidates: 24
+  max_candidates: 8  # Cap search breadth so full searches stay tractable.
   resume: true
 speculative:
   enabled: false

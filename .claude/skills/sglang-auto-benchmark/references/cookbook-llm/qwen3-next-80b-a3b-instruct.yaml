@@ -14,11 +14,9 @@ server:
   base_flags:
     tp_size: 2
     model_path: Qwen/Qwen3-Next-80B-A3B-Instruct
+    mem_fraction_static: 0.82
+    schedule_policy: lpm
   search_space:
-    mem_fraction_static:
-    - 0.82
-    - 0.85
-    - 0.88
     prefill_attention_backend:
     - fa3
     - flashinfer
@@ -32,15 +30,12 @@ server:
     - 64
     - 96
     - 128
-    schedule_policy:
-    - lpm
-    - fcfs
     ep_size:
     - 1
     - 2
 dataset:
   kind: random
-  num_prompts: 200
+  num_prompts: 80
   scenario_names:
   - chat
   - summarization
@@ -69,7 +64,7 @@ benchmark:
   output_dir: ./auto_benchmark_results/cookbook-llm/qwen3-next-80b-a3b-instruct
 search:
   tier: 2
-  max_candidates: 24
+  max_candidates: 8  # Cap search breadth so full searches stay tractable.
   resume: true
 speculative:
   enabled: false

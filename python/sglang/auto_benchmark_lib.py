@@ -90,6 +90,15 @@ PROGRESS_FLAG_ALIASES = {
     "speculative_num_draft_tokens": "draft_tok",
 }
 SENSITIVE_ENV_MARKERS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+DEFAULT_MAX_CANDIDATES = 8
+MAX_BINARY_SEARCH_ROUNDS = 5
+DEFAULT_BINARY_SEARCH_ROUNDS = 5
+MAX_SEARCH_DURATION_HOURS = 12.0
+DEFAULT_SEARCH_DURATION_HOURS = 12.0
+
+
+class SearchDeadlineExceeded(RuntimeError):
+    """Raised when the auto benchmark exhausts its global search budget."""
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
@@ -233,13 +242,33 @@ def preclean_stale_server(port: int) -> None:
         kill_pid_or_group(pid)
 
 
-def estimate_binary_search_trials(lower: float, upper: float, tolerance: float) -> int:
+def normalize_binary_search_rounds(value: Any) -> int:
+    if value is None:
+        return DEFAULT_BINARY_SEARCH_ROUNDS
+    return max(1, min(int(value), MAX_BINARY_SEARCH_ROUNDS))
+
+
+def resolve_max_candidates(search_cfg: Dict[str, Any]) -> Optional[int]:
+    if "max_candidates" not in search_cfg:
+        return DEFAULT_MAX_CANDIDATES
+    configured = search_cfg.get("max_candidates")
+    if configured is None:
+        return None
+    value = int(configured)
+    if value < 1:
+        raise ValueError("search.max_candidates must be >= 1 or null.")
+    return value
+
+
+def estimate_binary_search_trials(
+    lower: float, upper: float, tolerance: float, max_rounds: int
+) -> int:
     if upper <= lower or tolerance <= 0:
         return 1
 
     trials = 0
     lo, hi = float(lower), float(upper)
-    while hi - lo > tolerance:
+    while hi - lo > tolerance and trials < max_rounds:
         qps = pick_qps_midpoint(lo, hi)
         if qps <= lo or qps >= hi:
             break
@@ -256,23 +285,26 @@ def pick_qps_midpoint(lower: float, upper: float) -> float:
 
 
 def estimate_trials_per_candidate(benchmark_cfg: Dict[str, Any]) -> int:
-    mode, values, tolerance = build_qps_plan(benchmark_cfg)
+    mode, values, tolerance, max_rounds = build_qps_plan(benchmark_cfg)
     max_concurrency_values = as_list(benchmark_cfg.get("max_concurrency", [None]))
     if mode == "fixed":
         per_concurrency = len(values)
     else:
-        per_concurrency = estimate_binary_search_trials(values[0], values[1], tolerance)
+        per_concurrency = estimate_binary_search_trials(
+            values[0], values[1], tolerance, max_rounds
+        )
     return max(1, per_concurrency) * len(max_concurrency_values)
 
 
 def describe_qps_plan(benchmark_cfg: Dict[str, Any]) -> str:
-    mode, values, tolerance = build_qps_plan(benchmark_cfg)
+    mode, values, tolerance, max_rounds = build_qps_plan(benchmark_cfg)
     if mode == "fixed":
         return f"fixed qps values={values}"
     return (
         f"binary search qps lower={values[0]} upper={values[1]} "
-        f"tolerance={tolerance} estimated_trials_per_max_concurrency="
-        f"{estimate_binary_search_trials(values[0], values[1], tolerance)}"
+        f"tolerance={tolerance} max_rounds={max_rounds} "
+        "estimated_trials_per_max_concurrency="
+        f"{estimate_binary_search_trials(values[0], values[1], tolerance, max_rounds)}"
     )
 
 
@@ -297,6 +329,8 @@ def print_run_plan(
     server_cfg: Dict[str, Any],
     base_candidates: Sequence[Dict[str, Any]],
     speculative_enabled: bool,
+    search_budget_hours: float,
+    search_deadline: float,
 ) -> None:
     estimated_base_trials = (
         len(scenarios)
@@ -310,6 +344,10 @@ def print_run_plan(
     log_line(
         "search.max_candidates="
         f"{max_candidates if max_candidates is not None else 'unbounded'}"
+    )
+    log_line(
+        f"search.max_duration_hours={search_budget_hours:.1f} "
+        f"(deadline {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(search_deadline))})"
     )
     log_line(f"qps_plan={describe_qps_plan(benchmark_cfg)}")
     log_line(
@@ -351,6 +389,34 @@ def estimated_finish_time(
 
 def current_time_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def resolve_search_budget_hours(search_cfg: Dict[str, Any]) -> float:
+    configured = search_cfg.get("max_duration_hours", DEFAULT_SEARCH_DURATION_HOURS)
+    return max(0.0, min(float(configured), MAX_SEARCH_DURATION_HOURS))
+
+
+def format_timestamp(timestamp: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+
+
+def remaining_search_seconds(search_deadline: Optional[float]) -> Optional[float]:
+    if search_deadline is None:
+        return None
+    return max(0.0, search_deadline - time.time())
+
+
+def raise_if_search_deadline_reached(
+    search_deadline: Optional[float], budget_hours: float
+) -> None:
+    remaining = remaining_search_seconds(search_deadline)
+    if remaining is None or remaining > 0:
+        return
+    raise SearchDeadlineExceeded(
+        "search budget of "
+        f"{budget_hours:.1f}h reached before the full search completed "
+        f"(deadline {format_timestamp(search_deadline)})"
+    )
 
 
 def summarize_progress_flags(server_flags: Dict[str, Any], limit: int = 6) -> str:
@@ -843,24 +909,27 @@ def build_candidates(
             continue
         seen.add(key)
         deduped.append(candidate)
-        if max_candidates and len(deduped) >= max_candidates:
+        if max_candidates is not None and len(deduped) >= max_candidates:
             break
     return deduped
 
 
-def build_qps_plan(benchmark_cfg: Dict[str, Any]) -> Tuple[str, List[float], float]:
+def build_qps_plan(
+    benchmark_cfg: Dict[str, Any],
+) -> Tuple[str, List[float], float, int]:
     qps_cfg = benchmark_cfg.get("qps", benchmark_cfg.get("request_rate"))
     if isinstance(qps_cfg, (int, float)):
-        return "fixed", [float(qps_cfg)], 0.0
+        return "fixed", [float(qps_cfg)], 0.0, 0
     if isinstance(qps_cfg, list):
-        return "fixed", [float(value) for value in qps_cfg], 0.0
+        return "fixed", [float(value) for value in qps_cfg], 0.0, 0
     if isinstance(qps_cfg, dict) and "values" in qps_cfg:
-        return "fixed", [float(value) for value in qps_cfg["values"]], 0.0
+        return "fixed", [float(value) for value in qps_cfg["values"]], 0.0, 0
     if isinstance(qps_cfg, dict) and {"lower", "upper"} <= set(qps_cfg):
         return (
             "search",
             [float(qps_cfg["lower"]), float(qps_cfg["upper"])],
             float(qps_cfg.get("tolerance", 0.1)),
+            normalize_binary_search_rounds(qps_cfg.get("max_rounds")),
         )
     raise ValueError("benchmark.qps must be a list or a {lower, upper, tolerance} map.")
 
@@ -1041,10 +1110,24 @@ def build_bench_command(
     return command
 
 
-def run_bench_command(command: List[str]) -> Dict[str, Any]:
-    result = subprocess.run(command, capture_output=True, text=True)
+def run_bench_command(
+    command: List[str], timeout_sec: Optional[float] = None
+) -> Dict[str, Any]:
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout_sec
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SearchDeadlineExceeded(
+            f"search budget expired while waiting for bench_serving: {exc.cmd}"
+        ) from exc
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip()[-4000:])
+        message = (result.stderr or result.stdout).strip()
+        if len(message) > 4000:
+            head = message[:2000].rstrip()
+            tail = message[-2000:].lstrip()
+            message = f"{head}\n...\n{tail}"
+        raise RuntimeError(message)
 
     output_file = command[command.index("--output-file") + 1]
     with open(output_file, "r", encoding="utf-8") as f:
@@ -1067,6 +1150,8 @@ def run_trial(
     output_dir: str,
     request_rate: float,
     max_concurrency: Optional[int],
+    search_deadline: Optional[float] = None,
+    search_budget_hours: float = DEFAULT_SEARCH_DURATION_HOURS,
 ) -> Dict[str, Any]:
     process = None
     log_path = os.path.join(
@@ -1090,6 +1175,7 @@ def run_trial(
     }
 
     try:
+        raise_if_search_deadline_reached(search_deadline, search_budget_hours)
         if server_cfg.get("launch", True):
             preclean_stale_server(port)
             process = launch_server(server_cfg, server_flags, log_path)
@@ -1104,10 +1190,13 @@ def run_trial(
                 request_rate=request_rate,
                 max_concurrency=max_concurrency,
                 output_file=bench_path,
-            )
+            ),
+            timeout_sec=remaining_search_seconds(search_deadline),
         )
         record["sla_passed"] = meets_sla(metrics, benchmark_cfg)
         record["metrics"] = metrics
+    except SearchDeadlineExceeded:
+        raise
     except Exception as exc:  # noqa: BLE001
         record["error"] = repr(exc)
         diagnosis, hint = classify_failure(
@@ -1148,8 +1237,10 @@ def run_candidate(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     record_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     existing_records: Optional[Sequence[Dict[str, Any]]] = None,
+    search_deadline: Optional[float] = None,
+    search_budget_hours: float = DEFAULT_SEARCH_DURATION_HOURS,
 ) -> List[Dict[str, Any]]:
-    mode, values, tolerance = build_qps_plan(benchmark_cfg)
+    mode, values, tolerance, max_rounds = build_qps_plan(benchmark_cfg)
     max_concurrency_values = as_list(benchmark_cfg.get("max_concurrency", [None]))
     records: List[Dict[str, Any]] = []
     existing_by_key = {
@@ -1183,11 +1274,14 @@ def run_candidate(
                 output_dir=output_dir,
                 request_rate=request_rate,
                 max_concurrency=max_concurrency,
+                search_deadline=search_deadline,
+                search_budget_hours=search_budget_hours,
             ),
             False,
         )
 
     for max_concurrency in max_concurrency_values:
+        raise_if_search_deadline_reached(search_deadline, search_budget_hours)
         if mode == "fixed":
             incumbent_qps = None
             if (
@@ -1237,7 +1331,8 @@ def run_candidate(
                     f"mc={max_concurrency} incumbent_qps={incumbent_qps:.4f}"
                 )
                 continue
-        while upper - lower > tolerance:
+        rounds_run = 0
+        while upper - lower > tolerance and rounds_run < max_rounds:
             qps = pick_qps_midpoint(lower, upper)
             if qps <= lower or qps >= upper:
                 break
@@ -1252,6 +1347,7 @@ def run_candidate(
                 best = record
             else:
                 upper = qps
+            rounds_run += 1
         if best is not None:
             best["best_for_candidate"] = True
 
@@ -1321,15 +1417,13 @@ def write_markdown_summary(
     records: Sequence[Dict[str, Any]],
     best: Optional[Dict[str, Any]],
     server_cfg: Dict[str, Any],
-    interrupted: bool = False,
+    partial_reason: Optional[str] = None,
 ) -> None:
     lines = [f"# Auto Benchmark Summary: {scenario['display_name']}", ""]
     lines.append(f"- Dataset kind: `{dataset_cfg['kind']}`")
     lines.append(f"- Requests: `{dataset_summary['num_requests']}`")
-    if interrupted:
-        lines.append(
-            "- Status: `partial` (interrupted before the full search completed)"
-        )
+    if partial_reason:
+        lines.append(f"- Status: `partial` ({partial_reason})")
     if dataset_cfg["kind"] == "random":
         lines.append(
             f"- Random distribution: input `{dataset_cfg['random_input_len']}`, output `{dataset_cfg['random_output_len']}`"
@@ -1392,6 +1486,8 @@ def run_stage(
     output_dir: str,
     live_results_path: Optional[str] = None,
     existing_records: Optional[Sequence[Dict[str, Any]]] = None,
+    search_deadline: Optional[float] = None,
+    search_budget_hours: float = DEFAULT_SEARCH_DURATION_HOURS,
 ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     records: List[Dict[str, Any]] = []
     existing_stage_records = [
@@ -1415,6 +1511,7 @@ def run_stage(
     )
     try:
         for candidate_id, candidate_flags in enumerate(candidates):
+            raise_if_search_deadline_reached(search_deadline, search_budget_hours)
             merged = merge_host_port(server_cfg, candidate_flags)
             log_line(
                 f"[{stage_name}] scenario={scenario_name} "
@@ -1453,6 +1550,8 @@ def run_stage(
                 progress_callback=on_trial,
                 record_callback=on_record,
                 existing_records=existing_stage_records,
+                search_deadline=search_deadline,
+                search_budget_hours=search_budget_hours,
             )
             records.extend(candidate_records)
 
@@ -1478,7 +1577,7 @@ def persist_scenario_outputs(
     dataset_summary: Dict[str, Any],
     records: Sequence[Dict[str, Any]],
     server_cfg: Dict[str, Any],
-    interrupted: bool = False,
+    partial_reason: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     if not records:
         return None
@@ -1495,7 +1594,7 @@ def persist_scenario_outputs(
         records=records,
         best=best,
         server_cfg=server_cfg,
-        interrupted=interrupted,
+        partial_reason=partial_reason,
     )
     log_line(f"results_jsonl={results_jsonl}")
     log_line(f"results_csv={results_csv}")
@@ -1528,11 +1627,14 @@ def run_auto_benchmark(config_path: str) -> str:
     dataset_cfg = normalize_dataset_cfg(config.get("dataset"), benchmark_cfg)
     scenarios = expand_dataset_scenarios(dataset_cfg)
     tier = int(search_cfg.get("tier", 2))
-    max_candidates = search_cfg.get("max_candidates")
+    max_candidates = resolve_max_candidates(search_cfg)
     resume_enabled = bool(search_cfg.get("resume", True))
     base_candidates = build_server_candidates(server_cfg, tier, max_candidates)
+    search_budget_hours = resolve_search_budget_hours(search_cfg)
+    search_deadline = time.time() + (search_budget_hours * 3600)
     scenario_records: List[Dict[str, Any]] = []
     interrupted = False
+    run_partial_reason: Optional[str] = None
     print_run_plan(
         config_path=config_path,
         output_dir=output_dir,
@@ -1543,6 +1645,8 @@ def run_auto_benchmark(config_path: str) -> str:
         server_cfg=server_cfg,
         base_candidates=base_candidates,
         speculative_enabled=bool(config.get("speculative", {}).get("enabled")),
+        search_budget_hours=search_budget_hours,
+        search_deadline=search_deadline,
     )
 
     scenario_pbar, scenario_started_at = make_progress_bar(
@@ -1554,6 +1658,7 @@ def run_auto_benchmark(config_path: str) -> str:
     previous_handlers = install_interrupt_handlers()
     try:
         for scenario in scenarios:
+            raise_if_search_deadline_reached(search_deadline, search_budget_hours)
             scenario_output_dir = (
                 output_dir
                 if len(scenarios) == 1
@@ -1596,6 +1701,7 @@ def run_auto_benchmark(config_path: str) -> str:
                 )
 
             all_records: List[Dict[str, Any]] = []
+            scenario_partial_reason: Optional[str] = None
             try:
                 all_records, best_base = run_stage(
                     scenario_name=scenario["display_name"],
@@ -1610,6 +1716,8 @@ def run_auto_benchmark(config_path: str) -> str:
                     output_dir=scenario_output_dir,
                     live_results_path=live_results_path,
                     existing_records=existing_records,
+                    search_deadline=search_deadline,
+                    search_budget_hours=search_budget_hours,
                 )
 
                 speculative_cfg = config.get("speculative", {})
@@ -1658,10 +1766,22 @@ def run_auto_benchmark(config_path: str) -> str:
                         output_dir=scenario_output_dir,
                         live_results_path=live_results_path,
                         existing_records=read_jsonl(live_results_path),
+                        search_deadline=search_deadline,
+                        search_budget_hours=search_budget_hours,
                     )
                     all_records.extend(spec_records)
+            except SearchDeadlineExceeded as exc:
+                interrupted = True
+                scenario_partial_reason = str(exc)
+                run_partial_reason = scenario_partial_reason
+                log_line(
+                    f"search_deadline_reached=true scenario={scenario['display_name']} "
+                    f"detail={scenario_partial_reason}"
+                )
             except KeyboardInterrupt:
                 interrupted = True
+                scenario_partial_reason = "interrupted before the full search completed"
+                run_partial_reason = scenario_partial_reason
                 log_line(
                     f"interrupt_received=true scenario={scenario['display_name']} "
                     "saving partial results before exit"
@@ -1678,19 +1798,24 @@ def run_auto_benchmark(config_path: str) -> str:
                     dataset_summary=dataset_summary,
                     records=persisted_records,
                     server_cfg=server_cfg,
-                    interrupted=interrupted,
+                    partial_reason=scenario_partial_reason,
                 )
-                if best is not None:
+                if persisted_records:
                     scenario_records.append(
                         {
                             "scenario_name": scenario["display_name"],
                             "scenario_dir": scenario_output_dir,
                             "best_record": best,
+                            "has_records": True,
                         }
                     )
             if interrupted:
                 break
             advance_progress(scenario_pbar, scenario_started_at)
+    except SearchDeadlineExceeded as exc:
+        interrupted = True
+        run_partial_reason = str(exc)
+        log_line(f"search_deadline_reached=true detail={run_partial_reason}")
     finally:
         scenario_pbar.close()
         restore_interrupt_handlers(previous_handlers)
@@ -1704,6 +1829,11 @@ def run_auto_benchmark(config_path: str) -> str:
                 {
                     "scenario_name": item["scenario_name"],
                     "scenario_dir": item["scenario_dir"],
+                    "status": (
+                        "ok"
+                        if record and record.get("metrics")
+                        else "no_successful_runs"
+                    ),
                     "requested_qps": record.get("requested_qps") if record else None,
                     "mean_ttft_ms": metrics.get("mean_ttft_ms"),
                     "mean_tpot_ms": metrics.get("mean_tpot_ms"),
@@ -1717,17 +1847,21 @@ def run_auto_benchmark(config_path: str) -> str:
             )
         write_jsonl(os.path.join(output_dir, "scenario_summary.jsonl"), summary_rows)
         write_csv(os.path.join(output_dir, "scenario_summary.csv"), summary_rows)
-        lines = [
-            "# Scenario Summary",
-            "",
-            "| Scenario | QPS | Output tok/s | TTFT ms | TPOT ms | Summary |",
-            "|---|---:|---:|---:|---:|---|",
-        ]
+        lines = ["# Scenario Summary", ""]
+        if run_partial_reason:
+            lines.extend([f"- Status: `partial` ({run_partial_reason})", ""])
+        lines.extend(
+            [
+                "| Scenario | Status | QPS | Output tok/s | TTFT ms | TPOT ms | Summary |",
+                "|---|---|---:|---:|---:|---:|---|",
+            ]
+        )
         for row in summary_rows:
             summary_path = os.path.join(row["scenario_dir"], "summary.md")
             lines.append(
-                "| {name} | {qps} | {throughput} | {ttft} | {tpot} | `{path}` |".format(
+                "| {name} | {status} | {qps} | {throughput} | {ttft} | {tpot} | `{path}` |".format(
                     name=row["scenario_name"],
+                    status=row["status"],
                     qps=row.get("requested_qps") or "",
                     throughput=(
                         round(row.get("output_throughput", 0.0), 2)
@@ -1756,6 +1890,15 @@ def run_auto_benchmark(config_path: str) -> str:
                         "```bash",
                         row["launch_command"],
                         "```",
+                    ]
+                )
+            elif row["status"] == "no_successful_runs":
+                lines.extend(
+                    [
+                        "",
+                        f"## {row['scenario_name']}",
+                        "",
+                        "No successful run with metrics was produced for this scenario.",
                     ]
                 )
         with open(os.path.join(output_dir, "SUMMARY.md"), "w", encoding="utf-8") as f:

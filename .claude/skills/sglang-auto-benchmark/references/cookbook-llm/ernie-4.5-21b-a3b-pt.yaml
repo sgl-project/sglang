@@ -13,11 +13,9 @@ server:
     CUDA_VISIBLE_DEVICES: '0'
   base_flags:
     model_path: baidu/ERNIE-4.5-21B-A3B-PT
+    mem_fraction_static: 0.82
+    schedule_policy: lpm
   search_space:
-    mem_fraction_static:
-    - 0.82
-    - 0.85
-    - 0.88
     chunked_prefill_size:
     - 4096
     - 8192
@@ -25,16 +23,13 @@ server:
     - 64
     - 96
     - 128
-    schedule_policy:
-    - lpm
-    - fcfs
   command_prefix:
   - python3
   - -m
   - sglang.launch_server
 dataset:
   kind: random
-  num_prompts: 200
+  num_prompts: 80
   scenario_names:
   - chat
   - summarization
@@ -63,7 +58,7 @@ benchmark:
   output_dir: ./auto_benchmark_results/cookbook-llm/ernie-4.5-21b-a3b-pt
 search:
   tier: 2
-  max_candidates: 24
+  max_candidates: 8  # Cap search breadth so full searches stay tractable.
   resume: true
 speculative:
   enabled: false

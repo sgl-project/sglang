@@ -18,11 +18,9 @@ server:
     max_running_requests: 1
     attention_backend: flashinfer
     model_path: inclusionAI/LLaDA2.1-mini
+    mem_fraction_static: 0.77
+    schedule_policy: lpm
   search_space:
-    mem_fraction_static:
-    - 0.77
-    - 0.8
-    - 0.83
     prefill_attention_backend:
     - fa3
     - flashinfer
@@ -36,12 +34,9 @@ server:
     - 1
     - 2
     - 4
-    schedule_policy:
-    - lpm
-    - fcfs
 dataset:
   kind: random
-  num_prompts: 200
+  num_prompts: 80
   scenario_names:
   - chat
   - summarization
@@ -70,7 +65,7 @@ benchmark:
   output_dir: ./auto_benchmark_results/cookbook-llm/llada2-1-mini
 search:
   tier: 2
-  max_candidates: 24
+  max_candidates: 8  # Cap search breadth so full searches stay tractable.
   resume: true
 speculative:
   enabled: false

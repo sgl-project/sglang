@@ -27,6 +27,16 @@ The implementation lives in:
 
 If those are not true yet, fix them before running a large search.
 
+Environment consistency check:
+- if the benchmark will run from a remote repo copy or ad-hoc synced workspace,
+  verify that the remote `python/sglang/bench_serving.py` matches the local
+  feature level needed by auto benchmark before launching a long run
+- at minimum, run a preflight such as `PYTHONPATH=<repo>/python python3 -m
+  sglang.bench_serving --help` and confirm that the dataset choices include
+  `autobench`
+- if `autobench` is missing remotely, do not start the benchmark; sync
+  `python/sglang/bench_serving.py` and any required dataset modules first
+
 ## Remote Run Logging
 
 If the benchmark is executed on a remote machine, the progress bar output must be
@@ -43,7 +53,10 @@ Scope note:
   container" should use direct local inspection
 
 Required behavior:
-- start the remote run with a persistent terminal/session log, for example with `script -q -f`
+- start the remote run with a persistent terminal/session log, for example with
+  `script -q -f <log> -c "<cmd>"`; on Linux containers that use util-linux
+  `script`, prefer the explicit `-c` form instead of BSD-style positional
+  command arguments
 - continuously sync a cleaned version of that remote session log back to a local
   `progress.log`; this local `progress.log` should already have terminal control
   sequences removed, because `script` + `tqdm` progress bars will otherwise leave
@@ -51,11 +64,27 @@ Required behavior:
 - if the benchmark itself is executed inside a remote container, the cleaned local
   `progress.log` must be refreshed automatically at least once every 30
   seconds while the run is active; do not rely on one-off manual polling
+- implement the sync loop as a dedicated local script file checked into neither
+  git nor the benchmark config; avoid fragile one-line `nohup zsh -lc '...'`
+  command strings with heavy nested quoting
+- prefer running the sync loop inside a long-lived local session such as a
+  dedicated `tmux` pane, `screen`, or the agent's own persistent PTY session;
+  detached child processes started from short-lived command runners can be
+  reaped unexpectedly, so plain `nohup ... &` is not the most stable default
+- immediately after starting the sync loop, verify that `progress.log` is
+  actually updating by checking its timestamp or size twice across a short wait;
+  if it is not changing, treat that as a broken sync setup and fix it before
+  telling the user that live log mirroring is working
 - tell the user the local log path up front
 - keep final result files synced back locally after the run ends
+- when scenario-level or top-level markdown summaries are produced, sync those
+  `summary.md` / `SUMMARY.md` files back locally as first-class result artifacts
+  rather than leaving them only on the remote machine
 
 This is important because long searches can run for hours, and people need a
-stable local file they can tail without logging into the remote box.
+stable local file they can tail without logging into the remote box. The final
+local run folder should also be self-contained enough for someone to review the
+benchmark outcome without re-entering the remote environment.
 
 Recommended cleanup pipeline for the local mirrored log:
 
@@ -67,19 +96,50 @@ perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\r/\n/g; s/\x08//g;' raw_progress.log
 Recommended remote-container sync pattern:
 
 ```bash
+cat > sync_progress.sh <<'EOF'
+#!/bin/zsh
+set -euo pipefail
 while true; do
   ssh <remote-host> "tail -n 200 <remote-progress-log>" > raw_progress.log
   perl -pe 's/\e\[[0-9;?]*[ -\/]*[@-~]//g; s/\r/\n/g; s/\x08//g;' raw_progress.log \
     > progress.log
-  sleep 2
+  sleep 15
 done
+EOF
+chmod +x sync_progress.sh
 ```
 
-Use a persistent local background job, tmux pane, or equivalent long-lived sync
-process so that humans can watch the cleaned local log in real time. A faster
-cadence like `sleep 2` is preferred for active monitoring, but the cleaned local
-`progress.log` must not go more than 30 seconds without a refresh while the run
-is active.
+Run that script from a long-lived local session, for example:
+
+```bash
+tmux new-session -d -s autobench-sync './sync_progress.sh'
+```
+
+Use a persistent local background job, `tmux` pane, `screen`, or equivalent
+long-lived sync process so that humans can watch the cleaned local log in real
+time. Use `sleep 15` by default for long runs unless there is a specific need
+for tighter polling, and keep the cleaned local `progress.log` within the
+required 30-second refresh window while the run is active.
+
+At the end of the run, make sure the local artifact set includes any generated:
+- `results.jsonl`
+- `results.csv`
+- `summary.md`
+- `SUMMARY.md`
+- `scenario_summary.jsonl`
+- `scenario_summary.csv`
+
+Required health check after starting the sync script:
+
+```bash
+stat -f '%m %z' progress.log
+sleep 5
+stat -f '%m %z' progress.log
+```
+
+If the timestamp and size both stay unchanged while the remote benchmark is known
+to be producing new output, the sync loop is broken. Fix the script before
+continuing.
 
 Do not make the cleaned log optional. The default local progress artifact should
 be the cleaned `progress.log` that humans actually read.
@@ -235,7 +295,10 @@ python3 -m sglang.auto_benchmark validate \
 When it is set together with tier 3, the workflow still enumerates the full cartesian order conceptually, but only keeps the first `max_candidates` unique candidates after deduplication.
 That makes it useful as a safety valve, but it also means tier 3 is no longer truly exhaustive unless you remove the cap or raise it high enough.
 
-The reference configs now default to tier 2.
+If `search.max_candidates` is omitted, the workflow now defaults to `8`.
+Set it to `null` only when you intentionally want an unbounded sweep.
+
+The reference configs now default to tier 2 with `search.max_candidates: 8`.
 
 ## Interrupt And Resume
 
@@ -298,12 +361,10 @@ The most important performance-related groups are:
   - `chunked_prefill_size`
   - `prefill_max_requests`
   - `max_prefill_tokens`
-  - `schedule_policy`
   - `schedule_conservativeness`
   - `num_continuous_decode_steps`
   - `stream_interval`
 - Memory / cache
-  - `mem_fraction_static`
   - `max_total_tokens`
   - `page_size`
   - `disable_radix_cache`
@@ -330,15 +391,26 @@ The most important performance-related groups are:
   - `speculative_accept_threshold_single`
   - `speculative_accept_threshold_acc`
 
-In practice, `mem_fraction_static` is usually worth including in the search space with a small conservative range, because it directly changes available KV cache capacity and therefore affects throughput, TTFT stability, and whether a candidate starts successfully at all.
+For cookbook-derived reference configs, keep `mem_fraction_static` and
+`schedule_policy` pinned to the cookbook baseline unless the user explicitly
+asks to search them. They are useful knobs, but they add a lot of search width
+for relatively low validation value in the default workflow.
 
 Do not put these into the default search space:
+- `mem_fraction_static`
+- `schedule_policy`
 - `enable_hierarchical_cache`
 - `hicache_ratio`
 - `hicache_size`
 - `enable_lmcache`
 
 Those features are not treated as standard auto-benchmark sweep knobs in this workflow.
+
+Budget guardrails for the default workflow:
+- use `dataset.num_prompts: 80` unless the user asks for a heavier study
+- prefer a coarse QPS search tolerance
+- keep `benchmark.qps.max_rounds <= 5`
+- keep `search.max_duration_hours <= 12`
 
 ## Base Tuning Before EAGLE
 

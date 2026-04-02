@@ -17,11 +17,9 @@ server:
     trust_remote_code: true
     enable_multimodal: true
     model_path: meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8
+    mem_fraction_static: 0.82
+    schedule_policy: lpm
   search_space:
-    mem_fraction_static:
-    - 0.82
-    - 0.85
-    - 0.88
     chunked_prefill_size:
     - 4096
     - 8192
@@ -29,15 +27,12 @@ server:
     - 4
     - 8
     - 12
-    schedule_policy:
-    - lpm
-    - fcfs
   command_prefix:
   - sglang
   - serve
 dataset:
   kind: random
-  num_prompts: 200
+  num_prompts: 80
   scenario_names:
   - chat
   - summarization
@@ -66,7 +61,7 @@ benchmark:
   output_dir: ./auto_benchmark_results/cookbook-llm/llama-4-maverick-17b-128e-instruct-fp8
 search:
   tier: 2
-  max_candidates: 24
+  max_candidates: 8  # Cap search breadth so full searches stay tractable.
   resume: true
 speculative:
   enabled: false

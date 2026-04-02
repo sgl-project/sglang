@@ -4,12 +4,21 @@ These configs are derived from `sgl-cookbook` autoregressive text-model pages an
 
 Rules used here:
 - Keep the baseline as close as possible to a pure-TP launch command.
-- Move common performance knobs into `search_space`.
+- Keep `mem_fraction_static` and `schedule_policy` at the cookbook baseline by
+  default; search higher-ROI knobs first.
+- Move the remaining common performance knobs into `search_space`.
 - Add `ep_size` search for relevant MoE pages.
 - Keep CUDA graph enabled by default.
 - Prefer cookbook H200 defaults first, then H100 defaults when H200 is not available; if neither exists, fall back to the cookbook's published baseline for that model and say so in the config comments.
 - Default to synthetic `random` data so every config is runnable out of the box.
+- Default to `dataset.num_prompts: 80` so the reference sweep stays cheap enough
+  for interactive validation.
+- Default to a coarse QPS search with `benchmark.qps.max_rounds <= 5`.
 - Default to `search.tier: 2` so the shipped configs stay reasonably practical to run.
+- Default to `search.max_candidates: 8` so the candidate sweep stays bounded by
+  default.
+- Default to `search.max_duration_hours: 12` because longer searches do not fit
+  the intended workflow budget.
 - Treat `dataset.input_len` and `dataset.output_len` as aligned scenario lists, not a cartesian product.
 - If a candidate OOMs, the result table should recommend increasing GPU count or using GPUs with larger memory.
 

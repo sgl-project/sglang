@@ -13,11 +13,9 @@ server:
     CUDA_VISIBLE_DEVICES: '0'
   base_flags:
     model_path: zai-org/GLM-4.7-Flash
+    mem_fraction_static: 0.82
+    schedule_policy: lpm
   search_space:
-    mem_fraction_static:
-    - 0.82
-    - 0.85
-    - 0.88
     prefill_attention_backend:
     - fa3
     - flashinfer
@@ -31,12 +29,9 @@ server:
     - 64
     - 96
     - 128
-    schedule_policy:
-    - lpm
-    - fcfs
 dataset:
   kind: random
-  num_prompts: 200
+  num_prompts: 80
   scenario_names:
   - chat
   - summarization
@@ -65,7 +60,7 @@ benchmark:
   output_dir: ./auto_benchmark_results/cookbook-llm/glm-4.7-flash
 search:
   tier: 2
-  max_candidates: 24
+  max_candidates: 8  # Cap search breadth so full searches stay tractable.
   resume: true
 speculative:
   enabled: false
