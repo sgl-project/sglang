@@ -452,6 +452,9 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
 
 RUN python3 -m pip install --upgrade "urllib3>=2.6.3" "pillow>=12.1.1"
 
+# Install transformers with Gemma4 support
+RUN pip install --no-deps 'git+https://github.com/huggingface/transformers.git@91b1ab1fdfa81a552644a92fbe3e8d88de40e167'
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
