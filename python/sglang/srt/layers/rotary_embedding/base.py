@@ -204,7 +204,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         # forward_native can handled KV cache fusion.
         # cache_loc varies across calls;
-        compile_dynamic = False
+        compile_dynamic = True
 
         # Merge compile_mode and compile_options.
         merged_options = merge_mode_options(compile_mode, compile_options)
