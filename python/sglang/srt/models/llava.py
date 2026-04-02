@@ -55,6 +55,21 @@ from sglang.srt.utils import add_prefix, flatten_nested_list, logger
 
 
 class LlavaBaseForCausalLM(nn.Module):
+    @staticmethod
+    def _infer_image_aspect_ratio(mm_items):
+        """Determine image_aspect_ratio from processor metadata or item count."""
+        # Check if processor stored the aspect_ratio it used
+        for item in mm_items:
+            ar = item.model_specific_data.get("image_aspect_ratio")
+            if ar is not None:
+                return ar
+        # Fallback: multi-image or video → pad, single image → anyres
+        image_items = [item for item in mm_items if item.is_image()]
+        has_video = any(item.is_video() for item in mm_items)
+        if len(image_items) > 1 or has_video:
+            return "pad"
+        return "anyres"
+
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         image_sizes = flatten_nested_list(
             [item.image_sizes for item in image_inputs.mm_items]
@@ -63,13 +78,8 @@ class LlavaBaseForCausalLM(nn.Module):
         pad_values = [item.pad_value for item in image_inputs.mm_items]
 
         # hardcode for spatial_unpad + anyres
-        # Multi-image or video → use "pad" mode (no anyres)
-        image_items = [item for item in image_inputs.mm_items if item.is_image()]
-        has_video = any(item.is_video() for item in image_inputs.mm_items)
-        if len(image_items) > 1 or has_video:
-            image_aspect_ratio = "pad"
-        else:
-            image_aspect_ratio = "anyres"
+        # Use per-item aspect_ratio from processor if available, else infer
+        image_aspect_ratio = self._infer_image_aspect_ratio(image_inputs.mm_items)
         offset_list = []
         image_inputs.image_pad_len = []
         for image_idx, image_s in enumerate(image_sizes):
@@ -183,15 +193,14 @@ class LlavaBaseForCausalLM(nn.Module):
 
                 # Build per-image lists filtered by need_vision
                 modalities_list = []
-                is_multi_image = []  # per-image flag for anyres vs pad
+                aspect_ratios = []  # per-image aspect ratio
                 for i in range(bs):
                     if need_vision[i] and image_inputs[i]:
                         items = image_inputs[i].mm_items
-                        n = len(items)
-                        modalities_list.extend([item.modality for item in items])
-                        has_video = any(item.is_video() for item in items)
-                        for _ in range(n):
-                            is_multi_image.append(n > 1 or has_video)
+                        ar = self._infer_image_aspect_ratio(items)
+                        for item in items:
+                            modalities_list.append(item.modality)
+                            aspect_ratios.append(ar)
 
                 pixel_values = flatten_nested_list(
                     [
@@ -234,15 +243,7 @@ class LlavaBaseForCausalLM(nn.Module):
                     new_image_features = []
                     height = width = self.num_patches_per_side
                     for image_idx, image_feature in enumerate(image_features):
-                        if is_multi_image[image_idx]:
-                            image_aspect_ratio = "pad"  # multi image or video
-                        else:
-                            image_aspect_ratio = (
-                                self.config.image_aspect_ratio
-                            )  # single image
-                        # image_aspect_ratio = (
-                        #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
-                        # )
+                        image_aspect_ratio = aspect_ratios[image_idx]
                         if (
                             image_feature.shape[0] > 1
                             and "anyres" in image_aspect_ratio

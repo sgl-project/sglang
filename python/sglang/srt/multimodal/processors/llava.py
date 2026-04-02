@@ -212,6 +212,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     feature=pixel_v,
                     model_specific_data={
                         "image_sizes": [image_s],
+                        "image_aspect_ratio": aspect_ratio,
                     },
                     modality=modality,
                 )
