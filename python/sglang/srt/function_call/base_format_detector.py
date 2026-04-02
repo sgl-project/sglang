@@ -171,12 +171,13 @@ class BaseFormatDetector(ABC):
                 # parallel tool calls because the bot_token (e.g., '[') can also
                 # appear inside array parameters of the current tool, and we must not
                 # mistakenly identify that as the start of a new tool.
+                used_separator_branch = False
                 if self.current_tool_id > 0 and current_text.startswith(
                     self.tool_call_separator
                 ):
                     start_idx = len(self.tool_call_separator)
+                    used_separator_branch = True
                 else:
-                    # Only search for bot_token if not processing subsequent tool
                     tool_call_pos = current_text.find(self.bot_token)
                     if tool_call_pos != -1:
                         start_idx = tool_call_pos + len(self.bot_token)
@@ -186,7 +187,23 @@ class BaseFormatDetector(ABC):
                 if start_idx >= len(current_text):
                     return StreamingParseResult()
 
-                obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
+                try:
+                    obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
+                except (MalformedJSON, json.JSONDecodeError):
+                    # Separator landed on non-JSON markup; fall back to
+                    # bot_token which skips past all inter-object markup.
+                    # e.g. Qwen25: separator "," matches between eot/bot tags.
+                    if used_separator_branch and self.bot_token in current_text:
+                        start_idx = current_text.find(self.bot_token) + len(
+                            self.bot_token
+                        )
+                        if start_idx >= len(current_text):
+                            return StreamingParseResult()
+                        obj, end_idx = _partial_json_loads(
+                            current_text[start_idx:], flags
+                        )
+                    else:
+                        raise
 
                 is_current_complete = _is_complete_json(
                     current_text[start_idx : start_idx + end_idx]
@@ -212,7 +229,7 @@ class BaseFormatDetector(ABC):
 
                 current_tool_call = obj
 
-            except MalformedJSON:
+            except (MalformedJSON, json.JSONDecodeError):
                 return StreamingParseResult()
 
             if not current_tool_call:

@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     kv_to_page_indices,
     poll_and_all_reduce,
+    poll_and_all_reduce_with_staging,
     prepare_abort,
 )
 from sglang.srt.environ import envs
@@ -195,9 +196,18 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        effective_mamba_size = (
-            mamba_size if mamba_size is not None else size
-        ) + pre_alloc_size
+        if mamba_size is not None:
+            effective_mamba_size = min(mamba_size, size + pre_alloc_size)
+            if mamba_size > size + pre_alloc_size:
+                logger.warning(
+                    "mamba_size (%d) exceeds size + pre_alloc_size (%d), "
+                    "capping effective_mamba_size to %d",
+                    mamba_size,
+                    size + pre_alloc_size,
+                    effective_mamba_size,
+                )
+        else:
+            effective_mamba_size = size + pre_alloc_size
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
@@ -281,7 +291,10 @@ class DecodePreallocQueue:
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.kv_manager = self._init_kv_manager()
+        if self.enable_staging:
+            self.transfer_queue._init_staging_handler(self.kv_manager)
 
         if self.scheduler.tp_worker.is_hybrid_swa:
             # FIXME: current SWA allocation allocate full kv cache size in prefill
@@ -357,6 +370,21 @@ class DecodePreallocQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # Staging buffer setup (only when heterogeneous TP staging is enabled)
+        if self.enable_staging and not self.is_mla_backend:
+            kv_pool_for_heads = self.token_to_kv_pool
+            if hasattr(kv_pool_for_heads, "full_kv_pool"):
+                kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
+            per_rank_kv_heads = getattr(kv_pool_for_heads, "head_num", 0)
+            if per_rank_kv_heads > 0:
+                kv_args.kv_head_num = per_rank_kv_heads
+                kv_args.total_kv_head_num = per_rank_kv_heads * attn_tp_size
+            if hasattr(kv_manager, "set_kv_buffer_tensors"):
+                kv_pool = kv_pool_for_heads
+                if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+                    kv_manager.set_kv_buffer_tensors(
+                        kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size
+                    )
         return kv_manager
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
@@ -728,6 +756,13 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.send_metadata(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
+            if (
+                self.transfer_queue.enable_staging
+                and decode_req.kv_receiver.require_staging
+            ):
+                self.transfer_queue.staging_handler.register_decode_req(
+                    decode_req.req.bootstrap_room, decode_req
+                )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -854,12 +889,18 @@ class DecodeTransferQueue:
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.staging_handler = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
+        if self.enable_staging:
+            for dr in decode_reqs:
+                if dr.kv_receiver.require_staging:
+                    self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """
@@ -918,6 +959,9 @@ class DecodeTransferQueue:
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
+        decode_req.req.cached_tokens_device = cached_tokens[1].item()
+        decode_req.req.cached_tokens_host = cached_tokens[2].item()
+        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -942,18 +986,39 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return True
 
+    def _poll_with_staging(self) -> list:
+        return poll_and_all_reduce_with_staging(
+            self.queue, self.staging_handler, self.gloo_group
+        )
+
+    def _init_staging_handler(self, kv_manager):
+        """Create staging handler from kv_manager. Must be called exactly once."""
+        from sglang.srt.disaggregation.common.staging_handler import (
+            DecodeStagingHandler,
+        )
+
+        self.staging_handler = DecodeStagingHandler.create(
+            kv_manager, self.scheduler, self.tp_rank
+        )
+        kv_manager._staging_handler = self.staging_handler
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
+
+        if self.enable_staging:
+            polls = self._poll_with_staging()
+        else:
+            polls = poll_and_all_reduce(
+                [dr.kv_receiver for dr in self.queue], self.gloo_group
+            )
 
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -1001,6 +1066,12 @@ class DecodeTransferQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
+            if self.enable_staging and self.staging_handler.is_staging_room(
+                self.queue[i].req.bootstrap_room
+            ):
+                self.staging_handler.unregister_decode_req(
+                    self.queue[i].req.bootstrap_room
+                )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
             self.req_to_metadata_buffer_idx_allocator.free(idx)
