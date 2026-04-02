@@ -688,6 +688,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         code = finish_reason.get(
                             "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
                         )
+                        if isinstance(code, int) and not isinstance(code, HTTPStatus):
+                            code = HTTPStatus(code)
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
                             code.name,

@@ -117,18 +117,21 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     # accept the token as it's already accepted
                     if req.grammar.current_token is None:
                         req.grammar.accept_token(req.output_ids[-1])
+                    req.grammar.finished = req.finished()
                 except ValueError as e:
                     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
+                    # In PD disaggregation, this can occur when grammar state is
+                    # initialized independently on the decode node. Use to_finish
+                    # (not finished_reason) so that process_batch_result_prebuilt
                     # handles the release via check_finished -> release_kv_cache in one place.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
+                    logger.warning(error_message)
+                    req.grammar = None
                     req.to_finish = FINISH_ABORT(
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
-                req.grammar.finished = req.finished()
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
         # Simulate the eagle run.
