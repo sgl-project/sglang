@@ -6,6 +6,7 @@ import os
 import unittest
 from pathlib import Path
 
+from test_deepseek_ocr import TestDeepSeekOCR
 from transformers import AutoTokenizer
 
 from sglang.test.test_utils import (
@@ -13,7 +14,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
 )
-from test_deepseek_ocr import TestDeepSeekOCR
 
 
 class TestDeepSeekOCRTriton(TestDeepSeekOCR):

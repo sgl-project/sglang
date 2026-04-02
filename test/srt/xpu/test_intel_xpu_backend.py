@@ -3,8 +3,8 @@ Usage:
 python3 -m unittest test_intel_xpu_backend.TestIntelXPUBackend.test_latency_qwen_model
 """
 
-import unittest
 import gc
+import unittest
 from functools import wraps
 
 from sglang.test.test_utils import (
@@ -48,8 +48,8 @@ def intel_xpu_benchmark(extra_args=None, min_throughput=None):
 
             model = test_func(self)
             try:
-                prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-                    model, full_args
+                prefill_latency, decode_throughput, decode_latency = (
+                    run_bench_one_batch(model, full_args)
                 )
             finally:
                 _cleanup_xpu_memory()

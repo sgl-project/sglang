@@ -2,10 +2,10 @@
 python3 -m unittest test_deepseek_ocr.py
 """
 
+import gc
 import json
 import os
 import unittest
-import gc
 from pathlib import Path
 
 import requests
