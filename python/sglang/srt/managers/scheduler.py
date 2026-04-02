@@ -1635,7 +1635,7 @@ class Scheduler(
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
-        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
+
         if session_id is None:
             # Normal non-session request
             # 这里如果input_embeds不为None的话就把input_ids和长度都设置为input_embeds的长度
@@ -1650,7 +1650,7 @@ class Scheduler(
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
-                
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -2225,7 +2225,7 @@ class Scheduler(
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
-        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
@@ -2549,7 +2549,9 @@ class Scheduler(
                     if req.is_chunked <= 0:
                         if info_key not in req.aux_output_infos:
                             req.aux_output_infos[info_key] = []
-                        req.aux_output_infos[info_key].append(batch_result.output_ids[req_idx].tolist())
+                        req.aux_output_infos[info_key].append(
+                            batch_result.output_ids[req_idx].tolist()
+                        )
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that

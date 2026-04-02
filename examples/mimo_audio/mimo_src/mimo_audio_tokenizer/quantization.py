@@ -1,12 +1,11 @@
 # Copyright 2025 Xiaomi Corporation.
 import typing as tp
 
-from einops import rearrange, repeat
 import torch
-from torch import nn
-import torch.nn.functional as F
-
 import torch.distributed as dist
+import torch.nn.functional as F
+from einops import rearrange, repeat
+from torch import nn
 
 
 def rank():
@@ -442,11 +441,11 @@ class ResidualVectorQuantizer(nn.Module):
         Args:
             x (torch.Tensor): Input tensor.
             n_q (int): Number of quantizer used to quantize. Default: All quantizers.
-            layers (list): Layer that need to return quantized. Defalt: None.
+            layers (list): Layer that need to return quantized. Default: None.
         Returns:
             QuantizedResult:
                 The quantized (or approximately quantized) representation with
-                the associated numbert quantizers and layer quantized required to return.
+                the associated number quantizers and layer quantized required to return.
         """
         n_q = n_q if n_q else self.n_q
         quantized, codes, commit_loss, quantized_list = self.vq(

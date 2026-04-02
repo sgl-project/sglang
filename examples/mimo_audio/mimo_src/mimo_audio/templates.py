@@ -10,7 +10,7 @@ asr_zh_templates = [
     "转录这个音频片段",
     "将这段对话转换为文本",
     "麻烦帮我把这段录音整理成详细的文字记录",
-  ]
+]
 
 asr_en_templates = [
     "Please transcribe this audio file",
@@ -25,7 +25,7 @@ asr_en_templates = [
     "Could you please help me transcribe this important recording?",
     "Would you mind converting this voice message into a readable text format?",
     "I'd really appreciate it if you could turn this audio file into a written document",
-  ]
+]
 
 tts_zh_templates = [
     "请将这段文字转换为语音",
@@ -38,7 +38,7 @@ tts_zh_templates = [
     "将文本转换为可听的音频",
     "帮我朗读这段文字",
     "把这些内容念出来",
-  ]
+]
 
 tts_en_templates = [
     "Please convert this text to speech",
@@ -51,4 +51,4 @@ tts_en_templates = [
     "Turn this text into audible format",
     "Help me convert this writing to speech",
     "Make this text into spoken audio",
-  ]
+]

@@ -1,7 +1,8 @@
 # Copyright 2025 Xiaomi Corporation.
 import math
+from dataclasses import dataclass, field
+from typing import List
 
-import numpy as np
 import torch
 import torch.nn as nn
 from flash_attn import flash_attn_varlen_func
@@ -10,10 +11,13 @@ from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_audio_tokenizer import MiMoAudioTokenizerConfig
-from .modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update, apply_rotary_pos_emb
+from .modeling_rope_utils import (
+    ROPE_INIT_FUNCTIONS,
+    apply_rotary_pos_emb,
+    dynamic_rope_update,
+)
 from .quantization import ResidualVectorQuantizer
-from dataclasses import dataclass, field
-from typing import List
+
 
 def get_sequence_mask(inputs, inputs_length):
     if inputs.dim() == 3:
@@ -48,6 +52,7 @@ def get_position_ids(lengths):
     position_ids = torch.arange(0, total_len).to(offset) - offset
     return position_ids
 
+
 @dataclass
 class StreamingConfig:
     seg_point: int = field(default=60 * 25)
@@ -56,10 +61,12 @@ class StreamingConfig:
     right_overlap: int = field(default=40)
     seg_point_left_overlap: int = field(default=0)
 
+
 @dataclass
 class StreamingCache:
     hidden_states: List[torch.Tensor] = field(default=None)
     processed_lengths: List[int] = field(default=None)
+
 
 class ISTFT(nn.Module):
     """
@@ -145,6 +152,7 @@ class ISTFT(nn.Module):
         y = y / window_envelope
 
         return y
+
 
 class ISTFTHead(nn.Module):
     """
@@ -233,6 +241,7 @@ class RotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
+
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -254,27 +263,41 @@ class RMSNorm(nn.Module):
 
 LAYER_NORM = {"LayerNorm": nn.LayerNorm, "RMSNorm": RMSNorm}
 
+
 # 替换代码部分
-def sdpa_varlen_replacement(query_states, key_states, value_states, seq_len, bsz, num_heads, head_dim, causal=True):
+def sdpa_varlen_replacement(
+    query_states,
+    key_states,
+    value_states,
+    seq_len,
+    bsz,
+    num_heads,
+    head_dim,
+    causal=True,
+):
     """
     使用 PyTorch 原生 SDPA 替换 flash_attn_varlen_func
     """
     # 1. 将压平的 (total_q, n_heads, d) 还原为 (bsz, n_heads, max_seqlen, d)
     # 注意：SDPA 要求输入形状为 (batch, heads, seq_len, head_dim)
     max_seqlen = max(seq_len)
-    
+
     # 初始化输出张量
     # 这里我们假设输入的 query_states 等已经是 (total_q, n_heads, d) 格式
     # 我们需要根据 cu_len 或 seq_len 将其拆回 batch 维度
-    
+
     # 简易做法：创建一个 padding 后的 tensor
     def unflatten_and_pad(states, seq_lens, bsz, n_heads, d):
-        output = torch.zeros(bsz, n_heads, max_seqlen, d, device=states.device, dtype=states.dtype)
+        output = torch.zeros(
+            bsz, n_heads, max_seqlen, d, device=states.device, dtype=states.dtype
+        )
         start_idx = 0
         for i, length in enumerate(seq_lens):
             # 提取当前 sequence 并放入 output
             # states 形状假设为 [total_len, n_heads, d]
-            output[i, :, :length, :] = states[start_idx : start_idx + length].transpose(0, 1)
+            output[i, :, :length, :] = states[start_idx : start_idx + length].transpose(
+                0, 1
+            )
             start_idx += length
         return output
 
@@ -288,30 +311,31 @@ def sdpa_varlen_replacement(query_states, key_states, value_states, seq_len, bsz
     mask = None
     if not causal:
         # 创建 padding mask: (bsz, 1, 1, max_seqlen)
-        mask = torch.arange(max_seqlen, device=q.device)[None, :] < torch.tensor(seq_len, device=q.device)[:, None]
-        mask = mask.view(bsz, 1, 1, max_seqlen) # 广播到 heads 和 query 维度
+        mask = (
+            torch.arange(max_seqlen, device=q.device)[None, :]
+            < torch.tensor(seq_len, device=q.device)[:, None]
+        )
+        mask = mask.view(bsz, 1, 1, max_seqlen)  # 广播到 heads 和 query 维度
 
     # 3. 调用原生 SDPA
     # 如果是 causal 且没有额外的 padding mask，可以直接设 is_causal=True
     # 但因为我们是手动 padding 的，为了安全，建议显式构造 mask 或确保 padding 部分不参与计算
     attn_output = F.scaled_dot_product_attention(
-        q, k, v, 
-        attn_mask=mask, 
-        dropout_p=0.0, 
-        is_causal=causal
+        q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=causal
     )
 
     # 4. 将结果还原回原本的序列格式 (去掉 padding)
     # 原代码最后接的是 .reshape(bsz, self.embed_dim)，说明它期望输出是 (bsz, seq_len, hidden)
     # 或者是 total_len 展平后的格式。
-    
+
     # 按照你原图中 flash_attn_varlen_func 的返回习惯，通常是 [total_len, heads, d]
     # 如果后续代码直接用 reshape(bsz, -1)，这里我们需要处理一下：
-    
+
     # 将 (bsz, heads, max_len, d) -> (bsz, max_len, heads, d) -> (bsz, max_len, hidden)
     attn_output = attn_output.transpose(1, 2).contiguous()
-    
+
     return attn_output
+
 
 class Attention(nn.Module):
     def __init__(self, embed_dim, num_heads, window_size=(-1, -1), causal=False):
@@ -566,12 +590,8 @@ class AudioEncoder(nn.Module):
 
         hidden_states = inputs_embeds
 
-        position_ids = (
-            get_position_ids(output_length).long().to(input_features.device)
-        )
-        rope_position_embeddings = self.position_embedding(
-            input_features, position_ids
-        )
+        position_ids = get_position_ids(output_length).long().to(input_features.device)
+        rope_position_embeddings = self.position_embedding(input_features, position_ids)
 
         attention_mask, unpacking_index = get_sequence_mask(
             hidden_states, output_length
@@ -685,7 +705,7 @@ class AudioEncoder(nn.Module):
         return hidden_states
 
 
-class CausalConvTranspose1d(nn.Module): 
+class CausalConvTranspose1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride):
         super().__init__()
         self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride)
@@ -799,13 +819,8 @@ class AudioDecoder(nn.Module):
 
         hidden_states = audio_embed
 
-        position_ids = (
-            get_position_ids(output_length).long().to(hidden_states.device)
-        )
-        rope_position_embeddings = self.position_embedding(
-            hidden_states, position_ids
-        )
-
+        position_ids = get_position_ids(output_length).long().to(hidden_states.device)
+        rope_position_embeddings = self.position_embedding(hidden_states, position_ids)
 
         # packing hidden states
         attention_mask, _ = get_sequence_mask(hidden_states, output_length)
@@ -870,17 +885,26 @@ class MiMoAudioTokenizer(PreTrainedModel):
         return output
 
     @torch.no_grad()
-    def streaming_decode(self, codes_chunks, chunk_input_lengths, history_cache=StreamingCache(), streaming_config=StreamingConfig(), last_chunk=False):
+    def streaming_decode(
+        self,
+        codes_chunks,
+        chunk_input_lengths,
+        history_cache=StreamingCache(),
+        streaming_config=StreamingConfig(),
+        last_chunk=False,
+    ):
         hidden_states = self.encoder.decode_vq(codes_chunks)
         input_lengths = []
         input_hidden_states = []
         start_idx = 0
         cache_hidden_states = []
         for i, input_length in enumerate(chunk_input_lengths):
-            sample_hidden_states = hidden_states[start_idx:start_idx + input_length]
+            sample_hidden_states = hidden_states[start_idx : start_idx + input_length]
             start_idx += input_length
             if history_cache.hidden_states is not None:
-                sample_hidden_states = torch.cat([history_cache.hidden_states[i], sample_hidden_states], dim=0)
+                sample_hidden_states = torch.cat(
+                    [history_cache.hidden_states[i], sample_hidden_states], dim=0
+                )
                 input_length += history_cache.hidden_states[i].size(0)
             input_hidden_states.append(sample_hidden_states)
             cache_hidden_states.append(sample_hidden_states.clone())
@@ -889,25 +913,35 @@ class MiMoAudioTokenizer(PreTrainedModel):
         input_lengths = torch.tensor(input_lengths, device=hidden_states.device)
         output = self.decoder(input_hidden_states, input_lengths)
         return_wavs = []
-        frames_per_token = self.config.avg_pooler * self.config.stride_size * self.config.hop_length
+        frames_per_token = (
+            self.config.avg_pooler * self.config.stride_size * self.config.hop_length
+        )
         processed_lengths = []
         for i, wav in enumerate(output):
             wav = wav.float().detach().cpu()
-            start_idx = history_cache.processed_lengths[i] if history_cache.processed_lengths is not None else 0
+            start_idx = (
+                history_cache.processed_lengths[i]
+                if history_cache.processed_lengths is not None
+                else 0
+            )
             if last_chunk:
-                return_wavs.append(wav[:, start_idx * frames_per_token:])
+                return_wavs.append(wav[:, start_idx * frames_per_token :])
                 new_processed_length = input_lengths[i].item()
             elif input_lengths[i].item() <= streaming_config.right_overlap:
                 return_wavs.append(None)
                 new_processed_length = 0
             else:
-                end_idx = (input_lengths[i].item() - streaming_config.right_overlap)
-                wav = wav[:, start_idx * frames_per_token: end_idx * frames_per_token]
+                end_idx = input_lengths[i].item() - streaming_config.right_overlap
+                wav = wav[:, start_idx * frames_per_token : end_idx * frames_per_token]
                 return_wavs.append(wav)
                 new_processed_length = end_idx
                 if input_lengths[i].item() > streaming_config.left_overlap:
-                    cache_hidden_states[i] = cache_hidden_states[i][-streaming_config.left_overlap:]
-                    new_processed_length -= (input_lengths[i].item() - streaming_config.left_overlap)
+                    cache_hidden_states[i] = cache_hidden_states[i][
+                        -streaming_config.left_overlap :
+                    ]
+                    new_processed_length -= (
+                        input_lengths[i].item() - streaming_config.left_overlap
+                    )
             processed_lengths.append(new_processed_length)
         history_cache.hidden_states = cache_hidden_states
         history_cache.processed_lengths = processed_lengths

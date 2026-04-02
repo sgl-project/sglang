@@ -20,7 +20,6 @@ from typing import Optional
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import is_torch_available, logging
 
-
 logger = logging.get_logger(__name__)
 
 
@@ -852,6 +851,7 @@ def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
 
 def apply_rotary_pos_emb(x, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.

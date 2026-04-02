@@ -118,15 +118,14 @@ MultimodalDataInputFormat = Union[
     MultimodalDataInputItem,
 ]
 
+
 @dataclass
-class MiMoAudioMMId():
-    mm_ids: List[List[int]] = None    # [group_size, audio_channel + 1]
-    
+class MiMoAudioMMId:
+    mm_ids: List[List[int]] = None  # [group_size, audio_channel + 1]
+
     @classmethod
     def init_new(cls, mm_ids: List[List[int]]):
-        return cls(
-            mm_ids=mm_ids
-        )
+        return cls(mm_ids=mm_ids)
 
     def flatten_mm_ids(self) -> List[int]:
         """
@@ -136,10 +135,9 @@ class MiMoAudioMMId():
         """
         if self.mm_ids is None:
             return []
-        
+
         # 双层列表推导式，安全展平
         return [item for sublist in self.mm_ids for item in sublist]
-    
 
 
 @dataclass
@@ -325,7 +323,9 @@ class GenerateReqInput(BaseReq):
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
                 raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int) or isinstance(self.input_ids[0], MiMoAudioMMId):
+            if isinstance(self.input_ids[0], int) or isinstance(
+                self.input_ids[0], MiMoAudioMMId
+            ):
                 self.is_single = True
                 self.batch_size = 1
             else:

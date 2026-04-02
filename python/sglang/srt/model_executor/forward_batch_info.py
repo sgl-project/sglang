@@ -421,7 +421,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
-    
+
     # For MiMoAudio Audio Patch Decoder
     shift_hidden_states: Optional[torch.Tensor] = None
 
@@ -509,7 +509,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
-        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             return ret

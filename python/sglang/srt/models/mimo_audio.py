@@ -1,31 +1,26 @@
 # Adapted from qwen2.py and mimo.py for MiMoAudio compatibility
 import logging
 from dataclasses import dataclass
-
-from typing import Iterable, List, Optional, Tuple, Callable
+from typing import Callable, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-
+from transformers.cache_utils import DynamicCache
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Model as Qwen2ModelHF
-from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.cache_utils import DynamicCache
 
 from sglang.srt.configs.mimo_audio import MiMoAudioConfig
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model as Qwen2ModelSGLang
 from sglang.srt.utils import add_prefix
 
-
-
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class MiMoAudioArguments:
@@ -47,7 +42,7 @@ class MiMoAudioArguments:
             "eot_idx": self.eot_idx,
             "empty_idx": self.empty_idx,
         }
-    
+
 
 @dataclass
 class MiMoSampler:
@@ -89,6 +84,7 @@ class MiMoSampler:
 
         return torch.argmax(scores, dim=-1)
 
+
 class MiMoAudioForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -122,7 +118,7 @@ class MiMoAudioForCausalLM(nn.Module):
             else config
         )
         self.config = config
-        self.quant_config = quant_config     
+        self.quant_config = quant_config
         self.args = MiMoAudioArguments(
             model_name_or_path="",
             sosp_idx=151665,
@@ -132,31 +128,31 @@ class MiMoAudioForCausalLM(nn.Module):
             eostm_idx=151671,
             eot_idx=151672,
         )
-        
+
         # 1. Main Language Model (using SGLang's efficient Qwen2)
         self.model = Qwen2ModelSGLang(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        
+
         self.speech_vocab_sizes = config.parsed_speech_vocab_sizes()
         self.speech_empty_ids = config.parsed_speech_empty_ids()
         self.delay_pattern = config.parsed_delay_pattern()
         self.group_size = config.group_size
-        self.audio_channels = config.audio_channels        
-        
+        self.audio_channels = config.audio_channels
+
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
         )
-        
+
         # Construct local transformer
         self.local_config = config.local_config()
         # self.local_transformer = Qwen2ModelHF(self.local_config, prefix="local_transformer")
         self.local_transformer = Qwen2ModelHF(self.local_config)
         self.local_transformer.embed_tokens = None
-        
+
         # Add input local transformer if configured
         self.input_local_config = config.input_local_config()
         # self.input_local_transformer = Qwen2ModelHF(self.input_local_config, prefix="input_local_transformer")
@@ -165,7 +161,11 @@ class MiMoAudioForCausalLM(nn.Module):
 
         self.local_transformer_lm_heads = nn.ModuleList(
             [
-                nn.Linear(self.local_config.hidden_size, self.speech_vocab_sizes[i], bias=False)
+                nn.Linear(
+                    self.local_config.hidden_size,
+                    self.speech_vocab_sizes[i],
+                    bias=False,
+                )
                 for i in range(self.audio_channels)
             ]
         )
@@ -214,14 +214,13 @@ class MiMoAudioForCausalLM(nn.Module):
             B * T_groups, group_size, hidden_size
         )
 
-
         output = self.input_local_transformer(
             inputs_embeds=input_embeddings,
             return_dict=True,
             is_causal=False,
             # is_causal=not self.config.input_full_attention,  # for SDPA
         )
-        encoded_embeddings = output.last_hidden_state  
+        encoded_embeddings = output.last_hidden_state
         # encoded_embeddings = output[0]      # hidden_state
 
         # Reshape back to original format
@@ -231,7 +230,7 @@ class MiMoAudioForCausalLM(nn.Module):
         )
 
         return encoded_embeddings
-    
+
     def _prepare_input_embeds(
         self,
         input_ids: torch.LongTensor,  # [B, audio_channels + 1, new_T]
@@ -240,7 +239,7 @@ class MiMoAudioForCausalLM(nn.Module):
 
         input_ids = input_ids.int()
         group_size = self.config.group_size
-        
+
         text_input_ids = input_ids[:, 0, ::group_size]
         speech_input_ids = (
             input_ids[:, 1:, :]
@@ -303,33 +302,32 @@ class MiMoAudioForCausalLM(nn.Module):
         get_embedding: bool = False,
     ) -> torch.Tensor:
         # forward_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        input_ids = input_ids.view(1, -1, 9).transpose(-1,-2) # [B, audio_channels + 1, new_T]
-        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
+        input_ids = input_ids.view(1, -1, 9).transpose(
+            -1, -2
+        )  # [B, audio_channels + 1, new_T]
         input_embeds = self._prepare_input_embeds(input_ids)
-        # import rpdb;rpdb.set_trace("0.0.0.0",5555)
         # forward_batch.num_token_non_padded_cpu=input_embeds.shape[1]
         input_ids = None
         # positions = None
-        input_embeds = input_embeds.squeeze(0)  # 去掉 第一个 B 维度，Qwen2ModelSGLang 好像不支持
+        input_embeds = input_embeds.squeeze(0)  # 去掉 第一个 B 维度
         # positions = torch.arange(input_embeds.shape[0]).to("cuda") # 暂时添加 positions
-        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
-        outputs = self.model(
-            input_ids, positions, forward_batch, input_embeds
+        outputs = self.model(input_ids, positions, forward_batch, input_embeds)
+
+        hidden_states = (
+            outputs  # outputs is last_hidden_state shape [T_group, hidden_dim]
         )
-        
-        hidden_states = outputs # outputs is last_hidden_state shape [T_group, hidden_dim]
-        
+
         # text_logits: torch.Tensor = self.lm_head(
         #     hidden_states[-1:, :]
         # )  # [1, vocab_size]
         text_logits = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
-        )   # text_logits.next_token_logits shape [1, vocab_size]
+        )  # text_logits.next_token_logits shape [1, vocab_size]
         shift_hidden_states: torch.Tensor = self.hidden_states_downcast(
             hidden_states[-1:, :]
         )  # [1, hidden_size]
         forward_batch.shift_hidden_states = shift_hidden_states
-        
+
         return text_logits
 
     def sample(
@@ -338,13 +336,14 @@ class MiMoAudioForCausalLM(nn.Module):
         sample_func: Callable,
         text_logits_output: LogitsProcessorOutput,
     ):
-        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
         global_sampler = MiMoSampler()
-        text_logits: torch.Tensor = text_logits_output.next_token_logits    # [B. vocab_size]
-        next_text_tokens = global_sampler.sample(text_logits)   # [B]
-        
+        text_logits: torch.Tensor = (
+            text_logits_output.next_token_logits
+        )  # [B. vocab_size]
+        next_text_tokens = global_sampler.sample(text_logits)  # [B]
+
         local_hidden_states = forward_batch.shift_hidden_states  # [B, hidden_size]
-        
+
         B = 1
         # Only Support batch_size=1 here
         if next_text_tokens[0] != self.args.empty_idx:
@@ -362,23 +361,22 @@ class MiMoAudioForCausalLM(nn.Module):
             next_speech_tokens = self.local_forward(
                 local_embeds=local_hidden_states,
                 tokens_dtype=next_text_tokens.dtype,
-                tokens_device=next_text_tokens.device
+                tokens_device=next_text_tokens.device,
             )
-        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
         next_text_tokens = next_text_tokens.reshape(B, 1, 1).expand(
             -1, self.group_size, -1
         )  # [B, group_size, 1]
-        
+
         # generate speech tokens
-        next_tokens = torch.cat(
-            (next_text_tokens, next_speech_tokens), dim=-1
-        ).reshape(B, -1)  # [B, group_size * (audio_channels + 1)]
+        next_tokens = torch.cat((next_text_tokens, next_speech_tokens), dim=-1).reshape(
+            B, -1
+        )  # [B, group_size * (audio_channels + 1)]
 
         # input_ids = torch.cat(
         #     [input_ids, next_tokens], dim=-1
         # )  # [B, T*group_size*vq]
         return next_tokens  # [B, group_size * (audio_channels + 1)]
-    
+
     def local_forward(
         self,
         local_embeds: torch.FloatTensor,  # [B, 1, hidden_size]
@@ -433,7 +431,7 @@ class MiMoAudioForCausalLM(nn.Module):
                     local_embeds += cur_input_embed
 
         return local_tokens  # [B, group_size, audio_channels]
-    
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -444,25 +442,32 @@ class MiMoAudioForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        params_dict = dict(self.named_parameters())     # params_dict 是 当前模型所有参数字典
-        for name, loaded_weight in weights:     # name 是权重文件中参数名 loaded_weight 是权重文件中参数对应权重值
+        params_dict = dict(
+            self.named_parameters()
+        )  # params_dict 是 当前模型所有参数字典
+        for (
+            name,
+            loaded_weight,
+        ) in (
+            weights
+        ):  # name 是权重文件中参数名 loaded_weight 是权重文件中参数对应权重值
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            
+
             # Route mapping correctly
             is_mapped = False
-            for param_name, weight_name, shard_id in stacked_params_mapping: 
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                
+
                 mapped_name = name.replace(weight_name, param_name)
-                
+
                 # Check mapping for nested transformers
                 if mapped_name not in params_dict:
                     continue
-                
+
                 param = params_dict[mapped_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 # Apply Sharding only to main SGLang Qwen2 Model
@@ -474,21 +479,24 @@ class MiMoAudioForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 is_mapped = True
                 break
-                
+
             if not is_mapped:
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
                     continue
-                    
+
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                
-                if "local_transformer" in name or "speech_embeddings" in name or "hidden_states_downcast" in name:
+
+                if (
+                    "local_transformer" in name
+                    or "speech_embeddings" in name
+                    or "hidden_states_downcast" in name
+                ):
                     param.data.copy_(loaded_weight)
                 else:
                     weight_loader(param, loaded_weight)
-
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -513,5 +521,6 @@ class MiMoAudioModel(MiMoAudioForCausalLM):
         prefix: str = "",
     ) -> None:
         super().__init__(config, quant_config, prefix)
+
 
 EntryClass = MiMoAudioModel

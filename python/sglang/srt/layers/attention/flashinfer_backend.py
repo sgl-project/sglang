@@ -769,7 +769,6 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         q = q.contiguous()
-        # import rpdb;rpdb.set_trace("0.0.0.0", 7777)
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None

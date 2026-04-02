@@ -24,7 +24,6 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from transformers.utils import is_torchdynamo_compiling
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -50,13 +49,15 @@ class MiMoStopper(StoppingCriteria):
     def __call__(self, input_ids: torch.LongTensor, _scores: torch.FloatTensor):
         is_done = False
         cur_len = input_ids.shape[-1] // self.step
-        
+
         if self.max_length:
             is_done |= cur_len >= self.max_length
-            
-        if (self.stop_token_ids and 
-            input_ids.shape[1] >= self.step and 
-            cur_len >= self.min_length):
+
+        if (
+            self.stop_token_ids
+            and input_ids.shape[1] >= self.step
+            and cur_len >= self.min_length
+        ):
             last_token = input_ids[0, -self.step].item()
             is_done |= last_token in self.stop_token_ids
 
@@ -395,7 +396,6 @@ class MiMoAudioForCausalLM(Qwen2PreTrainedModel):
         cache_position: torch.LongTensor | None = None,  # [new_T_group]
         **_kwargs,
     ):
-        # import pdb;pdb.set_trace()
         inputs_embeds = self._prepare_input_embeds(input_ids)
 
         outputs: BaseModelOutputWithPast = self.model(
@@ -507,7 +507,9 @@ class MiMoAudioForCausalLM(Qwen2PreTrainedModel):
         model_inputs = {}
         input_ids = input_ids.reshape(
             input_ids.shape[0], -1, (self.audio_channels + 1) * self.config.group_size
-        ).transpose(1, 2)  # [B, audio_channels*group_size, T]
+        ).transpose(
+            1, 2
+        )  # [B, audio_channels*group_size, T]
         # - some models don't have `Cache` support (which implies they don't expect `cache_position` in `forward`)
         if self._supports_cache_class:
             model_inputs["cache_position"] = cache_position
@@ -732,7 +734,7 @@ class MiMoAudioForCausalLM(Qwen2PreTrainedModel):
         initial_len = cur_len
         this_peer_finished = False
         unfinished_sequences = torch.ones(B, dtype=torch.long, device=input_ids.device)
-        
+
         min_length = 0
         stop_token_ids = set()
         for criterion in stopping_criteria:
@@ -769,12 +771,14 @@ class MiMoAudioForCausalLM(Qwen2PreTrainedModel):
 
             text_logits: torch.Tensor = outputs.text_logits[:, -1, :].clone()
             # [B, vocab_size]
-            
+
             removed_tokens = None
             if cur_len < min_length:
                 removed_tokens = list(stop_token_ids)
-            
-            next_text_tokens = global_sampler.sample(text_logits, removed_tokens=removed_tokens)
+
+            next_text_tokens = global_sampler.sample(
+                text_logits, removed_tokens=removed_tokens
+            )
             # [B]
 
             local_hidden_states = outputs.local_hidden_states
@@ -804,7 +808,9 @@ class MiMoAudioForCausalLM(Qwen2PreTrainedModel):
             # generate speech tokens
             next_tokens = torch.cat(
                 (next_text_tokens, next_speech_tokens), dim=-1
-            ).reshape(B, -1)  # [B, group_size * (audio_channels + 1)]
+            ).reshape(
+                B, -1
+            )  # [B, group_size * (audio_channels + 1)]
 
             input_ids = torch.cat(
                 [input_ids, next_tokens], dim=-1

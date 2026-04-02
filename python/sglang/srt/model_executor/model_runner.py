@@ -2165,9 +2165,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Capture device graphs."""
         self.graph_runner = None
         self.graph_mem_usage = 0
-        
+
         # manually disable cuda graph
-        # return 
+        # return
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -2549,7 +2549,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,
             )
-        # import rpdb;rpdb.set_trace("0.0.0.0", 5555)
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -2629,8 +2628,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
             return next_token_ids
+
         if self.model_sample_itself:
-            next_token_ids = self.model.sample(forward_batch, sample_func, logits_output)
+            next_token_ids = self.model.sample(
+                forward_batch, sample_func, logits_output
+            )
         else:
             next_token_ids = sample_func(logits_output, forward_batch)
             self.maybe_update_ngram_token_table(next_token_ids, forward_batch)

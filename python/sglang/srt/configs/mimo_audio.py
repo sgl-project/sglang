@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 
+
 @dataclass
 class MiMoAudioConfig(Qwen2Config):
     def __init__(
@@ -86,4 +87,3 @@ class MiMoAudioConfig(Qwen2Config):
         config.attention_dropout = self.local_attn_dropout
 
         return config
-
