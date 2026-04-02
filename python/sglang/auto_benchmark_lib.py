@@ -349,6 +349,10 @@ def estimated_finish_time(
     )
 
 
+def current_time_text() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
 def summarize_progress_flags(server_flags: Dict[str, Any], limit: int = 6) -> str:
     parts = []
     for key in PROGRESS_FLAG_KEYS:
@@ -387,6 +391,7 @@ def refresh_progress_eta(
     pbar: tqdm, start_time: float, best_record: Optional[Dict[str, Any]] = None
 ) -> None:
     pbar.set_postfix_str(
+        f"now {current_time_text()} | "
         f"finish {estimated_finish_time(start_time, int(pbar.n), pbar.total)} | "
         f"{format_best_progress(best_record)}",
         refresh=False,
@@ -1139,6 +1144,7 @@ def run_candidate(
     tokenizer_path: str,
     server_flags: Dict[str, Any],
     output_dir: str,
+    incumbent_record: Optional[Dict[str, Any]] = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     record_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     existing_records: Optional[Sequence[Dict[str, Any]]] = None,
@@ -1183,7 +1189,16 @@ def run_candidate(
 
     for max_concurrency in max_concurrency_values:
         if mode == "fixed":
+            incumbent_qps = None
+            if (
+                incumbent_record
+                and incumbent_record.get("metrics")
+                and incumbent_record.get("sla_passed")
+            ):
+                incumbent_qps = float(incumbent_record.get("requested_qps", 0.0))
             for qps in values:
+                if incumbent_qps is not None and qps < incumbent_qps:
+                    continue
                 record, reused = one_trial(qps, max_concurrency)
                 records.append(record)
                 if record_callback is not None and not reused:
@@ -1194,6 +1209,34 @@ def run_candidate(
 
         lower, upper = values
         best: Optional[Dict[str, Any]] = None
+        incumbent_qps = None
+        if (
+            incumbent_record
+            and incumbent_record.get("metrics")
+            and incumbent_record.get("sla_passed")
+        ):
+            incumbent_qps = float(incumbent_record.get("requested_qps", 0.0))
+        if incumbent_qps is not None and lower < incumbent_qps <= upper:
+            probe_record, reused = one_trial(incumbent_qps, max_concurrency)
+            records.append(probe_record)
+            if record_callback is not None and not reused:
+                record_callback(probe_record)
+            if progress_callback is not None:
+                progress_callback(probe_record)
+            if probe_record.get("metrics") and probe_record["sla_passed"]:
+                lower = max(lower, incumbent_qps)
+                best = probe_record
+            else:
+                probe_record["heuristic_pruned"] = True
+                probe_record["heuristic_reason"] = (
+                    "Failed incumbent probe; skipped lower-QPS search because "
+                    "it cannot beat the current best candidate."
+                )
+                log_line(
+                    f"[{stage_name}] heuristic prune candidate={candidate_id} "
+                    f"mc={max_concurrency} incumbent_qps={incumbent_qps:.4f}"
+                )
+                continue
         while upper - lower > tolerance:
             qps = pick_qps_midpoint(lower, upper)
             if qps <= lower or qps >= upper:
@@ -1406,6 +1449,7 @@ def run_stage(
                 tokenizer_path=tokenizer_path,
                 server_flags=merged,
                 output_dir=output_dir,
+                incumbent_record=current_best,
                 progress_callback=on_trial,
                 record_callback=on_record,
                 existing_records=existing_stage_records,
