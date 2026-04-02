@@ -650,6 +650,7 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
 
+        stream_started = False
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -714,6 +715,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         model=request.model,
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
+                    stream_started = True
 
                 stream_buffer = stream_buffers.get(index, "")
                 delta = content["text"][len(stream_buffer) :]
@@ -894,6 +896,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
+            if not stream_started:
+                raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 

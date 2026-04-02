@@ -223,6 +223,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
 
+        stream_started = False
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -327,6 +328,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
+                stream_started = True
 
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
@@ -388,6 +390,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 yield f"data: {final_usage_data}\n\n"
 
         except Exception as e:
+            if not stream_started:
+                raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
