@@ -7,6 +7,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.marconi_config import MarconiConfig
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 
@@ -26,6 +27,8 @@ class CacheInitParams:
     enable_kv_cache_events: bool = False
 
     enable_mamba_extra_buffer: bool = False
+
+    marconi_config: Optional["MarconiConfig"] = None
 
     pp_rank: int = 0
     pp_size: int = 1

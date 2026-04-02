@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.marconi_config import MarconiConfig
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -33,6 +34,79 @@ class TestMamba(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def _make_marconi_tree(self):
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1, radix_eviction_policy="marconi")
+        )
+        size = 32
+        dtype = torch.bfloat16
+        head_num = 2
+        head_dim = 64
+        num_layers = 8
+        global_interval = 4
+        max_num_reqs = 16
+        mamba_cache_size = 16
+        max_context_len = 32
+        device = get_device()
+        full_attention_layer_ids = [
+            i for i in range(global_interval - 1, num_layers, global_interval)
+        ]
+        mamba_layers = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids
+        ]
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=512,
+                n_groups=4,
+                num_heads=8,
+                head_dim=64,
+                state_size=16,
+                conv_kernel=4,
+            )
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+
+        req_to_token_pool = HybridReqToTokenPool(
+            size=max_num_reqs,
+            mamba_size=mamba_cache_size,
+            mamba_spec_state_size=max_num_reqs,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=False,
+            cache_params=mamba2_cache_params,
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+        )
+        pool = HybridLinearKVPool(
+            size=size,
+            dtype=dtype,
+            page_size=1,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+            enable_memory_saver=False,
+            mamba_pool=req_to_token_pool.mamba_pool,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=size,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+        tree = MambaRadixCache(
+            params=CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                disable=False,
+                marconi_config=MarconiConfig.enabled(),
+            )
+        )
+        return tree, allocator
 
     def test_hybrid_linear_kv_pool(self):
         size = 16
@@ -118,25 +192,27 @@ class TestMamba(unittest.TestCase):
             sampling_params=sampling_params,
         )
 
-        # alloc req
         req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
-        # free req
+    def test_marconi_admission_uses_runtime_chunk_alignment_and_capacity(self):
+        tree, allocator = self._make_marconi_tree()
+        self.assertEqual(tree.marconi_branch_align_interval, 64)
+        self.assertIsNotNone(tree.marconi_admission_tree)
+        self.assertEqual(tree.marconi_admission_tree.max_tokens, allocator.size)
+
         req_to_token_pool.free_mamba_cache(req)
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
 
-        # alloc req without free mamba cache
         req.mamba_pool_idx = None
         req_to_token_pool.alloc([req])
         req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
-        # alloc again
         req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
@@ -146,7 +222,6 @@ class TestMamba(unittest.TestCase):
             self._setup_tree_and_allocator()
         )
         mamba_pool = req_to_token_pool.mamba_pool
-        # test
         print(
             f"[Start] allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
         )

@@ -12,7 +12,6 @@ from sglang.test.test_utils import (
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
-# Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
 _mock_device.start()
 
@@ -32,6 +31,18 @@ class TestPrepareServerArgs(CustomTestCase):
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
+
+    def test_radix_eviction_policy_marconi_requires_radix_cache(self):
+        with self.assertRaises(ValueError):
+            ServerArgs(
+                model_path="dummy",
+                radix_eviction_policy="marconi",
+                disable_radix_cache=True,
+            )
+
+    def test_radix_eviction_policy_marconi_enables_admission(self):
+        server_args = ServerArgs(model_path="dummy", radix_eviction_policy="marconi")
+        self.assertTrue(server_args.enable_marconi_admission())
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -54,9 +65,8 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_nccl_port_none(self, mock_temp_file, mock_get_free_port):
         """Test that get_free_port() is called when nccl_port is None"""
         mock_temp_file.return_value.name = "temp_file"
-        mock_get_free_port.return_value = 45678  # Mock ephemeral port
+        mock_get_free_port.return_value = 45678
 
-        # Use MagicMock here to verify get_free_port is called
         server_args = MagicMock()
         server_args.nccl_port = None
         server_args.enable_dp_attention = False
@@ -64,10 +74,7 @@ class TestPortArgs(unittest.TestCase):
 
         port_args = PortArgs.init_new(server_args)
 
-        # Verify get_free_port was called
         mock_get_free_port.assert_called_once()
-
-        # Verify the returned port is used
         self.assertEqual(port_args.nccl_port, 45678)
 
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

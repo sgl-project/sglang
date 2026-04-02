@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.common import MAMBA_STATE_PER_REQ_PREFIX_CACHE
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -389,6 +390,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        marconi_branch_prefill: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -427,6 +429,11 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
+        self.req_to_token_pool = getattr(self.tree_cache, "req_to_token_pool", None)
+        self.mamba_state_per_req = (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE if self.is_hybrid_ssm_cache else 0
+        )
+        self.rem_mamba_state_offset = 0
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -437,6 +444,7 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        self.marconi_branch_prefill = marconi_branch_prefill
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -496,11 +504,36 @@ class PrefillAdder:
 
         return available_and_evictable - self.cur_rem_token_offset
 
+    @property
+    def rem_mamba_states(self):
+        if not self.is_hybrid_ssm_cache or self.req_to_token_pool is None:
+            return float("inf")
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return float("inf")
+        mamba_evictable_size = getattr(self.tree_cache, "mamba_evictable_size", None)
+        evictable = mamba_evictable_size() if mamba_evictable_size is not None else 0
+        available = mamba_pool.available_size()
+        return available + evictable - self.rem_mamba_state_offset
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _needs_mamba_alloc(self, req: Req) -> bool:
+        return (
+            self.is_hybrid_ssm_cache
+            and req.req_pool_idx is None
+            and req.mamba_pool_idx is None
+        )
+
+    def _update_mamba_budget(self, req: Req) -> None:
+        if self._needs_mamba_alloc(req):
+            self.rem_mamba_state_offset += self.mamba_state_per_req
+
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+            return AddReqResult.NO_TOKEN
+        if self.rem_mamba_states <= 0:
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0:
@@ -560,6 +593,7 @@ class PrefillAdder:
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
 
         self.can_run_list.append(req)
+        self._update_mamba_budget(req)
 
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
@@ -597,6 +631,10 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        if self._needs_mamba_alloc(req) and (
+            self.rem_mamba_states < self.mamba_state_per_req
+        ):
+            return req
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -605,11 +643,20 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
+        if (
+            self.is_hybrid_ssm_cache
+            and self.marconi_branch_prefill
+            and req.mamba_branching_seqlen is not None
+        ):
+            prefix_len = len(req.prefix_indices)
+            if prefix_len < req.mamba_branching_seqlen:
+                _rem_tokens = min(_rem_tokens, req.mamba_branching_seqlen - prefix_len)
 
         truncated = req.extend_input_len > _rem_tokens
         req.set_extend_input_len(min(req.extend_input_len, _rem_tokens))
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
+        self._update_mamba_budget(req)
         self._update_prefill_budget(
             0,
             req.extend_input_len,
@@ -642,6 +689,10 @@ class PrefillAdder:
         # Early exit if no enough tokens for the input tokens
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
+        ):
+            return AddReqResult.NO_TOKEN
+        if self._needs_mamba_alloc(req) and (
+            self.rem_mamba_states < self.mamba_state_per_req
         ):
             return AddReqResult.NO_TOKEN
 
@@ -705,6 +756,7 @@ class PrefillAdder:
         ):
             # Non-chunked prefill
             self.can_run_list.append(req)
+            self._update_mamba_budget(req)
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
@@ -720,6 +772,7 @@ class PrefillAdder:
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
+            self._update_mamba_budget(req)
             self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
 
@@ -750,6 +803,11 @@ class PrefillAdder:
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
+
+        if self._needs_mamba_alloc(req) and (
+            self.rem_mamba_states < self.mamba_state_per_req
+        ):
+            return AddReqResult.NO_TOKEN
 
         total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
@@ -784,6 +842,7 @@ class PrefillAdder:
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                req.kv_cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -800,46 +859,79 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
-                self.can_run_list.append(req)
-
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(
-                    prefix_len,
-                    input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
-                    ),
-                )
             else:
-                # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                trunc_len = None
+                branch_trunc_len = None
+                if self.is_hybrid_ssm_cache and self.marconi_branch_prefill:
+                    branching_seqlen = req.mamba_branching_seqlen
+                    prefix_len = len(req.prefix_indices)
+                    if (
+                        branching_seqlen is not None
+                        and prefix_len < branching_seqlen
+                        and branching_seqlen < len(req.fill_ids)
+                    ):
+                        branch_trunc_len = branching_seqlen - prefix_len
+                        if branch_trunc_len > 0:
+                            trunc_len = branch_trunc_len
+                needs_chunking = trunc_len is not None or (
+                    self.rem_chunk_tokens is not None
+                    and input_tokens > self.rem_chunk_tokens
+                )
+                if not needs_chunking:
+                    # Non-chunked prefill
+                    self.can_run_list.append(req)
+                    self._update_mamba_budget(req)
 
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
-                # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
-                # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
-                # we need the prefill prefix length to be multiple of attention split size
-                if truncation_align_size is not None:
-                    if trunc_len < truncation_align_size:
+                    self._req_inc_lock_ref(req)
+                    self._update_prefill_budget(
+                        prefix_len,
+                        input_tokens,
+                        min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        ),
+                    )
+                else:
+                    if has_chunked_req:
                         return AddReqResult.OTHER
-                    else:
-                        trunc_len = truncation_align_size * (
-                            trunc_len // truncation_align_size
+
+                    # Make sure at least one page is available
+                    if trunc_len is None:
+                        trunc_len = (
+                            self.rem_chunk_tokens // self.page_size * self.page_size
                         )
+                    elif self.rem_chunk_tokens is not None:
+                        trunc_len = min(
+                            trunc_len,
+                            self.rem_chunk_tokens // self.page_size * self.page_size,
+                        )
+                    if trunc_len <= 0:
+                        return AddReqResult.OTHER
 
-                # Chunked prefill
-                req.set_extend_input_len(trunc_len)
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                    # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
+                    # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
+                    # we need the prefill prefix length to be multiple of attention split size
+                    if truncation_align_size is not None and branch_trunc_len is None:
+                        if trunc_len < truncation_align_size:
+                            return AddReqResult.OTHER
+                        else:
+                            trunc_len = truncation_align_size * (
+                                trunc_len // truncation_align_size
+                            )
 
-                self.can_run_list.append(req)
-                self.new_chunked_req = req
+                    # Chunked prefill
+                    req.set_extend_input_len(trunc_len)
+                    req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                    self.can_run_list.append(req)
+                    self.new_chunked_req = req
+                    self._update_mamba_budget(req)
+
+                    self._req_inc_lock_ref(req)
+                    self._update_prefill_budget(prefix_len, trunc_len, 0)
+
+                    if branch_trunc_len is not None:
+                        req.mamba_branching_seqlen = None
 
         return self.budget_state()
 

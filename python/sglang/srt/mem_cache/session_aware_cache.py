@@ -337,6 +337,9 @@ class SessionAwareCache(BasePrefixCache):
     def take_events(self):
         return self.inner.take_events()
 
+    def get_runtime_stats(self) -> Optional[dict[str, object]]:
+        return self.inner.get_runtime_stats()
+
     def supports_swa(self):
         return self.inner.supports_swa()
 

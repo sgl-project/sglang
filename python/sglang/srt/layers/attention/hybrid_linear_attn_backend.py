@@ -6,7 +6,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    PAD_SLOT_ID,
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -16,7 +20,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
@@ -28,6 +32,12 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
+
+if is_cpu():
+    from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
+
+    causal_conv1d_fn = causal_conv1d_fn_cpu
+    causal_conv1d_update = causal_conv1d_update_cpu
 
 logger = logging.getLogger(__name__)
 
@@ -200,10 +210,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if (
+                use_entry_track = (
+                    forward_batch.mamba_track_entry_indices is not None
+                    and forward_batch.mamba_track_entry_indices.numel() > 0
+                )
+                use_mask_track = (
                     forward_batch.mamba_track_mask is not None
                     and forward_batch.mamba_track_mask.any()
-                ):
+                )
+                if use_entry_track or use_mask_track:
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
@@ -257,12 +272,44 @@ class MambaAttnBackendBase(AttentionBackend):
         """
         conv_state_len = self.conv_states_shape[-1]
 
+        if (
+            forward_batch.mamba_track_entry_req_indices is not None
+            and forward_batch.mamba_track_entry_seqlens is not None
+            and forward_batch.mamba_track_entry_req_indices.numel() > 0
+        ):
+            track_req_indices = forward_batch.mamba_track_entry_req_indices.cpu()
+            track_seqlens = forward_batch.mamba_track_entry_seqlens.cpu()
+            prefix_lens = forward_batch.extend_prefix_lens.cpu()
+            extend_seq_lens = forward_batch.extend_seq_lens.cpu()
+            query_start_loc_cpu = query_start_loc.cpu()
+
+            lens_to_track = track_seqlens - prefix_lens[track_req_indices]
+            mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+            is_end = lens_to_track == extend_seq_lens[track_req_indices]
+            aligned_len = (
+                lens_to_track // mamba_cache_chunk_size
+            ) * mamba_cache_chunk_size
+            aligned_len = torch.where(is_end, lens_to_track, aligned_len)
+            start_indices = (
+                query_start_loc_cpu[track_req_indices] + aligned_len - conv_state_len
+            )
+            indices = start_indices.unsqueeze(-1) + torch.arange(
+                conv_state_len,
+                device=start_indices.device,
+                dtype=start_indices.dtype,
+            )
+            return indices.clamp(0, query_start_loc_cpu[-1] - 1).to(
+                self.device, non_blocking=True
+            )
+
         # Calculate the end position of the last aligned chunk
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
+        is_end = lens_to_track == forward_batch.extend_seq_lens
         aligned_len = (lens_to_track // mamba_cache_chunk_size) * mamba_cache_chunk_size
+        aligned_len = torch.where(is_end, lens_to_track, aligned_len)
         start_indices = query_start_loc[:-1] + aligned_len - conv_state_len
         start_indices = start_indices[forward_batch.mamba_track_mask]
 
@@ -312,11 +359,8 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_dst: Destination cache slot indices (for aligned seqs)
         """
         # Move to CPU to avoid kernel launches for masking operations
-        mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
-        mamba_track_indices = forward_batch.mamba_track_indices.cpu()
-        mamba_cache_indices = mamba_cache_indices.cpu()
-        mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
+        mamba_cache_indices_cpu = mamba_cache_indices.cpu()
         prefix_lens = forward_batch.extend_prefix_lens.cpu()
 
         # Calculate the number of hidden states per request
@@ -326,26 +370,53 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_src_offset = torch.zeros_like(num_h_states)
         track_ssm_src_offset[1:] = torch.cumsum(num_h_states[:-1], dim=0)
 
-        # Filter variables by track mask
-        lens_to_track = mamba_track_seqlens - prefix_lens
-        lens_masked = lens_to_track[mamba_track_mask]
-        offset_masked = track_ssm_src_offset[mamba_track_mask]
-        dst_masked = mamba_track_indices[mamba_track_mask]
+        if (
+            forward_batch.mamba_track_entry_req_indices is not None
+            and forward_batch.mamba_track_entry_seqlens is not None
+            and forward_batch.mamba_track_entry_indices is not None
+            and forward_batch.mamba_track_entry_req_indices.numel() > 0
+        ):
+            track_req_indices = forward_batch.mamba_track_entry_req_indices.cpu()
+            track_seqlens = forward_batch.mamba_track_entry_seqlens.cpu()
+            track_indices = forward_batch.mamba_track_entry_indices.cpu()
 
-        # Determine if the sequence ends at a chunk boundary
-        is_aligned = (lens_masked % FLA_CHUNK_SIZE) == 0
+            lens_to_track = track_seqlens - prefix_lens[track_req_indices]
+            is_end = lens_to_track == extend_seq_lens[track_req_indices]
 
-        # Case 1: Aligned. Use last_recurrent_state from ssm_states.
-        track_ssm_final_src = mamba_cache_indices[mamba_track_mask][is_aligned]
-        track_ssm_final_dst = dst_masked[is_aligned]
+            # Case 1: track at end -> use last_recurrent_state.
+            final_mask = is_end
+            track_ssm_final_src = mamba_cache_indices_cpu[track_req_indices[final_mask]]
+            track_ssm_final_dst = track_indices[final_mask]
 
-        # Case 2: Unaligned. Use intermediate state from h.
-        # TODO: if support FLA_CHUNK_SIZE % page size != 0, then need to modify this
-        not_aligned = ~is_aligned
-        track_ssm_h_src = offset_masked[not_aligned] + (
-            lens_masked[not_aligned] // FLA_CHUNK_SIZE
-        )
-        track_ssm_h_dst = dst_masked[not_aligned]
+            # Case 2: intermediate -> use h.
+            not_end = ~is_end
+            track_ssm_h_src = track_ssm_src_offset[track_req_indices[not_end]] + (
+                lens_to_track[not_end] // FLA_CHUNK_SIZE
+            )
+            track_ssm_h_dst = track_indices[not_end]
+        else:
+            mamba_track_mask = forward_batch.mamba_track_mask.cpu()
+            mamba_track_indices = forward_batch.mamba_track_indices.cpu()
+            mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
+
+            lens_to_track = mamba_track_seqlens - prefix_lens
+            lens_masked = lens_to_track[mamba_track_mask]
+            offset_masked = track_ssm_src_offset[mamba_track_mask]
+            dst_masked = mamba_track_indices[mamba_track_mask]
+
+            # Determine if tracking the end of extend.
+            is_end = lens_masked == extend_seq_lens[mamba_track_mask]
+
+            # Case 1: track at end -> use last_recurrent_state.
+            track_ssm_final_src = mamba_cache_indices_cpu[mamba_track_mask][is_end]
+            track_ssm_final_dst = dst_masked[is_end]
+
+            # Case 2: intermediate -> use h.
+            not_end = ~is_end
+            track_ssm_h_src = offset_masked[not_end] + (
+                lens_masked[not_end] // FLA_CHUNK_SIZE
+            )
+            track_ssm_h_dst = dst_masked[not_end]
 
         # Move back to GPU
         return (
@@ -614,21 +685,21 @@ class MambaAttnBackendBase(AttentionBackend):
         using indices computed by `_init_track_conv_indices`.
         """
         if (
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
+            forward_metadata.track_ssm_h_src is None
+            and forward_metadata.track_ssm_final_src is None
         ):
-            h = h.squeeze(0)
+            return
 
-            if forward_metadata.track_ssm_h_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_h_dst] = h[
-                    forward_metadata.track_ssm_h_src
-                ].to(ssm_states.dtype, copy=False)
-            if forward_metadata.track_ssm_final_src.numel() > 0:
-                ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
-                    forward_metadata.track_ssm_final_src
-                ]
+        h = h.squeeze(0)
 
-
+        if forward_metadata.track_ssm_h_src.numel() > 0:
+            ssm_states[forward_metadata.track_ssm_h_dst] = h[
+                forward_metadata.track_ssm_h_src
+            ].to(ssm_states.dtype, copy=False)
+        if forward_metadata.track_ssm_final_src.numel() > 0:
+            ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
+                forward_metadata.track_ssm_final_src
+            ]
 class Mamba2AttnBackend(MambaAttnBackendBase):
     """Attention backend wrapper for Mamba2Mixer kernels."""
 

@@ -31,6 +31,9 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.mem_cache.marconi_config import (
+    get_marconi_branch_align_interval,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -176,7 +179,7 @@ NSA_CHOICES = [
     "trtllm",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "marconi"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -817,6 +820,9 @@ class ServerArgs:
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
+
+        # Handle Marconi mode defaults.
+        self._handle_marconi_mode()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -3128,6 +3134,18 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+    def _handle_marconi_mode(self):
+        if self.radix_eviction_policy != "marconi":
+            return
+        if self.disable_radix_cache:
+            raise ValueError("Cannot enable Marconi when radix cache is disabled.")
+        get_marconi_branch_align_interval(
+            self.page_size, align_interval=self.mamba_cache_chunk_size
+        )
+
+    def enable_marconi_admission(self) -> bool:
+        return self.radix_eviction_policy == "marconi"
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -4044,7 +4062,7 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, and 'slru' stands for Segmented Least Recently Used.",
+            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used, 'slru' stands for Segmented Least Recently Used, and 'marconi' enables Marconi admission for hybrid radix cache.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",
@@ -4077,7 +4095,6 @@ class ServerArgs:
             default=None,
             help="Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
         )
-
         # Runtime options
         parser.add_argument(
             "--device",

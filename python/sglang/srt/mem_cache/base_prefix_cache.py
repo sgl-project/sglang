@@ -52,6 +52,8 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    branchoff_mamba_value: Optional[torch.Tensor] = None
+    branch_checkpoint_len: Optional[int] = None
 
     # SWA specific
     prev_prefix_len: int = 0
@@ -255,6 +257,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def take_events(self):
         return []
+
+    def get_runtime_stats(self) -> Optional[dict[str, object]]:
+        return None
 
     def supports_swa(self) -> bool:
         return False

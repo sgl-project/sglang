@@ -395,15 +395,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
+                forward_metadata.track_conv_indices is not None
+                and forward_metadata.track_conv_indices.numel() > 0
             ):
-                conv_dst = forward_batch.mamba_track_indices
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
+                if (
+                    forward_batch.mamba_track_entry_indices is not None
+                    and forward_batch.mamba_track_entry_indices.numel() > 0
+                ):
+                    conv_dst = forward_batch.mamba_track_entry_indices
+                    conv_states[conv_dst] = mixed_qkv_to_track
+                else:
+                    conv_dst = forward_batch.mamba_track_indices
+                    mask_indices = forward_batch.mamba_track_mask.nonzero(
+                        as_tuple=True
+                    )[0]
+                    conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,
