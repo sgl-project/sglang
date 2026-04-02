@@ -168,23 +168,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         is_nextn: bool = False,
         support_shared_expert_fusion: bool = False,
     ):
-        # By default, fuse shared experts to routed experts are not supported except Qwen3.5 MoE for now.
         super().__init__()
-        self.support_shared_expert_fusion = support_shared_expert_fusion
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
-        self.num_experts = config.num_experts
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.num_experts}."
             )
-
-        self.num_fused_shared_experts = self._determine_num_fused_shared_experts(
-            config,
-            quant_config,
-        )
+        self.num_experts = config.num_experts
+        self.num_fused_shared_experts = 0
+        self.enable_fused_moe = True if (support_shared_expert_fusion and _use_aiter) else False
+        if self.enable_fused_moe:
+            self.num_fused_shared_experts = self._determine_num_fused_shared_experts(
+                config, quant_config
+            )
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -194,10 +193,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=self.layer_id,
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-            num_experts=config.num_experts
-            + self.num_fused_shared_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            top_k=(
+                config.num_experts_per_tok
+                if not self.enable_fused_moe
+                else config.num_experts_per_tok + self.num_fused_shared_experts
+            ),
+            num_experts=(
+                config.num_experts + get_global_server_args().ep_num_redundant_experts
+                if not self.enable_fused_moe
+                else config.num_experts
+                + get_global_server_args().ep_num_redundant_experts
+                + self.num_fused_shared_experts
+            ),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -213,10 +220,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
-        if (
-            config.shared_expert_intermediate_size > 0
-            and self.num_fused_shared_experts == 0
-        ):
+        if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -256,19 +260,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig]
     ) -> int:
         """Determine if shared expert can be fused with router experts (topk+1).
-        Fusion requires shared_expert_intermediate_size == moe_intermediate_size,
-        support_shared_expert_fusion=True (e.g. Qwen3.5 MoE), and Aiter on HIP.
+        Fusion requires matching intermediate sizes, a supported backend, no
+        quantization, and no DeepEP.
         """
         if (
-            not self.support_shared_expert_fusion
-            or get_global_server_args().disable_shared_experts_fusion is True
+            get_global_server_args().disable_shared_experts_fusion is True
             or getattr(config, "shared_expert_intermediate_size", 0) <= 0
             or config.shared_expert_intermediate_size != config.moe_intermediate_size
-            or not _use_aiter
-            or quant_config is not None
             or get_moe_a2a_backend().is_deepep()
         ):
+            # Falled back to non-fused version, return 0 shared_experts.
             return 0
+        # Return 1 shared_expert for qwen model.
         return 1
 
     def get_moe_weights(self):
@@ -301,7 +304,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if shared_weights is None:
             return topk_output
         M = topk_output.topk_ids.shape[0]
-        shared_expert_id = self.num_experts  # 512 for Qwen3.5 MoE
+        shared_expert_id = self.num_experts
         shared_ids = torch.full(
             (M, self.num_fused_shared_experts),
             shared_expert_id,
@@ -376,9 +379,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        if self.num_fused_shared_experts > 0 and TopKOutputChecker.format_is_standard(
-            topk_output
-        ):
+        if self.enable_fused_moe and TopKOutputChecker.format_is_standard(topk_output):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
         return self.experts(hidden_states, topk_output)
 
