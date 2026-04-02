@@ -830,7 +830,7 @@ class Req(ReqDllmMixin):
         self.init_diffusion_llm(dllm_config)
 
         # For hisparse
-        self.staging = False
+        self.hisparse_staging = False
 
     @property
     def seqlen(self) -> int:
@@ -2266,6 +2266,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+        self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)

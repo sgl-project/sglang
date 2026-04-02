@@ -218,9 +218,9 @@ mark_step_done "Uninstall Flashinfer"
 # Install main package
 # ------------------------------------------------------------------------------
 # Install the main package
-EXTRAS="dev"
+EXTRAS="dev,runai"
 if [ -n "$OPTIONAL_DEPS" ]; then
-    EXTRAS="dev,${OPTIONAL_DEPS}"
+    EXTRAS="dev,runai,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
 source "$(dirname "$0")/cache_nvidia_wheels.sh"
@@ -304,7 +304,7 @@ if [ "$CU_VERSION" = "cu130" ]; then
 else
     NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
 fi
-$PIP_CMD install mooncake-transfer-engine==0.3.10 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.10.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # Install other test dependencies
 if [ "$IS_BLACKWELL" != "1" ]; then
