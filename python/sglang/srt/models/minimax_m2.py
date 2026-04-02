@@ -89,7 +89,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 
