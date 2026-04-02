@@ -155,8 +155,9 @@ class KVArgsRegisterInfo:
                 else []
             ),
             staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
+            # staging consumes msg[12] (base_ptr) and msg[13] (total_size)
             enable_hisparse=(
-                msg[13].decode("ascii") == "1" if len(msg) > 13 else False
+                msg[14].decode("ascii") == "1" if len(msg) > 14 else False
             ),
         )
 
