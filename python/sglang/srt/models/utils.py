@@ -120,8 +120,10 @@ def enable_fused_set_kv_buffer(
         _is_cuda
         and hasattr(pool, "dtype")
         and pool.dtype == torch.bfloat16
-        and (is_compiled or not is_swa)
-        and (not (is_compiled and is_swa) or forward_batch.out_cache_loc_swa is not None)
+        and (
+            not is_swa
+            or (is_compiled and forward_batch.out_cache_loc_swa is not None)
+        )
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
 

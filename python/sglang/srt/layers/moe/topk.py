@@ -322,8 +322,7 @@ class TopK(MultiPlatformOp):
         if not self.is_torch_compile:
             return
 
-        saved = getattr(self, "_saved_output_format", None)
-        if saved is not None or hasattr(self, "_saved_output_format"):
+        if hasattr(self, "_saved_output_format"):
             self.topk_config.output_format = self._saved_output_format
             del self._saved_output_format
             self.is_torch_compile = False

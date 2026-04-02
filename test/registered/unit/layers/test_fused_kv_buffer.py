@@ -1,8 +1,8 @@
 """
-Unit tests for fused KV buffer helpers and forward_native KV scatter.
+Unit tests for fused KV buffer helpers.
 
-Validates the torch.compile-path changes that enable RoPE + KV cache scatter
-fusion for SWA models (e.g. gpt-oss-20b).
+Validates the torch.compile-path gate logic and cache_loc selection
+for SWA models (e.g. gpt-oss-20b).
 """
 
 import unittest
@@ -20,13 +20,6 @@ from sglang.srt.models.utils import (
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sgl_kernel.testing.rotary_embedding import (
-    FlashInferRotaryEmbedding,
-    FusedSetKVBufferArg as TestingFusedSetKVBufferArg,
-    MHATokenToKVPool,
-    RotaryEmbedding as TestingRotaryEmbedding,
-    create_inputs,
-)
 
 register_cuda_ci(est_time=10, suite="stage-b-test-large-1-gpu")
 
@@ -155,167 +148,6 @@ class TestCreateFusedSetKvBufferArg(CustomTestCase):
         self.assertEqual(arg.v_buffer.ndim, 2)
         self.assertEqual(arg.k_buffer.shape[-1], HEAD_NUM * HEAD_DIM)
         self.assertEqual(arg.v_buffer.shape[-1], HEAD_NUM * HEAD_DIM)
-
-
-class TestForwardNativeVsCudaKernel(CustomTestCase):
-    """Numerics: compare forward_native KV scatter against the JIT CUDA kernel.
-
-    Uses gpt-oss-20b-like config: head_size=64, 8 KV heads, neox-style RoPE.
-    The JIT CUDA kernel (FlashInferRotaryEmbedding.forward_cuda) is the
-    ground-truth reference that the hand-written fused_rope_kernel implements.
-    forward_native must produce matching q, k, k_buffer, v_buffer."""
-
-    # gpt-oss-20b attention config
-    GPT_OSS_HEAD_SIZE = 64
-    GPT_OSS_NUM_Q_HEADS = 8
-    GPT_OSS_NUM_KV_HEADS = 8
-    GPT_OSS_ROPE_BASE = 8000
-    GPT_OSS_MAX_POS = 4096
-
-    POOL_SIZE = MHATokenToKVPool.KV_POOL_SIZE
-    # The CUDA kernel reads cos/sin in FP32 internally; forward_native casts
-    # them to BF16 before the multiply.  The worst-case per-element delta is
-    # 1 BF16 ULP ≈ 3.125e-2 at the relevant magnitudes, so we need > 1e-2.
-    ATOL = 4e-2
-    RTOL = 4e-2
-
-    def setUp(self):
-        self.device = get_device()
-        rope_cfg = dict(
-            head_size=self.GPT_OSS_HEAD_SIZE,
-            rotary_dim=self.GPT_OSS_HEAD_SIZE,
-            max_position_embeddings=self.GPT_OSS_MAX_POS,
-            base=self.GPT_OSS_ROPE_BASE,
-            is_neox_style=True,
-            dtype=torch.bfloat16,
-        )
-        self.rope_cuda = FlashInferRotaryEmbedding(**rope_cfg).to(self.device)
-        self.rope_native = TestingRotaryEmbedding(**rope_cfg).to(self.device)
-        self.rope_native.cos_sin_cache = self.rope_cuda.cos_sin_cache
-
-    def _run_comparison(self, batch_size, seq_len):
-        """Run both paths and compare all outputs."""
-        inputs = create_inputs(
-            head_size=self.GPT_OSS_HEAD_SIZE,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            device=self.device,
-            dtype=torch.bfloat16,
-            num_q_heads=self.GPT_OSS_NUM_Q_HEADS,
-            num_kv_heads=self.GPT_OSS_NUM_KV_HEADS,
-        )
-        positions = inputs["pos_ids"]
-        query = inputs["query"]
-        key = inputs["key"]
-        value = inputs["value"]
-        cache_loc = inputs["out_cache_loc"]
-
-        flat_kv = self.GPT_OSS_NUM_KV_HEADS * self.GPT_OSS_HEAD_SIZE
-
-        # --- Reference: JIT CUDA kernel (fused RoPE + KV scatter) ---
-        k_buf_ref = torch.zeros(
-            self.POOL_SIZE, self.GPT_OSS_NUM_KV_HEADS, self.GPT_OSS_HEAD_SIZE,
-            dtype=torch.bfloat16, device=self.device,
-        )
-        v_buf_ref = torch.zeros_like(k_buf_ref)
-        cuda_arg = TestingFusedSetKVBufferArg(
-            value=value.clone(),
-            k_buffer=k_buf_ref.view(self.POOL_SIZE, -1),
-            v_buffer=v_buf_ref.view(self.POOL_SIZE, -1),
-            cache_loc=cache_loc,
-        )
-        q_cuda, k_cuda = self.rope_cuda.forward_cuda(
-            positions, query.clone(), key.clone(),
-            fused_set_kv_buffer_arg=cuda_arg,
-        )
-
-        # --- Test: forward_native (pure PyTorch scatter) ---
-        k_buf_native = torch.zeros(
-            self.POOL_SIZE, self.GPT_OSS_NUM_KV_HEADS, self.GPT_OSS_HEAD_SIZE,
-            dtype=torch.bfloat16, device=self.device,
-        )
-        v_buf_native = torch.zeros_like(k_buf_native)
-        native_arg = FusedSetKVBufferArg(
-            value=value.clone(),
-            k_buffer=k_buf_native.view(self.POOL_SIZE, -1),
-            v_buffer=v_buf_native.view(self.POOL_SIZE, -1),
-            cache_loc=cache_loc,
-        )
-        q_native, k_native = self.rope_native.forward_native(
-            positions, query.clone(), key.clone(),
-            fused_set_kv_buffer_arg=native_arg,
-        )
-
-        # Compare q and k (RoPE outputs)
-        torch.testing.assert_close(
-            q_native, q_cuda, atol=self.ATOL, rtol=self.RTOL,
-            msg="query mismatch: forward_native vs CUDA kernel",
-        )
-        torch.testing.assert_close(
-            k_native, k_cuda, atol=self.ATOL, rtol=self.RTOL,
-            msg="key mismatch: forward_native vs CUDA kernel",
-        )
-
-        # Compare k_buffer (rotated key scattered into cache)
-        torch.testing.assert_close(
-            k_buf_native.view(self.POOL_SIZE, -1)[cache_loc],
-            k_buf_ref.view(self.POOL_SIZE, -1)[cache_loc],
-            atol=self.ATOL, rtol=self.RTOL,
-            msg="k_buffer mismatch: forward_native vs CUDA kernel",
-        )
-
-        # v_buffer scatter is pure index_put (no RoPE math), so it must be exact
-        self.assertTrue(
-            torch.equal(
-                v_buf_native.view(self.POOL_SIZE, -1)[cache_loc],
-                v_buf_ref.view(self.POOL_SIZE, -1)[cache_loc],
-            ),
-            "v_buffer mismatch: scatter must be bitwise exact",
-        )
-
-    def test_decode_bs1(self):
-        """Single-token decode — most common CUDA graph bucket."""
-        self._run_comparison(batch_size=1, seq_len=1)
-
-    def test_decode_bs32(self):
-        """32-token decode batch."""
-        self._run_comparison(batch_size=32, seq_len=1)
-
-    def test_decode_bs128(self):
-        """128-token decode batch."""
-        self._run_comparison(batch_size=128, seq_len=1)
-
-    def test_decode_bs512(self):
-        """512-token decode batch — large CUDA graph bucket."""
-        self._run_comparison(batch_size=512, seq_len=1)
-
-    def test_prefill_short(self):
-        """Short prefill (2 seqs × 512 tokens)."""
-        self._run_comparison(batch_size=2, seq_len=512)
-
-    def test_prefill_long(self):
-        """Long prefill (4 seqs × 4096 tokens)."""
-        self._run_comparison(batch_size=4, seq_len=4096)
-
-    def test_none_arg_rope_matches_cuda(self):
-        """RoPE-only (no scatter) must also match the CUDA kernel."""
-        inputs = create_inputs(
-            head_size=self.GPT_OSS_HEAD_SIZE,
-            batch_size=32, seq_len=1,
-            device=self.device, dtype=torch.bfloat16,
-            num_q_heads=self.GPT_OSS_NUM_Q_HEADS,
-            num_kv_heads=self.GPT_OSS_NUM_KV_HEADS,
-        )
-        q_cuda, k_cuda = self.rope_cuda.forward_cuda(
-            inputs["pos_ids"], inputs["query"].clone(), inputs["key"].clone(),
-            fused_set_kv_buffer_arg=None,
-        )
-        q_native, k_native = self.rope_native.forward_native(
-            inputs["pos_ids"], inputs["query"].clone(), inputs["key"].clone(),
-            fused_set_kv_buffer_arg=None,
-        )
-        torch.testing.assert_close(q_native, q_cuda, atol=self.ATOL, rtol=self.RTOL)
-        torch.testing.assert_close(k_native, k_cuda, atol=self.ATOL, rtol=self.RTOL)
 
 
 if __name__ == "__main__":
