@@ -107,6 +107,7 @@ class TestHermesDetector(CustomTestCase):
         text = "<tool_call>not valid json</tool_call>"
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, text)
 
     # ==================== structure_info Tests ====================
 

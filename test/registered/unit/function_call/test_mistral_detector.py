@@ -130,6 +130,7 @@ class TestMistralDetector(CustomTestCase):
         text = "[TOOL_CALLS] [not valid json]"
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, "")
 
     # ==================== Internal Methods Tests ====================
 
