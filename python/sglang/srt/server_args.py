@@ -1093,8 +1093,11 @@ class ServerArgs:
         # 3. DP attention
         if self.enable_dp_attention:
             self.disable_piecewise_cuda_graph = True
-        # 4. Torch compile
-        if self.enable_torch_compile:
+        # 4. Torch compile (full scope wraps model.forward with torch.compile,
+        #    which conflicts with PCG's own trampoline.  Local scope only
+        #    compiles leaf ops during CG capture and restores before PCG init,
+        #    so piecewise is safe.)
+        if self.enable_torch_compile and self.torch_compile_scope != "local":
             self.disable_piecewise_cuda_graph = True
         # 5. Pipeline parallelism
         if self.pp_size > 1:
