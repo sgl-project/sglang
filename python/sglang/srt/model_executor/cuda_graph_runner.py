@@ -96,10 +96,6 @@ if TYPE_CHECKING:
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
-_COMPILED_REPLAY_PREPARE_WHITELISTED_BACKEND_FQNS = frozenset(
-    {"sglang.srt.layers.attention.trtllm_mha_backend.TRTLLMHAAttnBackend"}
-)
-
 
 def _batch_inplace_copy(
     dsts: List[torch.Tensor], srcs: List[torch.Tensor], use_foreach_copy: bool = True
@@ -1082,10 +1078,7 @@ class CudaGraphRunner:
     def _can_compile_replay_prepare(self):
         if not self.compile_replay_prepare:
             return False
-
-        backend_type = type(self._get_replay_attn_backend())
-        backend_fqn = f"{backend_type.__module__}.{backend_type.__qualname__}"
-        return backend_fqn in _COMPILED_REPLAY_PREPARE_WHITELISTED_BACKEND_FQNS
+        return self._get_replay_attn_backend().supports_compiled_replay_prepare
 
     def _populate_from_forward_batch_and_init_attn_backend(
         self,

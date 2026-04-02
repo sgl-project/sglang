@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
+    # Whether init_forward_metadata_replay_cuda_graph is torch.compile-safe.
+    supports_compiled_replay_prepare: bool = False
+
     @abstractmethod
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
