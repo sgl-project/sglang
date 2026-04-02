@@ -203,7 +203,7 @@ class RotaryEmbedding(MultiPlatformOp):
         from sglang.srt.utils.torch_compile_utils import merge_mode_options
 
         # forward_native can handled KV cache fusion.
-        # cache_loc varies across calls;
+        # cache_loc varies across calls so we need dynamic compilation;
         compile_dynamic = True
 
         # Merge compile_mode and compile_options.
