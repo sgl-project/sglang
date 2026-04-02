@@ -1,6 +1,7 @@
 import itertools
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.testing
 from sgl_kernel import gelu_and_mul as gelu_and_mul_aot
@@ -20,10 +21,29 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="stage-b-kernel-benchmark-1-gpu-large")
 
+
+@torch.compile
+def silu_and_mul(input: torch.Tensor) -> torch.Tensor:
+    lhs, rhs = input.split(input.shape[-1] // 2, dim=-1)
+    return F.silu(lhs) * rhs
+
+
+@torch.compile
+def gelu_and_mul(input: torch.Tensor) -> torch.Tensor:
+    lhs, rhs = input.split(input.shape[-1] // 2, dim=-1)
+    return F.gelu(lhs, approximate="none") * rhs
+
+
+@torch.compile
+def gelu_tanh_and_mul(input: torch.Tensor) -> torch.Tensor:
+    lhs, rhs = input.split(input.shape[-1] // 2, dim=-1)
+    return F.gelu(lhs, approximate="tanh") * rhs
+
+
 OPS = {
-    "silu": (silu_and_mul_aot, silu_and_mul_jit),
-    "gelu": (gelu_and_mul_aot, gelu_and_mul_jit),
-    "gelu_tanh": (gelu_tanh_and_mul_aot, gelu_tanh_and_mul_jit),
+    "silu": (silu_and_mul_aot, silu_and_mul_jit, silu_and_mul),
+    "gelu": (gelu_and_mul_aot, gelu_and_mul_jit, gelu_and_mul),
+    "gelu_tanh": (gelu_tanh_and_mul_aot, gelu_tanh_and_mul_jit, gelu_tanh_and_mul),
 }
 BS_LIST = get_benchmark_range(full_range=[2**x for x in range(0, 15)], ci_range=[8])
 DIM_LIST = get_benchmark_range(full_range=[1024, 4096, 6144, 8192], ci_range=[4096])
@@ -36,20 +56,15 @@ NUM_LAYERS = 4  # to eliminate L2 effect
         x_names=["op_name", "dim", "batch_size"],
         x_vals=CONFIGS,
         line_arg="provider",
-        line_vals=["aot", "jit"],
-        line_names=["AOT (sgl-kernel)", "JIT (jit_kernel)"],
-        styles=[("blue", "--"), ("orange", "-")],
+        line_vals=["aot", "jit", "torch"],
+        line_names=["AOT (sgl-kernel)", "JIT (jit_kernel)", "torch.compile"],
+        styles=[("blue", "--"), ("orange", "-"), ("green", "-")],
         ylabel="us",
         plot_name="activation-aot-vs-jit",
         args={},
     )
 )
 def benchmark(op_name: str, dim: int, batch_size: int, provider: str):
-    def f():
-        fn = aot_op if provider == "aot" else jit_op
-        for i in range(NUM_LAYERS):
-            fn(x[i])
-
     x = torch.randn(
         NUM_LAYERS,
         batch_size,
@@ -57,9 +72,14 @@ def benchmark(op_name: str, dim: int, batch_size: int, provider: str):
         dtype=DEFAULT_DTYPE,
         device=DEFAULT_DEVICE,
     )
-    aot_op, jit_op = OPS[op_name]
+    aot_op, jit_op, torch_op = OPS[op_name]
+    fn = {"aot": aot_op, "jit": jit_op, "torch": torch_op}[provider]
 
-    return [t / NUM_LAYERS for t in run_benchmark(f)]
+    def f():
+        for i in range(NUM_LAYERS):
+            fn(x[i])
+
+    return run_benchmark(f, scale=NUM_LAYERS)
 
 
 if __name__ == "__main__":

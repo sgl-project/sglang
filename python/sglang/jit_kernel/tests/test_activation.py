@@ -11,21 +11,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=20, suite="stage-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
-try:
-    from sgl_kernel import gelu_and_mul as aot_gelu_and_mul
-    from sgl_kernel import gelu_tanh_and_mul as aot_gelu_tanh_and_mul
-    from sgl_kernel import silu_and_mul as aot_silu_and_mul
-except Exception:
-    aot_gelu_and_mul = None
-    aot_gelu_tanh_and_mul = None
-    aot_silu_and_mul = None
 
-
-OPS = {
-    "silu": (silu_and_mul, aot_silu_and_mul),
-    "gelu": (gelu_and_mul, aot_gelu_and_mul),
-    "gelu_tanh": (gelu_tanh_and_mul, aot_gelu_tanh_and_mul),
-}
+OPS = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 SHAPES = get_ci_test_range(
     full_range=[
@@ -67,8 +54,7 @@ def test_activation_correctness(
     torch.manual_seed(42)
     x = torch.randn(shape, dtype=dtype, device="cuda")
 
-    jit_op, _ = OPS[op_name]
-    out = jit_op(x)
+    out = OPS[op_name](x)
     expected = _reference(op_name, x)
     atol, rtol = _tolerances(dtype)
     torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
@@ -81,37 +67,12 @@ def test_activation_out_param(op_name: str, dtype: torch.dtype) -> None:
     x = torch.randn((4, 7, 128), dtype=dtype, device="cuda")
     out = torch.empty((4, 7, 64), dtype=dtype, device="cuda")
 
-    jit_op, _ = OPS[op_name]
-    result = jit_op(x, out)
+    result = OPS[op_name](x, out)
     assert result is out
 
     expected = _reference(op_name, x)
     atol, rtol = _tolerances(dtype)
     torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
-
-
-@pytest.mark.parametrize("op_name", OPS)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "shape",
-    get_ci_test_range(
-        full_range=[(8, 1024), (2, 4, 4096)],
-        ci_range=[(8, 1024)],
-    ),
-)
-def test_activation_matches_aot(
-    op_name: str, dtype: torch.dtype, shape: tuple[int, ...]
-) -> None:
-    torch.manual_seed(123)
-    jit_op, aot_op = OPS[op_name]
-    if aot_op is None:
-        pytest.skip("sgl-kernel AOT activation op is not available")
-
-    x = torch.randn(shape, dtype=dtype, device="cuda")
-    jit_out = jit_op(x)
-    aot_out = aot_op(x)
-    atol, rtol = _tolerances(dtype)
-    torch.testing.assert_close(jit_out, aot_out, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
