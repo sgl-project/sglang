@@ -557,12 +557,28 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
                 self.assertIn("text", body)
                 self.assertGreater(len(body["text"]), 0)
 
+    async def _get_num_running_reqs(self, session):
+        """Query sglang:num_running_reqs from prefill node's /metrics."""
+        async with session.get(
+            self.prefill_url + "/metrics",
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+            for line in text.splitlines():
+                # Match the gauge line, skip HELP/TYPE comments and
+                # per-priority breakdowns (which have priority="<int>")
+                if (
+                    line.startswith("sglang:num_running_reqs{")
+                    and "priority=" not in line
+                ):
+                    return int(float(line.split()[-1]))
+            return 0
+
     async def _run_pause_resume_leak_test(self, mode):
         NUM_WORKERS = 64
         NUM_PAUSE_RESUME_CYCLES = self.MAX_RUNNING * 4
-        NUM_FINAL_REQUESTS = 4
         MAX_NEW_TOKENS = 1
-        FINAL_TIMEOUT = 10
         LONG_PROMPT = "Tell me a story. " * 200
 
         async def _background_worker(session, worker_id, cancel_event):
@@ -615,6 +631,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
                 )
                 await asyncio.sleep(0.1)
 
+            # Stop workers and abort all in-flight requests
             cancel_event.set()
             await _post(
                 session, self.prefill_url + "/abort_request", {"abort_all": True}
@@ -622,45 +639,19 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             await _post(
                 session, self.decode_url + "/abort_request", {"abort_all": True}
             )
-
             await asyncio.gather(*workers, return_exceptions=True)
 
-            # Fresh requests must not hang. With the bug, running_batch is
-            # full of phantom requests and new prefills are blocked.
-            async def _final_request(i):
-                async with session.post(
-                    self.lb_url + "/generate",
-                    json={
-                        "text": f"[final-{i}] What is 1+1?",
-                        "sampling_params": {
-                            "temperature": 0,
-                            "max_new_tokens": MAX_NEW_TOKENS,
-                        },
-                    },
-                    timeout=aiohttp.ClientTimeout(total=FINAL_TIMEOUT),
-                ) as resp:
-                    resp.raise_for_status()
-                    body = await resp.json()
-                    assert "text" in body and len(body["text"]) > 0
-                    return body
-
-            results = await asyncio.gather(
-                *[_final_request(i) for i in range(NUM_FINAL_REQUESTS)],
-                return_exceptions=True,
+            # Wait for abort cleanup, then check for leaked phantom requests.
+            # With the bug, running_batch accumulates phantom prefill requests
+            # that are never cleaned up.
+            await asyncio.sleep(2)
+            num_running = await self._get_num_running_reqs(session)
+            self.assertEqual(
+                num_running,
+                0,
+                f"Prefill node has {num_running} phantom running requests "
+                f"after abort — pause_generation is leaking into running_batch",
             )
-
-        errors = [
-            f"Request {i}: {r}"
-            for i, r in enumerate(results)
-            if isinstance(r, Exception)
-        ]
-        completed = sum(1 for r in results if not isinstance(r, Exception))
-        self.assertEqual(
-            completed,
-            NUM_FINAL_REQUESTS,
-            f"Phase 2 requests blocked after {mode} pause/resume "
-            f"({completed}/{NUM_FINAL_REQUESTS} succeeded). Errors: {errors}",
-        )
 
 
 if __name__ == "__main__":
