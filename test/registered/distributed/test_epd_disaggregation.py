@@ -814,6 +814,10 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
         self.assertGreater(mmmu_accuracy, 0.40)
 
 
+@unittest.skipIf(
+    is_in_ci(),
+    "Qwen3.5 EPD image/video test runs locally only",
+)
 class TestEPDDisaggregationQwen35(PDDisaggregationServerBase):
     """EPD disaggregation test for Qwen3.5 image and video requests."""
 
