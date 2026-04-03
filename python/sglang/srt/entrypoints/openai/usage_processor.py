@@ -72,6 +72,24 @@ class UsageProcessor:
         )
 
     @staticmethod
+    def calculate_continuous_usage(
+        prompt_tokens: int,
+        completion_tokens: int,
+        cached_tokens: int = 0,
+        enable_cache_report: bool = False,
+    ) -> UsageInfo:
+        cached_details = (
+            UsageProcessor._details_if_cached(cached_tokens)
+            if enable_cache_report
+            else None
+        )
+        return UsageProcessor.calculate_token_usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_details,
+        )
+
+    @staticmethod
     def calculate_token_usage(
         prompt_tokens: int,
         completion_tokens: int,

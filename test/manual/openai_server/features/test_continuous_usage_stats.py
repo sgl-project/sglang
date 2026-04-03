@@ -17,7 +17,12 @@ class TestContinuousUsageStats(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(cls.model, cls.base_url, timeout=300)
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=300,
+            other_args=["--enable-cache-report"],
+        )
         cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
         cls.aclient = openai.AsyncClient(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
 
@@ -96,6 +101,54 @@ class TestContinuousUsageStats(CustomTestCase):
 
         assert len(usage_chunks) == 1
         assert len(usage_chunks[0].choices) == 0
+
+    def test_continuous_usage_stats_include_cache_details_when_enabled(self):
+        messages = [
+            {
+                "role": "user",
+                "content": "Summarize how attention works in one short paragraph.",
+            }
+        ]
+
+        prime = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=24,
+            temperature=0,
+        )
+        assert prime.usage.prompt_tokens > 0
+
+        stream = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            max_tokens=24,
+            temperature=0,
+            stream_options={"include_usage": True, "continuous_usage_stats": True},
+        )
+
+        saw_usage = False
+        saw_content = False
+        saw_cache_details = False
+        saw_positive_cached_tokens = False
+
+        for chunk in stream:
+            has_content = len(chunk.choices) > 0 and chunk.choices[0].delta.content
+            if has_content:
+                saw_content = True
+            if not chunk.usage:
+                continue
+            saw_usage = True
+            if chunk.usage.prompt_tokens_details is None:
+                continue
+            saw_cache_details = True
+            if chunk.usage.prompt_tokens_details.cached_tokens > 0:
+                saw_positive_cached_tokens = True
+
+        assert saw_content
+        assert saw_usage
+        assert saw_cache_details
+        assert saw_positive_cached_tokens
 
     def test_async_runner(self):
         asyncio.run(self.test_continuous_usage_stats_async())

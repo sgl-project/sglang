@@ -322,9 +322,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     request.stream_options
                     and request.stream_options.continuous_usage_stats
                 ):
-                    chunk.usage = UsageProcessor.calculate_token_usage(
+                    chunk.usage = UsageProcessor.calculate_continuous_usage(
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
+                        cached_tokens=content["meta_info"].get("cached_tokens", 0),
+                        enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
