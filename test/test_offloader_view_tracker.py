@@ -20,15 +20,16 @@ Solution:
 Run:
   SGLANG_DISABLE_CUDNN_CHECK=1 python test_offload_fix.py
 """
+
 import os
+
 os.environ["SGLANG_DISABLE_CUDNN_CHECK"] = "1"
 
 import torch
 import torch.nn as nn
-
-from sglang.srt.utils.offloader import _ParamViewTracker
 from torch.func import functional_call
 
+from sglang.srt.utils.offloader import _ParamViewTracker
 
 # ---------------------------------------------------------------------------
 # Helpers that mimic real model patterns
@@ -37,8 +38,10 @@ from torch.func import functional_call
 # In real models, params are loaded to GPU first, then views are created.
 # ---------------------------------------------------------------------------
 
+
 class FakeLinearAttn(nn.Module):
     """Mimics RadixLinearAttention: stores view(s) of conv1d weights."""
+
     def __init__(self, conv_weights):
         super().__init__()
         self.conv_weights = conv_weights
@@ -59,6 +62,7 @@ class FakeQwenDecoder(nn.Module):
         conv_weights = self.conv1d.weight.view(conv1d.weight.size(0), ...)
         self.attn = RadixLinearAttention(conv_weights=conv_weights, ...)
     """
+
     def __init__(self, dim, kernel_size=3):
         super().__init__()
         self.conv1d = nn.Linear(dim * kernel_size, dim, bias=True).cuda()
@@ -82,6 +86,7 @@ class FakeKimiDecoder(nn.Module):
         v_view = self.v_conv1d.weight.view(...)
         self.attn = RadixLinearAttention(conv_weights=(q_view, k_view, v_view), ...)
     """
+
     def __init__(self, dim, kernel_size=3):
         super().__init__()
         self.q_conv1d = nn.Linear(dim * kernel_size, dim, bias=True).cuda()
@@ -93,11 +98,14 @@ class FakeKimiDecoder(nn.Module):
         self.v_conv1d.weight.data = self.v_conv1d.weight.data.unsqueeze(1)
 
         q_view = self.q_conv1d.weight.view(
-            self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2))
+            self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2)
+        )
         k_view = self.k_conv1d.weight.view(
-            self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2))
+            self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2)
+        )
         v_view = self.v_conv1d.weight.view(
-            self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2))
+            self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
+        )
 
         self.attn = FakeLinearAttn((q_view, k_view, v_view))
 
@@ -107,6 +115,7 @@ class FakeKimiDecoder(nn.Module):
 
 class FakeTiedParam(nn.Module):
     """Mimics tied parameters (e.g., A_log in both GatedDeltaNet and child)."""
+
     def __init__(self, dim):
         super().__init__()
         self.A_log = nn.Parameter(torch.randn(dim)).cuda()
@@ -121,6 +130,7 @@ class FakeTiedParam(nn.Module):
 # Part 1: Before/After demonstration
 # Shows what breaks WITHOUT the fix and that it works WITH the fix.
 # ===================================================================
+
 
 def test_without_fix_stale_view_has_wrong_storage():
     """Demonstrate the bug: stale view references old storage, not device_state.
@@ -143,18 +153,19 @@ def test_without_fix_stale_view_has_wrong_storage():
 
     # Build device_state (new GPU copies from CPU data)
     device_state = {
-        k: v.to("cuda", non_blocking=True)
-        for k, v in module.state_dict().items()
+        k: v.to("cuda", non_blocking=True) for k, v in module.state_dict().items()
     }
 
     # WITHOUT refresh: conv_weights still points to old GPU storage
     # while device_state has a DIFFERENT GPU tensor for conv1d.weight
     new_param_ptr = device_state["conv1d.weight"].data_ptr()
     stale_view_ptr = module.attn.conv_weights.data_ptr()
-    assert stale_view_ptr != new_param_ptr, \
-        "Bug: conv_weights should point to OLD storage, not device_state copy"
-    assert stale_view_ptr == original_ptr, \
-        "conv_weights should still reference original pre-offload storage"
+    assert (
+        stale_view_ptr != new_param_ptr
+    ), "Bug: conv_weights should point to OLD storage, not device_state copy"
+    assert (
+        stale_view_ptr == original_ptr
+    ), "conv_weights should still reference original pre-offload storage"
 
     # Restore
     for name, p in module.named_parameters():
@@ -184,22 +195,23 @@ def test_with_fix_view_is_refreshed():
 
     # Build device_state and REFRESH views
     device_state = {
-        k: v.to("cuda", non_blocking=True)
-        for k, v in module.state_dict().items()
+        k: v.to("cuda", non_blocking=True) for k, v in module.state_dict().items()
     }
     tracker.refresh(module, device_state)
 
     # conv_weights is now on CUDA
-    assert module.attn.conv_weights.device.type == "cuda", \
-        f"After refresh, conv_weights should be CUDA, got {module.attn.conv_weights.device}"
+    assert (
+        module.attn.conv_weights.device.type == "cuda"
+    ), f"After refresh, conv_weights should be CUDA, got {module.attn.conv_weights.device}"
 
     # Forward produces correct result
     with torch.no_grad():
         out = functional_call(
             module, device_state, args=(x,), kwargs={}, tie_weights=False
         )
-    assert torch.allclose(unwrap(out), unwrap(ref_out), atol=1e-5), \
-        f"Output mismatch: max diff = {(unwrap(out) - unwrap(ref_out)).abs().max():.2e}"
+    assert torch.allclose(
+        unwrap(out), unwrap(ref_out), atol=1e-5
+    ), f"Output mismatch: max diff = {(unwrap(out) - unwrap(ref_out)).abs().max():.2e}"
 
     for name, p in module.named_parameters():
         p.data = saved[name]
@@ -209,6 +221,7 @@ def test_with_fix_view_is_refreshed():
 # ===================================================================
 # Part 2: Unit tests for _ParamViewTracker functionality
 # ===================================================================
+
 
 def test_detect_single_view():
     """Single tensor view (Qwen3.5 pattern) is detected."""
@@ -228,11 +241,13 @@ def test_detect_tuple_views():
 
 def test_no_false_positive():
     """Module without views should not be detected."""
+
     class PlainModule(nn.Module):
         def __init__(self, dim):
             super().__init__()
             self.linear = nn.Linear(dim, dim)
             self.some_tensor = torch.randn(dim)
+
         def forward(self, x):
             return self.linear(x)
 
@@ -262,8 +277,9 @@ def test_refresh_tuple_views():
     tracker.refresh(module, device_state)
 
     for i, elem in enumerate(module.attn.conv_weights):
-        assert elem.device.type == "cuda", \
-            f"conv_weights[{i}] should be CUDA, got {elem.device}"
+        assert (
+            elem.device.type == "cuda"
+        ), f"conv_weights[{i}] should be CUDA, got {elem.device}"
 
     with torch.no_grad():
         out = functional_call(
@@ -302,6 +318,7 @@ def test_tied_weights_no_crash():
 # ---------------------------------------------------------------------------
 # Util
 # ---------------------------------------------------------------------------
+
 
 def unwrap(x):
     return x[0] if isinstance(x, tuple) else x
