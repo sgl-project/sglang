@@ -23,6 +23,15 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
     return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
+def _is_registered_diffusion_model(model_path: str) -> bool:
+    try:
+        from sglang.multimodal_gen.registry import get_model_info
+    except ImportError:
+        return False
+
+    return get_model_info(model_path) is not None
+
+
 def _is_diffusers_model_dir(model_dir: str) -> bool:
     """Check if a local directory contains a valid diffusers model_index.json."""
     config_path = os.path.join(model_dir, "model_index.json")
@@ -55,6 +64,9 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if is_known_non_diffusers_diffusion_model(model_path):
         return True
 
+    if _is_registered_diffusion_model(model_path):
+        return True
+
     try:
         if envs.SGLANG_USE_MODELSCOPE.get():
             from modelscope import model_file_download
@@ -70,7 +82,7 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return _is_diffusers_model_dir(os.path.dirname(file_path))
     except Exception as e:
         logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
-        return False
+        return _is_registered_diffusion_model(model_path)
 
 
 def get_model_path(extra_argv):
