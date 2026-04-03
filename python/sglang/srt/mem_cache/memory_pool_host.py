@@ -1726,7 +1726,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             pin_memory,
             device,
             allocator_type,
-            override_kv_cache_dim=device_pool.kv_cache_dim,
+            override_kv_cache_dim=device_pool.kv_cache_size,
         )
         self.indexer_page_stride_size = (
             self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize

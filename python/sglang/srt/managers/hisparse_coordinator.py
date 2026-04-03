@@ -53,7 +53,7 @@ class HiSparseCoordinator:
             host_size=0,
             page_size=1,  # for simplicity, we set page size to 1 to enable backup one token at a time
             layout="layer_first",
-            override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+            override_kv_cache_dim=self.mem_pool_device.kv_cache_size,
         )
 
         max_num_reqs = req_to_token_pool.size

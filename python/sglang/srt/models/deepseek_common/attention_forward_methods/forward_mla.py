@@ -519,10 +519,23 @@ class DeepseekMLAForwardMixin:
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
         if self.current_attention_backend == "nsa":
-            return (
-                get_global_server_args().nsa_decode_backend == "trtllm"
-                or get_global_server_args().nsa_prefill_backend == "trtllm"
-            ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
+            is_fp8_kv_cache = (
+                forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
+            )
+            if not is_fp8_kv_cache:
+                return False
+
+            # Local import to avoid circular dependency (nsa_backend imports from model layer)
+            from sglang.srt.layers.attention.nsa_backend import (
+                NativeSparseAttnBackend,
+            )
+
+            if NativeSparseAttnBackend.should_use_decode_backend(
+                forward_batch.forward_mode
+            ):
+                return get_global_server_args().nsa_decode_backend == "trtllm"
+            else:
+                return get_global_server_args().nsa_prefill_backend == "trtllm"
 
         return (
             self.current_attention_backend == "trtllm_mla"

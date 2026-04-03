@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MLAKVCacheLayout, NSATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
 
 # sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
@@ -28,9 +28,10 @@ else:
 
 
 class HiSparseNSATokenToKVPool(NSATokenToKVPool):
+
     def __init__(
         self,
-        size: int,
+        max_total_num_tokens: int,
         page_size: int,
         kv_lora_rank: int,
         dtype: torch.dtype,
@@ -39,13 +40,14 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         device: str,
         index_head_dim: int,
         enable_memory_saver: bool,
-        kv_cache_dim: int,
+        kv_cache_layout: MLAKVCacheLayout,
+        kv_cache_size: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         host_to_device_ratio: int = 2,
     ):
         super().__init__(
-            size=size,
+            max_total_num_tokens=max_total_num_tokens,
             page_size=page_size,
             kv_lora_rank=kv_lora_rank,
             dtype=dtype,
@@ -54,12 +56,13 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             device=device,
             index_head_dim=index_head_dim,
             enable_memory_saver=enable_memory_saver,
-            kv_cache_dim=kv_cache_dim,
+            kv_cache_layout=kv_cache_layout,
+            kv_cache_size=kv_cache_size,
             start_layer=start_layer,
             end_layer=end_layer,
-            index_buf_size=size * host_to_device_ratio,
+            index_buf_size=max_total_num_tokens * host_to_device_ratio,
         )
-        self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
+        self.bytes_per_token = self.kv_cache_size * self.dtype.itemsize
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
         self.full_to_hisparse_device_index_mapping = (

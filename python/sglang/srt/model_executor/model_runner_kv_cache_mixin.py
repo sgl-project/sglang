@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
+    MLAKVCacheLayout,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
@@ -235,44 +236,54 @@ class ModelRunnerKVCacheMixin:
         )
         return total_rest_memory - mamba_state_memory
 
-    def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
+    def get_mla_kv_cache_layout(self: ModelRunner) -> tuple[MLAKVCacheLayout, int]:
+        """
+        Returns:
+            - MLAKVCacheLayout: layout of MLA kv cache
+            - int: dimension of MLA kv cache if MLAKVCacheLayout is BF16/FP4 or number of bytes otherwise.
+        """
+
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
         kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
-        # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
-        if not is_nsa_model:
-            return kv_cache_dim
+        if kv_cache_dtype == torch.bfloat16:
+            return MLAKVCacheLayout.BF16, kv_cache_dim
 
-        # TRTLLM backend does not override kv_cache_dim for MLA kv cache
-        # Assuming nsa prefill and decode backends are the same when using trtllm MLA backend,
-        # since it is not compatible for trtllm and other mla attn backend due to the different
-        # kv cache layout.
-        if (
-            self.server_args.nsa_prefill_backend == "trtllm"
-            or self.server_args.nsa_decode_backend == "trtllm"
-        ):
-            return kv_cache_dim
+        if is_float4_e2m1fn_x2(kv_cache_dtype):
+            return MLAKVCacheLayout.FP4, kv_cache_dim
+
+        if is_nsa_model:
+            prefill_is_trtllm = self.server_args.nsa_prefill_backend == "trtllm"
+            decode_is_trtllm = self.server_args.nsa_decode_backend == "trtllm"
+            assert (
+                prefill_is_trtllm == decode_is_trtllm
+            ), "NSA backend trtllm cannot be mixed with other NSA backends."
+
+            use_block_scale = not prefill_is_trtllm
+        else:
+            use_block_scale = False
+
+        if not use_block_scale:
+            return MLAKVCacheLayout.FP8_NOPE_FP8_ROPE, kv_cache_dim
 
         quant_block_size = NSATokenToKVPool.quant_block_size
         rope_storage_dtype = NSATokenToKVPool.rope_storage_dtype
-        # Calculate override_kv_cache_dim for FP8 storage for non-trtllm attention backends:
-        # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
-        # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
-        if kv_cache_dtype == torch.float8_e4m3fn:
-            assert (
-                kv_lora_rank % quant_block_size == 0
-            ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
 
-            return (
-                kv_lora_rank
-                + kv_lora_rank // quant_block_size * 4
-                + qk_rope_head_dim * rope_storage_dtype.itemsize
-            )
+        assert (
+            kv_lora_rank % quant_block_size == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+        assert (
+            rope_storage_dtype == torch.bfloat16
+        ), "Internal error: unexpected rope storage dtype"
 
-        return kv_cache_dim
+        return MLAKVCacheLayout.FP8_NOPE_WITH_BLOCK_SCALE_BF16_ROPE, (
+            kv_lora_rank
+            + kv_lora_rank // quant_block_size * 4
+            + qk_rope_head_dim * rope_storage_dtype.itemsize
+        )
 
     def _resolve_hybrid_swa_tokens(
         self: ModelRunner, token_capacity: int
@@ -539,15 +550,17 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
+            kv_cache_layout, kv_cache_size = self.get_mla_kv_cache_layout()
             nsa_pool_kwargs = dict(
-                size=self.max_total_num_tokens,
+                max_total_num_tokens=self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.num_effective_layers,
                 device=self.device,
-                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                kv_cache_layout=kv_cache_layout,
+                kv_cache_size=kv_cache_size,
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
@@ -565,6 +578,7 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
+            kv_cache_layout, kv_cache_size = self.get_mla_kv_cache_layout()
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,
@@ -575,6 +589,8 @@ class ModelRunnerKVCacheMixin:
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    kv_cache_layout=kv_cache_layout,
+                    kv_cache_size=kv_cache_size,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
@@ -588,6 +604,8 @@ class ModelRunnerKVCacheMixin:
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
+                    kv_cache_layout=kv_cache_layout,
+                    kv_cache_size=kv_cache_size,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
