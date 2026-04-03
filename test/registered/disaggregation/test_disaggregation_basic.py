@@ -1,8 +1,10 @@
+import asyncio
 import json
 import os
 import unittest
 from types import SimpleNamespace
 
+import aiohttp
 import openai
 import requests
 from transformers import AutoTokenizer
@@ -448,6 +450,209 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.62)
+
+
+class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
+    """Regression test: pause_generation must not leak prefill requests into
+    running_batch.  With a small --max-running-requests the leak fills the
+    scheduling budget and blocks all subsequent prefills."""
+
+    MAX_RUNNING = 4
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+
+        cls.start_prefill()
+        cls.start_decode()
+
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+
+        cls.launch_lb()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+            "--max-running-requests",
+            str(cls.MAX_RUNNING),
+            "--enable-metrics",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+        ]
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+        )
+
+    def test_retract_pause_no_leak_on_prefill(self):
+        """Retract-mode pause on a disagg prefill node must not leak prefill
+        requests into running_batch. Without the fix, each retract pause merges
+        last_batch into running_batch, but the prefill event loop never cleans
+        them up via update_running_batch. After enough cycles the
+        max-running-requests budget is exhausted and all new prefills hang."""
+        asyncio.run(self._run_pause_resume_leak_test("retract"))
+
+    def test_retract_pause_empty_running_batch(self):
+        """Retract-mode pause must not crash when running_batch is empty.
+        Regression test for issue #20272."""
+        asyncio.run(self._run_pause_on_idle("retract"))
+
+    async def _run_pause_on_idle(self, mode):
+        """Pause/resume on an idle prefill node (no in-flight requests)."""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self.prefill_url + "/pause_generation",
+                json={"mode": mode},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+            async with session.post(
+                self.prefill_url + "/continue_generation",
+                json={},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+
+            # Verify the engine still works after pause/resume
+            async with session.post(
+                self.lb_url + "/generate",
+                json={
+                    "text": "What is 1+1?",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+                body = await resp.json()
+                self.assertIn("text", body)
+                self.assertGreater(len(body["text"]), 0)
+
+    async def _get_num_running_reqs(self, session):
+        """Query sglang:num_running_reqs from prefill node's /metrics."""
+        async with session.get(
+            self.prefill_url + "/metrics",
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+            for line in text.splitlines():
+                # Match the gauge line, skip HELP/TYPE comments and
+                # per-priority breakdowns (which have priority="<int>")
+                if (
+                    line.startswith("sglang:num_running_reqs{")
+                    and "priority=" not in line
+                ):
+                    return int(float(line.split()[-1]))
+            return 0
+
+    async def _run_pause_resume_leak_test(self, mode):
+        NUM_WORKERS = 64
+        NUM_PAUSE_RESUME_CYCLES = self.MAX_RUNNING * 4
+        MAX_NEW_TOKENS = 1
+        LONG_PROMPT = "Tell me a story. " * 200
+
+        async def _background_worker(session, worker_id, cancel_event):
+            """Send requests sequentially until cancelled."""
+            seq = 0
+            while not cancel_event.is_set():
+                try:
+                    async with session.post(
+                        self.lb_url + "/generate",
+                        json={
+                            "text": f"[w{worker_id}-{seq}] {LONG_PROMPT}",
+                            "sampling_params": {
+                                "temperature": 0,
+                                "max_new_tokens": MAX_NEW_TOKENS,
+                            },
+                        },
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        await resp.read()
+                except Exception:
+                    pass
+                seq += 1
+
+        async def _post(session, url, json_data):
+            async with session.post(
+                url,
+                json=json_data,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                resp.raise_for_status()
+
+        cancel_event = asyncio.Event()
+
+        async with aiohttp.ClientSession() as session:
+            workers = [
+                asyncio.create_task(_background_worker(session, i, cancel_event))
+                for i in range(NUM_WORKERS)
+            ]
+
+            for _ in range(NUM_PAUSE_RESUME_CYCLES):
+                await _post(
+                    session,
+                    self.prefill_url + "/pause_generation",
+                    {"mode": mode},
+                )
+                await _post(
+                    session,
+                    self.prefill_url + "/continue_generation",
+                    {},
+                )
+                await asyncio.sleep(0.1)
+
+            # Stop workers and abort all in-flight requests
+            cancel_event.set()
+            await _post(
+                session, self.prefill_url + "/abort_request", {"abort_all": True}
+            )
+            await _post(
+                session, self.decode_url + "/abort_request", {"abort_all": True}
+            )
+            await asyncio.gather(*workers, return_exceptions=True)
+
+            # Wait for abort cleanup, then check for leaked phantom requests.
+            # With the bug, running_batch accumulates phantom prefill requests
+            # that are never cleaned up.
+            await asyncio.sleep(2)
+            num_running = await self._get_num_running_reqs(session)
+            self.assertEqual(
+                num_running,
+                0,
+                f"Prefill node has {num_running} phantom running requests "
+                f"after abort — pause_generation is leaking into running_batch",
+            )
 
 
 if __name__ == "__main__":
