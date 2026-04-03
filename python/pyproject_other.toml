@@ -116,9 +116,6 @@ srt_musa = [
     "torch_musa",
     "torchada>=0.1.45",
     "mthreads-ml-py",
-    "mate",
-    "mate-deep_gemm",
-    "mate-flash-attention",
     "numpy<2.0",
 ]
 
