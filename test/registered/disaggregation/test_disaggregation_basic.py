@@ -484,6 +484,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             "1",
             "--max-running-requests",
             str(cls.MAX_RUNNING),
+            "--enable-metrics",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
