@@ -24,6 +24,15 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
     return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
+def _is_registered_diffusion_model(model_path: str) -> bool:
+    try:
+        from sglang.multimodal_gen.registry import get_model_info
+    except ImportError:
+        return False
+
+    return get_model_info(model_path, backend="sglang") is not None
+
+
 def _is_diffusers_model_dir(model_dir: str) -> bool:
     """Check if a local directory contains a valid diffusers model_index.json."""
     config_path = os.path.join(model_dir, "model_index.json")
