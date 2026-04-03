@@ -25,6 +25,8 @@ class CommunicatorImpl:
     # NOTE: never use this, this is only kept for compatibility with
     # python/sglang/srt/model_executor/mindspore_runner.py
     device_group: torch.distributed.ProcessGroup
+    ranks: List[int]
+    local_rank: int
 
     def __post_init__(self):
         _register_group(self)
@@ -139,7 +141,7 @@ def inplace_reduce_scatter(
     group.reduce_scatter_comms[method].reduce_scatter_tensor(input_, out=out)
 
 
-@register_custom_op(mutates_args=["out"], out_shape="input_")
+@register_custom_op(mutates_args=["out"])
 def inplace_all_gather(
     input_: torch.Tensor, group_name: str, method: int, *, out: torch.Tensor
 ) -> None:

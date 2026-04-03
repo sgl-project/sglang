@@ -384,6 +384,8 @@ class GroupCoordinator:
                 self.torch_comm,
             ),
             device_group=self.device_group,
+            local_rank=self.local_rank,
+            ranks=self.ranks,
         )
 
     def __repr__(self):
