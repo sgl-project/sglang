@@ -29,9 +29,9 @@ ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl${CPLUS_INCLUDE_PATH:+:${CPLU
 ENV C_INCLUDE_PATH=/usr/local/cuda/include/cccl${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
 
 # Install build dependencies
-RUN yum install gcc gcc-c++ make wget tar numactl-devel libibverbs -y --nogpgcheck
-RUN ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so
-RUN yum clean all && rm -rf /var/cache/yum
+RUN yum install gcc gcc-c++ make wget tar numactl-devel libibverbs -y --nogpgcheck \
+ && ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so \
+ && yum clean all && rm -rf /var/cache/yum
 
 # Install CMake (cached download)
 RUN --mount=type=cache,id=sgl-kernel-cmake,target=/cmake-downloads \
