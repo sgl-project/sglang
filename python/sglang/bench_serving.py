@@ -229,8 +229,8 @@ def _extract_cache_from_sglext(data, output):
     details = sglext.get("cached_tokens_details")
     if details:
         output.cached_tokens = (
-            details.get("device", 0)
-            + details.get("host", 0)
+            (details.get("device") or 0)
+            + (details.get("host") or 0)
             + (details.get("storage") or 0)
         )
         output.cached_tokens_details = details
@@ -1567,16 +1567,20 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     if args.cache_report:
-        total_prompt_tokens = sum(o.prompt_len for o in outputs if o.success)
-        total_cached = sum(o.cached_tokens for o in outputs if o.success)
+        total_prompt_tokens = 0
+        total_cached = 0
         total_device = total_host = total_storage = 0
         storage_backend_name = None
         has_details = False
         for o in outputs:
-            if o.success and o.cached_tokens_details:
+            if not o.success:
+                continue
+            total_prompt_tokens += o.prompt_len
+            total_cached += o.cached_tokens
+            if o.cached_tokens_details:
                 has_details = True
-                total_device += o.cached_tokens_details.get("device", 0)
-                total_host += o.cached_tokens_details.get("host", 0)
+                total_device += o.cached_tokens_details.get("device") or 0
+                total_host += o.cached_tokens_details.get("host") or 0
                 s = o.cached_tokens_details.get("storage") or 0
                 if s:
                     total_storage += s
