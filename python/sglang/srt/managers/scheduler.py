@@ -706,7 +706,6 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
-        # Check linear attn model registry (reuses model_runner's cached lookup)
         _spec = self.tp_worker.model_runner.linear_attn_model_spec
         _registry_needs_mamba = (
             _spec.uses_mamba_radix_cache if _spec is not None else False

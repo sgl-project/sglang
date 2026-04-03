@@ -1851,7 +1851,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     def _get_linear_attn_registry_result(self):
-        """Cached registry lookup — called once, result reused by properties."""
         if not hasattr(self, "_linear_attn_registry_cache"):
             self._linear_attn_registry_cache = get_linear_attn_config(
                 self.model_config.hf_config
@@ -1860,13 +1859,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def linear_attn_model_spec(self):
-        """Return the LinearAttnModelSpec if this model was externally registered."""
         result = self._get_linear_attn_registry_result()
         return result[0] if result else None
 
     @property
     def mambaish_config(self):
-        # Existing hardcoded checks first (backward compat)
         existing = (
             self.mamba2_config
             or self.hybrid_gdn_config
@@ -1875,7 +1872,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         if existing:
             return existing
-        # Fall back to registry for externally registered models
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
 

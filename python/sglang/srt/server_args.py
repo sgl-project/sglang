@@ -1495,7 +1495,6 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
-        # Check linear attn model registry for externally registered models.
         _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
         if _hybrid_spec is not None:
             self._handle_mamba_radix_cache(
