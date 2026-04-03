@@ -463,6 +463,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.need_sort and bs > len(self.free_pages):
             self.merge_and_sort_free()
 
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            decode=True,
+        )
+        if num_new_pages > len(self.free_pages):
+            return None
+
+        assert num_new_pages <= bs, (
+            f"Decode should allocate at most 1 new page per request, "
+            f"but got {num_new_pages} new pages for {bs} requests"
+        )
+        assert num_new_pages <= len(self.free_pages), (
+            f"Not enough free pages: need {num_new_pages}, "
+            f"have {len(self.free_pages)}"
+        )
+
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
         alloc_decode_kernel[(bs,)](
             seq_lens,
@@ -475,14 +492,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
-
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            decode=True,
-        )
-        if num_new_pages > len(self.free_pages):
-            return None
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
