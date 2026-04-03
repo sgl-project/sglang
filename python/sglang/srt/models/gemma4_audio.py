@@ -69,14 +69,20 @@ class Gemma4AudioRelativePositionEmbedding(nn.Module):
         tp_size = get_parallel().attn_tp_size
         total_num_heads = config.num_attention_heads
         self.channels = config.hidden_size
-        self.head_dim = self.channels // total_num_heads
+        original_num_attn_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.num_attention_heads
+        )
+        self.head_dim = self.channels // original_num_attn_heads
         self.num_heads = total_num_heads // tp_size
         self.max_backward = max(0, config.attention_context_left - 1)
         self.max_forward = config.attention_context_right
+        padded_hidden_size = self.head_dim * config.num_attention_heads
 
         self.pos_proj = ColumnParallelLinear(
             self.channels,
-            config.hidden_size,
+            padded_hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("pos_proj", prefix),
@@ -219,7 +225,12 @@ class Gemma4AudioAttention(nn.Module):
         tp_size = get_parallel().attn_tp_size
         total_num_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
-        self.head_dim = self.hidden_size // total_num_heads
+        original_num_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else total_num_heads
+        )
+        self.head_dim = self.hidden_size // original_num_heads
         self.num_heads = total_num_heads // tp_size
 
         self.chunk_size = config.attention_chunk_size
@@ -493,15 +504,31 @@ class Gemma4AudioSubSampleConvProjection(nn.Module):
         final_c_out = conv_channels[-1]
         final_f_out = calculated_f_out_dims[-1]
         self.input_proj_in_features = final_c_out * final_f_out
-
-        self.input_proj_linear = RowParallelLinear(
-            self.input_proj_in_features,
-            config.hidden_size,
-            bias=False,
-            input_is_parallel=False,
-            quant_config=quant_config,
-            prefix=add_prefix("input_proj_linear", prefix),
+        original_num_attn_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.num_attention_heads
         )
+        padded_hidden_size = (
+            config.hidden_size // original_num_attn_heads * config.num_attention_heads
+        )
+        tp_size = get_parallel().attn_tp_size
+
+        if self.input_proj_in_features % tp_size != 0:
+            self.input_proj_linear = nn.Linear(
+                self.input_proj_in_features,
+                padded_hidden_size,
+                bias=False,
+            )
+        else:
+            self.input_proj_linear = RowParallelLinear(
+                self.input_proj_in_features,
+                padded_hidden_size,
+                bias=False,
+                input_is_parallel=False,
+                quant_config=quant_config,
+                prefix=add_prefix("input_proj_linear", prefix),
+            )
 
     def forward(
         self, audio_encodings: torch.Tensor, audio_mel_mask: torch.Tensor
@@ -512,7 +539,11 @@ class Gemma4AudioSubSampleConvProjection(nn.Module):
         b, c_out, t_out, f_out = x.shape
         x_permuted = x.permute(0, 2, 3, 1).contiguous()
         output_flattened = x_permuted.reshape(b, t_out, f_out * c_out)
-        output, _ = self.input_proj_linear(output_flattened)
+        outputs = self.input_proj_linear(output_flattened)
+        if isinstance(outputs, tuple):
+            output = outputs[0]
+        else:
+            output = outputs
         return output, mask
 
 
@@ -530,7 +561,16 @@ class Gemma4AudioConformerAttention(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.post_in_features = config.hidden_size
+        orig_num_attn_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.num_attention_heads
+        )
+        padded_hidden_size = (
+            config.hidden_size // orig_num_attn_heads * config.num_attention_heads
+        )
+
+        self.post_in_features = padded_hidden_size
 
         self.register_buffer(
             "gradient_clipping",
@@ -593,17 +633,25 @@ class Gemma4AudioConformerFeedForward(nn.Module):
             torch.tensor(config.gradient_clipping),
             persistent=False,
         )
+        orig_num_attn_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.num_attention_heads
+        )
+        padded_hidden_size = (
+            config.hidden_size // orig_num_attn_heads * config.num_attention_heads
+        )
 
         self.pre_layer_norm = Gemma4RMSNorm(config.hidden_size, scale_shift=0.0)
         self.ffw_layer_1 = ClippableColumnParallelLinear(
             config.hidden_size,
-            config.hidden_size * 4,
+            padded_hidden_size * 4,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("ffw_layer_1", prefix),
         )
         self.ffw_layer_2 = ClippableRowParallelLinear(
-            config.hidden_size * 4,
+            padded_hidden_size * 4,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
@@ -639,7 +687,16 @@ class Gemma4AudioConformerLightConv1d(nn.Module):
         self.config = config
         self.causal_padding = config.conv_kernel_size - 1
         tp_size = get_parallel().attn_tp_size
-        hidden_per_tp = config.hidden_size // tp_size
+        orig_num_attn_heads = (
+            config.original_num_attention_heads
+            if hasattr(config, "original_num_attention_heads")
+            else config.num_attention_heads
+        )
+        padded_hidden_size = (
+            config.hidden_size // orig_num_attn_heads * config.num_attention_heads
+        )
+
+        hidden_per_tp = padded_hidden_size // tp_size
 
         self.register_buffer(
             "gradient_clipping",
@@ -652,7 +709,7 @@ class Gemma4AudioConformerLightConv1d(nn.Module):
         )
         self.linear_start = ClippableGLUParallelLinear(
             config.hidden_size,
-            config.hidden_size,
+            padded_hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("linear_start", prefix),
@@ -674,14 +731,24 @@ class Gemma4AudioConformerLightConv1d(nn.Module):
 
         def _shard_dim0(param, loaded_weight, _rank=tp_rank, _tp=tp_size):
             shard = param.shape[0]
-            loaded_weight = loaded_weight.narrow(0, _rank * shard, shard)
-            param.data.copy_(loaded_weight)
+            if _rank * shard + shard <= loaded_weight.shape[0]:
+                loaded_weight = loaded_weight.narrow(0, _rank * shard, shard)
+                param.data.copy_(loaded_weight)
+            else:
+                if loaded_weight.shape[0] <= _rank * shard:
+                    param.data.zero_()
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        0, _rank * shard, loaded_weight.shape[0] - _rank * shard
+                    )
+                    param.data[: loaded_weight.shape[0]].copy_(loaded_weight)
+                    param.data[loaded_weight.shape[0] :].zero_()
 
         set_weight_attrs(self.depthwise_conv1d.weight, {"weight_loader": _shard_dim0})
         set_weight_attrs(self.conv_norm.weight, {"weight_loader": _shard_dim0})
 
         self.linear_end = ClippableRowParallelLinear(
-            config.hidden_size,
+            padded_hidden_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
@@ -793,8 +860,17 @@ class Gemma4AudioEncoder(nn.Module):
         )
 
         if config.output_proj_dims is not None:
+            orig_num_attn_heads = (
+                config.original_num_attention_heads
+                if hasattr(config, "original_num_attention_heads")
+                else config.num_attention_heads
+            )
+            padded_hidden_size = (
+                config.hidden_size // orig_num_attn_heads * config.num_attention_heads
+            )
+
             self.output_proj = RowParallelLinear(
-                config.hidden_size,
+                padded_hidden_size,
                 config.output_proj_dims,
                 bias=True,
                 input_is_parallel=False,
@@ -827,6 +903,7 @@ class Gemma4AudioEncoder(nn.Module):
             local_causal_valid_mask * lower_causal_mask * upper_causal_mask,
             persistent=False,
         )
+        self.hidden_size = config.hidden_size
 
     @property
     def device(self):
@@ -850,8 +927,10 @@ class Gemma4AudioEncoder(nn.Module):
         )
 
         for block in self.conformer:
-            audio_encodings = block(
-                audio_encodings, current_mask, self.causal_valid_mask
+            audio_encodings[..., : self.hidden_size] = block(
+                audio_encodings[..., : self.hidden_size],
+                current_mask,
+                self.causal_valid_mask,
             )
 
         if self.output_proj is not None:
