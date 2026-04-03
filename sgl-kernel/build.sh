@@ -64,6 +64,12 @@ BUILD_ARGS=()
 # ---- Step 1: Build deps image (layer cached, fast on repeat) ----
 DEPS_TAG="sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"
 
+CACHE_ARGS=()
+if [ "${USE_CCACHE:-1}" != "0" ]; then
+  CACHE_ARGS+=(--cache-from "type=local,src=${BUILDX_CACHE_DIR}")
+  CACHE_ARGS+=(--cache-to "type=local,dest=${BUILDX_CACHE_DIR},mode=max")
+fi
+
 docker buildx build \
   --builder "${BUILDER_NAME}" \
   -f Dockerfile . \
@@ -73,8 +79,7 @@ docker buildx build \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
   "${BUILD_ARGS[@]}" \
-  --cache-from type=local,src=${BUILDX_CACHE_DIR} \
-  --cache-to type=local,dest=${BUILDX_CACHE_DIR},mode=max \
+  "${CACHE_ARGS[@]}" \
   --target deps \
   --load \
   -t "${DEPS_TAG}" \
