@@ -2046,6 +2046,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if backend_str not in [
             "flashinfer_trtllm",
+            # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
+            # "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
@@ -2116,6 +2118,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.enable_torch_compile:
             set_torch_compile_config()
+            should_disable_torch_compile = not getattr(
+                self.model, "_can_torch_compile", True
+            )
+            if should_disable_torch_compile:
+                log_info_on_rank0(
+                    logger,
+                    "Transformers backend model reports it is not torch.compile "
+                    "compatible (e.g. dynamic rope scaling). Disabling torch.compile.",
+                )
+                self.server_args.enable_torch_compile = False
 
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture()
