@@ -1114,6 +1114,19 @@ class BaseMultimodalProcessor(ABC):
                 all_collected_items.extend(items)
             elif input_format == "precomputed_embedding":
                 feature = dict_item["feature"]
+                # Validate precomputed_embedding input
+                if isinstance(feature, (list, np.ndarray)):
+                    feature = torch.tensor(feature)
+                if not isinstance(feature, torch.Tensor):
+                    raise ValueError(
+                        f"precomputed_embedding feature must be a tensor, "
+                        f"got {type(feature)}"
+                    )
+                if feature.ndim < 2:
+                    raise ValueError(
+                        f"precomputed_embedding feature must be at least 2D, "
+                        f"got shape {feature.shape}"
+                    )
                 del dict_item["feature"]
                 all_collected_items.append(
                     MultimodalDataItem(

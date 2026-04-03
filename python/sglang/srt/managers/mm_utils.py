@@ -1312,7 +1312,7 @@ def get_multimodal_data_bounds(
 
 
 def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
+    hash_bytes = hashlib.sha256(data).digest()[:16]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
@@ -1330,12 +1330,16 @@ def tensor_hash(tensor_list) -> int:
         if any(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
             tensor = torch.concat(tensors)
             return gpu_tensor_hash(tensor.cuda())
-        # CPU path: hash each tensor incrementally without concat
+        # CPU path: hash each tensor with shape boundary markers
         hasher = hashlib.sha256()
         for t in tensors:
             t = t.detach().contiguous()
+            # Include shape and dtype as boundary markers to prevent
+            # different tensor partitions from producing the same hash
+            shape_tag = f"{tuple(t.shape)}:{t.dtype}|".encode()
+            hasher.update(shape_tag)
             hasher.update(memoryview(t.view(torch.uint8).numpy()))
-        hash_bytes = hasher.digest()[:8]
+        hash_bytes = hasher.digest()[:16]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
     # Single tensor
@@ -1343,21 +1347,41 @@ def tensor_hash(tensor_list) -> int:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
     hasher = hashlib.sha256()
+    shape_tag = f"{tuple(tensor.shape)}:{tensor.dtype}|".encode()
+    hasher.update(shape_tag)
     hasher.update(memoryview(tensor.view(torch.uint8).numpy()))
-    hash_bytes = hasher.digest()[:8]
+    hash_bytes = hasher.digest()[:16]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
 def hash_feature(f):
     if isinstance(f, list):
+        if len(f) == 0:
+            return data_hash(b"empty_list")
         if isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
+        # Serialize non-tensor list elements to bytes before hashing
+        import struct
+
+        parts = []
+        for x in flatten_nested_list(f):
+            if isinstance(x, float):
+                parts.append(struct.pack(">d", x))
+            elif isinstance(x, int):
+                parts.append(struct.pack(">q", x))
+            else:
+                encoded = str(x).encode()
+                parts.append(len(encoded).to_bytes(4, "big") + encoded)
+        return data_hash(b"".join(parts))
     elif isinstance(f, np.ndarray):
         arr = np.ascontiguousarray(f)
+        # Include shape and dtype metadata to prevent collisions between
+        # arrays with the same raw bytes but different shapes
+        meta = f"{arr.shape}:{arr.dtype}:".encode()
         hasher = hashlib.sha256()
+        hasher.update(meta)
         hasher.update(memoryview(arr))
-        hash_bytes = hasher.digest()[:8]
+        hash_bytes = hasher.digest()[:16]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
