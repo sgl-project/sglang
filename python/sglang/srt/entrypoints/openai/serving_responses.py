@@ -281,6 +281,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     adapted_request = GenerateReqInput(
                         input_ids=engine_prompt,
                         sampling_params=sampling_params,
+                        sampling_params_explicit_keys=request.get_explicit_sampling_keys(),
                         stream=request.stream,
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
@@ -1298,6 +1299,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             adapted_request = GenerateReqInput(
                 input_ids=prompt_token_ids,
                 sampling_params=sampling_params,
+                sampling_params_explicit_keys=adapted_request.sampling_params_explicit_keys,
                 stream=adapted_request.stream,
                 rid=request_id,
                 extra_key=adapted_request.extra_key,

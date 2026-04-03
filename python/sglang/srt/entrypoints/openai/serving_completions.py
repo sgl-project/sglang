@@ -108,6 +108,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             sampling_params=sampling_params,
+            sampling_params_explicit_keys=request.get_explicit_sampling_keys(),
             return_logprob=request.logprobs is not None,
             top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
             logprob_start_len=logprob_start_len,

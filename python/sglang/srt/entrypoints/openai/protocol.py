@@ -17,7 +17,18 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeAlias, Union
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    TypeAlias,
+    Union,
+)
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -317,6 +328,43 @@ class CompletionRequest(BaseModel):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+
+    # Mapping from request field names to sampling_params dict key names.
+    _FIELD_TO_SAMPLING_KEY: ClassVar[Dict[str, str]] = {
+        "max_tokens": "max_new_tokens",
+        "min_tokens": "min_new_tokens",
+        "stop": "stop",
+        "stop_token_ids": "stop_token_ids",
+        "stop_regex": "stop_regex",
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "top_k": "top_k",
+        "min_p": "min_p",
+        "presence_penalty": "presence_penalty",
+        "frequency_penalty": "frequency_penalty",
+        "repetition_penalty": "repetition_penalty",
+        "regex": "regex",
+        "json_schema": "json_schema",
+        "ebnf": "ebnf",
+        "n": "n",
+        "no_stop_trim": "no_stop_trim",
+        "ignore_eos": "ignore_eos",
+        "skip_special_tokens": "skip_special_tokens",
+        "logit_bias": "logit_bias",
+        "custom_params": "custom_params",
+        "seed": "sampling_seed",
+        "response_format": "json_schema",
+    }
+
+    def get_explicit_sampling_keys(self) -> Set[str]:
+        """Return the set of sampling param keys explicitly set by the user."""
+        keys = set()
+        for field, sampling_key in self._FIELD_TO_SAMPLING_KEY.items():
+            if field in self.model_fields_set:
+                keys.add(sampling_key)
+        if "response_format" in self.model_fields_set:
+            keys.add("structural_tag")
+        return keys
 
     @model_validator(mode="before")
     @classmethod
@@ -738,6 +786,43 @@ class ChatCompletionRequest(BaseModel):
             }
 
         return values
+
+    # Mapping from request field names to sampling_params dict key names.
+    _FIELD_TO_SAMPLING_KEY: ClassVar[Dict[str, str]] = {
+        "max_completion_tokens": "max_new_tokens",
+        "max_tokens": "max_new_tokens",
+        "min_tokens": "min_new_tokens",
+        "stop": "stop",
+        "stop_token_ids": "stop_token_ids",
+        "stop_regex": "stop_regex",
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "top_k": "top_k",
+        "min_p": "min_p",
+        "presence_penalty": "presence_penalty",
+        "frequency_penalty": "frequency_penalty",
+        "repetition_penalty": "repetition_penalty",
+        "regex": "regex",
+        "ebnf": "ebnf",
+        "n": "n",
+        "no_stop_trim": "no_stop_trim",
+        "ignore_eos": "ignore_eos",
+        "skip_special_tokens": "skip_special_tokens",
+        "logit_bias": "logit_bias",
+        "custom_params": "custom_params",
+        "seed": "sampling_seed",
+        "response_format": "json_schema",
+    }
+
+    def get_explicit_sampling_keys(self) -> Set[str]:
+        """Return the set of sampling param keys explicitly set by the user."""
+        keys = set()
+        for field, sampling_key in self._FIELD_TO_SAMPLING_KEY.items():
+            if field in self.model_fields_set:
+                keys.add(sampling_key)
+        if "response_format" in self.model_fields_set:
+            keys.add("structural_tag")
+        return keys
 
     def to_sampling_params(
         self,
@@ -1201,6 +1286,19 @@ class ResponsesRequest(BaseModel):
     min_p: float = 0.0
     repetition_penalty: float = 1.0
 
+    # Mapping from request field names to sampling_params dict key names.
+    _FIELD_TO_SAMPLING_KEY: ClassVar[Dict[str, str]] = {
+        "max_output_tokens": "max_new_tokens",
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "top_k": "top_k",
+        "min_p": "min_p",
+        "frequency_penalty": "frequency_penalty",
+        "presence_penalty": "presence_penalty",
+        "repetition_penalty": "repetition_penalty",
+        "stop": "stop",
+    }
+
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 0.7,
@@ -1209,6 +1307,14 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    def get_explicit_sampling_keys(self) -> Set[str]:
+        """Return the set of sampling param keys explicitly set by the user."""
+        keys = set()
+        for field, sampling_key in self._FIELD_TO_SAMPLING_KEY.items():
+            if field in self.model_fields_set:
+                keys.add(sampling_key)
+        return keys
 
     def to_sampling_params(
         self, default_max_tokens: int, default_params: Optional[Dict] = None

@@ -939,7 +939,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
         if self.preferred_sampling_params:
-            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
+            sampling_kwargs = dict(self.preferred_sampling_params)
+            explicit_keys = getattr(obj, "sampling_params_explicit_keys", None)
+            for k, v in obj.sampling_params.items():
+                if explicit_keys is None or k in explicit_keys:
+                    sampling_kwargs[k] = v
         else:
             sampling_kwargs = obj.sampling_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)

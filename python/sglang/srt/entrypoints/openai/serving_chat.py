@@ -297,6 +297,7 @@ class OpenAIServingChat(OpenAIServingBase):
             video_data=processed_messages.video_data,
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
+            sampling_params_explicit_keys=request.get_explicit_sampling_keys(),
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,

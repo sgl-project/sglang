@@ -24,7 +24,7 @@ from abc import ABC
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Union
 
 import torch
 
@@ -150,6 +150,9 @@ class GenerateReqInput(BaseReq):
     audio_data: Optional[MultimodalDataInputFormat] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
+    # The set of sampling param keys explicitly set by the user request.
+    # Used to correctly merge with preferred_sampling_params.
+    sampling_params_explicit_keys: Optional[Set[str]] = None
     # Whether to return logprobs.
     return_logprob: Optional[Union[List[bool], bool]] = None
     # If return logprobs, the start location in the prompt for returning logprobs.
@@ -611,6 +614,7 @@ class GenerateReqInput(BaseReq):
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
             sampling_params=self.sampling_params[i],
+            sampling_params_explicit_keys=self.sampling_params_explicit_keys,
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
