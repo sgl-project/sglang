@@ -531,13 +531,16 @@ def refresh_context_on_transformer(
     verbose: bool = False,
 ) -> None:
     """Refresh cache-dit context for transformer."""
+    steps_computation_mask = (
+        cache_dit.steps_mask(mask_policy=scm_preset, total_steps=num_inference_steps)
+        if scm_preset is not None
+        else None
+    )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_inference_steps,
-            steps_computation_mask=cache_dit.steps_mask(
-                mask_policy=scm_preset, total_steps=num_inference_steps
-            ),
+            steps_computation_mask=steps_computation_mask,
             steps_computation_policy=scm_preset,
         ),
         verbose=verbose,
@@ -554,13 +557,21 @@ def refresh_context_on_dual_transformer(
     verbose: bool = False,
 ) -> None:
     """Refresh cache-dit context for dual transformers."""
+    high_mask = (
+        cache_dit.steps_mask(mask_policy=scm_preset, total_steps=num_high_noise_steps)
+        if scm_preset is not None
+        else None
+    )
+    low_mask = (
+        cache_dit.steps_mask(mask_policy=scm_preset, total_steps=num_low_noise_steps)
+        if scm_preset is not None
+        else None
+    )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_high_noise_steps,
-            steps_computation_mask=cache_dit.steps_mask(
-                mask_policy=scm_preset, total_steps=num_high_noise_steps
-            ),
+            steps_computation_mask=high_mask,
             steps_computation_policy=scm_preset,
         ),
         verbose=verbose,
@@ -569,9 +580,7 @@ def refresh_context_on_dual_transformer(
         transformer_2,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_low_noise_steps,
-            steps_computation_mask=cache_dit.steps_mask(
-                mask_policy=scm_preset, total_steps=num_low_noise_steps
-            ),
+            steps_computation_mask=low_mask,
             steps_computation_policy=scm_preset,
         ),
         verbose=verbose,
