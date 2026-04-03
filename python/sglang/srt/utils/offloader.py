@@ -141,7 +141,9 @@ class OffloaderV1(BaseOffloader):
                     k: v.to(device, non_blocking=True)
                     for k, v in module.state_dict().items()
                 }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                output = functional_call(
+                    module, device_state, args=args, kwargs=kwargs, tie_weights=False
+                )
                 module.forward = forward
                 return output
 
