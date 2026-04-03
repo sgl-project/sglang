@@ -1034,6 +1034,8 @@ class SchedulerOutputProcessorMixin:
                         and not req.input_logprob_sent
                         # Decode server does not send input logprobs
                         and self.disaggregation_mode != DisaggregationMode.DECODE
+                        # Only send when input logprobs have been computed (after prefill)
+                        and req.input_token_logprobs_val is not None
                     ):
                         input_token_logprobs_val.append(req.input_token_logprobs_val)
                         input_token_logprobs_idx.append(req.input_token_logprobs_idx)
@@ -1055,39 +1057,38 @@ class SchedulerOutputProcessorMixin:
                         input_token_ids_logprobs_idx.append([])
 
                     if req.return_logprob:
+                        logprob_end = max(len(output_ids_), 1)
                         output_token_logprobs_val.append(
                             req.output_token_logprobs_val[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_token_logprobs_idx.append(
                             req.output_token_logprobs_idx[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_top_logprobs_val.append(
                             req.output_top_logprobs_val[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_top_logprobs_idx.append(
                             req.output_top_logprobs_idx[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_token_ids_logprobs_val.append(
                             req.output_token_ids_logprobs_val[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_token_ids_logprobs_idx.append(
                             req.output_token_ids_logprobs_idx[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
-                        req.send_output_token_logprobs_offset = len(
-                            req.output_token_logprobs_val
-                        )
+                        req.send_output_token_logprobs_offset = logprob_end
                     else:
                         output_token_logprobs_val.append([])
                         output_token_logprobs_idx.append([])
