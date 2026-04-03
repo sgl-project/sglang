@@ -372,7 +372,7 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
-    if m.skip_topk:
+    if getattr(m, "skip_topk", False):
         topk_indices = prev_topk_indices
     else:
         topk_indices = m.indexer(
@@ -446,8 +446,8 @@ def forward_dsa_core_npu(
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
     output, _ = m.o_proj(attn_bmm_output)
-    if not m.next_skip_topk:
-        return output, None
+    if not getattr(m, "next_skip_topk", False):
+        return output
     else:
         return output, topk_indices
 
