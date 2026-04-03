@@ -456,4 +456,151 @@ class Mistral3ForConditionalGeneration(nn.Module):
         return loaded_params
 
 
+class Mistral3CausalLM(nn.Module):
+    """CausalLM variant for PE (Prompt Enhancement).
+
+    Uses ``self.model = MistralModel(config)`` directly (NOT Mistral3Model)
+    so that parameter names match the PE weight keys exactly::
+
+        model.embed_tokens.weight   ← model.embed_tokens.weight
+        model.layers.0.…            ← model.layers.0.…
+        model.norm.weight           ← model.norm.weight
+        lm_head.weight              ← lm_head.weight
+
+    Reuses the same MistralModel/MistralAttention (with USPAttention) as the
+    text encoder, and adds lm_head + a simple generate() for autoregressive
+    prompt enhancement.
+    """
+
+    def __init__(self, config: MistralConfig):
+        super().__init__()
+        self.model = MistralModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.config = config
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        logits = self.lm_head(outputs.last_hidden_state)
+        return BaseModelOutputWithPast(
+            last_hidden_state=logits,
+            past_key_values=outputs.past_key_values,
+        )
+
+    # ------------------------------------------------------------------
+    # Simple autoregressive generate() with KV-cache, top-p sampling
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 1536,
+        do_sample: bool = True,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        **kwargs,
+    ) -> torch.LongTensor:
+        """Minimal autoregressive generation with KV-cache."""
+        generated = input_ids
+
+        # --- prefill ---
+        outputs = self.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        next_logits = outputs.last_hidden_state[:, -1, :]
+
+        for _ in range(max_new_tokens):
+            next_token = self._sample(next_logits, temperature, top_p, do_sample)
+            generated = torch.cat([generated, next_token], dim=-1)
+
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+
+            # --- decode step ---
+            outputs = self.forward(
+                input_ids=next_token,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            next_logits = outputs.last_hidden_state[:, -1, :]
+
+        return generated
+
+    @staticmethod
+    def _sample(
+        logits: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        do_sample: bool,
+    ) -> torch.LongTensor:
+        """Sample a single token from logits with optional top-p."""
+        if not do_sample or temperature <= 0:
+            return logits.argmax(dim=-1, keepdim=True)
+
+        logits = logits / temperature
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+        cumprobs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # Zero out tokens beyond the top-p nucleus
+        remove_mask = cumprobs - torch.softmax(sorted_logits, dim=-1) > top_p
+        sorted_logits[remove_mask] = float("-inf")
+
+        probs = torch.softmax(sorted_logits, dim=-1)
+        sampled = torch.multinomial(probs, num_samples=1)
+        return sorted_idx.gather(1, sampled)
+
+    # ------------------------------------------------------------------
+    # Weight loading — names match PE safetensors keys 1-to-1
+    # ------------------------------------------------------------------
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # PE weights use flat namespace: model.* + lm_head.*
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+            else:
+                logger.warning("PE weight %s not matched to any parameter", name)
+
+        # Handle tie_word_embeddings: share embed_tokens → lm_head
+        if (
+            getattr(self.config, "tie_word_embeddings", False)
+            and "lm_head.weight" not in loaded_params
+            and "model.embed_tokens.weight" in loaded_params
+        ):
+            self.lm_head.weight = self.model.embed_tokens.weight
+            loaded_params.add("lm_head.weight")
+
+        return loaded_params
+
+
 EntryClass = Mistral3ForConditionalGeneration
