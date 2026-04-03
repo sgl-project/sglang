@@ -32,6 +32,8 @@ MONOLITH_PREFIX = "model.diffusion_model."
 VIDEO_CONNECTOR_PREFIX = f"{MONOLITH_PREFIX}video_embeddings_connector."
 AUDIO_CONNECTOR_PREFIX = f"{MONOLITH_PREFIX}audio_embeddings_connector."
 TEXT_PROJ_IN_PREFIX = f"{MONOLITH_PREFIX}text_proj_in."
+VIDEO_AGGREGATE_PREFIX = "text_embedding_projection.video_aggregate_embed."
+AUDIO_AGGREGATE_PREFIX = "text_embedding_projection.audio_aggregate_embed."
 
 
 def _load_json(path: str) -> dict:
@@ -56,6 +58,10 @@ def _rename_connector_key(key: str) -> str | None:
         return f"audio_connector.{suffix}"
     if key.startswith(TEXT_PROJ_IN_PREFIX):
         return key[len(MONOLITH_PREFIX) :]
+    if key.startswith(VIDEO_AGGREGATE_PREFIX):
+        return f"video_aggregate_embed.{key[len(VIDEO_AGGREGATE_PREFIX):]}"
+    if key.startswith(AUDIO_AGGREGATE_PREFIX):
+        return f"audio_aggregate_embed.{key[len(AUDIO_AGGREGATE_PREFIX):]}"
     return None
 
 
@@ -113,10 +119,16 @@ def _build_connectors_config(config_donor_dir: str) -> dict:
         "audio_connector_num_learnable_registers": text_encoder_config[
             "connector_num_learnable_registers"
         ],
+        "audio_feature_extractor_out_features": text_encoder_config[
+            "audio_feature_extractor_out_features"
+        ],
         "caption_channels": text_encoder_config["hidden_size"],
         "causal_temporal_positioning": False,
         "connector_apply_gated_attention": text_encoder_config[
             "connector_apply_gated_attention"
+        ],
+        "feature_extractor_in_features": text_encoder_config[
+            "feature_extractor_in_features"
         ],
         "connector_rope_base_seq_len": text_encoder_config[
             "connector_positional_embedding_max_pos"
@@ -128,6 +140,9 @@ def _build_connectors_config(config_donor_dir: str) -> dict:
         "rope_type": text_encoder_config["connector_rope_type"],
         "text_proj_in_factor": text_encoder_config["feature_extractor_in_features"]
         // text_encoder_config["hidden_size"],
+        "video_feature_extractor_out_features": text_encoder_config[
+            "video_feature_extractor_out_features"
+        ],
         "video_connector_attention_head_dim": text_encoder_config[
             "connector_attention_head_dim"
         ],

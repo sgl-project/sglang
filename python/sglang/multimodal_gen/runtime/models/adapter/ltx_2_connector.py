@@ -535,10 +535,36 @@ class LTX2TextConnectors(nn.Module):
         causal_temporal_positioning = config.causal_temporal_positioning
         rope_type = config.rope_type
         connector_apply_gated_attention = config.connector_apply_gated_attention
-
-        self.text_proj_in = nn.Linear(
-            caption_channels * text_proj_in_factor, caption_channels, bias=False
+        feature_extractor_in_features = config.feature_extractor_in_features
+        video_feature_extractor_out_features = (
+            config.video_feature_extractor_out_features
         )
+        audio_feature_extractor_out_features = (
+            config.audio_feature_extractor_out_features
+        )
+
+        self.text_proj_in: nn.Linear | None = None
+        self.video_aggregate_embed: nn.Linear | None = None
+        self.audio_aggregate_embed: nn.Linear | None = None
+        if (
+            feature_extractor_in_features > 0
+            and video_feature_extractor_out_features > 0
+            and audio_feature_extractor_out_features > 0
+        ):
+            self.video_aggregate_embed = nn.Linear(
+                feature_extractor_in_features,
+                video_feature_extractor_out_features,
+                bias=True,
+            )
+            self.audio_aggregate_embed = nn.Linear(
+                feature_extractor_in_features,
+                audio_feature_extractor_out_features,
+                bias=True,
+            )
+        else:
+            self.text_proj_in = nn.Linear(
+                caption_channels * text_proj_in_factor, caption_channels, bias=False
+            )
         self.video_connector = LTX2ConnectorTransformer1d(
             num_attention_heads=video_connector_num_attention_heads,
             attention_head_dim=video_connector_attention_head_dim,
@@ -578,12 +604,6 @@ class LTX2TextConnectors(nn.Module):
             )
             attention_mask = attention_mask.to(text_dtype) * torch.finfo(text_dtype).max
 
-        # Ensure input dtype matches the layer's weight dtype
-        if text_encoder_hidden_states.dtype != self.text_proj_in.weight.dtype:
-            text_encoder_hidden_states = text_encoder_hidden_states.to(
-                self.text_proj_in.weight.dtype
-            )
-
         # Ensure sequence length is divisible by num_learnable_registers (128)
         seq_len = text_encoder_hidden_states.shape[1]
         num_learnable_registers = self.video_connector.num_learnable_registers
@@ -600,10 +620,30 @@ class LTX2TextConnectors(nn.Module):
                 # Pad with a large negative value to mask out the new tokens
                 attention_mask = F.pad(attention_mask, (0, pad_len), value=-1000000.0)
 
-        text_encoder_hidden_states = self.text_proj_in(text_encoder_hidden_states)
+        if self.video_aggregate_embed is not None and self.audio_aggregate_embed is not None:
+            video_hidden_states = text_encoder_hidden_states
+            audio_hidden_states = text_encoder_hidden_states
+            if video_hidden_states.dtype != self.video_aggregate_embed.weight.dtype:
+                video_hidden_states = video_hidden_states.to(
+                    self.video_aggregate_embed.weight.dtype
+                )
+            if audio_hidden_states.dtype != self.audio_aggregate_embed.weight.dtype:
+                audio_hidden_states = audio_hidden_states.to(
+                    self.audio_aggregate_embed.weight.dtype
+                )
+            video_hidden_states = self.video_aggregate_embed(video_hidden_states)
+            audio_hidden_states = self.audio_aggregate_embed(audio_hidden_states)
+        else:
+            assert self.text_proj_in is not None
+            if text_encoder_hidden_states.dtype != self.text_proj_in.weight.dtype:
+                text_encoder_hidden_states = text_encoder_hidden_states.to(
+                    self.text_proj_in.weight.dtype
+                )
+            video_hidden_states = self.text_proj_in(text_encoder_hidden_states)
+            audio_hidden_states = video_hidden_states
 
         video_text_embedding, new_attn_mask = self.video_connector(
-            text_encoder_hidden_states, attention_mask
+            video_hidden_states, attention_mask
         )
 
         attn_mask = (new_attn_mask < 1e-6).to(torch.int64)
@@ -614,7 +654,7 @@ class LTX2TextConnectors(nn.Module):
         new_attn_mask = attn_mask.squeeze(-1)
 
         audio_text_embedding, _ = self.audio_connector(
-            text_encoder_hidden_states, attention_mask
+            audio_hidden_states, attention_mask
         )
 
         return video_text_embedding, audio_text_embedding, new_attn_mask
