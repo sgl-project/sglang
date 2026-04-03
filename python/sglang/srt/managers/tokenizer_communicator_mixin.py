@@ -59,8 +59,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
-    PinPrefixReqInput,
-    PinPrefixReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -216,9 +214,6 @@ class TokenizerCommunicatorMixin:
         self.detach_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.pin_prefix_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -310,10 +305,6 @@ class TokenizerCommunicatorMixin:
                     self.detach_hicache_storage_communicator.handle_recv,
                 ),
                 (
-                    PinPrefixReqOutput,
-                    self.pin_prefix_communicator.handle_recv,
-                ),
-                (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
                 ),
@@ -352,9 +343,13 @@ class TokenizerCommunicatorMixin:
             ]
         )
 
-    async def flush_cache(self: TokenizerManager) -> FlushCacheReqOutput:
+    async def flush_cache(
+        self: TokenizerManager, timeout_s: Optional[float] = None
+    ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
+        return (
+            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+        )[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
@@ -416,19 +411,6 @@ class TokenizerCommunicatorMixin:
             self.server_args.hicache_storage_backend = None
             self.server_args.hicache_storage_backend_extra_config = None
         return out
-
-    async def pin_prefix(
-        self: TokenizerManager, token_ids: List[int], ttl_seconds: int = 300
-    ) -> PinPrefixReqOutput:
-        """Pin a prefix by token_ids to resist eviction."""
-        results = await self.pin_prefix_communicator(
-            PinPrefixReqInput(token_ids=token_ids, ttl_seconds=ttl_seconds)
-        )
-        all_success, all_message = _Communicator.merge_results(results)
-        total = sum(r.nodes_pinned for r in results)
-        return PinPrefixReqOutput(
-            success=all_success, nodes_pinned=total, message=all_message
-        )
 
     async def start_profile(
         self: TokenizerManager,

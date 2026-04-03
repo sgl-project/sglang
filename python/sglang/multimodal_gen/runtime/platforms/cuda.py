@@ -189,7 +189,7 @@ class CudaPlatformBase(Platform):
             logger.warning(
                 "best performance kit (comfy-kitchen) is not installed. "
                 "Blackwell NVFP4 will fall back to the generic ModelOpt FP4 path. "
-                "Install it with `pip install comfy-kitchen`."
+                "Install it with `pip install comfy-kitchen[cublas]`."
             )
 
     @classmethod
