@@ -32,27 +32,6 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
     get_threshold,
 )
 
-STAGED_1GPU_NATIVE_CASE_IDS = {
-    "flux_2_image_t2i",
-    "qwen_image_layered_i2i",
-    "flux_2_image_t2i_upscaling_4x",
-    "flux_2_ti2i",
-    "flux_2_t2i_customized_vae_path",
-    "flux_2_ti2i_multi_image_cache_dit",
-}
-
-# These case allowlists are accuracy-runner policy. They select the few 1-GPU
-# cases that need sequential SGLang/reference execution to stay within memory
-# limits during CI and local correctness runs.
-STAGED_1GPU_TEXT_ENCODER_CASE_IDS = {
-    "flux_2_image_t2i",
-    "flux_2_image_t2i_upscaling_4x",
-    "mova_360p_1gpu",
-    "flux_2_ti2i",
-    "flux_2_t2i_customized_vae_path",
-    "flux_2_ti2i_multi_image_cache_dit",
-}
-
 SOURCE_PREFIXES = (
     "module.",
     "model.",
@@ -680,16 +659,6 @@ def run_text_encoder_accuracy_pair(
     )
 
 
-def _should_stage_case(case: Any, component: ComponentType, num_gpus: int) -> bool:
-    if num_gpus == 2:
-        return True
-    if num_gpus != 1:
-        return False
-    if component == ComponentType.TEXT_ENCODER:
-        return case.id in STAGED_1GPU_TEXT_ENCODER_CASE_IDS
-    return case.id in STAGED_1GPU_NATIVE_CASE_IDS
-
-
 def _run_single_text_encoder_forward(
     model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
@@ -823,58 +792,10 @@ def run_native_component_accuracy_case(
     library: str,
     num_gpus: int,
 ) -> None:
-    if _should_stage_case(case, component, num_gpus):
-        _run_staged_native_component_accuracy_case(
-            engine_cls, case, component, library, num_gpus
-        )
-        return
-    engine_cls.clear_memory()
-    sgl = None
-    ref = None
-    try:
-        sgl, ref, device = engine_cls.load_component_pair(
-            case, component, library, num_gpus
-        )
-        sgl_out, ref_out = engine_cls.run_component_pair_native(
-            case, component, sgl, ref, device
-        )
-        engine_cls.check_accuracy(
-            sgl_out,
-            ref_out,
-            f"{case.id}_{component.value}",
-            get_threshold(case.id, component),
-        )
-    finally:
-        if sgl is not None:
-            del sgl
-        if ref is not None:
-            del ref
-        engine_cls.reset_parallel_runtime()
-        engine_cls.clear_memory()
+    _run_staged_native_component_accuracy_case(
+        engine_cls, case, component, library, num_gpus
+    )
 
 
 def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_gpus: int) -> None:
-    if _should_stage_case(case, ComponentType.TEXT_ENCODER, num_gpus):
-        _run_staged_text_encoder_accuracy_case(engine_cls, case, num_gpus)
-        return
-    engine_cls.clear_memory()
-    sgl = None
-    ref = None
-    try:
-        sgl, ref, _device = engine_cls.load_component_pair(
-            case, ComponentType.TEXT_ENCODER, "transformers", num_gpus
-        )
-        sgl_out, ref_out = run_text_encoder_accuracy_pair(sgl, ref)
-        engine_cls.check_accuracy(
-            sgl_out,
-            ref_out,
-            f"{case.id}_encoder",
-            get_threshold(case.id, ComponentType.TEXT_ENCODER),
-        )
-    finally:
-        if sgl is not None:
-            del sgl
-        if ref is not None:
-            del ref
-        engine_cls.reset_parallel_runtime()
-        engine_cls.clear_memory()
+    _run_staged_text_encoder_accuracy_case(engine_cls, case, num_gpus)
