@@ -671,23 +671,17 @@ class GroupCoordinator:
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
 
-        # 1-stage policy for fused AR+RMSNorm:
-        # 1) Explicit env override wins.
-        # 2) Deterministic inference forces 1-stage for reproducibility.
-        # 3) Otherwise follow AITER's heuristic (small payloads only).
+        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
+        # The 1-stage kernel launches one block per token and is capped at
+        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
+        # prefill batches fall through to the 2-stage kernel instead of
+        # hitting a runtime error.  AITER's C++ dispatch already gates
+        # which hidden_dims have valid 1-stage support.
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
-        elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
-            use_1stage_ar = True
         else:
             total_bytes = input_.numel() * input_.element_size()
-            hidden_dim = input_.shape[-1]
-            use_1stage_ar = total_bytes <= 128 * 1024 and hidden_dim in {
-                512,
-                1024,
-                2048,
-                4096,
-            }
+            use_1stage_ar = total_bytes <= 128 * 1024
 
         fused_outputs = ca_comm.custom_fused_ar_rms(
             input_,
