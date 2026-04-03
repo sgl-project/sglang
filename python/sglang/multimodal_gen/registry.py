@@ -209,7 +209,6 @@ class ConfigInfo:
 
     sampling_param_cls: Any
     pipeline_config_cls: Type[PipelineConfig]
-    pipeline_class_name: Optional[str] = None
 
 
 # The central registry mapping a model name to its configuration information
@@ -225,7 +224,6 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 def register_configs(
     sampling_param_cls: Any,
     pipeline_config_cls: Type[PipelineConfig],
-    pipeline_class_name: Optional[str] = None,
     hf_model_paths: Optional[List[str]] = None,
     model_detectors: Optional[List[Callable[[str], bool]]] = None,
 ):
@@ -237,7 +235,6 @@ def register_configs(
     _CONFIG_REGISTRY[model_id] = ConfigInfo(
         sampling_param_cls=sampling_param_cls,
         pipeline_config_cls=pipeline_config_cls,
-        pipeline_class_name=pipeline_class_name,
     )
     if hf_model_paths:
         for path in hf_model_paths:
@@ -489,21 +486,12 @@ def get_model_info(
         )
         return _get_diffusers_model_info(model_path=model_path, model_id=model_id)
 
-    config_info = _get_config_info(model_path, model_id=model_id)
-
     # 2. Get pipeline class - check non-diffusers models first
     pipeline_class_name = get_non_diffusers_pipeline_name(model_path)
     if pipeline_class_name:
         # Known non-diffusers model, skip model_index.json download
         logger.debug(
             f"Using registered pipeline '{pipeline_class_name}' for non-diffusers model '{model_path}'"
-        )
-    elif config_info and config_info.pipeline_class_name:
-        pipeline_class_name = config_info.pipeline_class_name
-        logger.debug(
-            "Using registered native pipeline '%s' for model '%s' without model_index.json",
-            pipeline_class_name,
-            model_path,
         )
     else:
         # Try to get from model_index.json
@@ -547,6 +535,7 @@ def get_model_info(
             return None
 
     # 3. Get configuration classes (sampling, pipeline config)
+    config_info = _get_config_info(model_path, model_id=model_id)
     if not config_info:
         if backend == Backend.AUTO:
             logger.warning(
@@ -714,7 +703,6 @@ def _register_configs():
     register_configs(
         sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=FluxPipelineConfig,
-        pipeline_class_name="FluxPipeline",
         hf_model_paths=[
             "black-forest-labs/FLUX.1-dev",
         ],
@@ -723,7 +711,6 @@ def _register_configs():
     register_configs(
         sampling_param_cls=Flux2KleinSamplingParams,
         pipeline_config_cls=Flux2KleinPipelineConfig,
-        pipeline_class_name="Flux2KleinPipeline",
         hf_model_paths=[
             "black-forest-labs/FLUX.2-klein-4B",
             "black-forest-labs/FLUX.2-klein-9B",
@@ -736,7 +723,6 @@ def _register_configs():
     register_configs(
         sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
-        pipeline_class_name="Flux2Pipeline",
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
             "black-forest-labs/FLUX.2-dev-NVFP4",
