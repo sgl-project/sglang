@@ -89,6 +89,7 @@ class LTX2Attention(torch.nn.Module):
         norm_eps: float = 1e-6,
         norm_elementwise_affine: bool = True,
         rope_type: str = "interleaved",
+        apply_gated_attention: bool = False,
         processor=None,
     ):
         super().__init__()
@@ -125,6 +126,9 @@ class LTX2Attention(torch.nn.Module):
         self.to_v = torch.nn.Linear(
             self.cross_attention_dim, self.inner_kv_dim, bias=bias
         )
+        self.to_gate_logits = None
+        if apply_gated_attention:
+            self.to_gate_logits = torch.nn.Linear(query_dim, heads, bias=True)
         self.to_out = torch.nn.ModuleList([])
         self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
         self.to_out.append(torch.nn.Dropout(dropout))
@@ -153,6 +157,7 @@ class LTX2Attention(torch.nn.Module):
         query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        gate_input = hidden_states
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
@@ -198,6 +203,15 @@ class LTX2Attention(torch.nn.Module):
         )
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
+
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(gate_input)
+            b, t, _ = hidden_states.shape
+            hidden_states = hidden_states.view(b, t, self.heads, self.head_dim)
+            hidden_states = hidden_states * (
+                2.0 * torch.sigmoid(gate_logits).unsqueeze(-1)
+            )
+            hidden_states = hidden_states.view(b, t, self.heads * self.head_dim)
 
         hidden_states = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
@@ -317,6 +331,7 @@ class LTX2TransformerBlock1d(nn.Module):
         activation_fn: str = "gelu-approximate",
         eps: float = 1e-6,
         rope_type: str = "interleaved",
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
 
@@ -327,6 +342,7 @@ class LTX2TransformerBlock1d(nn.Module):
             kv_heads=num_attention_heads,
             dim_head=attention_head_dim,
             rope_type=rope_type,
+            apply_gated_attention=apply_gated_attention,
         )
 
         self.norm2 = torch.nn.RMSNorm(dim, eps=eps, elementwise_affine=False)
@@ -373,6 +389,7 @@ class LTX2ConnectorTransformer1d(nn.Module):
         eps: float = 1e-6,
         causal_temporal_positioning: bool = False,
         rope_type: str = "interleaved",
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -403,6 +420,7 @@ class LTX2ConnectorTransformer1d(nn.Module):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     rope_type=rope_type,
+                    apply_gated_attention=apply_gated_attention,
                 )
                 for _ in range(num_layers)
             ]
@@ -516,6 +534,7 @@ class LTX2TextConnectors(nn.Module):
         rope_double_precision = config.rope_double_precision
         causal_temporal_positioning = config.causal_temporal_positioning
         rope_type = config.rope_type
+        connector_apply_gated_attention = config.connector_apply_gated_attention
 
         self.text_proj_in = nn.Linear(
             caption_channels * text_proj_in_factor, caption_channels, bias=False
@@ -530,6 +549,7 @@ class LTX2TextConnectors(nn.Module):
             rope_double_precision=rope_double_precision,
             causal_temporal_positioning=causal_temporal_positioning,
             rope_type=rope_type,
+            apply_gated_attention=connector_apply_gated_attention,
         )
         self.audio_connector = LTX2ConnectorTransformer1d(
             num_attention_heads=audio_connector_num_attention_heads,
@@ -541,6 +561,7 @@ class LTX2TextConnectors(nn.Module):
             rope_double_precision=rope_double_precision,
             causal_temporal_positioning=causal_temporal_positioning,
             rope_type=rope_type,
+            apply_gated_attention=connector_apply_gated_attention,
         )
 
     def forward(

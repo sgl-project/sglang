@@ -15,6 +15,7 @@ class LTX2ConnectorArchConfig(AdapterArchConfig):
     caption_channels: int = 3840
     causal_temporal_positioning: bool = False
     connector_rope_base_seq_len: int = 4096
+    connector_apply_gated_attention: bool = False
     rope_double_precision: bool = True
     rope_theta: float = 10000.0
     rope_type: str = "split"

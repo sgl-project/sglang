@@ -1,31 +1,35 @@
+import os
+
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
-    load_overlay_manifest_if_present,
     maybe_load_overlay_model_index,
     resolve_model_overlay_target,
 )
 
 
-def test_ltx23_builtin_overlay_target_is_local():
+def test_ltx23_builtin_overlay_target_is_hf_repo():
     target = resolve_model_overlay_target("Lightricks/LTX-2.3")
     assert target is not None
 
     source_model_id, overlay_spec = target
     assert source_model_id == "Lightricks/LTX-2.3"
-    assert str(overlay_spec["overlay_revision"]) == "local"
-
-    overlay_dir = str(overlay_spec["overlay_repo_id"])
-    manifest = load_overlay_manifest_if_present(overlay_dir)
-    assert manifest is not None
-    assert manifest["source_model_id"] == "Lightricks/LTX-2.3"
+    assert str(overlay_spec["overlay_revision"]) == "main"
+    assert str(overlay_spec["overlay_repo_id"]) == "MickJ/LTX-2.3-overlay"
 
 
 def test_ltx23_overlay_model_index_is_native():
+    local_overlay_dir = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "model_overlays",
+            "ltx_2_3",
+        )
+    )
     model_index = maybe_load_overlay_model_index(
         "Lightricks/LTX-2.3",
-        snapshot_download_fn=lambda **kwargs: str(
-            resolve_model_overlay_target("Lightricks/LTX-2.3")[1]["overlay_repo_id"]
-        ),
+        snapshot_download_fn=lambda **kwargs: local_overlay_dir,
         hf_hub_download_fn=lambda **kwargs: None,
     )
     assert model_index is not None
