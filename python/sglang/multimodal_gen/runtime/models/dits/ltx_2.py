@@ -1071,7 +1071,7 @@ class LTX2TransformerBlock(nn.Module):
             )
         # 4. Feedforward
         vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
-            self.scale_shift_table, batch_size, temb, slice(3, None)
+            self.scale_shift_table, batch_size, temb, slice(3, 6)
         )
         norm_hidden_states = (
             rms_norm(hidden_states, self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
@@ -1080,7 +1080,7 @@ class LTX2TransformerBlock(nn.Module):
         hidden_states = hidden_states + ff_output * vgate_mlp
 
         ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
-            self.audio_scale_shift_table, batch_size, temb_audio, slice(3, None)
+            self.audio_scale_shift_table, batch_size, temb_audio, slice(3, 6)
         )
         norm_audio_hidden_states = (
             rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
