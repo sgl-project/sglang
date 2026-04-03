@@ -81,6 +81,8 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
+    # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
+    staging: Optional[StagingTransferInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
