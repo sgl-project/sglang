@@ -69,6 +69,8 @@ CACHE_ARGS=()
 if [ "${USE_DOCKER_CACHE:-1}" != "0" ]; then
   CACHE_ARGS+=(--cache-from "type=local,src=${BUILDX_CACHE_DIR}")
   CACHE_ARGS+=(--cache-to "type=local,dest=${BUILDX_CACHE_DIR},mode=max")
+else
+  CACHE_ARGS+=(--no-cache)
 fi
 
 docker buildx build \
