@@ -12,9 +12,9 @@ from sglang.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
 )
-from sglang.utils import convert_json_schema_to_str
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.utils import convert_json_schema_to_str
 
 register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
 
@@ -165,7 +165,9 @@ class TestChatCompletionRequest(CustomTestCase):
             )
         )
 
-    def test_to_sampling_params_response_format_json_schema_sets_json_schema_param(self):
+    def test_to_sampling_params_response_format_json_schema_sets_json_schema_param(
+        self,
+    ):
         """Test json_schema response_format sets the json_schema sampling param."""
         req = ChatCompletionRequest(
             messages=[{"role": "user", "content": "structured output"}],
