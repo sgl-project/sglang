@@ -541,6 +541,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if forward_mode.is_target_verify():
             seq_lens = seq_lens[:bs] + self.num_draft_tokens
             metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
+            metadata.max_seq_len_k = max(seq_lens)
             del seq_lens_sum  # not handle "num_draft_tokens" but we do not need it
         elif forward_mode.is_draft_extend(include_v2=True):
             accept_length = spec_info.accept_length[:bs]
@@ -550,15 +551,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             else:
                 metadata.max_seq_len_q = 1
                 metadata.sum_seq_lens_q = bs
-            # draft_extend uses (accept_length + 1) query tokens per sequence
-            extend_seq_lens = accept_length + 1
             metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
             )
-            metadata.seq_lens_q.copy_(extend_seq_lens)
+            metadata.seq_lens_q.copy_(accept_length)
             # see NOTE(draft_extend seq_len handling)
             seq_lens = seq_lens[:bs] - metadata.seq_lens_q + metadata.max_seq_len_q
             metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
+            metadata.max_seq_len_k = max(seq_lens)
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[(bs,)](
@@ -997,60 +997,27 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q = q.to(self.data_type)
 
             bmm1_scale = q_scale * k_scale * layer.scaling
-            if forward_batch.forward_mode.is_target_verify():
-                max_seq_len = (
-                    metadata.max_seq_len_k + forward_batch.spec_info.draft_token_num
-                )
-                # For target_verify, all sequences have the same number of draft tokens
-                q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-                needs_unpad = False
-            else:
-                # draft_extend: handle varying accept_lengths. If total_tokens % bs == 0,
-                # we can directly reshape q; otherwise, pad to max_seq_len_q.
-                total_tokens = q.shape[0]
-                tokens_per_seq = total_tokens // bs if bs > 0 else 0
-                can_direct_view = bs > 0 and (total_tokens % bs == 0)
-
-                if can_direct_view:
-                    max_seq_len = metadata.max_seq_len_k + tokens_per_seq
-                    q = q.view(bs, tokens_per_seq, layer.tp_q_head_num, layer.head_dim)
-                    needs_unpad = False
+            if forward_batch.forward_mode.is_draft_extend(include_v2=True):
+                # Check if we're in CUDA graph mode (buffers are pre-allocated)
+                if self.padded_q_buffer is not None:
+                    # Use pre-allocated buffer for CUDA graph compatibility
+                    padded_q = self.padded_q_buffer[
+                        :bs, : metadata.max_seq_len_q, :, :
+                    ].to(dtype=q.dtype)
                 else:
-                    # Varying lengths: pad q to (bs, max_seq_len_q, ...)
-                    actual_seq_lens_q = forward_batch.extend_seq_lens
-                    actual_max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
-                    max_seq_len = metadata.max_seq_len_k + actual_max_seq_len_q
-
-                    actual_cu_seqlens_q = torch.nn.functional.pad(
-                        torch.cumsum(actual_seq_lens_q, dim=0, dtype=torch.int32),
-                        (1, 0),
+                    # Dynamic allocation for non-CUDA graph mode
+                    padded_q = torch.zeros(
+                        bs,
+                        metadata.max_seq_len_q,
+                        layer.tp_q_head_num,
+                        layer.head_dim,
+                        dtype=q.dtype,
+                        device=q.device,
                     )
-
-                    if self.padded_q_buffer is not None:
-                        padded_q = self.padded_q_buffer[
-                            :bs, :actual_max_seq_len_q, :, :
-                        ].to(dtype=q.dtype)
-                        padded_q.zero_()
-                    else:
-                        padded_q = torch.zeros(
-                            (
-                                bs,
-                                actual_max_seq_len_q,
-                                layer.tp_q_head_num,
-                                layer.head_dim,
-                            ),
-                            dtype=q.dtype,
-                            device=q.device,
-                        )
-
-                    q = self.pad_draft_extend_query(
-                        q, padded_q, actual_seq_lens_q, actual_cu_seqlens_q
-                    )
-                    needs_unpad = True
-                    unpad_seq_lens_q = actual_seq_lens_q
-                    unpad_cu_seqlens_q = actual_cu_seqlens_q
-                    unpad_sum_seq_lens_q = total_tokens
-
+                q = self.pad_draft_extend_query(
+                    q, padded_q, metadata.seq_lens_q, metadata.cu_seqlens_q
+                )
+            q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
             assert kv_cache.dtype == self.data_type
 
             raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -1062,23 +1029,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 block_tables=metadata.block_kv_indices,
                 seq_lens=metadata.seq_lens_k,
-                max_seq_len=max_seq_len,
+                max_seq_len=metadata.max_seq_len_k,
                 bmm1_scale=bmm1_scale,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
 
-            if needs_unpad:
-                # Unpad the output for draft_extend mode with varying lengths
-                # Use the actual values computed during padding, not from metadata
+            if forward_batch.forward_mode.is_draft_extend(include_v2=True):
+                # 需要使用 unpad_draft_extend_output 处理变长输出
                 output = self.unpad_draft_extend_output(
                     raw_out,
-                    unpad_cu_seqlens_q,
-                    unpad_seq_lens_q,
-                    unpad_sum_seq_lens_q,
+                    metadata.cu_seqlens_q,
+                    metadata.seq_lens_q,
+                    metadata.sum_seq_lens_q,
                 )
-                output = output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-            else:
-                output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             return output
 
         if k_rope is not None:
