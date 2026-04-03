@@ -626,11 +626,10 @@ __global__ void Marlin(
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
 
   // Scale sizes/strides without act_order
-  int s_gl_stride = prob_n / 8;
-  constexpr int s_sh_stride = 16 * thread_n_blocks / 8;
-  constexpr int s_tb_groups = !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks
-                                  ? thread_k_blocks / group_blocks / (w_type == host::kFE2M1f ? 2 : 1)
-                                  : 1;
+  int s_gl_stride = prob_n / (w_type == host::kFE2M1f ? 16 : 8);
+  constexpr int s_sh_stride = 16 * thread_n_blocks / (w_type == host::kFE2M1f ? 16 : 8);
+  constexpr int s_tb_groups =
+      !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks ? thread_k_blocks / group_blocks : 1;
   constexpr int s_sh_stage = s_tb_groups * s_sh_stride;
   int s_gl_rd_delta = s_gl_stride;
 
@@ -682,8 +681,7 @@ __global__ void Marlin(
     if constexpr (group_blocks == -1) {
       s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
     } else {
-      s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) / (w_type == host::kFE2M1f ? 2 : 1) +
-                s_sh_stride * slice_col + threadIdx.x;
+      s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col + threadIdx.x;
     }
   }
   auto s_sh_wr = threadIdx.x;
@@ -705,15 +703,7 @@ __global__ void Marlin(
   // we scale a `half2` tile in column-major layout in the former and in
   // row-major in the latter case.
   int s_sh_rd;
-  if constexpr (group_blocks != -1 && w_type == host::kFE2M1f) {
-    auto warp_id = threadIdx.x / 32;
-    int n_warps = thread_n_blocks / 4;
-    int warp_row = warp_id / n_warps;
-
-    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
-    s_sh_rd = s_sh_rd * 2 + (warp_row / group_blocks) % 2;
-
-  } else if constexpr (group_blocks != -1)
+  if constexpr (group_blocks != -1)
     s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
   else if constexpr (group_blocks == -1 && (m_block_size_8 || (has_zp && !dequant_skip_flop)))
     s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 8;
@@ -1038,18 +1028,15 @@ __global__ void Marlin(
           cur_k += k_iter_size * (k % b_sh_wr_iters);
 
           int k_blocks = cur_k / 16;
-          int cur_group_id = k_blocks / (group_blocks * (w_type == host::kFE2M1f ? 2 : 1));
+          int cur_group_id = k_blocks / group_blocks;
 
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
           if constexpr (w_type_id != host::kFE2M1f.id()) {
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
-          } else if constexpr (group_blocks == 1 || thread_k_blocks > 4) {
-            reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
-                reinterpret_cast<int2*>(sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
           } else {
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
-                reinterpret_cast<int2*>(sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride) + k % 2];
+                reinterpret_cast<int2*>(sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
           }
         }
       }
@@ -1243,17 +1230,19 @@ __global__ void Marlin(
       }
     }
 
-    // Commented out FP4/FP8 scale dequantization since we don't generate
-    // kFE2M1f kernels to reduce compilation time
-    // if constexpr (w_type == host::kFE2M1f) {
-    //   int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
-    //   int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
-    //
-    //   dequant_fp8_scales<scalar_t2, s_type_id>(
-    //       s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
-    //   dequant_fp8_scales<scalar_t2, s_type_id>(
-    //       s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
-    // }
+#ifdef SGL_MOE_MARLIN_FP4
+    // Convert FP8 per-group scales to BF16/FP16 before applying them.
+    // Required for kFE2M1f (NVFP4): frag_s holds raw float8_e4m3fn bytes;
+    // without this conversion scale<scalar_t> would misinterpret them as
+    // BF16/FP16, producing NaN/Inf multipliers.
+    if constexpr (w_type == host::kFE2M1f) {
+      int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
+      int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
+
+      dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
+      dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
+    }
+#endif
 
 // We have the m dimension as the inner loop in order to encourage overlapping
 // dequantization and matmul operations.
