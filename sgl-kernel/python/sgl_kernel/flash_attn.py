@@ -68,6 +68,7 @@ def flash_attn_with_kvcache(
     score_mod=None,
     aux_tensors=None,
     ver=3,
+    out=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -193,7 +194,7 @@ def flash_attn_with_kvcache(
         k,
         v,
         qv,
-        None,  # out
+        out,  # out (pre-allocated output to avoid DtoD copy)
         cu_seqlens_q,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,

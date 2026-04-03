@@ -186,6 +186,7 @@ def unified_attention_with_output(
         attention_layer,
         forward_batch,
         save_kv_cache,
+        output=output,
         **kwargs,
     )
     forward_batch.out_cache_loc = original_out_cache_loc
@@ -195,5 +196,6 @@ def unified_attention_with_output(
     ):
         token_to_kv_pool.set_swa_loc(original_swa_loc)
 
-    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    if ret.data_ptr() != output.data_ptr():
+        output[:real_num_tokens].view(ret.shape).copy_(ret)
     return
