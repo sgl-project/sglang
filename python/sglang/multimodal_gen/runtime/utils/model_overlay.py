@@ -24,8 +24,12 @@ from sglang.utils import load_diffusion_overlay_registry_from_env
 logger = init_logger(__name__)
 
 # Built-in diffusion model overlay registry.
-# Keep this empty until concrete overlay repos are ready to ship.
-BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {}
+BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
+    "Lightricks/LTX-2.3": {
+        "overlay_repo_id": "MickJ/LTX-2.3-overlay",
+        "overlay_revision": "main",
+    },
+}
 
 
 MODEL_OVERLAY_METADATA_PATTERNS = [

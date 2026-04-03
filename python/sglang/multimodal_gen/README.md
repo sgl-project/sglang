@@ -76,11 +76,6 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
-For LTX-2 two-stage generation, use `--pipeline-class-name LTX2TwoStagePipeline`. The
-spatial upsampler and distilled LoRA are auto-resolved from the same model snapshot by
-default, and can still be overridden with `--spatial-upsampler-path` and
-`--distilled-lora-path` when needed.
-
 ### LoRA support
 
 Apply LoRA adapters via `--lora-path`:

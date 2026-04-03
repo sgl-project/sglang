@@ -44,6 +44,8 @@ def _resolve_ltx2_two_stage_component_paths(
     if "spatial_upsampler" not in resolved:
         spatial_candidates = [
             os.path.join(model_path, "latent_upsampler"),
+            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"),
             os.path.join(model_path, "ltx-2-spatial-upscaler-x2-1.0.safetensors"),
         ]
         for candidate in spatial_candidates:
@@ -53,12 +55,15 @@ def _resolve_ltx2_two_stage_component_paths(
                 break
 
     if "distilled_lora" not in resolved:
-        distilled_lora = os.path.join(
-            model_path, "ltx-2-19b-distilled-lora-384.safetensors"
-        )
-        if os.path.exists(distilled_lora):
-            resolved["distilled_lora"] = distilled_lora
-            auto_resolved.append(f"distilled_lora={distilled_lora}")
+        distilled_lora_candidates = [
+            os.path.join(model_path, "ltx-2.3-22b-distilled-lora-384.safetensors"),
+            os.path.join(model_path, "ltx-2-19b-distilled-lora-384.safetensors"),
+        ]
+        for distilled_lora in distilled_lora_candidates:
+            if os.path.exists(distilled_lora):
+                resolved["distilled_lora"] = distilled_lora
+                auto_resolved.append(f"distilled_lora={distilled_lora}")
+                break
 
     if auto_resolved:
         logger.info(

@@ -595,6 +595,7 @@ def _register_configs():
         pipeline_config_cls=LTX2PipelineConfig,
         hf_model_paths=[
             "Lightricks/LTX-2",
+            "Lightricks/LTX-2.3",
         ],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
