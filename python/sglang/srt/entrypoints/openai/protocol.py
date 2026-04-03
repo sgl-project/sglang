@@ -585,6 +585,7 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
@@ -1443,6 +1444,7 @@ class TranscriptionRequest(BaseModel):
     language: Optional[str] = None
     response_format: str = "json"
     temperature: float = 0.0
+    timestamp_granularities: Optional[List[str]] = None
     stream: bool = False
     # Internal fields (not from API)
     audio_data: Optional[bytes] = None
@@ -1460,6 +1462,26 @@ class TranscriptionResponse(BaseModel):
     """Non-streaming transcription response (OpenAI-compatible)."""
 
     text: str
+    usage: Optional[TranscriptionUsage] = None
+
+
+class TranscriptionSegment(BaseModel):
+    """A segment with timestamp information."""
+
+    id: int
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptionVerboseResponse(BaseModel):
+    """Verbose transcription response with timestamps (OpenAI-compatible)."""
+
+    task: str = "transcribe"
+    language: Optional[str] = None
+    duration: Optional[float] = None
+    text: str
+    segments: List[TranscriptionSegment] = []
     usage: Optional[TranscriptionUsage] = None
 
 

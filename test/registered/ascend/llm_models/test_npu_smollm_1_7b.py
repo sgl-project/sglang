@@ -5,7 +5,7 @@ from sglang.test.ascend.test_ascend_utils import SMOLLM_1_7B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
 
 
 class TestSmolLM(GSM8KAscendMixin, CustomTestCase):

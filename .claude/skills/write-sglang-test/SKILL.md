@@ -92,9 +92,22 @@ Defined in `python/sglang/test/test_utils.py`:
 | `stage-c-test-large-8-gpu-amd` | `linux-mi325-8gpu-sglang` | 8-GPU MI325 scaling and integration |
 | `stage-c-test-large-8-gpu-amd-mi35x` | `linux-mi35x-gpu-8` | 8-GPU MI35x scaling (2 partitions) |
 
+
+### Per-commit (Ascend NPU)
+
+| Suite | Runner (label) | Description |
+| --- | --- | --- |
+| `per-commit-1-npu-a2` | `linux-aarch64-a2-1` | 1-NPU LLM CI machine |
+| `per-commit-2-npu-a2` | `linux-aarch64-a2-2` | 2-NPU LLM CI machine |
+| `per-commit-4-npu-a3` | `linux-aarch64-a3-4` | 4-NPU LLM CI machine |
+| `per-commit-16-npu-a3` | `linux-aarch64-a3-16` | 16-NPU LLM CI machine  |
+| `multimodal-gen-test-1-npu-a3` | `linux-aarch64-a3-2` | 1-NPU multimodal CI machine |
+| `multimodal-gen-test-2-npu-a3` | `linux-aarch64-a3-16` | 2-NPU multimodal CI machine |
+| `multimodal-gen-test-8-npu-a3` | `linux-aarch64-a3-16` | 8-NPU multimodal CI machine |
+
 #### Nightly
 
-Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml` and `nightly-test-amd.yml`, not `pr-test.yml`. Examples:
+Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml` amd `nightly-test-npu.yml`, not `pr-test.yml`. Examples:
 
 - `nightly-1-gpu` (CUDA)
 - `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
@@ -103,6 +116,11 @@ Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../
 - `nightly-eval-vlm-2-gpu` (CUDA)
 - `nightly-amd` (AMD)
 - `nightly-amd-8-gpu-mi35x` (AMD)
+- `nightly-1-npu-a3` (NPU)
+- `nightly-2-npu-a3` (NPU)
+- `nightly-4-npu-a3` (NPU)
+- `nightly-8-npu-a3` (NPU)
+- `nightly-16-npu-a3` (NPU)
 
 > **Note**: Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
@@ -154,7 +172,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-Use `unittest.mock.patch` / `MagicMock` to mock dependencies and isolate the logic under test. If the module fails to import on CPU CI (e.g., imports `torch` or CUDA ops at module level), use `sys.modules` stubs to make the import succeed. See existing tests in `test/registered/unit/` for examples.
+Use `unittest.mock.patch` / `MagicMock` to mock dependencies and isolate the logic under test. If the module transitively imports GPU-only packages (e.g. `sgl_kernel`), they can be stubbed so the test runs on CPU CI. See `test/registered/unit/README.md` for details and examples.
 
 **Quality bar** — test real logic (validation boundaries, state transitions, error paths, branching, etc.). Skip tests that just verify Python itself works (e.g., "does calling an abstract method raise `NotImplementedError`?", "does a dataclass store the field I assigned?"). Consolidate repetitive patterns into parameterized tests. No production code changes in test PRs.
 

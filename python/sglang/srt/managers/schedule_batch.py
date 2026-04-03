@@ -198,7 +198,6 @@ class FINISH_ABORT(BaseFinishReason):
 
 class Modality(Enum):
     IMAGE = auto()
-    MULTI_IMAGES = auto()
     VIDEO = auto()
     AUDIO = auto()
 
@@ -225,9 +224,10 @@ class MultimodalInputFormat(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    One MultimodalDataItem contains all inputs for one modality.
-    For example, if there are 3 images and 1 audio inputs, there will be 2 MultimodalDataItem.
-    One for images and one for audio.
+    One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
+    For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
+
+    Each item has its own hash and pad_value, enabling per-image RadixAttention caching.
 
     We put the common fields first and the model-specific fields in model_specific_data.
     """
@@ -305,7 +305,7 @@ class MultimodalDataItem:
         return self.modality == Modality.AUDIO
 
     def is_image(self):
-        return self.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]
+        return self.modality == Modality.IMAGE
 
     def is_video(self):
         return self.modality == Modality.VIDEO
@@ -330,11 +330,27 @@ class MultimodalDataItem:
         ret.validate()
         return ret
 
-    def merge(self, other):
-        self.feature += other.feature
-        self.offsets += other.offsets
-        self.hash = hash((self.hash, other.hash))
-        self.set_pad_value()
+    def reconstruct(self):
+        if not isinstance(self.feature, CudaIpcTensorTransportProxy):
+            return
+
+        reconstruct_device = torch.cuda.current_device()
+        if isinstance(self.feature, CudaIpcTensorTransportProxy):
+            self.feature = self.feature.reconstruct_on_target_device(reconstruct_device)
+        if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
+            self.precomputed_embeddings = (
+                self.precomputed_embeddings.reconstruct_on_target_device(
+                    reconstruct_device
+                )
+            )
+        for extra_key in self.model_specific_data:
+            if isinstance(
+                self.model_specific_data[extra_key], CudaIpcTensorTransportProxy
+            ):
+                extra_data = self.model_specific_data[
+                    extra_key
+                ].reconstruct_on_target_device(reconstruct_device)
+                self.model_specific_data[extra_key] = extra_data
 
 
 @dataclasses.dataclass
@@ -373,15 +389,9 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
-        # Check if MM splitting is enabled
-        if not envs.SGLANG_ENABLE_MM_SPLITTING.get():
-            mm_items = obj["mm_items"]
-        else:
-            from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-
-            original_mm_items = obj["mm_items"]
-            # Now, `mm_items` contains one item per image.
-            mm_items = get_new_expanded_mm_items(original_mm_items)
+        mm_items = obj["mm_items"]
+        for mm_item in mm_items:
+            mm_item.reconstruct()
 
         ret = MultimodalInputs(
             mm_items=mm_items,
@@ -805,7 +815,7 @@ class Req(ReqDllmMixin):
         self.init_diffusion_llm(dllm_config)
 
         # For hisparse
-        self.staging = False
+        self.hisparse_staging = False
 
     @property
     def seqlen(self) -> int:
@@ -1673,13 +1683,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
                     mm_item.feature = pixel_values.to(self.device, non_blocking=True)
-                elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
-                    mm_item.feature = pixel_values.reconstruct_on_target_device(
-                        torch.cuda.current_device()
-                    )
-                    # The reference by CudaIpcTensorTransportProxy was cut off,
-                    # proactively delete to avoid slow gc.
-                    del pixel_values
                 if get_global_server_args().language_only:
                     precomputed_embeddings = getattr(
                         mm_item, "precomputed_embeddings", None
@@ -2248,6 +2251,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+        self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
@@ -2364,13 +2368,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
-
-            if (
-                self.forward_mode.is_decode()
-                and not server_args.disable_piecewise_cuda_graph
-                and not self.tree_cache.is_chunk_cache()
-            ):
-                return
 
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():

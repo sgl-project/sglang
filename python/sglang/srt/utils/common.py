@@ -20,6 +20,7 @@ import asyncio
 import builtins
 import ctypes
 import functools
+import gc
 import importlib
 import inspect
 import io
@@ -86,6 +87,7 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
+from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -363,7 +365,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "ascend"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -763,64 +765,109 @@ class ImageData:
     max_dynamic_patch: Optional[int] = None
 
 
+image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+    """
+    Check three conditions:
+    1. whether CUDA is available.
+    2. whether input is recognized as JPEG.
+    3. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
+    """
+    if not is_cuda() or not gpu_image_decode:
+        return False
+    if image_bytes != b"":
+        return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
+    return False
+
+
+def _load_image(
+    image_bytes: bytes = b"",
+    image_file: str = "",
+    gpu_image_decode: bool = True,
+) -> Union[torch.Tensor, Image.Image]:
+    """
+    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
+    otherwise fallback to decode with PIL on CPU and return a PIL Image.
+    Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
+    """
+    if image_file != "":
+        image_bytes = get_image_bytes(image_file)
+    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
+        try:
+            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            return image_tensor
+        except Exception as e:
+            logger.warning(
+                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
+            )
+    return Image.open(BytesIO(image_bytes))
+
+
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
-) -> tuple[Image.Image, tuple[int, int]]:
+    gpu_image_decode: bool = True,
+) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
+    """
+    Load image from multiple input formats, including:
+    ImageData, PIL Image, bytes, URL, file path, or base64 string.
+    """
     if isinstance(image_file, ImageData):
         image_file = image_file.url
 
-    image = image_size = None
+    image = None
+    image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
         image = image_file
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = Image.open(BytesIO(image_file))
-    elif image_file.startswith("http://") or image_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout)
-        try:
-            response.raise_for_status()
-            image = Image.open(response.raw)
-            image.load()  # Force loading to avoid issues after closing the stream
-        finally:
-            response.close()
-    elif image_file.startswith("file://"):
-        image_file = unquote(urlparse(image_file).path)
-        image = Image.open(image_file)
-    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
-        image = Image.open(image_file)
-    elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
-    elif isinstance(image_file, str):
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("file://"):
+        image = _load_image(
+            image_file=unquote(urlparse(image_file).path),
+            gpu_image_decode=gpu_image_decode,
+        )
+    elif isinstance(image_file, str) and image_file.lower().endswith(
+        image_extension_names
+    ):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("data:"):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(
+        image_file, str
+    ):  # Other formats, try to decode as base64 by default
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
-
     return image, image_size
 
 
-def get_image_bytes(image_file: Union[str, bytes]):
+def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
+    """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
-    elif image_file.startswith("http://") or image_file.startswith("https://"):
+    if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
-        return response.content
-    elif image_file.startswith("file://"):
-        image_file = unquote(urlparse(image_file).path)
+        try:
+            response.raise_for_status()
+            result = response.content
+        finally:
+            response.close()
+        return result
+    if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
             return f.read()
-    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
-        with open(image_file, "rb") as f:
-            return f.read()
-    elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
+    if isinstance(image_file, str) and image_file.startswith("data:"):
+        _, encoded = image_file.split(",", 1)
+        return pybase64.b64decode(encoded, validate=True)
+    if isinstance(image_file, str):
         return pybase64.b64decode(image_file, validate=True)
-    elif isinstance(image_file, str):
-        return pybase64.b64decode(image_file, validate=True)
-    else:
-        raise NotImplementedError(f"Invalid image: {image_file}")
+    raise NotImplementedError(f"Invalid image: {image_file}")
 
 
 def _normalize_video_input(
@@ -976,7 +1023,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.6")
+        min_version: Minimum version required (e.g., "0.6.7")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -2379,6 +2426,8 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     import uvicorn
     from fastapi import FastAPI, Response
 
+    from sglang.srt.utils.network import NetworkAddress
+
     app = FastAPI()
 
     @app.get("/ping")
@@ -2421,14 +2470,16 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
             logger.error(f"Dummy health check server failed to start: {e}")
             raise
         finally:
-            logger.info(f"Dummy health check server stopped at {host}:{port}")
+            logger.info(
+                f"Dummy health check server stopped at {NetworkAddress(host, port).to_host_port_str()}"
+            )
 
     thread = threading.Thread(
         target=run_server, daemon=True, name="health-check-server"
     )
     thread.start()
     logger.info(
-        f"Dummy health check server started in background thread at {host}:{port}"
+        f"Dummy health check server started in background thread at {NetworkAddress(host, port).to_host_port_str()}"
     )
 
 
@@ -2945,8 +2996,6 @@ def configure_gc_warning(warn_threshold_secs):
 
 
 def freeze_gc(context: str):
-    import gc
-
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
@@ -2960,8 +3009,6 @@ def freeze_gc(context: str):
 
 def configure_gc_logger():
     logger.info("Enable GC Logger")
-
-    import gc
 
     gc_start_time = {}
 
@@ -3350,6 +3397,41 @@ class ConcurrentCounter:
 @lru_cache(maxsize=1)
 def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
+
+
+@lru_cache(maxsize=1)
+def get_nvidia_driver_version() -> tuple:
+    """Return the NVIDIA driver version as a tuple of ints, e.g. (595, 58, 3).
+    Returns (0,) on failure."""
+    version_str = get_nvidia_driver_version_str()
+    if version_str is None:
+        return (0,)
+    try:
+        return tuple(int(x) for x in version_str.split("."))
+    except ValueError:
+        return (0,)
+
+
+@lru_cache(maxsize=1)
+def get_nvidia_driver_version_str() -> str:
+    """Return the NVIDIA driver version string, e.g. '595.58.03'.
+    Returns None on failure."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        version_str = result.stdout.strip().split("\n")[0].strip()
+        return version_str if version_str else None
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return None
 
 
 def check_cuda_result(raw_output):

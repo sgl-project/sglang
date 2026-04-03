@@ -233,6 +233,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     @property
     def broker_port(self) -> int:
@@ -859,6 +860,15 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+        parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
         )
         parser.add_argument(
             "--backend",

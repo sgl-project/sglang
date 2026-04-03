@@ -61,7 +61,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
-                    offsets=offset,
+                    offsets=[offset],
                     precomputed_embeddings=embedding_slice,
                 )
             )
