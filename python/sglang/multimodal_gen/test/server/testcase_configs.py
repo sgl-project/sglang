@@ -817,6 +817,7 @@ TWO_GPU_CASES_A = [
             model_path=DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
             modality="video",
             custom_validator="video",
+            num_gpus=2,
         ),
         TI2V_sampling_params,
     ),
