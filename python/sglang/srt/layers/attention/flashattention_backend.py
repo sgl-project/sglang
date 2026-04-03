@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -20,35 +19,16 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_compiler_backend, is_musa
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
+from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
+from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
 
-_is_musa = is_musa()
-if not _is_musa:
-    from sgl_kernel.flash_attn import (
-        flash_attn_varlen_func as flash_attn_varlen_func_fa3,
-    )
-    from sgl_kernel.flash_attn import (
-        flash_attn_with_kvcache as flash_attn_with_kvcache_fa3,
-    )
-else:
-    from flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
-
-    from sglang.srt.hardware_backend.musa.attention import (
-        FlashAttentionContext,
-        FlashAttentionContextManager,
-    )
-    from sglang.srt.hardware_backend.musa.attention import (
-        flash_attn_with_kvcache as flash_attn_with_kvcache_fa3,
-    )
-    from sglang.srt.hardware_backend.musa.attention import (
-        update_flash_attention_context,
-    )
 flash_attn_varlen_func = flash_attn_varlen_func_fa3
 flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
 
@@ -84,8 +64,6 @@ class FlashAttentionMetadata:
     page_table: torch.Tensor = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
-    # Extend from cached prefix tokens
-    extend_with_prefix: bool = False
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -424,33 +402,6 @@ class FlashAttentionBackend(AttentionBackend):
             else 0
         )
 
-        if _is_musa:
-            self.num_hidden_layers = model_runner.model_config.num_hidden_layers
-            self.first_k_dense_replace = model_runner.model_config.first_k_dense_replace
-            self.full_attention_interval = (
-                model_runner.model_config.full_attention_interval
-            )
-
-    # TODO: This function is currently designed to create a context for MUSA devices
-    # to automatically inject scheduler metadata. Refactoring may be required
-    # if other devices use it in the future.
-    def get_flash_attention_context(self, layer, prefix, max_seqlen_k, can_run_tbo):
-        if not _is_musa:
-            return nullcontext()
-        return FlashAttentionContextManager(
-            FlashAttentionContext(
-                device=self.device,
-                use_mla=self.use_mla,
-                num_hidden_layers=self.num_hidden_layers,
-                first_k_dense_replace=self.first_k_dense_replace,
-                full_attention_interval=self.full_attention_interval,
-                layer=layer,
-                prefix=prefix,
-                max_seqlen_k=max_seqlen_k,
-                can_run_tbo=can_run_tbo,
-            )
-        )
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -684,11 +635,9 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            metadata.extend_with_prefix = any(forward_batch.extend_prefix_lens_cpu)
-            if (
-                metadata.extend_with_prefix
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-            ):
+            if any(
+                forward_batch.extend_prefix_lens_cpu
+            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -906,7 +855,6 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_q = local_metadata.local_query_start_loc
             cache_seqlens = local_metadata.local_seqused_k
             max_seqlen_q = local_metadata.local_max_query_len
-            max_seqlen_k = local_metadata.local_max_seq_len
         elif is_swa_layer and metadata.swa_spec_metadata is not None:
             swa_spec_metadata = metadata.swa_spec_metadata
             page_table = swa_spec_metadata.page_table
@@ -914,7 +862,6 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = swa_spec_metadata.cache_seqlens_int32
             max_seqlen_q = swa_spec_metadata.max_seq_len_q
             cu_seqlens_k = swa_spec_metadata.cu_seqlens_k
-            max_seqlen_k = swa_spec_metadata.max_seq_len_k
         else:
             page_table = metadata.page_table
             if is_swa_layer and self.use_sliding_window_kv_pool:
@@ -928,60 +875,7 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
-            max_seqlen_k = metadata.max_seq_len_k
 
-        with self.get_flash_attention_context(
-            layer, "forward_extend", max_seqlen_k, forward_batch.can_run_tbo
-        ):
-            return self._forward_extend_impl(
-                q=q,
-                k=k,
-                v=v,
-                layer=layer,
-                forward_batch=forward_batch,
-                metadata=metadata,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                window_size=window_size,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                causal=causal,
-                use_cascade_attn=use_cascade_attn,
-                use_local_attn=use_local_attn,
-                q_rope=q_rope,
-                k_rope=k_rope,
-                **kwargs,
-            )
-
-    def _forward_extend_impl(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: "RadixAttention",
-        forward_batch: ForwardBatch,
-        metadata: FlashAttentionMetadata,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        window_size,
-        k_descale,
-        v_descale,
-        causal,
-        use_cascade_attn,
-        use_local_attn,
-        q_rope,
-        k_rope,
-        **kwargs,
-    ):
-        """Internal implementation of forward_extend, wrapped by context manager."""
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
@@ -1036,12 +930,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.device,
                     _fa_cp_attn,
                 )
-            elif (
-                not _is_musa
-                or metadata.extend_with_prefix
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
-            ):
+            else:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1062,71 +951,40 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
 
-                if use_cascade_attn:
-                    if _is_musa:
-                        # Need to re-create scheduler metadata for different flash_attn_with_kvcache parameters
-                        update_flash_attention_context(
-                            prefix="forward_extend_use_cascade_attn",
-                            max_seqlen_k=self.forward_metadata_spec_decode_expand.max_seq_len_k,
-                        )
-                    o, softmax_lse, *rest = result
-                    o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
-                            q=q.contiguous().view(
-                                -1, layer.tp_q_head_num, layer.head_dim
-                            ),
-                            # Here metadata_expand.page_table is not divided with page_size.
-                            # This is because we loose the fine control of  what token to attend,
-                            # but has to attend to some block completely.
-                            k_cache=key_cache.view(
-                                -1, 1, layer.tp_k_head_num, layer.head_dim
-                            ),
-                            v_cache=value_cache.view(
-                                -1, 1, layer.tp_v_head_num, layer.head_dim
-                            ),
-                            page_table=self.forward_metadata_spec_decode_expand.page_table,
-                            cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
-                            cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
-                            cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
-                            max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
-                            softmax_scale=layer.scaling,
-                            causal=False,
-                            window_size=window_size,
-                            softcap=layer.logit_cap,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
-                            return_softmax_lse=True,
-                            num_splits=self.num_splits,
-                            **kwargs,
-                        )
-                    )
-                    o, _ = merge_state_v2_wrapper(
-                        o,
-                        softmax_lse.T.contiguous(),
-                        o_expand,
-                        softmax_lse_expand.T.contiguous(),
-                    )
-                else:
-                    o = result
-            else:
-                # MATE's MHA for extend part of sequence without attending prefix kv cache
-                output = flash_attn_varlen_func(
-                    q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                    v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k=metadata.cu_seqlens_q,
-                    max_seqlen_q=metadata.max_seq_len_q,
-                    max_seqlen_k=metadata.max_seq_len_q,
+            if use_cascade_attn:
+                o, softmax_lse, *rest = result
+                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    # Here metadata_expand.page_table is not divided with page_size.
+                    # This is because we loose the fine control of  what token to attend,
+                    # but has to attend to some block completely.
+                    k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
+                    v_cache=value_cache.view(
+                        -1, 1, layer.tp_v_head_num, layer.head_dim
+                    ),
+                    page_table=self.forward_metadata_spec_decode_expand.page_table,
+                    cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
+                    cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
+                    cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
+                    max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
                     softmax_scale=layer.scaling,
-                    causal=True,
-                    return_softmax_lse=forward_batch.mha_return_lse,
+                    causal=False,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=True,
+                    num_splits=self.num_splits,
+                    **kwargs,
                 )
-                if forward_batch.mha_return_lse:
-                    output, lse, *rest = output
-                    lse = torch.transpose(lse, 0, 1).contiguous()
-                    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
-                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                o, _ = merge_state_v2_wrapper(
+                    o,
+                    softmax_lse.T.contiguous(),
+                    o_expand,
+                    softmax_lse_expand.T.contiguous(),
+                )
+            else:
+                o = result
         else:
             if (
                 forward_batch.attn_attend_prefix_cache is not None
@@ -1331,43 +1189,6 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
-        with self.get_flash_attention_context(
-            layer, "forward_decode", metadata.max_seq_len_k, forward_batch.can_run_tbo
-        ):
-            return self._forward_decode_impl(
-                q=q,
-                layer=layer,
-                forward_batch=forward_batch,
-                metadata=metadata,
-                is_swa_layer=is_swa_layer,
-                window_size=window_size,
-                causal=causal,
-                use_cascade_attn=use_cascade_attn,
-                use_local_attn=use_local_attn,
-                local_attn_metadata=local_attn_metadata,
-                q_rope=q_rope,
-                k_rope=k_rope,
-                **kwargs,
-            )
-
-    def _forward_decode_impl(
-        self,
-        q: torch.Tensor,
-        layer: "RadixAttention",
-        forward_batch: ForwardBatch,
-        metadata: FlashAttentionMetadata,
-        is_swa_layer,
-        window_size,
-        causal,
-        use_cascade_attn,
-        use_local_attn,
-        local_attn_metadata,
-        q_rope,
-        k_rope,
-        **kwargs,
-    ):
-        """Internal implementation of forward_decode, wrapped by context manager."""
-        k_descale, v_descale = None, None
         flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
 
         flash_attn_with_kvcache = (
@@ -1479,12 +1300,6 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
                 if use_cascade_attn:
-                    if _is_musa:
-                        # Need to re-create scheduler metadata for different flash_attn_with_kvcache parameters
-                        update_flash_attention_context(
-                            prefix="forward_decode_use_cascade_attn",
-                            max_seqlen_k=self.forward_metadata_spec_decode_expand.max_seq_len_k,
-                        )
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
@@ -1562,12 +1377,6 @@ class FlashAttentionBackend(AttentionBackend):
                 num_splits=self.num_splits,
             )
             if use_cascade_attn:
-                if _is_musa:
-                    # Need to re-create scheduler metadata for different flash_attn_with_kvcache parameters
-                    update_flash_attention_context(
-                        prefix="forward_decode_use_cascade_attn",
-                        max_seqlen_k=self.forward_metadata_spec_decode_expand.max_seq_len_k,
-                    )
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q_rope,
