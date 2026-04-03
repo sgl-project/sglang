@@ -304,3 +304,25 @@ class OpenAIServingBase(ABC):
                 )
 
         return body_routed_dp_rank
+
+    def _build_response_metadata(self, meta_info: dict) -> dict:
+        """Build response metadata including speculative decoding info if available.
+
+        Args:
+            meta_info: Dictionary containing metadata from the response.
+
+        Returns:
+            Dictionary with weight_version and speculative decoding metrics if present.
+        """
+        metadata = {"weight_version": meta_info.get("weight_version")}
+
+        spec_keys = (
+            "spec_accept_rate",
+            "spec_accept_length",
+            "spec_verify_ct",
+        )
+        spec_metadata = {key: meta_info[key] for key in spec_keys if key in meta_info}
+        if spec_metadata:
+            metadata.update(spec_metadata)
+
+        return metadata

@@ -139,6 +139,7 @@ class UsageInfo(BaseModel):
 
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
+    include_metadata: Optional[bool] = False
     continuous_usage_stats: Optional[bool] = False
 
 
@@ -405,6 +406,7 @@ class CompletionStreamResponse(BaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
@@ -906,6 +908,7 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    metadata: Optional[Dict[str, Any]] = None
     sglext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")

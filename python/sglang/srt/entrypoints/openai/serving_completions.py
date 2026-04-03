@@ -371,22 +371,29 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
-            if request.stream_options and request.stream_options.include_usage:
-                usage = UsageProcessor.calculate_streaming_usage(
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
-                )
-                final_usage_chunk = CompletionStreamResponse(
+            if request.stream_options:
+                metadata = None
+                if request.stream_options.include_metadata:
+                    metadata = self._build_response_metadata(content["meta_info"])
+
+                usage = None
+                if request.stream_options.include_usage:
+                    usage = UsageProcessor.calculate_streaming_usage(
+                        prompt_tokens,
+                        completion_tokens,
+                        cached_tokens,
+                        n_choices=request.n,
+                        enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    )
+                last_chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=created,
                     choices=[],
                     model=request.model,
                     usage=usage,
+                    metadata=metadata,
                 )
-                final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
+                final_usage_data = last_chunk.model_dump_json(exclude_none=True)
                 yield f"data: {final_usage_data}\n\n"
 
         except Exception as e:
@@ -506,13 +513,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
             ret, n_choices=request.n, enable_cache_report=cache_report
         )
 
+        meta_info = ret[0]["meta_info"]
+        metadata = self._build_response_metadata(meta_info)
+
         return CompletionResponse(
-            id=ret[0]["meta_info"]["id"],
+            id=meta_info["id"],
             model=request.model,
             created=created,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=metadata,
             sglext=response_sglext,
         )
 

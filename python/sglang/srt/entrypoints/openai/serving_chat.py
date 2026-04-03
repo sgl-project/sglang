@@ -881,22 +881,29 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
-            if request.stream_options and request.stream_options.include_usage:
-                usage = UsageProcessor.calculate_streaming_usage(
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
-                )
-                usage_chunk = ChatCompletionStreamResponse(
+            if request.stream_options:
+                metadata = None
+                if request.stream_options.include_metadata:
+                    metadata = self._build_response_metadata(content["meta_info"])
+
+                usage = None
+                if request.stream_options.include_usage:
+                    usage = UsageProcessor.calculate_streaming_usage(
+                        prompt_tokens,
+                        completion_tokens,
+                        cached_tokens,
+                        n_choices=request.n,
+                        enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    )
+                last_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
+                    metadata=metadata,
                 )
-                yield f"data: {usage_chunk.model_dump_json()}\n\n"
+                yield f"data: {last_chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
             if not stream_started:
@@ -1031,13 +1038,16 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
+        meta_info = ret[0]["meta_info"]
+        metadata = self._build_response_metadata(meta_info)
+
         return ChatCompletionResponse(
-            id=ret[0]["meta_info"]["id"],
+            id=meta_info["id"],
             created=created,
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=metadata,
             sglext=response_sglext,
         )
 
