@@ -36,16 +36,6 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
 }
 
-# Substrings that identify gated or otherwise hard-to-probe diffusion repos
-# whose model_index.json cannot be fetched without credentials.
-# Used by cli/utils.py as a lightweight fallback so that we never need to
-# import multimodal_gen from public modules.
-KNOWN_GATED_DIFFUSION_MODEL_PATTERNS: list[str] = [
-    "flux.1-dev",
-    "flux.2-klein",
-    "flux.2-dev",
-]
-
 
 def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
     raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
