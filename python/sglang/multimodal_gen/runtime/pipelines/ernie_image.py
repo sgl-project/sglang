@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """ErnieImage text-to-image pipeline."""
 
-import json
 import os
 
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -13,6 +12,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.e
     PromptEnhancementStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import TextEncodingStage
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model_index
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -37,13 +37,15 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def _has_pe_in_model_index(self, server_args) -> bool:
-        """Check if the model directory declares a 'pe' component."""
-        model_index_path = os.path.join(server_args.model_path, "model_index.json")
+        """Check if the model declares a 'pe' component in model_index.json.
+
+        Uses maybe_download_model_index to correctly resolve both local paths
+        and remote HuggingFace model IDs (e.g. 'baidu/ERNIE-Image-Turbo').
+        """
         try:
-            with open(model_index_path) as f:
-                model_index = json.load(f)
+            model_index = maybe_download_model_index(server_args.model_path)
             return "pe" in model_index and model_index["pe"] is not None
-        except (FileNotFoundError, json.JSONDecodeError):
+        except Exception:
             return False
 
     def load_modules(self, server_args, loaded_modules=None):
