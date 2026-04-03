@@ -44,7 +44,7 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if not (_is_npu or _is_hip) and _is_cuda:
-    from sgl_kernel import silu_and_mul
+    from sglang.jit_kernel.activation import silu_and_mul
 
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")

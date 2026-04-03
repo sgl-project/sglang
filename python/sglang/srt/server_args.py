@@ -52,7 +52,6 @@ from sglang.srt.utils.common import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_mps,
-    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -290,7 +289,7 @@ class ServerArgs:
     The arguments of the server.
 
     NOTE: When you add new arguments, please make sure the order
-    in this class definition the same as the order in the the function
+    in this class definition the same as the order in the function
     `ServerArgs.add_cli_args`.
     Please follow the existing style to group the new arguments into related groups or create new groups.
     """
@@ -1133,6 +1132,9 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 16. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 17. Context parallel
+        if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
@@ -2412,13 +2414,6 @@ class ServerArgs:
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
-
-        # MUSA platforms compatible backends
-        if is_musa() and self.attention_backend == "fa3":
-            logger.warning(
-                "FA3 attention backend on MUSA ignores any user-provided page_size and enforces a fixed value of 64."
-            )
-            self.page_size = 64
 
         # Other platforms backends
         if (
@@ -6175,6 +6170,14 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            hf_config = self.get_model_config().hf_config
+            assert is_deepseek_nsa(hf_config), (
+                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
+                "(e.g., DeepSeek V3.2, GLM-5). "
+            )
+
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."

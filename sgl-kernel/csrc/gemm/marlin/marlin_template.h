@@ -487,11 +487,11 @@ __global__ void Marlin(
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
 
   // Scale sizes/strides without act_order
-  int s_gl_stride = prob_n / 8;
-  constexpr int s_sh_stride = 16 * thread_n_blocks / 8;
-  constexpr int s_tb_groups = !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks
-                                  ? thread_k_blocks / group_blocks / (w_type == sglang::kFE2M1f ? 2 : 1)
-                                  : 1;
+  // FP4 (kFE2M1f) uses FP8 scales (1 byte/element), others use FP16 (2 bytes)
+  int s_gl_stride = prob_n / (w_type == sglang::kFE2M1f ? 16 : 8);
+  constexpr int s_sh_stride = 16 * thread_n_blocks / (w_type == sglang::kFE2M1f ? 16 : 8);
+  constexpr int s_tb_groups =
+      !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks ? thread_k_blocks / group_blocks : 1;
   constexpr int s_sh_stage = s_tb_groups * s_sh_stride;
   int s_gl_rd_delta = s_gl_stride;
 
@@ -543,8 +543,7 @@ __global__ void Marlin(
     if constexpr (group_blocks == -1) {
       s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
     } else {
-      s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) / (w_type == sglang::kFE2M1f ? 2 : 1) +
-                s_sh_stride * slice_col + threadIdx.x;
+      s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col + threadIdx.x;
     }
   }
   auto s_sh_wr = threadIdx.x;
@@ -566,15 +565,7 @@ __global__ void Marlin(
   // we scale a `half2` tile in column-major layout in the former and in
   // row-major in the latter case.
   int s_sh_rd;
-  if constexpr (group_blocks != -1 && w_type == sglang::kFE2M1f) {
-    auto warp_id = threadIdx.x / 32;
-    int n_warps = thread_n_blocks / 4;
-    int warp_row = warp_id / n_warps;
-
-    s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
-    s_sh_rd = s_sh_rd * 2 + warp_row % 2;
-
-  } else if constexpr (group_blocks != -1)
+  if constexpr (group_blocks != -1)
     s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 4;
   else if constexpr (group_blocks == -1 && (m_block_size_8 || (has_zp && !dequant_skip_flop)))
     s_sh_rd = 8 * ((threadIdx.x / 32) % (thread_n_blocks / 4)) + (threadIdx.x % 32) / 8;
@@ -879,7 +870,7 @@ __global__ void Marlin(
           cur_k += k_iter_size * (k % b_sh_wr_iters);
 
           int k_blocks = cur_k / 16;
-          int cur_group_id = k_blocks / (group_blocks * (w_type == sglang::kFE2M1f ? 2 : 1));
+          int cur_group_id = k_blocks / group_blocks;
 
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 

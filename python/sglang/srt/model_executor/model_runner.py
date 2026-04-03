@@ -2019,22 +2019,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
-        self._warmup_fused_sampling()
-
-    def _warmup_fused_sampling(self):
-        """Pre-compile and autotune fused sampling Triton kernels."""
-        if _is_hip:
-            return
-        from sglang.srt.layers.fused_sampling import warmup_fused_temperature_softmax
-
-        logits_warmup_dtype = (
-            torch.float32 if self.server_args.enable_fp32_lm_head else self.dtype
-        )
-        warmup_fused_temperature_softmax(
-            self.model_config.vocab_size,
-            logits_dtype=logits_warmup_dtype,
-        )
-
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
         if self.server_args.disable_flashinfer_autotune:
@@ -2118,6 +2102,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.enable_torch_compile:
             set_torch_compile_config()
+            should_disable_torch_compile = not getattr(
+                self.model, "_can_torch_compile", True
+            )
+            if should_disable_torch_compile:
+                log_info_on_rank0(
+                    logger,
+                    "Transformers backend model reports it is not torch.compile "
+                    "compatible (e.g. dynamic rope scaling). Disabling torch.compile.",
+                )
+                self.server_args.enable_torch_compile = False
 
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture()
