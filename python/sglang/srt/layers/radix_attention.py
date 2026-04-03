@@ -96,6 +96,15 @@ class RadixAttention(nn.Module):
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
 
+        # In embedding mode with chunked prefill disabled, skip KV cache
+        # entirely (both read and write) — no decode step so KV is never used.
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        self.skip_kv_cache = (
+            server_args.is_embedding and server_args.chunked_prefill_size == -1
+        )
+
     def forward(
         self,
         q,
@@ -105,6 +114,9 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        if self.skip_kv_cache:
+            save_kv_cache = False
+
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None

@@ -764,6 +764,24 @@ class FlashAttentionBackend(AttentionBackend):
                     self.device,
                     _fa_cp_attn,
                 )
+            elif layer.skip_kv_cache:
+                # Skip KV cache read — use raw K/V tensors via varlen func.
+                # In this mode K length == Q length (no prefix cache).
+                assert k is not None, "skip_kv_cache requires k to be provided"
+                result = flash_attn_varlen_func(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    **kwargs,
+                )
             else:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
