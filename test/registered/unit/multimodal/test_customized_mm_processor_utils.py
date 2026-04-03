@@ -10,7 +10,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 # Load the target module from source with a lightweight `transformers` stub.
 _old_transformers = sys.modules.get("transformers")
