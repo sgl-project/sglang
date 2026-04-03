@@ -169,7 +169,6 @@ jobs:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
           USE_CCACHE: 0
-
           RESET_BUILDER: 1
 
       - name: Upload artifacts
