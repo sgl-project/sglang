@@ -25,7 +25,6 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
@@ -91,6 +90,18 @@ class DeepseekV2WeightLoaderMixin:
     quant_config: Optional[QuantizationConfig]
     pp_group: GroupCoordinator
     num_fused_shared_experts: int
+    # Weight mapping relationships determined at model initialization time.
+    fuse_qkv_a_proj: bool
+    stacked_params_mapping: List[Tuple[str, str, int]]
+    expert_params_mapping: List[Tuple[str, str, int, int]]
+
+    def mutate_weight_preload(self, name: str) -> str:
+        """Override in subclass for model-specific weight name mutations."""
+        return name
+
+    def custom_scale_remap(self, name: str) -> str:
+        """Override in subclass for model-specific scale remapping."""
+        return name
 
     def do_load_weights(
         self,
@@ -109,33 +120,7 @@ class DeepseekV2WeightLoaderMixin:
             weights, NVFP4_CKPT_FP8_ATTN_QUANT_MODULES, nextn_conf
         )
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
-        # Params for special naming rules in mixed-precision models, for example:
-        # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
-        # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
-            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
-                num_experts=self.config.n_routed_experts
-            )
-
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
-        )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        cached_a_proj = {} if self.fuse_qkv_a_proj else None
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
@@ -157,11 +142,7 @@ class DeepseekV2WeightLoaderMixin:
                     )
                 ):
                     continue
-                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                    name = name.replace(
-                        "mlp.shared_experts",
-                        f"mlp.experts.{self.config.n_routed_experts}",
-                    )
+                name = self.mutate_weight_preload(name)
 
                 weight_names.append(name)
 
@@ -197,7 +178,7 @@ class DeepseekV2WeightLoaderMixin:
                 if "rotary_emb.inv_freq" in name:
                     continue
 
-                for param_name, weight_name, shard_id in stacked_params_mapping:
+                for param_name, weight_name, shard_id in self.stacked_params_mapping:
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
                         continue
@@ -226,7 +207,7 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
+                    for mapping in self.expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
@@ -263,7 +244,7 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
                             continue
-                        if fuse_qkv_a_proj and (
+                        if self.fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
                             cached_a_proj[name] = loaded_weight
@@ -331,13 +312,7 @@ class DeepseekV2WeightLoaderMixin:
                             if (
                                 "k_scale" in name or "v_scale" in name
                             ) and name not in params_dict:
-                                # modelopt attn kv scale is named differently
-                                for scale in ["k_scale", "v_scale"]:
-                                    if scale in name:
-                                        name = name.replace(
-                                            f"{scale[0]}_proj", "attn_mqa"
-                                        )
-                                        break
+                                name = self.custom_scale_remap(name)
                             if name not in params_dict:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
