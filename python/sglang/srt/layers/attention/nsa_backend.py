@@ -1625,7 +1625,7 @@ class NativeSparseAttnBackend(
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if self.nsa_kv_cache_store_fp4:
                 bs = page_table_1.shape[0]
-                pt_valid = page_table_1[:, : self.nsa_index_topk]
+                pt_valid = page_table_1[:, : self.nsa_index_topk].contiguous()
                 kv_cache = dequant_fp4_paged_decode(
                     kv_cache,
                     pt_valid,
