@@ -327,46 +327,26 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         input_ids_tensor = torch.as_tensor(input_ids)
 
-        # Check if MM splitting is enabled
-        if envs.SGLANG_ENABLE_MM_SPLITTING.get():
-            items_by_modality = defaultdict(list)
-            for item in mm_inputs.mm_items:
-                items_by_modality[item.modality].append(item)
+        # Replace multimodal tokens using per-item offsets
+        items_by_modality = defaultdict(list)
+        for item in mm_inputs.mm_items:
+            items_by_modality[item.modality].append(item)
 
-            token_id_map = {
-                Modality.IMAGE: mm_inputs.im_token_id,
-                Modality.MULTI_IMAGES: mm_inputs.im_token_id,
-                Modality.AUDIO: mm_inputs.audio_token_id,
-                Modality.VIDEO: mm_inputs.video_token_id,
-            }
+        token_id_map = {
+            Modality.IMAGE: mm_inputs.im_token_id,
+            Modality.AUDIO: mm_inputs.audio_token_id,
+            Modality.VIDEO: mm_inputs.video_token_id,
+        }
 
-            for modality, items in items_by_modality.items():
-                token_id = token_id_map.get(modality)
+        for modality, items in items_by_modality.items():
+            token_id = token_id_map.get(modality)
 
-                if not items or token_id is None:
-                    continue
+            if not items or token_id is None:
+                continue
 
-                for i, item in enumerate(items):
-                    for offset in items[i].offsets:
-                        input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
-        else:
-            # Create mapping of token_ids to pad_values for each modality
-            token_to_pad_mapping = {}
-            for item in mm_inputs.mm_items:
-                if item.is_image() and mm_inputs.im_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
-                elif item.is_audio() and mm_inputs.audio_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
-                elif item.is_video() and mm_inputs.video_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
-                else:
-                    raise ValueError(
-                        f"No multimodal token id provided for {item.modality}"
-                    )
-
-            # Apply replacements for all tokens at once
-            for token_id, pad_value in token_to_pad_mapping.items():
-                input_ids_tensor[input_ids_tensor == token_id] = pad_value
+            for i, item in enumerate(items):
+                for offset in items[i].offsets:
+                    input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
@@ -1476,6 +1456,54 @@ def _slice_model_data(
     return sliced
 
 
+def _try_simple_split(item, num_items, expanded_mm_items):
+    """Try to split a bundled item by matching feature dim-0 to offset count.
+    Returns True if split succeeded, False otherwise."""
+    feature = item.feature if item.feature is not None else item.precomputed_embeddings
+    if feature is None:
+        return False
+
+    if isinstance(feature, (torch.Tensor, np.ndarray)):
+        feature_count = feature.shape[0]
+    elif isinstance(feature, (list, tuple)):
+        feature_count = len(feature)
+    else:
+        return False
+
+    if feature_count != num_items:
+        return False
+
+    for i in range(num_items):
+        new_item = copy.copy(item)
+        if item.feature is not None:
+            if isinstance(item.feature, (list, tuple)):
+                new_item.feature = [item.feature[i]]
+            else:
+                new_item.feature = item.feature[i : i + 1]
+        if item.precomputed_embeddings is not None:
+            if isinstance(item.precomputed_embeddings, (list, tuple)):
+                new_item.precomputed_embeddings = [item.precomputed_embeddings[i]]
+            else:
+                new_item.precomputed_embeddings = item.precomputed_embeddings[i : i + 1]
+        new_item.offsets = [item.offsets[i]]
+        new_data = {}
+        for k, v in item.model_specific_data.items():
+            if isinstance(v, (list, tuple)) and len(v) == num_items:
+                new_data[k] = [v[i]]
+            elif (
+                isinstance(v, (torch.Tensor, np.ndarray))
+                and len(v.shape) > 0
+                and v.shape[0] == num_items
+            ):
+                new_data[k] = v[i : i + 1]
+            else:
+                new_data[k] = v
+        new_item.model_specific_data = new_data
+        new_item.hash = None
+        expanded_mm_items.append(new_item)
+    return True
+
+
 def get_new_expanded_mm_items(original_mm_items):
     expanded_mm_items = []
     for item in original_mm_items:
@@ -1488,7 +1516,9 @@ def get_new_expanded_mm_items(original_mm_items):
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
                 grid_len = _get_length(image_grid_thw)
                 if image_grid_thw is None or grid_len != num_items:
-                    expanded_mm_items.append(item)
+                    # No grid info — fall back to simple split by feature dim-0
+                    if not _try_simple_split(item, num_items, expanded_mm_items):
+                        expanded_mm_items.append(item)
                     continue
 
                 patches_per_item = []
@@ -1533,7 +1563,8 @@ def get_new_expanded_mm_items(original_mm_items):
             elif item.is_video():
                 video_grid_thw = item.model_specific_data.get("video_grid_thw")
                 if video_grid_thw is None:
-                    expanded_mm_items.append(item)
+                    if not _try_simple_split(item, num_items, expanded_mm_items):
+                        expanded_mm_items.append(item)
                     continue
 
                 # video_grid_thw shape: [num_videos, 3] where each row is [T, H, W]
@@ -1623,7 +1654,8 @@ def get_new_expanded_mm_items(original_mm_items):
                     new_item.hash = None
                     expanded_mm_items.append(new_item)
             else:
-                expanded_mm_items.append(item)
+                if not _try_simple_split(item, num_items, expanded_mm_items):
+                    expanded_mm_items.append(item)
 
         else:
             expanded_mm_items.append(item)

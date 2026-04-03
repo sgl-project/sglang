@@ -16,6 +16,10 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_fp4_layer_for_marlin,
+    should_use_fp4_marlin_fallback,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
@@ -34,7 +38,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        return 75  # SM75+ (Turing) supports Marlin FP4 fallback; SM100 for native FP4
 
     def create_weights(
         self,
@@ -47,6 +51,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
     ):
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
+        layer.params_dtype = params_dtype
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
 
@@ -91,6 +96,20 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         layer.register_parameter("input_global_scale", input_global_scale)
 
     def process_weights_after_loading(self, layer) -> None:
+        if should_use_fp4_marlin_fallback():
+            # Marlin FP4 fallback: consolidate global scale then repack weights
+            global_scale = layer.weight_global_scale.max().to(torch.float32)
+            layer.weight_global_scale = Parameter(global_scale, requires_grad=False)
+            prepare_fp4_layer_for_marlin(
+                layer,
+                weight_attr="weight_packed",
+                weight_scale_attr="weight_scale",
+                weight_global_scale_attr="weight_global_scale",
+            )
+            layer.use_marlin_fallback = True
+            return
+
+        layer.use_marlin_fallback = False
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 
@@ -136,6 +155,18 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if layer.use_marlin_fallback:
+            return torch.ops.sglang.apply_fp4_marlin_linear(
+                input=x,
+                weight=layer.weight_packed,
+                weight_scale=layer.weight_scale,
+                weight_global_scale=layer.weight_global_scale,
+                workspace=layer.marlin_workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+
         output_dtype = x.dtype
         w_n, _ = layer.weight_packed.shape
         output_shape = [x.shape[0], w_n]

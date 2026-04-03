@@ -52,7 +52,6 @@ from sglang.srt.utils.common import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_mps,
-    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -290,7 +289,7 @@ class ServerArgs:
     The arguments of the server.
 
     NOTE: When you add new arguments, please make sure the order
-    in this class definition the same as the order in the the function
+    in this class definition the same as the order in the function
     `ServerArgs.add_cli_args`.
     Please follow the existing style to group the new arguments into related groups or create new groups.
     """
@@ -2412,13 +2411,6 @@ class ServerArgs:
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
-
-        # MUSA platforms compatible backends
-        if is_musa() and self.attention_backend == "fa3":
-            logger.warning(
-                "FA3 attention backend on MUSA ignores any user-provided page_size and enforces a fixed value of 64."
-            )
-            self.page_size = 64
 
         # Other platforms backends
         if (

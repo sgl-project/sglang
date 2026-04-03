@@ -88,7 +88,7 @@ ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
-ARG TILELANG_COMMIT="ebf4a7cb8881432165ae8760e99d209d905c704a"
+ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
 
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"

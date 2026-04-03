@@ -7,23 +7,23 @@ you encounter issues or have any questions, please [open an issue](https://githu
 
 ### Low Latency
 
-| Model             | Hardware      | Cards | Deploy Mode   | Dataset   | TPOT | Quantization | Configuration                                                                         |
-|-------------------|---------------|-------|---------------|-----------|------|--------------|---------------------------------------------------------------------------------------|
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 6K+1.6K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-separation-mode)     |
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.9K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_9k-1k-20ms-on-a3-32-cards-separation-mode)     |
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1.5K | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-20ms-on-a3-32-cards-separation-mode)   |
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1k-20ms-on-a3-32-cards-separation-mode)     |
-| DeepSeek-V3.2     | Atlas 800I A3 | 32    | PD Separation | 128K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-128k-1k-20ms-on-a3-32-cards-separation-mode) |
+| Model             | Hardware      | Cards | Deploy Mode       | Dataset   | TPOT | Quantization | Configuration                                                                             |
+|-------------------|---------------|-------|-------------------|-----------|------|--------------|-------------------------------------------------------------------------------------------|
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 6K+1.6K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-disaggregation-mode)     |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.9K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_9k-1k-20ms-on-a3-32-cards-disaggregation-mode)     |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1.5K | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-20ms-on-a3-32-cards-disaggregation-mode)   |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1k-20ms-on-a3-32-cards-disaggregation-mode)     |
+| DeepSeek-V3.2     | Atlas 800I A3 | 32    | PD Disaggregation | 128K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-128k-1k-20ms-on-a3-32-cards-disaggregation-mode)    |
 
 ### High Throughput
 
-| Model       | Hardware      | Cards | Deploy Mode   | Dataset   | TPOT | Quantization | Configuration                                                                       |
-|-------------|---------------|-------|---------------|-----------|------|--------------|-------------------------------------------------------------------------------------|
-| Deepseek-R1 | Atlas 800I A3 | 32    | PD Separation | 3.5K+1.5K | 50ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-32-cards-separation-mode) |
-| Deepseek-R1 | Atlas 800I A3 | 8     | PD Mixed      | 2K+2K     | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-2k-2k-50ms-on-a3-8-cards-mixed-mode)           |
-| Deepseek-R1 | Atlas 800I A3 | 16    | PD Separation | 2K+2K     | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-2k-2k-50ms-on-a3-16-cards-separation-mode)     |
-| Deepseek-R1 | Atlas 800I A3 | 8     | PD Mixed      | 3.5K+1.5K | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)       |
-| Deepseek-R1 | Atlas 800I A3 | 16    | PD Separation | 3.5K+1.5K | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-16-cards-separation-mode) |
+| Model       | Hardware      | Cards | Deploy Mode       | Dataset   | TPOT | Quantization | Configuration                                                                           |
+|-------------|---------------|-------|-------------------|-----------|------|--------------|-----------------------------------------------------------------------------------------|
+| Deepseek-R1 | Atlas 800I A3 | 32    | PD Disaggregation | 3.5K+1.5K | 50ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-32-cards-disaggregation-mode) |
+| Deepseek-R1 | Atlas 800I A3 | 8     | PD Mixed          | 2K+2K     | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-2k-2k-50ms-on-a3-8-cards-mixed-mode)               |
+| Deepseek-R1 | Atlas 800I A3 | 16    | PD Disaggregation | 2K+2K     | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-2k-2k-50ms-on-a3-16-cards-disaggregation-mode)     |
+| Deepseek-R1 | Atlas 800I A3 | 8     | PD Mixed          | 3.5K+1.5K | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)           |
+| Deepseek-R1 | Atlas 800I A3 | 16    | PD Disaggregation | 3.5K+1.5K | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-16-cards-disaggregation-mode) |
 
 ## Qwen Series Models
 
@@ -40,32 +40,32 @@ you encounter issues or have any questions, please [open an issue](https://githu
 
 ### High Throughput
 
-| Model                          | Hardware      | Cards | Deploy Mode   | Dataset   | TPOT  | Quantization | Configuration                                                                                          |
-|--------------------------------|---------------|-------|---------------|-----------|-------|--------------|--------------------------------------------------------------------------------------------------------|
-| Qwen3-235B-A22B                | Atlas 800I A3 | 24    | PD Separation | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-3_5k-1_5k-50ms-on-a3-24-cards-separation-mode)                |
-| Qwen3-235B-A22B                | Atlas 800I A3 | 8     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)                      |
-| Qwen3-235B-A22B                | Atlas 800I A3 | 8     | PD Mixed      | 2K+2K     | 100ms | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-2k-2k-100ms-on-a3-8-cards-mixed-mode)                         |
-| Qwen3-235B-A22B                | Atlas 800I A3 | 8     | PD Mixed      | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-2k-2k-50ms-on-a3-8-cards-mixed-mode)                          |
-| Qwen3-235B-A22B                | Atlas 800I A3 | 16    | PD Mixed      | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-2k-2k-50ms-on-a3-16-cards-mixed-mode)                         |
-| Qwen3-32B                      | Atlas 800I A3 | 2     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-3_5k-1_5k-50ms-on-a3-2-cards-mixed-mode)                            |
-| Qwen3-32B                      | Atlas 800I A3 | 2     | PD Mixed      | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-2k-2k-50ms-on-a3-2-cards-mixed-mode)                                |
-| Qwen3-30B-A3B                  | Atlas 800I A3 | 1     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-3_5k-1_5k-50ms-on-a3-1-card-mixed-mode)                         |
-| Qwen3-Coder-480B-A35B-Instruct | Atlas 800I A3 | 24    | PD Separation | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-coder-480b-a35b-instruct-3_5k-1_5k-50ms-on-a3-24-cards-separation-mode) |
-| Qwen3-Coder-480B-A35B-Instruct | Atlas 800I A3 | 16    | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-coder-480b-a35b-instruct-3_5k-1_5k-50ms-on-a3-16-cards-mixed-mode)      |
-| Qwen3-Coder-480B-A35B-Instruct | Atlas 800I A3 | 8     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-coder-480b-a35b-instruct-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)       |
-| Qwen3-Next-80B-A3B-Instruct    | Atlas 800I A3 | 2     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-next-80B-a3b-instruct-3_5k-1_5k-50ms-on-a3-2-cards-mixed-mode)          |
-| Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-3_5k-1_5k-50ms-on-a2-8-cards-mixed-mode)                            |
-| Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed      | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-2k-2k-50ms-on-a2-8-cards-mixed-mode)                                |
+| Model                          | Hardware      | Cards | Deploy Mode       | Dataset   | TPOT  | Quantization | Configuration                                                                                              |
+|--------------------------------|---------------|-------|-------------------|-----------|-------|--------------|------------------------------------------------------------------------------------------------------------|
+| Qwen3-235B-A22B                | Atlas 800I A3 | 24    | PD Disaggregation | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-3_5k-1_5k-50ms-on-a3-24-cards-disaggregation-mode)                |
+| Qwen3-235B-A22B                | Atlas 800I A3 | 8     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)                          |
+| Qwen3-235B-A22B                | Atlas 800I A3 | 8     | PD Mixed          | 2K+2K     | 100ms | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-2k-2k-100ms-on-a3-8-cards-mixed-mode)                             |
+| Qwen3-235B-A22B                | Atlas 800I A3 | 8     | PD Mixed          | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-2k-2k-50ms-on-a3-8-cards-mixed-mode)                              |
+| Qwen3-235B-A22B                | Atlas 800I A3 | 16    | PD Mixed          | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-2k-2k-50ms-on-a3-16-cards-mixed-mode)                             |
+| Qwen3-32B                      | Atlas 800I A3 | 2     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-3_5k-1_5k-50ms-on-a3-2-cards-mixed-mode)                                |
+| Qwen3-32B                      | Atlas 800I A3 | 2     | PD Mixed          | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-2k-2k-50ms-on-a3-2-cards-mixed-mode)                                    |
+| Qwen3-30B-A3B                  | Atlas 800I A3 | 1     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-3_5k-1_5k-50ms-on-a3-1-card-mixed-mode)                             |
+| Qwen3-Coder-480B-A35B-Instruct | Atlas 800I A3 | 24    | PD Disaggregation | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-coder-480b-a35b-instruct-3_5k-1_5k-50ms-on-a3-24-cards-disaggregation-mode) |
+| Qwen3-Coder-480B-A35B-Instruct | Atlas 800I A3 | 16    | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-coder-480b-a35b-instruct-3_5k-1_5k-50ms-on-a3-16-cards-mixed-mode)          |
+| Qwen3-Coder-480B-A35B-Instruct | Atlas 800I A3 | 8     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-coder-480b-a35b-instruct-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)           |
+| Qwen3-Next-80B-A3B-Instruct    | Atlas 800I A3 | 2     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-next-80B-a3b-instruct-3_5k-1_5k-50ms-on-a3-2-cards-mixed-mode)              |
+| Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed          | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-3_5k-1_5k-50ms-on-a2-8-cards-mixed-mode)                                |
+| Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed          | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-2k-2k-50ms-on-a2-8-cards-mixed-mode)                                    |
 
 ## Optimal Configuration
 
-### DeepSeek-R1 3_5K-1_5K 50ms on A3 32 Cards Separation Mode
+### DeepSeek-R1 3_5K-1_5K 50ms on A3 32 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
 Hardware: Atlas 800I A3 32Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
@@ -177,13 +177,13 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 3072 --random-range-ratio 1 --request-rate 16
 ```
 
-### DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Separation Mode
+### DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
 Hardware: Atlas 800I A3 32Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
@@ -293,13 +293,13 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 6000 --random-output-len 1600 --num-prompts 32 --random-range-ratio 1
 ```
 
-### DeepSeek-R1 3_9K-1K 20ms on A3 32 Cards Separation Mode
+### DeepSeek-R1 3_9K-1K 20ms on A3 32 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
 Hardware: Atlas 800I A3 32Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
@@ -309,7 +309,7 @@ TPOT: 20ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Separation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-separation-mode)
+Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Disaggregation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-disaggregation-mode)
 
 #### Benchmark
 
@@ -319,13 +319,13 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3900 --random-output-len 1000 --num-prompts 768 --random-range-ratio 1 --request-rate 16
 ```
 
-### DeepSeek-R1 3_5K-1_5K 20ms on A3 32 Cards Separation Mode
+### DeepSeek-R1 3_5K-1_5K 20ms on A3 32 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
 Hardware: Atlas 800I A3 32Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
@@ -335,7 +335,7 @@ TPOT: 20ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Separation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-separation-mode)
+Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Disaggregation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-disaggregation-mode)
 
 #### Benchmark
 
@@ -345,13 +345,13 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 768 --random-range-ratio 1 --request-rate 16
 ```
 
-### DeepSeek-R1 3_5K-1K 20ms on A3 32 Cards Separation Mode
+### DeepSeek-R1 3_5K-1K 20ms on A3 32 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
 Hardware: Atlas 800I A3 32Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
@@ -361,7 +361,7 @@ TPOT: 20ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Separation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-separation-mode)
+Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Disaggregation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-disaggregation-mode)
 
 #### Benchmark
 
@@ -451,13 +451,13 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 256  --random-input-len 2048 --random-output-len 2048 --num-prompts 1024 --random-range-ratio 1
 ```
 
-### DeepSeek-R1 2K-2K 50ms on A3 16 Cards Separation Mode
+### DeepSeek-R1 2K-2K 50ms on A3 16 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
 Hardware: Atlas 800I A3 16Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
@@ -652,13 +652,13 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 144  --random-input-len 3500 --random-output-len 1500 --num-prompts 576 --random-range-ratio 1
 ```
 
-### DeepSeek-R1 3_5K-1_5K 50ms on A3 16 Cards Separation Mode
+### DeepSeek-R1 3_5K-1_5K 50ms on A3 16 Cards Disaggregation Mode
 
 Model: Deepseek R1
 
 Hardware: Atlas 800I A3 16Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
@@ -775,13 +775,13 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 384  --random-input-len 3500 --random-output-len 1500 --num-prompts 1536 --random-range-ratio 1
 ```
 
-### DeepSeek-V3.2 128K-1K 20ms on A3 32 Cards Separation Mode
+### DeepSeek-V3.2 128K-1K 20ms on A3 32 Cards Disaggregation Mode
 
 Model: DeepSeek-V3.2-W8A8
 
 Hardware: Atlas 800I A3 32Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
@@ -931,13 +931,13 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 8  --random-input-len 131076 --random-output-len 1024 --num-prompts 8 --random-range-ratio 1
 ```
 
-### Qwen3-235B-A22B 3_5K-1_5K 50ms on A3 24 Cards Separation Mode
+### Qwen3-235B-A22B 3_5K-1_5K 50ms on A3 24 Cards Disaggregation Mode
 
 Model: Qwen3-235B-A22B-W8A8
 
 Hardware: Atlas 800I A3 24Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
@@ -1860,13 +1860,13 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 156 --random-input-len 3500 --random-output-len 1500 --num-prompts 624 --random-range-ratio 1
 ```
 
-### Qwen3-Coder-480B-A35B-Instruct 3_5K-1_5K 50ms on A3 24 Cards Separation Mode
+### Qwen3-Coder-480B-A35B-Instruct 3_5K-1_5K 50ms on A3 24 Cards Disaggregation Mode
 
 Model: Qwen3-Coder-480B-A35B-Instruct
 
 Hardware: Atlas 800I A3 24Card
 
-DeployMode: PD Separation
+DeployMode: PD Disaggregation
 
 Dataset: random
 
