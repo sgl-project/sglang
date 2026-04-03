@@ -234,6 +234,7 @@ async def preprocess_video(
 
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(SGLangBaseProcessor):
+    supports_transformers_backend = True
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -369,6 +370,31 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         return input_ids, offsets, modality_list
 
+    def compute_mrope_positions(self, input_ids, mm_items):
+        image_grid_thw = None
+        video_grid_thw = None
+        for item in mm_items:
+            if "image_grid_thw" in item.model_specific_data:
+                image_grid_thw = item.model_specific_data["image_grid_thw"]
+            if "video_grid_thw" in item.model_specific_data:
+                video_grid_thw = item.model_specific_data["video_grid_thw"]
+
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+            image_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.model_type,
+            tokens_per_second=getattr(
+                self.hf_config.vision_config, "tokens_per_second", None
+            ),
+            input_ids=input_ids_tensor,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+        )
+        return mrope_positions.squeeze(1), mrope_position_delta
+
     def get_mm_data(self, prompt, embeddings, **kwargs):
         img_grid_thw = kwargs.get("img_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
@@ -443,7 +469,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
-                    offsets=offset,
+                    offsets=[offset],
                     precomputed_embeddings=embedding_slice,
                 )
             )

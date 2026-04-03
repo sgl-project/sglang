@@ -156,7 +156,7 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = debug_torch_op(self.op_name)
+            self._impl = debug_torch_op(self.op_func, self.op_name)
             assert self._impl is not None
         return self._impl
 

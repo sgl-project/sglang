@@ -327,46 +327,26 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
         input_ids_tensor = torch.as_tensor(input_ids)
 
-        # Check if MM splitting is enabled
-        if envs.SGLANG_ENABLE_MM_SPLITTING.get():
-            items_by_modality = defaultdict(list)
-            for item in mm_inputs.mm_items:
-                items_by_modality[item.modality].append(item)
+        # Replace multimodal tokens using per-item offsets
+        items_by_modality = defaultdict(list)
+        for item in mm_inputs.mm_items:
+            items_by_modality[item.modality].append(item)
 
-            token_id_map = {
-                Modality.IMAGE: mm_inputs.im_token_id,
-                Modality.MULTI_IMAGES: mm_inputs.im_token_id,
-                Modality.AUDIO: mm_inputs.audio_token_id,
-                Modality.VIDEO: mm_inputs.video_token_id,
-            }
+        token_id_map = {
+            Modality.IMAGE: mm_inputs.im_token_id,
+            Modality.AUDIO: mm_inputs.audio_token_id,
+            Modality.VIDEO: mm_inputs.video_token_id,
+        }
 
-            for modality, items in items_by_modality.items():
-                token_id = token_id_map.get(modality)
+        for modality, items in items_by_modality.items():
+            token_id = token_id_map.get(modality)
 
-                if not items or token_id is None:
-                    continue
+            if not items or token_id is None:
+                continue
 
-                for i, item in enumerate(items):
-                    for offset in items[i].offsets:
-                        input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
-        else:
-            # Create mapping of token_ids to pad_values for each modality
-            token_to_pad_mapping = {}
-            for item in mm_inputs.mm_items:
-                if item.is_image() and mm_inputs.im_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.im_token_id] = item.pad_value
-                elif item.is_audio() and mm_inputs.audio_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.audio_token_id] = item.pad_value
-                elif item.is_video() and mm_inputs.video_token_id is not None:
-                    token_to_pad_mapping[mm_inputs.video_token_id] = item.pad_value
-                else:
-                    raise ValueError(
-                        f"No multimodal token id provided for {item.modality}"
-                    )
-
-            # Apply replacements for all tokens at once
-            for token_id, pad_value in token_to_pad_mapping.items():
-                input_ids_tensor[input_ids_tensor == token_id] = pad_value
+            for i, item in enumerate(items):
+                for offset in items[i].offsets:
+                    input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
 
         ret_input_ids = input_ids_tensor.tolist()
         return ret_input_ids
@@ -994,6 +974,8 @@ def embed_mm_inputs(
                     multimodal_model.separate_deepstack_embeds(embedding)
                 )
                 deepstack_embeddings += [deepstack_embedding]
+            else:
+                deepstack_embeddings += [None]
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
@@ -1341,23 +1323,29 @@ def tensor_hash(tensor_list) -> int:
     tensor = tensor_list
     if isinstance(tensor_list, list):
         tensor_list = flatten_nested_list(tensor_list)
-        tensor_list = [
+        tensors = [
             x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
         ]
-        tensor = torch.concat(tensor_list)
+        # GPU path: concat + triton hash (unchanged)
+        if any(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
+            tensor = torch.concat(tensors)
+            return gpu_tensor_hash(tensor.cuda())
+        # CPU path: hash each tensor incrementally without concat
+        hasher = hashlib.sha256()
+        for t in tensors:
+            t = t.detach().contiguous()
+            hasher.update(memoryview(t.view(torch.uint8).numpy()))
+        hash_bytes = hasher.digest()[:8]
+        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+    # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
-
-    if tensor.dtype == torch.bfloat16:
-        # memoryview() doesn't support PyTorch's BFloat16 dtype
-        tensor = tensor.float()
-
-    assert isinstance(tensor, torch.Tensor)
-    tensor_cpu = tensor.cpu()
-
-    mv = memoryview(tensor_cpu.numpy())
-    return data_hash(mv.tobytes())
+    hasher = hashlib.sha256()
+    hasher.update(memoryview(tensor.view(torch.uint8).numpy()))
+    hash_bytes = hasher.digest()[:8]
+    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
 def hash_feature(f):
@@ -1367,8 +1355,10 @@ def hash_feature(f):
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
         arr = np.ascontiguousarray(f)
-        arr_bytes = arr.tobytes()
-        return data_hash(arr_bytes)
+        hasher = hashlib.sha256()
+        hasher.update(memoryview(arr))
+        hash_bytes = hasher.digest()[:8]
+        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
     elif isinstance(f, CudaIpcTensorTransportProxy):
@@ -1466,6 +1456,54 @@ def _slice_model_data(
     return sliced
 
 
+def _try_simple_split(item, num_items, expanded_mm_items):
+    """Try to split a bundled item by matching feature dim-0 to offset count.
+    Returns True if split succeeded, False otherwise."""
+    feature = item.feature if item.feature is not None else item.precomputed_embeddings
+    if feature is None:
+        return False
+
+    if isinstance(feature, (torch.Tensor, np.ndarray)):
+        feature_count = feature.shape[0]
+    elif isinstance(feature, (list, tuple)):
+        feature_count = len(feature)
+    else:
+        return False
+
+    if feature_count != num_items:
+        return False
+
+    for i in range(num_items):
+        new_item = copy.copy(item)
+        if item.feature is not None:
+            if isinstance(item.feature, (list, tuple)):
+                new_item.feature = [item.feature[i]]
+            else:
+                new_item.feature = item.feature[i : i + 1]
+        if item.precomputed_embeddings is not None:
+            if isinstance(item.precomputed_embeddings, (list, tuple)):
+                new_item.precomputed_embeddings = [item.precomputed_embeddings[i]]
+            else:
+                new_item.precomputed_embeddings = item.precomputed_embeddings[i : i + 1]
+        new_item.offsets = [item.offsets[i]]
+        new_data = {}
+        for k, v in item.model_specific_data.items():
+            if isinstance(v, (list, tuple)) and len(v) == num_items:
+                new_data[k] = [v[i]]
+            elif (
+                isinstance(v, (torch.Tensor, np.ndarray))
+                and len(v.shape) > 0
+                and v.shape[0] == num_items
+            ):
+                new_data[k] = v[i : i + 1]
+            else:
+                new_data[k] = v
+        new_item.model_specific_data = new_data
+        new_item.hash = None
+        expanded_mm_items.append(new_item)
+    return True
+
+
 def get_new_expanded_mm_items(original_mm_items):
     expanded_mm_items = []
     for item in original_mm_items:
@@ -1478,7 +1516,9 @@ def get_new_expanded_mm_items(original_mm_items):
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
                 grid_len = _get_length(image_grid_thw)
                 if image_grid_thw is None or grid_len != num_items:
-                    expanded_mm_items.append(item)
+                    # No grid info — fall back to simple split by feature dim-0
+                    if not _try_simple_split(item, num_items, expanded_mm_items):
+                        expanded_mm_items.append(item)
                     continue
 
                 patches_per_item = []
@@ -1501,7 +1541,7 @@ def get_new_expanded_mm_items(original_mm_items):
                 total_feature_len = feature_len
                 for i in range(num_items):
                     start, end = slice_indices[i], slice_indices[i + 1]
-                    new_item = copy.deepcopy(item)
+                    new_item = copy.copy(item)
                     if item.feature is not None:
                         new_item.feature = _slice_value(item.feature, start, end)
                     if item.precomputed_embeddings is not None:
@@ -1523,7 +1563,8 @@ def get_new_expanded_mm_items(original_mm_items):
             elif item.is_video():
                 video_grid_thw = item.model_specific_data.get("video_grid_thw")
                 if video_grid_thw is None:
-                    expanded_mm_items.append(item)
+                    if not _try_simple_split(item, num_items, expanded_mm_items):
+                        expanded_mm_items.append(item)
                     continue
 
                 # video_grid_thw shape: [num_videos, 3] where each row is [T, H, W]
@@ -1592,7 +1633,7 @@ def get_new_expanded_mm_items(original_mm_items):
                         frame_start_indices[video_idx + 1],
                     )
 
-                    new_item = copy.deepcopy(item)
+                    new_item = copy.copy(item)
                     if item.feature is not None:
                         new_item.feature = _slice_value(item.feature, start, end)
                     if item.precomputed_embeddings is not None:
@@ -1613,7 +1654,8 @@ def get_new_expanded_mm_items(original_mm_items):
                     new_item.hash = None
                     expanded_mm_items.append(new_item)
             else:
-                expanded_mm_items.append(item)
+                if not _try_simple_split(item, num_items, expanded_mm_items):
+                    expanded_mm_items.append(item)
 
         else:
             expanded_mm_items.append(item)
@@ -1627,45 +1669,28 @@ class ShmPointerMMData:
     """
 
     def __init__(self, tensor: torch.Tensor):
-        self.cpu_tensor = tensor.cpu().contiguous()
-        self.shape = self.cpu_tensor.shape
-        self.dtype = self.cpu_tensor.dtype
-
-        nbytes = self.cpu_tensor.numel() * self.cpu_tensor.element_size()
-
-        self.shm = shared_memory.SharedMemory(create=True, size=nbytes)
-
+        if not tensor.is_cpu:
+            tensor = tensor.cpu()
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        self.shape = tensor.shape
+        self.dtype = tensor.dtype
+        nbytes = tensor.numel() * tensor.element_size()
+        shm = shared_memory.SharedMemory(create=True, size=nbytes)
         try:
-            shm_view = np.ndarray((nbytes,), dtype=np.uint8, buffer=self.shm.buf)
-
-            shm_view[:] = self.cpu_tensor.view(torch.uint8).numpy().flatten()
-        finally:
-            self.shm.close()
+            dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
+            dst.copy_(tensor.view(torch.uint8).reshape(-1))
+        except BaseException:
+            shm.close()
+            shm.unlink()
+            raise
+        self.shm_name = shm.name
+        shm.close()
+        self._shm_handle = None
 
     def __getstate__(self):
-        if not hasattr(self, "shm") or self.shm is None:
-            tensor = getattr(self, "cpu_tensor", None)
-            if tensor is None:
-                tensor = getattr(self, "tensor", None)
-            if tensor is None:
-                raise RuntimeError(
-                    "ShmPointerMMData cannot recreate shared memory without tensor"
-                )
-
-            cpu_tensor = tensor.cpu().contiguous()
-            self.shape = cpu_tensor.shape
-            self.dtype = cpu_tensor.dtype
-
-            nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
-            self.shm = shared_memory.SharedMemory(create=True, size=nbytes)
-            try:
-                shm_view = np.ndarray((nbytes,), dtype=np.uint8, buffer=self.shm.buf)
-                shm_view[:] = cpu_tensor.view(torch.uint8).numpy().flatten()
-            finally:
-                self.shm.close()
-
         return {
-            "shm_name": self.shm.name,
+            "shm_name": self.shm_name,
             "shape": self.shape,
             "dtype": self.dtype,
         }
@@ -1675,17 +1700,29 @@ class ShmPointerMMData:
         self.shape = state["shape"]
         self.dtype = state["dtype"]
         self.shm = None
+        self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
+        # Zero-copy view into shared memory (no clone, no unlink)
+        self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
+            self.shape
+        )
 
-        shm_handle = shared_memory.SharedMemory(name=self.shm_name)
-        try:
-            self.tensor = (
-                torch.frombuffer(shm_handle.buf, dtype=self.dtype)
-                .reshape(self.shape)
-                .clone()
-            )
-        finally:
-            shm_handle.close()
-            shm_handle.unlink()
+    def materialize(self) -> torch.Tensor:
+        """Clone tensor from shm to owned memory, then release shm handle."""
+        tensor = self.tensor.clone()
+        if self._shm_handle is not None:
+            self._shm_handle.close()
+            try:
+                self._shm_handle.unlink()
+            except FileNotFoundError:
+                pass  # Another rank already unlinked
+            self._shm_handle = None
+        return tensor
+
+    def __del__(self):
+        # Only close; never unlink. Unlinking is materialize()'s job.
+        if getattr(self, "_shm_handle", None) is not None:
+            self._shm_handle.close()
+            self._shm_handle = None
 
 
 def _get_is_default_transport():
@@ -1720,15 +1757,35 @@ def wrap_shm_features(obj):
     return obj
 
 
+def has_shm_features(recv_reqs):
+    """Return True if any request in the list contains ShmPointerMMData."""
+    for req in recv_reqs:
+        if hasattr(req, "batch"):
+            if has_shm_features(req.batch):
+                return True
+        elif hasattr(req, "mm_inputs") and req.mm_inputs:
+            for item in req.mm_inputs.get("mm_items", []):
+                if isinstance(item.feature, ShmPointerMMData):
+                    return True
+    return False
+
+
 def unwrap_shm_features(obj):
     """
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
+    Handles both single requests and batch requests.
     """
     if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
         return obj
+    # Handle batch requests
+    if hasattr(obj, "batch"):
+        for sub_obj in obj.batch:
+            unwrap_shm_features(sub_obj)
+        return obj
+    # Handle single requests
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         mm_items = obj.mm_inputs.get("mm_items", [])
         for item in mm_items:
             if isinstance(item.feature, ShmPointerMMData):
-                item.feature = item.feature.tensor
+                item.feature = item.feature.materialize()
     return obj

@@ -55,15 +55,10 @@ class SchedulerOutputProcessorMixin:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
-            - None if HiCache is not enabled
-            - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
-            - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
+            - None if no cached tokens at all
+            - {"device": X, "host": Y} without storage breakdown
+            - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
-        # Only show details if HiCache is enabled
-        if not getattr(self, "enable_hierarchical_cache", False):
-            return None
-
-        # Only show if there are any cached tokens
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
@@ -78,6 +73,13 @@ class SchedulerOutputProcessorMixin:
                 details["storage"] = req.cached_tokens_storage
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
+
+        if req.cached_tokens > 0:
+            return {
+                "device": req.cached_tokens,
+                "host": 0,
+            }
+
         return None
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
@@ -152,6 +154,18 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+                if logits_output.next_token_top_logprobs_val:
+                    logits_output.next_token_top_logprobs_val = [
+                        v.tolist() for v in logits_output.next_token_top_logprobs_val
+                    ]
+                    logits_output.next_token_top_logprobs_idx = [
+                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                    ]
+                if logits_output.next_token_token_ids_logprobs_val:
+                    logits_output.next_token_token_ids_logprobs_val = [
+                        v.tolist()
+                        for v in logits_output.next_token_token_ids_logprobs_val
+                    ]
 
             hidden_state_offset = 0
 
@@ -377,7 +391,7 @@ class SchedulerOutputProcessorMixin:
 
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                if batch.is_spec_v2 and logits_output.next_token_top_logprobs_val:
+                if logits_output.next_token_top_logprobs_val:
                     logits_output.next_token_top_logprobs_val = [
                         v.tolist() for v in logits_output.next_token_top_logprobs_val
                     ]
@@ -385,7 +399,7 @@ class SchedulerOutputProcessorMixin:
                         x.tolist() for x in logits_output.next_token_top_logprobs_idx
                     ]
 
-                if batch.is_spec_v2 and logits_output.next_token_token_ids_logprobs_val:
+                if logits_output.next_token_token_ids_logprobs_val:
                     logits_output.next_token_token_ids_logprobs_val = [
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
@@ -437,12 +451,8 @@ class SchedulerOutputProcessorMixin:
 
             if req.finished():
                 # delete feature to save memory
-                if req.multimodal_inputs is not None:
-                    for mm_item in req.multimodal_inputs.mm_items:
-                        pixel_values = mm_item.feature
-                        if isinstance(pixel_values, torch.Tensor):
-                            mm_item.feature = None
-                            del pixel_values
+                if req.multimodal_inputs is not None and req.session is None:
+                    req.multimodal_inputs.release_features()
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
@@ -945,10 +955,6 @@ class SchedulerOutputProcessorMixin:
             if req is skip_req:
                 continue
 
-            # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
-            if self.model_config.is_multimodal_gen and req.to_finish:
-                continue
-
             if req.finished():
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice
@@ -967,8 +973,7 @@ class SchedulerOutputProcessorMixin:
                     # origin stream_interval logic
                     should_output = (
                         len(req.output_ids) % stream_interval == 1
-                        if not self.model_config.is_multimodal_gen
-                        and stream_interval > 1
+                        if stream_interval > 1
                         else len(req.output_ids) % stream_interval == 0
                     )
 
@@ -978,8 +983,6 @@ class SchedulerOutputProcessorMixin:
                 else:
                     should_output = (
                         len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0
-                        if not self.model_config.is_multimodal_gen
-                        else False
                     )
 
             if should_output:
@@ -995,10 +998,7 @@ class SchedulerOutputProcessorMixin:
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 
-                if self.model_config.is_multimodal_gen:
-                    decode_ids_list.append(decode_ids)
-                else:
-                    decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+                decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
 
                 # Exclude the tokens after stop condition
                 output_ids_ = req.output_ids_through_stop
@@ -1034,6 +1034,8 @@ class SchedulerOutputProcessorMixin:
                         and not req.input_logprob_sent
                         # Decode server does not send input logprobs
                         and self.disaggregation_mode != DisaggregationMode.DECODE
+                        # Only send when input logprobs have been computed (after prefill)
+                        and req.input_token_logprobs_val is not None
                     ):
                         input_token_logprobs_val.append(req.input_token_logprobs_val)
                         input_token_logprobs_idx.append(req.input_token_logprobs_idx)
@@ -1055,39 +1057,38 @@ class SchedulerOutputProcessorMixin:
                         input_token_ids_logprobs_idx.append([])
 
                     if req.return_logprob:
+                        logprob_end = max(len(output_ids_), 1)
                         output_token_logprobs_val.append(
                             req.output_token_logprobs_val[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_token_logprobs_idx.append(
                             req.output_token_logprobs_idx[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_top_logprobs_val.append(
                             req.output_top_logprobs_val[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_top_logprobs_idx.append(
                             req.output_top_logprobs_idx[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_token_ids_logprobs_val.append(
                             req.output_token_ids_logprobs_val[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_token_ids_logprobs_idx.append(
                             req.output_token_ids_logprobs_idx[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
-                        req.send_output_token_logprobs_offset = len(
-                            req.output_token_logprobs_val
-                        )
+                        req.send_output_token_logprobs_offset = logprob_end
                     else:
                         output_token_logprobs_val.append([])
                         output_token_logprobs_idx.append([])
@@ -1109,7 +1110,9 @@ class SchedulerOutputProcessorMixin:
                     for k, v in req.customized_info.items():
                         if k not in customized_info:
                             customized_info[k] = []
-                        customized_info[k].append(v[send_token_offset:])
+                        customized_info[k].append(
+                            v[send_token_offset : len(output_ids_)]
+                        )
 
             if (
                 req.finished()
@@ -1122,8 +1125,6 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if reqs or is_idle_batch:
-            if self.model_config.is_multimodal_gen:
-                return
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,

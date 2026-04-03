@@ -40,6 +40,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_fp4_layer_for_marlin,
+    prepare_moe_fp4_layer_for_marlin,
+    should_use_fp4_marlin_fallback,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -86,12 +91,18 @@ try:
 
     enable_flashinfer_fp4_gemm = True
 except ImportError:
-    if is_cuda():
-        from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
     shuffle_matrix_sf_a = None
+
+if is_cuda():
+    try:
+        from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+    except ImportError:
+        cutlass_fp4_gemm = None
+else:
+    cutlass_fp4_gemm = None
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
@@ -134,7 +145,15 @@ def fp4_gemm(
     out_features: int,
 ) -> torch.Tensor:
     fp4_backend = get_fp4_gemm_runner_backend()
-    if enable_flashinfer_fp4_gemm:
+    if fp4_backend.is_cutlass() and cutlass_fp4_gemm is not None:
+        # flashinfer.fp4_quantize returns scale factors as uint8 (e4m3fn bits
+        # stored in uint8 memory). The JIT kernel requires float8_e4m3fn dtype.
+        if input_sf.dtype != torch.float8_e4m3fn:
+            input_sf = input_sf.view(torch.float8_e4m3fn)
+        if weight_sf.dtype != torch.float8_e4m3fn:
+            weight_sf = weight_sf.view(torch.float8_e4m3fn)
+        return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
+    elif enable_flashinfer_fp4_gemm:
         # Use the remapping logic to convert SGLang backend names to FlashInfer API names
         backend = fp4_backend.get_flashinfer_backend()
         return flashinfer_fp4_gemm(
@@ -1128,7 +1147,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 100
+        return 75  # SM75+ (Turing) supports Marlin FP4 fallback; SM100 for native FP4
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
@@ -1259,7 +1278,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             layer,
             prefix,
             Linear=ModelOptFp4LinearMethod,
-            Moe=ModelOptNvFp4FusedMoEMethod,  # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
+            Moe=ModelOptNvFp4FusedMoEMethod,
         )
 
 
@@ -1302,6 +1321,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
         layer.logical_widths = output_partition_sizes
+        layer.params_dtype = params_dtype
 
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
@@ -1356,6 +1376,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if should_use_fp4_marlin_fallback():
+            # Marlin FP4 fallback: consolidate global scale then repack weights
+            weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+            layer.weight_scale_2_marlin = Parameter(weight_scale_2, requires_grad=False)
+            prepare_fp4_layer_for_marlin(
+                layer,
+                weight_attr="weight",
+                weight_scale_attr="weight_scale",
+                weight_global_scale_attr="weight_scale_2_marlin",
+            )
+            layer.use_marlin_fallback = True
+            return
+
+        layer.use_marlin_fallback = False
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
@@ -1456,6 +1490,18 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if layer.use_marlin_fallback:
+            return torch.ops.sglang.apply_fp4_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                weight_global_scale=layer.weight_scale_2_marlin,
+                workspace=layer.marlin_workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+
         output_dtype = x.dtype
         x_m, _ = x.shape
 
@@ -1478,7 +1524,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
-        if enable_flashinfer_fp4_gemm:
+        if (
+            enable_flashinfer_fp4_gemm
+            and not get_fp4_gemm_runner_backend().is_cutlass()
+        ):
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
 
@@ -1509,15 +1558,24 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        if not is_blackwell_supported():
+
+        if should_use_fp4_marlin_fallback():
+            logger.warning_once(
+                "GPU is not Blackwell (SM100+). Using Marlin FP4 fallback kernel "
+                "for MoE layers. Weights remain compressed in FP4 format."
+            )
+            self.use_marlin_fallback = True
+            self.enable_flashinfer_trtllm_moe = False
+        elif not is_blackwell_supported():
             raise ValueError(
                 "Current platform does not support NVFP4"
-                " quantization. Please use Blackwell and"
-                " above."
+                " quantization. Please use SM75+ (Turing or newer)."
             )
-        self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-        )
+        else:
+            self.use_marlin_fallback = False
+            self.enable_flashinfer_trtllm_moe = (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+            )
         self._cache_permute_indices = {}
 
     @property
@@ -1671,6 +1729,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+        if self.use_marlin_fallback:
+            prepare_moe_fp4_layer_for_marlin(layer)
+            return
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
@@ -1883,6 +1944,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.use_marlin_fallback:
+            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+            return
         if get_moe_runner_backend().is_flashinfer_trtllm():
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
@@ -1904,6 +1968,34 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation in ACT_STR_TO_TYPE_MAP
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
+
+        # Marlin FP4 fallback path for non-Blackwell GPUs (SM75-SM89)
+        if self.use_marlin_fallback:
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+            expert_map = None
+            global_num_experts = -1
+            if hasattr(layer, "dispatcher") and hasattr(
+                layer.dispatcher, "local_expert_mapping"
+            ):
+                expert_map = layer.dispatcher.local_expert_mapping
+                if expert_map is not None:
+                    global_num_experts = moe_runner_config.num_experts
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=4,
+                w13_global_scale=layer.w13_weight_scale_2,
+                w2_global_scale=layer.w2_weight_scale_2,
+                expert_map=expert_map,
+                global_num_experts=global_num_experts,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
         # backend is flashinfer_trtllm

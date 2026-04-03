@@ -87,6 +87,18 @@ def get_hidden_dim(
             return config.hidden_size, config.intermediate_size * 2
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
+        elif module_name == "gate_up_proj_moe":
+            moe_inter = (
+                getattr(config, "moe_intermediate_size", None)
+                or config.intermediate_size
+            )
+            return config.hidden_size, moe_inter * 2
+        elif module_name == "down_proj_moe":
+            moe_inter = (
+                getattr(config, "moe_intermediate_size", None)
+                or config.intermediate_size
+            )
+            return moe_inter, config.hidden_size
         elif module_name == "embed_tokens":
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
             # if contain extra tokens will be added; otherwise is 0.
@@ -109,13 +121,17 @@ def get_normalized_target_modules(
     Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
 
     Also handles PEFT shorthand strings like "all-linear" or "all" by returning
-    {"all"} as a sentinel value (the caller should check for "all" and fall
-    back to the CLI --lora-target-modules to determine the concrete module set).
+    {"all"} as a sentinel value.  Callers that need a concrete module set
+    should use :func:`auto_detect_lora_target_modules` to resolve the shorthand
+    against the loaded base model.
     """
-    # Handle PEFT shorthand strings — these cannot be resolved to concrete
-    # module names without inspecting the base model, so we return {"all"}
-    # and let the caller fall back to the CLI --lora-target-modules.
+    # Handle PEFT shorthand strings — return {"all"} as sentinel.
+    # Callers can resolve to concrete names via auto_detect_lora_target_modules().
     if isinstance(target_modules, str):
+        if target_modules not in ["all", "all-linear"]:
+            raise ValueError(
+                "Only 'all' or 'all-linear' can be used as the string for target module"
+            )
         return {"all"}
 
     params_mapping = {
@@ -148,6 +164,7 @@ def get_stacked_multiply(module_name: str) -> int:
     stacked_rank = {
         "qkv_proj": 3,
         "gate_up_proj": 2,
+        "gate_up_proj_moe": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
 
@@ -168,7 +185,46 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj", "down_proj_moe"]
+
+# Normalized module names that the LoRA system fully supports
+# (i.e. get_hidden_dim, init_buffers, and init_lora_modules can handle them).
+_KNOWN_LORA_TARGET_MODULES = frozenset(
+    {
+        "qkv_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    }
+)
+
+
+def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
+    """Discover LoRA-compatible modules by inspecting the base model.
+
+    Walks the model graph and returns the set of *normalized* target-module
+    names that (a) actually exist in the model and (b) the LoRA memory pool
+    can handle.  This is used to resolve PEFT shorthands like ``"all-linear"``
+    without requiring the user to enumerate modules on the CLI.
+    """
+    from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+    raw_names: set = set()
+    for name, module in model.named_modules():
+        if isinstance(module, FusedMoE):
+            raw_names.add("gate_up_proj")
+            raw_names.add("down_proj")
+        elif isinstance(module, ParallelLMHead):
+            raw_names.add("lm_head")
+        elif isinstance(module, LinearBase):
+            raw_names.add(name.split(".")[-1])
+
+    normalized = get_normalized_target_modules(raw_names)
+    return normalized & _KNOWN_LORA_TARGET_MODULES
 
 
 def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:

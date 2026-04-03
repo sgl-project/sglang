@@ -184,7 +184,9 @@ class FunctionCallParser:
         )
 
     def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
+        self,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+        parallel_tool_calls: bool = True,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -210,5 +212,7 @@ class FunctionCallParser:
             tag = self.get_structure_tag()
             return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            json_schema = get_json_schema_constraint(
+                self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
+            )
             return ("json_schema", json_schema)

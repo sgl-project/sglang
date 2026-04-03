@@ -243,6 +243,10 @@ class Envs:
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
+    # Extra slots in req_to_token_pool for decode workers (only effective when
+    # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
+    # can overlap with decode execution without raising max_running_requests.
+    SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS = EnvInt(0)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -280,9 +284,13 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
-    # Max fraction of cache (by token count) that can be pinned; 0 = disable pinning.
-    SGLANG_HICACHE_MAX_PINNED_RATIO = EnvFloat(0.0)
-
+    # Staging buffer for heterogeneous TP KV transfer
+    SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
+    SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
+    SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
+    # staging_buffer.py once Triton kernels are fully validated in production.
+    SGLANG_STAGING_USE_TORCH = EnvBool(False)
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
@@ -328,6 +336,7 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    SGLANG_FORCE_NVFP4_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
@@ -337,10 +346,12 @@ class Envs:
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
-    SGLANG_ENABLE_FLASHINFER_FP8_GEMM = EnvBool(False)
     # Default to the pick from flashinfer
-    SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
+    # None = standard attention. See https://arxiv.org/abs/2512.12087
+    SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     # TODO(mmangkad): Remove this once the FlashInfer unified allreduce-fusion
     # transport issue on GB200/GB300 platforms is fixed and verified resolved.
     SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
@@ -408,7 +419,6 @@ class Envs:
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     SGLANG_IS_FIRST_RANK_ON_NODE = EnvBool(True)
-    SGLANG_SUPPORT_CUTLASS_BLOCK_FP8 = EnvBool(False)
     SGLANG_SYNC_TOKEN_IDS_ACROSS_TP = EnvBool(False)
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
 
@@ -450,11 +460,9 @@ class Envs:
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
+    SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
-
-    # MM splitting behavior control
-    SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
@@ -549,9 +557,6 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
     _print_deprecated_env(
-        "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
-    )
-    _print_deprecated_env(
         "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
     )
     _print_deprecated_env(
@@ -581,23 +586,6 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
-
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_ENABLE_FLASHINFER_FP8_GEMM",
-    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_ENABLE_FLASHINFER_GEMM",
-    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
-    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
-)
-_warn_deprecated_env_to_cli_flag(
-    "SGLANG_FLASHINFER_FP4_GEMM_BACKEND",
-    "It will be completely removed in 0.5.9. Please use '--fp4-gemm-backend' instead.",
-)
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE",
     "Please use '--enable-prefill-delayer' instead.",

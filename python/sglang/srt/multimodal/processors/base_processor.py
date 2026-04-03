@@ -40,6 +40,7 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
+_IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 
 
 @dataclasses.dataclass
@@ -136,7 +137,6 @@ class MultimodalSpecialTokens:
     def get_token_id_by_modality(self, modality: Modality) -> Optional[int]:
         return {
             Modality.IMAGE: self.image_token_id,
-            Modality.MULTI_IMAGES: self.image_token_id,
             Modality.VIDEO: self.video_token_id,
             Modality.AUDIO: self.audio_token_id,
         }.get(modality)
@@ -173,6 +173,7 @@ class MultimodalSpecialTokens:
 
 class BaseMultimodalProcessor(ABC):
     models = []
+    gpu_image_decode = True  # Enable GPU decoding by default
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -251,6 +252,14 @@ class BaseMultimodalProcessor(ABC):
                 MM_FEATURE_CACHE_SIZE,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             )
+
+    def compute_mrope_positions(self, input_ids, mm_items):
+        """Compute M-RoPE positions from expanded input_ids and multimodal items.
+
+        Returns (mrope_positions, mrope_position_delta) or (None, None) if the
+        model does not use M-RoPE.
+        """
+        return None, None
 
     @property
     def spatial_merge_size(self):
@@ -349,7 +358,7 @@ class BaseMultimodalProcessor(ABC):
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
-                    offsets=offset,
+                    offsets=[offset],
                     precomputed_embeddings=embedding_slice,
                 )
             )
@@ -399,7 +408,9 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["device"] = "xpu"
             elif not _is_npu:
                 kwargs["device"] = "cuda"
-            else:
+            elif processor.__class__.__name__ not in {
+                "Glm4vProcessor",
+            }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
                     npu_apply_qwen_image_preprocess_patch,
@@ -460,8 +471,9 @@ class BaseMultimodalProcessor(ABC):
 
         return estimated_frames_list
 
-    @staticmethod
+    @classmethod
     def _load_single_item(
+        cls,
         data,
         modality: Modality,
         frame_count_limit=None,
@@ -473,7 +485,8 @@ class BaseMultimodalProcessor(ABC):
 
         If data is processor_output or precomputed embedding, return directly.
 
-        Static method that can be pickled for multiprocessing"""
+        Class method that can be pickled for multiprocessing
+        """
         if isinstance(data, dict):
             data_format = data.get("format")
             if data_format in (
@@ -485,8 +498,13 @@ class BaseMultimodalProcessor(ABC):
                 return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
+                img, _ = load_image(data, cls.gpu_image_decode)
+                if (
+                    discard_alpha_channel
+                    and not isinstance(img, torch.Tensor)
+                    and img.mode != "RGB"
+                ):
+                    # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
@@ -527,7 +545,7 @@ class BaseMultimodalProcessor(ABC):
                 type(data),
             )
             future = self.io_executor.submit(
-                BaseMultimodalProcessor._load_single_item,
+                self.__class__._load_single_item,
                 data,
                 modality,
                 None,  # frame_count_limit: no consider for fast path
@@ -587,7 +605,7 @@ class BaseMultimodalProcessor(ABC):
 
                 futures.append(
                     self.io_executor.submit(
-                        BaseMultimodalProcessor._load_single_item,
+                        self.__class__._load_single_item,
                         data,
                         modality,
                         frame_count_limit,
@@ -979,7 +997,8 @@ class BaseMultimodalProcessor(ABC):
         self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
         """
-        Create mm_items directly from processor output, with one item for each modality
+        Create mm_items from processor output. Initially creates one item per modality;
+        these are later split into per-image/video items by get_new_expanded_mm_items.
 
         Note that the data_dict can be passed via offline engine api
         """
@@ -1122,6 +1141,11 @@ class BaseMultimodalProcessor(ABC):
                 mm_token_id=mm_token_id,
             )
 
+        # Split bundled items into per-image/video items for better cache granularity
+        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+        all_collected_items = get_new_expanded_mm_items(all_collected_items)
+
         """
         solution for cuda-ipc memory-leak:
         1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
@@ -1134,7 +1158,7 @@ class BaseMultimodalProcessor(ABC):
             # post-process
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    sync_flag, available_slice = (
+                    sync_flag, available_slice, byte_offset = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.feature
                         )
@@ -1147,6 +1171,13 @@ class BaseMultimodalProcessor(ABC):
                             data=available_slice,
                             info_data=item.feature,
                             sync_buffer_meta=sync_flag,
+                            pool_ipc_handle=(
+                                self.cudaipc_mmfeature_pool._pool_ipc_handle
+                                if _IPC_POOL_HANDLE_CACHE
+                                else None
+                            ),
+                            pool_byte_offset=byte_offset,
+                            pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
                         )
                     elif not self.server_args.keep_mm_feature_on_device:
                         item.feature = item.feature.cpu()
@@ -1155,7 +1186,7 @@ class BaseMultimodalProcessor(ABC):
                     and item.precomputed_embeddings.is_cuda
                 ):
 
-                    sync_flag, available_slice = (
+                    sync_flag, available_slice, byte_offset = (
                         self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
                             item.precomputed_embeddings
                         )
@@ -1169,6 +1200,13 @@ class BaseMultimodalProcessor(ABC):
                             data=available_slice,
                             info_data=item.precomputed_embeddings,
                             sync_buffer_meta=sync_flag,
+                            pool_ipc_handle=(
+                                self.cudaipc_mmfeature_pool._pool_ipc_handle
+                                if _IPC_POOL_HANDLE_CACHE
+                                else None
+                            ),
+                            pool_byte_offset=byte_offset,
+                            pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
                         )
                     elif not self.server_args.keep_mm_feature_on_device:
                         item.precomputed_embeddings = item.precomputed_embeddings.cpu()
