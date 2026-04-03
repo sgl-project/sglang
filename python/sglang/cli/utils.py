@@ -29,7 +29,7 @@ def _is_registered_diffusion_model(model_path: str) -> bool:
     except ImportError:
         return False
 
-    return get_model_info(model_path) is not None
+    return get_model_info(model_path, backend="sglang") is not None
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
