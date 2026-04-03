@@ -38,6 +38,7 @@ from sglang.jit_kernel.flash_attention_v4 import (
 from sglang.jit_kernel.flash_attention_v4 import (
     flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
 )
+from sglang.srt.layers.attention.ringattention_backend import RingAttentionBackend
 
 
 @dataclass
@@ -74,6 +75,8 @@ class FlashAttentionMetadata:
     encoder_lens_int32: torch.Tensor = None
     # Page table for the encoder
     encoder_page_table: torch.Tensor = None
+    # Ring Attention Backend
+    ring_attn_backend: RingAttentionBackend = None
 
     @dataclass
     class LocalAttentionMetadata:
@@ -644,6 +647,8 @@ class FlashAttentionBackend(AttentionBackend):
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
+                if forward_batch.do_ring_attn:
+                    metadata.ring_attn_backend = RingAttentionBackend()
                 metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
@@ -900,29 +905,37 @@ class FlashAttentionBackend(AttentionBackend):
                 and forward_batch.attn_cp_metadata is not None
                 and self.attn_cp_size > 1
             ):
+                args = {
+                    "k_cache": key_cache,
+                    "v_cache": value_cache,
+                    "page_table": page_table,
+                    "cu_seqlens_k_new": cu_seqlens_k if not use_local_attn else None,
+                    "softmax_scale": layer.scaling,
+                    "causal": False if use_cascade_attn else causal,
+                    "window_size": window_size,
+                    "softcap": layer.logit_cap,
+                    "k_descale": k_descale,
+                    "v_descale": v_descale,
+                    "num_splits": self.num_splits,
+                }
 
                 def _fa_cp_attn(
                     q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
                 ):
-                    return flash_attn_with_kvcache(
-                        q=q_chunk,
-                        k_cache=key_cache,
-                        v_cache=value_cache,
-                        page_table=page_table,
-                        cache_seqlens=cache_seqlens_cp,
-                        cu_seqlens_q=cu_seqlens_q_cp,
-                        cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                        max_seqlen_q=max_seqlen_q_cp,
-                        softmax_scale=layer.scaling,
-                        causal=False if use_cascade_attn else causal,
-                        window_size=window_size,
-                        softcap=layer.logit_cap,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        return_softmax_lse=use_cascade_attn,
-                        num_splits=self.num_splits,
-                        **kwargs,
-                    )
+                    args["q"] = q_chunk
+                    args["max_seqlen_q"] = max_seqlen_q
+                    args["cache_seqlens"] = cache_seqlens_cp
+                    args["cu_seqlens_q"] = cu_seqlens_q_cp
+
+                    if metadata.ring_attn_backend is not None:
+                        return metadata.ring_attn_backend.forward_extend(
+                            flash_attn_with_kvcache, *args, **kwargs
+                        )
+                    else:
+                        return flash_attn_with_kvcache(
+                            *args,
+                            **kwargs,
+                        )
 
                 result = cp_attn_forward_extend(
                     forward_batch,

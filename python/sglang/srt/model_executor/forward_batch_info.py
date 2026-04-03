@@ -369,6 +369,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
+    do_ring_attn: bool = False
 
     # For DP attention
     original_global_num_tokens_cpu: Optional[List[int]] = None
