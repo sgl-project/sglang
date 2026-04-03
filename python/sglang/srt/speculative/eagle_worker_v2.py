@@ -1050,6 +1050,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
             named_tensors=named_tensors,
             load_format=recv_req.load_format,
+            loader_metadata=recv_req.loader_metadata,
         )
         if not success:
             return success, message
@@ -1057,5 +1058,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         success, message = self.target_worker.model_runner.update_weights_from_tensor(
             named_tensors=named_tensors,
             load_format=recv_req.load_format,
+            loader_metadata=recv_req.loader_metadata,
         )
         return success, message

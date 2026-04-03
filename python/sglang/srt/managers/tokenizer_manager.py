@@ -373,6 +373,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
+        self.weight_update_payload_digest: Optional[str] = None
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 

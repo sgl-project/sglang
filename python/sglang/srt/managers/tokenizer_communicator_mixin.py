@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -82,7 +83,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, kill_process_tree
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -579,11 +580,24 @@ class TokenizerCommunicatorMixin:
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
         async with lock_context:
+            success, message, is_noop = self._validate_weight_update_request(obj)
+            if not success:
+                return success, message
+            if is_noop:
+                return True, message
             results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = _Communicator.merge_results(results)
+        if not success and obj.crash_on_error:
+            logger.critical(
+                "Crashing after failed weight update because crash_on_error=True: %s",
+                message,
+            )
+            kill_process_tree(os.getpid())
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
+            self._update_weight_version_if_provided(
+                obj.weight_version, payload_digest=obj.payload_digest
+            )
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
@@ -961,8 +975,53 @@ class TokenizerCommunicatorMixin:
         await self.send_to_scheduler.send_pyobj(obj)
 
     def _update_weight_version_if_provided(
-        self: TokenizerManager, weight_version: Optional[str]
+        self: TokenizerManager,
+        weight_version: Optional[str],
+        payload_digest: Optional[str] = None,
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
             self.server_args.weight_version = weight_version
+            self.weight_update_payload_digest = payload_digest
+
+    def _validate_weight_update_request(
+        self: TokenizerManager, obj: UpdateWeightsFromTensorReqInput
+    ) -> Tuple[bool, str, bool]:
+        """Validate version / digest constraints for tensor-based weight updates."""
+        current_version = self.server_args.weight_version
+        current_digest = self.weight_update_payload_digest
+
+        if obj.weight_version is not None and current_version == obj.weight_version:
+            if obj.payload_digest is None or current_digest is None:
+                return (
+                    False,
+                    "Target weight version is already active. "
+                    "Provide a new weight_version or a matching payload_digest for a no-op retry.",
+                    False,
+                )
+
+            if current_digest == obj.payload_digest:
+                return (
+                    True,
+                    "Weight update already applied; payload digest matches the active version.",
+                    True,
+                )
+
+            return (
+                False,
+                "Target weight version is already active with a different payload digest.",
+                False,
+            )
+
+        if (
+            obj.base_weight_version is not None
+            and obj.base_weight_version != current_version
+        ):
+            return (
+                False,
+                "Base weight version mismatch: "
+                f"expected {obj.base_weight_version}, current {current_version}.",
+                False,
+            )
+
+        return True, "", False

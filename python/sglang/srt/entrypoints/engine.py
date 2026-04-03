@@ -101,6 +101,10 @@ from sglang.srt.utils import (
 from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.weight_sync.update_bytes import (
+    build_update_weights_request_from_named_tensors,
+    load_named_tensors_from_bytes,
+)
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -904,9 +908,17 @@ class Engine(EngineBase):
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict] = None,
+        crash_on_error: bool = False,
     ):
-        """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
-        to avoid duplicated cache cleaning operation."""
+        """Update model weights from in-memory tensors.
+
+        If there are going to be more updates, set `flush_cache=False` to avoid
+        duplicated cache cleaning work.
+        """
         if load_format == "flattened_bucket":
             serialized_named_tensors = named_tensors
         else:
@@ -918,6 +930,44 @@ class Engine(EngineBase):
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
+            weight_version=weight_version,
+            base_weight_version=base_weight_version,
+            payload_digest=payload_digest,
+            loader_metadata=loader_metadata,
+            crash_on_error=crash_on_error,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.update_weights_from_tensor(obj, None)
+        )
+
+    def update_weights_from_bytes(
+        self,
+        weights_bytes: bytes,
+        *,
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+        tensor_format: str = "safetensors",
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict] = None,
+        crash_on_error: bool = False,
+    ):
+        """Update model weights from a self-describing byte payload."""
+        named_tensors = load_named_tensors_from_bytes(
+            weights_bytes,
+            tensor_format=tensor_format,
+        )
+        obj = build_update_weights_request_from_named_tensors(
+            named_tensors,
+            tp_size=self.server_args.tp_size,
+            load_format=load_format,
+            flush_cache=flush_cache,
+            base_weight_version=base_weight_version,
+            weight_version=weight_version,
+            payload_digest=payload_digest,
+            loader_metadata=loader_metadata,
+            crash_on_error=crash_on_error,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)

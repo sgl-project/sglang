@@ -26,7 +26,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -1642,6 +1642,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self,
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         load_format: Optional[str] = None,
+        loader_metadata: Optional[Dict[str, Any]] = None,
     ):
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
@@ -1662,7 +1663,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format in self.server_args.custom_weight_loader:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self.model, named_tensors)
+            _call_custom_weight_loader(
+                custom_loader,
+                self.model,
+                named_tensors,
+                loader_metadata=loader_metadata,
+            )
         elif load_format is None:
             self.model.load_weights(named_tensors)
         else:
@@ -2991,6 +2997,32 @@ def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tenso
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
         default_weight_loader(params_dict[name], tensor)
+
+
+def _call_custom_weight_loader(
+    custom_loader: Callable,
+    model: nn.Module,
+    named_tensors: List[Tuple[str, torch.Tensor]],
+    loader_metadata: Optional[Dict[str, Any]] = None,
+):
+    """Call custom loaders with optional metadata while preserving the legacy 2-arg API."""
+    try:
+        signature = inspect.signature(custom_loader)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is None:
+        custom_loader(model, named_tensors)
+        return
+
+    accepts_loader_metadata = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD or param.name == "loader_metadata"
+        for param in signature.parameters.values()
+    )
+    if accepts_loader_metadata:
+        custom_loader(model, named_tensors, loader_metadata=loader_metadata)
+    else:
+        custom_loader(model, named_tensors)
 
 
 def _unwrap_tensor(tensor, tp_rank, device):

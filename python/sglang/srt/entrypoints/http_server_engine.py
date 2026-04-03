@@ -1,9 +1,11 @@
+import json
 import multiprocessing
 import time
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import torch
+from safetensors.torch import save as save_safetensors
 
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
@@ -80,11 +82,15 @@ class HttpServerEngineAdapter(EngineBase):
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = False,
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict[str, Any]] = None,
+        crash_on_error: bool = False,
     ):
         """
-        Update model weights from tensor data. The HTTP server will only post meta data, and the real weights will be copied directly from GPUs.
-        Note: The model should be on GPUs rather than CPU for this functionality to work properly.
-        If you encounter issues, ensure your model is loaded on GPU devices rather than CPU.
+        Update model weights through the legacy local tensor / IPC transport.
+        For remote-safe HTTP updates, prefer `update_weights_from_bytes()`.
         """
 
         return self._make_request(
@@ -96,7 +102,80 @@ class HttpServerEngineAdapter(EngineBase):
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,
+                "weight_version": weight_version,
+                "base_weight_version": base_weight_version,
+                "payload_digest": payload_digest,
+                "loader_metadata": loader_metadata,
+                "crash_on_error": crash_on_error,
             },
+        )
+
+    def update_weights_from_bytes(
+        self,
+        weights_bytes: bytes,
+        *,
+        load_format: Optional[str] = None,
+        flush_cache: bool = False,
+        tensor_format: str = "safetensors",
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict[str, Any]] = None,
+        crash_on_error: bool = False,
+    ):
+        metadata = {
+            "tensor_format": tensor_format,
+            "load_format": load_format,
+            "flush_cache": flush_cache,
+            "weight_version": weight_version,
+            "base_weight_version": base_weight_version,
+            "payload_digest": payload_digest,
+            "loader_metadata": loader_metadata,
+            "crash_on_error": crash_on_error,
+        }
+        response = requests.post(
+            f"{self.server_args.url()}/update_weights_from_bytes",
+            data={"metadata": json.dumps(metadata)},
+            files={
+                "weights_file": (
+                    "weights.safetensors",
+                    weights_bytes,
+                    "application/octet-stream",
+                )
+            },
+            verify=self.server_args.ssl_verify(),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def update_weights_from_safetensors(
+        self,
+        named_tensors: List[Tuple[str, torch.Tensor]],
+        *,
+        load_format: Optional[str] = None,
+        flush_cache: bool = False,
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict[str, Any]] = None,
+        crash_on_error: bool = False,
+    ):
+        weights_bytes = save_safetensors(
+            {
+                name: tensor.detach().cpu().contiguous()
+                for name, tensor in named_tensors
+            }
+        )
+        return self.update_weights_from_bytes(
+            weights_bytes,
+            load_format=load_format,
+            flush_cache=flush_cache,
+            tensor_format="safetensors",
+            weight_version=weight_version,
+            base_weight_version=base_weight_version,
+            payload_digest=payload_digest,
+            loader_metadata=loader_metadata,
+            crash_on_error=crash_on_error,
         )
 
     def shutdown(self):

@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import tempfile
@@ -175,6 +176,10 @@ from sglang.srt.utils.json_response import (
     orjson_response,
 )
 from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.weight_sync.update_bytes import (
+    build_update_weights_request_from_named_tensors,
+    load_named_tensors_from_bytes,
+)
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -1069,12 +1074,81 @@ async def destroy_weights_update_group(
 async def update_weights_from_tensor(
     obj: UpdateWeightsFromTensorReqInput, request: Request
 ):
-    """Update the weights from tensor inplace without re-launching the server.
+    """Update weights via the local tensor / IPC transport without restarting.
+
     Notes:
     1. Ensure that the model is on the correct device (e.g., GPU) before calling this endpoint. If the model is moved to the CPU unexpectedly, it may cause performance issues or runtime errors.
-    2. HTTP will transmit only the metadata of the tensor, while the tensor itself will be directly copied to the model.
-    3. Any binary data in the named tensors should be base64 encoded.
+    2. This route expects `serialized_named_tensors` produced by `MultiprocessingSerializer`.
+    3. Remote HTTP clients should prefer `/update_weights_from_bytes`.
     """
+
+    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
+        obj, request
+    )
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/update_weights_from_bytes")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_bytes(
+    request: Request,
+    weights_file: UploadFile = File(...),
+    metadata: str = Form("{}"),
+):
+    """Update weights from an uploaded byte payload.
+
+    The external wire format is multipart form data with a safetensors blob.
+    The server decodes the uploaded tensors locally and reuses the existing
+    in-process tensor update path.
+    """
+
+    try:
+        metadata_dict = json.loads(metadata or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=f"Invalid metadata JSON: {exc}",
+        ) from exc
+
+    if not isinstance(metadata_dict, dict):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="metadata must decode to a JSON object.",
+        )
+
+    tensor_format = metadata_dict.pop("tensor_format", "safetensors")
+    payload = await weights_file.read()
+    if not payload:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="weights_file must not be empty.",
+        )
+
+    try:
+        named_tensors = load_named_tensors_from_bytes(payload, tensor_format=tensor_format)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=f"Failed to decode uploaded tensor payload: {exc}",
+        ) from exc
+
+    obj = build_update_weights_request_from_named_tensors(
+        named_tensors,
+        tp_size=_global_state.tokenizer_manager.server_args.tp_size,
+        load_format=metadata_dict.get("load_format"),
+        flush_cache=metadata_dict.get("flush_cache", True),
+        abort_all_requests=metadata_dict.get("abort_all_requests", False),
+        base_weight_version=metadata_dict.get("base_weight_version"),
+        weight_version=metadata_dict.get("weight_version"),
+        payload_digest=metadata_dict.get("payload_digest"),
+        loader_metadata=metadata_dict.get("loader_metadata"),
+        crash_on_error=metadata_dict.get("crash_on_error", False),
+        disable_draft_model=metadata_dict.get("disable_draft_model"),
+    )
 
     success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
         obj, request
@@ -1132,8 +1206,9 @@ async def update_weight_version(obj: UpdateWeightVersionReqInput, request: Reque
     # Use a simple approach without the complex lock mechanism for now
     # since weight_version update is a simple operation that doesn't affect model weights
     try:
-        # Update the weight version in server args (the single source of truth)
-        _global_state.tokenizer_manager.server_args.weight_version = obj.new_version
+        _global_state.tokenizer_manager._update_weight_version_if_provided(
+            obj.new_version
+        )
 
         return ORJSONResponse(
             {

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -17,6 +17,11 @@ async def update_weights(
     device_mesh_key: str,
     device_mesh: DeviceMesh,
     load_format: Optional[str] = None,
+    weight_version: Optional[str] = None,
+    base_weight_version: Optional[str] = None,
+    payload_digest: Optional[str] = None,
+    loader_metadata: Optional[Dict[str, Any]] = None,
+    crash_on_error: bool = False,
 ):
     """
     Update weights for the inference engine.
@@ -96,6 +101,11 @@ async def update_weights(
                 for _ in range(infer_tp_size)
             ],
             load_format=load_format,
+            weight_version=weight_version,
+            base_weight_version=base_weight_version,
+            payload_digest=payload_digest,
+            loader_metadata=loader_metadata,
+            crash_on_error=crash_on_error,
         )
 
         return await engine.update_weights_from_tensor(update_weights_request)

@@ -48,8 +48,30 @@ class EngineBase(ABC):
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict] = None,
+        crash_on_error: bool = False,
     ):
         """Update model weights with in-memory tensor data."""
+        pass
+
+    @abstractmethod
+    def update_weights_from_bytes(
+        self,
+        weights_bytes: bytes,
+        *,
+        load_format: Optional[str] = None,
+        flush_cache: bool = True,
+        tensor_format: str = "safetensors",
+        weight_version: Optional[str] = None,
+        base_weight_version: Optional[str] = None,
+        payload_digest: Optional[str] = None,
+        loader_metadata: Optional[Dict] = None,
+        crash_on_error: bool = False,
+    ):
+        """Update model weights from a self-describing byte payload."""
         pass
 
     def load_lora_adapter(self, lora_name: str, lora_path: str):

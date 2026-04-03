@@ -162,6 +162,7 @@ class BaseTpWorker(ABC):
                 recv_req.serialized_named_tensors[self.tp_rank]
             ),
             load_format=recv_req.load_format,
+            loader_metadata=recv_req.loader_metadata,
         )
         return success, message
 

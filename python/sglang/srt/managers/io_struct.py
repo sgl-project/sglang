@@ -1275,10 +1275,11 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq):
 
 @dataclass
 class UpdateWeightsFromTensorReqInput(BaseReq):
-    """Update model weights from tensor input.
+    """Update model weights from an in-process tensor transport.
 
-    - Tensors are serialized for transmission
-    - Data is structured in JSON for easy transmission over HTTP
+    `serialized_named_tensors` is produced by `MultiprocessingSerializer` and is
+    intended for local / IPC-style updates. Remote HTTP clients should prefer
+    `/update_weights_from_bytes`.
     """
 
     serialized_named_tensors: List[Union[str, bytes]]
@@ -1288,8 +1289,16 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     flush_cache: bool = True
     # Whether to abort all requests before updating weights
     abort_all_requests: bool = False
+    # Optional: Base version that must match the currently active weights.
+    base_weight_version: Optional[str] = None
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional: Payload digest for duplicate suppression / replay safety.
+    payload_digest: Optional[str] = None
+    # Optional metadata forwarded to custom weight loaders.
+    loader_metadata: Optional[Dict[str, Any]] = None
+    # Crash the serving process on a failed / potentially partial apply.
+    crash_on_error: bool = False
     # Optional: Determine whether to disable updating the draft model
     disable_draft_model: Optional[bool] = None
 
