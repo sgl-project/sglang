@@ -1075,7 +1075,9 @@ class MooncakeKVManager(CommonKVManager):
         prefill_state_data_ptrs = self.kv_args.state_data_ptrs
         prefill_state_item_lens = self.kv_args.state_item_lens
         src_state_dim_per_tensor = getattr(self.kv_args, "state_dim_per_tensor", [])
-
+        src_state_segment_dims_per_tensor = getattr(
+            self.kv_args, "state_segment_dims_per_tensor", []
+        )
         # If no dimension info available, fall back to regular transfer
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(req, prefill_mamba_index, dst_state_data_ptrs)
@@ -1098,10 +1100,59 @@ class MooncakeKVManager(CommonKVManager):
             if self.attn_tp_size > dst_attn_tp_size:
                 # Multiple prefill ranks send to 1 decode rank
                 # Each prefill sends all its dims to the appropriate offset in decode
-                src_dim_start = 0
-                num_dims_to_send = src_dim
                 writers_per_decode = self.attn_tp_size // dst_attn_tp_size
                 local_writer_idx = local_tp_rank_in_group % writers_per_decode
+
+                # Mamba conv_state concatenates [intermediate, SSM, SSM] along the
+                # TP-sliced dimension. When prefill_tp > decode_tp, a single
+                # contiguous merge transfer misaligns the decode-side layout, so use
+                # per-segment transfers when segment metadata is available.
+                src_segment_dims = (
+                    src_state_segment_dims_per_tensor[i]
+                    if i < len(src_state_segment_dims_per_tensor)
+                    else []
+                )
+                if src_segment_dims and sum(src_segment_dims) == src_dim:
+                    src_dim_prefix = 0
+                    dst_dim_prefix = 0
+                    segment_blocks = []
+                    segment_valid = True
+
+                    for src_segment_dim in src_segment_dims:
+                        full_segment_dim = src_segment_dim * self.attn_tp_size
+                        if full_segment_dim % dst_attn_tp_size != 0:
+                            segment_valid = False
+                            break
+
+                        dst_segment_dim = full_segment_dim // dst_attn_tp_size
+                        src_dim_offset = src_dim_prefix * src_bytes_per_dim
+                        dst_dim_offset = (
+                            dst_dim_prefix + local_writer_idx * src_segment_dim
+                        ) * dst_bytes_per_dim
+                        bytes_to_send = src_segment_dim * src_bytes_per_dim
+
+                        src_addr = (
+                            prefill_state_data_ptrs[i]
+                            + src_item_len * int(prefill_mamba_index[0])
+                            + src_dim_offset
+                        )
+                        dst_addr = (
+                            dst_state_ptr
+                            + dst_item_len * int(req.dst_state_indices[0])
+                            + dst_dim_offset
+                        )
+                        segment_blocks.append((src_addr, dst_addr, bytes_to_send))
+
+                        src_dim_prefix += src_segment_dim
+                        dst_dim_prefix += dst_segment_dim
+
+                    if segment_valid:
+                        transfer_blocks.extend(segment_blocks)
+                        continue
+
+                # Fallback for tensors without segment metadata.
+                src_dim_start = 0
+                num_dims_to_send = src_dim
                 dst_dim_start = local_writer_idx * src_dim
             else:
                 # 1 prefill rank sends to multiple decode ranks

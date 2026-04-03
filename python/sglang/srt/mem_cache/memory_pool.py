@@ -228,6 +228,7 @@ class MambaPool:
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
+        self.cache_params = cache_params
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
@@ -443,6 +444,69 @@ class MambaPool:
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_segment_dims_per_tensor(self):
+        """Get optional segment dims for TP-sliced state tensors.
+
+        For Mamba conv state, the TP-sliced dim is laid out as
+        [intermediate_size, n_groups * state_size, n_groups * state_size].
+        We only expose this for layouts if it is safe. Tensors without segment metadata
+        return an empty list and will fall back to the original contiguous slice transfer.
+        """
+        shape = getattr(self.cache_params, "shape", None)
+        if (
+            shape is None
+            or not hasattr(shape, "conv")
+            or not hasattr(shape, "conv_dim")
+            or not hasattr(shape, "intermediate_size")
+            or not hasattr(shape, "conv_kernel")
+        ):
+            return []
+        if len(shape.conv) != 1:
+            return []
+
+        local_conv_dim = int(shape.conv[0][0])
+        full_conv_dim = int(shape.conv_dim)
+        conv_kernel_size = int(shape.conv_kernel)
+        if local_conv_dim <= 0 or full_conv_dim % local_conv_dim != 0:
+            return []
+        tp_world_size = full_conv_dim // local_conv_dim
+        if tp_world_size <= 0:
+            return []
+
+        intermediate_size = int(shape.intermediate_size)
+        ngroups_state_size = full_conv_dim - intermediate_size
+        if (
+            intermediate_size % tp_world_size != 0
+            or ngroups_state_size <= 0
+            or ngroups_state_size % 2 != 0
+        ):
+            return []
+        ngroups_state_size //= 2
+        if ngroups_state_size % tp_world_size != 0:
+            return []
+
+        conv_segment_dims = [
+            intermediate_size // tp_world_size,
+            ngroups_state_size // tp_world_size,
+            ngroups_state_size // tp_world_size,
+        ]
+
+        state_tensors = []
+        for field in vars(self.mamba_cache):
+            value = getattr(self.mamba_cache, field)
+            if isinstance(value, list):
+                state_tensors.extend(value)
+            else:
+                state_tensors.append(value)
+
+        segment_dims_per_tensor = []
+        for state_tensor in state_tensors:
+            segment_dims = (
+                conv_segment_dims if state_tensor.shape[-1] == conv_kernel_size - 1 else []
+            )
+            segment_dims_per_tensor += [segment_dims] * self.num_mamba_layers
+        return segment_dims_per_tensor
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -1324,6 +1388,10 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_segment_dims_per_tensor(self):
+        """Get optional segment dims for TP-sliced mamba state tensors."""
+        return self.mamba_pool.get_state_segment_dims_per_tensor()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
