@@ -20,17 +20,6 @@ ARG SG_LANG_KERNEL_BRANCH=main
 RUN useradd -m -d /home/sdp -s /bin/bash sdp && \
     chown -R sdp:sdp /home/sdp
 
-# Switch to root user
-USER root
-
-# Install the latest UMD driver for SYCL-TLA
-RUN apt-get install -y software-properties-common && \
-    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
-    apt-get update  && \
-    apt-get install -y libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc && \
-    apt-get install -y intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo && \
-    apt-get install -y libze-dev intel-ocloc
-
 # Switch to non-root user 'sdp'
 USER sdp
 
