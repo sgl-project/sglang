@@ -67,7 +67,7 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
-enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1 };
+enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1, gelu_and_mul = 2 };
 
 constexpr bool operator==(CPUAcTMethod a, int b) {
   return static_cast<int>(a) == b;

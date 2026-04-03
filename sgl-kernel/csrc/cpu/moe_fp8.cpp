@@ -132,6 +132,34 @@ inline void silu_and_mul_stub(
   }
 }
 template <typename scalar_t>
+inline void gelu_and_mul_stub(
+    scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const scalar_t* __restrict__ input2, int64_t size) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
+  const fVec half = fVec(0.5f);
+  const fVec one = fVec(1.f);
+  const fVec inv_sqrt2_v = fVec(inv_sqrt2);
+
+  // no remainder
+#pragma GCC unroll 4
+  for (int64_t d = 0; d < size; d += bVec::size()) {
+    bVec x = bVec::loadu(input + d);
+    fVec x0, x1;
+    std::tie(x0, x1) = at::vec::convert_to_float(x);
+    bVec y = bVec::loadu(input2 + d);
+    fVec y0, y1;
+    std::tie(y0, y1) = at::vec::convert_to_float(y);
+    // gelu: 0.5 * x * (1 + erf(x / sqrt(2)))
+    x0 = half * x0 * (one + (x0 * inv_sqrt2_v).erf());
+    x1 = half * x1 * (one + (x1 * inv_sqrt2_v).erf());
+    x0 = x0 * y0;
+    x1 = x1 * y1;
+    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
+    out_vec.store(out + d);
+  }
+}
+template <typename scalar_t>
 inline void clamp_sigmoid_and_mul_stub(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ input,
@@ -292,11 +320,17 @@ void fused_experts_fp_kernel_impl(
     }
   });
 
-  // stage 1.5: intermediate_cache1 = silu(intermediate_cache0)
+  // stage 1.5: intermediate_cache1 = activation(intermediate_cache0)
   if (act_func == CPUAcTMethod::silu_and_mul) {
     at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
+      }
+    });
+  } else if (act_func == CPUAcTMethod::gelu_and_mul) {
+    at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        gelu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
       }
     });
   } else if (act_func == CPUAcTMethod::swiglu) {
