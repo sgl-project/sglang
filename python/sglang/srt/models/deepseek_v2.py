@@ -165,7 +165,7 @@ if _use_aiter:
     pass
 
 if _is_cuda:
-    from flashinfer.gemm.routergemm_dsv3 import mm_M1_16_K7168_N256
+    from flashinfer.gemm import mm_M1_16_K7168_N256
     from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
