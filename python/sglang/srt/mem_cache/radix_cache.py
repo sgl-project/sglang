@@ -333,6 +333,14 @@ class RadixCache(BasePrefixCache):
         elif self.eviction_policy == "slru":
             self.eviction_strategy: EvictionStrategy = SLRUStrategy()
         elif self.eviction_policy == "tlru":
+            if params.tlru_xi_tokens is None:
+                logger.warning(
+                    "T-LRU eviction policy selected but --tlru-xi-tokens is "
+                    "not set. Defaulting xi=0, which makes B = L + q_hat "
+                    "(all blocks protected) and degenerates T-LRU to plain "
+                    "LRU. Set --tlru-xi-tokens to your SLA threshold for "
+                    "T-LRU to have an effect."
+                )
             self.eviction_strategy: EvictionStrategy = TLRUStrategy(
                 xi=params.tlru_xi_tokens or 0,
                 q_hat=params.tlru_qhat_tokens,
