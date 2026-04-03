@@ -35,10 +35,10 @@ from sglang.auto_benchmark_lib import (
     run_candidate,
 )
 from sglang.benchmark.datasets.autobench import sample_autobench_requests
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
 
 
 def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
