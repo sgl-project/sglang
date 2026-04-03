@@ -884,6 +884,39 @@ def _register_configs():
 _register_configs()
 
 
+def has_registered_model(model_path: str) -> bool:
+    """Lightweight check: does *model_path* match any statically registered
+    diffusion model (exact or partial HF-path match)?
+
+    Unlike :func:`get_model_info`, this never downloads ``model_index.json``,
+    never discovers pipeline classes, and never imports heavy runtime modules,
+    so it is safe to call from the CLI entry-point for *any* model path
+    (including pure-LLM models).
+    """
+    # Exact match
+    if model_path in _MODEL_HF_PATH_TO_NAME:
+        return True
+
+    # Partial match (same logic as _get_config_info steps 1-2b)
+    model_short_name = get_model_short_name(model_path.lower())
+    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+    for registered_model_hf_id in all_model_hf_paths:
+        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
+        if registered_model_name in model_short_name:
+            return True
+
+    # HF cache path match
+    normalized_model_path = _normalize_hf_cache_path(model_path)
+    for registered_model_hf_id in all_model_hf_paths:
+        cache_repo_fragment = (
+            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
+        )
+        if cache_repo_fragment in normalized_model_path:
+            return True
+
+    return False
+
+
 def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
     model_path_lower = model_path.lower()
     return any(

@@ -25,11 +25,11 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
 
 def _is_registered_diffusion_model(model_path: str) -> bool:
     try:
-        from sglang.multimodal_gen.registry import get_model_info
+        from sglang.multimodal_gen.registry import has_registered_model
     except ImportError:
         return False
 
-    return get_model_info(model_path) is not None
+    return has_registered_model(model_path)
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
