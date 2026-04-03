@@ -3142,6 +3142,20 @@ def log_debug_on_rank0(logger, msg):
             logger.debug(f"{msg} (rank-check failed: {e})")
 
 
+def log_debug_on_rank0(logger, msg):
+    """
+    Log a debug message only on tensor model parallel rank 0.
+    Falls back to logging if distributed is not initialized or error occurs.
+    """
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    try:
+        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+            logger.debug(msg)
+    except:
+        logger.debug(msg)
+
+
 def load_json_config(data: str):
     try:
         return orjson.loads(data)
