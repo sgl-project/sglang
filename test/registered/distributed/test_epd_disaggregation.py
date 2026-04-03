@@ -815,7 +815,7 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
 
 
 class TestEPDDisaggregationQwen35(PDDisaggregationServerBase):
-    """EPD disaggregation regression test for Qwen3.5 image and video requests."""
+    """EPD disaggregation test for Qwen3.5 image and video requests."""
 
     @classmethod
     def setUpClass(cls):
