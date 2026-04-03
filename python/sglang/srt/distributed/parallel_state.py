@@ -263,7 +263,7 @@ class GroupCoordinator:
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # Lazy import to avoid documentation build error
-        import sglang.srt.distributed.device_communicators as comm
+        import sglang.srt.distributed.device_communicators.comm as comm
         from sglang.srt.distributed.device_communicators.pynccl_allocator import (
             use_symmetric_memory,
         )
