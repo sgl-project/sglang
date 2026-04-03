@@ -47,11 +47,12 @@ _use_aiter = bool(int(os.getenv("SGLANG_USE_AITER", "0")))
 _is_xpu = is_xpu()
 _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
-if _is_cuda:
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
-elif _is_hip:
+
+if _is_cuda or _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-    from vllm import _custom_ops as vllm_ops  # moe_sum
+
+    if _is_hip:
+        from vllm import _custom_ops as vllm_ops  # moe_sum
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_xpu:
