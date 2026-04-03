@@ -52,6 +52,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_mps,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -2411,6 +2412,13 @@ class ServerArgs:
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
+
+        # MUSA platforms compatible backends
+        if is_musa() and self.attention_backend == "fa3":
+            logger.warning(
+                "FA3 attention backend on MUSA ignores any user-provided page_size and enforces a fixed value of 64."
+            )
+            self.page_size = 64
 
         # Other platforms backends
         if (
