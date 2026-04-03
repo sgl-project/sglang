@@ -171,6 +171,9 @@ def get_rope(
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
                     mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    mrope_interleaved_glm=rope_scaling.get(
+                        "mrope_interleaved_glm", False
+                    ),
                 )
             elif rope_scaling.get("use_fope", False):
                 rotary_emb = FourierRotaryEmbedding(

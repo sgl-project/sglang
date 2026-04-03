@@ -29,7 +29,11 @@ from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
-from sglang.srt.utils.network import get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_local_ip_auto,
+    get_zmq_socket_on_host,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -399,7 +403,7 @@ class WaitingImageRequest:
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
         self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
-            zmq.Context(), zmq.PULL
+            zmq.Context(), zmq.PULL, host=host_name
         )
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
@@ -447,7 +451,9 @@ class WaitingImageRequest:
                         payload = {
                             "req_id": part_req_id,  # use part_req_id to match encode request
                             "receive_count": receive_count,
-                            "receive_url": f"{host_name}:{embedding_port}",
+                            "receive_url": NetworkAddress(
+                                host_name, embedding_port
+                            ).to_host_port_str(),
                             "modality": modality.name,
                         }
                         logger.info(
@@ -666,6 +672,11 @@ class MMReceiverBase(ABC):
                     server_args,
                     _processor,
                     transport_mode,
+                    model_config=(
+                        getattr(self.scheduler, "model_config", None)
+                        if self.scheduler is not None
+                        else None
+                    ),
                     skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
                 )
 
@@ -681,7 +692,9 @@ class MMReceiverBase(ABC):
             if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
             req_id = uuid.uuid4().hex
-            embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
+            embedding_port, recv_socket = get_zmq_socket_on_host(
+                self.context, zmq.PULL, host=self.host
+            )
             mm_data = self._extract_url_data(request_obj)
             asyncio.create_task(
                 self.encode(req_id, mm_data, embedding_port, "encode", "send")

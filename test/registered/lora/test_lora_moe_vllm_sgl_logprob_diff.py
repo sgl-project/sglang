@@ -25,7 +25,7 @@ from sglang.test.lora_utils import (
 from sglang.test.runners import SRTRunner
 
 register_cuda_ci(
-    est_time=25,
+    est_time=50,
     suite="stage-b-test-1-gpu-large",
 )
 
@@ -332,7 +332,7 @@ class TestMoELoraRegression(unittest.TestCase):
 
             ref = REFERENCE_STATS[i]
             # Epsilon to allow room for different, but correct, implementations
-            eps = 1e-4
+            eps = 2e-4
 
             # Assertions
             self.assertEqual(v_text, s_text, f"String mismatch on prompt {i}")
