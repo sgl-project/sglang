@@ -12,7 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 """
-OpenAI-compatible transcription endpoint handler for Whisper models.
+OpenAI-compatible transcription endpoint handler for audio ASR models.
+Supports Whisper and Qwen3-ASR models.
 """
 
 from __future__ import annotations
@@ -51,11 +52,20 @@ TIMESTAMP_BASE_TOKEN_ID = 50365  # <|0.00|>
 TIMESTAMP_BASE_OFFSET = 0.02  # Each token step = 0.02 seconds
 
 
+def _is_qwen3_asr_model(architectures: List[str]) -> bool:
+    return any("Qwen3ASR" in arch for arch in (architectures or []))
+
+
 class OpenAIServingTranscription(OpenAIServingBase):
     """Handler for /v1/audio/transcriptions requests"""
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         super().__init__(tokenizer_manager)
+        # Detect if the loaded model is Qwen3-ASR
+        model_config = tokenizer_manager.model_config
+        self._is_qwen3_asr = _is_qwen3_asr_model(
+            getattr(model_config.hf_config, "architectures", [])
+        )
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
@@ -71,17 +81,25 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, TranscriptionRequest]:
         """Convert transcription request to internal format."""
-        # Build sampling params - include language for WhisperProcessor
+        if self._is_qwen3_asr:
+            return self._convert_qwen3_asr_request(request, raw_request)
+        return self._convert_whisper_request(request, raw_request)
+
+    def _convert_whisper_request(
+        self,
+        request: TranscriptionRequest,
+        raw_request: Request = None,
+    ) -> tuple[GenerateReqInput, TranscriptionRequest]:
+        """Convert transcription request for Whisper models."""
         sampling_params = {
             "temperature": request.temperature,
             "max_new_tokens": 448,  # Whisper default max tokens
-            "language": request.language,  # Pass to WhisperProcessor for language-specific decoding
+            "language": request.language,
         }
 
         if request.timestamp_granularities:
             sampling_params["timestamp_granularities"] = request.timestamp_granularities
 
-        # For Whisper, we pass audio_data and let the processor handle it
         adapted_request = GenerateReqInput(
             text="",  # Empty text - Whisper processor will set proper decoder tokens
             audio_data=request.audio_data,
@@ -90,7 +108,33 @@ class OpenAIServingTranscription(OpenAIServingBase):
             modalities=["audio"],
             routing_key=self.extract_routing_key(raw_request),
         )
+        return adapted_request, request
 
+    def _convert_qwen3_asr_request(
+        self,
+        request: TranscriptionRequest,
+        raw_request: Request = None,
+    ) -> tuple[GenerateReqInput, TranscriptionRequest]:
+        """Convert transcription request for Qwen3-ASR models."""
+        temperature = request.temperature
+        if temperature == 0.0:
+            temperature = 0.01  # Qwen3-ASR recommended near-greedy temperature
+
+        sampling_params = {
+            "temperature": temperature,
+            "max_new_tokens": 256,  # Qwen3-ASR default
+        }
+
+        # Qwen3-ASR uses chat format with audio_url in content
+        # The processor handles the prompt construction from audio_data
+        adapted_request = GenerateReqInput(
+            text="",  # Processor will construct the proper prompt
+            audio_data=request.audio_data,
+            sampling_params=sampling_params,
+            stream=request.stream,
+            modalities=["audio"],
+            routing_key=self.extract_routing_key(raw_request),
+        )
         return adapted_request, request
 
     def _get_audio_duration(self, audio_data: bytes) -> float:
@@ -232,6 +276,12 @@ class OpenAIServingTranscription(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         text = ret.get("text", "")
+
+        # Qwen3-ASR outputs "language <lang><asr_text>transcription" format
+        # Strip the prefix to return clean transcription text
+        if self._is_qwen3_asr and "<asr_text>" in text:
+            text = text.split("<asr_text>", 1)[-1]
+
         usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
         # Build response based on format
@@ -239,17 +289,27 @@ class OpenAIServingTranscription(OpenAIServingBase):
             return Response(content=text, media_type="text/plain")
 
         if request.response_format == "verbose_json":
-            output_ids = ret.get("output_ids", [])
-            tokenizer = self.tokenizer_manager.tokenizer
-            parsed_text, segments = self._parse_segments(output_ids, tokenizer)
+            if self._is_qwen3_asr:
+                # Qwen3-ASR doesn't natively produce timestamp tokens
+                return TranscriptionVerboseResponse(
+                    language=request.language or "auto",
+                    duration=round(request.audio_duration_s, 2),
+                    text=text,
+                    segments=[],
+                    usage=usage,
+                )
+            else:
+                output_ids = ret.get("output_ids", [])
+                tokenizer = self.tokenizer_manager.tokenizer
+                parsed_text, segments = self._parse_segments(output_ids, tokenizer)
 
-            return TranscriptionVerboseResponse(
-                language=request.language or "en",
-                duration=round(request.audio_duration_s, 2),
-                text=parsed_text or text,
-                segments=segments,
-                usage=usage,
-            )
+                return TranscriptionVerboseResponse(
+                    language=request.language or "en",
+                    duration=round(request.audio_duration_s, 2),
+                    text=parsed_text or text,
+                    segments=segments,
+                    usage=usage,
+                )
 
         # Default JSON format
         return TranscriptionResponse(text=text, usage=usage)
