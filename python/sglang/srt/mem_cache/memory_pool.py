@@ -1224,6 +1224,661 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class MHATokenToKVPoolTQ(MHATokenToKVPool):
+    """TurboQuant KV cache pool (arXiv:2504.19874).
+
+    Stores KV cache in compressed format:
+      Keys:   TurboQuant_prod — (b-1)-bit MSE + 1-bit QJL (Algorithm 2)
+      Values: TurboQuant_mse  — b-bit MSE                  (Algorithm 1)
+
+    Dequantizes to bf16 in get_key/value_buffer() so all attention backends
+    (FlashInfer, Triton, etc.) work without modification — same pattern as FP4.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        tq_config=None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        # tq_config must be set BEFORE super().__init__ because it calls _create_buffers
+        from sglang.srt.layers.quantization.turboquant import TurboQuantConfig
+
+        if tq_config is None:
+            tq_config = TurboQuantConfig(head_dim=head_dim)
+        else:
+            tq_config.head_dim = head_dim
+        self.tq_config = tq_config
+
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=False,  # KV copy not supported for TQ yet
+        )
+
+    def _create_buffers(self):
+        from sglang.srt.layers.quantization.turboquant import TurboQuantState
+
+        d = self.head_dim
+        if d & (d - 1) != 0:
+            raise ValueError(
+                f"TurboQuant requires head_dim to be a power of 2, got {d}. "
+                "Pad to the next power of 2 or fall back to FP8/FP4."
+            )
+
+        self.tq_state = TurboQuantState(
+            config=self.tq_config,
+            layer_num=self.layer_num,
+            head_num=self.head_num,
+            device=self.device,
+        )
+
+        cfg = self.tq_config
+        # Compute protected layer set
+        self._protected_set = set()
+        for i in range(min(cfg.protected_layers_head, self.layer_num)):
+            self._protected_set.add(i)
+        for i in range(
+            max(0, self.layer_num - cfg.protected_layers_tail), self.layer_num
+        ):
+            self._protected_set.add(i)
+        if self._protected_set and len(self._protected_set) >= self.layer_num:
+            logger.warning(
+                "TQ: all %d layers are protected (head=%d, tail=%d) — "
+                "no TQ compression will be applied",
+                self.layer_num,
+                cfg.protected_layers_head,
+                cfg.protected_layers_tail,
+            )
+
+        m = self.size + self.page_size
+        n = self.head_num
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                if cfg.mixed_precision:
+                    # ---- Mixed-precision key buffers ----
+                    self.k_mse_outlier_buffer = [
+                        torch.zeros(
+                            (m, n, cfg.key_outlier_packed_dim),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.k_mse_regular_buffer = [
+                        torch.zeros(
+                            (m, n, cfg.key_regular_packed_dim),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.k_norm_outlier_buffer = [
+                        torch.zeros(
+                            (m, n, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.k_norm_regular_buffer = [
+                        torch.zeros(
+                            (m, n, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    # ---- Mixed-precision value buffers ----
+                    self.v_mse_outlier_buffer = [
+                        torch.zeros(
+                            (m, n, cfg.value_outlier_packed_dim),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_mse_regular_buffer = [
+                        torch.zeros(
+                            (m, n, cfg.value_regular_packed_dim),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_norm_outlier_buffer = [
+                        torch.zeros(
+                            (m, n, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_norm_regular_buffer = [
+                        torch.zeros(
+                            (m, n, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    # QJL stays the same (operates in original D-space)
+                    if cfg.enable_qjl:
+                        self.k_qjl_buffer = [
+                            torch.zeros(
+                                (m, n, cfg.key_qjl_packed_dim),
+                                dtype=torch.uint8,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                        self.k_rnorm_buffer = [
+                            torch.zeros(
+                                (m, n, 1),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                    else:
+                        self.k_qjl_buffer = None
+                        self.k_rnorm_buffer = None
+                    # Aliases for parent compatibility
+                    self.k_mse_buffer = self.k_mse_regular_buffer
+                    self.v_mse_buffer = self.v_mse_regular_buffer
+                    self.k_norm_buffer = self.k_norm_regular_buffer
+                    self.v_norm_buffer = self.v_norm_regular_buffer
+                else:
+                    # ---- Original uniform buffers ----
+                    # Protected layers get minimal (1-row) dummy tensors to save VRAM.
+                    # Full pool buffers are only allocated for layers that use TQ.
+                    def _tq_size(li):
+                        return 1 if li in self._protected_set else m
+
+                    # ---- Key buffers ----
+                    self.k_mse_buffer = [
+                        torch.zeros(
+                            (_tq_size(li), n, cfg.key_mse_packed_dim),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for li in range(self.layer_num)
+                    ]
+                    self.k_norm_buffer = [
+                        torch.zeros(
+                            (_tq_size(li), n, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for li in range(self.layer_num)
+                    ]
+
+                    if cfg.enable_qjl:
+                        self.k_qjl_buffer = [
+                            torch.zeros(
+                                (_tq_size(li), n, cfg.key_qjl_packed_dim),
+                                dtype=torch.uint8,
+                                device=self.device,
+                            )
+                            for li in range(self.layer_num)
+                        ]
+                        self.k_rnorm_buffer = [
+                            torch.zeros(
+                                (_tq_size(li), n, 1),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            for li in range(self.layer_num)
+                        ]
+                    else:
+                        self.k_qjl_buffer = None
+                        self.k_rnorm_buffer = None
+
+                    # ---- Value buffers ----
+                    self.v_mse_buffer = [
+                        torch.zeros(
+                            (_tq_size(li), n, cfg.value_packed_dim),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for li in range(self.layer_num)
+                    ]
+                    self.v_norm_buffer = [
+                        torch.zeros(
+                            (_tq_size(li), n, 1),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        for li in range(self.layer_num)
+                    ]
+
+                # Boundary layer protection: bf16 buffers for protected layers
+                if self._protected_set:
+                    self.k_bf16_buffer = [None] * self.layer_num
+                    self.v_bf16_buffer = [None] * self.layer_num
+                    for li in self._protected_set:
+                        self.k_bf16_buffer[li] = torch.zeros(
+                            m, n, d, dtype=torch.bfloat16, device=self.device
+                        )
+                        self.v_bf16_buffer[li] = torch.zeros(
+                            m, n, d, dtype=torch.bfloat16, device=self.device
+                        )
+                    logger.info(
+                        "TQ boundary protection: %d layers in bf16 (%s)",
+                        len(self._protected_set),
+                        sorted(self._protected_set),
+                    )
+                else:
+                    self.k_bf16_buffer = None
+                    self.v_bf16_buffer = None
+
+        # Triton encode scratch buffer (covers batch sizes up to _max_encode_batch)
+        self._max_encode_batch = 512
+        self._encode_scratch = torch.empty(
+            self._max_encode_batch * n * d,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._use_triton_encode = True
+
+        # Compatibility aliases for parent methods (get_kv_size_bytes, etc.)
+        self.k_buffer = self.k_mse_buffer
+        self.v_buffer = self.v_mse_buffer
+        self.store_dtype = torch.uint8
+
+        # data_ptrs / data_strides for parent compatibility.
+        # Protected layers have 1-row dummy TQ buffers (valid data_ptr but size=1).
+        # This is safe because: set_kv_buffer, move_kv_cache, _get_key/value_buffer
+        # all short-circuit for protected layers. Parent's Triton copy kernel
+        # (store_cache) is not used — we override set_kv_buffer entirely.
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_mse_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_mse_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_mse_buffer + self.v_mse_buffer
+            ],
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        # Delete aliases first to release references to the underlying lists
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_mse_buffer
+        del self.k_norm_buffer
+        del self.v_mse_buffer
+        del self.v_norm_buffer
+        if self.k_qjl_buffer is not None:
+            del self.k_qjl_buffer
+        if self.k_rnorm_buffer is not None:
+            del self.k_rnorm_buffer
+        if self.tq_config.mixed_precision:
+            del self.k_mse_outlier_buffer
+            del self.k_mse_regular_buffer
+            del self.k_norm_outlier_buffer
+            del self.k_norm_regular_buffer
+            del self.v_mse_outlier_buffer
+            del self.v_mse_regular_buffer
+            del self.v_norm_outlier_buffer
+            del self.v_norm_regular_buffer
+        if self.k_bf16_buffer is not None:
+            del self.k_bf16_buffer
+        if self.v_bf16_buffer is not None:
+            del self.v_bf16_buffer
+
+    def get_kv_size_bytes(self):
+        if self.tq_config.mixed_precision:
+            k_size = (
+                sum(t.nelement() * t.element_size() for t in self.k_mse_outlier_buffer)
+                + sum(
+                    t.nelement() * t.element_size() for t in self.k_mse_regular_buffer
+                )
+                + sum(
+                    t.nelement() * t.element_size() for t in self.k_norm_outlier_buffer
+                )
+                + sum(
+                    t.nelement() * t.element_size() for t in self.k_norm_regular_buffer
+                )
+            )
+            if self.k_qjl_buffer is not None:
+                k_size += sum(
+                    t.nelement() * t.element_size() for t in self.k_qjl_buffer
+                )
+            if self.k_rnorm_buffer is not None:
+                k_size += sum(
+                    t.nelement() * t.element_size() for t in self.k_rnorm_buffer
+                )
+            v_size = (
+                sum(t.nelement() * t.element_size() for t in self.v_mse_outlier_buffer)
+                + sum(
+                    t.nelement() * t.element_size() for t in self.v_mse_regular_buffer
+                )
+                + sum(
+                    t.nelement() * t.element_size() for t in self.v_norm_outlier_buffer
+                )
+                + sum(
+                    t.nelement() * t.element_size() for t in self.v_norm_regular_buffer
+                )
+            )
+            return k_size, v_size
+
+        k_size = sum(t.nelement() * t.element_size() for t in self.k_mse_buffer) + sum(
+            t.nelement() * t.element_size() for t in self.k_norm_buffer
+        )
+        if self.k_qjl_buffer is not None:
+            k_size += sum(t.nelement() * t.element_size() for t in self.k_qjl_buffer)
+        if self.k_rnorm_buffer is not None:
+            k_size += sum(t.nelement() * t.element_size() for t in self.k_rnorm_buffer)
+        v_size = sum(t.nelement() * t.element_size() for t in self.v_mse_buffer) + sum(
+            t.nelement() * t.element_size() for t in self.v_norm_buffer
+        )
+
+        # Include bf16 protected-layer buffers in accounting
+        if self.k_bf16_buffer is not None:
+            k_size += sum(
+                t.nelement() * t.element_size()
+                for t in self.k_bf16_buffer
+                if t is not None
+            )
+        if self.v_bf16_buffer is not None:
+            v_size += sum(
+                t.nelement() * t.element_size()
+                for t in self.v_bf16_buffer
+                if t is not None
+            )
+        return k_size, v_size
+
+    def _get_key_buffer(self, layer_id: int):
+        layer_idx = layer_id - self.start_layer
+        if self._protected_set and layer_idx in self._protected_set:
+            return self.k_bf16_buffer[layer_idx]
+
+        if self.tq_config.mixed_precision:
+            from sglang.srt.layers.quantization.turboquant import decode_keys_mixed
+
+            layer_idx = layer_id - self.start_layer
+            return decode_keys_mixed(
+                outlier_packed=self.k_mse_outlier_buffer[layer_idx],
+                regular_packed=self.k_mse_regular_buffer[layer_idx],
+                outlier_norms=self.k_norm_outlier_buffer[layer_idx],
+                regular_norms=self.k_norm_regular_buffer[layer_idx],
+                qjl_packed=(
+                    self.k_qjl_buffer[layer_idx]
+                    if self.k_qjl_buffer is not None
+                    else None
+                ),
+                r_norms=(
+                    self.k_rnorm_buffer[layer_idx]
+                    if self.k_rnorm_buffer is not None
+                    else None
+                ),
+                layer_idx=layer_idx,
+                state=self.tq_state,
+                output_dtype=self.dtype,
+            )
+
+        from sglang.srt.layers.quantization.turboquant import decode_keys
+
+        layer_idx = layer_id - self.start_layer
+        return decode_keys(
+            packed_mse=self.k_mse_buffer[layer_idx],
+            norms=self.k_norm_buffer[layer_idx],
+            packed_qjl=(
+                self.k_qjl_buffer[layer_idx] if self.k_qjl_buffer is not None else None
+            ),
+            r_norms=(
+                self.k_rnorm_buffer[layer_idx]
+                if self.k_rnorm_buffer is not None
+                else None
+            ),
+            layer_idx=layer_idx,
+            state=self.tq_state,
+            output_dtype=self.dtype,
+        )
+
+    def _get_value_buffer(self, layer_id: int):
+        layer_idx = layer_id - self.start_layer
+        if self._protected_set and layer_idx in self._protected_set:
+            return self.v_bf16_buffer[layer_idx]
+
+        if self.tq_config.mixed_precision:
+            from sglang.srt.layers.quantization.turboquant import decode_values_mixed
+
+            layer_idx = layer_id - self.start_layer
+            return decode_values_mixed(
+                outlier_packed=self.v_mse_outlier_buffer[layer_idx],
+                regular_packed=self.v_mse_regular_buffer[layer_idx],
+                outlier_norms=self.v_norm_outlier_buffer[layer_idx],
+                regular_norms=self.v_norm_regular_buffer[layer_idx],
+                layer_idx=layer_idx,
+                state=self.tq_state,
+                output_dtype=self.dtype,
+            )
+
+        from sglang.srt.layers.quantization.turboquant import decode_values
+
+        layer_idx = layer_id - self.start_layer
+        return decode_values(
+            packed_mse=self.v_mse_buffer[layer_idx],
+            norms=self.v_norm_buffer[layer_idx],
+            layer_idx=layer_idx,
+            state=self.tq_state,
+            output_dtype=self.dtype,
+        )
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        from sglang.srt.layers.quantization.turboquant import (
+            encode_keys,
+            encode_values,
+        )
+
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        layer_idx = layer_id - self.start_layer
+
+        # Handle FP8 model scaling (same as parent)
+        if k_scale is not None:
+            cache_k = cache_k.float().div_(k_scale)
+        if v_scale is not None:
+            cache_v = cache_v.float().div_(v_scale)
+
+        # Boundary layer protection: store as bf16 without TQ compression
+        if hasattr(self, "_protected_set") and layer_idx in self._protected_set:
+            self.k_bf16_buffer[layer_idx][loc] = cache_k.to(torch.bfloat16)
+            self.v_bf16_buffer[layer_idx][loc] = cache_v.to(torch.bfloat16)
+            return
+
+        if self.tq_config.mixed_precision:
+            from sglang.srt.layers.quantization.turboquant import (
+                encode_keys_mixed,
+                encode_values_mixed,
+            )
+
+            ok, rk, on_k, rn_k, packed_qjl, r_norms = encode_keys_mixed(
+                cache_k, layer_idx, self.tq_state
+            )
+            ov, rv, on_v, rn_v = encode_values_mixed(cache_v, layer_idx, self.tq_state)
+            self.k_mse_outlier_buffer[layer_idx][loc] = ok
+            self.k_mse_regular_buffer[layer_idx][loc] = rk
+            self.k_norm_outlier_buffer[layer_idx][loc] = on_k
+            self.k_norm_regular_buffer[layer_idx][loc] = rn_k
+            self.v_mse_outlier_buffer[layer_idx][loc] = ov
+            self.v_mse_regular_buffer[layer_idx][loc] = rv
+            self.v_norm_outlier_buffer[layer_idx][loc] = on_v
+            self.v_norm_regular_buffer[layer_idx][loc] = rn_v
+            if packed_qjl is not None:
+                self.k_qjl_buffer[layer_idx][loc] = packed_qjl
+                self.k_rnorm_buffer[layer_idx][loc] = r_norms
+            return
+
+        N = cache_k.shape[0]
+        cfg = self.tq_config
+        state = self.tq_state
+
+        # Try Triton fused encode (encode + scatter write in 1 kernel launch).
+        # Falls back to PyTorch for: QJL keys (needs residual), large batches,
+        # or if Triton import/compilation fails.
+        use_triton_k = (
+            self._use_triton_encode
+            and not cfg.enable_qjl
+            and N <= self._max_encode_batch
+        )
+        use_triton_v = self._use_triton_encode and N <= self._max_encode_batch
+
+        if use_triton_k or use_triton_v:
+            try:
+                from sglang.srt.layers.quantization.triton_tq_encode import (
+                    triton_tq_encode,
+                )
+
+                if use_triton_k:
+                    triton_tq_encode(
+                        kv=cache_k,
+                        loc=loc,
+                        signs=state.rotation_signs[layer_idx, 0],
+                        boundaries=state.key_inner,
+                        mse_buffer=self.k_mse_buffer[layer_idx],
+                        norm_buffer=self.k_norm_buffer[layer_idx],
+                        scratch=self._encode_scratch,
+                        bits=cfg.key_mse_bits,
+                    )
+
+                if use_triton_v:
+                    triton_tq_encode(
+                        kv=cache_v,
+                        loc=loc,
+                        signs=state.rotation_signs[layer_idx, 1],
+                        boundaries=state.value_inner,
+                        mse_buffer=self.v_mse_buffer[layer_idx],
+                        norm_buffer=self.v_norm_buffer[layer_idx],
+                        scratch=self._encode_scratch,
+                        bits=cfg.value_bits,
+                    )
+
+                if use_triton_k and use_triton_v:
+                    return  # Both done via Triton
+            except Exception as e:
+                if not hasattr(self, "_triton_encode_warned"):
+                    logger.warning(
+                        "Triton TQ encode failed, falling back to PyTorch: %s", e
+                    )
+                    self._triton_encode_warned = True
+                self._use_triton_encode = False
+                use_triton_k = False
+                use_triton_v = False
+
+        # PyTorch fallback for whichever path wasn't handled by Triton
+        if not use_triton_k:
+            packed_mse, norms, packed_qjl, r_norms = encode_keys(
+                cache_k, layer_idx, self.tq_state
+            )
+            self.k_mse_buffer[layer_idx][loc] = packed_mse
+            self.k_norm_buffer[layer_idx][loc] = norms
+            if packed_qjl is not None:
+                self.k_qjl_buffer[layer_idx][loc] = packed_qjl
+                self.k_rnorm_buffer[layer_idx][loc] = r_norms
+
+        if not use_triton_v:
+            v_packed, v_norms = encode_values(cache_v, layer_idx, self.tq_state)
+            self.v_mse_buffer[layer_idx][loc] = v_packed
+            self.v_norm_buffer[layer_idx][loc] = v_norms
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Copy bf16 buffers for boundary-protected layers
+        if self._protected_set:
+            for i in self._protected_set:
+                self.k_bf16_buffer[i][tgt_loc] = self.k_bf16_buffer[i][src_loc]
+                self.v_bf16_buffer[i][tgt_loc] = self.v_bf16_buffer[i][src_loc]
+
+        if self.tq_config.mixed_precision:
+            for i in range(self.layer_num):
+                if self._protected_set and i in self._protected_set:
+                    continue
+                self.k_mse_outlier_buffer[i][tgt_loc] = self.k_mse_outlier_buffer[i][
+                    src_loc
+                ]
+                self.k_mse_regular_buffer[i][tgt_loc] = self.k_mse_regular_buffer[i][
+                    src_loc
+                ]
+                self.k_norm_outlier_buffer[i][tgt_loc] = self.k_norm_outlier_buffer[i][
+                    src_loc
+                ]
+                self.k_norm_regular_buffer[i][tgt_loc] = self.k_norm_regular_buffer[i][
+                    src_loc
+                ]
+                self.v_mse_outlier_buffer[i][tgt_loc] = self.v_mse_outlier_buffer[i][
+                    src_loc
+                ]
+                self.v_mse_regular_buffer[i][tgt_loc] = self.v_mse_regular_buffer[i][
+                    src_loc
+                ]
+                self.v_norm_outlier_buffer[i][tgt_loc] = self.v_norm_outlier_buffer[i][
+                    src_loc
+                ]
+                self.v_norm_regular_buffer[i][tgt_loc] = self.v_norm_regular_buffer[i][
+                    src_loc
+                ]
+                if self.k_qjl_buffer is not None:
+                    self.k_qjl_buffer[i][tgt_loc] = self.k_qjl_buffer[i][src_loc]
+                    self.k_rnorm_buffer[i][tgt_loc] = self.k_rnorm_buffer[i][src_loc]
+            return
+
+        for i in range(self.layer_num):
+            if self._protected_set and i in self._protected_set:
+                continue
+            self.k_mse_buffer[i][tgt_loc] = self.k_mse_buffer[i][src_loc]
+            self.k_norm_buffer[i][tgt_loc] = self.k_norm_buffer[i][src_loc]
+            self.v_mse_buffer[i][tgt_loc] = self.v_mse_buffer[i][src_loc]
+            self.v_norm_buffer[i][tgt_loc] = self.v_norm_buffer[i][src_loc]
+            if self.k_qjl_buffer is not None:
+                self.k_qjl_buffer[i][tgt_loc] = self.k_qjl_buffer[i][src_loc]
+                self.k_rnorm_buffer[i][tgt_loc] = self.k_rnorm_buffer[i][src_loc]
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 

@@ -82,9 +82,20 @@ def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
 
 
 class OffloaderV1(BaseOffloader):
-    def __init__(self, cpu_offload_max_bytes: int):
+    # Parameter name patterns that indicate MoE expert weights.
+    # These are the largest tensors in MoE models and only a fraction
+    # is used per token (e.g. 8/128 experts), making them ideal offload targets.
+    _EXPERT_PARAM_PATTERNS = ("experts.", "expert_")
+
+    def __init__(self, cpu_offload_max_bytes: int, moe_experts_first: bool = True):
         self._cpu_offload_bytes = 0
         self._cpu_offload_max_bytes = cpu_offload_max_bytes
+        self._moe_experts_first = moe_experts_first
+
+    @staticmethod
+    def _is_expert_param(name: str) -> bool:
+        """Check if parameter name indicates MoE expert weights."""
+        return any(p in name for p in OffloaderV1._EXPERT_PARAM_PATTERNS)
 
     def wrap_modules(
         self,
@@ -93,6 +104,26 @@ class OffloaderV1(BaseOffloader):
         whitelist_param_names_creator: Optional[_WhitelistParamNamesCreator] = None,
     ):
         return [self.maybe_offload_to_cpu(module) for module in all_modules_generator]
+
+    def _offload_param(self, p: torch.nn.Parameter, pin_memory: bool) -> bool:
+        """Offload a single parameter to CPU. Returns True if offloaded."""
+        if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
+            return False
+        if p.data.device == torch.device("cpu"):
+            return False
+
+        cpu_data = torch.empty_strided(
+            size=p.data.size(),
+            stride=p.data.stride(),
+            dtype=p.data.dtype,
+            layout=p.data.layout,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+        cpu_data.copy_(p.data)
+        p.data = cpu_data
+        self._cpu_offload_bytes += p.data.numel() * p.data.element_size()
+        return True
 
     def maybe_offload_to_cpu(self, module: torch.nn.Module) -> torch.nn.Module:
         if (params := next(module.parameters(), None)) is None:
@@ -107,28 +138,31 @@ class OffloaderV1(BaseOffloader):
             return module
 
         pin_memory = is_pin_memory_available()
-        # offload parameters to CPU
-        # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
-        for p in module.parameters():
-            if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
-                # we use per-parameter offloading
-                # one module might have some parameters offloaded and some not
-                break
 
-            # `torch.empty_like` does not support `pin_memory` argument
-            cpu_data = torch.empty_strided(
-                size=p.data.size(),
-                stride=p.data.stride(),
-                dtype=p.data.dtype,
-                layout=p.data.layout,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
-            cpu_data.copy_(p.data)
-            p.data = cpu_data
-            self._cpu_offload_bytes += p.data.numel() * p.data.element_size()
-            offloaded_parameters = True
+        if self._moe_experts_first:
+            # Pass 1: offload expert parameters first (largest, sparsely accessed)
+            for name, p in module.named_parameters():
+                if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
+                    break
+                if self._is_expert_param(name):
+                    if self._offload_param(p, pin_memory):
+                        offloaded_parameters = True
+
+            # Pass 2: offload remaining parameters if budget allows
+            for name, p in module.named_parameters():
+                if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
+                    break
+                if not self._is_expert_param(name):
+                    if self._offload_param(p, pin_memory):
+                        offloaded_parameters = True
+        else:
+            # Original behavior: offload in iteration order
+            for p in module.parameters():
+                if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
+                    break
+                if self._offload_param(p, pin_memory):
+                    offloaded_parameters = True
 
         if offloaded_parameters:
             original_forward = module.forward

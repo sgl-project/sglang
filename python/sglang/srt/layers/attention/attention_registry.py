@@ -177,6 +177,13 @@ def create_dual_chunk_flash_attn_backend(runner):
     return DualChunkFlashAttentionBackend(runner)
 
 
+@register_attention_backend("flashinfer_tq")
+def create_flashinfer_tq_backend(runner):
+    from sglang.srt.layers.attention.flashinfer_tq_backend import FlashInferTQBackend
+
+    return FlashInferTQBackend(runner, init_new_workspace=runner.init_new_workspace)
+
+
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
     """
     Wrapper for special models like hybrid GDN, so we don't

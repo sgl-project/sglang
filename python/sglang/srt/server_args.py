@@ -331,6 +331,15 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    turboquant_key_bits: int = 4
+    turboquant_value_bits: int = 2
+    turboquant_no_qjl: bool = True
+    turboquant_mixed_precision: bool = False
+    turboquant_n_outlier: int = 32
+    turboquant_online_codebook: bool = False
+    turboquant_qjl_score_weight: float = 1.0
+    turboquant_protected_layers_head: int = 2
+    turboquant_protected_layers_tail: int = 2
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -2277,6 +2286,11 @@ class ServerArgs:
         model_config = self.get_model_config()
         use_mla_backend = self.use_mla_backend()
 
+        # TurboQuant KV cache: auto-select flashinfer_tq backend
+        if self.kv_cache_dtype == "turboquant" and self.attention_backend is None:
+            self.attention_backend = "flashinfer_tq"
+            logger.info("TurboQuant: auto-selected flashinfer_tq backend")
+
         if self.prefill_attention_backend is not None and (
             self.prefill_attention_backend == self.decode_attention_backend
         ):  # override the default attention backend
@@ -3856,8 +3870,73 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "bf16",
+                "bfloat16",
+                "fp4_e2m1",
+                "turboquant",
+            ],
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+. "turboquant" for TurboQuant sub-4-bit KV cache (arXiv:2504.19874).',
+        )
+        parser.add_argument(
+            "--turboquant-key-bits",
+            type=int,
+            default=ServerArgs.turboquant_key_bits,
+            help="TurboQuant: total bits per key coordinate (default 4). "
+            "With QJL: (b-1)-bit MSE + 1-bit QJL. Without QJL: b-bit MSE.",
+        )
+        parser.add_argument(
+            "--turboquant-value-bits",
+            type=int,
+            default=ServerArgs.turboquant_value_bits,
+            help="TurboQuant: bits per value coordinate (default 2). MSE-only.",
+        )
+        parser.add_argument(
+            "--turboquant-no-qjl",
+            action="store_true",
+            default=ServerArgs.turboquant_no_qjl,
+            help="TurboQuant: disable QJL correction for keys. "
+            "Saves 20 bytes/token/head but loses unbiased inner products.",
+        )
+        parser.add_argument(
+            "--turboquant-mixed-precision",
+            action="store_true",
+            default=ServerArgs.turboquant_mixed_precision,
+            help="TurboQuant: enable mixed-precision outlier handling (Section 2.3). "
+            "Outlier channels get +1 bit with independent rotations.",
+        )
+        parser.add_argument(
+            "--turboquant-n-outlier",
+            type=int,
+            default=ServerArgs.turboquant_n_outlier,
+            help="TurboQuant: number of outlier channels for mixed-precision (default 32).",
+        )
+        parser.add_argument(
+            "--turboquant-online-codebook",
+            action="store_true",
+            default=ServerArgs.turboquant_online_codebook,
+            help="TurboQuant: build codebook from actual data (Section 4.1) instead of pre-computed.",
+        )
+        parser.add_argument(
+            "--turboquant-qjl-score-weight",
+            type=float,
+            default=ServerArgs.turboquant_qjl_score_weight,
+            help="TurboQuant: QJL score weight (1.0=unbiased, <1.0=lower variance). Default 1.0.",
+        )
+        parser.add_argument(
+            "--turboquant-protected-layers-head",
+            type=int,
+            default=ServerArgs.turboquant_protected_layers_head,
+            help="TurboQuant: number of initial layers to keep in bf16 (skip TQ). Default 2.",
+        )
+        parser.add_argument(
+            "--turboquant-protected-layers-tail",
+            type=int,
+            default=ServerArgs.turboquant_protected_layers_tail,
+            help="TurboQuant: number of final layers to keep in bf16 (skip TQ). Default 2.",
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
@@ -6064,6 +6143,16 @@ class ServerArgs:
                 and self.speculative_algorithm is None
                 and not self.enable_mixed_chunk
             ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+
+        if (
+            self.kv_cache_dtype == "turboquant"
+            and self.speculative_algorithm is not None
+        ):
+            raise ValueError(
+                "TurboQuant KV cache is not compatible with speculative decoding. "
+                "Use --kv-cache-dtype auto/fp8/fp4 with --speculative-algorithm, "
+                "or disable speculative decoding to use TurboQuant."
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
