@@ -128,17 +128,25 @@ class _ParamViewTracker:
             if entries[0][0] is None:
                 # single tensor attribute
                 _, param_name, offset, size, stride = entries[0]
-                setattr(
-                    submod,
-                    attr_name,
-                    device_state[param_name].as_strided(size, stride, offset),
-                )
+                param_tensor = device_state.get(param_name)
+                if param_tensor is not None:
+                    setattr(
+                        submod,
+                        attr_name,
+                        param_tensor.as_strided(
+                            size, stride, param_tensor.storage_offset() + offset
+                        ),
+                    )
             else:
                 # sequence (tuple / list) attribute
                 old = getattr(submod, attr_name)
                 new = list(old)
                 for idx, param_name, offset, size, stride in entries:
-                    new[idx] = device_state[param_name].as_strided(size, stride, offset)
+                    param_tensor = device_state.get(param_name)
+                    if param_tensor is not None:
+                        new[idx] = param_tensor.as_strided(
+                            size, stride, param_tensor.storage_offset() + offset
+                        )
                 setattr(submod, attr_name, type(old)(new))
 
 
@@ -400,7 +408,9 @@ def _hook_module_forward_raw(
         device_tensors = get_parameter_and_buffer_dicts()
         if view_tracker is not None and view_tracker.has_views:
             view_tracker.refresh(module, device_tensors)
-        output = functional_call(module, device_tensors, args=args, kwargs=kwargs)
+        output = functional_call(
+            module, device_tensors, args=args, kwargs=kwargs, tie_weights=False
+        )
         on_forward_end()
         module.forward = forward
         return output
