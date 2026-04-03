@@ -3,6 +3,7 @@ import logging
 import os
 import subprocess
 from functools import lru_cache
+from huggingface_hub import HfApi
 
 from sglang.srt.environ import envs
 from sglang.utils import (
@@ -38,8 +39,6 @@ def _is_diffusers_model_dir(model_dir: str) -> bool:
 def _is_gated_diffusion_repo(repo_id: str) -> bool:
     """Query HF model card metadata to check if a gated repo is a diffusers model."""
     try:
-        from huggingface_hub import HfApi
-
         info = HfApi().model_info(repo_id)
         return getattr(info, "library_name", None) == "diffusers"
     except Exception:
