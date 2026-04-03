@@ -51,7 +51,8 @@ class CommunicatorImpl:
             if mode is not None and _is_mode_supported(mode, inplace):
                 if not comm.should_use_custom_op():
                     return comm.all_reduce(input_, inplace=inplace)
-                if _can_use_inplace(mode):  # we prefer in-place if possible
+                use_inplace = _can_use_inplace(mode) if inplace is None else inplace
+                if use_inplace:
                     inplace_all_reduce(input_, self.unique_name, i)
                     return input_
                 else:
@@ -160,6 +161,7 @@ def outplace_all_gather(
 # NOTE(dark): we don't make them class method due to conflict with piecewise cuda graph
 
 
+# we prefer in-place if possible
 def _can_use_inplace(mode: AllReduceMode) -> bool:
     return mode.value != "outplace"
 

@@ -76,16 +76,18 @@ class TorchSymmMemCommunicator(BaseCommunicator):
         self.device_capability = torch.cuda.get_device_capability(device)[0]
         if self.device_capability < 9:
             raise RuntimeError(
-                "TorchSymmMemCommunicator: Device capability %s not supported, "
-                "communicator is not available.".format(self.device_capability)
+                "TorchSymmMemCommunicator: "
+                f"Device capability {self.device_capability} not supported, "
+                "communicator is not available."
             )
         if (
             self.world_size
             not in TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability]
         ):
             raise RuntimeError(
-                "TorchSymmMemCommunicator: World size %d not supported, "
-                "communicator is not available.".format(self.world_size)
+                "TorchSymmMemCommunicator: "
+                f"World size {self.world_size} not supported, "
+                "communicator is not available."
             )
         self.max_size = TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES[self.device_capability][
             self.world_size

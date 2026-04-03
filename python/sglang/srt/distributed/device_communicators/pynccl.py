@@ -128,7 +128,6 @@ class PyNcclCommunicator(BaseCommunicator):
         return self.change_state(enable=True)
 
     def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
-        # NOTE: inplace all-reduce is not compatible with piecewise CUDA graph
         return AllReduceMode.BOTH
 
     @BaseCommunicator.validate
