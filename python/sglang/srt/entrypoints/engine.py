@@ -52,6 +52,7 @@ from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manage
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
 )
+from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -82,7 +83,6 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.managers.tokenizer_manager_multiitem_mixin import ScoreResult
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -140,7 +140,7 @@ def init_tokenizer_manager(
     return tokenizer_manager, template_manager
 
 
-class Engine(EngineBase):
+class Engine(EngineScoreMixin, EngineBase):
     """
     The entry point to the inference engine.
 
@@ -1081,78 +1081,7 @@ class Engine(EngineBase):
     def save_sharded_model(self, **kwargs):
         self.collective_rpc("save_sharded_model", **kwargs)
 
-    def score(
-        self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
-        apply_softmax: bool = False,
-        item_first: bool = False,
-    ) -> ScoreResult:
-        """
-        Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
-        query = "<|user|>Is the following city the capital of France? "
-        items = ["Paris <|assistant|>", "London <|assistant|>", "Berlin <|assistant|>"]
-        label_token_ids = [2332, 1223] # Token IDs for "Yes" and "No"
-        item_first = False
-
-        This would pass the following prompts to the model:
-        "<|user|>Is the following city the capital of France? Paris <|assistant|>"
-        "<|user|>Is the following city the capital of France? London <|assistant|>"
-        "<|user|>Is the following city the capital of France? Berlin <|assistant|>"
-        The api would then return the probabilities of the model producing "Yes" and "No" as the next token.
-        The output would look like:
-        [[0.9, 0.1], [0.2, 0.8], [0.1, 0.9]]
-
-
-        Args:
-            query: The query text or pre-tokenized query token IDs. Must be provided.
-            items: The item text(s) or pre-tokenized item token IDs. Must be provided.
-            label_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
-            apply_softmax: Whether to normalize probabilities using softmax.
-            item_first: If True, prepend items to query. Otherwise append items to query.
-
-        Returns:
-            ScoreResult with:
-                scores: List of lists containing probabilities for each item and each label token
-                prompt_tokens: The number of prompt tokens processed.
-
-        Raises:
-            ValueError: If query is not provided, or if items is not provided,
-                      or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
-        """
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.score_request(
-                query=query,
-                items=items,
-                label_token_ids=label_token_ids,
-                apply_softmax=apply_softmax,
-                item_first=item_first,
-                request=None,
-            )
-        )
-
-    async def async_score(
-        self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
-        apply_softmax: bool = False,
-        item_first: bool = False,
-    ) -> ScoreResult:
-        """
-        Asynchronous version of score method.
-
-        See score() for detailed documentation.
-        """
-        return await self.tokenizer_manager.score_request(
-            query=query,
-            items=items,
-            label_token_ids=label_token_ids,
-            apply_softmax=apply_softmax,
-            item_first=item_first,
-            request=None,
-        )
+    # score() and async_score() are provided by EngineScoreMixin
 
 
 def _set_envs_and_config(server_args: ServerArgs):
