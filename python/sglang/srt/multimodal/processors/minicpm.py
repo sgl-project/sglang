@@ -223,6 +223,8 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                 f"{len(pixel_values)} vs. {len(tgt_sizes)}"
             )
 
+        # Track slices per image (like vLLM's num_slices)
+        slices_per_image: List[int] = []
         pixel_values_flat: List[torch.Tensor] = []
         tgt_sizes_flat: List[torch.Tensor] = []
         for pixel_b, tgt_b in zip(pixel_values, tgt_sizes):
@@ -231,6 +233,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                 raise ValueError(
                     "Inconsistent N lengths, found: " f"{len(pixel_b)} vs {len(tgt_b)}"
                 )
+            slices_per_image.append(len(pixel_b))
             for pixel_n, tgt_n in zip(pixel_b, tgt_b):
                 pixel_values_flat += [pixel_n]
                 tgt_sizes_flat += [tgt_n]
@@ -250,14 +253,23 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         image_offsets.extend(slice_offsets)
         image_offsets = sorted(image_offsets)
 
+        # Create one item per image, each with its own slices and offsets
         if len(pixel_values) != 0:
-            item = MultimodalDataItem(
-                feature=pixel_values,
-                offsets=image_offsets,
-                model_specific_data={"tgt_size": tgt_sizes_flat},
-                modality=Modality.IMAGE,
-            )
-            items += [item]
+            pv_idx = 0
+            offset_idx = 0
+            for num_slices in slices_per_image:
+                items.append(
+                    MultimodalDataItem(
+                        feature=pixel_values[pv_idx : pv_idx + num_slices],
+                        offsets=image_offsets[offset_idx : offset_idx + num_slices],
+                        model_specific_data={
+                            "tgt_size": tgt_sizes_flat[pv_idx : pv_idx + num_slices]
+                        },
+                        modality=Modality.IMAGE,
+                    )
+                )
+                pv_idx += num_slices
+                offset_idx += num_slices
 
         if (
             "audio_features" in res

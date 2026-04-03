@@ -289,7 +289,7 @@ class ServerArgs:
     The arguments of the server.
 
     NOTE: When you add new arguments, please make sure the order
-    in this class definition the same as the order in the the function
+    in this class definition the same as the order in the function
     `ServerArgs.add_cli_args`.
     Please follow the existing style to group the new arguments into related groups or create new groups.
     """
@@ -1132,6 +1132,9 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 16. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 17. Context parallel
+        if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):

@@ -266,7 +266,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
             self.mm_processor = get_mm_processor(
-                self.model_config.hf_config, server_args, _processor, transport_mode
+                self.model_config.hf_config,
+                server_args,
+                _processor,
+                transport_mode,
+                model_config=self.model_config,
             )
 
             if server_args.skip_tokenizer_init:
@@ -747,6 +751,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+            if mm_inputs and "token_type_ids" in mm_inputs:
+                token_type_ids = mm_inputs.pop("token_type_ids")
+                if not isinstance(token_type_ids, list):
+                    token_type_ids = token_type_ids.flatten().tolist()
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -971,6 +979,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
+                token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
             )
@@ -2415,9 +2424,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             return span_attrs
 
         # Token usage attributes
-        span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
-            recv_obj.completion_tokens[i]
-        )
+        if not isinstance(recv_obj, BatchEmbeddingOutput):
+            span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
+                recv_obj.completion_tokens[i]
+            )
         span_attrs[SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] = recv_obj.prompt_tokens[
             i
         ]
