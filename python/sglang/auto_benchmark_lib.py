@@ -1473,6 +1473,71 @@ def write_markdown_summary(
         f.write("\n".join(lines) + "\n")
 
 
+def render_scenario_summary_markdown(
+    summary_rows: Sequence[Dict[str, Any]],
+    run_partial_reason: Optional[str] = None,
+) -> str:
+    lines = ["# Scenario Summary", ""]
+    if run_partial_reason:
+        lines.extend([f"- Status: `partial` ({run_partial_reason})", ""])
+    lines.extend(
+        [
+            "| Scenario | Status | QPS | Output tok/s | TTFT ms | TPOT ms | Summary |",
+            "|---|---|---:|---:|---:|---:|---|",
+        ]
+    )
+
+    for row in summary_rows:
+        summary_path = os.path.join(row["scenario_dir"], "summary.md")
+        lines.append(
+            "| {name} | {status} | {qps} | {throughput} | {ttft} | {tpot} | `{path}` |".format(
+                name=row["scenario_name"],
+                status=row["status"],
+                qps=row.get("requested_qps") or "",
+                throughput=(
+                    round(row.get("output_throughput", 0.0), 2)
+                    if row.get("output_throughput") is not None
+                    else ""
+                ),
+                ttft=(
+                    round(row.get("mean_ttft_ms", 0.0), 2)
+                    if row.get("mean_ttft_ms") is not None
+                    else ""
+                ),
+                tpot=(
+                    round(row.get("mean_tpot_ms", 0.0), 2)
+                    if row.get("mean_tpot_ms") is not None
+                    else ""
+                ),
+                path=summary_path,
+            )
+        )
+
+    for row in summary_rows:
+        if row.get("launch_command"):
+            lines.extend(
+                [
+                    "",
+                    f"## {row['scenario_name']}",
+                    "",
+                    "```bash",
+                    row["launch_command"],
+                    "```",
+                ]
+            )
+        elif row["status"] == "no_successful_runs":
+            lines.extend(
+                [
+                    "",
+                    f"## {row['scenario_name']}",
+                    "",
+                    "No successful run with metrics was produced for this scenario.",
+                ]
+            )
+
+    return "\n".join(lines) + "\n"
+
+
 def run_stage(
     scenario_name: str,
     stage_name: str,
@@ -1847,62 +1912,8 @@ def run_auto_benchmark(config_path: str) -> str:
             )
         write_jsonl(os.path.join(output_dir, "scenario_summary.jsonl"), summary_rows)
         write_csv(os.path.join(output_dir, "scenario_summary.csv"), summary_rows)
-        lines = ["# Scenario Summary", ""]
-        if run_partial_reason:
-            lines.extend([f"- Status: `partial` ({run_partial_reason})", ""])
-        lines.extend(
-            [
-                "| Scenario | Status | QPS | Output tok/s | TTFT ms | TPOT ms | Summary |",
-                "|---|---|---:|---:|---:|---:|---|",
-            ]
-        )
-        for row in summary_rows:
-            summary_path = os.path.join(row["scenario_dir"], "summary.md")
-            lines.append(
-                "| {name} | {status} | {qps} | {throughput} | {ttft} | {tpot} | `{path}` |".format(
-                    name=row["scenario_name"],
-                    status=row["status"],
-                    qps=row.get("requested_qps") or "",
-                    throughput=(
-                        round(row.get("output_throughput", 0.0), 2)
-                        if row.get("output_throughput") is not None
-                        else ""
-                    ),
-                    ttft=(
-                        round(row.get("mean_ttft_ms", 0.0), 2)
-                        if row.get("mean_ttft_ms") is not None
-                        else ""
-                    ),
-                    tpot=(
-                        round(row.get("mean_tpot_ms", 0.0), 2)
-                        if row.get("mean_tpot_ms") is not None
-                        else ""
-                    ),
-                    path=summary_path,
-                )
-            )
-            if row.get("launch_command"):
-                lines.extend(
-                    [
-                        "",
-                        f"## {row['scenario_name']}",
-                        "",
-                        "```bash",
-                        row["launch_command"],
-                        "```",
-                    ]
-                )
-            elif row["status"] == "no_successful_runs":
-                lines.extend(
-                    [
-                        "",
-                        f"## {row['scenario_name']}",
-                        "",
-                        "No successful run with metrics was produced for this scenario.",
-                    ]
-                )
         with open(os.path.join(output_dir, "SUMMARY.md"), "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+            f.write(render_scenario_summary_markdown(summary_rows, run_partial_reason))
     if interrupted:
         log_line(f"interrupted=true partial_output_dir={output_dir}")
     return output_dir

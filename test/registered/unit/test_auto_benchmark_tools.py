@@ -29,6 +29,7 @@ from sglang.auto_benchmark_lib import (
     format_best_progress,
     infer_backend,
     prepare_dataset,
+    render_scenario_summary_markdown,
     rendered_launch_command,
     resolve_max_candidates,
     run_candidate,
@@ -361,6 +362,40 @@ class TestAutoBenchmarkTools(CustomTestCase):
         self.assertIn("CUDA_VISIBLE_DEVICES=0", text)
         self.assertIn("--model-path Qwen/Qwen3-32B", text)
         self.assertNotIn("HF_TOKEN", text)
+
+    def test_render_scenario_summary_markdown_keeps_rows_in_single_table(self):
+        text = render_scenario_summary_markdown(
+            [
+                {
+                    "scenario_name": "chat",
+                    "scenario_dir": "/tmp/chat",
+                    "status": "ok",
+                    "requested_qps": 11.914,
+                    "output_throughput": 1867.28,
+                    "mean_ttft_ms": 99.58,
+                    "mean_tpot_ms": 21.09,
+                    "launch_command": "python -m sglang.launch_server --port 30000",
+                },
+                {
+                    "scenario_name": "summarization",
+                    "scenario_dir": "/tmp/summarization",
+                    "status": "ok",
+                    "requested_qps": 11.914,
+                    "output_throughput": 537.17,
+                    "mean_ttft_ms": 709.99,
+                    "mean_tpot_ms": 26.89,
+                    "launch_command": "python -m sglang.launch_server --port 30001",
+                },
+            ]
+        )
+
+        header = (
+            "| Scenario | Status | QPS | Output tok/s | TTFT ms | TPOT ms | Summary |"
+        )
+        self.assertEqual(text.count(header), 1)
+        self.assertLess(text.index("| chat |"), text.index("## chat"))
+        self.assertLess(text.index("| summarization |"), text.index("## chat"))
+        self.assertLess(text.index("| summarization |"), text.index("## summarization"))
 
     def test_run_candidate_binary_search_avoids_rounding_loop(self):
         benchmark_cfg = {
