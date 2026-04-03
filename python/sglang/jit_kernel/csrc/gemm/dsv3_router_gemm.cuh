@@ -21,130 +21,121 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
+
+#include <type_traits>
 
 namespace {
 
 using namespace device;
 
-// Convert VPT bfloat16 values from a uint4 to float array
-template <int VPT>
-SGL_DEVICE void bf16_uint4_to_float(uint4 const& vec, float* dst) {
-  bf16_t const* bf16_ptr = reinterpret_cast<bf16_t const*>(&vec);
-#pragma unroll
-  for (int i = 0; i < VPT; i++) {
-    dst[i] = __bfloat162float(bf16_ptr[i]);
-  }
-}
+static constexpr int kDefaultNumExperts = 256;
+static constexpr int kKimiK2NumExperts = 384;
+static constexpr int kDefaultHiddenDim = 7168;
 
 // kOutFloat: true = float32 output, false = bfloat16 output
-template <int kBlockSize, int VPT, int kNumTokens, int kNumExperts, int kHiddenDim, bool kUsePDL, bool kOutFloat>
-__global__ __launch_bounds__(128, 1) void router_gemm_kernel(void* out, bf16_t const* mat_a, bf16_t const* mat_b) {
-  int const n_idx = blockIdx.x;
-  int const tid = threadIdx.x;
+template <
+    typename T,
+    typename OutT,
+    int kBlockSize,
+    int VPT,
+    int kNumTokens,
+    int kNumExperts,
+    int kHiddenDim,
+    bool kUsePDL>
+__global__ __launch_bounds__(kBlockSize, 1) void router_gemm_kernel(OutT* out, T const* mat_a, T const* mat_b) {
   constexpr int kWarpSize = 32;
   constexpr int kNumWarps = kBlockSize / kWarpSize;
-  constexpr int k_elems_per_k_iteration = VPT * kBlockSize;
-  constexpr int k_iterations = kHiddenDim / k_elems_per_k_iteration;
+  constexpr int kElemsPerKIter = VPT * kBlockSize;
+  static_assert(kHiddenDim % kElemsPerKIter == 0, "hidden_dim must be divisible by one K iteration");
+  constexpr int kIters = kHiddenDim / kElemsPerKIter;
+  // Padding to avoid shared memory bank conflicts when kNumTokens > 8
+  constexpr int kSmReductionPad = (kNumTokens > 8) ? 1 : 0;
+  static_assert(kSmReductionPad == 0 || kSmReductionPad == 1, "kSmReductionPad only supports 0 or 1");
+
+  int const n_idx = blockIdx.x;
+  int const tid = threadIdx.x;
+  int const warp_id = tid / kWarpSize;
+  int const lane_id = tid % kWarpSize;
 
   float acc[kNumTokens] = {};
-  __shared__ float sm_reduction[kNumTokens][kNumWarps];
+  __shared__ float sm_reduction[kNumTokens][kNumWarps + kSmReductionPad];
 
-  bf16_t const* b_col = mat_b + n_idx * kHiddenDim;
-
-  std::array<int, k_iterations> k_bases;
-#pragma unroll
-  for (int ki = 0; ki < k_iterations; ki++) {
-    k_bases[ki] = ki * k_elems_per_k_iteration + tid * VPT;
-  }
+  T const* b_col = mat_b + n_idx * kHiddenDim;
 
   PDLWaitPrimary<kUsePDL>();
 
-  for (int ki = 0; ki < k_iterations; ki++) {
-    int const k_base = k_bases[ki];
-
-    uint4 b_vec = *reinterpret_cast<uint4 const*>(b_col + k_base);
-    float b_float[VPT];
-    bf16_uint4_to_float<VPT>(b_vec, b_float);
-
+  int k_base = tid * VPT;
 #pragma unroll
-    for (int m_idx = 0; m_idx < kNumTokens; m_idx++) {
-      uint4 a_vec = *reinterpret_cast<uint4 const*>(mat_a + (m_idx * kHiddenDim) + k_base);
-      float a_float[VPT];
-      bf16_uint4_to_float<VPT>(a_vec, a_float);
+  for (int ki = 0; ki < kIters; ++ki, k_base += kElemsPerKIter) {
+    AlignedVector<bf16_t, VPT> b_vec;
+    b_vec.load(b_col + k_base);
 #pragma unroll
-      for (int k = 0; k < VPT; k++) {
-        acc[m_idx] += a_float[k] * b_float[k];
+    for (int m_idx = 0; m_idx < kNumTokens; ++m_idx) {
+      AlignedVector<bf16_t, VPT> a_vec;
+      a_vec.load(mat_a + m_idx * kHiddenDim + k_base);
+#pragma unroll
+      for (int k = 0; k < VPT; ++k) {
+        acc[m_idx] += cast<float>(a_vec[k]) * cast<float>(b_vec[k]);
       }
     }
   }
 
-  int const warpId = tid / kWarpSize;
-  int const laneId = tid % kWarpSize;
-
 #pragma unroll
-  for (int m = 0; m < kNumTokens; m++) {
-    float sum = acc[m];
-    sum += __shfl_xor_sync(0xffffffff, sum, 16);
-    sum += __shfl_xor_sync(0xffffffff, sum, 8);
-    sum += __shfl_xor_sync(0xffffffff, sum, 4);
-    sum += __shfl_xor_sync(0xffffffff, sum, 2);
-    sum += __shfl_xor_sync(0xffffffff, sum, 1);
-    if (laneId == 0) {
-      sm_reduction[m][warpId] = sum;
+  for (int m_idx = 0; m_idx < kNumTokens; ++m_idx) {
+    float sum = warp::reduce_sum(acc[m_idx]);
+    if (lane_id == 0) {
+      sm_reduction[m_idx][warp_id] = sum;
     }
   }
 
   __syncthreads();
 
-  if (tid == 0) {
+  if (warp_id == 0 && lane_id < kNumTokens) {
+    float final_sum = 0.0f;
 #pragma unroll
-    for (int m = 0; m < kNumTokens; m++) {
-      float final_sum = 0.0f;
-#pragma unroll
-      for (int w = 0; w < kNumWarps; w++) {
-        final_sum += sm_reduction[m][w];
-      }
-      if constexpr (kOutFloat) {
-        static_cast<fp32_t*>(out)[m * kNumExperts + n_idx] = final_sum;
-      } else {
-        static_cast<bf16_t*>(out)[m * kNumExperts + n_idx] = __float2bfloat16(final_sum);
-      }
+    for (int w = 0; w < kNumWarps; ++w) {
+      final_sum += sm_reduction[lane_id][w];
     }
+    out[lane_id * kNumExperts + n_idx] = cast<OutT>(final_sum);
   }
 
   PDLTriggerSecondary<kUsePDL>();
 }
 
-// Dispatch runtime num_tokens to compile-time template parameter [kBegin, kEnd]
-template <int kBegin, int kEnd, int kNumExperts, int kHiddenDim, bool kUsePDL, bool kOutFloat>
-struct RouterGemmDispatcher {
-  static constexpr int kBlockSize = 128;
-  static constexpr int VPT = 16 / sizeof(bf16_t);  // 8 elements per thread
+template <typename T, typename OutT, int kNumTokens, int kNumExperts, int kHiddenDim, bool kUsePDL>
+void invokeRouterGemm(OutT* output, T const* mat_a, T const* mat_b, DLDevice device) {
+  constexpr int VPT = 16 / sizeof(T);
+  constexpr int kBlockSize = 128;
+  constexpr auto kernel = router_gemm_kernel<T, OutT, kBlockSize, VPT, kNumTokens, kNumExperts, kHiddenDim, kUsePDL>;
+  host::LaunchKernel(kNumExperts, kBlockSize, device).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b);
+}
 
-  static void run(int num_tokens, void* output, bf16_t const* mat_a, bf16_t const* mat_b, DLDevice device) {
+// Dispatch runtime num_tokens to compile-time template parameter [kBegin, kEnd]
+template <int kBegin, int kEnd, typename OutT, int kNumExperts, int kHiddenDim, bool kUsePDL>
+struct RouterGemmDispatcher {
+  static void run(int num_tokens, OutT* output, bf16_t const* mat_a, bf16_t const* mat_b, DLDevice device) {
     if (num_tokens == kBegin) {
-      constexpr auto kernel = router_gemm_kernel<kBlockSize, VPT, kBegin, kNumExperts, kHiddenDim, kUsePDL, kOutFloat>;
-      host::LaunchKernel(kNumExperts, kBlockSize, device).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b);
+      invokeRouterGemm<bf16_t, OutT, kBegin, kNumExperts, kHiddenDim, kUsePDL>(output, mat_a, mat_b, device);
     } else {
-      RouterGemmDispatcher<kBegin + 1, kEnd, kNumExperts, kHiddenDim, kUsePDL, kOutFloat>::run(
+      RouterGemmDispatcher<kBegin + 1, kEnd, OutT, kNumExperts, kHiddenDim, kUsePDL>::run(
           num_tokens, output, mat_a, mat_b, device);
     }
   }
 };
 
 // Base case: kBegin == kEnd
-template <int kEnd, int kNumExperts, int kHiddenDim, bool kUsePDL, bool kOutFloat>
-struct RouterGemmDispatcher<kEnd, kEnd, kNumExperts, kHiddenDim, kUsePDL, kOutFloat> {
-  static constexpr int kBlockSize = 128;
-  static constexpr int VPT = 16 / sizeof(bf16_t);
-
-  static void run(int num_tokens, void* output, bf16_t const* mat_a, bf16_t const* mat_b, DLDevice device) {
+template <int kEnd, typename OutT, int kNumExperts, int kHiddenDim, bool kUsePDL>
+struct RouterGemmDispatcher<kEnd, kEnd, OutT, kNumExperts, kHiddenDim, kUsePDL> {
+  static void run(int num_tokens, OutT* output, bf16_t const* mat_a, bf16_t const* mat_b, DLDevice device) {
     if (num_tokens == kEnd) {
-      constexpr auto kernel = router_gemm_kernel<kBlockSize, VPT, kEnd, kNumExperts, kHiddenDim, kUsePDL, kOutFloat>;
-      host::LaunchKernel(kNumExperts, kBlockSize, device).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b);
+      invokeRouterGemm<bf16_t, OutT, kEnd, kNumExperts, kHiddenDim, kUsePDL>(output, mat_a, mat_b, device);
     } else {
       host::panic({}, "dsv3_router_gemm: num_tokens must be between 1 and 16, got ", num_tokens);
     }
@@ -157,6 +148,12 @@ struct RouterGemmDispatcher<kEnd, kEnd, kNumExperts, kHiddenDim, kUsePDL, kOutFl
 // kOutFloat: compile-time bool (true = float32 output, false = bfloat16 output)
 template <int kNumExperts, int kHiddenDim, bool kUsePDL, bool kOutFloat>
 struct DSV3RouterGemmKernel {
+  static_assert(
+      kNumExperts == kDefaultNumExperts || kNumExperts == kKimiK2NumExperts,
+      "required num_experts == 256 or num_experts == 384");
+
+  using OutT = std::conditional_t<kOutFloat, fp32_t, bf16_t>;
+
   static void
   run(const tvm::ffi::TensorView mat_a, const tvm::ffi::TensorView mat_b, const tvm::ffi::TensorView output) {
     using namespace host;
@@ -171,17 +168,13 @@ struct DSV3RouterGemmKernel {
 
     TensorMatcher({M, K}).with_dtype<bf16_t>().with_device(device).verify(mat_a);
     TensorMatcher({N, K}).with_dtype<bf16_t>().with_device(device).verify(mat_b);
-    if constexpr (kOutFloat) {
-      TensorMatcher({M, N}).with_dtype<fp32_t>().with_device(device).verify(output);
-    } else {
-      TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(output);
-    }
+    TensorMatcher({M, N}).with_dtype<OutT>().with_device(device).verify(output);
 
     const int num_tokens = static_cast<int>(M.unwrap());
 
-    RouterGemmDispatcher<1, 16, kNumExperts, kHiddenDim, kUsePDL, kOutFloat>::run(
+    RouterGemmDispatcher<1, 16, OutT, kNumExperts, kHiddenDim, kUsePDL>::run(
         num_tokens,
-        output.data_ptr(),
+        static_cast<OutT*>(output.data_ptr()),
         static_cast<bf16_t const*>(mat_a.data_ptr()),
         static_cast<bf16_t const*>(mat_b.data_ptr()),
         device.unwrap());

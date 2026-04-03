@@ -1,66 +1,36 @@
-"""
-JIT kernel test for DeepSeek V3 router GEMM.
-
-Adapted from sgl-kernel/tests/test_dsv3_router_gemm.py.
-"""
-
-import sys
+"""Tests for JIT dsv3_router_gemm kernel."""
 
 import pytest
 import torch
-import torch.nn.functional as F
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.jit_kernel.dsv3_router_gemm import (
+    can_use_dsv3_router_gemm,
+    dsv3_router_gemm,
+)
 
-register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-1-gpu")
-
-
-def _skip_if_not_sm90():
-    from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
-
-    if is_hip_runtime():
-        pytest.skip("dsv3_router_gemm JIT kernel requires CUDA (not ROCm)")
-    arch = get_jit_cuda_arch()
-    if arch.major < 9:
-        pytest.skip(
-            f"dsv3_router_gemm JIT kernel requires SM90+ (got SM{arch.major}{arch.minor})"
-        )
+HIDDEN_DIM = 7168
+ATOL = 1e-2
+RTOL = 1e-2
 
 
-@pytest.mark.parametrize("num_tokens", [i + 1 for i in range(16)])
+def _ref(hidden_states, router_weights, out_dtype):
+    return (hidden_states.float() @ router_weights.float().T).to(out_dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("num_experts", [256, 384])
+@pytest.mark.parametrize("num_tokens", list(range(1, 17)))
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
-def test_dsv3_router_gemm_jit(num_tokens, num_experts, out_dtype):
-    _skip_if_not_sm90()
+def test_dsv3_router_gemm(num_experts, num_tokens, out_dtype):
+    if not can_use_dsv3_router_gemm(num_experts, HIDDEN_DIM):
+        pytest.skip("SM90+ required")
 
-    from sglang.jit_kernel.dsv3_router_gemm import dsv3_router_gemm
+    mat_a = torch.randn(num_tokens, HIDDEN_DIM, dtype=torch.bfloat16, device="cuda")
+    mat_b = torch.randn(num_experts, HIDDEN_DIM, dtype=torch.bfloat16, device="cuda")
 
-    hidden_dim = 7168
-    mat_a = torch.randn(
-        (num_tokens, hidden_dim), dtype=torch.bfloat16, device="cuda"
-    ).contiguous()
-    mat_b = torch.randn(
-        (num_experts, hidden_dim), dtype=torch.bfloat16, device="cuda"
-    ).contiguous()
-
-    ref = F.linear(mat_a, mat_b).to(out_dtype)
+    ref = _ref(mat_a, mat_b, out_dtype)
     out = dsv3_router_gemm(mat_a, mat_b, out_dtype=out_dtype)
 
     assert out.shape == (num_tokens, num_experts)
     assert out.dtype == out_dtype
-    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-3)
-
-
-def test_can_use_dsv3_router_gemm():
-    _skip_if_not_sm90()
-
-    from sglang.jit_kernel.dsv3_router_gemm import can_use_dsv3_router_gemm
-
-    assert can_use_dsv3_router_gemm(256, 7168) is True
-    assert can_use_dsv3_router_gemm(384, 7168) is True
-    assert can_use_dsv3_router_gemm(128, 7168) is False  # unsupported num_experts
-    assert can_use_dsv3_router_gemm(256, 4096) is False  # unsupported hidden_dim
-
-
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+    torch.testing.assert_close(out.float(), ref.float(), atol=ATOL, rtol=RTOL)
