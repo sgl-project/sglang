@@ -1184,12 +1184,15 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # 2. Prompt embeddings
-        self.caption_projection = LTX2TextProjection(
-            in_features=arch.caption_channels, hidden_size=self.hidden_size
-        )
-        self.audio_caption_projection = LTX2TextProjection(
-            in_features=arch.caption_channels, hidden_size=self.audio_hidden_size
-        )
+        self.caption_projection: LTX2TextProjection | None = None
+        self.audio_caption_projection: LTX2TextProjection | None = None
+        if not arch.caption_proj_before_connector:
+            self.caption_projection = LTX2TextProjection(
+                in_features=arch.caption_channels, hidden_size=self.hidden_size
+            )
+            self.audio_caption_projection = LTX2TextProjection(
+                in_features=arch.caption_channels, hidden_size=self.audio_hidden_size
+            )
 
         # 3. Timestep Modulation Params and Embedding
         self.adaln_single = LTX2AdaLayerNormSingle(
@@ -1527,10 +1530,12 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # 4. Prepare prompt embeddings
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        audio_encoder_hidden_states = self.audio_caption_projection(
-            audio_encoder_hidden_states
-        )
+        if self.caption_projection is not None:
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        if self.audio_caption_projection is not None:
+            audio_encoder_hidden_states = self.audio_caption_projection(
+                audio_encoder_hidden_states
+            )
         # 5. Run blocks
         skip_video_self_attn_blocks = set(skip_video_self_attn_blocks or ())
         skip_audio_self_attn_blocks = set(skip_audio_self_attn_blocks or ())
