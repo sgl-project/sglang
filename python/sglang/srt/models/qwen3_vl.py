@@ -70,10 +70,20 @@ from sglang.srt.models.utils import (
     WeightsMapper,
     compute_cu_seqlens_from_grid_numpy,
 )
-from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.multimodal.mm_utils import (
+    init_all_vision_forward_metadata,
+    run_dp_sharded_mrope_vision_model,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, round_up
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+    is_npu,
+    round_up,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
@@ -87,6 +97,9 @@ if _is_npu:
 
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -753,65 +766,70 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
-        # ---- build token indptr (B+1,) ----
-        token_cu_seqlens = np.repeat(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(axis=0, dtype=np.int32)
-        token_cu_seqlens = np.concatenate(
-            [np.zeros(1, dtype=np.int32), token_cu_seqlens]
-        )
-
-        flashinfer_max_seqlen = 0
-        cu_seqlens = None
-        if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
-            # real token lens (B,)
-            real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
-            flashinfer_max_seqlen = self.bucket_flashinfer_max_seqlen(
-                int(real_seq_lens.max()) if real_seq_lens.size > 0 else 0
+        if not _use_aiter:
+            # ---- build token indptr (B+1,) ----
+            token_cu_seqlens = np.repeat(
+                grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+            ).cumsum(axis=0, dtype=np.int32)
+            token_cu_seqlens = np.concatenate(
+                [np.zeros(1, dtype=np.int32), token_cu_seqlens]
             )
 
-            # (B_padded,) token lengths
-            seq_lens_padded = self.compute_flashinfer_sequence_lengths_padded(
-                token_cu_seqlens
-            )
+            flashinfer_max_seqlen = 0
+            cu_seqlens = None
+            if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
+                # real token lens (B,)
+                real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
+                flashinfer_max_seqlen = self.bucket_flashinfer_max_seqlen(
+                    int(real_seq_lens.max()) if real_seq_lens.size > 0 else 0
+                )
 
-            # element-per-token width on THIS ATTENTION TP rank
-            # q/k/v in VisionAttention are sharded by attention TP
-            attn_tp_size = 1 if self.use_data_parallel else self.tp_size
-            elem_per_token = (
-                self.hidden_size // attn_tp_size
-            )  # == heads_per_rank * head_dim
+                # (B_padded,) token lengths
+                seq_lens_padded = self.compute_flashinfer_sequence_lengths_padded(
+                    token_cu_seqlens
+                )
 
-            # (3*(B_padded+1),) packed element indptrs
-            offsets_packed = self.compute_flashinfer_batch_offsets_packed(
-                token_cu_seqlens,
-                elem_per_token=elem_per_token,
-            )
+                # element-per-token width on THIS ATTENTION TP rank
+                # q/k/v in VisionAttention are sharded by attention TP
+                attn_tp_size = 1 if self.use_data_parallel else self.tp_size
+                elem_per_token = (
+                    self.hidden_size // attn_tp_size
+                )  # == heads_per_rank * head_dim
 
-            sequence_lengths = (
-                torch.from_numpy(seq_lens_padded)
-                .to(device=self.device, dtype=torch.int32, non_blocking=True)
-                .view(-1, 1, 1, 1)
-            )  # match cuDNN test style
+                # (3*(B_padded+1),) packed element indptrs
+                offsets_packed = self.compute_flashinfer_batch_offsets_packed(
+                    token_cu_seqlens,
+                    elem_per_token=elem_per_token,
+                )
 
-            cu_seqlens = torch.from_numpy(offsets_packed).to(
-                device=self.device, dtype=torch.int32, non_blocking=True
-            )
+                sequence_lengths = (
+                    torch.from_numpy(seq_lens_padded)
+                    .to(device=self.device, dtype=torch.int32, non_blocking=True)
+                    .view(-1, 1, 1, 1)
+                )  # match cuDNN test style
 
-            max_seqlen = int(flashinfer_max_seqlen)
-            sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
-        else:
-            sequence_lengths = None
-            cu_seqlens = torch.from_numpy(token_cu_seqlens)
-            if not _is_npu:
-                cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+                cu_seqlens = torch.from_numpy(offsets_packed).to(
+                    device=self.device, dtype=torch.int32, non_blocking=True
+                )
+
+                max_seqlen = int(flashinfer_max_seqlen)
+                sequence_lengths = sequence_lengths.to(self.device, non_blocking=True)
             else:
-                cu_seqlens = cu_seqlens.to("cpu")
+                sequence_lengths = None
+                cu_seqlens = torch.from_numpy(token_cu_seqlens)
+                if not _is_npu:
+                    cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+                else:
+                    cu_seqlens = cu_seqlens.to("cpu")
+                max_seqlen = None
+        else:
+            cu_seqlens = None
+            sequence_lengths = None
             max_seqlen = None
-
         x = x.unsqueeze(1)
 
-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        if cu_seqlens is not None:
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
@@ -1179,6 +1197,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     rope_type="rope_3d",
                 )
             else:
+                if _use_aiter:
+                    init_all_vision_forward_metadata(
+                        self.visual, image_grid_thw, pixel_values
+                    )
                 return self.visual(pixel_values, grid_thw=image_grid_thw)
 
         # compute the number of patches per image and the slice positions in pixel_values
@@ -1283,6 +1305,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
             )
         else:
+            if _use_aiter:
+                init_all_vision_forward_metadata(
+                    self.visual, video_grid_thw, pixel_values
+                )
             video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
