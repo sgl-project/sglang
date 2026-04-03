@@ -40,6 +40,7 @@
 /python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py @hebiao064
 /python/sglang/srt/models/deepseek_common @Fridge003 @ispobock @fzyzcjy @ch-wan
 /python/sglang/srt/models/deepseek_v2.py @fzyzcjy @zhyncs @ispobock @ch-wan @merrymercy @Fridge003
+/python/sglang/srt/models/transformers.py @adarshxs
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
 /python/sglang/srt/observability @merrymercy @fzyzcjy @sufeng-buaa
 /python/sglang/srt/ray @Qiaolin-Yu @xyuzh

@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import uuid
 from abc import ABC
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
@@ -57,6 +58,15 @@ class BaseReq(ABC):
         else:
             self.rid = uuid.uuid4().hex
         return self.rid
+
+    def _validate_rid_uniqueness(self):
+        """Validate that request IDs within a batch are unique."""
+        if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
+            counts = Counter(self.rid)
+            duplicates = [rid for rid, count in counts.items() if count > 1]
+            raise ValueError(
+                f"Duplicate request IDs detected within the request: {duplicates}"
+            )
 
 
 @dataclass
@@ -275,6 +285,8 @@ class GenerateReqInput(BaseReq):
             self._normalize_single_inputs()
         else:
             self._normalize_batch_inputs()
+
+        self._validate_rid_uniqueness()
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -731,6 +743,8 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    token_type_ids: Optional[List[int]] = None
+
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
@@ -852,6 +866,8 @@ class EmbeddingReqInput(BaseReq):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
             self._normalize_lora_paths(self.batch_size)
+
+        self._validate_rid_uniqueness()
 
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
@@ -1009,38 +1025,6 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
 
 @dataclass
-class BatchMultimodalDecodeReq(BaseBatchReq):
-    decoded_ids: List[int]
-    input_token_logprobs_val: List[float]
-    input_token_logprobs_idx: List[int]
-    output_token_logprobs_val: List[float]
-    output_token_logprobs_idx: List[int]
-    read_offsets: List[int]
-    skip_special_tokens: List[bool]
-    spaces_between_special_tokens: List[bool]
-    image_resolutions: List[List[int]]
-    resize_image_resolutions: List[List[int]]
-
-    finished_reasons: List[BaseFinishReason]
-
-    # Token counts
-    prompt_tokens: List[int]
-    completion_tokens: List[int]
-    cached_tokens: List[int]
-
-    # The information of placeholder tokens (e.g., image token)
-    # idx is the index of the token in the prompt after expansion.
-    # val is the length of padded tokens after expansion.
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
-
-    return_bytes: List[bool]
-
-    # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]] = None
-
-
-@dataclass
 class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The finish reason
     finished_reasons: List[dict]
@@ -1097,36 +1081,6 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
-
-    # For observability
-    time_stats: Optional[List[SchedulerReqTimeStats]] = None
-
-
-@dataclass
-class BatchMultimodalOutput(BaseBatchReq):
-    # The finish reason
-    finished_reasons: List[dict]
-    decoded_ids: List[List[int]]
-    # The outputs
-    outputs: Union[List[str | bytes], List[List[Dict]]]
-
-    # probability values for input tokens and output tokens
-    input_token_logprobs_val: List[List[float]]
-    input_token_logprobs_idx: List[List[int]]
-    output_token_logprobs_val: List[List[float]]
-    output_token_logprobs_idx: List[List[int]]
-
-    # Token counts
-    prompt_tokens: List[int]
-    completion_tokens: List[int]
-    cached_tokens: List[int]
-
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
-
-    return_bytes: List[bool]
-    # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1226,21 +1180,6 @@ class DetachHiCacheStorageReqInput(BaseReq):
 @dataclass
 class DetachHiCacheStorageReqOutput(BaseReq):
     success: bool
-    message: str = ""
-
-
-@dataclass
-class PinPrefixReqInput(BaseReq):
-    """Pin a prefix by token_ids to resist eviction."""
-
-    token_ids: List[int] = field(default_factory=list)
-    ttl_seconds: int = 300  # TTL in seconds, default 5 minutes
-
-
-@dataclass
-class PinPrefixReqOutput(BaseReq):
-    success: bool
-    nodes_pinned: int = 0
     message: str = ""
 
 
