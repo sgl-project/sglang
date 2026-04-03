@@ -670,7 +670,7 @@ class ServerArgs:
     enable_nsa_prefill_context_parallel: bool = False
     nsa_prefill_cp_mode: str = "round-robin-split"
     enable_fused_qk_norm_rope: bool = False
-    enable_precise_embedding_interpolation: bool = False
+    disable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
 
     # Context parallelism
@@ -5669,9 +5669,12 @@ class ServerArgs:
             help="Enable fused qk normalization and rope rotary embedding.",
         )
         parser.add_argument(
-            "--enable-precise-embedding-interpolation",
+            "--disable-precise-embedding-interpolation",
             action="store_true",
-            help="Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
+            help="Disable corner-aligned (align_corners=True) interpolation for vision position embeddings. "
+            "The default (enabled) matches the HuggingFace transformers reference implementation. "
+            "Disabling switches to an align_corners=False scheme that samples different grid locations "
+            "than what the model was trained with.",
         )
         parser.add_argument(
             "--enable-fused-moe-sum-all-reduce",

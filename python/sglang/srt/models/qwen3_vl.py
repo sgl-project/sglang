@@ -311,7 +311,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.num_grid_per_side = int(self.num_position_embeddings**0.5)
         self.num_grid = self.num_grid_per_side * self.num_grid_per_side
         self.align_corners = (
-            get_global_server_args().enable_precise_embedding_interpolation
+            not get_global_server_args().disable_precise_embedding_interpolation
         )
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
@@ -525,12 +525,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         outputs = []
         for t, h, w in grid_thw:
-            h_idxs = torch.linspace(
-                0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device
-            )
-            w_idxs = torch.linspace(
-                0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device
-            )
+            h_idxs = self._torch_interp_indices(h, self.device)
+            w_idxs = self._torch_interp_indices(w, self.device)
 
             h_floor = h_idxs.to(torch.long)
             w_floor = w_idxs.to(torch.long)
