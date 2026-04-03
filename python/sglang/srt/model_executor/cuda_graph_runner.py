@@ -409,7 +409,7 @@ def patch_model(
     num_tokens: int,
     tp_group: GroupCoordinator,
 ):
-    """Patch the model to make it compatible with with torch.compile"""
+    """Patch the model to make it compatible with torch.compile"""
     backup_ca_comm = None
 
     try:
