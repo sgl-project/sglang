@@ -4,7 +4,7 @@ from typing import List
 
 import torch
 import triton
-from flashinfer.gemm.routergemm_dsv3 import mm_M1_16_K7168_N256
+from flashinfer.gemm import mm_M1_16_K7168_N256
 from sgl_kernel import dsv3_router_gemm
 
 N = 256
