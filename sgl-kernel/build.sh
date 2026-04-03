@@ -132,7 +132,7 @@ export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS}"
 echo "Build parallelism: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}, NVCC_THREADS=${NVCC_THREADS}"
 
 ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation
-./rename_wheels.sh
+PYTHON=${PYTHON_ROOT_PATH}/bin/python ./rename_wheels.sh
 
 if [ "${USE_CCACHE}" = "1" ]; then
   echo "=== ccache stats (after) ==="
