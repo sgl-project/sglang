@@ -166,8 +166,9 @@ if _use_aiter:
 
 if _is_cuda:
     from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
-    from sglang.srt.utils.custom_op import register_custom_op
     from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+
+    from sglang.srt.utils.custom_op import register_custom_op
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -2273,7 +2274,7 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 @register_custom_op(
     op_name="flashinfer_dsv3_router_gemm",
     mutates_args=[],
-    fake_impl=lambda logits, hidden_states, weight: None
+    fake_impl=lambda logits, hidden_states, weight: None,
 )
 def flashinfer_dsv3_router_gemm(
     logits: torch.Tensor,
@@ -2286,5 +2287,6 @@ def flashinfer_dsv3_router_gemm(
         logits,
         launch_with_pdl=True,
     )
+
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
