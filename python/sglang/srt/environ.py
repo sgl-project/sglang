@@ -336,6 +336,7 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    SGLANG_FORCE_NVFP4_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
@@ -462,9 +463,6 @@ class Envs:
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
-
-    # MM splitting behavior control
-    SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")

@@ -292,9 +292,11 @@ class DeepseekMLAForwardMixin:
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
+        skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
+            and (not skip_rope_for_nsa_tilelang_fused)
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -332,24 +334,69 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            extra_args = {}
-            if self._fuse_rope_for_trtllm_mla(forward_batch):
-                extra_args = {
-                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
-                    "is_neox": self.rotary_emb.is_neox_style,
-                    "llama_4_scaling": llama_4_scaling,
-                }
-
-            attn_output = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-                **extra_args,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if self._skip_rope_for_nsa_tilelang_fused() and self.rotary_emb is not None:
+                cos = self.rotary_emb.cos_cache
+                sin = self.rotary_emb.sin_cache
+                kv_cache_dtype = (
+                    fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
+                )
+                q_cat, _, k_pe_fused, _ = fused_qk_rope_cat_and_cache_mla(
+                    q_nope_out,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    forward_batch.token_to_kv_pool.get_key_buffer(
+                        self.attn_mqa.layer_id
+                    ),
+                    forward_batch.out_cache_loc,
+                    positions,
+                    cos,
+                    sin,
+                    self.attn_mqa.k_scale,
+                    self.rotary_emb.is_neox_style,
+                    q_out_dtype=kv_cache_dtype,
+                )
+                q_nope_fused = q_cat[..., : self.kv_lora_rank]
+                q_pe_fused = q_cat[..., self.kv_lora_rank :]
+                save_kv_cache = False
+                if llama_4_scaling is not None:
+                    q_nope_fused *= llama_4_scaling
+                attn_output = self.attn_mqa(
+                    q_nope_fused,
+                    None,
+                    None,
+                    forward_batch,
+                    q_rope=q_pe_fused,
+                    k_rope=k_pe_fused,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            else:
+                extra_args = {}
+                if self._fuse_rope_for_trtllm_mla(forward_batch):
+                    extra_args = {
+                        "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+                        "is_neox": self.rotary_emb.is_neox_style,
+                        "llama_4_scaling": llama_4_scaling,
+                    }
+                attn_output = self.attn_mqa(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
@@ -531,4 +578,18 @@ class DeepseekMLAForwardMixin:
                 or forward_batch.forward_mode.is_target_verify()
             )
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+        )
+
+    def _skip_rope_for_nsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
+        """
+        Check if we should skip rope and use fused rope+cache path for TileLang NSA on gfx95.
+        """
+        server_args = get_global_server_args()
+        return (
+            _use_aiter_gfx95
+            and self.current_attention_backend == "nsa"
+            and (
+                server_args.nsa_decode_backend == "tilelang"
+                or server_args.nsa_prefill_backend == "tilelang"
+            )
         )
