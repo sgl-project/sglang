@@ -588,11 +588,21 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         items = []
         if image_tensor is not None:
-            items.append(
-                MultimodalDataItem(
-                    feature=image_tensor, modality=Modality.IMAGE, offsets=image_offsets
-                )
+            # Split per-image for better cache granularity
+            assert len(num_patches_list) == len(image_offsets), (
+                f"InternVL: num_patches_list ({len(num_patches_list)}) != "
+                f"image_offsets ({len(image_offsets)})"
             )
+            cumulative = 0
+            for i, num_patches in enumerate(num_patches_list):
+                items.append(
+                    MultimodalDataItem(
+                        feature=image_tensor[cumulative : cumulative + num_patches],
+                        modality=Modality.IMAGE,
+                        offsets=[image_offsets[i]],
+                    )
+                )
+                cumulative += num_patches
         if video_tensor is not None:
             items.append(
                 MultimodalDataItem(
@@ -702,11 +712,21 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         items = []
         if pixel_values is not None:
-            items.append(
-                MultimodalDataItem(
-                    feature=pixel_values, modality=Modality.IMAGE, offsets=image_offsets
-                )
+            # Split per-image for better cache granularity
+            assert len(num_patches_list) == len(image_offsets), (
+                f"InternVL: num_patches_list ({len(num_patches_list)}) != "
+                f"image_offsets ({len(image_offsets)})"
             )
+            cumulative = 0
+            for i, num_patches in enumerate(num_patches_list):
+                items.append(
+                    MultimodalDataItem(
+                        feature=pixel_values[cumulative : cumulative + num_patches],
+                        modality=Modality.IMAGE,
+                        offsets=[image_offsets[i]],
+                    )
+                )
+                cumulative += num_patches
 
         return {
             "input_ids": input_ids,
