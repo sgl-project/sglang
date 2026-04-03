@@ -627,7 +627,7 @@ jobs:
 
   # Specialized B200 tests - 8 GPU, for specific backends and configs
   nightly-test-specialized-8-gpu-b200:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-specialized-8-gpu-b200')
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-8-gpu-b200' || inputs.job_filter == 'nightly-test-specialized-8-gpu-b200')
     runs-on: 8-gpu-b200
     env:
       RUNNER_LABELS: 8-gpu-b200
