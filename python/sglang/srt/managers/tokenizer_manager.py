@@ -75,8 +75,8 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
-from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
-    TokenizerManagerMultiItemMixin,
+from sglang.srt.managers.tokenizer_manager_score_mixin import (
+    TokenizerManagerScoreMixin,
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
@@ -175,7 +175,7 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
-class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixin):
+class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(

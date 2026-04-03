@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from sgl_kernel import gelu_and_mul, silu_and_mul
 from triton_kernels.matmul_ogs import (
     FlexCtx,
     FnSpecs,
@@ -15,13 +16,6 @@ from triton_kernels.matmul_ogs import (
 from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
-
-from sglang.srt.utils import is_cuda
-
-if is_cuda():
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
-else:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig

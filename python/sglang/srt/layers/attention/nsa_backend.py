@@ -1768,31 +1768,49 @@ class NativeSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
+        # TODO: Revert FA4 back to trtllm once FlashInfer fixes TRTLLM attention on SM103 (#21904)
+        # (G)B300 (SM103) hangs with TRTLLM attention at high concurrency.
         if self.device_sm_major >= 10:
-            import flashinfer
+            if self.device_capability == (10, 3):
+                from sglang.jit_kernel.flash_attention_v4 import (
+                    flash_attn_varlen_func as flash_attn_varlen_func_v4,
+                )
 
-            seq_lens = metadata.cache_seqlens_int32
-            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
-                query=q,
-                key=k,
-                value=v,
-                workspace_buffer=self.workspace_buffer,
-                seq_lens=seq_lens,
-                max_q_len=metadata.max_seq_len_q,
-                max_kv_len=max_seqlen_k,
-                bmm1_scale=layer.scaling,
-                bmm2_scale=1.0,
-                o_sf_scale=1.0,
-                batch_size=forward_batch.batch_size,
-                window_left=-1,
-                cum_seq_lens_q=cu_seqlens_q,
-                cum_seq_lens_kv=cu_seqlens_k,
-                enable_pdl=False,
-                is_causal=causal,
-                return_lse=False,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-            )
+                return flash_attn_varlen_func_v4(
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=metadata.max_seq_len_q,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                )
+            else:
+                import flashinfer
+
+                seq_lens = metadata.cache_seqlens_int32
+                return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                    query=q,
+                    key=k,
+                    value=v,
+                    workspace_buffer=self.workspace_buffer,
+                    seq_lens=seq_lens,
+                    max_q_len=metadata.max_seq_len_q,
+                    max_kv_len=max_seqlen_k,
+                    bmm1_scale=layer.scaling,
+                    bmm2_scale=1.0,
+                    o_sf_scale=1.0,
+                    batch_size=forward_batch.batch_size,
+                    window_left=-1,
+                    cum_seq_lens_q=cu_seqlens_q,
+                    cum_seq_lens_kv=cu_seqlens_k,
+                    enable_pdl=False,
+                    is_causal=causal,
+                    return_lse=False,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                )
 
         # Use FA3 for SM90 (Hopper/H200)
         return flash_attn_varlen_func(
