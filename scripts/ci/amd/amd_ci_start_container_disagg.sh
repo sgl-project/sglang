@@ -27,11 +27,13 @@ DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
+CUSTOM_IMAGE=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
       MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
@@ -39,7 +41,7 @@ while [[ $# -gt 0 ]]; do
       echo "Using ROCm version override: ${ROCM_VERSION}"
       shift 2;;
     -h|--help)
-      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--rocm-version VERSION]"
+      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--custom-image IMAGE] [--rocm-version VERSION]"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -164,9 +166,15 @@ find_latest_image() {
 }
 
 # Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-echo "Pulling Docker image: ${IMAGE}"
-docker pull "${IMAGE}"
+if [[ -n "${CUSTOM_IMAGE}" ]]; then
+  IMAGE="${CUSTOM_IMAGE}"
+  echo "Using custom image: ${IMAGE}"
+  docker pull "${IMAGE}"
+else
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+  echo "Pulling Docker image: ${IMAGE}"
+  docker pull "${IMAGE}"
+fi
 
 CACHE_HOST=/home/runner/sgl-data
 if [[ -d "$CACHE_HOST" ]]; then

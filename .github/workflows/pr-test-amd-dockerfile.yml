@@ -1,0 +1,143 @@
+name: PR Test AMD Dockerfile
+on:
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened, labeled ]
+    paths:
+      - "docker/rocm.Dockerfile"
+  workflow_dispatch:
+    inputs:
+      pr_head_sha:
+        description: "PR head SHA to checkout (optional)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: pr-test-amd-dockerfile-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build-mi30x:
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      github.event.pull_request.draft != true &&
+      (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'rocm-docker'))
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub (AMD)
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Build and push MI30X (gfx942) image
+        id: build
+        run: |
+          DATE=$(date +%Y%m%d)
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          PRETEND_VERSION="${{ steps.version.outputs.version }}.dev${DATE}+g${COMMIT_HASH}"
+          TAG="v${{ steps.version.outputs.version }}-rocm700-mi30x-${DATE}_test"
+          IMAGE="rocm/sgl-dev:${TAG}"
+
+          echo "Building MI30X image: ${IMAGE}"
+          docker build . \
+            -f docker/rocm.Dockerfile \
+            --build-arg SGL_BRANCH=${{ github.event.pull_request.head.ref || github.ref_name }} \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GPU_ARCH=gfx942 \
+            --build-arg ENABLE_MORI=1 \
+            --build-arg NIC_BACKEND=ainic \
+            --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION} \
+            -t "${IMAGE}" \
+            --no-cache
+
+          docker push "${IMAGE}"
+          echo "image_tag=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "Successfully built and pushed MI30X: ${IMAGE}"
+
+  build-mi35x:
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      github.event.pull_request.draft != true &&
+      (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'rocm-docker'))
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    outputs:
+      image_tag: ${{ steps.build.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub (AMD)
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Build and push MI35X (gfx950) image
+        id: build
+        run: |
+          DATE=$(date +%Y%m%d)
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          PRETEND_VERSION="${{ steps.version.outputs.version }}.dev${DATE}+g${COMMIT_HASH}"
+          TAG="v${{ steps.version.outputs.version }}-rocm700-mi35x-${DATE}_test"
+          IMAGE="rocm/sgl-dev:${TAG}"
+
+          echo "Building MI35X image: ${IMAGE}"
+          docker build . \
+            -f docker/rocm.Dockerfile \
+            --build-arg SGL_BRANCH=${{ github.event.pull_request.head.ref || github.ref_name }} \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GPU_ARCH=gfx950 \
+            --build-arg ENABLE_MORI=1 \
+            --build-arg NIC_BACKEND=ainic \
+            --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION} \
+            -t "${IMAGE}" \
+            --no-cache
+
+          docker push "${IMAGE}"
+          echo "image_tag=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "Successfully built and pushed MI35X: ${IMAGE}"
+
+  run-amd-ci:
+    needs: [build-mi30x, build-mi35x]
+    uses: ./.github/workflows/pr-test-amd.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      docker_image: ${{ needs.build-mi30x.outputs.image_tag }}
+      docker_image_mi35x: ${{ needs.build-mi35x.outputs.image_tag }}
+      run_all_tests: true
+    secrets: inherit

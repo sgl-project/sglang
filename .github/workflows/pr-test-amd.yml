@@ -12,7 +12,6 @@ on:
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
-      - "docker/rocm.Dockerfile"
   pull_request:
     branches: [ main ]
     paths:
@@ -21,7 +20,6 @@ on:
       - "test/**"
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
-      - "docker/rocm.Dockerfile"
   workflow_dispatch:
     inputs:
       target_stage_select:
@@ -66,6 +64,16 @@ on:
         required: false
         type: boolean
         default: false
+      docker_image:
+        description: 'Custom Docker image for MI30X (e.g. rocm/sgl-dev:v0.5.9-rocm700-mi30x-20260328_test). Leave empty to use latest nightly.'
+        required: false
+        type: string
+        default: ''
+      docker_image_mi35x:
+        description: 'Custom Docker image for MI35X (e.g. rocm/sgl-dev:v0.5.9-rocm700-mi35x-20260328_test). Leave empty to use latest nightly.'
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
@@ -88,6 +96,16 @@ on:
         required: false
         type: boolean
         default: false
+      docker_image:
+        description: 'Custom Docker image for MI30X CI containers. Leave empty to use latest nightly.'
+        required: false
+        type: string
+        default: ''
+      docker_image_mi35x:
+        description: 'Custom Docker image for MI35X CI containers. Leave empty to use latest nightly.'
+        required: false
+        type: string
+        default: ''
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
@@ -186,7 +204,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -233,7 +256,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -276,7 +304,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -315,7 +348,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -356,7 +394,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -395,7 +438,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -434,7 +482,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image_mi35x || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image_mi35x }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -474,7 +527,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -514,7 +572,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -562,7 +625,12 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -690,7 +758,12 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -809,7 +882,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -867,7 +945,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -913,7 +996,12 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image_mi35x || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image_mi35x }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -992,7 +1080,12 @@ jobs:
           echo "=== Host RDMA Check Complete ==="
 
       - name: Start Special Container
-        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh
+        run: |
+          EXTRA_ARGS=""
+          if [[ -n "${{ inputs.docker_image_mi35x || '' }}" ]]; then
+            EXTRA_ARGS="--custom-image ${{ inputs.docker_image_mi35x }}"
+          fi
+          bash scripts/ci/amd/amd_ci_start_container_disagg.sh $EXTRA_ARGS
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
