@@ -1422,7 +1422,6 @@ class DeepseekV2AttentionMLA(
                 forward_batch,
                 zero_allocator,
                 layer_scatter_modes,
-                prev_topk_indices,
             )
         else:
             raise NotImplementedError
