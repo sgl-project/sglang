@@ -67,6 +67,7 @@ jobs:
         env:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
+          USE_CCACHE: 0
           USE_DOCKER_CACHE: 0
 
       - name: Upload to PyPI
@@ -167,6 +168,7 @@ jobs:
         env:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
+          USE_CCACHE: 0
           USE_DOCKER_CACHE: 0
 
       - name: Upload artifacts
