@@ -1,4 +1,5 @@
 import dataclasses
+from dataclasses import field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
@@ -39,3 +40,25 @@ class LTX2SamplingParams(SamplingParams):
         "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, "
         "inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
     )
+
+
+@dataclasses.dataclass
+class LTX23SamplingParams(LTX2SamplingParams):
+    """Sampling parameters matching official LTX-2.3 one-stage defaults."""
+
+    guidance_scale: float = 3.0
+    num_inference_steps: int = 30
+
+    video_cfg_scale: float = 3.0
+    video_stg_scale: float = 1.0
+    video_rescale_scale: float = 0.7
+    video_modality_scale: float = 3.0
+    video_skip_step: int = 0
+    video_stg_blocks: list[int] = field(default_factory=lambda: [28])
+
+    audio_cfg_scale: float = 7.0
+    audio_stg_scale: float = 1.0
+    audio_rescale_scale: float = 0.7
+    audio_modality_scale: float = 3.0
+    audio_skip_step: int = 0
+    audio_stg_blocks: list[int] = field(default_factory=lambda: [28])

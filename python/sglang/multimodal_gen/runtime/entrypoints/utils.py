@@ -295,6 +295,25 @@ def prepare_request(
     if diffusers_kwargs:
         req.extra["diffusers_kwargs"] = diffusers_kwargs
 
+    ltx2_stage1_guider_fields = (
+        "video_cfg_scale",
+        "video_stg_scale",
+        "video_rescale_scale",
+        "video_modality_scale",
+        "video_skip_step",
+        "video_stg_blocks",
+        "audio_cfg_scale",
+        "audio_stg_scale",
+        "audio_rescale_scale",
+        "audio_modality_scale",
+        "audio_skip_step",
+        "audio_stg_blocks",
+    )
+    if all(hasattr(sampling_params, field) for field in ltx2_stage1_guider_fields):
+        req.extra["ltx2_stage1_guider_params"] = {
+            field: getattr(sampling_params, field) for field in ltx2_stage1_guider_fields
+        }
+
     req.adjust_size(server_args)
 
     if not isinstance(req.prompt, str):

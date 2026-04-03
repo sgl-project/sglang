@@ -89,7 +89,10 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
-from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2 import (
+    LTX23SamplingParams,
+    LTX2SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -593,13 +596,18 @@ def _register_configs():
     register_configs(
         sampling_param_cls=LTX2SamplingParams,
         pipeline_config_cls=LTX2PipelineConfig,
-        hf_model_paths=[
-            "Lightricks/LTX-2",
-            "Lightricks/LTX-2.3",
-        ],
+        hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower(),
+            lambda path: "ltx-2" in path.lower() and "ltx-2.3" not in path.lower(),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LTX23SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.3"],
+        model_detectors=[
+            lambda path: "ltx-2.3" in path.lower(),
         ],
     )
 
