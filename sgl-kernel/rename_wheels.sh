@@ -55,7 +55,7 @@ for wheel in "${wheel_files[@]}"; do
     TMPDIR=$(mktemp -d)
     trap 'rm -rf -- "$TMPDIR"' ERR
 
-    python3 -m wheel unpack "$wheel" --dest "$TMPDIR"
+    "${PYTHON:-python3}" -m wheel unpack "$wheel" --dest "$TMPDIR"
     UNPACKED=$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -type d | head -1)
     DIST_INFO=$(find "$UNPACKED" -maxdepth 1 -type d -name "*.dist-info" | head -1)
     WHEEL_META="${DIST_INFO}/WHEEL"
@@ -78,7 +78,7 @@ for wheel in "${wheel_files[@]}"; do
     mv "$DIST_INFO" "${UNPACKED}/${NEW_BASE}"
 
     rm -f "$wheel"
-    python3 -m wheel pack "$UNPACKED" --dest-dir "$WHEEL_DIR"
+    "${PYTHON:-python3}" -m wheel pack "$UNPACKED" --dest-dir "$WHEEL_DIR"
     rm -rf "$TMPDIR"
     trap - ERR
 done
