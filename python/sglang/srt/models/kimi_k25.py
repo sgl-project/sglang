@@ -726,6 +726,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Process image features (includes both images and videos for Kimi K2.5)."""
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.vision_tower.dtype
         )
@@ -754,6 +755,12 @@ class KimiK25ForConditionalGeneration(nn.Module):
         )
         image_features = torch.cat(image_features, dim=0)
         return image_features
+
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Process video features using the same 3D vision tower as images."""
+        # Kimi K2.5 uses the same vision tower for both images and videos
+        # The 3D vision tower can handle temporal dimension natively
+        return self.get_image_feature(items)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -785,6 +792,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             language_model=self.language_model,
             data_embedding_funcs={
                 Modality.IMAGE: self.get_image_feature,
+                Modality.VIDEO: self.get_video_feature,  # Add video support
             },
             positions=positions,
             pp_proxy_tensors=pp_proxy_tensors,
