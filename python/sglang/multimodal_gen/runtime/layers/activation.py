@@ -16,8 +16,14 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
 _is_npu = current_platform.is_npu()
-if _is_cuda or _is_hip:
-    from sgl_kernel import silu_and_mul
+if _is_cuda:
+    from sglang.jit_kernel.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
+elif _is_hip:
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
 if _is_npu:
     import torch_npu
@@ -76,8 +82,16 @@ class GeluAndMul(CustomOp):
         if approximate not in ("none", "tanh"):
             raise ValueError(f"Unknown approximate mode: {approximate}")
 
-    def forward_cuda(self, *args, **kwargs) -> Any:
-        return self.forward_native(*args, **kwargs)
+    def forward_cuda(self, x: torch.Tensor) -> Any:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        if self.approximate == "tanh":
+            gelu_and_mul_fn = gelu_tanh_and_mul
+        else:
+            gelu_and_mul_fn = gelu_and_mul
+        gelu_and_mul_fn(x, out)
+        return out
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
