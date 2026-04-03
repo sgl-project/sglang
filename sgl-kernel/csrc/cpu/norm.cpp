@@ -528,20 +528,24 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
   return output;
 }
 
-// input : {batch_size, hidden_size}
+// input : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
 // weight: {hidden_size}
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   RECORD_FUNCTION("sgl-kernel::rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(weight);
-  CHECK_DIM(2, input);
+  int64_t inp_dim{input.dim()};
+  TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "Expected input dim to be 2 or 3, but got ", inp_dim);
   CHECK_DIM(1, weight);
-  CHECK_EQ(input.size(1), weight.size(0));
-  int64_t batch_size = input.size(0);
-  int64_t hidden_size = input.size(1);
+  CHECK_EQ(input.size(-1), weight.size(0));
+
+  int64_t batch_size{input.size(0)}, hidden_size{input.size(-1)}, input_strideN{input.stride(0)};
+  if (inp_dim == 3) {
+    batch_size *= input.size(1);
+    input_strideN = input.stride(1);
+  }
   at::Tensor output = at::empty_like(input);
-  int64_t input_strideN = input.stride(0);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "rmsnorm_kernel", [&] {
     using Vec = at::vec::Vectorized<float>;
@@ -732,23 +736,28 @@ at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Te
   return output;
 }
 
-// input   : {batch_size, hidden_size}
-// residual: {batch_size, hidden_size}
+// input   : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
+// residual: {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
 // weight  : {hidden_size}
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
   RECORD_FUNCTION("sgl-kernel::fused_add_rmsnorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_INPUT(residual);
   CHECK_INPUT(weight);
-  CHECK_DIM(2, input);
-  CHECK_DIM(2, residual);
+  int64_t inp_dim{input.dim()}, res_dim{residual.dim()};
+  CHECK_EQ(inp_dim, res_dim);
+  TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "Expected input dim to be 2 or 3, but got ", inp_dim);
   CHECK_DIM(1, weight);
   CHECK_EQ(input.size(0), residual.size(0));
-  CHECK_EQ(input.size(1), residual.size(1));
-  CHECK_EQ(input.size(1), weight.size(0));
-  int64_t batch_size = input.size(0);
-  int64_t hidden_size = input.size(1);
-  int64_t input_strideN = input.stride(0);
+  CHECK_EQ(input.size(-1), residual.size(-1));
+  CHECK_EQ(input.size(-1), weight.size(0));
+
+  int64_t batch_size{input.size(0)}, hidden_size{input.size(-1)}, input_strideN{input.stride(0)};
+  if (inp_dim == 3) {
+    CHECK_EQ(input.size(1), residual.size(1));
+    batch_size *= input.size(1);
+    input_strideN = input.stride(1);
+  }
 
   // allocate temp buffer to store x in float32 per thread
   // TODO: implement a singleton for context
