@@ -17,7 +17,10 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.bench_utils import bench_kineto
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
+
+register_cuda_ci(est_time=13, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 IS_CI = is_in_ci()
 

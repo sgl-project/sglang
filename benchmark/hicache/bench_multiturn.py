@@ -529,6 +529,8 @@ class WorkloadGenerator:
                             f"({expected} clients), releasing {len(next_round_reqs)} "
                             f"requests for round {current_barrier_round + 1}"
                         )
+                        self._send_heartbeat(input_len=100, output_len=100)
+                        time.sleep(10)
                         for req in next_round_reqs:
                             self.ready_queue.append(req)
                         next_round_reqs = []
@@ -540,6 +542,15 @@ class WorkloadGenerator:
             except ValueError as e:
                 print(f"Error processing response for client {client_id}: {e}")
                 continue
+
+    def _send_heartbeat(self, input_len=100, output_len=20):
+        """Send a small heartbeat request to the server."""
+        heartbeat_input = [1] * input_len
+        payload = gen_payload(heartbeat_input, output_len, self.lora_path)
+        try:
+            requests.post(self.url, json=payload, timeout=30)
+        except Exception as e:
+            print(f"Heartbeat request failed: {e}")
 
     def run(self):
         request_thread = threading.Thread(target=self.request_sender, daemon=True)

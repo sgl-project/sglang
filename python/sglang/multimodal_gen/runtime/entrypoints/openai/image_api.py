@@ -146,6 +146,7 @@ async def generations(
             enable_upscaling=request.enable_upscaling,
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
+            perf_dump_path=request.perf_dump_path,
         )
         from sglang.srt.observability.trace import extract_trace_headers
 

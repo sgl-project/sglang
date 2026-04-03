@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
 try:
     import cuda.bindings.driver as cuda_driver
     import cutlass  # noqa: F401
@@ -26,6 +28,9 @@ try:
     TRITON_AVAILABLE = True
 except ImportError:
     TRITON_AVAILABLE = False
+
+register_cuda_ci(est_time=5, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 def run_triton_kernel(A_log, dt_bias, q, k, v, a, b, initial_state, indices, scale):

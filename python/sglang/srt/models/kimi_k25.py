@@ -767,6 +767,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
     def end_layer(self) -> int:
         return self.language_model.end_layer
 
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.language_model._routed_experts_weights_of_layer.value
+
     def forward(
         self,
         input_ids: torch.Tensor,

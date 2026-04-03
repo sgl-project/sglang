@@ -48,7 +48,7 @@ _sa.ServerArgs = _ServerArgs
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import asyncio
 import json
@@ -58,6 +58,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.observability.request_metrics_exporter import (
     FileRequestMetricsExporter,
     RequestMetricsExporter,
@@ -243,7 +244,7 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
 
     def test_write_record_skips_health_check(self):
         exporter = self._make_exporter()
-        obj = _GenerateReqInput(rid="HEALTH_CHECK_123", text="ping")
+        obj = _GenerateReqInput(rid=f"{HEALTH_CHECK_RID_PREFIX}_123", text="ping")
         asyncio.run(exporter.write_record(obj, {}))
 
         files = os.listdir(self.tmp_dir)
