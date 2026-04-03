@@ -169,14 +169,14 @@ class IntelAMXAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
-        if layer.v_head_dim == self.v_head_dim:
+        if layer.v_head_dim == self.v_head_dim and layer.tp_q_head_num == self.num_head:
             attn_logits, _ = self.forward_metadata
         else:
             bs = forward_batch.batch_size
             attn_logits = torch.zeros(
                 (
                     bs,
-                    self.num_head,
+                    layer.tp_q_head_num,
                     8,  # self.num_kv_splits,
                     layer.v_head_dim + 1,
                 ),

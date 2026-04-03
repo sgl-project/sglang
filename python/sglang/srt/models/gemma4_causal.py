@@ -299,16 +299,18 @@ class Gemma4Attention(nn.Module):
             else -1
         )
 
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-
         if layer_type == "sliding_attention":
+            self.total_num_heads = getattr(
+                config, "swa_num_attention_heads", config.num_attention_heads
+            )
             self.total_num_kv_heads = getattr(
                 config, "swa_num_key_value_heads", config.num_key_value_heads
             )
         else:
+            self.total_num_heads = config.num_attention_heads
             self.total_num_kv_heads = config.num_key_value_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
 
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
 
