@@ -57,6 +57,9 @@ if TYPE_CHECKING:
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
+    INTERNVLU_SRC_PATH: str | None = None
+    INTERNVLU_TORCH_COMPILE: bool = False
+    FLASH_ATTN_PATCH_PATH: str | None = None
 
 
 def get_default_cache_root() -> str:
@@ -282,6 +285,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
+    # InternVL-U runtime
+    "INTERNVLU_SRC_PATH": _lazy_str("INTERNVLU_SRC_PATH"),
+    "INTERNVLU_TORCH_COMPILE": _lazy_bool("INTERNVLU_TORCH_COMPILE", "false"),
+    "FLASH_ATTN_PATCH_PATH": _lazy_str("FLASH_ATTN_PATCH_PATH"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication

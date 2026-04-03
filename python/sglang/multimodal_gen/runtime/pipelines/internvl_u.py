@@ -34,6 +34,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -47,29 +48,33 @@ logger = init_logger(__name__)
 
 def _setup_internvlu_imports():
     """Ensure InternVL-U source code is importable."""
-    src_path = os.environ.get("INTERNVLU_SRC_PATH")
+    src_path = envs.INTERNVLU_SRC_PATH
     if src_path and src_path not in sys.path:
         sys.path.insert(0, src_path)
 
-    # Apply flash_attn SDPA patch if needed
-    patch_path = os.environ.get("FLASH_ATTN_PATCH_PATH")
+    patch_path = envs.FLASH_ATTN_PATCH_PATH
     if patch_path and patch_path not in sys.path:
         sys.path.insert(0, patch_path)
+
     try:
         import flash_attn_patch  # noqa: F401
     except ImportError:
-        pass
+        logger.warning(
+            "flash_attn_patch is not available; set FLASH_ATTN_PATCH_PATH if InternVL-U requires the SDPA patch"
+        )
 
-    # Verify internvlu is importable
     try:
-        import internvlu  # noqa: F401
-    except ImportError:
+        from internvlu import InternVLUPipeline
+        from internvlu.processing_internvlu import InternVLUProcessor
+    except ImportError as exc:
         raise ImportError(
             "InternVL-U source not found. Either:\n"
             "  1. pip install internvlu, or\n"
             "  2. Set INTERNVLU_SRC_PATH to the InternVL-U repo directory\n"
             "  See: https://github.com/OpenGVLab/InternVL-U"
-        )
+        ) from exc
+
+    return InternVLUPipeline, InternVLUProcessor
 
 
 class InternVLUExecutionStage(PipelineStage):
@@ -81,23 +86,20 @@ class InternVLUExecutionStage(PipelineStage):
         self.processor = processor
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        prompt = getattr(batch, "prompt", "") or ""
-        if not prompt and hasattr(batch, "sampling_params"):
-            prompt = getattr(batch.sampling_params, "prompt", "")
+        prompt = batch.prompt or ""
 
-        height, width, num_steps = 512, 512, 20
-        if hasattr(batch, "sampling_params"):
-            sp = batch.sampling_params
-            height = getattr(sp, "height", height)
-            width = getattr(sp, "width", width)
-            num_steps = getattr(sp, "num_inference_steps", num_steps)
-            size = getattr(sp, "size", None)
-            if isinstance(size, str) and "x" in size:
-                try:
-                    w, h = size.split("x")
-                    width, height = int(w), int(h)
-                except ValueError:
-                    pass
+        height = batch.height if batch.height is not None else 512
+        width = batch.width if batch.width is not None else 512
+        num_steps = (
+            batch.num_inference_steps if batch.num_inference_steps is not None else 20
+        )
+        size = batch.size
+        if isinstance(size, str) and "x" in size:
+            try:
+                width_str, height_str = size.split("x")
+                width, height = int(width_str), int(height_str)
+            except ValueError:
+                pass
 
         logger.info(
             "Generating %dx%d (%d steps): %.50s", width, height, num_steps, prompt
@@ -113,7 +115,7 @@ class InternVLUExecutionStage(PipelineStage):
                 processor=self.processor,
             )
 
-        if hasattr(result, "images") and result.images:
+        if result.images:
             img = result.images[0]
             if isinstance(img, Image.Image):
                 batch.output = (
@@ -140,15 +142,12 @@ class InternVLUDiffusionPipeline(ComposedPipelineBase):
     def load_modules(
         self, server_args: ServerArgs, loaded_modules: Optional[Dict] = None
     ) -> Dict[str, Any]:
-        _setup_internvlu_imports()
+        InternVLUPipeline, InternVLUProcessor = _setup_internvlu_imports()
 
         model_path = self.model_path
         dtype = torch.float16
 
         logger.info("Loading InternVL-U pipeline from %s", model_path)
-
-        from internvlu import InternVLUPipeline
-        from internvlu.processing_internvlu import InternVLUProcessor
 
         self._pipe = InternVLUPipeline.from_pretrained(
             model_path, torch_dtype=dtype
@@ -158,12 +157,11 @@ class InternVLUDiffusionPipeline(ComposedPipelineBase):
         self._processor = InternVLUProcessor.from_pretrained(processor_path)
 
         # Optional torch.compile acceleration
-        if os.environ.get("INTERNVLU_TORCH_COMPILE", "").strip() == "1":
-            if hasattr(self._pipe, "generation_decoder"):
-                logger.info("Applying torch.compile to generation decoder")
-                self._pipe.generation_decoder.decoder = torch.compile(
-                    self._pipe.generation_decoder.decoder, mode="reduce-overhead"
-                )
+        if envs.INTERNVLU_TORCH_COMPILE:
+            logger.info("Applying torch.compile to generation decoder")
+            self._pipe.generation_decoder.decoder = torch.compile(
+                self._pipe.generation_decoder.decoder, mode="reduce-overhead"
+            )
 
         mem_gb = torch.cuda.max_memory_allocated() / 1024**3
         logger.info("InternVL-U loaded, GPU: %.1f GB", mem_gb)
