@@ -1133,6 +1133,9 @@ class ServerArgs:
         # 16. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
             self.disable_piecewise_cuda_graph = True
+        # 17. Context parallel
+        if self.attn_cp_size > 1:
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
