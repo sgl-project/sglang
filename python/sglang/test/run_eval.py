@@ -20,10 +20,10 @@ from sglang.test.simple_eval_common import (
 def get_thinking_kwargs(args):
     thinking_mode = getattr(args, "thinking_mode", None)
     if thinking_mode in THINKING_MODE_CHOICES:
-        if thinking_mode == "deepseek-v3":
+        if thinking_mode in ["deepseek-v3", "kimi-k2"]:
             thinking_param = "thinking"
         else:
-            # Qwen3
+            # All models other than dpsk v3/kimi_k2
             thinking_param = "enable_thinking"
         return {thinking_param: True}
     return {}
@@ -62,7 +62,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
             extra_body[param_name] = value
 
     common_kwargs = dict(
-        model=args.model,
+        model=getattr(args, "model", None),
         max_tokens=getattr(args, "max_tokens", 2048),
         top_p=getattr(args, "top_p", 1.0),
         base_url=base_url,
@@ -71,7 +71,12 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 
     api_mode = getattr(args, "api", "chat")
     if api_mode == "completion":
-        sampler = CompletionSampler(**common_kwargs)
+        # Default stop tokens for completion API (matches few_shot_gsm8k behavior)
+        stop = getattr(args, "stop", ["Question", "Assistant:", "<|separator|>"])
+        sampler = CompletionSampler(
+            **common_kwargs,
+            stop=stop,
+        )
     else:
         sampler = ChatCompletionSampler(
             **common_kwargs,
@@ -143,7 +148,7 @@ def run_eval(args):
         categories = args.categories.split(",") if args.categories else None
 
         eval_obj = LongBenchV2Eval(
-            model=args.model,
+            model=getattr(args, "model", None),
             data_source=data_source,
             num_examples=args.num_examples,
             num_threads=args.num_threads,
@@ -179,8 +184,15 @@ def run_eval(args):
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
         metrics = result.metrics | {"score": result.score}
+        metrics["latency"] = latency
         print(f"Total latency: {latency:.3f} s")
         print(f"Score: {metrics['score']:.3f}")
+
+        # Compute output throughput from accumulated completion tokens
+        total_completion_tokens = sum(sampler._completion_tokens)
+        if total_completion_tokens > 0 and latency > 0:
+            metrics["output_throughput"] = total_completion_tokens / latency
+            print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
 
         # Report metrics to unified collection framework
         dump_metric(
@@ -204,19 +216,31 @@ def run_eval(args):
         ]
 
         scores_repeat = []
+        latencies = []
+        total_completion_tokens = 0
 
         for f in futures:
             result, latency, sampler = f.result()
             scores_repeat.append(result.score)
+            latencies.append(latency)
+            total_completion_tokens += sum(sampler._completion_tokens)
 
         mean_score = sum(scores_repeat) / len(scores_repeat)
+        mean_latency = sum(latencies) / len(latencies)
+        total_latency = sum(latencies)
         scores_repeat = [f"{s:.3f}" for s in scores_repeat]
         print("=" * 20)
         print(f"Repeat: {args.repeat}, mean: {mean_score:.3f}")
         print(f"Scores: {scores_repeat}")
+        print(f"Mean latency: {mean_latency:.3f} s")
         print("=" * 20)
         metrics = result.metrics | {"scores": scores_repeat}
         metrics = metrics | {"mean_score": mean_score}
+        metrics["latency"] = mean_latency
+
+        if total_completion_tokens > 0 and total_latency > 0:
+            metrics["output_throughput"] = total_completion_tokens / total_latency
+            print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
 
         # Report metrics to unified collection framework
         dump_metric(
@@ -248,7 +272,7 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-v3", "qwen3"]
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

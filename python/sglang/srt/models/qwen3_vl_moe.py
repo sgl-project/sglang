@@ -179,9 +179,8 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
 
-    # Only allow LoRA on attention projections within text layers for MoE.
     _lora_pattern_moe = re.compile(
-        r"^model\.layers\.(\d+)\.self_attn\.(?:qkv_proj|o_proj)$"
+        r"^(?:model\.layers\.(\d+)\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)|lm_head|model\.embed_tokens)$"
     )
 
     def should_apply_lora(self, module_name: str) -> bool:

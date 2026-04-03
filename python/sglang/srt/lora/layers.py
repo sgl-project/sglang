@@ -629,7 +629,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def forward(self, input_: torch.Tensor, skip_all_reduce=False):
-        # duplicate the logic in RowParallelLinear
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
@@ -638,8 +637,14 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 input_, num_partitions=self.base_layer.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
+
+        bias_ = (
+            None
+            if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
+            else self.base_layer.bias
+        )
         output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
+            self.base_layer, input_parallel, bias=bias_
         )
 
         should_reduce = (
@@ -668,17 +673,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             else:
                 output_ = output_parallel
 
-        if not self.base_layer.skip_bias_add:
-            output = (
-                output_ + self.base_layer.bias
-                if self.base_layer.bias is not None
-                else output_
-            )
-            output_bias = None
-        else:
-            output = output_
-            output_bias = self.base_layer.bias
-        return output, output_bias
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output_, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         shard_size = self.base_layer.input_size_per_partition
@@ -718,6 +714,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
         self.intermediate_size_per_partition = getattr(
             base_layer, "intermediate_size_per_partition", None
+        )
+        self._uses_interleaved_gate_up = (
+            getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
         )
 
         # initialize triton_lora moe runner for batches with lora enabled
@@ -895,7 +894,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
           gate_up_proj_moe B: [intermediate_size*2, rank] — output matches sharded base w13
           down_proj_moe B:    [hidden_size, rank] — output is all-reduced, no slice
         """
-        if self.tp_size <= 1:
+        needs_processing = (self.tp_size > 1) or (
+            target_module == "gate_up_proj_moe" and self._uses_interleaved_gate_up
+        )
+        if not needs_processing:
             return B
         if target_module != "gate_up_proj_moe":
             return B
@@ -923,6 +925,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             full_inter = B.shape[0] // 2
             gate_b = B[start:end, :]
             up_b = B[full_inter + start : full_inter + end, :]
+            if self._uses_interleaved_gate_up:
+                return torch.stack([gate_b, up_b], dim=1).reshape(-1, B.shape[-1])
             return torch.cat([gate_b, up_b], dim=0).contiguous()
         return B
 

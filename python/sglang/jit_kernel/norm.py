@@ -32,20 +32,23 @@ def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
 
 
 _RMSNORM_WARP_SIZES = frozenset({64, 128, 256})
-_RMSNORM_MAX_HIDDEN_SIZE = 8192
+_RMSNORM_MAX_HIDDEN_SIZE = 16384
+_RMSNORM_HALF_BLOCK_MIN_SIZE = 2048
 
 
-def _is_supported_rmsnorm_hidden_size(hidden_size: int) -> bool:
-    return hidden_size in _RMSNORM_WARP_SIZES or (
-        hidden_size > 256
-        and hidden_size % 256 == 0
-        and hidden_size <= _RMSNORM_MAX_HIDDEN_SIZE
+def _is_supported_rmsnorm_hidden_size(d: int) -> bool:
+    return d in _RMSNORM_WARP_SIZES or (
+        (d > 256 and d % 256 == 0 and d <= 8192)
+        or (d >= 8192 and d % 512 == 0 and d <= 16384)
     )
 
 
 def _rmsnorm_kernel_class(hidden_size: int) -> str:
     if hidden_size in _RMSNORM_WARP_SIZES:
         return "RMSNormWarpKernel"
+    if hidden_size >= _RMSNORM_HALF_BLOCK_MIN_SIZE:
+        if hidden_size % 512 == 0:
+            return "RMSNormHalfKernel"
     return "RMSNormKernel"
 
 
@@ -118,10 +121,10 @@ def fused_inplace_qknorm(
 def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    output: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
 ) -> None:
-    output = output if output is not None else input
+    out = out if out is not None else input
     hidden_size = input.size(-1)
     if not _is_supported_rmsnorm_hidden_size(hidden_size):
         raise RuntimeError(
@@ -130,7 +133,7 @@ def rmsnorm(
             f"(256, {_RMSNORM_MAX_HIDDEN_SIZE}]."
         )
     module = _jit_rmsnorm_module(hidden_size, input.dtype)
-    module.rmsnorm(input, weight, output, eps)
+    module.rmsnorm(input, weight, out, eps)
 
 
 @debug_kernel_api
