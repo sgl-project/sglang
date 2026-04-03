@@ -52,6 +52,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_mps,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -68,6 +69,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -91,6 +93,7 @@ LOAD_FORMAT_CHOICES = [
     "remote_instance",
     "fastsafetensors",
     "private",
+    "runai_streamer",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -504,8 +507,6 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
 
     # Speculative decoding (ngram)
-    speculative_ngram_min_match_window_size: int = 1
-    speculative_ngram_max_match_window_size: int = 12
     speculative_ngram_min_bfs_breadth: int = 1
     speculative_ngram_max_bfs_breadth: int = 10
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
@@ -745,6 +746,8 @@ class ServerArgs:
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
 
+        self._maybe_download_model_for_runai()
+
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
 
@@ -845,6 +848,17 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+    def _maybe_download_model_for_runai(self):
+        if is_runai_obj_uri(self.model_path):
+            ObjectStorageModel.download_and_get_path(self.model_path)
+
+        if (
+            self.tokenizer_path is not None
+            and is_runai_obj_uri(self.tokenizer_path)
+            and self.tokenizer_path != self.model_path
+        ):
+            ObjectStorageModel.download_and_get_path(self.tokenizer_path)
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -1411,15 +1425,10 @@ class ServerArgs:
             )
 
         if self.kv_cache_dtype == "auto":
-            # TODO: Temporarily set default dtype on B200 as bfloat16 to avoid performance regression.
-            # TODO: Remove this after the performance regression is fixed. (Ref: https://github.com/sgl-project/sglang/issues/21291)
-            if quantization == "modelopt_fp4" and major >= 10 and self.dp_size > 1:
+            if major >= 10:
                 self.kv_cache_dtype = "fp8_e4m3"
             else:
                 self.kv_cache_dtype = "bfloat16"
-            # self.kv_cache_dtype = (
-            #     "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
-            # )
             logger.warning(
                 f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
             )
@@ -1450,7 +1459,7 @@ class ServerArgs:
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            if self.dp_size == 1 and major >= 10:
+            if major >= 10:
                 self.nsa_prefill_backend = "trtllm"
                 self.nsa_decode_backend = "trtllm"
             else:
@@ -2404,6 +2413,13 @@ class ServerArgs:
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
+        # MUSA platforms compatible backends
+        if is_musa() and self.attention_backend == "fa3":
+            logger.warning(
+                "FA3 attention backend on MUSA ignores any user-provided page_size and enforces a fixed value of 64."
+            )
+            self.page_size = 64
+
         # Other platforms backends
         if (
             self.attention_backend == "intel_amx"
@@ -3093,8 +3109,10 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
-                self.speculative_num_draft_tokens = (
-                    self.speculative_ngram_max_match_window_size
+                self.speculative_num_draft_tokens = 12
+                logger.warning(
+                    "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
+                    "You can override this by explicitly setting --speculative-num-draft-tokens."
                 )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
@@ -3130,7 +3148,9 @@ class ServerArgs:
                 "Detected Mistral native format checkpoint, setting load_format='mistral'"
             )
 
-        if is_remote_url(self.model_path):
+        if is_runai_obj_uri(self.model_path):
+            self.load_format = "runai_streamer"
+        elif is_remote_url(self.model_path):
             self.load_format = "remote"
 
         if self.custom_weight_loader is None:
@@ -4835,18 +4855,6 @@ class ServerArgs:
 
         # Speculative decoding (ngram)
         parser.add_argument(
-            "--speculative-ngram-min-match-window-size",
-            type=int,
-            default=ServerArgs.speculative_ngram_min_match_window_size,
-            help="The minimum window size for pattern matching in ngram speculative decoding.",
-        )
-        parser.add_argument(
-            "--speculative-ngram-max-match-window-size",
-            type=int,
-            default=ServerArgs.speculative_ngram_max_match_window_size,
-            help="The maximum window size for pattern matching in ngram speculative decoding.",
-        )
-        parser.add_argument(
             "--speculative-ngram-min-bfs-breadth",
             type=int,
             default=ServerArgs.speculative_ngram_min_bfs_breadth,
@@ -6075,11 +6083,12 @@ class ServerArgs:
         }, "moe_dense_tp_size only support 1 and None currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        assert ":" not in self.served_model_name, (
-            "served_model_name cannot contain a colon (':') character. "
-            "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
-            f"Invalid value: '{self.served_model_name}'"
-        )
+        if not is_runai_obj_uri(self.served_model_name):
+            assert ":" not in self.served_model_name, (
+                "served_model_name cannot contain a colon (':') character. "
+                "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
+                f"Invalid value: '{self.served_model_name}'"
+            )
 
         # Check LoRA
         self.check_lora_server_args()

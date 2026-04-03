@@ -672,6 +672,11 @@ class MMReceiverBase(ABC):
                     server_args,
                     _processor,
                     transport_mode,
+                    model_config=(
+                        getattr(self.scheduler, "model_config", None)
+                        if self.scheduler is not None
+                        else None
+                    ),
                     skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
                 )
 
