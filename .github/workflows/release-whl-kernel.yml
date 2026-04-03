@@ -36,7 +36,7 @@ jobs:
   build-cu129-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'cu129')
+      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'cu129')
     strategy:
       matrix:
         python-version: ["3.10"]
@@ -135,7 +135,7 @@ jobs:
   build-cu130-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'cu130')
+      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'cu130')
     strategy:
       matrix:
         python-version: ["3.10"]
@@ -227,7 +227,7 @@ jobs:
   build-rocm-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'rocm700' || github.event.inputs.target == 'rocm720')
+      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'rocm700' || github.event.inputs.target == 'rocm720')
     runs-on: amd-docker-scale
     strategy:
       matrix:
@@ -362,7 +362,7 @@ jobs:
   build-musa43:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'musa43')
+      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'musa43')
     runs-on: kernel-build-node-musa
     strategy:
       matrix:
