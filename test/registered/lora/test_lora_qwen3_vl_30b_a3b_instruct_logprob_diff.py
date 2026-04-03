@@ -35,7 +35,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
-    est_time=300,
+    est_time=160,
     suite="stage-c-test-4-gpu-b200",
 )
 
@@ -50,7 +50,7 @@ EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "fa4"
 
-KL_THRESHOLD = 1e-2
+KL_THRESHOLD = 5e-3
 
 
 def kl_v2(a, b):

@@ -104,6 +104,7 @@ class DmdDenoisingStage(DenoisingStage):
                     logger=logger,
                     metrics=batch.metrics,
                     perf_dump_path_provided=batch.perf_dump_path is not None,
+                    record_as_step=True,
                 ):
                     t_int = int(t.item())
                     if self.transformer_2 is not None:

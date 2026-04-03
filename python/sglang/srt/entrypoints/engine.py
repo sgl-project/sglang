@@ -180,6 +180,10 @@ class Engine(EngineBase):
         self.server_args = server_args
         logger.info(f"{server_args=}")
 
+        # Pre-initialize tokenizer_manager so the atexit handler in
+        # shutdown() won't hit AttributeError.
+        self.tokenizer_manager = None
+
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 

@@ -36,6 +36,7 @@ jobs:
           output: 'trivy-results-${{ matrix.tag }}.sarif'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          skip-dirs: 'usr/local/go,opt/nvidia'
 
       - name: Upload Trivy scan results to GitHub Security
         uses: github/codeql-action/upload-sarif@v4
@@ -53,6 +54,7 @@ jobs:
           format: 'table'
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
+          skip-dirs: 'usr/local/go,opt/nvidia'
 
       - name: Scan summary
         if: always()
