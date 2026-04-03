@@ -6170,6 +6170,14 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            hf_config = self.get_model_config().hf_config
+            assert is_deepseek_nsa(hf_config), (
+                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
+                "(e.g., DeepSeek V3.2, GLM-5). "
+            )
+
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
