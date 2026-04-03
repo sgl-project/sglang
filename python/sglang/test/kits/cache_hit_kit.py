@@ -29,7 +29,7 @@ async def async_request_sglang_generate(
         st = time.perf_counter()
         most_recent_timestamp = st
         output = RequestFuncOutput()
-        completion_tokens = 0
+        completion_tokens = None
 
         try:
             async with session.post(url=url, json=payload, headers=headers) as response:
@@ -81,7 +81,9 @@ async def async_request_sglang_generate(
                     output.prompt_len = prompt_tokens
                     output.cached_tokens = cached_tokens
                     output.generated_len = (
-                        completion_tokens if completion_tokens else len(output.itl) + 1
+                        completion_tokens
+                        if completion_tokens is not None
+                        else len(output.itl) + 1
                     )
                 else:
                     output.error = response.reason or ""
