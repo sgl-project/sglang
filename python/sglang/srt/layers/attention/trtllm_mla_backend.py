@@ -543,7 +543,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
             del seq_lens_sum  # not handle "num_draft_tokens" but we do not need it
         elif forward_mode.is_draft_extend(include_v2=True):
-            num_tokens_per_bs = self.speculative_num_steps + 1
+            num_tokens_per_bs = self.num_draft_tokens
             metadata.max_seq_len_q = num_tokens_per_bs
             metadata.sum_seq_lens_q = num_tokens_per_bs * bs
             metadata.cu_seqlens_q[: bs + 1].copy_(
