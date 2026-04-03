@@ -1573,12 +1573,18 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
 
         if self.nsa_kv_cache_store_fp8:
-            # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
-            # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
-            # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
-            cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
-                cache_k_nope, cache_k_rope
-            )
+            if _is_hip:
+                from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+                    fp8_quant_kv_cache_separate,
+                )
+
+                cache_k_nope_fp8, cache_k_rope_fp8 = fp8_quant_kv_cache_separate(
+                    cache_k_nope, cache_k_rope
+                )
+            else:
+                cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
+                    cache_k_nope, cache_k_rope
+                )
 
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]

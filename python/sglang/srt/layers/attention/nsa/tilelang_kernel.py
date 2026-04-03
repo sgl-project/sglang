@@ -1110,3 +1110,119 @@ def tilelang_sparse_fwd(
         )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
+
+
+def fp8_quant_kv_cache_separate(
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    group_size: int = 128,
+) -> tuple:
+    """Tilelang-based KV cache quantization, drop-in replacement for quantize_k_cache_separate.
+
+    Uses the existing tilelang act_quant kernel for nope FP8 quantization
+    and copies rope as raw BF16 bytes.
+
+    Args:
+        k_nope: (num_tokens, dim_nope) or (num_tokens, 1, dim_nope), BF16
+        k_rope: (num_tokens, dim_rope) or (num_tokens, 1, dim_rope), BF16
+        group_size: quantization tile size (default 128)
+
+    Returns:
+        Tuple of (nope_part_u8, rope_part_u8):
+        - nope_part_u8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
+        - rope_part_u8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
+    """
+    k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
+    k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
+
+    num_tokens = k_nope_2d.shape[0]
+    dim_nope = k_nope_2d.shape[1]
+    dim_rope = k_rope_2d.shape[1]
+    assert dim_nope == 512, f"Expected dim_nope=512, got {dim_nope}"
+    assert dim_rope == 64, f"Expected dim_rope=64, got {dim_rope}"
+
+    k_nope_2d = k_nope_2d.contiguous()
+    k_rope_2d = k_rope_2d.contiguous()
+
+    nope_fp8, nope_scale = act_quant(k_nope_2d, block_size=group_size)
+
+    num_tiles = dim_nope // group_size
+    nope_part_bytes = dim_nope + num_tiles * 4
+
+    nope_part_u8 = torch.empty(
+        num_tokens, nope_part_bytes, dtype=torch.uint8, device=k_nope_2d.device
+    )
+    nope_part_u8[:, :dim_nope] = nope_fp8.view(torch.uint8)
+    nope_part_u8[:, dim_nope:] = nope_scale.view(torch.uint8)
+
+    rope_part_u8 = k_rope_2d.view(torch.uint8).contiguous()
+
+    return nope_part_u8.unsqueeze(1), rope_part_u8.unsqueeze(1)
+
+
+@tilelang.jit(out_idx=[4], pass_configs=pass_configs)
+def fp8_dequant_paged_fused_kernel(dim_nope=512, dim_rope=64, group_size=128):
+    """Fused paged gather + FP8 dequant: reads directly from paged KV cache pool."""
+    num_tokens = T.symbolic("num_tokens")
+    num_pages = T.symbolic("num_pages")
+    num_tiles = dim_nope // group_size
+    dim_quant_fp8 = dim_nope + num_tiles * 4 + dim_rope * 2
+    dim_quant_f32 = dim_quant_fp8 // 4
+    dim_quant_bf16 = dim_quant_fp8 // 2
+    scale_offset_f32 = dim_nope // 4
+    rope_offset_bf16 = (dim_nope + num_tiles * 4) // 2
+    indices_dtype = "int32"
+
+    @T.prim_func
+    def fused_dequant(
+        kv_fp8: T.Tensor[(num_pages, dim_quant_fp8), FP8],
+        kv_f32: T.Tensor[(num_pages, dim_quant_f32), FP32],
+        kv_bf16: T.Tensor[(num_pages, dim_quant_bf16), BF16],
+        page_indices: T.Tensor[(num_tokens,), indices_dtype],
+        output: T.Tensor[(num_tokens, dim_nope + dim_rope), BF16],
+    ):
+        with T.Kernel(num_tokens, threads=128) as (pid,):
+            page_idx = page_indices[pid]
+            for tile in T.serial(num_tiles):
+                scale = kv_f32[page_idx, scale_offset_f32 + tile]
+                for j in T.Parallel(group_size):
+                    col = tile * group_size + j
+                    output[pid, col] = kv_fp8[page_idx, col] * scale
+            for j in T.Parallel(dim_rope):
+                output[pid, dim_nope + j] = kv_bf16[page_idx, rope_offset_bf16 + j]
+
+    return fused_dequant
+
+
+def fp8_dequant_paged(
+    kv_cache: torch.Tensor,
+    page_indices: torch.Tensor,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """Fused paged gather + FP8 dequant.
+
+    Reads directly from the paged KV cache pool using indirect indexing,
+    avoiding intermediate buffers and .contiguous() copies.
+
+    Args:
+        kv_cache: FP8 KV cache from the pool, any shape with last dim = 656.
+        page_indices: [num_tokens] int32 physical page indices into kv_cache.
+        group_size: quantization group size (default 128).
+
+    Returns:
+        [num_tokens, 1, dim_nope + dim_rope] BF16 dequantized KV cache.
+    """
+    dim_quant = kv_cache.shape[-1]
+    assert dim_quant == 656, f"Expected dim_quant=656, got {dim_quant}"
+    kv_cache_flat = kv_cache.view(-1, dim_quant)
+
+    fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
+    kv_fp8 = kv_cache_flat.view(fp8_dtype)
+    kv_f32 = kv_cache_flat.view(torch.float32)
+    kv_bf16 = kv_cache_flat.view(torch.bfloat16)
+
+    dim_nope = 512
+    dim_rope = 64
+    kernel = fp8_dequant_paged_fused_kernel(dim_nope, dim_rope, group_size)
+    output = kernel(kv_fp8, kv_f32, kv_bf16, page_indices)
+    return output.view(page_indices.shape[0], 1, dim_nope + dim_rope)
