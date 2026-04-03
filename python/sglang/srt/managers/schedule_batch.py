@@ -198,7 +198,6 @@ class FINISH_ABORT(BaseFinishReason):
 
 class Modality(Enum):
     IMAGE = auto()
-    MULTI_IMAGES = auto()
     VIDEO = auto()
     AUDIO = auto()
 
@@ -225,9 +224,10 @@ class MultimodalInputFormat(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    One MultimodalDataItem contains all inputs for one modality.
-    For example, if there are 3 images and 1 audio inputs, there will be 2 MultimodalDataItem.
-    One for images and one for audio.
+    One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
+    For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
+
+    Each item has its own hash and pad_value, enabling per-image RadixAttention caching.
 
     We put the common fields first and the model-specific fields in model_specific_data.
     """
@@ -305,7 +305,7 @@ class MultimodalDataItem:
         return self.modality == Modality.AUDIO
 
     def is_image(self):
-        return self.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]
+        return self.modality == Modality.IMAGE
 
     def is_video(self):
         return self.modality == Modality.VIDEO
@@ -329,12 +329,6 @@ class MultimodalDataItem:
         ret = MultimodalDataItem(modality=modality, **kwargs)
         ret.validate()
         return ret
-
-    def merge(self, other):
-        self.feature += other.feature
-        self.offsets += other.offsets
-        self.hash = hash((self.hash, other.hash))
-        self.set_pad_value()
 
     def reconstruct(self):
         if not isinstance(self.feature, CudaIpcTensorTransportProxy):
@@ -395,18 +389,9 @@ class MultimodalInputs:
 
     @staticmethod
     def from_dict(obj: dict):
-        original_mm_items = obj["mm_items"]
-        for mm_item in original_mm_items:
+        mm_items = obj["mm_items"]
+        for mm_item in mm_items:
             mm_item.reconstruct()
-
-        # Check if MM splitting is enabled
-        if not envs.SGLANG_ENABLE_MM_SPLITTING.get():
-            mm_items = original_mm_items
-        else:
-            from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-
-            # Now, `mm_items` contains one item per image.
-            mm_items = get_new_expanded_mm_items(original_mm_items)
 
         ret = MultimodalInputs(
             mm_items=mm_items,
