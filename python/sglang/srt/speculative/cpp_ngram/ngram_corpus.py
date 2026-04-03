@@ -1,64 +1,48 @@
 # -*- coding: utf-8 -*-
 
 import logging
-import os
 from typing import List, Tuple
 
 import numpy as np
-from torch.utils.cpp_extension import load
+
+from sglang.jit_kernel.ngram_corpus import get_ngram_corpus_cls
 
 logger = logging.getLogger(__name__)
-
-_abs_path = os.path.dirname(os.path.abspath(__file__))
-ngram_corpus_cpp = load(
-    name="ngram_corpus_cpp",
-    sources=[
-        f"{_abs_path}/ngram_corpus_binding.cpp",
-        f"{_abs_path}/ngram.cpp",
-        f"{_abs_path}/trie.cpp",
-        f"{_abs_path}/result.cpp",
-    ],
-    extra_cflags=["-O3", "-std=c++20"],
-)
 
 
 class NgramCorpus:
     def __init__(
         self,
         max_trie_depth=18,
-        min_match_window_size=1,
-        max_match_window_size=10,
         min_bfs_breadth=1,
         max_bfs_breadth=8,
         draft_token_num=8,
         match_type="BFS",
         capacity=1000000,
-    ):
-        param = ngram_corpus_cpp.Param()
-        param.max_trie_depth = max_trie_depth
-        param.min_match_window_size = min_match_window_size
-        param.max_match_window_size = max_match_window_size
-        param.min_bfs_breadth = min_bfs_breadth
-        param.max_bfs_breadth = max_bfs_breadth
-        param.draft_token_num = draft_token_num
-        param.match_type = match_type
-        self._ngram = ngram_corpus_cpp.Ngram(capacity, param)
-
+    ) -> None:
+        cls = get_ngram_corpus_cls()
+        self._obj = cls(
+            capacity=capacity,
+            max_trie_depth=max_trie_depth,
+            min_bfs_breadth=min_bfs_breadth,
+            max_bfs_breadth=max_bfs_breadth,
+            draft_token_num=draft_token_num,
+            match_type=match_type,
+        )
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
 
     def batch_put(self, batch_tokens: List[List[int]]):
-        self._ngram.asyncInsert(batch_tokens)
+        self._obj.insert(batch_tokens)
 
     def synchronize(self):
-        self._ngram.synchronize()
+        self._obj.synchronize()  # type: ignore
 
     def reset(self):
-        self._ngram.reset()
+        self._obj.reset()  # type: ignore
 
     def batch_get(self, batch_tokens: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
-        result = self._ngram.batchMatch(batch_tokens)
-        return np.array(result.token), np.array(result.mask)
+        return self._obj.match(batch_tokens)
 
     def leaf_paths_from_mask(
         self, tokens: List[int], tree_mask: List[List[int]]

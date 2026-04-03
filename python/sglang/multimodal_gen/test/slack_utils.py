@@ -130,7 +130,7 @@ def upload_file_to_slack(
                 try:
                     suffix = os.path.splitext(urlparse(path).path)[1] or ".tmp"
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
-                        with urlopen(path) as response:
+                        with urlopen(path, timeout=30) as response:
                             tf.write(response.read())
                     temp_paths.append(tf.name)
                     final_origin_paths.append(tf.name)
@@ -155,7 +155,7 @@ def upload_file_to_slack(
             f"*Case ID:* `{case_id}`\n" f"*Model:* `{model}`\n" f"*Prompt:* {prompt}"
         )
 
-        client = WebClient(token=token)
+        client = WebClient(token=token, timeout=60)
         channel_id = "C0A02NDF7UY"
         thread_ts = None
 
