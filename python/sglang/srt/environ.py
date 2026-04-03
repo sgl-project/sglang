@@ -284,9 +284,13 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
-    # Max fraction of cache (by token count) that can be pinned; 0 = disable pinning.
-    SGLANG_HICACHE_MAX_PINNED_RATIO = EnvFloat(0.0)
-
+    # Staging buffer for heterogeneous TP KV transfer
+    SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
+    SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
+    SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
+    # staging_buffer.py once Triton kernels are fully validated in production.
+    SGLANG_STAGING_USE_TORCH = EnvBool(False)
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
@@ -326,6 +330,9 @@ class Envs:
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+
+    # MTHREADS & MUSA
+    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
