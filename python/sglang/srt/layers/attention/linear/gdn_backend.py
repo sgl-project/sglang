@@ -262,7 +262,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
             )
-            self.forward_metadata.conv_states_indices = (
+            self.forward_metadata.conv_states_mask_indices = (
                 forward_batch.mamba_track_indices[
                     self.forward_metadata.mamba_track_mask_indices
                 ]
@@ -410,7 +410,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                conv_states[forward_metadata.conv_states_indices] = mixed_qkv_to_track
+                conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv_to_track
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,

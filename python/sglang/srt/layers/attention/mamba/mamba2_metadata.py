@@ -43,7 +43,7 @@ class ForwardMetadata:
 
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
-    conv_states_indices: Optional[torch.Tensor] = None
+    conv_states_mask_indices: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
