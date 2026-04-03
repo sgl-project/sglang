@@ -85,7 +85,7 @@ repos:
         name: check for duplicate workflow job names
         entry: python3 scripts/ci/check_workflow_job_names.py
         language: system
-        files: ^\.github/workflows/pr-test.*\.yml$
+        files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
