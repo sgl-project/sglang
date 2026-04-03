@@ -187,6 +187,16 @@ def get_quant_config(
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+        # For modelopt, route to FP4 vs FP8 config based on quant_algo
+        if model_config.quantization.startswith("modelopt"):
+            quant_algo = hf_quant_config.get("quant_algo")
+            if quant_algo is None:
+                quant_algo = hf_quant_config.get("quantization", {}).get("quant_algo")
+            if quant_algo is not None:
+                if quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
+                    return ModelOptFp8Config.from_config(hf_quant_config)
+                if "FP4" in quant_algo:
+                    return ModelOptFp4Config.from_config(hf_quant_config)
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
