@@ -220,13 +220,14 @@ class ExtendedRadixCache(BasePrefixCache):
         task_id = self._load_task_id_counter
         self._load_task_id_counter += 1
 
+        self._inner_radixtree.inc_lock_ref(req.last_node)
+        
         self._connector.start_store_kv(
             task_id=task_id,
             token_ids=token_ids,
             kv_indices=kv_indices,
         )
 
-        self._inner_radixtree.inc_lock_ref(req.last_node)
         self._ongoing_store_tasks[task_id] = req.last_node
 
     def evict(self, params: EvictParams) -> EvictResult:
