@@ -21,6 +21,7 @@ on:
           - 'rocm720'
           - 'musa43'
       tag_name:
+        description: "Version number, must be in the form of vX.Y.Z (e.g. v0.4.0)"
         type: string
         required: false
       pr_number:

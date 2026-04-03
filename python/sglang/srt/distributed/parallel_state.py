@@ -1532,11 +1532,12 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     with get_tp_group().graph_capture(
         stream=stream
     ) as context, get_pp_group().graph_capture(context):
-        moe_ep = _MOE_EP
-        if moe_ep is not None and moe_ep is not _TP:
-            with moe_ep.graph_capture(context):
-                yield context
-        else:
+        with contextlib.ExitStack() as stack:
+            seen = {id(_TP)}
+            for group in (_MOE_EP, _MOE_TP):
+                if group is not None and id(group) not in seen:
+                    seen.add(id(group))
+                    stack.enter_context(group.graph_capture(context))
             yield context
 
 
