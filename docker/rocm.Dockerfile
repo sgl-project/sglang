@@ -27,7 +27,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.11.post1"
+ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -37,7 +37,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.11.post1"
+ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
 
 # ===============================
 # Base image 950 and args
@@ -47,7 +47,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.11.post1"
+ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -57,7 +57,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.11.post1"
+ENV AITER_COMMIT_DEFAULT="v0.1.11.post1"
 
 # ===============================
 # Chosen arch and args
@@ -79,6 +79,8 @@ ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT=""
+ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
 
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
