@@ -30,10 +30,15 @@ def _jit_activation_module(dtype: torch.dtype) -> Module:
     )
 
 
+SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh"}
+
+
 @register_custom_op(mutates_args=["out"], out_shape="input")
-def _run_activation(
+def run_activation(
     op_name: str, input: torch.Tensor, out: Optional[torch.Tensor]
 ) -> torch.Tensor:
+    assert op_name in SUPPORTED_ACTIVATIONS, f"Unsupported activation: {op_name}"
+
     if out is None:
         out = input.new_empty(*input.shape[:-1], input.shape[-1] // 2)
     module = _jit_activation_module(input.dtype)
@@ -46,16 +51,16 @@ def _run_activation(
 def silu_and_mul(
     input: torch.Tensor, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    return _run_activation("silu", input, out)
+    return run_activation("silu", input, out)
 
 
 def gelu_and_mul(
     input: torch.Tensor, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    return _run_activation("gelu", input, out)
+    return run_activation("gelu", input, out)
 
 
 def gelu_tanh_and_mul(
     input: torch.Tensor, out: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    return _run_activation("gelu_tanh", input, out)
+    return run_activation("gelu_tanh", input, out)

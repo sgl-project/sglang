@@ -200,16 +200,11 @@ def fused_moe_gguf(
     activation: str,
 ) -> torch.Tensor:
     def act(x: torch.Tensor):
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if activation == "silu":
-            silu_and_mul(x, out)
+            return silu_and_mul(x)
         elif activation == "gelu":
-            gelu_and_mul(x, out)
-        else:
-            raise ValueError(f"Unsupported activation: {activation}")
-        return out
+            return gelu_and_mul(x)
+        raise ValueError(f"Unsupported activation: {activation}")
 
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
