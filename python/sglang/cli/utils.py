@@ -6,6 +6,7 @@ from functools import lru_cache
 
 from sglang.srt.environ import envs
 from sglang.utils import (
+    KNOWN_GATED_DIFFUSION_MODEL_PATTERNS,
     has_diffusion_overlay_registry_match,
     is_known_non_diffusers_diffusion_model,
     load_diffusion_overlay_registry_from_env,
@@ -23,13 +24,10 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
     return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
-def _is_registered_diffusion_model(model_path: str) -> bool:
-    try:
-        from sglang.multimodal_gen.registry import has_registered_model
-    except ImportError:
-        return False
-
-    return has_registered_model(model_path)
+def _is_known_gated_diffusion_model(model_path: str) -> bool:
+    """Check if model_path matches a known gated diffusion repo pattern."""
+    model_path_lower = model_path.lower()
+    return any(p in model_path_lower for p in KNOWN_GATED_DIFFUSION_MODEL_PATTERNS)
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
@@ -64,7 +62,7 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if is_known_non_diffusers_diffusion_model(model_path):
         return True
 
-    if _is_registered_diffusion_model(model_path):
+    if _is_known_gated_diffusion_model(model_path):
         return True
 
     try:
@@ -82,7 +80,7 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return _is_diffusers_model_dir(os.path.dirname(file_path))
     except Exception as e:
         logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
-        return _is_registered_diffusion_model(model_path)
+        return _is_known_gated_diffusion_model(model_path)
 
 
 def get_model_path(extra_argv):
