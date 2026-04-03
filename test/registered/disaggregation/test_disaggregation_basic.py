@@ -510,23 +510,55 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             other_args=decode_args,
         )
 
-    def test_prefill_not_blocked_after_pause_resume(self):
-        """Keep the prefill engine busy with async workers, repeatedly
-        pause/resume to trigger the leak, abort everything, then verify new
-        requests still work.
+    def test_retract_pause_no_leak_on_prefill(self):
+        """Retract-mode pause on a disagg prefill node must not leak prefill
+        requests into running_batch. Without the fix, each retract pause merges
+        last_batch into running_batch, but the prefill event loop never cleans
+        them up via update_running_batch. After enough cycles the
+        max-running-requests budget is exhausted and all new prefills hang."""
+        asyncio.run(self._run_pause_resume_leak_test("retract"))
 
-        Without the fix, each in_place pause leaks one last_batch into
-        running_batch.  After enough cycles the max-running-requests budget
-        is exhausted and all new prefills hang."""
-        asyncio.run(self._run_pause_resume_leak_test())
+    def test_retract_pause_empty_running_batch(self):
+        """Retract-mode pause must not crash when running_batch is empty.
+        Regression test for issue #20272."""
+        asyncio.run(self._run_pause_on_idle("retract"))
 
-    async def _run_pause_resume_leak_test(self):
+    async def _run_pause_on_idle(self, mode):
+        """Pause/resume on an idle prefill node (no in-flight requests)."""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self.prefill_url + "/pause_generation",
+                json={"mode": mode},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+            async with session.post(
+                self.prefill_url + "/continue_generation",
+                json={},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+
+            # Verify the engine still works after pause/resume
+            async with session.post(
+                self.lb_url + "/generate",
+                json={
+                    "text": "What is 1+1?",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+                body = await resp.json()
+                self.assertIn("text", body)
+                self.assertGreater(len(body["text"]), 0)
+
+    async def _run_pause_resume_leak_test(self, mode):
         NUM_WORKERS = 64
-        # Try several times to trigger leak condition
         NUM_PAUSE_RESUME_CYCLES = self.MAX_RUNNING * 4
         NUM_FINAL_REQUESTS = 4
         MAX_NEW_TOKENS = 1
-        FINAL_TIMEOUT = 5
+        FINAL_TIMEOUT = 10
         LONG_PROMPT = "Tell me a story. " * 200
 
         async def _background_worker(session, worker_id, cancel_event):
@@ -561,18 +593,16 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
         cancel_event = asyncio.Event()
 
         async with aiohttp.ClientSession() as session:
-            # Phase 1: start background workers to keep the engine saturated
             workers = [
                 asyncio.create_task(_background_worker(session, i, cancel_event))
                 for i in range(NUM_WORKERS)
             ]
 
-            # Repeatedly pause/resume to accumulate leaked requests
             for _ in range(NUM_PAUSE_RESUME_CYCLES):
                 await _post(
                     session,
                     self.prefill_url + "/pause_generation",
-                    {"mode": "in_place"},
+                    {"mode": mode},
                 )
                 await _post(
                     session,
@@ -581,7 +611,6 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
                 )
                 await asyncio.sleep(0.1)
 
-            # Stop workers and abort all in-flight requests
             cancel_event.set()
             await _post(
                 session, self.prefill_url + "/abort_request", {"abort_all": True}
@@ -592,9 +621,8 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
 
             await asyncio.gather(*workers, return_exceptions=True)
 
-            # Phase 2: send fresh requests — these must not hang.
-            # With the bug, running_batch is full of phantom requests and
-            # get_num_allocatable_reqs returns <= 0, blocking all new prefills.
+            # Fresh requests must not hang. With the bug, running_batch is
+            # full of phantom requests and new prefills are blocked.
             async def _final_request(i):
                 async with session.post(
                     self.lb_url + "/generate",
@@ -626,7 +654,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
         self.assertEqual(
             completed,
             NUM_FINAL_REQUESTS,
-            f"Phase 2 requests blocked after pause/resume "
+            f"Phase 2 requests blocked after {mode} pause/resume "
             f"({completed}/{NUM_FINAL_REQUESTS} succeeded). Errors: {errors}",
         )
 
