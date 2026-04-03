@@ -233,15 +233,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # because aiter CK kernels don't support all GEMM dimensions
         _should_use_aiter_moe = _use_aiter and get_moe_runner_backend().is_auto()
         if _should_use_aiter_moe:
-            layer.w13_weight = torch.nn.Parameter(
-                shuffle_weight(layer.w13_weight.data, (16, 16)),
-                requires_grad=False,
-            )
+            layer.w13_weight.data = shuffle_weight(layer.w13_weight.data, (16, 16))
             torch.cuda.empty_cache()
-            layer.w2_weight = torch.nn.Parameter(
-                shuffle_weight(layer.w2_weight.data, (16, 16)),
-                requires_grad=False,
-            )
+            layer.w2_weight.data = shuffle_weight(layer.w2_weight.data, (16, 16))
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU
