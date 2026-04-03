@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple, Union
 
 import torch
@@ -590,6 +591,10 @@ class LTX2TextConnectors(nn.Module):
             apply_gated_attention=connector_apply_gated_attention,
         )
 
+    @staticmethod
+    def _rescale_v2_features(x: torch.Tensor, target_dim: int, source_dim: int) -> torch.Tensor:
+        return x * math.sqrt(target_dim / source_dim)
+
     def forward(
         self,
         text_encoder_hidden_states: torch.Tensor,
@@ -631,6 +636,17 @@ class LTX2TextConnectors(nn.Module):
                 audio_hidden_states = audio_hidden_states.to(
                     self.audio_aggregate_embed.weight.dtype
                 )
+            source_dim = self.video_aggregate_embed.out_features
+            video_hidden_states = self._rescale_v2_features(
+                video_hidden_states,
+                self.video_aggregate_embed.out_features,
+                source_dim,
+            )
+            audio_hidden_states = self._rescale_v2_features(
+                audio_hidden_states,
+                self.audio_aggregate_embed.out_features,
+                source_dim,
+            )
             video_hidden_states = self.video_aggregate_embed(video_hidden_states)
             audio_hidden_states = self.audio_aggregate_embed(audio_hidden_states)
         else:

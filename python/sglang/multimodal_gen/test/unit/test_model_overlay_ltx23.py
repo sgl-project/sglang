@@ -1,6 +1,12 @@
 import os
 from types import SimpleNamespace
 
+import torch
+
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    _gemma_postprocess_func,
+    pack_text_embeds_v2,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -78,3 +84,46 @@ def test_ltx23_prepare_request_sets_stage1_guider_defaults():
         "audio_skip_step": 0,
         "audio_stg_blocks": [28],
     }
+
+
+def test_pack_text_embeds_v2_masks_padding():
+    hidden_states = torch.tensor(
+        [
+            [
+                [[3.0, 4.0], [0.0, 0.0]],
+                [[0.0, 0.0], [0.0, 0.0]],
+            ]
+        ]
+    )
+    attention_mask = torch.tensor([[1, 0]])
+
+    packed = pack_text_embeds_v2(hidden_states, attention_mask)
+
+    expected_first = torch.tensor(
+        [1.0, 1.0, 0.0, 0.0], dtype=packed.dtype, device=packed.device
+    )
+    assert torch.allclose(packed[0, 0], expected_first)
+    assert torch.equal(packed[0, 1], torch.zeros_like(packed[0, 1]))
+
+
+def test_ltx23_gemma_postprocess_uses_v2_norm():
+    hidden_state = torch.tensor(
+        [
+            [
+                [3.0, 0.0],
+                [4.0, 0.0],
+            ]
+        ]
+    )
+    outputs = SimpleNamespace(hidden_states=(hidden_state,))
+    text_inputs = {"attention_mask": torch.tensor([[1]])}
+    pipeline_config = SimpleNamespace(
+        dit_config=SimpleNamespace(
+            arch_config=SimpleNamespace(caption_proj_before_connector=True)
+        )
+    )
+
+    packed = _gemma_postprocess_func(outputs, text_inputs, pipeline_config)
+
+    expected = torch.tensor([[[0.6, 0.8]]], dtype=packed.dtype, device=packed.device)
+    assert torch.allclose(packed, expected, atol=1e-6)
