@@ -51,6 +51,7 @@ echo "Builder:        ${BUILDER_NAME}"
 echo "BUILD_JOBS:     ${BUILD_JOBS:-auto}"
 echo "NVCC_THREADS:   ${NVCC_THREADS:-32}"
 echo "USE_CCACHE:     ${USE_CCACHE:-1}"
+echo "USE_DOCKER_CACHE: ${USE_DOCKER_CACHE:-1}"
 echo "----------------------------------------"
 
 # Optional build-args (empty string disables)
@@ -65,7 +66,7 @@ BUILD_ARGS=()
 DEPS_TAG="sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"
 
 CACHE_ARGS=()
-if [ "${USE_CCACHE:-1}" != "0" ]; then
+if [ "${USE_DOCKER_CACHE:-1}" != "0" ]; then
   CACHE_ARGS+=(--cache-from "type=local,src=${BUILDX_CACHE_DIR}")
   CACHE_ARGS+=(--cache-to "type=local,dest=${BUILDX_CACHE_DIR},mode=max")
 fi
