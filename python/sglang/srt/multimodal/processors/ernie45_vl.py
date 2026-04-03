@@ -11,6 +11,7 @@ from transformers import BaseImageProcessorFast
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -357,6 +358,24 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
 
         return result
 
+    def compute_mrope_positions(self, input_ids, mm_items):
+        image_grid_thw = None
+        video_grid_thw = None
+        for item in mm_items:
+            if "image_grid_thw" in item.model_specific_data:
+                image_grid_thw = item.model_specific_data["image_grid_thw"]
+            if "video_grid_thw" in item.model_specific_data:
+                video_grid_thw = item.model_specific_data["video_grid_thw"]
+
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_ernie45(
+            input_ids=input_ids_tensor,
+            hf_config=self.hf_config,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+        )
+        return mrope_positions.squeeze(1), mrope_position_delta
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -405,15 +424,13 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             input_ids.shape[0] == mrope_positions.shape[-1]
         ), "input_ids and mrope_positions should have the same length"
 
-        mm_inputs = {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_start_id": self.image_start_token_id,
-            "im_end_id": self.image_end_token_id,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.video_token_id,
-            "mrope_positions": mrope_positions,
-            "mrope_position_delta": mrope_position_delta,
-        }
-
-        return mm_inputs
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_start_id=self.image_start_token_id,
+            im_end_id=self.image_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )

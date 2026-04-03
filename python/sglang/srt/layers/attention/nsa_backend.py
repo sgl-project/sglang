@@ -260,6 +260,11 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 row_starts=ks,
             )
         elif self.topk_transform_method == TopkTransformMethod.RAGGED:
+            if cu_topk_indices_offset is None:
+                raise RuntimeError(
+                    "RAGGED topk_transform requires topk_indices_offset; "
+                    "expected extend-without-speculative metadata."
+                )
             return fast_topk_transform_ragged_fused(
                 score=logits,
                 lengths=seq_lens_topk,
@@ -402,7 +407,9 @@ class NativeSparseAttnBackend(
 
         # Centralized dispatch: decide all strategies for this batch
         self.set_nsa_prefill_impl(forward_batch)
-        topk_transform_method = self.get_topk_transform_method()
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
         # Batch indices selected when cp enabled: After splitting multiple sequences,
         # a certain cp rank may not have some of these sequences.
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
@@ -1290,6 +1297,7 @@ class NativeSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                is_prefill=True,
             )
 
         if k is not None:
@@ -1343,7 +1351,9 @@ class NativeSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         # NOTE(dark): here, we use page size = 1
-        topk_transform_method = self.get_topk_transform_method()
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
@@ -1758,30 +1768,49 @@ class NativeSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
+        # TODO: Revert FA4 back to trtllm once FlashInfer fixes TRTLLM attention on SM103 (#21904)
+        # (G)B300 (SM103) hangs with TRTLLM attention at high concurrency.
         if self.device_sm_major >= 10:
-            import flashinfer
+            if self.device_capability == (10, 3):
+                from sglang.jit_kernel.flash_attention_v4 import (
+                    flash_attn_varlen_func as flash_attn_varlen_func_v4,
+                )
 
-            seq_lens = metadata.cache_seqlens_int32
-            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
-                query=q,
-                key=k,
-                value=v,
-                workspace_buffer=self.workspace_buffer,
-                seq_lens=seq_lens,
-                max_q_len=metadata.max_seq_len_q,
-                max_kv_len=max_seqlen_k,
-                bmm1_scale=layer.scaling,
-                bmm2_scale=1.0,
-                o_sf_scale=1.0,
-                batch_size=forward_batch.batch_size,
-                window_left=-1,
-                cum_seq_lens_q=cu_seqlens_q,
-                cum_seq_lens_kv=cu_seqlens_k,
-                enable_pdl=False,
-                is_causal=causal,
-                return_lse=False,
-            )
+                return flash_attn_varlen_func_v4(
+                    q=q,
+                    k=k,
+                    v=v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=metadata.max_seq_len_q,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                )
+            else:
+                import flashinfer
+
+                seq_lens = metadata.cache_seqlens_int32
+                return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                    query=q,
+                    key=k,
+                    value=v,
+                    workspace_buffer=self.workspace_buffer,
+                    seq_lens=seq_lens,
+                    max_q_len=metadata.max_seq_len_q,
+                    max_kv_len=max_seqlen_k,
+                    bmm1_scale=layer.scaling,
+                    bmm2_scale=1.0,
+                    o_sf_scale=1.0,
+                    batch_size=forward_batch.batch_size,
+                    window_left=-1,
+                    cum_seq_lens_q=cu_seqlens_q,
+                    cum_seq_lens_kv=cu_seqlens_k,
+                    enable_pdl=False,
+                    is_causal=causal,
+                    return_lse=False,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                )
 
         # Use FA3 for SM90 (Hopper/H200)
         return flash_attn_varlen_func(
@@ -1919,6 +1948,7 @@ class NativeSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
@@ -1980,6 +2010,13 @@ class NativeSparseAttnBackend(
 
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
+        elif is_prefill:
+            page_table_1 = transform_index_page_table_prefill(
+                page_table=metadata.page_table_1,
+                topk_indices=topk_indices,
+                extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
+                page_size=1,
+            )
         else:
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
@@ -2016,6 +2053,7 @@ class NativeSparseAttnBackend(
             sparse_mla_top_k=self.nsa_index_topk,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
         )
         # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
         return out.squeeze(1)
@@ -2095,7 +2133,9 @@ class NativeSparseAttnBackend(
                 # bf16 kv cache
                 self.nsa_prefill_impl = "flashmla_sparse"
 
-    def get_topk_transform_method(self) -> TopkTransformMethod:
+    def get_topk_transform_method(
+        self, forward_mode: Optional[ForwardMode] = None
+    ) -> TopkTransformMethod:
         """
         SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
@@ -2106,6 +2146,9 @@ class NativeSparseAttnBackend(
             and self.nsa_prefill_impl == "flashmla_sparse"
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
+
+            if forward_mode is not None and (forward_mode.is_decode_or_idle()):
+                topk_transform_method = TopkTransformMethod.PAGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
@@ -2119,7 +2162,9 @@ class NativeSparseAttnBackend(
         )
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
-            topk_transform_method=self.get_topk_transform_method(),
+            topk_transform_method=self.get_topk_transform_method(
+                forward_batch.forward_mode
+            ),
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             force_unfused_topk=force_unfused,
         )
