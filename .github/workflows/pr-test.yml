@@ -890,6 +890,9 @@ jobs:
       (
         inputs.target_stage == 'multimodal-gen-test-1-gpu' ||
         inputs.target_stage == 'multimodal-gen-test-2-gpu' ||
+        inputs.target_stage == 'multimodal-gen-component-accuracy-1-gpu' ||
+        inputs.target_stage == 'multimodal-gen-component-accuracy-2-gpu' ||
+        inputs.target_stage == 'multimodal-gen-test-1-b200' ||
         inputs.target_stage == 'multimodal-gen-unit-test' ||
         (
           !inputs.target_stage &&
@@ -901,6 +904,7 @@ jobs:
     with:
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
