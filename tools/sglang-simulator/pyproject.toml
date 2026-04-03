@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang_simulator"
+dynamic = ["version"]
+description = "A simulation benchmark tool for sglang"
+dependencies = [
+    "numpy",
+    "scikit-learn",
+    "xgboost",
+    "aiconfigurator @ git+https://github.com/ai-dynamo/aiconfigurator.git"
+]
