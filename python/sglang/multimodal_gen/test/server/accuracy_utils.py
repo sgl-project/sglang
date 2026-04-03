@@ -693,8 +693,11 @@ def _run_staged_native_component_accuracy_case(
             component,
             library,
             num_gpus,
+            materialize_sgl_on_device=(component != ComponentType.TRANSFORMER),
             materialize_ref_on_device=False,
         )
+        if component == ComponentType.TRANSFORMER:
+            sgl = sgl.to(device=device, dtype=torch.bfloat16).eval()
         profile = resolve_component_native_profile(component)
         inputs = profile.build_inputs(case, sgl, device, ref)
 

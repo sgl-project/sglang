@@ -476,6 +476,8 @@ class AccuracyEngine:
             num_gpus,
             component_selection.component_paths,
         )
+        if component == ComponentType.TRANSFORMER and not materialize_sgl_on_device:
+            sgl_args.dit_cpu_offload = True
         initialize_parallel_runtime(sgl_args)
         set_global_server_args(sgl_args)
 
