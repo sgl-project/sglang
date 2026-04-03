@@ -1207,7 +1207,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.0",
+                "0.4.1",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
