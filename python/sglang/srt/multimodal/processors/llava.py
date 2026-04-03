@@ -3,6 +3,10 @@ import os
 from typing import Dict, List, Optional, Union
 
 import numpy as np
+from transformers.models.auto.processing_auto import (
+    PROCESSOR_MAPPING_NAMES as HF_MAPPING_NAMES,
+)
+
 import sglang.srt.managers.multimodal_processor as sgl_mm_processor_utils
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -25,9 +29,6 @@ from sglang.srt.multimodal.mm_utils import (
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import ImageData, load_image, logger
 from sglang.utils import get_exception_traceback
-from transformers.models.auto.processing_auto import (
-    PROCESSOR_MAPPING_NAMES as HF_MAPPING_NAMES,
-)
 
 
 class LlavaImageProcessor(BaseMultimodalProcessor):
@@ -168,7 +169,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         grid_pinpoints = (
             self.hf_config.image_grid_pinpoints
             if hasattr(self.hf_config, "image_grid_pinpoints")
-               and "anyres" in aspect_ratio
+            and "anyres" in aspect_ratio
             else None
         )
 
