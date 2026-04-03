@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.memory_pool_int8kv import INT8MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -73,6 +74,7 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
+        use_int8_kv_cache = getattr(self.server_args, "int8_kv_cache", False)
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
@@ -107,7 +109,16 @@ class ModelRunnerKVCacheMixin:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
-            if self.model_config.is_hybrid_swa:
+            if use_int8_kv_cache:
+                cell_size = INT8MHATokenToKVPool.get_bytes_per_token(
+                    self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                    self.model_config.head_dim,
+                    num_layers,
+                    v_head_dim=getattr(
+                        self.model_config, "v_head_dim", self.model_config.head_dim
+                    ),
+                )
+            elif self.model_config.is_hybrid_swa:
                 full_layers_num = len(self.model_config.full_attention_layer_ids)
                 swa_layers_num = len(self.model_config.swa_attention_layer_ids)
 
@@ -130,7 +141,7 @@ class ModelRunnerKVCacheMixin:
                     * kv_size
                 )
 
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            if (not use_int8_kv_cache) and is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
 
@@ -400,9 +411,29 @@ class ModelRunnerKVCacheMixin:
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
+    def _validate_int8_kv_cache_config(self: ModelRunner):
+        if not getattr(self.server_args, "int8_kv_cache", False):
+            return
+
+        if self.use_mla_backend:
+            raise ValueError("INT8 KV cache currently supports MHA only.")
+        if self.server_args.enable_double_sparsity:
+            raise ValueError(
+                "INT8 KV cache is incompatible with --enable-double-sparsity."
+            )
+        if self.mambaish_config is not None:
+            raise ValueError(
+                "INT8 KV cache phase-1 is not implemented for hybrid linear/GDN models."
+            )
+        if self.is_hybrid_swa:
+            raise ValueError(
+                "INT8 KV cache phase-1 does not support hybrid SWA memory pools."
+            )
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+        use_int8_kv_cache = getattr(self.server_args, "int8_kv_cache", False)
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -694,7 +725,29 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                if use_int8_kv_cache:
+                    self.token_to_kv_pool = INT8MHATokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        v_head_dim=getattr(
+                            self.model_config, "v_head_dim", self.model_config.head_dim
+                        ),
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
+                elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -732,6 +785,32 @@ class ModelRunnerKVCacheMixin:
                             self.server_args.speculative_algorithm is not None
                         ),
                     )
+
+        if use_int8_kv_cache:
+            base_cell = INT8MHATokenToKVPool.get_baseline_bytes_per_token(
+                self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                self.model_config.head_dim,
+                self.num_effective_layers,
+                self.kv_cache_dtype,
+                v_head_dim=getattr(
+                    self.model_config, "v_head_dim", self.model_config.head_dim
+                ),
+            )
+            int8_cell = INT8MHATokenToKVPool.get_bytes_per_token(
+                self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                self.model_config.head_dim,
+                self.num_effective_layers,
+                v_head_dim=getattr(
+                    self.model_config, "v_head_dim", self.model_config.head_dim
+                ),
+            )
+            logger.info(
+                "[INT8 KV] cell_size: baseline=%d B, int8=%d B, compression=%.2fx, max_total_tokens=%d",
+                base_cell,
+                int8_cell,
+                base_cell / int8_cell,
+                self.max_total_num_tokens,
+            )
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
@@ -888,6 +967,7 @@ class ModelRunnerKVCacheMixin:
         self: ModelRunner, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
+        self._validate_int8_kv_cache_config()
         profiled_tokens = self.profile_max_num_token(pre_model_load_memory)
         token_capacity = self._resolve_token_capacity(profiled_tokens)
 

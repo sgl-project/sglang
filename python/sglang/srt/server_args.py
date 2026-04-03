@@ -333,6 +333,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    int8_kv_cache: bool = False
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -3613,6 +3614,56 @@ class ServerArgs:
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
+        self._handle_int8_kv_cache_compatibility()
+
+    def _handle_int8_kv_cache_compatibility(self):
+        if not self.int8_kv_cache:
+            return
+
+        if self.kv_cache_dtype != "auto":
+            raise ValueError(
+                "INT8 KV cache requires --kv-cache-dtype auto. "
+                "INT8 quantization is handled by the KV pool itself."
+            )
+        if self.page_size != 1:
+            raise ValueError("INT8 KV cache phase-1 only supports --page-size 1.")
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "INT8 KV cache phase-1 does not support PD disaggregation."
+            )
+        if self.enable_hierarchical_cache:
+            raise ValueError(
+                "INT8 KV cache phase-1 does not support hierarchical cache."
+            )
+        if self.enable_deterministic_inference:
+            raise ValueError(
+                "INT8 KV cache phase-1 does not support deterministic inference."
+            )
+        if not self.disable_radix_cache:
+            logger.warning("INT8 KV cache phase-1 forces --disable-radix-cache.")
+            self.disable_radix_cache = True
+
+        if self.attention_backend == "ascend":
+            raise ValueError(
+                "INT8 KV cache phase-1 does not support ascend attention backend."
+            )
+
+        if self.attention_backend != "triton":
+            logger.warning(
+                "INT8 KV cache requires triton attention backend. "
+                f"Overriding attention backend from {self.attention_backend} to triton."
+            )
+            self.attention_backend = "triton"
+
+        for backend_name in ("decode_attention_backend", "prefill_attention_backend"):
+            backend_value = getattr(self, backend_name)
+            if backend_value is not None and backend_value != "triton":
+                logger.warning(
+                    "INT8 KV cache requires triton attention backend. "
+                    f"Overriding {backend_name} from {backend_value} to triton."
+                )
+                setattr(self, backend_name, "triton")
+
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
             logger.warning(
@@ -4062,6 +4113,14 @@ class ServerArgs:
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
             help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+        )
+        parser.add_argument(
+            "--int8-kv-cache",
+            action="store_true",
+            default=ServerArgs.int8_kv_cache,
+            help="Enable per-token per-head asymmetric INT8 KV cache. "
+            "Phase-1 constraints: MHA only, triton backend, --kv-cache-dtype auto, "
+            "--page-size 1, non-disaggregation, and radix cache disabled.",
         )
         parser.add_argument(
             "--enable-fp32-lm-head",

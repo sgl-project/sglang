@@ -14,6 +14,26 @@ Quantized KV cache is a memory optimization technique that primarily benefits th
 
 SGLang supports the following quantized KV cache formats:
 
+### INT8 Format
+
+INT8 KV cache uses per-token per-head asymmetric quantization:
+
+- `zp = (min + max) / 2`
+- `scale = (max - min) / 255`
+- `q = round((x - zp) / scale)`
+- `x_hat = q * scale + zp`
+
+```{note}
+INT8 KV cache is currently a phase-1 feature with the following constraints:
+
+- MHA models only
+- Triton attention backend only
+- `--kv-cache-dtype auto`
+- `--page-size 1`
+- no PD disaggregation
+- no hierarchical cache
+```
+
 ### FP8 Format
 
 [OCP (Open Compute Project)](https://www.opencompute.org) specifies two common 8-bit floating point formats:
@@ -38,6 +58,13 @@ FP4 quantization is currently experimental.
 To enable quantized KV cache, use the `--kv-cache-dtype` argument when launching the server:
 
 ```bash
+# Enable INT8 KV cache
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-32B \
+    --attention-backend triton \
+    --page-size 1 \
+    --int8-kv-cache \
+
 # Enable FP8 E5M2 KV cache
 python3 -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-R1-0528 \
@@ -98,6 +125,7 @@ If scaling factors are not provided and not found in the checkpoint, it will def
 ### Memory Savings
 
 Quantized KV cache provides significant memory savings:
+- **BF16/FP16/FP32 → INT8**: Supports more tokens by storing K/V values in INT8 plus FP16 scale/zp metadata
 - **BF16 → FP4**: Supports approximately 3.56× more tokens than BF16 (accounting for scaling factor overhead)
 
 ```{note}
@@ -152,6 +180,7 @@ Evaluate FP4 accuracy on your specific model and workload. Large models on simpl
 ## Best Practices
 
 - **Use pre-quantized models**: Prefer models quantized offline with scaling factors included in the checkpoint.
+- **Use INT8 for capacity-oriented optimization**: INT8 KV cache is useful when you want more KV capacity with a fused Triton decode path.
 - **Choose the right format**: Use `fp8_e4m3` for better accuracy (recommended), `fp8_e5m2` for larger dynamic range, or `fp4_e2m1` for maximum memory savings (experimental)
 - **Check backend compatibility**: Verify that your chosen attention backend supports quantized KV cache
 

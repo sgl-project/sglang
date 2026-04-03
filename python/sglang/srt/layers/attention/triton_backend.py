@@ -66,6 +66,7 @@ class TritonAttnBackend(AttentionBackend):
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.decode_attention import (
             decode_attention_fwd,
+            decode_attention_int8_fwd,
         )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             build_unified_kv_indices,
@@ -76,6 +77,9 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        self.decode_attention_int8_fwd = torch.compiler.disable(
+            decode_attention_int8_fwd
+        )
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -128,6 +132,12 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self.int8_kv_pool = None
+        if getattr(model_runner.token_to_kv_pool, "int8_kv_cache_enabled", False):
+            self.int8_kv_pool = model_runner.token_to_kv_pool
+        self._int8_local_indices: Optional[torch.Tensor] = None
+        self._int8_gather_k_buf: Optional[torch.Tensor] = None
+        self._int8_gather_v_buf: Optional[torch.Tensor] = None
 
         self.allow_bidirectional_attention_in_extend = (
             model_runner.server_args.disable_cuda_graph
@@ -833,6 +843,79 @@ class TritonAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _get_int8_local_indices(self, size: int, dtype: torch.dtype) -> torch.Tensor:
+        if (
+            self._int8_local_indices is None
+            or self._int8_local_indices.dtype != dtype
+            or str(self._int8_local_indices.device) != str(self.device)
+            or self._int8_local_indices.numel() < size
+        ):
+            self._int8_local_indices = torch.arange(
+                size, dtype=dtype, device=self.device
+            )
+        return self._int8_local_indices[:size]
+
+    def _get_int8_gather_out_buffers(
+        self,
+        size: int,
+        head_num: int,
+        k_head_dim: int,
+        v_head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        needs_new = (
+            self._int8_gather_k_buf is None
+            or self._int8_gather_v_buf is None
+            or self._int8_gather_k_buf.shape[0] < size
+            or self._int8_gather_k_buf.shape[1] != head_num
+            or self._int8_gather_k_buf.shape[2] != k_head_dim
+            or self._int8_gather_v_buf.shape[0] < size
+            or self._int8_gather_v_buf.shape[1] != head_num
+            or self._int8_gather_v_buf.shape[2] != v_head_dim
+            or self._int8_gather_k_buf.dtype != self.int8_kv_pool.dtype
+            or str(self._int8_gather_k_buf.device) != str(self.device)
+        )
+        if needs_new:
+            self._int8_gather_k_buf = torch.empty(
+                (size, head_num, k_head_dim),
+                dtype=self.int8_kv_pool.dtype,
+                device=self.device,
+            )
+            self._int8_gather_v_buf = torch.empty(
+                (size, head_num, v_head_dim),
+                dtype=self.int8_kv_pool.dtype,
+                device=self.device,
+            )
+
+        return self._int8_gather_k_buf[:size], self._int8_gather_v_buf[:size]
+
+    def _materialize_kv_for_attention(
+        self, layer_id: int, kv_indices: torch.Tensor, token_to_kv_pool
+    ):
+        if self.int8_kv_pool is None or token_to_kv_pool is not self.int8_kv_pool:
+            return (
+                token_to_kv_pool.get_key_buffer(layer_id),
+                token_to_kv_pool.get_value_buffer(layer_id),
+                kv_indices,
+            )
+
+        num_tokens = kv_indices.numel()
+        if kv_indices.dtype != torch.int32:
+            kv_indices_i32 = kv_indices.to(torch.int32)
+        else:
+            kv_indices_i32 = kv_indices
+
+        out_k, out_v = self._get_int8_gather_out_buffers(
+            num_tokens,
+            self.int8_kv_pool.head_num,
+            self.int8_kv_pool.head_dim,
+            self.int8_kv_pool.v_head_dim,
+        )
+        k_cache, v_cache = self.int8_kv_pool.gather_kv_buffer(
+            layer_id, kv_indices_i32, out_k=out_k, out_v=out_v
+        )
+        local_kv_indices = self._get_int8_local_indices(num_tokens, torch.int32)
+        return k_cache, v_cache, local_kv_indices
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -908,7 +991,7 @@ class TritonAttnBackend(AttentionBackend):
             causal = False
 
         # Deterministic mode: use unified 1-stage kernel
-        if self.enable_deterministic:
+        if self.enable_deterministic and self.int8_kv_pool is None:
             return self._forward_extend_unified(
                 q, o, layer, forward_batch, causal, logits_soft_cap, sinks
             )
@@ -927,6 +1010,9 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
 
+        key_cache, value_cache, kv_indices = self._materialize_kv_for_attention(
+            layer.layer_id, kv_indices, forward_batch.token_to_kv_pool
+        )
         if layer.k_scale is not None and layer.v_scale is not None:
             k_descale = layer.k_scale_float
             v_descale = layer.v_scale_float
@@ -939,8 +1025,8 @@ class TritonAttnBackend(AttentionBackend):
             k.contiguous(),
             v.contiguous(),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            key_cache,
+            value_cache,
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
@@ -1143,9 +1229,9 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # Select the correctly-sized attn_logits buffer for this layer.
-        # The triton kernel's // Lv stride trick requires attn_logits.shape[-1]
-        # to exactly match the layer's v_head_dim.
+        # The Triton decode kernel derives attn_lse offsets from attn_logits
+        # using the current layer's v_head_dim, so select the matching buffer
+        # for hybrid SWA models when needed.
         attn_logits = self.forward_metadata.attn_logits
         if (
             self.forward_metadata.swa_attn_logits is not None
@@ -1153,24 +1239,53 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
-            attn_logits,
-            self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
-            layer.scaling,
-            k_descale,
-            v_descale,
-            logit_cap=logits_soft_cap,
-            sinks=sinks,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        if (
+            self.int8_kv_pool is not None
+            and forward_batch.token_to_kv_pool is self.int8_kv_pool
+        ):
+            layer_idx = layer.layer_id - self.int8_kv_pool.start_layer
+            self.decode_attention_int8_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                self.int8_kv_pool.k_buffer[layer_idx],
+                self.int8_kv_pool.v_buffer[layer_idx],
+                self.int8_kv_pool.k_scale_buffer[layer_idx],
+                self.int8_kv_pool.k_zp_buffer[layer_idx],
+                self.int8_kv_pool.v_scale_buffer[layer_idx],
+                self.int8_kv_pool.v_zp_buffer[layer_idx],
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+        else:
+            key_cache, value_cache, kv_indices = self._materialize_kv_for_attention(
+                layer.layer_id, kv_indices, forward_batch.token_to_kv_pool
+            )
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                key_cache,
+                value_cache,
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                k_descale,
+                v_descale,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
         return o
 
 

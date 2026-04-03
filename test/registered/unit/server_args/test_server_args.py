@@ -48,6 +48,40 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestInt8KVCacheServerArgs(unittest.TestCase):
+    def test_int8_kv_cache_forces_triton_and_disables_radix(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            int8_kv_cache=True,
+            page_size=1,
+            attention_backend="fa3",
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="flashinfer",
+        )
+
+        server_args._handle_int8_kv_cache_compatibility()
+
+        self.assertEqual(server_args.attention_backend, "triton")
+        self.assertEqual(server_args.prefill_attention_backend, "triton")
+        self.assertEqual(server_args.decode_attention_backend, "triton")
+        self.assertTrue(server_args.disable_radix_cache)
+
+    def test_int8_kv_cache_requires_page_size_one(self):
+        with self.assertRaisesRegex(ValueError, "page-size 1"):
+            server_args = ServerArgs(model_path="dummy", int8_kv_cache=True, page_size=16)
+            server_args._handle_int8_kv_cache_compatibility()
+
+    def test_int8_kv_cache_rejects_disaggregation(self):
+        with self.assertRaisesRegex(ValueError, "does not support PD disaggregation"):
+            server_args = ServerArgs(
+                model_path="dummy",
+                int8_kv_cache=True,
+                page_size=1,
+                disaggregation_mode="decode",
+            )
+            server_args._handle_int8_kv_cache_compatibility()
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

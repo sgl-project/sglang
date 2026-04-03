@@ -1974,6 +1974,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return result[1] if result else None
 
     def configure_kv_cache_dtype(self):
+        if getattr(self.server_args, "int8_kv_cache", False):
+            self.kv_cache_dtype = self.dtype
+            log_info_on_rank0(
+                logger,
+                f"Using KV cache compute dtype for INT8 KV cache: {self.kv_cache_dtype}",
+            )
+            return
+
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
