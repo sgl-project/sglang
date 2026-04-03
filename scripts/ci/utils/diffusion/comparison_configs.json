@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-model comparison config. Only frameworks listed under each case are tested. vLLM-Omni disabled until dep install issues resolved.",
+  "_comment": "Per-model comparison config. Only frameworks listed under each case are tested.",
   "test_image_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png",
   "cases": [
     {
@@ -16,6 +16,10 @@
       "frameworks": {
         "sglang": {
           "serve_args": "--enable-torch-compile --warmup --dit-layerwise-offload false",
+          "extra_env": {}
+        },
+        "vllm-omni": {
+          "serve_args": "",
           "extra_env": {}
         }
       }
