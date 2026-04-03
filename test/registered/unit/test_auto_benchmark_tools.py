@@ -231,6 +231,55 @@ class TestAutoBenchmarkTools(CustomTestCase):
         self.assertIn((4, 2), tp_dp_pairs)
         self.assertIn((2, 4), tp_dp_pairs)
 
+    def test_build_server_candidates_filters_unsupported_fa3_on_sm100(self):
+        server_cfg = {
+            "base_flags": {"model_path": "/model", "tp_size": 1},
+            "search_space": {
+                "prefill_attention_backend": ["fa3", "flashinfer"],
+                "decode_attention_backend": ["fa3", "flashinfer"],
+                "chunked_prefill_size": [4096, 8192],
+            },
+        }
+
+        with mock.patch(
+            "sglang.auto_benchmark_lib.detect_current_cuda_capability",
+            return_value=(10, 0),
+        ):
+            candidates = build_server_candidates(
+                server_cfg, tier=2, max_candidates=None
+            )
+
+        self.assertGreater(len(candidates), 0)
+        for candidate in candidates:
+            self.assertNotEqual(candidate.get("attention_backend"), "fa3")
+            self.assertNotEqual(candidate.get("prefill_attention_backend"), "fa3")
+            self.assertNotEqual(candidate.get("decode_attention_backend"), "fa3")
+
+    def test_build_server_candidates_keeps_fa3_on_sm90(self):
+        server_cfg = {
+            "base_flags": {"model_path": "/model", "tp_size": 1},
+            "search_space": {
+                "prefill_attention_backend": ["fa3", "flashinfer"],
+                "decode_attention_backend": ["fa3", "flashinfer"],
+            },
+        }
+
+        with mock.patch(
+            "sglang.auto_benchmark_lib.detect_current_cuda_capability",
+            return_value=(9, 0),
+        ):
+            candidates = build_server_candidates(
+                server_cfg, tier=2, max_candidates=None
+            )
+
+        self.assertTrue(
+            any(
+                candidate.get("prefill_attention_backend") == "fa3"
+                or candidate.get("decode_attention_backend") == "fa3"
+                for candidate in candidates
+            )
+        )
+
     def test_ep_alias_and_oom_classification(self):
         server_cfg = {
             "base_flags": {"model_path": "/model", "tp_size": 8},

@@ -137,6 +137,44 @@ def log_line(message: str) -> None:
     tqdm.write(message)
 
 
+def detect_current_cuda_capability() -> Optional[Tuple[int, int]]:
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return None
+
+    if not torch.cuda.is_available():
+        return None
+    major, minor = torch.cuda.get_device_capability()
+    return int(major), int(minor)
+
+
+def is_attention_backend_supported(
+    backend: Any, capability: Optional[Tuple[int, int]]
+) -> bool:
+    if capability is None or backend in (None, ""):
+        return True
+
+    major, _minor = capability
+    if backend == "fa3":
+        return major in (8, 9)
+    return True
+
+
+def is_candidate_supported_on_current_device(
+    candidate: Dict[str, Any], capability: Optional[Tuple[int, int]]
+) -> bool:
+    backend_keys = (
+        "attention_backend",
+        "prefill_attention_backend",
+        "decode_attention_backend",
+    )
+    return all(
+        is_attention_backend_supported(candidate.get(key), capability)
+        for key in backend_keys
+    )
+
+
 def append_jsonl(path: str, records: Iterable[Dict[str, Any]]) -> None:
     with open(path, "a", encoding="utf-8") as f:
         for record in records:
@@ -873,6 +911,7 @@ def build_candidates(
 ) -> List[Dict[str, Any]]:
     base_flags = canonicalize_flags(base_flags)
     search_space = canonicalize_flags(search_space)
+    capability = detect_current_cuda_capability()
     items = [(key, as_list(values)) for key, values in search_space.items()]
     if tier == 1:
         items = [(k, v[:2]) for k, v in items[:6]]
@@ -904,6 +943,8 @@ def build_candidates(
     deduped: List[Dict[str, Any]] = []
     seen = set()
     for candidate in candidates:
+        if not is_candidate_supported_on_current_device(candidate, capability):
+            continue
         key = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
         if key in seen:
             continue
