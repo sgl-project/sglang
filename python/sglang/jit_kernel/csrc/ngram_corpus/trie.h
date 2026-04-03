@@ -1,5 +1,7 @@
 #pragma once
 
+#include "param.h"
+#include "result.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -9,9 +11,6 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
-
-#include "param.h"
-#include "result.h"
 
 namespace ngram {
 
@@ -49,8 +48,7 @@ class Trie {
   void reset();
 
  private:
-  std::vector<std::pair<TrieNode*, int32_t>>
-  match(const int32_t* context, size_t len, size_t min_window, size_t max_window) const;
+  std::vector<std::pair<TrieNode*, int32_t>> match(const int32_t* context, size_t len) const;
 
   TrieNode* getNode() {
     auto node = node_pool_[--free_node_count_];

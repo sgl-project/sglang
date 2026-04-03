@@ -127,7 +127,7 @@ BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elaps
 
 @lru_cache(maxsize=1)
 def is_cuda():
-    return torch.cuda.is_available() and torch.version.cuda
+    return torch.cuda.is_available() and torch.version.cuda is not None
 
 
 @lru_cache(maxsize=1)

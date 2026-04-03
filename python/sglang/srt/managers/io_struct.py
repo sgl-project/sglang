@@ -674,7 +674,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # The input token ids
     input_ids: List[int]
     # The multimodal inputs
-    mm_inputs: dict
+    mm_inputs: object
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs
@@ -742,6 +742,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    token_type_ids: Optional[List[int]] = None
 
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
