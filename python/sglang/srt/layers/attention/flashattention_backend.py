@@ -32,14 +32,6 @@ from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvc
 flash_attn_varlen_func = flash_attn_varlen_func_fa3
 flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
 
-from sglang.jit_kernel.flash_attention_v4 import (
-    flash_attn_varlen_func as flash_attn_varlen_func_fa4,
-)
-from sglang.jit_kernel.flash_attention_v4 import (
-    flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
-)
-
-
 @dataclass
 class FlashAttentionMetadata:
     """Metadata to be init once in the model forward pass,
@@ -833,16 +825,18 @@ class FlashAttentionBackend(AttentionBackend):
         flash_attn_varlen_func_base = flash_attn_varlen_func_fa3
         flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
 
-        flash_attn_varlen_func = (
-            flash_attn_varlen_func_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_varlen_func_base
-        )
-        flash_attn_with_kvcache = (
-            flash_attn_with_kvcache_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_with_kvcache_base
-        )
+        if self.fa_impl_ver == 4:
+            from sglang.jit_kernel.flash_attention_v4 import (
+                flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+            )
+            from sglang.jit_kernel.flash_attention_v4 import (
+                flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
+            )
+            flash_attn_varlen_func = flash_attn_varlen_func_fa4
+            flash_attn_with_kvcache = flash_attn_with_kvcache_fa4
+        else:
+            flash_attn_varlen_func = flash_attn_varlen_func_base
+            flash_attn_with_kvcache = flash_attn_with_kvcache_base
 
         kwargs = {}
         if sinks is not None:
@@ -1191,11 +1185,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
 
-        flash_attn_with_kvcache = (
-            flash_attn_with_kvcache_fa4
-            if self.fa_impl_ver == 4
-            else flash_attn_with_kvcache_base
-        )
+        if self.fa_impl_ver == 4:
+            from sglang.jit_kernel.flash_attention_v4 import (
+                flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
+            )
+            flash_attn_with_kvcache = flash_attn_with_kvcache_fa4
+        else:
+            flash_attn_with_kvcache = flash_attn_with_kvcache_base
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
