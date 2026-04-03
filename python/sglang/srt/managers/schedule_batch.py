@@ -390,6 +390,9 @@ class MultimodalProcessorOutput:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
+    # for transformers-compatibility
+    token_type_ids: Optional[torch.Tensor] = None
+
     @staticmethod
     def from_dict(d: dict) -> "MultimodalProcessorOutput":
         return MultimodalProcessorOutput(
