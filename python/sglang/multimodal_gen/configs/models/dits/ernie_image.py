@@ -41,10 +41,12 @@ class ErnieImageArchConfig(DiTArchConfig):
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 
     # Merge gate_proj and up_proj checkpoint weights into gate_up_proj
-    # for MergedColumnParallelLinear. Q/K/V stay separate (ColumnParallel each).
+    # for MergedColumnParallelLinear.
+    # Attention weights (to_q/to_k/to_v/to_out.0/norm_q/norm_k) match the model
+    # module names directly — no remapping needed.
     param_names_mapping: dict = field(default_factory=lambda: {
         r"(.*)\.mlp\.gate_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 0, 2),
-        r"(.*)\.mlp\.up_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 1, 2),
+        r"(.*)\.mlp\.up_proj\.(.*)":   (r"\1.mlp.gate_up_proj.\2", 1, 2),
     })
 
     _fsdp_shard_conditions: list = field(

@@ -79,8 +79,9 @@ class EmbedND3(nn.Module):
 class ErnieImageSelfAttention(nn.Module):
     """Self-attention with separate Q/K/V projections and QK LayerNorm.
 
-    Module name hierarchy matches safetensors:
-      self_attention.q_proj, self_attention.k_proj, etc.
+    Module name hierarchy matches diffusers Attention naming convention:
+      self_attention.to_q, self_attention.to_k, self_attention.to_v,
+      self_attention.to_out.0, self_attention.norm_q, self_attention.norm_k.
 
     Supports tensor parallelism: Q/K/V projections use ColumnParallelLinear
     (output dim sharded by heads), output projection uses RowParallelLinear
@@ -106,31 +107,35 @@ class ErnieImageSelfAttention(nn.Module):
             f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
         )
 
-        self.q_proj = ColumnParallelLinear(
+        self.to_q = ColumnParallelLinear(
             hidden_size, hidden_size, bias=False,
             gather_output=False,
-            prefix=f"{prefix}.q_proj",
+            prefix=f"{prefix}.to_q",
         )
-        self.k_proj = ColumnParallelLinear(
+        self.to_k = ColumnParallelLinear(
             hidden_size, hidden_size, bias=False,
             gather_output=False,
-            prefix=f"{prefix}.k_proj",
+            prefix=f"{prefix}.to_k",
         )
-        self.v_proj = ColumnParallelLinear(
+        self.to_v = ColumnParallelLinear(
             hidden_size, hidden_size, bias=False,
             gather_output=False,
-            prefix=f"{prefix}.v_proj",
+            prefix=f"{prefix}.to_v",
         )
-        self.linear_proj = RowParallelLinear(
-            hidden_size, hidden_size, bias=False,
-            input_is_parallel=True,
-            prefix=f"{prefix}.linear_proj",
-        )
+        # to_out is a ModuleList in diffusers (to_out[0] = Linear, to_out[1] = Dropout)
+        # We only need to_out[0] (the linear projection).
+        self.to_out = nn.ModuleList([
+            RowParallelLinear(
+                hidden_size, hidden_size, bias=False,
+                input_is_parallel=True,
+                prefix=f"{prefix}.to_out.0",
+            ),
+        ])
 
         self.qk_layernorm = qk_layernorm
         if qk_layernorm:
-            self.q_layernorm = RMSNorm(head_dim, eps=eps)
-            self.k_layernorm = RMSNorm(head_dim, eps=eps)
+            self.norm_q = RMSNorm(head_dim, eps=eps)
+            self.norm_k = RMSNorm(head_dim, eps=eps)
 
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
@@ -150,9 +155,9 @@ class ErnieImageSelfAttention(nn.Module):
         """
         B, S, H = x.shape
 
-        q, _ = self.q_proj(x)
-        k, _ = self.k_proj(x)
-        v, _ = self.v_proj(x)
+        q, _ = self.to_q(x)
+        k, _ = self.to_k(x)
+        v, _ = self.to_v(x)
 
         q = q.view(B, S, self.num_local_heads, self.head_dim)
         k = k.view(B, S, self.num_local_heads, self.head_dim)
@@ -160,7 +165,7 @@ class ErnieImageSelfAttention(nn.Module):
 
         if self.qk_layernorm:
             q, k = apply_qk_norm(
-                q, k, self.q_layernorm, self.k_layernorm, self.head_dim,
+                q, k, self.norm_q, self.norm_k, self.head_dim,
             )
 
         q = _apply_rotary_bshd(q, rotary_pos_emb)
@@ -168,7 +173,7 @@ class ErnieImageSelfAttention(nn.Module):
 
         attn_out = self.attn(q, k, v)
         attn_out = attn_out.reshape(B, S, self.num_local_heads * self.head_dim)
-        out, _ = self.linear_proj(attn_out)
+        out, _ = self.to_out[0](attn_out)
         return out
 
 
