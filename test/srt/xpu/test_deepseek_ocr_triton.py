@@ -35,8 +35,6 @@ class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
             "xpu",
             "--attention-backend",
             "intel_xpu",
-            "--mem-fraction-static",
-            "0.4",
         ]
         os.environ["SGLANG_USE_SGL_XPU"] = "0"
         cls.process = popen_launch_server(
