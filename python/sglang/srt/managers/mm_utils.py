@@ -1746,8 +1746,7 @@ def wrap_shm_features(obj):
         return obj
 
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
-        mm_items = obj.mm_inputs.get("mm_items", [])
-        for item in mm_items:
+        for item in obj.mm_inputs.mm_items:
             if (
                 hasattr(item, "feature")
                 and isinstance(item.feature, torch.Tensor)
@@ -1764,7 +1763,7 @@ def has_shm_features(recv_reqs):
             if has_shm_features(req.batch):
                 return True
         elif hasattr(req, "mm_inputs") and req.mm_inputs:
-            for item in req.mm_inputs.get("mm_items", []):
+            for item in req.mm_inputs.mm_items:
                 if isinstance(item.feature, ShmPointerMMData):
                     return True
     return False
@@ -1784,7 +1783,7 @@ def unwrap_shm_features(obj):
         return obj
     # Handle single requests
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
-        mm_items = obj.mm_inputs.get("mm_items", [])
+        mm_items = obj.mm_inputs.mm_items
         for item in mm_items:
             if isinstance(item.feature, ShmPointerMMData):
                 item.feature = item.feature.materialize()
