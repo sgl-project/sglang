@@ -27,6 +27,7 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
 
 def _is_registered_diffusion_model(model_path: str) -> bool:
     try:
+        # if diffusion dependencies are not installed
         from sglang.multimodal_gen.registry import get_model_info
     except ImportError:
         return False
