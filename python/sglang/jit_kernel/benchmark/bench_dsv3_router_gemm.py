@@ -27,8 +27,6 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda"
 HIDDEN_DIM = 7168
 
-# num_tokens: 1-16 (the kernel's sweet spot)
-# num_experts: 256 (DeepSeek-V3) or 384 (Kimi-K2)
 if IS_CI:
     NUM_TOKENS_LIST = [1, 8, 16]
     NUM_EXPERTS_LIST = [256]

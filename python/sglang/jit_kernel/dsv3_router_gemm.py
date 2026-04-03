@@ -7,7 +7,7 @@ Supports num_experts in {256, 384} and hidden_dim=7168, num_tokens 1-16.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -75,6 +75,7 @@ def dsv3_router_gemm(
     hidden_states: torch.Tensor,
     router_weights: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     DeepSeek V3 router GEMM kernel (JIT variant).
@@ -83,18 +84,20 @@ def dsv3_router_gemm(
         hidden_states: Input tensor of shape [num_tokens, hidden_dim], bfloat16.
         router_weights: Weight tensor of shape [num_experts, hidden_dim], bfloat16.
         out_dtype: Output dtype, either torch.bfloat16 or torch.float32.
+        output: Optional pre-allocated output tensor.
 
     Returns:
         Output tensor of shape [num_tokens, num_experts].
     """
     num_experts = router_weights.shape[0]
     out_float = out_dtype == torch.float32
-    output = torch.empty(
-        hidden_states.shape[0],
-        num_experts,
-        device=hidden_states.device,
-        dtype=out_dtype,
-    )
+    if output is None:
+        output = torch.empty(
+            hidden_states.shape[0],
+            num_experts,
+            device=hidden_states.device,
+            dtype=out_dtype,
+        )
     module = _jit_dsv3_router_gemm_module(num_experts, is_arch_support_pdl(), out_float)
     module.dsv3_router_gemm(hidden_states, router_weights, output)
     return output
