@@ -183,7 +183,7 @@ at::Tensor int8_scaled_mm_with_quant(
     at::ScalarType out_dtype,
     bool is_vnni);
 
-#if defined(SGLANG_CPU_X86_ONLY_OPS)
+#if !defined(SGLANG_CPU_ARM64_BOOTSTRAP_SKIP_X86_ONLY_OPS)
 // int4 gemm
 at::Tensor int4_scaled_mm_cpu(
     at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
@@ -211,7 +211,7 @@ at::Tensor fused_linear_sigmoid_mul(
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
-#if defined(SGLANG_CPU_X86_ONLY_OPS)
+#if !defined(SGLANG_CPU_ARM64_BOOTSTRAP_SKIP_X86_ONLY_OPS)
 // fused moe
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
@@ -521,7 +521,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "is_vnni) -> Tensor");
   m.impl("int8_scaled_mm_with_quant", torch::kCPU, &int8_scaled_mm_with_quant);
 
-#if defined(SGLANG_CPU_X86_ONLY_OPS)
+#if !defined(SGLANG_CPU_ARM64_BOOTSTRAP_SKIP_X86_ONLY_OPS)
   // int4 gemm
   m.def("int4_scaled_mm_cpu(Tensor x, Tensor w, Tensor w_zeros, Tensor w_scales, Tensor? bias) -> Tensor");
   m.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
@@ -546,7 +546,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
   m.impl("bmm_cpu", torch::kCPU, &bmm_cpu);
 
-#if defined(SGLANG_CPU_X86_ONLY_OPS)
+#if !defined(SGLANG_CPU_ARM64_BOOTSTRAP_SKIP_X86_ONLY_OPS)
   // moe
   m.def(
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "

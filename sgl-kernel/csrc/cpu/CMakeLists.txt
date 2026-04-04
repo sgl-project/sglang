@@ -76,7 +76,7 @@ endif()
 file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 # These kernels still rely on x86-specific AMX/AVX512 implementations.
-# Keep them out of non-x86 bootstrap builds until native Arm paths land.
+# Keep them out of Arm64 bootstrap builds until native Arm paths land.
 set(SGLANG_CPU_X86_ONLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe.cpp
@@ -87,9 +87,8 @@ set(SGLANG_CPU_X86_ONLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/mamba/conv.cpp
 )
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    add_compile_definitions(SGLANG_CPU_X86_ONLY_OPS)
-else()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    add_compile_definitions(SGLANG_CPU_ARM64_BOOTSTRAP_SKIP_X86_ONLY_OPS)
     list(REMOVE_ITEM SOURCES ${SGLANG_CPU_X86_ONLY_SOURCES})
 endif()
 
