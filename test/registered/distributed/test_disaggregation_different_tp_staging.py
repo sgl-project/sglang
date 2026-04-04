@@ -10,7 +10,6 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
     try_cached_model,
@@ -26,14 +25,14 @@ STAGING_ENV = {
 
 
 class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
-    """Prefill TP=4 -> Decode TP=2 with staging buffer enabled (MLA model)."""
+    """Prefill TP=4 -> Decode TP=2 with staging buffer enabled (MHA model)."""
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         cls.start_prefill()
         cls.start_decode()
@@ -103,14 +102,14 @@ class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
 
 
 class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
-    """Prefill TP=2 -> Decode TP=4 with staging buffer enabled (MLA model)."""
+    """Prefill TP=2 -> Decode TP=4 with staging buffer enabled (MHA model)."""
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
 
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
 
         cls.start_prefill()
         cls.start_decode()

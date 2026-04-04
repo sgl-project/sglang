@@ -143,7 +143,7 @@ SGLang supports various environment variables that can be used to configure its 
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
-| `SGLANG_DISAGG_STAGING_BUFFER` | Enable GPU staging buffer for heterogeneous TP KV transfer. Required when prefill and decode use different TP/attention-TP sizes. | `false` |
+| `SGLANG_DISAGG_STAGING_BUFFER` | Enable GPU staging buffer for heterogeneous TP KV transfer. Required when prefill and decode use different TP/attention-TP sizes. Only for non-MLA models (e.g. GQA, MHA). | `false` |
 | `SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB` | Prefill-side per-worker staging buffer size in MB. Used for gathering KV head slices before bulk RDMA transfer. | `64` |
 | `SGLANG_DISAGG_STAGING_POOL_SIZE_MB` | Decode-side ring buffer pool total size in MB. Shared buffer receiving RDMA data from all prefill ranks. Larger values support higher concurrency. | `4096` |
 | `SGLANG_STAGING_USE_TORCH` | Force using PyTorch gather/scatter fallback instead of Triton fused kernels for staging operations. Useful for debugging. | `false` |

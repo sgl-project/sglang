@@ -163,6 +163,8 @@ When prefill and decode use different tensor parallelism (TP) sizes (e.g., prefi
 
 Enable the staging buffer when prefill and decode use **different TP sizes** with the **Mooncake** transfer backend. When both sides use the same TP size, staging is automatically bypassed even if enabled.
 
+> **Note:** The staging buffer is designed for non-MLA models (e.g. GQA, MHA). MLA models (e.g. DeepSeek-V2/V3) should not enable this flag.
+
 ### Environment Variables
 
 | Variable | Description | Default |
