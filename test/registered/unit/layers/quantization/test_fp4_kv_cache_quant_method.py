@@ -1,22 +1,14 @@
-"""
-Unit tests for NVFP4 KV cache quantization strategy pattern.
+"""Unit tests for FP4 KV cache quantization strategy pattern — no server, no model loading."""
 
-Tests:
-  - FP4KVCacheQuantMethod registry and factory
-  - NoneMethod is identity
-  - NVFP4Method buffer creation, quantize→dequantize roundtrip
-  - MXFP4Method buffer creation, quantize→dequantize roundtrip
-  - NVFP4Method scale loading (mock)
+from sglang.test.ci.ci_register import register_cpu_ci
 
-Run:
-  python -m pytest test/manual/quant/test_nvfp4_kv_cache_quant.py -v
-  # Or directly:
-  python test/manual/quant/test_nvfp4_kv_cache_quant.py
-"""
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 import unittest
 
 import torch
+
+from sglang.test.test_utils import CustomTestCase
 
 
 def skip_if_no_cuda(func):
@@ -24,7 +16,7 @@ def skip_if_no_cuda(func):
     return unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")(func)
 
 
-class TestKVCacheQuantRegistry(unittest.TestCase):
+class TestKVCacheQuantRegistry(CustomTestCase):
     """Test the registry and factory function."""
 
     def test_registry_contains_nvfp4_and_mxfp4(self):
@@ -66,7 +58,7 @@ class TestKVCacheQuantRegistry(unittest.TestCase):
             get_fp4_kv_cache_quant_method("unknown_method")
 
 
-class TestNoneMethod(unittest.TestCase):
+class TestNoneMethod(CustomTestCase):
     """Test NoneMethod is identity / no-op."""
 
     def test_properties(self):
@@ -95,7 +87,7 @@ class TestNoneMethod(unittest.TestCase):
         self.assertTrue(torch.equal(v_out, v))
 
 
-class TestNVFP4Method(unittest.TestCase):
+class TestNVFP4Method(CustomTestCase):
     """Test NVFP4Method buffer creation and properties."""
 
     def test_properties(self):
@@ -192,7 +184,7 @@ class TestNVFP4Method(unittest.TestCase):
         )
 
 
-class TestMXFP4Method(unittest.TestCase):
+class TestMXFP4Method(CustomTestCase):
     """Test MXFP4Method buffer creation and roundtrip."""
 
     def test_properties(self):
@@ -249,7 +241,7 @@ class TestMXFP4Method(unittest.TestCase):
         self.assertEqual(k_out.dtype, torch.float8_e4m3fn)
 
 
-class TestKVFP4QuantizeUtil(unittest.TestCase):
+class TestKVFP4QuantizeUtil(CustomTestCase):
     """Test the existing MXFP4 KVFP4QuantizeUtil roundtrip."""
 
     def test_roundtrip_cpu(self):
@@ -266,7 +258,7 @@ class TestKVFP4QuantizeUtil(unittest.TestCase):
         self.assertLess(rel_error, 0.5)
 
 
-class TestFP4KVCacheRecipe(unittest.TestCase):
+class TestFP4KVCacheRecipe(CustomTestCase):
     """Test enum."""
 
     def test_enum_values(self):
