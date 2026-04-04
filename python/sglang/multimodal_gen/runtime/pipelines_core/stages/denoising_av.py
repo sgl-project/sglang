@@ -342,8 +342,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
         )
 
         img = load_image(image_path)
+        img_array = np.array(img).astype(np.uint8)[..., :3]
+        img_array = self._apply_video_codec_compression(img_array, crf=33)
+        conditioned_img = PIL.Image.fromarray(img_array)
         batch.condition_image = self._resize_center_crop(
-            img, width=int(batch.width), height=int(batch.height)
+            conditioned_img, width=int(batch.width), height=int(batch.height)
         )
 
         latents_device = (
@@ -359,11 +362,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
         ) and not server_args.disable_autocast
 
         video_condition = self._resize_center_crop_tensor(
-            img,
+            conditioned_img,
             width=int(batch.width),
             height=int(batch.height),
             device=latents_device,
             dtype=encode_dtype,
+            apply_codec_compression=False,
         )
 
         with torch.autocast(
