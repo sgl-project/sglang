@@ -37,6 +37,7 @@ from sglang.srt.layers.moe.moe_runner.triton import (
     TritonRunnerInput,
     TritonRunnerOutput,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_xpu
 
 _is_hip = is_hip()
@@ -71,17 +72,22 @@ if _is_cuda or _is_hip or _is_xpu:
 class LoRAInfo:
     """LoRA weights and dispatch info for MoE computation."""
 
-    # LoRA weights: [num_loras, num_experts, dim1, dim2]
+    # LoRA weights: [num_loras, num_experts_or_1, dim1, dim2]
+    # When experts_shared_outer_loras=True:
+    #   gate_up_lora_a: [num_loras, 1, max_rank, hidden_dim] (shared)
+    #   down_lora_b: [num_loras, 1, hidden_dim, max_rank] (shared)
     gate_up_lora_a_weights: (
         torch.Tensor
-    )  # [num_loras, num_experts, max_rank, hidden_dim]
+    )  # [num_loras, num_experts_or_1, max_rank, hidden_dim]
     gate_up_lora_b_weights: (
         torch.Tensor
     )  # [num_loras, num_experts, gate_up_dim, max_rank]
     down_lora_a_weights: (
         torch.Tensor
     )  # [num_loras, num_experts, max_rank, intermediate_dim]
-    down_lora_b_weights: torch.Tensor  # [num_loras, num_experts, hidden_dim, max_rank]
+    down_lora_b_weights: (
+        torch.Tensor
+    )  # [num_loras, num_experts_or_1, hidden_dim, max_rank]
 
     # Indice pointers of each segment in shape (num_segments + 1, )
     seg_indptr: torch.Tensor
@@ -95,6 +101,9 @@ class LoRAInfo:
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
+    experts_shared_outer_loras: bool = False
+    cg_buffers: Optional[dict] = None
+    has_active_lora: bool = False
 
     fully_sharded: bool = False
     tp_size: int = 1
@@ -139,6 +148,21 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         Returns:
             TritonRunnerOutput with combined base + LoRA output
         """
+
+        if lora_info is None:
+            return super().run(runner_input, quant_info, running_state)
+
+        if get_is_capture_mode():
+            # During CUDA graph capture, always enter the LoRA path so that
+            # the LoRA kernels are recorded in the graph.  adapter_enabled is
+            # all-zeros during capture, so the Triton kernel early-exits per
+            # program (zero overhead).  During replay the tensor is updated
+            # in-place with the real adapter mask before graph.replay().
+            has_active_lora = True
+        else:
+            has_active_lora = lora_info.has_active_lora
+        if not has_active_lora:
+            return super().run(runner_input, quant_info, running_state)
 
         # Extract common variables
         hidden_states = runner_input.hidden_states
@@ -190,14 +214,19 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             moe_sum_reduce_triton,
         )
 
+        cg = lora_info.cg_buffers if get_is_capture_mode() else None
+
         # ============================================================
         # Stage 1: Gate/Up projection (base)
         # ============================================================
-        intermediate_cache1 = torch.empty(
-            (M, topk_ids.shape[1], N),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        if cg is not None:
+            intermediate_cache1 = cg["intermediate_cache1"][:M, : topk_ids.shape[1], :N]
+        else:
+            intermediate_cache1 = torch.empty(
+                (M, topk_ids.shape[1], N),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
 
         invoke_fused_moe_kernel(
             hidden_states,
@@ -243,23 +272,32 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         ) * block_size_m
         max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
 
-        # Initialize output tensors (using torch.empty like the reference implementation)
         device = topk_ids.device
-        sorted_token_ids_lora = torch.empty(
-            (max_loras * max_num_tokens_padded,),
-            dtype=torch.int32,
-            device=device,
-        )
-        expert_ids_lora = torch.empty(
-            (max_loras * max_num_m_blocks,),
-            dtype=torch.int32,
-            device=device,
-        )
-        num_tokens_post_padded_lora = torch.empty(
-            (max_loras,), dtype=torch.int32, device=device
-        )
+        if cg is not None:
+            sorted_token_ids_lora = cg["sorted_token_ids_lora"][
+                : max_loras * max_num_tokens_padded
+            ]
+            expert_ids_lora = cg["expert_ids_lora"][: max_loras * max_num_m_blocks]
+            num_tokens_post_padded_lora = cg["num_tokens_post_padded_lora"][:max_loras]
+        else:
+            sorted_token_ids_lora = torch.empty(
+                (max_loras * max_num_tokens_padded,),
+                dtype=torch.int32,
+                device=device,
+            )
+            expert_ids_lora = torch.empty(
+                (max_loras * max_num_m_blocks,),
+                dtype=torch.int32,
+                device=device,
+            )
+            num_tokens_post_padded_lora = torch.empty(
+                (max_loras,), dtype=torch.int32, device=device
+            )
 
-        lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
+        if cg is not None and "lora_ids" in cg:
+            lora_ids = cg["lora_ids"][:max_loras]
+        else:
+            lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
 
         moe_lora_align_block_size(
             topk_ids,
@@ -276,6 +314,12 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             lora_info.adapter_enabled,
             lora_ids,
             None,  # expert_map
+            cumsum_buffer=cg["cumsum_buffer"] if cg is not None else None,
+            token_mask=(
+                cg["token_mask"][: max_loras * topk_ids.shape[0]]
+                if cg is not None
+                else None
+            ),
         )
 
         # Reshape the sorted tensors for fused_moe_lora (expects 2D: max_loras x max_num_tokens_padded)
@@ -299,11 +343,16 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         # ============================================================
         # Stage 2: Activation (SiLU or GELU)
         # ============================================================
-        intermediate_cache2 = torch.empty(
-            (M * topk_ids.shape[1], N // 2),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        if cg is not None:
+            intermediate_cache2 = cg["intermediate_cache2"][
+                : M * topk_ids.shape[1], : N // 2
+            ]
+        else:
+            intermediate_cache2 = torch.empty(
+                (M * topk_ids.shape[1], N // 2),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         if activation == "silu":
             if gemm1_alpha is not None:
                 assert gemm1_limit is not None
@@ -335,11 +384,16 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         # ============================================================
         # Stage 3: Down projection (base)
         # ============================================================
-        intermediate_cache3 = torch.empty(
-            (M, topk_ids.shape[1], w2.shape[1]),
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        if cg is not None:
+            intermediate_cache3 = cg["intermediate_cache3"][
+                :M, : topk_ids.shape[1], : w2.shape[1]
+            ]
+        else:
+            intermediate_cache3 = torch.empty(
+                (M, topk_ids.shape[1], w2.shape[1]),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
 
         if no_combine:
             assert not inplace
@@ -350,6 +404,8 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             )
         elif inplace:
             out_hidden_states = hidden_states
+        elif cg is not None:
+            out_hidden_states = cg["out_hidden_states"][:M, : hidden_states.shape[1]]
         else:
             out_hidden_states = torch.empty_like(hidden_states)
 
@@ -469,16 +525,11 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         r = lora_info.max_lora_rank
         gate_up_a = lora_info.gate_up_lora_a_weights
+        if lora_info.experts_shared_outer_loras:
+            gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
         gate_up_b = lora_info.gate_up_lora_b_weights
         inter_size = gate_up_b.shape[2] // 2
 
-        # Split packed gate_up weights into separate gate and up slices.
-        # gate_up_lora_a has shape [max_loras, num_experts, 2*r, hidden_dim]
-        # where the first r rows are gate_lora_a and the next r are up_lora_a.
-        # gate_up_lora_b has shape [max_loras, num_experts, 2*inter_size, r]
-        # where the first inter_size rows are gate_lora_b and the rest up_lora_b.
-        # Using num_slices=2 lets the kernel handle gate and up independently,
-        # keeping the rank dimension at r so shrink and expand both match.
         lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
         lora_b_stacked = [
             gate_up_b[:, :, :inter_size, :],
@@ -542,8 +593,12 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         if lora_info.max_lora_rank == 0:
             return
 
+        down_lora_b = lora_info.down_lora_b_weights
+        if lora_info.experts_shared_outer_loras:
+            down_lora_b = down_lora_b.expand(-1, lora_info.num_experts, -1, -1)
+
         lora_a_stacked = [lora_info.down_lora_a_weights]
-        lora_b_stacked = [lora_info.down_lora_b_weights]
+        lora_b_stacked = [down_lora_b]
 
         if lora_info.fully_sharded and lora_info.tp_size > 1:
             shard_size = lora_info.hidden_size // lora_info.tp_size

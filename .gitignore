@@ -178,6 +178,7 @@ benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
 tmp*.txt
+/tmp/
 
 # Torch Compile logs
 tl_out/

@@ -31,7 +31,6 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
     is_flashinfer_available,
-    is_sm120_supported,
     next_power_of_2,
 )
 
@@ -41,12 +40,16 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-if is_flashinfer_available() and is_sm120_supported():
+if is_flashinfer_available():
     from flashinfer import fp4_quantize
 elif is_cuda_alike():
     from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
+
+_flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
+    tuple, dict[str, torch.Tensor]
+] = {}
 
 
 def align_fp8_moe_weights_for_flashinfer_trtllm(
@@ -127,10 +130,13 @@ def align_fp8_moe_weights_for_flashinfer_trtllm(
 
 def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     """Prepare MXFP8 MoE weights/scales for FlashInfer TRT-LLM kernels."""
-    from flashinfer import (
-        reorder_rows_for_gated_act_gemm,
-        shuffle_matrix_a,
-        shuffle_matrix_sf_a,
+    from flashinfer import block_scale_interleave
+    from flashinfer.fused_moe.core import (
+        get_reorder_rows_for_gated_act_gemm_row_indices,
+    )
+    from flashinfer.utils import (
+        get_shuffle_matrix_a_row_indices,
+        get_shuffle_matrix_sf_a_row_indices,
     )
 
     w13_weight = cast(torch.Tensor, layer.w13_weight).contiguous()
@@ -145,52 +151,93 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     _, hidden_size, _ = w2_weight.shape
     epilogue_tile_m = 128
 
-    w13_interleaved = [
-        reorder_rows_for_gated_act_gemm(w13_weight[i]) for i in range(num_experts)
-    ]
-    w13_scale_interleaved = [
-        reorder_rows_for_gated_act_gemm(w13_scale[i]) for i in range(num_experts)
-    ]
+    # Reuse precomputed row-index transforms whenever shape/device are unchanged.
+    w13_weight_u8 = w13_weight.view(torch.uint8)
+    w2_weight_u8 = w2_weight.view(torch.uint8)
+    cache_key = (
+        two_n,
+        hidden_size,
+        w2_weight.shape[-1],
+        w13_scale.shape[-1],
+        w2_scale.shape[-1],
+        epilogue_tile_m,
+        (w13_weight.device.type, w13_weight.device.index),
+        (w2_weight.device.type, w2_weight.device.index),
+        (w13_scale.device.type, w13_scale.device.index),
+        (w2_scale.device.type, w2_scale.device.index),
+    )
+    cache = _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.get(cache_key)
+    if cache is None:
+        reorder_row_indices = get_reorder_rows_for_gated_act_gemm_row_indices(
+            w13_weight_u8[0]
+        ).to(w13_weight.device)
+        w13_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
+            w13_weight_u8[0], epilogue_tile_m
+        ).to(w13_weight.device)
+        w2_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
+            w2_weight_u8[0], epilogue_tile_m
+        ).to(w2_weight.device)
+        w13_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
+            w13_scale[0].reshape(two_n, -1), epilogue_tile_m
+        ).to(w13_scale.device)
+        w2_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
+            w2_scale[0].reshape(hidden_size, -1), epilogue_tile_m
+        ).to(w2_scale.device)
+        cache = {
+            "reorder_row_indices": reorder_row_indices,
+            "w13_shuffle_row_indices": w13_shuffle_row_indices,
+            "w2_shuffle_row_indices": w2_shuffle_row_indices,
+            "w13_scale_shuffle_row_indices": w13_scale_shuffle_row_indices,
+            "w2_scale_shuffle_row_indices": w2_scale_shuffle_row_indices,
+        }
+        _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8[cache_key] = cache
 
-    w13_shuffled = [
-        shuffle_matrix_a(w13_interleaved[i].view(torch.uint8), epilogue_tile_m)
-        for i in range(num_experts)
-    ]
-    w2_shuffled = [
-        shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
-        for i in range(num_experts)
-    ]
-    w13_scale_shuffled = [
-        shuffle_matrix_sf_a(
-            w13_scale_interleaved[i].view(torch.uint8).reshape(two_n, -1),
-            epilogue_tile_m,
+    reorder_row_indices = cache["reorder_row_indices"]
+    w13_shuffle_row_indices = cache["w13_shuffle_row_indices"]
+    w2_shuffle_row_indices = cache["w2_shuffle_row_indices"]
+    w13_scale_shuffle_row_indices = cache["w13_scale_shuffle_row_indices"]
+    w2_scale_shuffle_row_indices = cache["w2_scale_shuffle_row_indices"]
+
+    w13_shuffled_u8 = torch.empty_like(w13_weight_u8)
+    w2_shuffled_u8 = torch.empty_like(w2_weight_u8)
+    w13_scale_shuffled = torch.empty_like(w13_scale)
+    w2_scale_shuffled = torch.empty_like(w2_scale)
+
+    for i in range(num_experts):
+        w13_interleaved_u8 = w13_weight_u8[i].index_select(0, reorder_row_indices)
+        w13_scale_interleaved = w13_scale[i].index_select(0, reorder_row_indices)
+
+        w13_shuffled_u8[i].copy_(
+            w13_interleaved_u8.index_select(0, w13_shuffle_row_indices)
         )
-        for i in range(num_experts)
-    ]
-    w2_scale_shuffled = [
-        shuffle_matrix_sf_a(
-            w2_scale[i].view(torch.uint8).reshape(hidden_size, -1),
-            epilogue_tile_m,
+        w2_shuffled_u8[i].copy_(w2_weight_u8[i].index_select(0, w2_shuffle_row_indices))
+
+        w13_scale_linear = w13_scale_interleaved.reshape(two_n, -1)
+        w13_scale_shuffled[i].copy_(
+            block_scale_interleave(
+                w13_scale_linear.index_select(0, w13_scale_shuffle_row_indices)
+            ).reshape_as(w13_scale_shuffled[i])
         )
-        for i in range(num_experts)
-    ]
+
+        w2_scale_linear = w2_scale[i].reshape(hidden_size, -1)
+        w2_scale_shuffled[i].copy_(
+            block_scale_interleave(
+                w2_scale_linear.index_select(0, w2_scale_shuffle_row_indices)
+            ).reshape_as(w2_scale_shuffled[i])
+        )
 
     # Keep parameter identities stable for CUDA graph capture reuse.
-    copy_or_rebind_param(
-        layer, "w13_weight", torch.stack(w13_shuffled).view(torch.float8_e4m3fn)
-    )
-    copy_or_rebind_param(
-        layer, "w2_weight", torch.stack(w2_shuffled).view(torch.float8_e4m3fn)
-    )
+    copy_or_rebind_param(layer, "w13_weight", w13_shuffled_u8.view(torch.float8_e4m3fn))
+    copy_or_rebind_param(layer, "w2_weight", w2_shuffled_u8.view(torch.float8_e4m3fn))
     copy_or_rebind_param(
         layer,
         "w13_weight_scale_inv",
-        torch.stack(w13_scale_shuffled).reshape_as(w13_scale).contiguous(),
+        w13_scale_shuffled.contiguous(),
     )
     copy_or_rebind_param(
         layer,
         "w2_weight_scale_inv",
-        torch.stack(w2_scale_shuffled).reshape_as(w2_scale).contiguous(),
+        w2_scale_shuffled.contiguous(),
     )
     layer.w13_weight_scale_inv.format_ue8m0 = True
     layer.w2_weight_scale_inv.format_ue8m0 = True
@@ -362,7 +409,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             symm_output = torch.empty(
                 hidden_states.shape[0],
                 hidden_states.shape[1],
-                dtype=torch.bfloat16,
+                dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
 
@@ -442,9 +489,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
             )
+        # TODO: Once https://github.com/flashinfer-ai/flashinfer/issues/2703 is fixed, pass output to moe kernel and remove this copy.
         symm_output.copy_(output)
         output = symm_output
     else:
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
         assert quant_info.w13_input_scale is not None
         assert quant_info.output1_scales_scalar is not None
         assert quant_info.output1_scales_gate_scalar is not None
@@ -564,7 +613,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     """FlashInfer TRTLLM FP4 MoE forward pass.
 
     This function handles the FP4 TRTLLM MoE path that was previously in
-    FlashInferFP4MoE.forward_impl and ModelOptNvFp4FusedMoEMethod.apply.
+    ModelOptNvFp4FusedMoEMethod.apply.
     """
     from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
 
@@ -638,7 +687,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         local_expert_offset=quant_info.local_expert_offset,
         local_num_experts=quant_info.local_num_experts,
         routed_scaling_factor=runner_config.routed_scaling_factor,
-        tile_tokens_dim=None,
         routing_method_type=(
             routing_method_type
             if routing_method_type is not None

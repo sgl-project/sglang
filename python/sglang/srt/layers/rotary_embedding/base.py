@@ -39,6 +39,7 @@ if _is_cuda:
 
 if _is_npu:
     import torch_npu
+    from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
 
 if _is_hip:
     from sglang.srt.layers.attention.utils import (
@@ -207,9 +208,14 @@ class RotaryEmbedding(MultiPlatformOp):
 
         if offsets is not None:
             positions = positions + offsets
+
         positions = positions.flatten()
         num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions)
+
+        if hasattr(self, "sin_cos_cache"):
+            cos_sin = self.sin_cos_cache
+        else:
+            cos_sin = self.cos_sin_cache.index_select(0, positions)
         cos, sin = cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
@@ -241,13 +247,40 @@ class RotaryEmbedding(MultiPlatformOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-        if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
-            return self.forward_native(positions, query, key, offsets)
+        if (
+            query.dtype == torch.bfloat16
+            and self.cos_sin_cache.dtype == torch.float
+            or key.ndim == 3
+        ):
+            if hasattr(self, "sin_cos_cache"):
+                cos_sin = self.sin_cos_cache
+            else:
+                cos_sin = self.cos_sin_cache.index_select(0, positions)
+
+            if query.shape[0] * query.shape[1] < 65535:
+                return fused_rope_qk_mqa(
+                    query,
+                    key,
+                    cos_sin,
+                    self.rotary_dim,
+                    self.is_neox_style,
+                )
+            else:
+                return self.forward_native(positions, query, key, offsets)
         if self.is_neox_style:
             rotary_mode = "half"
         else:
             rotary_mode = "interleave"
+
         mrope_section = [0, 0, 0]
+        # The npu_mrope kernel only supports 1D or 2D tensors for query and key.
+        # Therefore, when their dimensions exceed 2D, we flatten query and key to 2D tensors before computation
+        # and reshape their original shapes afterward.
+        query_shape = query.shape
+        key_shape = key.shape
+        query = query.reshape(query.shape[0], -1)
+        key = key.reshape(key.shape[0], -1)
+
         query_out, key_out = torch_npu.npu_mrope(
             positions,
             query,
@@ -257,6 +290,9 @@ class RotaryEmbedding(MultiPlatformOp):
             mrope_section=mrope_section,
             rotary_mode=rotary_mode,
         )
+
+        query_out = query_out.reshape(query_shape)
+        key_out = key_out.reshape(key_shape)
         return query_out, key_out
 
     def forward_cpu(

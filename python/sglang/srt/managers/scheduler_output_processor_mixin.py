@@ -51,19 +51,14 @@ class SchedulerOutputProcessorMixin:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
-    def _get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+    def _get_cached_tokens_details(self: Scheduler, req: Req) -> Optional[dict]:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
-            - None if HiCache is not enabled
-            - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
-            - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
+            - None if no cached tokens at all
+            - {"device": X, "host": Y} without storage breakdown
+            - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
-        # Only show details if HiCache is enabled
-        if not getattr(self, "enable_hierarchical_cache", False):
-            return None
-
-        # Only show if there are any cached tokens
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
@@ -78,6 +73,13 @@ class SchedulerOutputProcessorMixin:
                 details["storage"] = req.cached_tokens_storage
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
+
+        if req.cached_tokens > 0:
+            return {
+                "device": req.cached_tokens,
+                "host": 0,
+            }
+
         return None
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
@@ -180,8 +182,10 @@ class SchedulerOutputProcessorMixin:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
-                    req.check_finished()
 
+                    self._maybe_update_reasoning_tokens(req, next_token_id)
+
+                    req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
@@ -402,6 +406,20 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
+        else:
+            # for normal spec decoding: unify next_token_ids format
+            next_token_ids = []
+            cum_num_tokens = 0
+            next_token_ids_list = result.next_token_ids.tolist()
+
+            for i, req in enumerate(batch.reqs):
+                accept_length = result.accept_length_per_req_cpu[i]
+                next_token_ids.append(
+                    next_token_ids_list[
+                        cum_num_tokens : cum_num_tokens + accept_length + 1
+                    ]
+                )
+                cum_num_tokens += accept_length + 1
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
@@ -433,6 +451,8 @@ class SchedulerOutputProcessorMixin:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+
+            self._maybe_update_reasoning_tokens(req, next_token_id)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
@@ -534,8 +554,18 @@ class SchedulerOutputProcessorMixin:
             num_accepted_tokens=result.num_accepted_tokens,
         )
 
+    def _maybe_update_reasoning_tokens(
+        self: Scheduler, req: Req, next_token_id: Union[int, List[int]]
+    ):
+        if req.require_reasoning and self._think_end_id is not None:
+            req.update_reasoning_tokens(next_token_id, self._think_end_id)
+
     def _mamba_prefix_cache_update(
-        self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
+        self: Scheduler,
+        req: Req,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        i: int,
     ) -> None:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
@@ -569,7 +599,7 @@ class SchedulerOutputProcessorMixin:
                     )
 
     def _process_input_token_logprobs(
-        self, req: Req, input_token_logprobs: List
+        self: Scheduler, req: Req, input_token_logprobs: List
     ) -> None:
         """Process input token logprobs values and indices."""
         is_multi_item_scoring = self._is_multi_item_scoring(req)
@@ -601,7 +631,7 @@ class SchedulerOutputProcessorMixin:
             for x in input_token_logprobs_idx
         ]
 
-    def _process_input_top_logprobs(self, req: Req) -> None:
+    def _process_input_top_logprobs(self: Scheduler, req: Req) -> None:
         """Process input top logprobs."""
         if req.top_logprobs_num <= 0:
             return
@@ -630,7 +660,7 @@ class SchedulerOutputProcessorMixin:
         req.temp_input_top_logprobs_idx = None
         req.temp_input_top_logprobs_val = None
 
-    def _process_input_token_ids_logprobs(self, req: Req) -> None:
+    def _process_input_token_ids_logprobs(self: Scheduler, req: Req) -> None:
         """Process input token IDs logprobs."""
         if req.token_ids_logprob is None:
             return
@@ -662,7 +692,7 @@ class SchedulerOutputProcessorMixin:
         req.temp_input_token_ids_logprobs_idx = None
         req.temp_input_token_ids_logprobs_val = None
 
-    def _calculate_relevant_tokens_len(self, req: Req) -> int:
+    def _calculate_relevant_tokens_len(self: Scheduler, req: Req) -> int:
         """Calculate the expected length of logprob arrays based on whether multi-item scoring is enabled.
 
         For multi-item scoring, only delimiter positions have logprobs.
@@ -683,7 +713,7 @@ class SchedulerOutputProcessorMixin:
             return len(relevant_tokens)
 
     def _calculate_num_input_logprobs(
-        self, req: Req, extend_input_len: int, extend_logprob_start_len: int
+        self: Scheduler, req: Req, extend_input_len: int, extend_logprob_start_len: int
     ) -> int:
         """Calculate the number of input logprobs based on whether multi-item scoring is enabled.
 
@@ -706,7 +736,7 @@ class SchedulerOutputProcessorMixin:
             # Regular request: all tokens in the range
             return extend_input_len - extend_logprob_start_len
 
-    def _is_multi_item_scoring(self, req: Req) -> bool:
+    def _is_multi_item_scoring(self: Scheduler, req: Req) -> bool:
         """Check if request uses multi-item scoring.
 
         Multi-item scoring applies to prefill-only requests when a delimiter
@@ -843,7 +873,7 @@ class SchedulerOutputProcessorMixin:
 
         return num_input_logprobs
 
-    def _initialize_empty_logprob_containers(self, req: Req) -> None:
+    def _initialize_empty_logprob_containers(self: Scheduler, req: Req) -> None:
         """
         Initialize logprob fields to empty lists if unset.
 
@@ -880,7 +910,7 @@ class SchedulerOutputProcessorMixin:
                 envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get()
             )
 
-    def _trigger_crash_for_tests(self, crash_threshold: int):
+    def _trigger_crash_for_tests(self: Scheduler, crash_threshold: int):
         # Crash trigger: crash after stream_output is called N times
         # This is used for testing purposes.
         if not hasattr(self, "_test_stream_output_count"):
@@ -911,6 +941,7 @@ class SchedulerOutputProcessorMixin:
         spaces_between_special_tokens = []
         no_stop_trim = []
         prompt_tokens = []
+        reasoning_tokens = []
         completion_tokens = []
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
@@ -1011,6 +1042,7 @@ class SchedulerOutputProcessorMixin:
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
+                reasoning_tokens.append(req.reasoning_tokens)
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
 
@@ -1032,6 +1064,8 @@ class SchedulerOutputProcessorMixin:
                         and not req.input_logprob_sent
                         # Decode server does not send input logprobs
                         and self.disaggregation_mode != DisaggregationMode.DECODE
+                        # Only send when input logprobs have been computed (after prefill)
+                        and req.input_token_logprobs_val is not None
                     ):
                         input_token_logprobs_val.append(req.input_token_logprobs_val)
                         input_token_logprobs_idx.append(req.input_token_logprobs_idx)
@@ -1053,39 +1087,38 @@ class SchedulerOutputProcessorMixin:
                         input_token_ids_logprobs_idx.append([])
 
                     if req.return_logprob:
+                        logprob_end = max(len(output_ids_), 1)
                         output_token_logprobs_val.append(
                             req.output_token_logprobs_val[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_token_logprobs_idx.append(
                             req.output_token_logprobs_idx[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_top_logprobs_val.append(
                             req.output_top_logprobs_val[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_top_logprobs_idx.append(
                             req.output_top_logprobs_idx[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_token_ids_logprobs_val.append(
                             req.output_token_ids_logprobs_val[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         output_token_ids_logprobs_idx.append(
                             req.output_token_ids_logprobs_idx[
-                                send_output_token_logprobs_offset:
+                                send_output_token_logprobs_offset:logprob_end
                             ]
                         )
-                        req.send_output_token_logprobs_offset = len(
-                            req.output_token_logprobs_val
-                        )
+                        req.send_output_token_logprobs_offset = logprob_end
                     else:
                         output_token_logprobs_val.append([])
                         output_token_logprobs_idx.append([])
@@ -1139,6 +1172,7 @@ class SchedulerOutputProcessorMixin:
                     spaces_between_special_tokens=spaces_between_special_tokens,
                     no_stop_trim=no_stop_trim,
                     prompt_tokens=prompt_tokens,
+                    reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
                     cached_tokens_details=cached_tokens_details,
