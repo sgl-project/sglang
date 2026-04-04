@@ -718,6 +718,7 @@ class LTX2TransformerBlock(nn.Module):
         norm_eps: float = 1e-6,
         apply_gated_attention: bool = False,
         cross_attention_adaln: bool = False,
+        use_local_av_cross_attention: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
@@ -726,6 +727,7 @@ class LTX2TransformerBlock(nn.Module):
         self.idx = idx
         self.norm_eps = norm_eps
         self.cross_attention_adaln = cross_attention_adaln
+        self.use_local_av_cross_attention = use_local_av_cross_attention
 
         # 1. Self-Attention (video and audio)
         self.attn1 = LTX2Attention(
@@ -789,6 +791,7 @@ class LTX2TransformerBlock(nn.Module):
             dim_head=audio_attention_head_dim,
             norm_eps=norm_eps,
             qk_norm=qk_norm,
+            use_local_attention=use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_to_video_attn",
@@ -801,6 +804,7 @@ class LTX2TransformerBlock(nn.Module):
             dim_head=audio_attention_head_dim,
             norm_eps=norm_eps,
             qk_norm=qk_norm,
+            use_local_attention=use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.video_to_audio_attn",
@@ -1352,6 +1356,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     qk_norm=True,  # Always True in LTX2
                     apply_gated_attention=arch.apply_gated_attention,
                     cross_attention_adaln=arch.cross_attention_adaln,
+                    use_local_av_cross_attention=bool(
+                        getattr(arch, "use_local_av_cross_attention", False)
+                    ),
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=config.prefix,
                     quant_config=quant_config,

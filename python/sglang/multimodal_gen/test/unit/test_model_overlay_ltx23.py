@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 )
 from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
 from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
+    _build_transformer_config,
     _build_vae_config,
     _rename_connector_key,
     _repack_ltx23_image_encoder_weights,
@@ -339,6 +340,19 @@ def test_ltx23_connector_repack_renames_qk_norm_keys():
     assert _rename_connector_key(
         "model.diffusion_model.audio_embeddings_connector.transformer_1d_blocks.1.attn1.k_norm.weight"
     ) == "audio_connector.transformer_blocks.1.attn1.norm_k.weight"
+
+
+def test_ltx23_transformer_config_enables_local_av_cross_attention():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        donor_dir = os.path.join(tmpdir, "donor")
+        os.makedirs(os.path.join(donor_dir, "transformer"), exist_ok=True)
+        with open(os.path.join(donor_dir, "transformer", "config.json"), "w") as f:
+            json.dump({"_class_name": "OldClass", "num_layers": 1}, f)
+
+        config = _build_transformer_config(donor_dir)
+
+    assert config["_class_name"] == "LTX2VideoTransformer3DModel"
+    assert config["use_local_av_cross_attention"] is True
 
 
 def test_ltx23_vae_config_adds_official_image_encoder_marker():
