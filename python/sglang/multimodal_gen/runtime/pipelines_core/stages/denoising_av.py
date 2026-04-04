@@ -324,6 +324,117 @@ class LTX2AVDenoisingStage(DenoisingStage):
             )
         return latents, audio_latents
 
+    @staticmethod
+    def _ltx2_maybe_inject_pre_denoise_state(
+        batch: Req,
+        latents: torch.Tensor,
+        audio_latents: torch.Tensor | None,
+        clean_latent: torch.Tensor | None,
+        denoise_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        inject_path = os.environ.get(
+            "SGLANG_DIFFUSION_LTX2_PRE_DENOISE_INJECT_PATH"
+        )
+        if not inject_path:
+            return latents, audio_latents, clean_latent, denoise_mask
+
+        payload = torch.load(inject_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Expected pre-denoise injected payload at {inject_path} to be a dict."
+            )
+
+        def _maybe_override_tensor(
+            current: torch.Tensor | None,
+            key: str,
+            *,
+            required: bool = False,
+        ) -> torch.Tensor | None:
+            value = payload.get(key)
+            if value is None:
+                if required:
+                    raise ValueError(
+                        f"Injected pre-denoise payload at {inject_path} is missing `{key}`."
+                    )
+                return current
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(
+                    f"Injected pre-denoise payload field `{key}` at {inject_path} must be a tensor."
+                )
+            if current is not None and tuple(value.shape) != tuple(current.shape):
+                raise ValueError(
+                    f"Injected pre-denoise tensor `{key}` shape mismatch: "
+                    f"expected {tuple(current.shape)}, got {tuple(value.shape)}."
+                )
+            if current is None:
+                return value
+            return value.to(device=current.device, dtype=current.dtype)
+
+        def _maybe_override_batch_tensor(
+            attr: str,
+            key: str,
+            *,
+            is_list: bool = False,
+        ) -> None:
+            current = getattr(batch, attr, None)
+            if is_list:
+                current_tensor = current[0] if isinstance(current, list) and current else None
+            else:
+                current_tensor = current
+            injected = _maybe_override_tensor(current_tensor, key, required=False)
+            if injected is None:
+                return
+            if current_tensor is not None:
+                injected = injected.to(
+                    device=current_tensor.device, dtype=current_tensor.dtype
+                )
+            if is_list:
+                setattr(batch, attr, [injected])
+            else:
+                setattr(batch, attr, injected)
+
+        latents = _maybe_override_tensor(
+            latents, "video_latent_before", required=True
+        )
+        audio_latents = _maybe_override_tensor(
+            audio_latents, "audio_latent_before", required=audio_latents is not None
+        )
+        clean_latent = _maybe_override_tensor(clean_latent, "video_clean_latent")
+        denoise_mask = _maybe_override_tensor(denoise_mask, "video_denoise_mask")
+        image_latent = _maybe_override_tensor(
+            batch.image_latent if isinstance(batch.image_latent, torch.Tensor) else None,
+            "image_latent",
+        )
+        if image_latent is not None:
+            current_image_latent = batch.image_latent
+            if isinstance(current_image_latent, torch.Tensor):
+                image_latent = image_latent.to(
+                    device=current_image_latent.device, dtype=current_image_latent.dtype
+                )
+            batch.image_latent = image_latent
+
+        _maybe_override_batch_tensor("prompt_embeds", "prompt_embeds", is_list=True)
+        _maybe_override_batch_tensor(
+            "audio_prompt_embeds", "audio_prompt_embeds", is_list=True
+        )
+        _maybe_override_batch_tensor(
+            "negative_prompt_embeds", "negative_prompt_embeds", is_list=True
+        )
+        _maybe_override_batch_tensor(
+            "negative_audio_prompt_embeds",
+            "negative_audio_prompt_embeds",
+            is_list=True,
+        )
+        _maybe_override_batch_tensor(
+            "prompt_attention_mask", "prompt_attention_mask", is_list=False
+        )
+        _maybe_override_batch_tensor(
+            "negative_attention_mask", "negative_attention_mask", is_list=False
+        )
+
+        logger.info("Injecting pre-denoising LTX2 state from %s", inject_path)
+        return latents, audio_latents, clean_latent, denoise_mask
+
     @classmethod
     def _ltx2_calculate_guided_x0(
         cls,
@@ -684,6 +795,18 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 num_img_tokens=num_img_tokens,
                 zero_clean_latent=use_zero_clean_latent,
             )
+        (
+            latents,
+            audio_latents,
+            clean_latent,
+            denoise_mask,
+        ) = self._ltx2_maybe_inject_pre_denoise_state(
+            batch=batch,
+            latents=latents,
+            audio_latents=audio_latents,
+            clean_latent=clean_latent,
+            denoise_mask=denoise_mask,
+        )
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
