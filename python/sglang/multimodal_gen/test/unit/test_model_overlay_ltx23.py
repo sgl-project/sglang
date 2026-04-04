@@ -3,9 +3,12 @@ import os
 import tempfile
 from types import SimpleNamespace
 
+import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+
+pytest.importorskip("triton.compiler")
 
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEArchConfig
 from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig

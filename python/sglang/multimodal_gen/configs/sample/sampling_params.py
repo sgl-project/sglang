@@ -240,6 +240,13 @@ class SamplingParams:
         if self.height is None and self._default_height is not None:
             self.height = self._default_height
 
+    def build_request_extra(self) -> dict[str, Any]:
+        extra = {}
+        diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
+        if diffusers_kwargs:
+            extra["diffusers_kwargs"] = diffusers_kwargs
+        return extra
+
         # Handle output_quality to output_compression conversion
         if self.output_compression is None and self.output_quality is not None:
             self.output_compression = self._adjust_output_quality(

@@ -1,5 +1,6 @@
 import dataclasses
 from dataclasses import field
+from typing import Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
@@ -62,3 +63,21 @@ class LTX23SamplingParams(LTX2SamplingParams):
     audio_modality_scale: float = 3.0
     audio_skip_step: int = 0
     audio_stg_blocks: list[int] = field(default_factory=lambda: [28])
+
+    def build_request_extra(self) -> dict[str, Any]:
+        extra = super().build_request_extra()
+        extra["ltx2_stage1_guider_params"] = {
+            "video_cfg_scale": self.video_cfg_scale,
+            "video_stg_scale": self.video_stg_scale,
+            "video_rescale_scale": self.video_rescale_scale,
+            "video_modality_scale": self.video_modality_scale,
+            "video_skip_step": self.video_skip_step,
+            "video_stg_blocks": self.video_stg_blocks,
+            "audio_cfg_scale": self.audio_cfg_scale,
+            "audio_stg_scale": self.audio_stg_scale,
+            "audio_rescale_scale": self.audio_rescale_scale,
+            "audio_modality_scale": self.audio_modality_scale,
+            "audio_skip_step": self.audio_skip_step,
+            "audio_stg_blocks": self.audio_stg_blocks,
+        }
+        return extra
