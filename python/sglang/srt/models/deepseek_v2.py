@@ -103,6 +103,7 @@ from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_deepep_class_backend,
     is_sbo_enabled,
     is_tbo_enabled,
 )
@@ -339,12 +340,6 @@ class MoEGate(nn.Module):
         return logits
 
 
-def _is_deepep_class_backend() -> bool:
-    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
-    b = get_moe_a2a_backend()
-    return b.is_deepep() or b.is_mooncake() or b.is_mori()
-
-
 class DeepseekV2MoE(nn.Module):
 
     def __init__(
@@ -365,7 +360,7 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _is_deepep_backend = _is_deepep_class_backend()
+        _is_deepep_backend = is_deepep_class_backend()
         _fusion_disabled = get_global_server_args().disable_shared_experts_fusion
 
         # DeepEP shared expert fusion: shared expert is fused into the same MoE kernel
@@ -2231,7 +2226,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         # For DeepEP/Mori/Mooncake: fusion is off by default because shared expert
         # computation can overlap with A2A dispatch/combine. Users can opt-in via
         # --enforce-shared-experts-fusion.
-        if _is_deepep_class_backend():
+        if is_deepep_class_backend():
             if not server_args.enforce_shared_experts_fusion:
                 server_args.disable_shared_experts_fusion = True
                 return

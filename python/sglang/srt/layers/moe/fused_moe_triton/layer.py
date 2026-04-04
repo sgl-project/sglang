@@ -203,8 +203,6 @@ class FusedMoE(torch.nn.Module):
             num_experts - num_fused_shared_experts
         ) // self.moe_ep_size + num_fused_shared_experts
 
-        # Precompute routing parameters shared by AMD and DeepEP fusion paths.
-        # Both reduce to the same structure: _num_global_routed=256, _num_local_routed=16.
         if is_deepep_shared_expert_fusion:
             self._num_global_routed = num_experts - self.moe_ep_size
             self._num_local_routed = self._num_global_routed // self.moe_ep_size
