@@ -33,8 +33,8 @@ configure_runtime_env(required_gpus=1)
 import torch
 
 # ---------------------------------------------------------------------------
-# Import the JIT CUDA kernel.
-# When you implement the sglang-diffusion-cuda-kernel workflow, the file will be at:
+# Import the diffusion RMSNorm JIT kernel when it exists in-tree.
+# Expected location:
 #   python/sglang/jit_kernel/diffusion/rmsnorm.py
 # ---------------------------------------------------------------------------
 try:
@@ -45,7 +45,7 @@ except ImportError:
     JIT_AVAILABLE = False
     print(
         "WARNING: diffusion.rmsnorm JIT kernel not available. "
-        "Run after implementing the sglang-diffusion-cuda-kernel workflow."
+        "Run this script only after a diffusion RMSNorm JIT path exists in-tree."
     )
 
 

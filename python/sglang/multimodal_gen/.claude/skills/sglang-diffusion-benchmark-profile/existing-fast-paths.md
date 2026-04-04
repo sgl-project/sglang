@@ -2,7 +2,7 @@
 
 Use this guide when mapping a diffusion bottleneck to an existing fused path or
 distributed overlap pattern in `sglang.multimodal_gen`. Prefer reuse and
-configuration first before writing a new Triton or CUDA kernel.
+configuration first before handing the problem to a specialized kernel-optimization skill.
 
 **Key Files**
 - `python/sglang/multimodal_gen/runtime/layers/layernorm.py`
@@ -161,4 +161,4 @@ configuration first before writing a new Triton or CUDA kernel.
 - Keep CuTe compile cache keys aligned to `(dtype, ndim, D)`.
 - Avoid implicit broadcasts that force hidden `contiguous()` copies.
 - Preserve NPU and ROCm fallback paths.
-- **Always verify with ncu** (`ncu --set full`) and compare against both the unfused baseline and the hardware roofline. Do not rely on a single universal bandwidth/occupancy threshold; the right target depends on whether the kernel is memory-bound, compute-bound, or launch-limited. See `benchmark-and-profile.md` in this directory for the canonical ncu workflow.
+- If none of the families above match, package the evidence from the benchmark/profile skill and hand the kernel work to a specialized optimization skill such as `sglang-diffusion-ako4all-kernel`.
