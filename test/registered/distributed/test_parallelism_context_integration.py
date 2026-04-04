@@ -8,7 +8,7 @@ Run with:
     pytest test/registered/distributed/test_parallelism_context_integration.py -v
 
 Full test suite (non-CI):
-    - TP=2 small model (Qwem2.5-1.5B-Instruct)
+    - TP=2 small model (Qwen2.5-1.5B-Instruct)
     - EP=2 small MOE model (DeepSeek-Coder-V2-Lite-Instruct)
     - MLA model with hybrid dp attention (DeepSeek-Coder-V2-Lite-Instruct)
 
@@ -25,6 +25,7 @@ import requests
 import torch
 
 from sglang.srt.distributed.parallel_state import RankParallelismConfig
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -34,6 +35,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 from sglang.utils import terminate_process
+
+register_cuda_ci(est_time=200, suite="stage-b-test-2-gpu-large")
 
 
 def get_transfer_engine_info(url: str, rank: int) -> Dict:

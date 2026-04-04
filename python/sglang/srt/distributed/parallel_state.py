@@ -30,11 +30,11 @@ import pickle
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import timedelta
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import torch
 import torch.distributed
@@ -2431,9 +2431,8 @@ class RankParallelismConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RankParallelismConfig":
         """Create from dictionary, filtering unknown fields."""
-        import dataclasses
 
-        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        valid_fields = {f.name for f in fields(cls)}
         filtered_data = {k: v for k, v in data.items() if k in valid_fields}
         return cls(**filtered_data)
 
@@ -2504,65 +2503,88 @@ class ParallelismContext:
     def __init__(self, parallelism_config: RankParallelismConfig):
         self.config = parallelism_config
         self._original_globals: Dict[str, Any] = {}
-
-    def _create_mock_group(self, world_size: int, rank_in_group: int):
-        """Create a mock group coordinator with all necessary properties."""
-        mock_group = MagicMock()
-        mock_group.world_size = world_size
-        mock_group.rank_in_group = rank_in_group
-        mock_group.rank = rank_in_group
-        mock_group.local_rank = rank_in_group
-        mock_group.ranks = list(range(world_size))
-        mock_group.first_rank = 0
-        mock_group.last_rank = world_size - 1
-        mock_group.is_first_rank = rank_in_group == 0
-        mock_group.is_last_rank = rank_in_group == world_size - 1
-        mock_group.next_rank = mock_group.ranks[(rank_in_group + 1) % world_size]
-        mock_group.prev_rank = mock_group.ranks[(rank_in_group - 1) % world_size]
-        return mock_group
-
-    def __enter__(self):
-        conf = self.config
-
         from sglang.srt.distributed import parallel_state
         from sglang.srt.layers import dp_attention
 
+        self._parallel_state = parallel_state
+        self._dp_attention = dp_attention
+
+    class _StubGroupCoordinator:
+        """Lightweight stand-in for GroupCoordinator used by ParallelismContext."""
+
+        def __init__(self, world_size: int, rank_in_group: int):
+            self.world_size = world_size
+            self.rank_in_group = rank_in_group
+            self.rank = rank_in_group
+            self.local_rank = rank_in_group
+            self.ranks = list(range(world_size))
+            self.device_group = None
+            self.cpu_group = None
+            self.unique_name = ""
+
+        @property
+        def first_rank(self):
+            return self.ranks[0]
+
+        @property
+        def last_rank(self):
+            return self.ranks[-1]
+
+        @property
+        def is_first_rank(self):
+            return self.rank == self.first_rank
+
+        @property
+        def is_last_rank(self):
+            return self.rank == self.last_rank
+
+        @property
+        def next_rank(self):
+            return self.ranks[(self.rank_in_group + 1) % self.world_size]
+
+        @property
+        def prev_rank(self):
+            return self.ranks[(self.rank_in_group - 1) % self.world_size]
+
+    def __enter__(self):
+        conf = self.config
         # Save original globals
         for name in _PS_GLOBALS:
-            self._original_globals[name] = getattr(parallel_state, name, None)
+            self._original_globals[name] = getattr(self._parallel_state, name, None)
         for name in _DA_GLOBALS:
-            self._original_globals[name] = getattr(dp_attention, name, None)
+            self._original_globals[name] = getattr(self._dp_attention, name, None)
 
-        # Build and set mock group objects on parallel_state
+        # Build and set stub group coordinators on parallel_state
         _ps_new_values = {
-            "_TP": self._create_mock_group(conf.tp_size, conf.tp_rank),
-            "_PP": self._create_mock_group(conf.pp_size, conf.pp_rank),
-            "_MOE_EP": self._create_mock_group(conf.ep_size, conf.ep_rank),
-            "_MOE_TP": self._create_mock_group(conf.moe_tp_size, conf.moe_tp_rank),
-            "_ATTN_TP": self._create_mock_group(conf.attn_tp_size, conf.attn_tp_rank),
-            "_ATTN_CP": self._create_mock_group(conf.attn_cp_size, conf.attn_cp_rank),
-            "_MOE_DP": self._create_mock_group(conf.moe_dp_size, conf.moe_dp_rank),
+            "_TP": self._StubGroupCoordinator(conf.tp_size, conf.tp_rank),
+            "_PP": self._StubGroupCoordinator(conf.pp_size, conf.pp_rank),
+            "_MOE_EP": self._StubGroupCoordinator(conf.ep_size, conf.ep_rank),
+            "_MOE_TP": self._StubGroupCoordinator(conf.moe_tp_size, conf.moe_tp_rank),
+            "_ATTN_TP": self._StubGroupCoordinator(
+                conf.attn_tp_size, conf.attn_tp_rank
+            ),
+            "_ATTN_CP": self._StubGroupCoordinator(
+                conf.attn_cp_size, conf.attn_cp_rank
+            ),
+            "_MOE_DP": self._StubGroupCoordinator(conf.moe_dp_size, conf.moe_dp_rank),
         }
         for name, value in _ps_new_values.items():
-            setattr(parallel_state, name, value)
+            setattr(self._parallel_state, name, value)
 
         # Set dp_attention scalar globals
-        dp_attention._ATTN_DP_RANK = conf.attn_dp_rank
-        dp_attention._ATTN_DP_SIZE = conf.attn_dp_size
-        dp_attention._ENABLE_DP_ATTENTION_FLAG = conf.attn_dp_size > 1
+        self._dp_attention._ATTN_DP_RANK = conf.attn_dp_rank
+        self._dp_attention._ATTN_DP_SIZE = conf.attn_dp_size
+        self._dp_attention._ENABLE_DP_ATTENTION_FLAG = conf.attn_dp_size > 1
 
         logger.info(f"[ParallelismContext] Activated: {conf}")
         return self
 
     def __exit__(self, *args):
-        from sglang.srt.distributed import parallel_state
-        from sglang.srt.layers import dp_attention
-
         # Restore original globals
         for name in _PS_GLOBALS:
-            setattr(parallel_state, name, self._original_globals.get(name))
+            setattr(self._parallel_state, name, self._original_globals.get(name))
         for name in _DA_GLOBALS:
-            setattr(dp_attention, name, self._original_globals.get(name))
+            setattr(self._dp_attention, name, self._original_globals.get(name))
 
         logger.info("[ParallelismContext] Deactivated")
         return False
