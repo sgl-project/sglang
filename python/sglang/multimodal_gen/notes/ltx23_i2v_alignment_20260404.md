@@ -438,3 +438,116 @@
   - 下一步：
     - 优先继续 native step dump，把 compare 从 `step0` 扩到 `step1`
     - 若 `step1 latent_before` 已开始发散，就直接查 scheduler step / guider update / `post_process_latent` 之后的状态推进
+
+## 2026-04-04 二分结果更新 7：`step1` 的 sigma schedule 和 TI2V x0 还原语义都修正了，视频 pass-level 已接近对齐
+
+- 触发原因：
+  - `step1` compare 首先暴露两边 sigma 不一致：
+    - official `0.9949570`
+    - sglang `0.9970173`
+  - 随后继续对读官方 `X0Model`，发现它是按 `video.timesteps = sigma * denoise_mask` 做 tokenwise x0 还原；
+    我们此前在 TI2V 路径里还在用标量 `sigma` 手工还原 `video_cond/uncond/ptb/mod`
+
+- 修复 1：对齐官方 sigma schedule，但不破坏 legacy `LTX2`
+  - commit `366b3ed90 Align LTX2.3 sigma schedule with official`
+  - commit `0ac898b61 Avoid double-shifting LTX2.3 sigma schedule`
+  - 动作：
+    - 在 [ltx_2_pipeline.py](/Users/mick/repos/sglang/python/sglang/multimodal_gen/runtime/pipelines/ltx_2_pipeline.py) 新增 `build_official_ltx2_sigmas(...)`
+    - 仅当 `use_official_image_encoder == true` 时，`LTX2SigmaPreparationStage` 使用官方 `LTX2Scheduler.execute(...)` 等价 schedule
+    - 同时对同一路径返回 `("mu", None)`，避免把自定义 sigma 再做一次 mu-shift
+    - legacy `LTX2` 仍保留旧线性 schedule
+  - 结果：
+    - `step1 sigma` 现已完全一致：
+      - official `0.9949570298`
+      - sglang `0.9949570298`
+
+- 修复 2：TI2V video x0 还原改为 tokenwise sigma
+  - commit `8f34ef620 Use tokenwise sigma for LTX2.3 TI2V x0`
+  - 动作：
+    - 在 [denoising_av.py](/Users/mick/repos/sglang/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising_av.py) 新增 `_ltx2_velocity_to_x0(...)`
+    - 对 TI2V video 分支，把 `x0 = x - sigma * v` 改成按 `sigma * denoise_mask` 的 tokenwise 形式
+    - audio 仍是标量 sigma，不改 legacy 路径
+  - 远端 H100 `step1` compare（修完后）：
+    - `video_cond cosine = 0.996356`
+    - `video_uncond cosine = 0.996297`
+    - `video_ptb cosine = 0.996151`
+    - `video_mod cosine = 0.998290`
+    - `video_latent_before cosine = 0.999968`
+    - `video_latent_after cosine = 0.999965`
+  - 结论：
+    - `step1` 的 video transformer pass-level 输出现在已经基本对齐
+    - 说明 scheduler 和 TI2V x0 语义这两层 root cause 已经修正
+
+- 当前剩余主点：
+  - `video_denoised cosine` 仍只有 `0.939495`
+  - 但各个 pass-level 输入已经接近 `0.996+`
+  - 所以剩余首个主发散点已经收缩到：
+    - guider combine / rescale
+    - 或者 combine 后到 final `denoised_video` 的这条极窄路径
+
+- 黑盒现状：
+  - 最新黑盒视频还没有明显改善，说明当前 residual 虽然范围很小，但放大很快
+  - 下一步应直接验证：
+    - 用官方 guider 公式在两边 pass dump 上离线重算一次 `video_denoised`
+    - 确认是 combine 公式、rescale、还是 dump 对比口径的问题
+
+## 2026-04-04 二分结果更新 8：post-denoise injected run 仍然是噪点，问题已经落到 `denoising_av` 之后
+
+- 动作：
+  - 在 [denoising_av.py](/Users/mick/repos/sglang/python/sglang/multimodal_gen/runtime/pipelines_core/stages/denoising_av.py) 增加
+    `SGLANG_DIFFUSION_LTX2_POST_DENOISE_INJECT_PATH`
+    - 只在 `_post_denoising_loop(...)` 开头覆盖 `latents/audio_latents`
+    - 不改 denoise loop 本身
+  - 新增官方 native final-latent dump 脚本：
+    - [official_i2v_final_latents_dump.py](/Users/mick/repos/sglang/python/sglang/multimodal_gen/notes/ltx23_alignment_20260404/official_i2v_final_latents_dump.py)
+    - [h100_run_official_i2v_final_latents_dump.sh](/Users/mick/repos/sglang/python/sglang/multimodal_gen/notes/ltx23_alignment_20260404/h100_run_official_i2v_final_latents_dump.sh)
+  - 新增 injected native run 脚本：
+    - [h100_run_sglang_i2v_post_denoise_injected.sh](/Users/mick/repos/sglang/python/sglang/multimodal_gen/notes/ltx23_alignment_20260404/h100_run_sglang_i2v_post_denoise_injected.sh)
+
+- 远端 H100 实验：
+  - official native dump：
+    - `/tmp/ltx23_official_i2v_final.pt`
+  - sglang injected video：
+    - `/tmp/ltx23_sglang_i2v_injected_final/sglang_i2v_injected.mp4`
+  - runtime 日志确认 injected hook 生效：
+    - `Injecting post-denoising LTX2 latents from /tmp/ltx23_official_i2v_final.pt`
+
+- injected video compare：
+  - official:
+    - `/tmp/ltx23_official_i2v_blackbox.mp4`
+  - injected:
+    - `/tmp/ltx23_sglang_i2v_injected_final/sglang_i2v_injected.mp4`
+  - 本地 compare：
+    - `aggregate mean_abs = 36.8703`
+    - `aggregate psnr = 14.4899`
+    - `frame0 mean_abs = 36.0183`
+    - `frame60 mean_abs = 36.0531`
+    - `frame120 mean_abs = 40.0042`
+
+- 结论：
+  - 即使在 `denoising_av` 结束后直接注入 official final latents，最终视频仍然和 official 相差很大
+  - 所以当前“全部是噪点”的主因已经不在 denoise loop 主线，而是在 `denoising_av` 之后：
+    - `_post_denoising_loop`
+    - `_unpad_and_unpack_latents`
+    - 或 `LTX2AVDecodingStage` / VAE decode
+
+- 结合 overlay 现状的进一步判断：
+  - [materialize.py](/Users/mick/repos/sglang/python/sglang/multimodal_gen/model_overlays/ltx_2_3/_overlay/materialize.py)
+    现在仍然把 `vae/**` 从 `Lightricks/LTX-2` 整套拷过来
+  - `FastVideo/LTX-2.3-Distilled-Diffusers` 只被拿来做：
+    - `transformer/config.json`
+    - `text_encoder/config.json`
+    - `vae/ltx23_image_encoder/*`
+  - injected run 的结果说明：
+    - 仅修 image encoder 不够
+    - `LTX-2` donor VAE decode / latent layout 很可能仍然不符合 `LTX-2.3`
+
+- 当前精度对齐进度：75%
+  - 已完全排除：
+    - `denoising_av` 之前的输入层
+    - `step0/step1` 的主要 denoise 主线
+  - 当前首个未对齐的大阶段：
+    - `post-denoising latent -> unpack -> decode`
+  - 下一步：
+    - 优先对读官方 `LTX-2.3` decode 路径与当前 `LTX2AVDecodingStage`
+    - 重点核查 `vae` donor、latent unpack 布局、decode 前 denorm 语义
