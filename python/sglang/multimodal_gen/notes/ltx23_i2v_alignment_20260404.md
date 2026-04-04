@@ -228,3 +228,51 @@
 - 当前最可信的下一处主因：
   - official `FactoryGuidedDenoiser` / `MultiModalGuider.calculate()` 所驱动的 `cond / uncond / ptb / mod` pass 输出本身
   - 需要继续对拍 first forward 的 pass-level outputs，而不是继续改 timestep 来源
+
+## 2026-04-04 二分结果更新 4：first divergence 在 video cond pass，不在 guider combine
+
+- commit `ebe4d99aa Revert "Align LTX2 context mask handling"`
+  - 动作：
+    - 回滚 `encoder_attention_mask = None` 这轮实验
+  - 依据：
+    - 远端 H100 step0 compare 只带来边际变化：
+      - `video_denoised cosine: 0.5328 -> 0.5395`
+      - `audio_denoised cosine: -0.7826 -> -0.7834`
+    - 不是值得继续保留的主修复
+
+- commit `dd2aaf760 Add LTX2 I2V pass-level step dumps`
+  - 动作：
+    - 扩展 SGLang `runtime/pipelines_core/stages/denoising_av.py` 的 `step_dump`，额外记录
+      - `video/audio cond`
+      - `video/audio uncond`
+      - `video/audio ptb`
+      - `video/audio mod`
+    - 同时更新官方 native `official_i2v_step_dump.py` helper，在不改 upstream repo 的前提下，给 `FactoryGuidedDenoiser` 增加同样的 pass-level dump
+  - 远端 H100 pass-level compare 结果：
+    - `video_cond cosine = 0.3457`
+    - `video_uncond cosine = 0.2064`
+    - `video_ptb cosine = 0.2849`
+    - `video_mod cosine = 0.3415`
+    - `video_denoised cosine = 0.5328`
+    - `audio_cond cosine = 0.1390`
+    - `audio_uncond cosine = 0.6641`
+    - `audio_ptb cosine = 0.6437`
+    - `audio_mod cosine = 0.99965`
+    - `audio_denoised cosine = -0.7826`
+  - 结论：
+    - guider 的 combine 公式不是首个主因
+    - `video cond` 自身已经明显发散，说明第一次 conditioned forward 就不对
+    - `audio mod` 几乎完全对齐，说明 audio 单模态路径基本是对的；audio 的大偏差主要来自 cross-modality coupling
+    - 但 `video mod` 仍然明显发散，说明真正更靠前的 root cause 仍在 video 路径本身，而不是 only cross-modality guider/cross-attn combine
+
+- 当前精度对齐进度：62%
+  - 已完全对齐到的 stage：
+    - native example 输入语义
+    - prompt/image 请求层
+    - initial latent construction / step0 latent-before
+    - step0 guider pass-level 输出的“定位层级”
+  - 当前首个未对齐的大阶段：
+    - step0 第一次 video conditioned forward
+  - 下一步：
+    - 优先对读官方 `Modality(timesteps/positions/context_mask)` 语义和 SGLang video 路径的 `timestep_video / coords / i2v denoise_mask`
+    - 如有必要，再把 native dump 向前推进到 video transformer block0 的 cond/mod 路径
