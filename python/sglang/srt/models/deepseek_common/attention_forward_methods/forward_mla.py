@@ -517,6 +517,10 @@ class DeepseekMLAForwardMixin:
                 )
         output, _ = self.o_proj(attn_bmm_output)
 
+        if self.next_skip_topk is None:
+            return output
+
+        # Return topk_indices for the next layer when enabling index cache
         if not self.next_skip_topk:
             return output, None
         else:
