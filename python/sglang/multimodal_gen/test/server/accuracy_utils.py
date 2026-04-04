@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,7 +20,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.test.server.accuracy_config import (
     DEFAULT_TEXT_ENCODER_VOCAB_SIZE,
@@ -700,9 +701,24 @@ def _run_staged_native_component_accuracy_case(
             sgl = sgl.to(device=device, dtype=torch.bfloat16).eval()
         profile = resolve_component_native_profile(component)
         inputs = profile.build_inputs(case, sgl, device, ref)
+        runtime_server_args = get_global_server_args()
+        use_transformer_autocast = (
+            component == ComponentType.TRANSFORMER
+            and not runtime_server_args.disable_autocast
+            and torch.device(device).type != "cpu"
+        )
 
         sgl_call = profile.prepare_sglang_call(sgl, inputs)
-        with torch.no_grad():
+        sgl_autocast = (
+            torch.autocast(
+                device_type=torch.device(device).type,
+                dtype=torch.bfloat16,
+                enabled=True,
+            )
+            if use_transformer_autocast
+            else nullcontext()
+        )
+        with torch.no_grad(), sgl_autocast:
             sgl_raw = engine_cls._execute_with_native_hook(sgl_call)
         sgl_out = profile.normalize_sglang_output(sgl_raw)
         sgl_out = engine_cls._apply_output_transforms(sgl_out, sgl_call).detach().cpu()
@@ -715,7 +731,16 @@ def _run_staged_native_component_accuracy_case(
 
         ref = ref.to(device=device, dtype=torch.bfloat16).eval()
         ref_call = profile.prepare_reference_call(ref, inputs)
-        with torch.no_grad():
+        ref_autocast = (
+            torch.autocast(
+                device_type=torch.device(device).type,
+                dtype=torch.bfloat16,
+                enabled=True,
+            )
+            if use_transformer_autocast
+            else nullcontext()
+        )
+        with torch.no_grad(), ref_autocast:
             ref_raw = engine_cls._execute_with_native_hook(ref_call)
         ref_out = profile.normalize_reference_output(ref_raw)
         ref_out = engine_cls._apply_output_transforms(ref_out, ref_call).detach().cpu()
