@@ -90,6 +90,18 @@ default parameters when initializing and generating videos.
 | ERNIE-Image               | `baidu/ERNIE-Image`                                      |
 | ERNIE-Image-Turbo         | `baidu/ERNIE-Image-Turbo`                                |
 
+### Audio Generation Models
+
+| Model Name              | HuggingFace Model ID                        | Task                    | ODE Steps | Guidance |
+|:------------------------|:--------------------------------------------|:------------------------|:---------:|:--------:|
+| LongCat-AudioDiT 1B     | `meituan-longcat/LongCat-AudioDiT-1B`       | TTS / Voice Cloning     |    16     | CFG / APG |
+| LongCat-AudioDiT 3.5B   | `meituan-longcat/LongCat-AudioDiT-3.5B`     | TTS / Voice Cloning     |    16     | CFG / APG |
+
+**Note**:
+1. LongCat-AudioDiT requires `pip install librosa soundfile` for audio I/O.
+2. Voice cloning requires a reference audio file (`prompt_audio_path`) and its transcript (`prompt_text`).
+3. APG (Adaptive Projected Guidance) is an alternative to CFG and can be enabled with `--guidance-method apg`.
+
 ## Supported Components
 
 SGLang Diffusion supports overriding individual pipeline components with
