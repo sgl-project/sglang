@@ -142,6 +142,31 @@ class LTX2AVDenoisingStage(DenoisingStage):
         return pred * factor
 
     @staticmethod
+    def _prepare_ltx2_ti2v_clean_state(
+        latents: torch.Tensor,
+        image_latent: torch.Tensor,
+        num_img_tokens: int,
+        zero_clean_latent: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        latents = latents.clone()
+        conditioned = image_latent[:, :num_img_tokens, :].to(
+            device=latents.device, dtype=latents.dtype
+        )
+        latents[:, :num_img_tokens, :] = conditioned
+        denoise_mask = torch.ones(
+            (latents.shape[0], latents.shape[1], 1),
+            device=latents.device,
+            dtype=torch.float32,
+        )
+        denoise_mask[:, :num_img_tokens, :] = 0.0
+        if zero_clean_latent:
+            clean_latent = torch.zeros_like(latents)
+        else:
+            clean_latent = latents.detach().clone()
+        clean_latent[:, :num_img_tokens, :] = conditioned
+        return latents, denoise_mask, clean_latent
+
+    @staticmethod
     def _ltx2_step_dump_dir(step_index: int) -> Path | None:
         dump_dir = os.environ.get("SGLANG_DIFFUSION_LTX2_STEP_DUMP_DIR")
         if not dump_dir:
@@ -575,19 +600,19 @@ class LTX2AVDenoisingStage(DenoisingStage):
         if do_ti2v:
             if not (isinstance(latents, torch.Tensor) and latents.ndim == 3):
                 raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")
-            latents[:, :num_img_tokens, :] = batch.image_latent[
-                :, :num_img_tokens, :
-            ].to(device=latents.device, dtype=latents.dtype)
-            denoise_mask = torch.ones(
-                (latents.shape[0], latents.shape[1], 1),
-                device=latents.device,
-                dtype=torch.float32,
+            use_zero_clean_latent = bool(
+                getattr(
+                    server_args.pipeline_config.vae_config.arch_config,
+                    "use_official_image_encoder",
+                    False,
+                )
             )
-            denoise_mask[:, :num_img_tokens, :] = 0.0
-            clean_latent = latents.detach().clone()
-            clean_latent[:, :num_img_tokens, :] = batch.image_latent[
-                :, :num_img_tokens, :
-            ].to(device=latents.device, dtype=latents.dtype)
+            latents, denoise_mask, clean_latent = self._prepare_ltx2_ti2v_clean_state(
+                latents=latents,
+                image_latent=batch.image_latent,
+                num_img_tokens=num_img_tokens,
+                zero_clean_latent=use_zero_clean_latent,
+            )
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,

@@ -143,6 +143,42 @@ def test_ltx23_stage1_guider_params_apply_to_one_stage_path():
     )
 
 
+def test_ltx23_ti2v_clean_latent_uses_zero_background():
+    latents = torch.arange(24, dtype=torch.float32).view(1, 6, 4)
+    image_latent = torch.full((1, 2, 4), 99.0)
+
+    conditioned, denoise_mask, clean_latent = (
+        LTX2AVDenoisingStage._prepare_ltx2_ti2v_clean_state(
+            latents=latents,
+            image_latent=image_latent,
+            num_img_tokens=2,
+            zero_clean_latent=True,
+        )
+    )
+
+    assert torch.equal(conditioned[:, :2], image_latent)
+    assert torch.equal(clean_latent[:, :2], image_latent)
+    assert torch.equal(clean_latent[:, 2:], torch.zeros_like(clean_latent[:, 2:]))
+    assert torch.equal(denoise_mask[:, :2], torch.zeros_like(denoise_mask[:, :2]))
+    assert torch.equal(denoise_mask[:, 2:], torch.ones_like(denoise_mask[:, 2:]))
+
+
+def test_ltx2_ti2v_clean_latent_keeps_legacy_background_when_requested():
+    latents = torch.arange(24, dtype=torch.float32).view(1, 6, 4)
+    image_latent = torch.full((1, 2, 4), 99.0)
+
+    conditioned, _, clean_latent = LTX2AVDenoisingStage._prepare_ltx2_ti2v_clean_state(
+        latents=latents,
+        image_latent=image_latent,
+        num_img_tokens=2,
+        zero_clean_latent=False,
+    )
+
+    assert torch.equal(conditioned[:, :2], image_latent)
+    assert torch.equal(clean_latent[:, :2], image_latent)
+    assert torch.equal(clean_latent[:, 2:], latents[:, 2:])
+
+
 def test_pack_text_embeds_v2_masks_padding():
     hidden_states = torch.tensor(
         [
