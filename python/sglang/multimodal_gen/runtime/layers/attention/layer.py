@@ -361,6 +361,17 @@ class USPAttention(nn.Module):
         attn_backend = get_attn_backend(
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
+        if get_ring_parallel_world_size() > 1:
+            backend_enum = attn_backend.get_enum()
+            if backend_enum not in (
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.SAGE_ATTN,
+            ):
+                raise RuntimeError(
+                    f"Ring Attention is only supported for FlashAttention or SageAttention backends, "
+                    f"but got {backend_enum.name}. "
+                    f"Please ensure your platform supports these backends."
+                )
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
         self.attn_impl = impl_cls(
             num_heads=num_heads,
