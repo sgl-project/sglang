@@ -73,9 +73,14 @@ wget -O "${ASSET_DIR}/mova_single_person.jpg" \
 
 All commands include `--warmup` and `--enable-torch-compile` for real production performance. Add `--perf-dump-path <file>.json` for machine-readable output.
 
-Nightly diffusion comparison is server/API based (`sglang serve` + OpenAI-compatible requests). The commands below stay on `sglang generate` for local profiling, but the first 8 presets are aligned to nightly on model, prompt, reference image, steps, guidance scale, GPU count, and parallelism flags.
+Nightly diffusion comparison is server/API based (`sglang serve` + OpenAI-compatible requests). The commands below stay on `sglang generate` for local profiling, but the first 9 presets are aligned to nightly on model, prompt, negative prompt, reference image, size, frames, fps, seed, GPU count, and any explicitly overridden sampling or parallelism flags.
 
 If you want a checked-in preset runner instead of copying commands manually, use `scripts/bench_diffusion_denoise.py --model <preset> --label <name>` or `--list-models`. It writes the same perf dump JSONs used by `compare_perf.py`.
+
+For Wan2.2 video models, remember the difference between **nightly alignment** and **best latency tuning**:
+- the nightly-aligned 4-GPU commands intentionally keep `--enable-cfg-parallel --ulysses-degree=2` so CFG and ring behavior stay covered
+- do not assume that is the fastest topology
+- for pure latency tuning, benchmark pure Ulysses too, for example `--ulysses-degree=4 --ring-degree=1` on 4 GPUs, and on 8 GPUs compare pure `--ulysses-degree=8` against `--enable-cfg-parallel --ulysses-degree=4`
 
 ### Preset Catalog
 
@@ -90,6 +95,7 @@ Nightly-aligned presets come first; skill-only presets stay available after them
 | `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Aligned to nightly prompt + guidance 4.0 |
 | `wan-t2v` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Yes: `wan22_t2v_a14b_720p` | Aligned to nightly CFG-parallel 4-GPU launch |
 | `wan-ti2v` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Yes: `wan22_ti2v_5b_720p` | Uses nightly cat image + motion prompt |
+| `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | Uses `LTX2TwoStagePipeline`; nightly-aligned prompt, negative prompt, 1536x1024, 121 frames, fps 24, seed 1234 |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Added to match nightly; aligned to CFG-parallel 4-GPU launch |
 | `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only extra preset |
 | `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
@@ -189,6 +195,21 @@ sglang generate \
   --enable-torch-compile --warmup
 ```
 
+### LTX-2 Two-Stage (Nightly: `ltx2_twostage_t2v`)
+```bash
+sglang generate \
+  --model-path=Lightricks/LTX-2 \
+  --pipeline-class-name=LTX2TwoStagePipeline \
+  --prompt="A beautiful sunset over the ocean" \
+  --negative-prompt="shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
+  --width=1536 --height=1024 \
+  --num-frames=121 --fps=24 \
+  --seed=1234 --num-gpus=1 \
+  --save-output --enable-torch-compile --warmup
+```
+
+Note: after [PR #20707](https://github.com/sgl-project/sglang/pull/20707), `LTX2TwoStagePipeline` is a first-class native path. The spatial upsampler and distilled LoRA are auto-resolved from the same model snapshot unless you explicitly override them.
+
 ### Wan2.2-I2V-A14B 720P (Nightly: `wan22_i2v_a14b_720p`)
 ```bash
 # Select four idle GPUs first:
@@ -203,6 +224,10 @@ sglang generate \
   --text-encoder-cpu-offload --pin-cpu-memory \
   --warmup --enable-torch-compile
 ```
+
+Behavior note: after [PR #21390](https://github.com/sgl-project/sglang/pull/21390), `Wan2.2-I2V-A14B` now uses the 720p max-area config by default, and explicit `--width/--height` overrides control the **target area** while preserving the **reference image aspect ratio**.
+
+Performance note: this nightly-aligned command keeps `u2/ring2` behavior covered via `--enable-cfg-parallel --ulysses-degree=2`. For pure speed tuning, benchmark pure Ulysses as well instead of assuming the nightly topology is optimal.
 
 ### HunyuanVideo (Skill-only, not nightly)
 ```bash

@@ -35,19 +35,29 @@ Prefer reuse before writing a new Triton or CUDA kernel.
 - Constraints: `D % 256 == 0` and `D <= 8192`. `x/residual/gate/scale/shift` must pass shape and stride validation. Dtypes limited to fp16/bf16/fp32.
 - Behavior: CuTe DSL compilation cached by `(dtype, ndim, D, norm_type)`. `None` tensors replaced by scalar placeholders. If constraints fail, `layernorm.py` warns and falls back to native PyTorch.
 
-3. Triton LayerNorm/RMSNorm fusion
+3. Z-Image fused tanh/gate modulation (merged from PR #18762)
+- Kernels: `fused_norm_tanh_mul_add`, `fused_norm_tanh_mul_add_norm_scale`
+- Locations: `layernorm.py`, `cutedsl/norm_tanh_mul_add_norm_scale.py`, `zimage.py`
+- Use cases:
+  - `y = tanh(gate) * norm(x) + shift`
+  - `y, y2 = tanh(gate) * norm(x) + shift`, then `y2 = norm(y) * (1 + scale)`
+- Constraints: same CuTe DSL envelope as the norm+scale/shift family in practice: contiguous last dim, fp16/bf16/fp32, and `D % 256 == 0`, `D <= 8192`.
+- Validation: `python/sglang/jit_kernel/tests/test_norm_tanh_mul_add_norm_scale.py`
+- Behavior: this is already a merged fast path, so if Z-Image traces show the unfused chain, treat it as a missing or regressed existing optimization before proposing a new kernel.
+
+4. Triton LayerNorm/RMSNorm fusion
 - Kernels: `rms_norm_fn`, `layer_norm_fn`, `norm_infer`
 - Locations: `triton/norm.py`, `layernorm.py`
 - Use cases: fp32 RMSNorm with residual/dropout/rowscale/x1 branches, and inference-friendly `norm_infer`.
 - Constraints: last dim must be contiguous, and `N * element_size < 64KB`.
 
-4. Triton one-pass RMSNorm (small hidden size fast path)
+5. Triton one-pass RMSNorm (small hidden size fast path)
 - Kernel: `triton_one_pass_rms_norm`
 - Locations: `triton/rmsnorm_onepass.py`, `layernorm.py`
 - Use case: `hidden_size <= 128` in `RMSNorm.forward_cuda`.
 - `torch.compile` note: keep this path behind the custom-op wrapper in `rmsnorm_onepass.py`; direct `wrap_triton` can recompile on dynamic row counts.
 
-5. Triton RoPE fusion
+6. Triton RoPE fusion
 - Kernel: `apply_rotary_embedding`
 - Locations: `triton/rotary.py`, `rotary_embedding/utils.py`
 - Use case: GPT-J style RoPE when not Neox.
@@ -86,6 +96,7 @@ Prefer reuse before writing a new Triton or CUDA kernel.
 **Common Entry Points in Diffusion Models**
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Qwen-Image gating: `fuse_scale_shift_gate_select01_kernel` in `qwen_image.py`.
+- Z-Image residual-form modulation: `fused_norm_tanh_mul_add` and `fused_norm_tanh_mul_add_norm_scale` in `zimage.py`.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - RoPE: `_apply_rotary_emb` prefers Triton; Q/K RoPE prefers FlashInfer when present.
 
