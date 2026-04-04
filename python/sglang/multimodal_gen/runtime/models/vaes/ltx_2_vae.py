@@ -621,6 +621,64 @@ class LTX2VideoMidBlock3d(nn.Module):
         return hidden_states
 
 
+class LTX23VideoMidBlock3d(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        resnet_eps: float = 1e-6,
+        resnet_act_fn: str = "swish",
+        inject_noise: bool = False,
+        timestep_conditioning: bool = False,
+        spatial_padding_mode: str = "zeros",
+    ) -> None:
+        super().__init__()
+
+        self.time_embedder = None
+        if timestep_conditioning:
+            self.time_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(
+                in_channels * 4, 0
+            )
+
+        self.res_blocks = nn.ModuleList(
+            [
+                LTX2VideoResnetBlock3d(
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    dropout=dropout,
+                    eps=resnet_eps,
+                    non_linearity=resnet_act_fn,
+                    inject_noise=inject_noise,
+                    timestep_conditioning=timestep_conditioning,
+                    spatial_padding_mode=spatial_padding_mode,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+        causal: bool = True,
+    ) -> torch.Tensor:
+        if self.time_embedder is not None:
+            temb = self.time_embedder(
+                timestep=temb.flatten(),
+                resolution=None,
+                aspect_ratio=None,
+                batch_size=hidden_states.size(0),
+                hidden_dtype=hidden_states.dtype,
+            )
+            temb = temb.view(hidden_states.size(0), -1, 1, 1, 1)
+
+        for res_block in self.res_blocks:
+            hidden_states = res_block(hidden_states, temb, causal=causal)
+
+        return hidden_states
+
+
 # Like LTXVideoUpBlock3d but with no conv_in and the updated LTX2VideoResnetBlock3d
 class LTX2VideoUpBlock3d(nn.Module):
     r"""
@@ -1126,7 +1184,7 @@ def _make_ltx23_decoder_block(
 ) -> tuple[nn.Module, int]:
     out_channels = in_channels
     if block_name == "res_x":
-        block = LTX2VideoMidBlock3d(
+        block = LTX23VideoMidBlock3d(
             in_channels=in_channels,
             num_layers=int(block_config["num_layers"]),
             resnet_eps=resnet_norm_eps,
@@ -1262,7 +1320,7 @@ class LTX23VideoDecoder3d(nn.Module):
             temb = temb * self.timestep_scale_multiplier
 
         for up_block in self.up_blocks:
-            if isinstance(up_block, LTX2VideoMidBlock3d):
+            if isinstance(up_block, LTX23VideoMidBlock3d):
                 hidden_states = up_block(hidden_states, temb, causal=causal)
             elif isinstance(up_block, LTX2VideoResnetBlock3d):
                 hidden_states = up_block(hidden_states, None, causal=causal)
