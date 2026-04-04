@@ -1,10 +1,8 @@
 import copy
 import json
 import math
-import os
 import time
 from io import BytesIO
-from pathlib import Path
 
 import av
 import numpy as np
@@ -15,6 +13,9 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    is_ltx23_native_variant,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
     LTX23VideoConditionEncoder,
@@ -178,262 +179,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 sigma = sigma.unsqueeze(-1)
             return (sample.float() - sigma * velocity.float()).to(sample.dtype)
         return (sample.float() - float(sigma) * velocity.float()).to(sample.dtype)
-
-    @staticmethod
-    def _ltx2_step_dump_dir(step_index: int) -> Path | None:
-        dump_dir = os.environ.get("SGLANG_DIFFUSION_LTX2_STEP_DUMP_DIR")
-        if not dump_dir:
-            return None
-        target_step = int(os.environ.get("SGLANG_DIFFUSION_LTX2_STEP_DUMP_INDEX", "-1"))
-        if step_index != target_step:
-            return None
-        path = Path(dump_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    @staticmethod
-    def _ltx2_dump_step_tensors(
-        dump_dir: Path,
-        *,
-        step_index: int,
-        stage: str,
-        sigma: float,
-        latents_before: torch.Tensor,
-        denoised_video: torch.Tensor,
-        latents_after: torch.Tensor,
-        audio_latents_before: torch.Tensor | None,
-        denoised_audio: torch.Tensor | None,
-        audio_latents_after: torch.Tensor | None,
-        video_cond: torch.Tensor | None = None,
-        video_uncond: torch.Tensor | None = None,
-        video_ptb: torch.Tensor | None = None,
-        video_mod: torch.Tensor | None = None,
-        audio_cond: torch.Tensor | None = None,
-        audio_uncond: torch.Tensor | None = None,
-        audio_ptb: torch.Tensor | None = None,
-        audio_mod: torch.Tensor | None = None,
-        video_clean_latent: torch.Tensor | None = None,
-        video_denoise_mask: torch.Tensor | None = None,
-        image_latent: torch.Tensor | None = None,
-    ) -> None:
-        torch.save(
-            {
-                "stage": stage,
-                "step_index": step_index,
-                "sigma": sigma,
-                "video_latent_before": latents_before.detach().cpu(),
-                "video_denoised": denoised_video.detach().cpu(),
-                "video_latent_after": latents_after.detach().cpu(),
-                "audio_latent_before": (
-                    None
-                    if audio_latents_before is None
-                    else audio_latents_before.detach().cpu()
-                ),
-                "audio_denoised": (
-                    None if denoised_audio is None else denoised_audio.detach().cpu()
-                ),
-                "audio_latent_after": (
-                    None
-                    if audio_latents_after is None
-                    else audio_latents_after.detach().cpu()
-                ),
-                "video_cond": None if video_cond is None else video_cond.detach().cpu(),
-                "video_uncond": (
-                    None if video_uncond is None else video_uncond.detach().cpu()
-                ),
-                "video_ptb": None if video_ptb is None else video_ptb.detach().cpu(),
-                "video_mod": None if video_mod is None else video_mod.detach().cpu(),
-                "audio_cond": None if audio_cond is None else audio_cond.detach().cpu(),
-                "audio_uncond": (
-                    None if audio_uncond is None else audio_uncond.detach().cpu()
-                ),
-                "audio_ptb": None if audio_ptb is None else audio_ptb.detach().cpu(),
-                "audio_mod": None if audio_mod is None else audio_mod.detach().cpu(),
-                "video_clean_latent": (
-                    None
-                    if video_clean_latent is None
-                    else video_clean_latent.detach().cpu()
-                ),
-                "video_denoise_mask": (
-                    None
-                    if video_denoise_mask is None
-                    else video_denoise_mask.detach().cpu()
-                ),
-                "image_latent": (
-                    None if image_latent is None else image_latent.detach().cpu()
-                ),
-            },
-            dump_dir / f"{stage}_step{step_index}.pt",
-        )
-
-    @staticmethod
-    def _ltx2_maybe_load_injected_latents(
-        latents: torch.Tensor,
-        audio_latents: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        inject_path = os.environ.get(
-            "SGLANG_DIFFUSION_LTX2_POST_DENOISE_INJECT_PATH"
-        )
-        if not inject_path:
-            return latents, audio_latents
-
-        payload = torch.load(inject_path, map_location="cpu")
-        if not isinstance(payload, dict):
-            raise ValueError(
-                f"Expected injected latent payload at {inject_path} to be a dict."
-            )
-
-        injected_video = payload.get("video_latent_after", payload.get("video_latents"))
-        if not isinstance(injected_video, torch.Tensor):
-            raise ValueError(
-                f"Injected latent payload at {inject_path} is missing `video_latent_after`."
-            )
-        if tuple(injected_video.shape) != tuple(latents.shape):
-            raise ValueError(
-                "Injected video latents shape mismatch: "
-                f"expected {tuple(latents.shape)}, got {tuple(injected_video.shape)}."
-            )
-
-        injected_audio = payload.get("audio_latent_after", payload.get("audio_latents"))
-        if audio_latents is None:
-            if injected_audio is not None:
-                logger.warning(
-                    "Ignoring injected audio latents from %s because request has no audio latents.",
-                    inject_path,
-                )
-        elif injected_audio is None:
-            logger.warning(
-                "Injected latent payload at %s has no audio latents; keeping native audio latents.",
-                inject_path,
-            )
-        elif not isinstance(injected_audio, torch.Tensor):
-            raise ValueError(
-                f"Injected audio latents at {inject_path} must be a tensor when provided."
-            )
-        elif tuple(injected_audio.shape) != tuple(audio_latents.shape):
-            raise ValueError(
-                "Injected audio latents shape mismatch: "
-                f"expected {tuple(audio_latents.shape)}, got {tuple(injected_audio.shape)}."
-            )
-
-        logger.info("Injecting post-denoising LTX2 latents from %s", inject_path)
-        latents = injected_video.to(device=latents.device, dtype=latents.dtype)
-        if audio_latents is not None and isinstance(injected_audio, torch.Tensor):
-            audio_latents = injected_audio.to(
-                device=audio_latents.device, dtype=audio_latents.dtype
-            )
-        return latents, audio_latents
-
-    @staticmethod
-    def _ltx2_maybe_inject_pre_denoise_state(
-        batch: Req,
-        latents: torch.Tensor,
-        audio_latents: torch.Tensor | None,
-        clean_latent: torch.Tensor | None,
-        denoise_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        inject_path = os.environ.get(
-            "SGLANG_DIFFUSION_LTX2_PRE_DENOISE_INJECT_PATH"
-        )
-        if not inject_path:
-            return latents, audio_latents, clean_latent, denoise_mask
-
-        payload = torch.load(inject_path, map_location="cpu")
-        if not isinstance(payload, dict):
-            raise ValueError(
-                f"Expected pre-denoise injected payload at {inject_path} to be a dict."
-            )
-
-        def _maybe_override_tensor(
-            current: torch.Tensor | None,
-            key: str,
-            *,
-            required: bool = False,
-        ) -> torch.Tensor | None:
-            value = payload.get(key)
-            if value is None:
-                if required:
-                    raise ValueError(
-                        f"Injected pre-denoise payload at {inject_path} is missing `{key}`."
-                    )
-                return current
-            if not isinstance(value, torch.Tensor):
-                raise ValueError(
-                    f"Injected pre-denoise payload field `{key}` at {inject_path} must be a tensor."
-                )
-            if current is not None and tuple(value.shape) != tuple(current.shape):
-                raise ValueError(
-                    f"Injected pre-denoise tensor `{key}` shape mismatch: "
-                    f"expected {tuple(current.shape)}, got {tuple(value.shape)}."
-                )
-            if current is None:
-                return value
-            return value.to(device=current.device, dtype=current.dtype)
-
-        def _maybe_override_batch_tensor(
-            attr: str,
-            key: str,
-            *,
-            is_list: bool = False,
-        ) -> None:
-            current = getattr(batch, attr, None)
-            if is_list:
-                current_tensor = current[0] if isinstance(current, list) and current else None
-            else:
-                current_tensor = current
-            injected = _maybe_override_tensor(current_tensor, key, required=False)
-            if injected is None:
-                return
-            if current_tensor is not None:
-                injected = injected.to(
-                    device=current_tensor.device, dtype=current_tensor.dtype
-                )
-            if is_list:
-                setattr(batch, attr, [injected])
-            else:
-                setattr(batch, attr, injected)
-
-        latents = _maybe_override_tensor(
-            latents, "video_latent_before", required=True
-        )
-        audio_latents = _maybe_override_tensor(
-            audio_latents, "audio_latent_before", required=audio_latents is not None
-        )
-        clean_latent = _maybe_override_tensor(clean_latent, "video_clean_latent")
-        denoise_mask = _maybe_override_tensor(denoise_mask, "video_denoise_mask")
-        image_latent = _maybe_override_tensor(
-            batch.image_latent if isinstance(batch.image_latent, torch.Tensor) else None,
-            "image_latent",
-        )
-        if image_latent is not None:
-            current_image_latent = batch.image_latent
-            if isinstance(current_image_latent, torch.Tensor):
-                image_latent = image_latent.to(
-                    device=current_image_latent.device, dtype=current_image_latent.dtype
-                )
-            batch.image_latent = image_latent
-
-        _maybe_override_batch_tensor("prompt_embeds", "prompt_embeds", is_list=True)
-        _maybe_override_batch_tensor(
-            "audio_prompt_embeds", "audio_prompt_embeds", is_list=True
-        )
-        _maybe_override_batch_tensor(
-            "negative_prompt_embeds", "negative_prompt_embeds", is_list=True
-        )
-        _maybe_override_batch_tensor(
-            "negative_audio_prompt_embeds",
-            "negative_audio_prompt_embeds",
-            is_list=True,
-        )
-        _maybe_override_batch_tensor(
-            "prompt_attention_mask", "prompt_attention_mask", is_list=False
-        )
-        _maybe_override_batch_tensor(
-            "negative_attention_mask", "negative_attention_mask", is_list=False
-        )
-
-        logger.info("Injecting pre-denoising LTX2 state from %s", inject_path)
-        return latents, audio_latents, clean_latent, denoise_mask
 
     @classmethod
     def _ltx2_calculate_guided_x0(
@@ -782,12 +527,8 @@ class LTX2AVDenoisingStage(DenoisingStage):
         if do_ti2v:
             if not (isinstance(latents, torch.Tensor) and latents.ndim == 3):
                 raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")
-            use_zero_clean_latent = bool(
-                getattr(
-                    server_args.pipeline_config.vae_config.arch_config,
-                    "use_official_image_encoder",
-                    False,
-                )
+            use_zero_clean_latent = is_ltx23_native_variant(
+                server_args.pipeline_config.vae_config.arch_config
             )
             latents, denoise_mask, clean_latent = self._prepare_ltx2_ti2v_clean_state(
                 latents=latents,
@@ -795,18 +536,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 num_img_tokens=num_img_tokens,
                 zero_clean_latent=use_zero_clean_latent,
             )
-        (
-            latents,
-            audio_latents,
-            clean_latent,
-            denoise_mask,
-        ) = self._ltx2_maybe_inject_pre_denoise_state(
-            batch=batch,
-            latents=latents,
-            audio_latents=audio_latents,
-            clean_latent=clean_latent,
-            denoise_mask=denoise_mask,
-        )
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=target_dtype,
@@ -847,13 +576,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             device=latents.device, dtype=torch.float32
                         )
                         dt = sigma_next - sigma
-                        step_dump_dir = self._ltx2_step_dump_dir(i)
-                        latents_before_dump = (
-                            latents if step_dump_dir is not None else None
-                        )
-                        audio_latents_before_dump = (
-                            audio_latents if step_dump_dir is not None else None
-                        )
 
                         latent_model_input = latents.to(target_dtype)
                         audio_latent_model_input = audio_latents.to(target_dtype)
@@ -1307,30 +1029,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         audio_latents = (
                             audio_latents.float() + v_audio.float() * dt
                         ).to(dtype=audio_latents.dtype)
-                        if step_dump_dir is not None:
-                            self._ltx2_dump_step_tensors(
-                                step_dump_dir,
-                                step_index=i,
-                                stage=stage,
-                                sigma=sigma_val,
-                                latents_before=latents_before_dump,
-                                denoised_video=denoised_video,
-                                latents_after=latents,
-                                audio_latents_before=audio_latents_before_dump,
-                                denoised_audio=denoised_audio,
-                                audio_latents_after=audio_latents,
-                                video_cond=denoised_video_cond,
-                                video_uncond=denoised_video_neg,
-                                video_ptb=denoised_video_perturbed,
-                                video_mod=denoised_video_modality,
-                                audio_cond=denoised_audio_cond,
-                                audio_uncond=denoised_audio_neg,
-                                audio_ptb=denoised_audio_perturbed,
-                                audio_mod=denoised_audio_modality,
-                                video_clean_latent=clean_latent,
-                                video_denoise_mask=denoise_mask,
-                                image_latent=batch.image_latent,
-                            )
 
                         latents = self.post_forward_for_ti2v_task(
                             batch, server_args, reserved_frames_mask, latents, z
@@ -1394,10 +1092,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
         else:
             trajectory_tensor = None
             trajectory_timesteps_tensor = None
-
-        latents, batch.audio_latents = self._ltx2_maybe_load_injected_latents(
-            latents, batch.audio_latents
-        )
 
         latents, trajectory_tensor = self._postprocess_sp_latents(
             batch, latents, trajectory_tensor

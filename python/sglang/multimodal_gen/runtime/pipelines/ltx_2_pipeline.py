@@ -5,6 +5,9 @@ import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    is_ltx23_native_variant,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
@@ -86,13 +89,7 @@ def calculate_ltx2_shift(
 
 
 def prepare_ltx2_mu(batch: Req, server_args: ServerArgs):
-    if bool(
-        getattr(
-            server_args.pipeline_config.vae_config.arch_config,
-            "use_official_image_encoder",
-            False,
-        )
-    ):
+    if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
         return "mu", None
     latent_num_frames = (int(batch.num_frames) - 1) // int(
         server_args.pipeline_config.vae_temporal_compression
@@ -141,13 +138,7 @@ class LTX2SigmaPreparationStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage1"
-        if bool(
-            getattr(
-                server_args.pipeline_config.vae_config.arch_config,
-                "use_official_image_encoder",
-                False,
-            )
-        ):
+        if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
             batch.sigmas = build_official_ltx2_sigmas(int(batch.num_inference_steps))
         else:
             batch.sigmas = np.linspace(

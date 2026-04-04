@@ -9,6 +9,8 @@ from safetensors.torch import save_file
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     _gemma_postprocess_func,
+    is_ltx23_native_variant,
+    pack_text_embeds,
     pack_text_embeds_v2,
 )
 from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
@@ -36,6 +38,7 @@ from sglang.multimodal_gen.runtime.models.vocoder.ltx_2_vocoder import LTX2Vocod
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
     LTX2SigmaPreparationStage,
+    _resolve_ltx2_two_stage_component_paths,
     build_official_ltx2_sigmas,
     prepare_ltx2_mu,
 )
@@ -146,6 +149,16 @@ def test_ltx23_sigma_preparation_uses_official_schedule_only_for_ltx23_marker():
     assert abs(legacy_batch.sigmas[1] - (29.0 / 30.0)) < 1e-6
 
 
+def test_ltx23_native_variant_uses_explicit_marker_when_present():
+    ltx23_arch = SimpleNamespace(ltx_variant="ltx_2_3")
+    legacy_arch = SimpleNamespace(ltx_variant="ltx_2")
+    fallback_arch = SimpleNamespace(use_official_image_encoder=True)
+
+    assert is_ltx23_native_variant(ltx23_arch) is True
+    assert is_ltx23_native_variant(legacy_arch) is False
+    assert is_ltx23_native_variant(fallback_arch) is True
+
+
 def test_ltx23_skips_mu_when_using_official_sigma_schedule():
     req = Req(
         sampling_params=SamplingParams(num_frames=121, height=512, width=768),
@@ -161,6 +174,30 @@ def test_ltx23_skips_mu_when_using_official_sigma_schedule():
     )
 
     assert prepare_ltx2_mu(req, ltx23_server_args) == ("mu", None)
+
+
+def test_ltx2_legacy_mu_still_uses_shift_schedule():
+    req = Req(
+        sampling_params=SamplingParams(num_frames=121, height=512, width=768),
+        prompt="prompt",
+        prompt_embeds=[torch.zeros(1, 1, 1)],
+    )
+    legacy_server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    temporal_compression_ratio=8,
+                    spatial_compression_ratio=32,
+                )
+            )
+        )
+    )
+
+    key, mu = prepare_ltx2_mu(req, legacy_server_args)
+
+    assert key == "mu"
+    assert isinstance(mu, float)
+    assert mu > 0.0
 
 
 def test_ltx23_prepare_request_sets_stage1_guider_defaults():
@@ -265,31 +302,6 @@ def test_ltx23_velocity_to_x0_supports_tokenwise_sigma():
     assert torch.allclose(denoised, expected)
 
 
-def test_ltx23_post_denoise_injection_overrides_latents(tmp_path):
-    inject_path = tmp_path / "official_final.pt"
-    torch.save(
-        {
-            "video_latent_after": torch.full((1, 2, 3), 7.0, dtype=torch.float32),
-            "audio_latent_after": torch.full((1, 4, 5), 9.0, dtype=torch.float32),
-        },
-        inject_path,
-    )
-    os.environ["SGLANG_DIFFUSION_LTX2_POST_DENOISE_INJECT_PATH"] = str(inject_path)
-
-    try:
-        latents, audio_latents = LTX2AVDenoisingStage._ltx2_maybe_load_injected_latents(
-            torch.zeros((1, 2, 3), dtype=torch.float32),
-            torch.zeros((1, 4, 5), dtype=torch.float32),
-        )
-    finally:
-        os.environ.pop("SGLANG_DIFFUSION_LTX2_POST_DENOISE_INJECT_PATH", None)
-
-    assert torch.equal(latents, torch.full((1, 2, 3), 7.0, dtype=torch.float32))
-    assert torch.equal(
-        audio_latents, torch.full((1, 4, 5), 9.0, dtype=torch.float32)
-    )
-
-
 def test_pack_text_embeds_v2_masks_padding():
     hidden_states = torch.tensor(
         [
@@ -331,6 +343,32 @@ def test_ltx23_gemma_postprocess_uses_v2_norm():
 
     expected = torch.tensor([[[0.6, 0.8]]], dtype=packed.dtype, device=packed.device)
     assert torch.allclose(packed, expected, atol=1e-6)
+
+
+def test_ltx2_gemma_postprocess_keeps_legacy_pack_path():
+    hidden_state = torch.tensor(
+        [
+            [
+                [1.0, 3.0],
+                [2.0, 4.0],
+            ]
+        ]
+    )
+    outputs = SimpleNamespace(hidden_states=(hidden_state,))
+    text_inputs = {"attention_mask": torch.tensor([[1]])}
+    pipeline_config = SimpleNamespace(
+        dit_config=SimpleNamespace(
+            arch_config=SimpleNamespace(caption_proj_before_connector=False)
+        )
+    )
+
+    packed = _gemma_postprocess_func(outputs, text_inputs, pipeline_config)
+    expected = pack_text_embeds(
+        torch.stack(outputs.hidden_states, dim=-1),
+        text_inputs["attention_mask"].sum(dim=-1),
+        padding_side="left",
+    )
+    assert torch.allclose(packed, expected)
 
 
 def test_ltx23_connector_repack_renames_qk_norm_keys():
@@ -391,6 +429,7 @@ def test_ltx23_vae_config_adds_official_image_encoder_marker():
 
     assert config["encoder_spatial_padding_mode"] == "zeros"
     assert config["decoder_spatial_padding_mode"] == "reflect"
+    assert config["ltx_variant"] == "ltx_2_3"
     assert config["use_official_image_encoder"] is True
     assert config["official_image_encoder_subdir"] == "ltx23_image_encoder"
     assert config["use_official_video_decoder"] is True
@@ -480,6 +519,32 @@ def test_ltx23_decode_skips_external_denorm():
         )
         is True
     )
+
+
+def test_ltx2_two_stage_component_auto_resolution_preserves_legacy_candidates(tmp_path):
+    model_path = str(tmp_path)
+    legacy_spatial = tmp_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
+    legacy_lora = tmp_path / "ltx-2-19b-distilled-lora-384.safetensors"
+    legacy_spatial.touch()
+    legacy_lora.touch()
+
+    resolved = _resolve_ltx2_two_stage_component_paths(model_path, {})
+
+    assert resolved["spatial_upsampler"] == str(legacy_spatial)
+    assert resolved["distilled_lora"] == str(legacy_lora)
+
+
+def test_ltx23_two_stage_component_auto_resolution_prefers_23_assets(tmp_path):
+    model_path = str(tmp_path)
+    spatial = tmp_path / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    lora = tmp_path / "ltx-2.3-22b-distilled-lora-384.safetensors"
+    spatial.touch()
+    lora.touch()
+
+    resolved = _resolve_ltx2_two_stage_component_paths(model_path, {})
+
+    assert resolved["spatial_upsampler"] == str(spatial)
+    assert resolved["distilled_lora"] == str(lora)
 
 
 def test_ltx23_vocoder_uses_bwe_config():

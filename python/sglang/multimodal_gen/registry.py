@@ -157,7 +157,18 @@ def _discover_and_register_pipelines():
         package.__path__, package.__name__ + "."
     ):
         if not ispkg:
-            pipeline_module = importlib.import_module(module_name)
+            try:
+                pipeline_module = importlib.import_module(module_name)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping pipeline module %s during discovery due to import failure: %s",
+                    module_name,
+                    exc,
+                )
+                logger.debug(
+                    "Pipeline import failure details for %s", module_name, exc_info=True
+                )
+                continue
             if hasattr(pipeline_module, "EntryClass"):
                 entry_cls = pipeline_module.EntryClass
                 entry_cls_list = (
