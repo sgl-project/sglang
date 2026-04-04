@@ -173,6 +173,89 @@ class TestEnableThinking(CustomTestCase):
         self.assertNotIn("thinking_delta", delta_types)
         self.assertNotIn("signature_delta", delta_types)
 
+    def test_anthropic_messages_with_thinking_blocks(self):
+        response = requests.post(
+            f"{self.base_url}/v1/messages",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "max_tokens": 256,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Solve carefully and return only the final answer: What is 27 * 14?",
+                    }
+                ],
+                "thinking": {"type": "enabled"},
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
+        data = response.json()
+
+        self.assertIn("content", data)
+        thinking_blocks = [
+            block for block in data["content"] if block.get("type") == "thinking"
+        ]
+        text_blocks = [
+            block for block in data["content"] if block.get("type") == "text"
+        ]
+
+        self.assertTrue(len(thinking_blocks) > 0)
+        self.assertTrue(
+            any(block.get("thinking") for block in thinking_blocks),
+            "Expected non-empty Anthropic thinking blocks",
+        )
+        self.assertTrue(len(text_blocks) > 0)
+        self.assertTrue(any(block.get("text") for block in text_blocks))
+
+    def test_anthropic_messages_stream_with_thinking_events(self):
+        response = requests.post(
+            f"{self.base_url}/v1/messages",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "max_tokens": 256,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Solve carefully and return only the final answer: What is 39 + 48?",
+                    }
+                ],
+                "thinking": {"type": "enabled"},
+                "stream": True,
+            },
+            stream=True,
+        )
+
+        self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
+
+        delta_types = []
+        has_text_delta = False
+        has_thinking_delta = False
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+            line = line.decode("utf-8")
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+
+            payload = json.loads(line[6:])
+            delta = payload.get("delta")
+            if delta:
+                delta_type = delta.get("type")
+                delta_types.append(delta_type)
+                if delta_type == "text_delta" and delta.get("text"):
+                    has_text_delta = True
+                if delta_type == "thinking_delta" and delta.get("thinking"):
+                    has_thinking_delta = True
+
+        self.assertTrue(has_thinking_delta)
+        self.assertTrue(has_text_delta)
+        self.assertIn("thinking_delta", delta_types)
+        self.assertIn("signature_delta", delta_types)
+
     def test_stream_chat_completion_with_reasoning(self):
         # Test streaming with "enable_thinking": True, reasoning_content should not be empty
         response = requests.post(

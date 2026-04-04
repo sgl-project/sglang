@@ -159,6 +159,35 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(request.chat_template_kwargs, {"thinking": True})
         self.assertTrue(self.chat._get_reasoning_from_request(request))
 
+    def test_apply_reasoning_enabled_rejects_unsupported_parser(self):
+        self.chat.reasoning_parser = "gpt-oss"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+
+        with self.assertRaisesRegex(ValueError, "not supported"):
+            self.chat.apply_reasoning_enabled(request, False)
+
+    def test_apply_reasoning_enabled_allows_disable_without_reasoning_parser(self):
+        self.chat.reasoning_parser = None
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+
+        self.chat.apply_reasoning_enabled(request, False)
+
+        self.assertIsNone(request.chat_template_kwargs)
+        self.assertIsNone(request.reasoning_effort)
+
+    def test_wrap_reasoning_history_uses_mistral_tokens(self):
+        self.chat.reasoning_parser = "mistral"
+
+        wrapped = self.chat.wrap_reasoning_history("reason carefully")
+
+        self.assertEqual(wrapped, "[THINK]\nreason carefully\n[/THINK]")
+
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
         self.template_manager.chat_template_name = None

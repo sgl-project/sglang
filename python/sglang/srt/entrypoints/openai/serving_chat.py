@@ -59,6 +59,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Maps reasoning parsers to:
+# 1. the chat_template_kwargs key that controls thinking
+# 2. whether the model reasons by default when that key is absent
+REASONING_TEMPLATE_CONTROL: dict[str, tuple[str, bool]] = {
+    "deepseek-v3": ("thinking", False),
+    "kimi_k2": ("thinking", True),
+    "qwen3": ("enable_thinking", True),
+    "glm45": ("enable_thinking", True),
+    "nemotron_3": ("enable_thinking", True),
+    "interns1": ("enable_thinking", True),
+    "mimo": ("enable_thinking", False),
+}
+
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
     img_vals = []
@@ -90,15 +103,6 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     _default_sampling_params_logged = False
-    _REASONING_TEMPLATE_CONTROL = {
-        "deepseek-v3": ("thinking", False),
-        "kimi_k2": ("thinking", True),
-        "qwen3": ("enable_thinking", True),
-        "glm45": ("enable_thinking", True),
-        "nemotron_3": ("enable_thinking", True),
-        "interns1": ("enable_thinking", True),
-        "mimo": ("enable_thinking", False),
-    }
 
     def __init__(
         self,
@@ -1272,23 +1276,39 @@ class OpenAIServingChat(OpenAIServingBase):
         return idx
 
     def _get_reasoning_template_control(self) -> Optional[tuple[str, bool]]:
-        return self._REASONING_TEMPLATE_CONTROL.get(self.reasoning_parser)
+        return (
+            None
+            if not self.reasoning_parser
+            else REASONING_TEMPLATE_CONTROL.get(self.reasoning_parser)
+        )
+
+    def wrap_reasoning_history(self, reasoning_text: str) -> str:
+        if self.reasoning_parser == "mistral":
+            # Mistral uses [THINK] markers instead of <think> tags.
+            return f"[THINK]\n{reasoning_text}\n[/THINK]"
+        return f"<think>\n{reasoning_text}\n</think>"
 
     def apply_reasoning_enabled(
         self, request: ChatCompletionRequest, enabled: bool
     ) -> None:
         """Apply parser-specific reasoning controls to a chat request."""
+        if not self.reasoning_parser:
+            if enabled:
+                raise ValueError(
+                    "Anthropic thinking is not supported for models without a "
+                    "reasoning parser"
+                )
+            return
+
         control = self._get_reasoning_template_control()
         if control is None:
             if self.reasoning_parser == "mistral":
                 request.reasoning_effort = "medium" if enabled else "none"
                 return
-            if not enabled:
-                chat_template_kwargs = dict(request.chat_template_kwargs or {})
-                chat_template_kwargs["thinking"] = False
-                chat_template_kwargs["enable_thinking"] = False
-                request.chat_template_kwargs = chat_template_kwargs
-            return
+            raise ValueError(
+                f"Anthropic thinking is not supported for reasoning parser "
+                f"'{self.reasoning_parser}'"
+            )
 
         control_key, _ = control
         chat_template_kwargs = dict(request.chat_template_kwargs or {})

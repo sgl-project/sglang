@@ -169,6 +169,24 @@ class AnthropicServing:
             tool_text = str(content) if content else ""
             return tool_text, tool_text
 
+        def _convert_assistant_thinking_blocks(
+            blocks: list[AnthropicContentBlock],
+        ) -> Optional[str]:
+            if any(block.type == "redacted_thinking" for block in blocks):
+                raise ValueError("Anthropic redacted_thinking history is not supported")
+
+            thinking_parts = [
+                block.thinking
+                for block in blocks
+                if block.type == "thinking" and block.thinking
+            ]
+            if not thinking_parts:
+                return None
+
+            return self.openai_serving_chat.wrap_reasoning_history(
+                "\n".join(thinking_parts)
+            )
+
         # Add system message if provided
         if anthropic_request.system:
             if isinstance(anthropic_request.system, str):
@@ -195,18 +213,12 @@ class AnthropicServing:
             tool_calls = []
 
             if msg.role == "assistant":
-                thinking_parts = [
-                    block.thinking
-                    for block in msg.content
-                    if block.type == "thinking" and block.thinking
-                ]
-                if thinking_parts:
+                reasoning_history = _convert_assistant_thinking_blocks(msg.content)
+                if reasoning_history is not None:
                     content_parts.append(
                         {
                             "type": "text",
-                            "text": "<think>\n"
-                            + "\n".join(thinking_parts)
-                            + "\n</think>",
+                            "text": reasoning_history,
                         }
                     )
 
@@ -298,11 +310,13 @@ class AnthropicServing:
         chat_request = ChatCompletionRequest(**request_data)
 
         if anthropic_request.thinking is not None:
+            if anthropic_request.thinking.budget_tokens is not None:
+                raise ValueError(
+                    "Anthropic thinking budget_tokens is not supported yet"
+                )
             self.openai_serving_chat.apply_reasoning_enabled(
                 chat_request, self._thinking_enabled(anthropic_request)
             )
-            if anthropic_request.thinking.budget_tokens is not None:
-                logger.warning("Anthropic thinking budget_tokens is not supported")
 
         # Convert tools
         if anthropic_request.tools:
