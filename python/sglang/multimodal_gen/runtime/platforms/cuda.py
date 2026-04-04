@@ -122,15 +122,25 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     @lru_cache(maxsize=1)
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
+        if backend is None:
+            return "cudnn" if cls.is_blackwell() else "auto"
+
+        backend = backend.lower()
+        if backend not in {"auto", "cudnn"}:
+            logger.warning(
+                "Unsupported SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r. "
+                "Falling back to %r.",
+                backend,
+                "cudnn" if cls.is_blackwell() else "auto",
+            )
+            return "cudnn" if cls.is_blackwell() else "auto"
+        return backend
+
+    @classmethod
+    @lru_cache(maxsize=1)
     def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
-        if cls.is_blackwell():
-            try:
-                from flashinfer import mm_fp4 as flashinfer_mm_fp4
-
-                return flashinfer_mm_fp4, "cudnn"
-            except ImportError:
-                pass
-
         try:
             from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
 
@@ -141,7 +151,7 @@ class CudaPlatformBase(Platform):
         try:
             from flashinfer import mm_fp4 as flashinfer_mm_fp4
 
-            return flashinfer_mm_fp4, "auto"
+            return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
         except ImportError:
             return None, None
 
