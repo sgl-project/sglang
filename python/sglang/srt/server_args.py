@@ -4663,10 +4663,11 @@ class ServerArgs:
         parser.add_argument(
             "--experts-shared-outer-loras",
             default=ServerArgs.experts_shared_outer_loras,
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             help="Force shared outer LoRA mode for MoE models. "
             "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
-            "(expert_dim=1). By default this is auto-detected from adapter weights.",
+            "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
+            "By default this is auto-detected from adapter weights.",
         )
 
         # Kernel backend
