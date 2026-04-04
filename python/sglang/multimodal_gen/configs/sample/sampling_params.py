@@ -128,7 +128,7 @@ class SamplingParams:
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 42
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: str | None = None  # None means use the pipeline/model default
 
     # Original dimensions (before VAE scaling)
     num_frames: int = 1  # Default for image models
@@ -685,7 +685,7 @@ class SamplingParams:
             "--generator-device",
             type=str,
             choices=["cuda", "musa", "cpu"],
-            help="Device for random generator (cuda, musa or cpu). Default: cuda",
+            help="Device for random generator (cuda, musa or cpu). Default: use the model-specific setting.",
         )
         add_argument(
             "--num-frames",
