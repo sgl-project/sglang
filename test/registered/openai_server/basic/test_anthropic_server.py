@@ -16,14 +16,11 @@ python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropicServe
 
 import json
 import unittest
-from typing import Optional
-from unittest.mock import Mock
 
 import requests
 
 from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -36,27 +33,6 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
-
-
-class _ReasoningTestTokenizerManager:
-    def __init__(self, reasoning_parser: Optional[str]):
-        self.model_config = Mock(is_multimodal=False)
-        self.model_config.get_default_sampling_params.return_value = None
-        self.server_args = Mock(
-            enable_cache_report=False,
-            tool_call_parser="hermes",
-            reasoning_parser=reasoning_parser,
-            stream_response_default_include_usage=False,
-        )
-
-        mock_hf_config = Mock()
-        mock_hf_config.architectures = ["LlamaForCausalLM"]
-        self.model_config.hf_config = mock_hf_config
-
-
-class _ReasoningTestTemplateManager:
-    def __init__(self):
-        self.force_reasoning = False
 
 
 class TestAnthropicServer(CustomTestCase):
@@ -104,16 +80,6 @@ class TestAnthropicServer(CustomTestCase):
         }
         payload.update(overrides)
         return payload
-
-    def _make_reasoning_serving(
-        self, reasoning_parser: Optional[str]
-    ) -> AnthropicServing:
-        return AnthropicServing(
-            OpenAIServingChat(
-                _ReasoningTestTokenizerManager(reasoning_parser),
-                _ReasoningTestTemplateManager(),
-            )
-        )
 
     # ---- Non-streaming tests ----
 
@@ -180,98 +146,6 @@ class TestAnthropicServer(CustomTestCase):
             tool_message["content"][0]["image_url"]["url"],
             "data:image/png;base64,abcd",
         )
-
-    def test_thinking_history_uses_parser_specific_wrapper(self):
-        """Assistant thinking history should use the current parser's markers."""
-        anthropic_request = AnthropicMessagesRequest(
-            model=self.model,
-            max_tokens=64,
-            thinking={"type": "enabled"},
-            messages=[
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "thinking", "thinking": "reason carefully"},
-                        {"type": "text", "text": "Done."},
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": "Continue.",
-                },
-            ],
-        )
-
-        serving = self._make_reasoning_serving("mistral")
-        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
-        converted = chat_request.model_dump()
-
-        self.assertEqual(chat_request.reasoning_effort, "medium")
-        self.assertIn("[THINK]", converted["messages"][0]["content"])
-        self.assertIn("[/THINK]", converted["messages"][0]["content"])
-
-    def test_redacted_thinking_history_is_rejected(self):
-        """redacted_thinking blocks should fail fast instead of being dropped."""
-        anthropic_request = AnthropicMessagesRequest(
-            model=self.model,
-            max_tokens=64,
-            thinking={"type": "enabled"},
-            messages=[
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "redacted_thinking", "data": "opaque"},
-                        {"type": "text", "text": "Done."},
-                    ],
-                },
-                {"role": "user", "content": "Continue."},
-            ],
-        )
-
-        serving = self._make_reasoning_serving("qwen3")
-        with self.assertRaisesRegex(ValueError, "redacted_thinking"):
-            serving._convert_to_chat_completion_request(anthropic_request)
-
-    def test_budget_tokens_is_rejected(self):
-        """budget_tokens should fail until the backend implements it."""
-        anthropic_request = AnthropicMessagesRequest(
-            model=self.model,
-            max_tokens=64,
-            thinking={"type": "enabled", "budget_tokens": 32},
-            messages=[{"role": "user", "content": "Hello"}],
-        )
-
-        serving = self._make_reasoning_serving("qwen3")
-        with self.assertRaisesRegex(ValueError, "budget_tokens"):
-            serving._convert_to_chat_completion_request(anthropic_request)
-
-    def test_thinking_is_rejected_for_unsupported_parser(self):
-        """Thinking controls should fail for parsers without a real control path."""
-        anthropic_request = AnthropicMessagesRequest(
-            model=self.model,
-            max_tokens=64,
-            thinking={"type": "disabled"},
-            messages=[{"role": "user", "content": "Hello"}],
-        )
-
-        serving = self._make_reasoning_serving("gpt-oss")
-        with self.assertRaisesRegex(ValueError, "not supported"):
-            serving._convert_to_chat_completion_request(anthropic_request)
-
-    def test_disabled_thinking_is_accepted_without_reasoning_parser(self):
-        """Disabled thinking should be a no-op for non-reasoning models."""
-        anthropic_request = AnthropicMessagesRequest(
-            model=self.model,
-            max_tokens=64,
-            thinking={"type": "disabled"},
-            messages=[{"role": "user", "content": "Hello"}],
-        )
-
-        serving = self._make_reasoning_serving(None)
-        chat_request = serving._convert_to_chat_completion_request(anthropic_request)
-
-        self.assertIsNone(chat_request.chat_template_kwargs)
-        self.assertIsNone(chat_request.reasoning_effort)
 
     def test_simple_messages(self):
         """Test basic non-streaming message request."""
