@@ -1512,30 +1512,28 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         hidden_dtype = hidden_states.dtype
-        cross_video_timestep = self._collapse_prompt_timestep(audio_timestep)
         temb_ca_scale_shift, _ = self.av_ca_video_scale_shift_adaln_single(
-            cross_video_timestep.flatten(), hidden_dtype=hidden_dtype
+            timestep.flatten(), hidden_dtype=hidden_dtype
         )
         temb_ca_scale_shift = temb_ca_scale_shift.view(
             batch_size, -1, temb_ca_scale_shift.shape[-1]
         )
 
         temb_ca_gate, _ = self.av_ca_a2v_gate_adaln_single(
-            cross_video_timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            timestep.flatten() * self.av_ca_timestep_scale_multiplier,
             hidden_dtype=hidden_dtype,
         )
         temb_ca_gate = temb_ca_gate.view(batch_size, -1, temb_ca_gate.shape[-1])
 
-        cross_audio_timestep = self._collapse_prompt_timestep(timestep)
         temb_ca_audio_scale_shift, _ = self.av_ca_audio_scale_shift_adaln_single(
-            cross_audio_timestep.flatten(), hidden_dtype=audio_hidden_states.dtype
+            audio_timestep.flatten(), hidden_dtype=audio_hidden_states.dtype
         )
         temb_ca_audio_scale_shift = temb_ca_audio_scale_shift.view(
             batch_size, -1, temb_ca_audio_scale_shift.shape[-1]
         )
 
         temb_ca_audio_gate, _ = self.av_ca_v2a_gate_adaln_single(
-            cross_audio_timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            audio_timestep.flatten() * self.av_ca_timestep_scale_multiplier,
             hidden_dtype=audio_hidden_states.dtype,
         )
         temb_ca_audio_gate = temb_ca_audio_gate.view(
