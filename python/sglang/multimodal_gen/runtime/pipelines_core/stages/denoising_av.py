@@ -169,6 +169,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
         audio_uncond: torch.Tensor | None = None,
         audio_ptb: torch.Tensor | None = None,
         audio_mod: torch.Tensor | None = None,
+        video_clean_latent: torch.Tensor | None = None,
+        video_denoise_mask: torch.Tensor | None = None,
+        image_latent: torch.Tensor | None = None,
     ) -> None:
         torch.save(
             {
@@ -203,6 +206,19 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 ),
                 "audio_ptb": None if audio_ptb is None else audio_ptb.detach().cpu(),
                 "audio_mod": None if audio_mod is None else audio_mod.detach().cpu(),
+                "video_clean_latent": (
+                    None
+                    if video_clean_latent is None
+                    else video_clean_latent.detach().cpu()
+                ),
+                "video_denoise_mask": (
+                    None
+                    if video_denoise_mask is None
+                    else video_denoise_mask.detach().cpu()
+                ),
+                "image_latent": (
+                    None if image_latent is None else image_latent.detach().cpu()
+                ),
             },
             dump_dir / f"{stage}_step{step_index}.pt",
         )
@@ -1027,6 +1043,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 audio_uncond=denoised_audio_neg,
                                 audio_ptb=denoised_audio_perturbed,
                                 audio_mod=denoised_audio_modality,
+                                video_clean_latent=clean_latent,
+                                video_denoise_mask=denoise_mask,
+                                image_latent=batch.image_latent,
                             )
 
                         latents = self.post_forward_for_ti2v_task(
