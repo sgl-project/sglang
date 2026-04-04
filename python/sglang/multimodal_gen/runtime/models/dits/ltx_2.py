@@ -1473,8 +1473,10 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         audio_hidden_states, _ = self.audio_patchify_proj(audio_hidden_states)
         # 3. Prepare timestep embeddings
         # 3.1. Prepare global modality (video and audio) timestep embedding and modulation parameters
+        timestep_scaled = timestep * self.timestep_scale_multiplier
+        audio_timestep_scaled = audio_timestep * self.timestep_scale_multiplier
         temb, embedded_timestep = self.adaln_single(
-            timestep.flatten(),
+            timestep_scaled.flatten(),
         )
         temb = temb.view(batch_size, -1, temb.size(-1))
         embedded_timestep = embedded_timestep.view(
@@ -1482,7 +1484,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         temb_audio, audio_embedded_timestep = self.audio_adaln_single(
-            audio_timestep.flatten()
+            audio_timestep_scaled.flatten()
         )
         temb_audio = temb_audio.view(batch_size, -1, temb_audio.size(-1))
         audio_embedded_timestep = audio_embedded_timestep.view(
@@ -1493,13 +1495,14 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         if self.prompt_adaln_single is not None:
             prompt_timestep = self._collapse_prompt_timestep(timestep)
             temb_prompt, _ = self.prompt_adaln_single(
-                prompt_timestep.flatten(), hidden_dtype=hidden_states.dtype
+                (prompt_timestep * self.timestep_scale_multiplier).flatten(),
+                hidden_dtype=hidden_states.dtype,
             )
             temb_prompt = temb_prompt.view(batch_size, -1, temb_prompt.size(-1))
         if self.audio_prompt_adaln_single is not None:
             audio_prompt_timestep = self._collapse_prompt_timestep(audio_timestep)
             temb_audio_prompt, _ = self.audio_prompt_adaln_single(
-                audio_prompt_timestep.flatten(),
+                (audio_prompt_timestep * self.timestep_scale_multiplier).flatten(),
                 hidden_dtype=audio_hidden_states.dtype,
             )
             temb_audio_prompt = temb_audio_prompt.view(
@@ -1513,27 +1516,28 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         hidden_dtype = hidden_states.dtype
         temb_ca_scale_shift, _ = self.av_ca_video_scale_shift_adaln_single(
-            timestep.flatten(), hidden_dtype=hidden_dtype
+            timestep_scaled.flatten(), hidden_dtype=hidden_dtype
         )
         temb_ca_scale_shift = temb_ca_scale_shift.view(
             batch_size, -1, temb_ca_scale_shift.shape[-1]
         )
 
         temb_ca_gate, _ = self.av_ca_a2v_gate_adaln_single(
-            timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            timestep_scaled.flatten() * ts_ca_mult,
             hidden_dtype=hidden_dtype,
         )
         temb_ca_gate = temb_ca_gate.view(batch_size, -1, temb_ca_gate.shape[-1])
 
         temb_ca_audio_scale_shift, _ = self.av_ca_audio_scale_shift_adaln_single(
-            audio_timestep.flatten(), hidden_dtype=audio_hidden_states.dtype
+            audio_timestep_scaled.flatten(),
+            hidden_dtype=audio_hidden_states.dtype,
         )
         temb_ca_audio_scale_shift = temb_ca_audio_scale_shift.view(
             batch_size, -1, temb_ca_audio_scale_shift.shape[-1]
         )
 
         temb_ca_audio_gate, _ = self.av_ca_v2a_gate_adaln_single(
-            audio_timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            audio_timestep_scaled.flatten() * ts_ca_mult,
             hidden_dtype=audio_hidden_states.dtype,
         )
         temb_ca_audio_gate = temb_ca_audio_gate.view(
