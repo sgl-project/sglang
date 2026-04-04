@@ -62,6 +62,7 @@ def _ltx2_maybe_dump_attention_tensors(
     k: torch.Tensor | None,
     v: torch.Tensor,
     out: torch.Tensor,
+    out_proj: torch.Tensor | None = None,
 ) -> None:
     dump_dir = os.environ.get("SGLANG_DIFFUSION_LTX2_ATTN_DUMP_DIR")
     if not dump_dir:
@@ -94,6 +95,7 @@ def _ltx2_maybe_dump_attention_tensors(
         "k": None if k is None else k.detach().cpu(),
         "v": v.detach().cpu(),
         "out": out.detach().cpu(),
+        "out_proj": None if out_proj is None else out_proj.detach().cpu(),
     }
     torch.save(payload, os.path.join(dump_dir, f"{prefix}.call{call_idx}.pt"))
 
@@ -711,6 +713,9 @@ class LTX2Attention(nn.Module):
             out = out * (2.0 * torch.sigmoid(gate_logits).unsqueeze(-1))
             out = out.view(b, t, self.local_heads * self.dim_head)
 
+        out_flat = out.flatten(2)
+        out_proj, _ = self.to_out[0](out_flat)
+
         _ltx2_maybe_dump_attention_tensors(
             prefix=self.prefix,
             x=x,
@@ -722,11 +727,10 @@ class LTX2Attention(nn.Module):
             k=k if use_attention else None,
             v=v,
             out=out,
+            out_proj=out_proj,
         )
 
-        out = out.flatten(2)
-        out, _ = self.to_out[0](out)
-        return out
+        return out_proj
 
     def _slice_rope_for_tp(
         self,
