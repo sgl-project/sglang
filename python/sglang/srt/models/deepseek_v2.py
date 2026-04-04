@@ -1168,6 +1168,8 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
 
+        self.skip_topk = False
+        self.next_skip_topk = False
         if self.use_nsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
@@ -1191,10 +1193,7 @@ class DeepseekV2AttentionMLA(
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
-            if is_nextn:
-                self.skip_topk = False
-                self.next_skip_topk = False
-            else:
+            if not is_nextn:
                 self.index_topk_freq = getattr(config, "index_topk_freq", 1)
                 self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
                 if self.index_topk_pattern is None:
