@@ -20,9 +20,10 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
-    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
+
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 
 
 class Lfm2VlImageProcessor(SGLangBaseProcessor):
@@ -57,7 +58,7 @@ class Lfm2VlImageProcessor(SGLangBaseProcessor):
         input_text: str,
         request_obj,
         **kwargs,
-    ) -> Optional[Dict[str, Any]]:
+    ):
         if not image_data:
             input_ids = self._tokenizer(
                 input_text, return_tensors="pt", add_special_tokens=False
@@ -78,7 +79,7 @@ class Lfm2VlImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens
         )
 
-        return BaseMultiModalProcessorOutput(
+        return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
             mm_items=mm_items,
             im_token_id=self.IMAGE_TOKEN_ID,
