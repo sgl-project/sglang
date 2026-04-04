@@ -1,7 +1,8 @@
 # SGLang Diffusion Fast Paths
 
-Use this guide when mapping a diffusion bottleneck to an existing fused path in `sglang.multimodal_gen`.
-Prefer reuse before writing a new Triton or CUDA kernel.
+Use this guide when mapping a diffusion bottleneck to an existing fused path or
+distributed overlap pattern in `sglang.multimodal_gen`. Prefer reuse and
+configuration first before writing a new Triton or CUDA kernel.
 
 **Key Files**
 - `python/sglang/multimodal_gen/runtime/layers/layernorm.py`
@@ -35,14 +36,14 @@ Prefer reuse before writing a new Triton or CUDA kernel.
 - Constraints: `D % 256 == 0` and `D <= 8192`. `x/residual/gate/scale/shift` must pass shape and stride validation. Dtypes limited to fp16/bf16/fp32.
 - Behavior: CuTe DSL compilation cached by `(dtype, ndim, D, norm_type)`. `None` tensors replaced by scalar placeholders. If constraints fail, `layernorm.py` warns and falls back to native PyTorch.
 
-3. Z-Image fused tanh/gate modulation (merged from PR #18762)
+3. Z-Image fused tanh/gate modulation
 - Kernels: `fused_norm_tanh_mul_add`, `fused_norm_tanh_mul_add_norm_scale`
 - Locations: `layernorm.py`, `cutedsl/norm_tanh_mul_add_norm_scale.py`, `zimage.py`
 - Use cases:
   - `y = tanh(gate) * norm(x) + shift`
   - `y, y2 = tanh(gate) * norm(x) + shift`, then `y2 = norm(y) * (1 + scale)`
 - Constraints: same CuTe DSL envelope as the norm+scale/shift family in practice: contiguous last dim, fp16/bf16/fp32, and `D % 256 == 0`, `D <= 8192`.
-- Validation: `python/sglang/jit_kernel/tests/test_norm_tanh_mul_add_norm_scale.py`
+- Validation: `python/sglang/jit_kernel/tests/diffusion/test_norm_tanh_mul_add_norm_scale.py`
 - Behavior: this is already a merged fast path, so if Z-Image traces show the unfused chain, treat it as a missing or regressed existing optimization before proposing a new kernel.
 
 4. Triton LayerNorm/RMSNorm fusion
@@ -93,12 +94,43 @@ Prefer reuse before writing a new Triton or CUDA kernel.
   - Supported head dims: `64, 128, 256, 512, 1024`.
 - Behavior: Fused path operates on `q` and `k` in place after reshaping to `[B, -1, head_dim]`. If preconditions fail, fall back to per-tensor RMSNorm.
 
+**QK Norm + RoPE Optimization**
+
+- Entry point: `apply_qk_norm_rope` in `layernorm.py`.
+- Fast path: JIT fused inplace QK norm + RoPE from `python/sglang/jit_kernel/diffusion/qknorm_rope.py` via `fused_inplace_qknorm_rope`.
+- Toggle: `SGLANG_ENABLE_FUSED_QKNORM_ROPE=1` keeps the fused path enabled by default.
+- Preconditions for fused path:
+  - CUDA only.
+  - `allow_inplace=True` and `q_eps == k_eps`.
+  - `q` / `k` are contiguous 4D tensors with the same shape.
+  - `q.dtype` is `fp16` or `bf16`, and norm weights match tensor dtype.
+  - `can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, dtype)` returns true.
+  - Supported head dims: `64, 128, 256`.
+- Behavior: `apply_qk_norm_rope` prefers the fused JIT kernel when all guards pass; otherwise it falls back to `apply_qk_norm(...)` plus `apply_flashinfer_rope_qk_inplace(...)`.
+
+**Nunchaku Fused GELU MLP**
+
+- Entry point: `_fused_gelu_mlp` in `runtime/models/dits/flux.py`.
+- Fast path: Nunchaku checkpoints can fuse `fc1 GEMM + GELU + shift + re-quant + fc2.lora_down` before the second GEMM instead of materializing a standalone GELU activation.
+- Scope: this is a model-specific fast path for Nunchaku-quantized FLUX-family checkpoints.
+- Workflow rule: if a Nunchaku trace shows split `fc1 -> gelu -> quant -> fc2.lora_down`, treat it as a missing existing fast path before proposing a new fusion.
+
 **Common Entry Points in Diffusion Models**
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Qwen-Image gating: `fuse_scale_shift_gate_select01_kernel` in `qwen_image.py`.
 - Z-Image residual-form modulation: `fused_norm_tanh_mul_add` and `fused_norm_tanh_mul_add_norm_scale` in `zimage.py`.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
+- QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
+- Nunchaku fused GELU MLP: `_fused_gelu_mlp` in `flux.py` for quantized FLUX-family checkpoints.
 - RoPE: `_apply_rotary_emb` prefers Triton; Q/K RoPE prefers FlashInfer when present.
+
+**Existing Overlap / Communication Families**
+
+- Ulysses / USP attention: treat `all_to_all`, `ring_attn`, and head / sequence reshards as an existing distributed attention family, not a new overlap idea.
+- Turbo-layer async all-to-all: `all_to_all_single(..., async_op=True)` plus staged waits already form an existing overlap family in `turbo_layer.py`.
+- TorchInductor compute / communication reorder: `torch._inductor.config.reorder_for_compute_comm_overlap = True` can already partially overlap compiled denoise traces.
+- Dual-stream diffusion models: `use_dual_stream = True` in models such as `hunyuan3d.py` is an existing overlap family.
+- Workflow rule: if a hotspot is communication-heavy, rule out these in-repo overlap families before proposing a brand new overlap design.
 
 **Constraints and Fallbacks**
 - `scale_shift` Triton requires CUDA + contiguous `x`. NPU swaps to native.

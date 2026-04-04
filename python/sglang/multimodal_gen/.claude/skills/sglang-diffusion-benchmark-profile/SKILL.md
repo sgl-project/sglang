@@ -23,8 +23,20 @@ Before running any benchmark, profiler, or kernel-validation command:
 ## Main Reference
 
 - [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark and profiling workflow; includes `torch.profiler`, `nsys`, and `ncu`, plus the checked-in nightly-aligned presets, including `LTX-2` two-stage
-- [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels and runtime fast paths before writing new code
+- [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, fused `QK norm + RoPE`, and distributed overlap patterns before writing new code
 - [nsight-profiler.md](nsight-profiler.md) — Nsight Systems / Nsight Compute metric interpretation
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
 - [scripts/bench_diffusion_rmsnorm.py](scripts/bench_diffusion_rmsnorm.py) — RMSNorm micro-benchmark: JIT CUDA vs PyTorch, correctness check, bandwidth efficiency analysis
 - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; use `--list-models` to inspect preset order, then save perf dumps by label and compare them with `compare_perf.py`
+
+## Opportunity Discovery Rule
+
+Before calling a diffusion hotspot "new", first classify it with `existing-fast-paths.md`.
+
+Always rule out these existing families first:
+- merged Z-Image residual-form modulation
+- fused diffusion `QK norm + RoPE`
+- Ulysses / USP attention overlap
+- turbo-layer async all-to-all overlap
+- `torch.compile` compute / communication reorder
+- dual-stream diffusion execution

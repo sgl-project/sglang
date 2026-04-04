@@ -334,6 +334,7 @@ with torch.profiler.record_function(f"dit_block_{idx}.norm"):
 | AdaLN modulation | `fuse_scale_shift_kernel` |
 | RMSNorm / LayerNorm | `sgl_kernel_rmsnorm` / Triton norm |
 | SiLU gate | `vectorized_elementwise_kernel` |
+| QK Norm + RoPE | `fused_inplace_qknorm_rope` / FlashInfer QK RoPE fallback |
 | RoPE | `apply_rotary_embedding` (Triton) |
 | QK Norm | `fused_inplace_qknorm` (JIT) |
 
@@ -414,8 +415,8 @@ EOF
 | `gemm` dominant | Check tensor parallelism; QKV/MLP bottleneck |
 | `attn` dominant | Verify FA3/FA4 is active |
 | `adaln_modulation` high | Verify fused `fuse_scale_shift_kernel` is used |
-| `norm` high | Verify `sgl_kernel_rmsnorm` / CuTe DSL path; check D alignment |
-| `nccl_comm` high | Multi-GPU: tune Ulysses degree |
+| `norm` high | Verify `sgl_kernel_rmsnorm` / CuTe DSL path; if attention prep is hot, also check fused `QK norm + RoPE` |
+| `nccl_comm` high | Multi-GPU: classify against Ulysses / USP / turbo-layer overlap first, then tune topology |
 | `triton_kernel` high | Identify which Triton kernel; consider CUDA replacement |
 | `non-gpu-H_D_memops` high | Accidental CPU offload or `.cpu()` calls mid-denoising |
 | `CPU(non-GPU)` high | Python dispatch overhead / torch.compile graph breaks |
