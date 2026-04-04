@@ -20,6 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
 
@@ -77,8 +78,8 @@ class Lfm2VlImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_token_id": self.IMAGE_TOKEN_ID,
-        }
+        return BaseMultiModalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_token_id=self.IMAGE_TOKEN_ID,
+        )
