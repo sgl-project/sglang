@@ -29,7 +29,7 @@ class PyNcclSymmMemCommunicator(BaseCommunicator):
     def should_use_custom_op(self) -> bool:
         return True
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         # always inplace
         return AllReduceMode.INPLACE
 

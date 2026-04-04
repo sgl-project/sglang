@@ -28,7 +28,7 @@ class AiterCustomAllReduce(BaseCommunicator):
     def disabled(self) -> bool:
         return self._disabled or self.comm.disabled
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         can_use = self.comm.should_custom_ar(input_)
         return AllReduceMode.OUTPLACE if can_use else None
 

@@ -108,7 +108,7 @@ class CustomAllReduceV2(BaseCommunicator):
             self.obj.register_inputs(result)
             log_info_on_rank0(logger, f"Registering {len(pairs)} cuda graph addresses")
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         if self.disabled:
             return None
         inp_size = input_.numel() * input_.element_size()
@@ -127,8 +127,6 @@ class CustomAllReduceV2(BaseCommunicator):
         inplace: Optional[bool] = None,
     ) -> torch.Tensor:
         self.assert_outplace("all_reduce", inplace)
-        if self.can_all_reduce(input_) is None:
-            raise ValueError("custom_all_reduce_v2 cannot handle this input")
         if is_in_piecewise_cuda_graph():  # disable inplace optimization
             try:
                 self.obj.set_cuda_graph_capture(False)

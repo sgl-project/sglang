@@ -127,7 +127,7 @@ class PyNcclCommunicator(BaseCommunicator):
     def graph_capture_context(self):
         return self.change_state(enable=True)
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         return AllReduceMode.BOTH
 
     @BaseCommunicator.validate

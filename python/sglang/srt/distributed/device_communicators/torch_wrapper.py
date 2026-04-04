@@ -24,7 +24,7 @@ class TorchDefaultCommunicator(BaseCommunicator):
         assert enable, "TorchDefaultCommunicator cannot be disabled"
         return super().change_state(enable)
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         return AllReduceMode.INPLACE
 
     def all_reduce(

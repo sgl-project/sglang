@@ -258,7 +258,7 @@ class CustomAllreduce(BaseCommunicator):
             offsets = [d[1] for d in all_data]  # type: ignore
             ops.register_graph_buffers(self._ptr, handles, offsets)
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         if self.disabled:
             return None
         inp_size = input_.numel() * input_.element_size()
@@ -316,8 +316,6 @@ class CustomAllreduce(BaseCommunicator):
     ) -> torch.Tensor:
         """The main all-reduce API with CUDA-graph-aware behavior."""
         self.assert_outplace("all_reduce", inplace)
-        if self.can_all_reduce(input_) is None:
-            raise ValueError("custom_all_reduce cannot handle this input")
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self._all_reduce_impl(input_, registered=not self.tms_cudagraph)

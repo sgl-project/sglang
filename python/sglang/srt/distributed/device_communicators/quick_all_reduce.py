@@ -199,7 +199,7 @@ class QuickAllReduce(BaseCommunicator):
     def should_use_custom_op(self) -> bool:
         return True
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         if self.disabled:
             return None
         if input_.dtype not in self._SUPPORTED_DTYPES:

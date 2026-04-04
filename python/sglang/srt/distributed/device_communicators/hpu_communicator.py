@@ -21,7 +21,7 @@ class HpuCommunicator(BaseCommunicator):
         self.group = group
         super().__init__(dist.get_world_size(self.group), disabled=not is_hpu())
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         return AllReduceMode.INPLACE
 
     @BaseCommunicator.validate

@@ -261,7 +261,7 @@ class PyMscclppCommunicator(BaseCommunicator):
     def should_use_custom_op(self) -> bool:
         return True
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         if self.disabled or self._context is None:
             return None
         if input_.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
@@ -280,8 +280,6 @@ class PyMscclppCommunicator(BaseCommunicator):
         inplace: Optional[bool] = None,
     ) -> torch.Tensor:
         self.assert_outplace("all_reduce", inplace)
-        if self.can_all_reduce(input_) is None:
-            raise ValueError("pymscclpp cannot handle this input")
         msg_size = input_.numel() * input_.element_size()
         index = bisect.bisect_left(self.msg_size_for_finetune, msg_size)
         msg_size_finetune = self.msg_size_for_finetune[index]

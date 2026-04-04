@@ -47,7 +47,7 @@ class CommunicatorImpl:
         for i, comm in enumerate(self.all_reduce_comms):
             if comm.disabled:
                 continue
-            mode = comm.can_all_reduce(input_)
+            mode = comm.get_all_reduce_mode(input_)
             if mode is not None and _is_mode_supported(mode, inplace):
                 if not comm.should_use_custom_op():
                     return comm.all_reduce(input_, inplace=inplace)

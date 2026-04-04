@@ -122,7 +122,7 @@ class BaseCommunicator:
         """
         return False
 
-    def can_all_reduce(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
         """
         Report the preferred all-reduce mode for `input_`.
 
@@ -149,15 +149,15 @@ class BaseCommunicator:
         Run all-reduce on `input_`.
 
         Preconditions:
-        1. `self.can_all_reduce(input_)` must not return `None`.
-        2. `inplace=True` requires `self.can_all_reduce(input_).can_inplace()`.
-        3. `inplace=False` requires `self.can_all_reduce(input_).can_outplace()`.
+        1. `self.get_all_reduce_mode(input_)` must not return `None`.
+        2. `inplace=True` requires `self.get_all_reduce_mode(input_).can_inplace()`.
+        3. `inplace=False` requires `self.get_all_reduce_mode(input_).can_outplace()`.
         4. `self.disabled` must be `False`.
 
         :param input_: Input tensor for the all-reduce.
         :param inplace: Whether the operation should be in-place. If `None`, the
             communicator may choose its preferred mode. If specified, it must be
-            consistent with `can_all_reduce(input_)`.
+            consistent with `get_all_reduce_mode(input_)`.
         :return: The reduced tensor. If the operation is in-place, this must be
             `input_` itself.
         """
