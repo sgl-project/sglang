@@ -120,6 +120,7 @@ def create_lora_info(
     gate_up_dim,
     dtype,
     device,
+    lora_use_virtual_experts=False,
 ):
     # -------------------------------------------------------------------------
     # 1. Deterministic LoRA A Initialization
@@ -186,6 +187,7 @@ def create_lora_info(
         adapter_enabled=adapter_enabled,
         max_lora_rank=max_lora_rank,
         num_experts=num_experts,
+        lora_use_virtual_experts=lora_use_virtual_experts,
     )
 
 
@@ -461,6 +463,155 @@ def test_lora_moe_runner_multi_expert(
     torch.testing.assert_close(sglang_delta, torch_delta, atol=tol, rtol=tol)
 
 
+@pytest.mark.parametrize("num_tokens", [32, 64])
+@pytest.mark.parametrize("top_k_num", [1, 2])
+@pytest.mark.parametrize("num_experts", [8, 20])
+@pytest.mark.parametrize("max_lora_rank", [8, 16])
+def test_lora_moe_runner_virtual_experts(
+    num_tokens, top_k_num, num_experts, max_lora_rank
+):
+    # Fixed parameters
+    max_loras = 2
+    hidden_dim = 512
+    intermediate_dim = 1024
+
+    dtype = torch.float32
+    device = "cuda:0"
+    seed = 42
+
+    torch.set_default_device(device)
+    set_random_seed(seed)
+
+    num_sequences = 4
+
+    # Generate Data using the new Request-Based generator
+    topk_ids, topk_weights, seg_indptr, req_to_lora, token_lora_mapping = sample_data(
+        num_tokens, num_sequences, max_loras, num_experts, top_k_num, dtype, device
+    )
+
+    gate_up_dim = intermediate_dim * 2
+
+    # Initialize experts
+    w13 = torch.randn(num_experts, gate_up_dim, hidden_dim, dtype=dtype) * 0.1
+    w2 = torch.randn(num_experts, hidden_dim, intermediate_dim, dtype=dtype) * 0.1
+    b13 = torch.randn(num_experts, gate_up_dim, dtype=dtype) * 0.1
+    b2 = torch.randn(num_experts, hidden_dim, dtype=dtype) * 0.1
+
+    hidden_states = torch.randn(num_tokens, hidden_dim, dtype=dtype)
+
+    # Create LoRA Info with virtual experts enabled
+    lora_info_delta = create_lora_info(
+        seg_indptr=seg_indptr,
+        weight_indices=req_to_lora,
+        topk_ids=topk_ids,
+        max_loras=max_loras,
+        num_experts=num_experts,
+        max_lora_rank=max_lora_rank,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+        gate_up_dim=gate_up_dim,
+        dtype=dtype,
+        device=device,
+        lora_use_virtual_experts=True,
+    )
+
+    lora_info_baseline = create_lora_info(
+        seg_indptr=seg_indptr,
+        weight_indices=req_to_lora,
+        topk_ids=topk_ids,
+        max_loras=max_loras,
+        num_experts=num_experts,
+        max_lora_rank=0,
+        hidden_dim=hidden_dim,
+        intermediate_dim=intermediate_dim,
+        gate_up_dim=gate_up_dim,
+        dtype=dtype,
+        device=device,
+        lora_use_virtual_experts=True,
+    )
+
+    quant_info = TritonMoeQuantInfo(
+        w13_weight=w13,
+        w2_weight=w2,
+        b13=b13,
+        b2=b2,
+    )
+
+    config = MoeRunnerConfig(
+        activation="silu",
+        is_gated=True,
+        inplace=False,
+        no_combine=False,
+        gemm1_alpha=None,
+        gemm1_clamp_limit=None,
+        routed_scaling_factor=1.0,
+        apply_router_weight_on_input=False,
+        num_local_experts=num_experts,
+    )
+
+    router_logits = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=router_logits,
+    )
+
+    dispatch_output = StandardDispatchOutput(
+        hidden_states=hidden_states,
+        hidden_states_scale=None,
+        topk_output=topk_output,
+    )
+
+    class MockServerArgs:
+        enable_deterministic_inference = False
+
+    with patch(
+        "sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args",
+        return_value=MockServerArgs(),
+    ):
+        runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
+
+        output_with_lora = runner.run(
+            dispatch_output, quant_info, lora_info_delta
+        ).hidden_states
+        output_baseline = runner.run(
+            dispatch_output, quant_info, lora_info_baseline
+        ).hidden_states
+
+    # Run Naive Torch Implementation (Uses dense mapping for verification)
+    torch_output_lora = torch_naive_moe_with_lora(
+        hidden_states,
+        w13,
+        w2,
+        b13,
+        b2,
+        topk_weights,
+        topk_ids,
+        lora_info_delta,
+        token_lora_mapping,
+    )
+
+    torch_output_base = torch_naive_moe_with_lora(
+        hidden_states,
+        w13,
+        w2,
+        b13,
+        b2,
+        topk_weights,
+        topk_ids,
+        lora_info_baseline,
+        token_lora_mapping,
+    )
+
+    # The actual "Delta" (LoRA effect) for both
+    sglang_delta = output_with_lora - output_baseline
+    torch_delta = torch_output_lora - torch_output_base
+
+    # Larger expert counts accumulate more numerical drift in Triton kernels on GB300
+    tol = 0.15 if num_experts >= 20 else 5e-2
+    torch.testing.assert_close(sglang_delta, torch_delta, atol=tol, rtol=tol)
+
+
 def _setup_marlin_moe_weights(num_experts, n, k, dtype):
     """Quantize float weights into AWQ Marlin format for testing."""
     from sgl_kernel.scalar_type import scalar_types
@@ -547,6 +698,7 @@ def test_lora_moe_runner_marlin(num_tokens, top_k_num, num_experts, max_lora_ran
         gate_up_dim=gate_up_dim,
         dtype=dtype,
         device=device,
+        lora_use_virtual_experts=True,
     )
 
     lora_info_baseline = create_lora_info(
@@ -561,6 +713,7 @@ def test_lora_moe_runner_marlin(num_tokens, top_k_num, num_experts, max_lora_ran
         gate_up_dim=gate_up_dim,
         dtype=dtype,
         device=device,
+        lora_use_virtual_experts=True,
     )
 
     quant_info = MarlinMoeQuantInfo(

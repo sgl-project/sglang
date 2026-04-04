@@ -204,6 +204,7 @@ def test_marlin_vs_triton_lora_correctness(num_tokens, top_k):
             adapter_enabled=torch.ones(num_loras + 1, dtype=torch.int32, device=device),
             max_lora_rank=rank,
             num_experts=num_experts,
+            lora_use_virtual_experts=True,
             experts_shared_outer_loras=True,
         )
 

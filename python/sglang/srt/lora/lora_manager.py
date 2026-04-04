@@ -82,6 +82,8 @@ class LoRAManager:
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )
+        self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
+
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
         backend_type = get_backend_from_name(lora_backend)
@@ -777,4 +779,5 @@ class LoRAManager:
                 layer_id = get_layer_id(module_name)
                 lora_module = self.set_lora_module(module_name, module)
                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
+                lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
