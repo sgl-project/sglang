@@ -51,7 +51,7 @@ class SchedulerOutputProcessorMixin:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
-    def _get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+    def _get_cached_tokens_details(self: Scheduler, req: Req) -> Optional[dict]:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
@@ -554,12 +554,18 @@ class SchedulerOutputProcessorMixin:
             num_accepted_tokens=result.num_accepted_tokens,
         )
 
-    def _maybe_update_reasoning_tokens(self, req: Req, next_token_id):
+    def _maybe_update_reasoning_tokens(
+        self: Scheduler, req: Req, next_token_id: Union[int, List[int]]
+    ):
         if req.require_reasoning and self._think_end_id is not None:
             req.update_reasoning_tokens(next_token_id, self._think_end_id)
 
     def _mamba_prefix_cache_update(
-        self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
+        self: Scheduler,
+        req: Req,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        i: int,
     ) -> None:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if req.mamba_ping_pong_track_buffer is not None:
@@ -593,7 +599,7 @@ class SchedulerOutputProcessorMixin:
                     )
 
     def _process_input_token_logprobs(
-        self, req: Req, input_token_logprobs: List
+        self: Scheduler, req: Req, input_token_logprobs: List
     ) -> None:
         """Process input token logprobs values and indices."""
         is_multi_item_scoring = self._is_multi_item_scoring(req)
@@ -625,7 +631,7 @@ class SchedulerOutputProcessorMixin:
             for x in input_token_logprobs_idx
         ]
 
-    def _process_input_top_logprobs(self, req: Req) -> None:
+    def _process_input_top_logprobs(self: Scheduler, req: Req) -> None:
         """Process input top logprobs."""
         if req.top_logprobs_num <= 0:
             return
@@ -654,7 +660,7 @@ class SchedulerOutputProcessorMixin:
         req.temp_input_top_logprobs_idx = None
         req.temp_input_top_logprobs_val = None
 
-    def _process_input_token_ids_logprobs(self, req: Req) -> None:
+    def _process_input_token_ids_logprobs(self: Scheduler, req: Req) -> None:
         """Process input token IDs logprobs."""
         if req.token_ids_logprob is None:
             return
@@ -686,7 +692,7 @@ class SchedulerOutputProcessorMixin:
         req.temp_input_token_ids_logprobs_idx = None
         req.temp_input_token_ids_logprobs_val = None
 
-    def _calculate_relevant_tokens_len(self, req: Req) -> int:
+    def _calculate_relevant_tokens_len(self: Scheduler, req: Req) -> int:
         """Calculate the expected length of logprob arrays based on whether multi-item scoring is enabled.
 
         For multi-item scoring, only delimiter positions have logprobs.
@@ -707,7 +713,7 @@ class SchedulerOutputProcessorMixin:
             return len(relevant_tokens)
 
     def _calculate_num_input_logprobs(
-        self, req: Req, extend_input_len: int, extend_logprob_start_len: int
+        self: Scheduler, req: Req, extend_input_len: int, extend_logprob_start_len: int
     ) -> int:
         """Calculate the number of input logprobs based on whether multi-item scoring is enabled.
 
@@ -730,7 +736,7 @@ class SchedulerOutputProcessorMixin:
             # Regular request: all tokens in the range
             return extend_input_len - extend_logprob_start_len
 
-    def _is_multi_item_scoring(self, req: Req) -> bool:
+    def _is_multi_item_scoring(self: Scheduler, req: Req) -> bool:
         """Check if request uses multi-item scoring.
 
         Multi-item scoring applies to prefill-only requests when a delimiter
@@ -867,7 +873,7 @@ class SchedulerOutputProcessorMixin:
 
         return num_input_logprobs
 
-    def _initialize_empty_logprob_containers(self, req: Req) -> None:
+    def _initialize_empty_logprob_containers(self: Scheduler, req: Req) -> None:
         """
         Initialize logprob fields to empty lists if unset.
 
@@ -904,7 +910,7 @@ class SchedulerOutputProcessorMixin:
                 envs.SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS.get()
             )
 
-    def _trigger_crash_for_tests(self, crash_threshold: int):
+    def _trigger_crash_for_tests(self: Scheduler, crash_threshold: int):
         # Crash trigger: crash after stream_output is called N times
         # This is used for testing purposes.
         if not hasattr(self, "_test_stream_output_count"):
