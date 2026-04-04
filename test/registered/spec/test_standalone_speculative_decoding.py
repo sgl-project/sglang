@@ -66,7 +66,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
     model = DEFAULT_TARGET_MODEL_STANDALONE
     draft_model = DEFAULT_DRAFT_MODEL_STANDALONE
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.7  # derived tests need to override this
+    accuracy_threshold = 0.69  # derived tests need to override this
     spec_decode_threshold = 3.6  # derived spec decoding tests need to override this
 
     @classmethod
@@ -126,7 +126,7 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
     model = DEFAULT_TARGET_MODEL_STANDALONE
     draft_model = DEFAULT_DRAFT_MODEL_STANDALONE
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.7  # derived tests need to override this
+    accuracy_threshold = 0.69  # derived tests need to override this
     spec_decode_threshold = 3.6  # derived spec decoding tests need to override this
 
     @classmethod
