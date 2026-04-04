@@ -183,15 +183,7 @@ class SchedulerOutputProcessorMixin:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
 
-                    # update reasoning tokens
-                    if (
-                        req.require_reasoning
-                        and self.tokenizer
-                        and hasattr(self.tokenizer, "think_end_id")
-                    ):
-                        req.update_reasoning_tokens(
-                            next_token_id, self.tokenizer.think_end_id
-                        )
+                    self._maybe_update_reasoning_tokens(req, next_token_id)
 
                     req.check_finished()
                     if req.finished():
@@ -460,13 +452,7 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
-            # update reasoning tokens
-            if (
-                req.require_reasoning
-                and self.tokenizer
-                and hasattr(self.tokenizer, "think_end_id")
-            ):
-                req.update_reasoning_tokens(next_token_id, self.tokenizer.think_end_id)
+            self._maybe_update_reasoning_tokens(req, next_token_id)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
@@ -567,6 +553,10 @@ class SchedulerOutputProcessorMixin:
             running_batch=batch,
             num_accepted_tokens=result.num_accepted_tokens,
         )
+
+    def _maybe_update_reasoning_tokens(self, req: Req, next_token_id):
+        if req.require_reasoning and self._think_end_id is not None:
+            req.update_reasoning_tokens(next_token_id, self._think_end_id)
 
     def _mamba_prefix_cache_update(
         self, req: Req, batch: ScheduleBatch, result: GenerationBatchResult, i: int
