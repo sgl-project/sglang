@@ -54,17 +54,17 @@ def score_and_pool(
             # Score only the tokens that precede a delimiter
             scores = score_head(hidden_states[delim_positions - 1])
 
-            # Split per-request so the scheduler gets one tensor per request
-            seq_lens = forward_batch.extend_seq_lens
-            offsets = torch.zeros_like(seq_lens)
-            offsets[1:] = torch.cumsum(seq_lens[:-1], dim=0)
-
+            # Split per-request so the scheduler gets one tensor per request.
+            # Use CPU sequence lengths to avoid per-iteration GPU<->CPU sync
+            # from `.item()` calls on device tensors.
+            seq_lens = forward_batch.extend_seq_lens_cpu
+            start = 0
             per_request = []
-            for i in range(len(seq_lens)):
-                start = offsets[i].item()
-                end = start + seq_lens[i].item()
+            for seq_len in seq_lens:
+                end = start + seq_len
                 mask = (delim_positions >= start) & (delim_positions < end)
                 per_request.append(scores[mask])
+                start = end
 
             return EmbeddingPoolerOutput(embeddings=per_request)
 

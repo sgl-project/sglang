@@ -281,7 +281,9 @@ class TokenizerManagerScoreMixin:
                 prompt_tokens += result.get("meta_info", {}).get("prompt_tokens", 0)
 
                 if apply_softmax:
-                    embedding = torch.softmax(torch.tensor(embedding), dim=0).tolist()
+                    embedding = torch.softmax(
+                        torch.as_tensor(embedding), dim=-1
+                    ).tolist()
 
                 # The classification head produces per-token logits, which the pooler reduces
                 # into a single vector per input. That vector is returned in the `.embeddings`
