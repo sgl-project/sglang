@@ -551,3 +551,54 @@
   - 下一步：
     - 优先对读官方 `LTX-2.3` decode 路径与当前 `LTX2AVDecodingStage`
     - 重点核查 `vae` donor、latent unpack 布局、decode 前 denorm 语义
+
+## 2026-04-04 二分结果更新 9：把 `LTX-2.3` root `vae` 从旧 donor 改成“旧 encoder + 2.3 decoder + 2.3 stats”
+
+- 这轮源码排查结论：
+  - `_unpack_latents/_unpack_audio_latents` 和官方 patchifier 已经完全一致
+  - injected run 证明问题不在 `denoising_av` 主线，而在 decode 侧
+  - 继续对读官方 `VideoDecoder` 后，确认当前最大结构性问题是：
+    - overlay root `vae` 仍然整套复用 `LTX-2`
+    - 而官方 `LTX-2.3` decoder 走的是 `decoder + per_channel_statistics.un_normalize(...)`
+    - 当前 [decoding_av.py](/Users/mick/repos/sglang/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding_av.py) 还会在 decode 前额外做一次外部 denorm
+
+- 本地代码修复：
+  - [ltx_2_vae.py](/Users/mick/repos/sglang/python/sglang/multimodal_gen/runtime/models/vaes/ltx_2_vae.py)
+    - 新增 `LTX23VideoDecoder3d`
+    - 只在 `use_official_video_decoder == true` 时启用
+    - decoder block schema 对齐官方 `decoder_blocks`
+    - 内部使用 `per_channel_statistics.un_normalize(...)`
+    - 原来的 `LTX2` decoder 路径保持不变
+  - [decoding_av.py](/Users/mick/repos/sglang/python/sglang/multimodal_gen/runtime/pipelines_core/stages/decoding_av.py)
+    - 新增 `use_official_video_decoder` 分支
+    - `LTX-2.3` decode 前跳过外部 `latents_mean/std` denorm
+    - 原来的 `LTX2` decode 路径保持不变
+  - [materialize.py](/Users/mick/repos/sglang/python/sglang/multimodal_gen/model_overlays/ltx_2_3/_overlay/materialize.py)
+    - 不再把 root `vae/**` 从 `LTX-2` 整套拷过来
+    - 改为：
+      - root `vae/config.json` 写入 `use_official_video_decoder` 和 donor `official_vae_config`
+      - root `vae/model.safetensors` = `LTX-2 encoder.*` + `LTX-2.3 decoder.*` + `LTX-2.3 per_channel_statistics`
+    - `ltx23_image_encoder` 子目录继续保留现有官方 image encoder 路径
+
+- 轻量校验：
+  - 本地 `py_compile` 通过：
+    - `runtime/models/vaes/ltx_2_vae.py`
+    - `runtime/pipelines_core/stages/decoding_av.py`
+    - `model_overlays/ltx_2_3/_overlay/materialize.py`
+    - `test/unit/test_model_overlay_ltx23.py`
+  - 新增最小单测覆盖：
+    - overlay `vae/config.json` 现在带 `use_official_video_decoder`
+    - 2.3 decoder repack 会生成 `decoder.per_channel_statistics.*` 和 top-level `latents_mean/std`
+    - `LTX-2.3` decode 前会跳过外部 denorm，而 legacy `LTX2` 仍保留原行为
+
+- 当前精度对齐进度：80%
+  - 已完全对齐到：
+    - `denoising_av` 结束后的 packed latents
+    - `token -> unpack`
+    - `decode` 前的语义建模路径
+  - 当前待验证的首个阶段：
+    - fresh materialize 后的真实 `raw_video`
+  - 下一步：
+    - 远端 fresh rematerialize `LTX-2.3`
+    - 直接 compare `official_i2v_decode.pt` vs `sglang_i2v_decode.pt`
+    - 如果 `raw_video` 明显收敛，再复跑黑盒视频

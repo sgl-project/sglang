@@ -19,7 +19,8 @@ AUXILIARY_PATTERNS = [
     "scheduler/**",
     "text_encoder/**",
     "tokenizer/**",
-    "vae/**",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",
     "vocoder/**",
 ]
 
@@ -161,10 +162,14 @@ def _build_connectors_config(config_donor_dir: str) -> dict:
     }
 
 
-def _build_vae_config(auxiliary_dir: str) -> dict:
+def _build_vae_config(auxiliary_dir: str, config_donor_dir: str) -> dict:
     config = _load_json(os.path.join(auxiliary_dir, "vae", "config.json"))
     config["use_official_image_encoder"] = True
     config["official_image_encoder_subdir"] = "ltx23_image_encoder"
+    config["use_official_video_decoder"] = True
+    config["official_vae_config"] = _load_json(
+        os.path.join(config_donor_dir, "vae", "config.json")
+    )["vae"]
     return config
 
 
@@ -179,6 +184,36 @@ def _repack_ltx23_image_encoder_weights(source_path: str, output_path: str) -> N
                 tensors[key] = f.get_tensor(key)
     if not tensors:
         raise ValueError("No LTX-2.3 image-encoder tensors found in donor checkpoint.")
+    save_file(tensors, output_path)
+
+
+def _repack_ltx23_video_decoder_weights(
+    auxiliary_encoder_path: str,
+    donor_decoder_path: str,
+    output_path: str,
+) -> None:
+    tensors = {}
+    with safe_open(auxiliary_encoder_path, framework="pt") as f:
+        for key in f.keys():
+            if key.startswith("encoder."):
+                tensors[key] = f.get_tensor(key)
+    with safe_open(donor_decoder_path, framework="pt") as f:
+        for key in f.keys():
+            if key.startswith("decoder."):
+                tensors[key] = f.get_tensor(key)
+                continue
+            if key == "per_channel_statistics.mean-of-means":
+                tensor = f.get_tensor(key)
+                tensors["decoder.per_channel_statistics.mean_of_means"] = tensor
+                tensors["latents_mean"] = tensor
+                continue
+            if key == "per_channel_statistics.std-of-means":
+                tensor = f.get_tensor(key)
+                tensors["decoder.per_channel_statistics.std_of_means"] = tensor
+                tensors["latents_std"] = tensor
+                continue
+    if not tensors:
+        raise ValueError("No LTX-2.3 decoder tensors found in donor checkpoint.")
     save_file(tensors, output_path)
 
 
@@ -207,7 +242,6 @@ def materialize(
         "scheduler",
         "text_encoder",
         "tokenizer",
-        "vae",
         "vocoder",
     ):
         _copytree_link_or_copy(
@@ -238,7 +272,16 @@ def materialize(
     )
 
     vae_dir = os.path.join(output_dir, "vae")
-    _write_json(os.path.join(vae_dir, "config.json"), _build_vae_config(auxiliary_dir))
+    _ensure_dir(vae_dir)
+    _write_json(
+        os.path.join(vae_dir, "config.json"),
+        _build_vae_config(auxiliary_dir, config_donor_dir),
+    )
+    _repack_ltx23_video_decoder_weights(
+        os.path.join(auxiliary_dir, "vae", "diffusion_pytorch_model.safetensors"),
+        os.path.join(config_donor_dir, "vae", "model.safetensors"),
+        os.path.join(vae_dir, "model.safetensors"),
+    )
 
     image_encoder_dir = os.path.join(vae_dir, "ltx23_image_encoder")
     _ensure_dir(image_encoder_dir)

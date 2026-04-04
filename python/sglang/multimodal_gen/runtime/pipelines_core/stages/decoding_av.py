@@ -46,6 +46,11 @@ class LTX2AVDecodingStage(DecodingStage):
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(payload, path)
 
+    @staticmethod
+    def _ltx2_should_externally_denorm_video_latents(server_args: ServerArgs) -> bool:
+        arch_config = server_args.pipeline_config.vae_config.arch_config
+        return not bool(getattr(arch_config, "use_official_video_decoder", False))
+
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
 
@@ -61,9 +66,10 @@ class LTX2AVDecodingStage(DecodingStage):
         original_dtype = vae_dtype
         self.vae.to(torch.bfloat16)
         latents = latents.to(torch.bfloat16)
-        std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latents)
-        mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latents)
-        latents = latents * std + mean
+        if self._ltx2_should_externally_denorm_video_latents(server_args):
+            std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latents)
+            mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latents)
+            latents = latents * std + mean
         latents = server_args.pipeline_config.preprocess_decoding(
             latents, server_args, vae=self.vae
         )

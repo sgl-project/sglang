@@ -15,6 +15,7 @@ from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
     _build_vae_config,
     _rename_connector_key,
     _repack_ltx23_image_encoder_weights,
+    _repack_ltx23_video_decoder_weights,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_model_info
@@ -338,7 +339,9 @@ def test_ltx23_connector_repack_renames_qk_norm_keys():
 def test_ltx23_vae_config_adds_official_image_encoder_marker():
     with tempfile.TemporaryDirectory() as tmpdir:
         auxiliary_dir = os.path.join(tmpdir, "aux")
+        config_donor_dir = os.path.join(tmpdir, "donor")
         os.makedirs(os.path.join(auxiliary_dir, "vae"), exist_ok=True)
+        os.makedirs(os.path.join(config_donor_dir, "vae"), exist_ok=True)
 
         with open(os.path.join(auxiliary_dir, "vae", "config.json"), "w") as f:
             json.dump(
@@ -353,12 +356,26 @@ def test_ltx23_vae_config_adds_official_image_encoder_marker():
                 },
                 f,
             )
-        config = _build_vae_config(auxiliary_dir)
+        with open(os.path.join(config_donor_dir, "vae", "config.json"), "w") as f:
+            json.dump(
+                {
+                    "vae": {
+                        "decoder_blocks": [["res_x", {"num_layers": 2}]],
+                        "decoder_base_channels": 128,
+                        "patch_size": 4,
+                        "spatial_padding_mode": "zeros",
+                    }
+                },
+                f,
+            )
+        config = _build_vae_config(auxiliary_dir, config_donor_dir)
 
     assert config["encoder_spatial_padding_mode"] == "zeros"
     assert config["decoder_spatial_padding_mode"] == "reflect"
     assert config["use_official_image_encoder"] is True
     assert config["official_image_encoder_subdir"] == "ltx23_image_encoder"
+    assert config["use_official_video_decoder"] is True
+    assert config["official_vae_config"]["decoder_base_channels"] == 128
 
 
 def test_ltx23_repack_image_encoder_keeps_only_encoder_tensors():
@@ -382,6 +399,68 @@ def test_ltx23_repack_image_encoder_keeps_only_encoder_tensors():
                 "conv_in.conv.weight",
                 "per_channel_statistics.mean-of-means",
             ]
+
+
+def test_ltx23_repack_video_decoder_keeps_decoder_and_stats():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        auxiliary_path = os.path.join(tmpdir, "aux.safetensors")
+        donor_path = os.path.join(tmpdir, "donor.safetensors")
+        output_path = os.path.join(tmpdir, "output.safetensors")
+        save_file(
+            {
+                "encoder.conv_in.conv.weight": torch.full((1,), 5.0),
+            },
+            auxiliary_path,
+        )
+        save_file(
+            {
+                "decoder.conv_in.conv.weight": torch.ones(1),
+                "per_channel_statistics.mean-of-means": torch.full((2,), 3.0),
+                "per_channel_statistics.std-of-means": torch.full((2,), 4.0),
+            },
+            donor_path,
+        )
+
+        _repack_ltx23_video_decoder_weights(auxiliary_path, donor_path, output_path)
+
+        with safe_open(output_path, framework="pt") as f:
+            keys = sorted(f.keys())
+            assert keys == [
+                "decoder.conv_in.conv.weight",
+                "decoder.per_channel_statistics.mean_of_means",
+                "decoder.per_channel_statistics.std_of_means",
+                "encoder.conv_in.conv.weight",
+                "latents_mean",
+                "latents_std",
+            ]
+
+
+def test_ltx23_decode_skips_external_denorm():
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(use_official_video_decoder=True)
+            )
+        )
+    )
+    legacy_server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(use_official_video_decoder=False)
+            )
+        )
+    )
+
+    assert (
+        LTX2AVDecodingStage._ltx2_should_externally_denorm_video_latents(server_args)
+        is False
+    )
+    assert (
+        LTX2AVDecodingStage._ltx2_should_externally_denorm_video_latents(
+            legacy_server_args
+        )
+        is True
+    )
 
 
 def test_ltx23_latent_preparation_samples_directly_in_packed_space():
