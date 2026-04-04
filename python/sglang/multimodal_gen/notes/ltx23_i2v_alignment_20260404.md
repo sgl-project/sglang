@@ -191,3 +191,40 @@
   - 下一步：
     - 对读官方 `ltx_pipelines/utils/denoisers.py` 与 SGLang `runtime/pipelines_core/stages/denoising_av.py`
     - 继续二分 `cond / uncond / ptb / mod` 这几条 pass 或其 guider combine 前后的输出
+
+## 2026-04-04 二分结果更新 3：cross-modality sigma 重新复验后仍然更差
+
+- 背景：
+  - 之前在 CPU generator 仍未对齐时，曾尝试把 cross-modality AdaLN 改成使用对端模态 sigma，黑盒略微变差
+  - 在 `generator_device = cuda` 已成为默认路径之后，再按官方 `transformer_args.py` 重新核对一次
+
+- 官方源码确认：
+  - `ltx_core/model/transformer/transformer_args.py`
+  - `MultiModalTransformerArgsPreprocessor.prepare(...)` 的 cross-attention modulation 使用的是 `cross_modality.sigma`
+  - 即：
+    - video cross-attn modulation 用 audio sigma
+    - audio cross-attn modulation 用 video sigma
+
+- 试验 commit：
+  - `e83b234f3 Align LTX2 cross-modality sigma`
+
+- 远端 H100 step0 compare：
+  - 基线（仅 generator 对齐，commit `d24a47077`）：
+    - `video_denoised mean_abs = 0.5878117680549622`
+    - `video_denoised cosine = 0.5328061580657959`
+    - `audio_denoised mean_abs = 1.27132248878479`
+    - `audio_denoised cosine = -0.7826241850852966`
+  - cross-modality sigma 复验（commit `e83b234f3`）：
+    - `video_denoised mean_abs = 0.5880815386772156`
+    - `video_denoised cosine = 0.5293195843696594`
+    - `audio_denoised mean_abs = 1.307675838470459`
+    - `audio_denoised cosine = -0.7909688949584961`
+
+- 结论：
+  - 在 latent-before 已对齐的前提下，这个 patch 依然更差
+  - 它不是当前主发散点
+  - 已用 commit `2bbd476fc Revert "Align LTX2 cross-modality sigma"` 回滚，保持分支干净
+
+- 当前最可信的下一处主因：
+  - official `FactoryGuidedDenoiser` / `MultiModalGuider.calculate()` 所驱动的 `cond / uncond / ptb / mod` pass 输出本身
+  - 需要继续对拍 first forward 的 pass-level outputs，而不是继续改 timestep 来源
