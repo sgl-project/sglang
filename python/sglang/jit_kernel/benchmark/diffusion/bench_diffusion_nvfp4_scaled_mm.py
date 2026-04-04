@@ -22,9 +22,11 @@ register_cuda_ci(
 )
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = Path(os.environ["SGLANG_NVFP4_REPO_ROOT"]) if os.environ.get(
-    "SGLANG_NVFP4_REPO_ROOT"
-) else Path(__file__).resolve().parents[5]
+REPO_ROOT = (
+    Path(os.environ["SGLANG_NVFP4_REPO_ROOT"])
+    if os.environ.get("SGLANG_NVFP4_REPO_ROOT")
+    else Path(__file__).resolve().parents[5]
+)
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "nvfp4_benchmarks"
 DEFAULT_SHAPE_LIBRARY = SCRIPT_DIR / "diffusion_nvfp4_shapes.json"
 DTYPE = DEFAULT_DTYPE
