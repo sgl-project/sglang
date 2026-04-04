@@ -62,7 +62,7 @@ runtime_common = [
   "transformers==4.57.1",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
+  "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
 ]
 
@@ -123,7 +123,7 @@ srt_musa = [
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.25",
+  "torchada>=0.1.45",
   "mthreads-ml-py",
   "numpy<2.0",
 ]

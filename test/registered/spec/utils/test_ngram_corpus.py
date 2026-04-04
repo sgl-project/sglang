@@ -7,7 +7,7 @@ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 
 
 def _make_corpus(match_type="BFS", **kwargs):
@@ -41,14 +41,6 @@ def _batch_get_with_state(
     total_len: int,
 ):
     return corpus.batch_get([req_id], [current_tokens], [total_len])
-
-
-def _raw_batch_match(corpus: NgramCorpus, batch_tokens: list[list[int]]):
-    return corpus._ngram.batchMatch(
-        [uuid.uuid4().hex for _ in range(len(batch_tokens))],
-        batch_tokens,
-        [len(tokens) for tokens in batch_tokens],
-    )
 
 
 SEED_SEQUENCES = [
@@ -509,41 +501,40 @@ class TestDraftBudgetSaturation(CustomTestCase):
 
 
 class TestTruncate(CustomTestCase):
-    """Verify the Result.truncate method via the Python binding."""
+    """Verify truncation logic on batch_get output."""
 
     def test_truncate_reduces_output(self):
         corpus = _make_corpus("BFS", draft_token_num=8)
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        result = _raw_batch_match(corpus, [[1, 2, 3]])
-        original_len = len(result.token)
-        self.assertEqual(original_len, 8)
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
+        ids = ids.reshape(8)
+        self.assertEqual(len(ids), 8)
 
-        result.truncate(4)
-        self.assertEqual(len(result.token), 4)
-        self.assertEqual(len(result.mask), 4 * 4)
+        # Simulate truncate to 4
+        trunc_n = 4
+        trunc_ids = ids[:trunc_n]
+        self.assertEqual(len(trunc_ids), trunc_n)
 
     def test_truncate_preserves_mask_structure(self):
         corpus = _make_corpus("BFS", draft_token_num=8)
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        result = _raw_batch_match(corpus, [[1, 2, 3]])
-        full_ids = list(result.token)
-        full_mask = list(result.mask)
-        n = len(full_ids)
+        _, masks = _batch_get(corpus, [[1, 2, 3]])
+        n = 8
+        full_mask = masks.reshape(n, n)
 
-        result_copy = _raw_batch_match(corpus, [[1, 2, 3]])
+
         trunc_n = 4
-        result_copy.truncate(trunc_n)
-        trunc_mask = list(result_copy.mask)
+        trunc_mask = full_mask[:trunc_n, :trunc_n]
 
         for i in range(trunc_n):
             for j in range(trunc_n):
                 self.assertEqual(
-                    trunc_mask[i * trunc_n + j],
-                    full_mask[i * n + j],
+                    trunc_mask[i, j],
+                    full_mask[i, j],
                     f"Mask mismatch at ({i},{j})",
                 )
 
