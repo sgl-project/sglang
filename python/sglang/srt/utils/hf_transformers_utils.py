@@ -1008,6 +1008,15 @@ def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
         if config_val is None:
             # Key missing or null → use v4 default for this tokenizer class
             config_val = _V4_DEFAULTS.get(attr, False)
+        # Fast tokenizers in v4 used tokenizer.json post-processor for EOS —
+        # the add_eos_token Python attribute was set but the post-processor
+        # came from tokenizer.json, not from the attribute. In v5, the flag is
+        # stripped and both sglang and HF reference end up with add_eos_token=False.
+        # Restoring add_eos_token for fast tokenizers makes sglang diverge from
+        # the HF reference (which doesn't restore it), breaking embedding models
+        # like intfloat/e5-mistral-7b-instruct (cosine similarity drops to ~0.33).
+        if attr == "add_eos_token" and isinstance(tokenizer, PreTrainedTokenizerFast):
+            config_val = _V4_DEFAULTS["add_eos_token"]  # False
         current_val = getattr(tokenizer, attr, None)
         if current_val != config_val:
             logger.info(
