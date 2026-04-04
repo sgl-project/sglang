@@ -27,6 +27,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av i
     LTX2AVLatentPreparationStage,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
+    LTX2SigmaPreparationStage,
+    build_official_ltx2_sigmas,
+)
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     maybe_load_overlay_model_index,
     resolve_model_overlay_target,
@@ -86,6 +90,52 @@ def test_ltx23_defaults_to_cuda_generator():
 
     assert sampling_params.generator_device == "cuda"
     assert pipeline_config.generator_device == "cuda"
+
+
+def test_ltx23_uses_official_sigma_schedule():
+    sigmas = build_official_ltx2_sigmas(30)
+
+    assert len(sigmas) == 30
+    assert sigmas[0] == 1.0
+    assert abs(sigmas[1] - 0.99495703) < 1e-6
+    assert abs(sigmas[-1] - 0.1) < 1e-6
+
+
+def test_ltx23_sigma_preparation_uses_official_schedule_only_for_ltx23_marker():
+    req = Req(
+        sampling_params=SamplingParams(num_inference_steps=30),
+        prompt="prompt",
+        prompt_embeds=[torch.zeros(1, 1, 1)],
+    )
+    stage = LTX2SigmaPreparationStage()
+
+    ltx23_server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(use_official_image_encoder=True)
+            )
+        )
+    )
+    legacy_server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(use_official_image_encoder=False)
+            )
+        )
+    )
+
+    ltx23_batch = stage.forward(req, ltx23_server_args)
+    legacy_batch = stage.forward(
+        Req(
+            sampling_params=SamplingParams(num_inference_steps=30),
+            prompt="prompt",
+            prompt_embeds=[torch.zeros(1, 1, 1)],
+        ),
+        legacy_server_args,
+    )
+
+    assert abs(ltx23_batch.sigmas[1] - 0.99495703) < 1e-6
+    assert abs(legacy_batch.sigmas[1] - (29.0 / 30.0)) < 1e-6
 
 
 def test_ltx23_prepare_request_sets_stage1_guider_defaults():
