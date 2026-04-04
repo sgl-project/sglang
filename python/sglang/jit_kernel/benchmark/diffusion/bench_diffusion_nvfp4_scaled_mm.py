@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import statistics
 from pathlib import Path
 from typing import Any, Callable
@@ -108,11 +109,41 @@ def build_quantized_inputs(
     }
 
 
+def make_shape_id(model: str, shape_kind: str, prefix: str, m: int, n: int, k: int) -> str:
+    prefix_slug = re.sub(r"[^a-zA-Z0-9]+", "_", prefix).strip("_")
+    return f"{model}_{shape_kind}_{prefix_slug}_{m}x{n}x{k}"
+
+
 def load_shape_cases(shape_library: Path) -> list[dict[str, Any]]:
     payload = json.loads(shape_library.read_text(encoding="utf-8"))
-    rows = payload.get("shape_cases", [])
+    if not isinstance(payload, dict) or not payload:
+        raise RuntimeError(f"Expected a non-empty model->shape list mapping in {shape_library}.")
+
+    rows: list[dict[str, Any]] = []
+    for model, shapes in payload.items():
+        if not isinstance(shapes, list):
+            raise RuntimeError(f"Expected {model} to map to a list of shapes in {shape_library}.")
+        for shape in shapes:
+            m, n, k = (int(x) for x in shape["shape"])
+            count = int(shape["count"])
+            shape_kind = str(shape.get("kind", "actual_runtime_linear"))
+            prefix = str(shape.get("prefix", ""))
+            rows.append(
+                {
+                    "shape_id": make_shape_id(model, shape_kind, prefix, m, n, k),
+                    "source_model": model,
+                    "shape_kind": shape_kind,
+                    "runtime_prefix": prefix,
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                    "count": count,
+                    "approx_flops": 2 * m * n * k * count,
+                }
+            )
+
     if not rows:
-        raise RuntimeError(f"No shape_cases found in {shape_library}.")
+        raise RuntimeError(f"No shapes found in {shape_library}.")
     return rows
 
 
@@ -147,13 +178,8 @@ def write_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
             fieldnames=[
                 "shape_id",
                 "source_model",
-                "source_model_path",
-                "source_gpu_config",
                 "shape_kind",
                 "runtime_prefix",
-                "runtime_prefixes",
-                "layer_class",
-                "quant_method",
                 "m",
                 "n",
                 "k",
@@ -164,7 +190,6 @@ def write_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
                 "min_ms",
                 "max_ms",
                 "tflops",
-                "notes",
             ],
         )
         writer.writeheader()
@@ -185,13 +210,11 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
     lines.append("")
     lines.append("## Shape Cases")
     lines.append("")
-    lines.append(
-        "| Shape ID | Model | Shape Kind | Layer | Quant | GPU Config | Calls | Shape `(M,N,K)` | Prefix |"
-    )
-    lines.append("|---|---|---|---|---|---|---:|---|---|")
+    lines.append("| Shape ID | Model | Shape Kind | Calls | Shape `(M,N,K)` | Prefix |")
+    lines.append("|---|---|---|---:|---|---|")
     for row in shape_rows:
         lines.append(
-            f"| {row['shape_id']} | {row['source_model']} | {row['shape_kind']} | {row['layer_class']} | {row['quant_method']} | {row['source_gpu_config']} | {row['count']} | `({row['m']}, {row['n']}, {row['k']})` | `{row['runtime_prefix']}` |"
+            f"| {row['shape_id']} | {row['source_model']} | {row['shape_kind']} | {row['count']} | `({row['m']}, {row['n']}, {row['k']})` | `{row['runtime_prefix']}` |"
         )
     lines.append("")
 
@@ -200,9 +223,6 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
         scoped = [row for row in rows if row["shape_id"] == shape_id]
         lines.append(f"## {shape_id}")
         lines.append("")
-        if shape_row.get("notes"):
-            lines.append(shape_row["notes"])
-            lines.append("")
         lines.append("| Method | Median ms | TFLOPS |")
         lines.append("|---|---:|---:|")
         for row in sorted(scoped, key=lambda item: float(item["median_ms"])):
@@ -226,19 +246,13 @@ def run_shape_suite(shape_cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
         metadata = {
             "shape_id": str(shape["shape_id"]),
             "source_model": str(shape["source_model"]),
-            "source_model_path": str(shape["source_model_path"]),
-            "source_gpu_config": str(shape["source_gpu_config"]),
             "shape_kind": str(shape["shape_kind"]),
             "runtime_prefix": str(shape["runtime_prefix"]),
-            "runtime_prefixes": list(shape.get("runtime_prefixes", [])),
-            "layer_class": str(shape.get("layer_class", "")),
-            "quant_method": str(shape.get("quant_method", "")),
             "m": m,
             "n": n,
             "k": k,
             "count": int(shape["count"]),
             "approx_flops": int(shape["approx_flops"]),
-            "notes": str(shape.get("notes", "")),
         }
 
         providers: dict[str, Callable[[], torch.Tensor]] = {
