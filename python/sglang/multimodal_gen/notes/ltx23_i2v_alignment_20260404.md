@@ -276,3 +276,40 @@
   - 下一步：
     - 优先对读官方 `Modality(timesteps/positions/context_mask)` 语义和 SGLang video 路径的 `timestep_video / coords / i2v denoise_mask`
     - 如有必要，再把 native dump 向前推进到 video transformer block0 的 cond/mod 路径
+
+## 2026-04-04 二分结果更新 5：timestep-scale 是一条 false lead，原因是 SGLang `timesteps` 已经是 1000 标度
+
+- 触发原因：
+  - 对读官方 `ltx_core/model/transformer/transformer_args.py` 时，看到 `_prepare_timestep()` 会把 `timestep * timestep_scale_multiplier` 再送进 AdaLN
+  - 直觉上像是 SGLang `runtime/models/dits/ltx_2.py` 漏掉了这层 scaling
+
+- 试验 commit：
+  - `7c1de964d Align LTX2 timestep scaling with official`
+  - 动作：
+    - 给 main/prompt/cross-scale-shift 的 AdaLN 输入补 `self.timestep_scale_multiplier`
+
+- 远端 H100 pass-level compare（错误 patch）：
+  - `video_cond cosine = 0.2156`，比基线 `0.3457` 更差
+  - `audio_mod cosine = 0.3029`，比基线 `0.99965` 大幅变差
+  - 虽然 `video_denoised cosine = 0.5879`、`audio_denoised cosine = -0.1074` 表面上变好，但 first-divergence 的 pass-level 指标明显恶化
+  - 结论：
+    - 这不是 source-aligned 修复，更像偶然补偿
+
+- 根因澄清：
+  - 本地直接验证 `FlowMatchEulerDiscreteScheduler`：
+    - `timesteps[0] = 1000.0`
+    - `sigmas[0] = 1.0`
+  - 也就是说：
+    - 官方 native 路径是 `raw sigma -> *1000 -> AdaLN`
+    - SGLang 当前传进 model 的 `timestep` 已经是 scheduler 的 `timesteps`，本来就是 1000 标度
+    - 所以上述 patch 实际上造成了 double-scale
+
+- 回滚：
+  - `e8d48791a Revert "Align LTX2 timestep scaling with official"`
+
+- 当前最可信的下一处主因：
+  - 不是 timestep 是否乘 1000
+  - 仍然是 step0 第一次 `video cond` forward 里的 video-path 语义
+  - 下一刀应继续看：
+    - i2v video `timesteps / denoise_mask / positions`
+    - 或 native block0 `cond/mod` 内部输出
