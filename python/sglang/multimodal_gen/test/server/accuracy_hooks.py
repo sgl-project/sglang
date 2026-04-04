@@ -204,7 +204,6 @@ def _build_transformer_hook_inputs(
 ) -> Inputs:
     """Build one synthetic input bundle that both transformer variants can consume."""
     compat = _resolve_transformer_hook_compat(case)
-    model_path = case.server_args.model_path.lower()
     param_names = _forward_parameter_names(model)
     if ref_model is not None:
         # The input bundle has to satisfy both call signatures.
@@ -212,14 +211,12 @@ def _build_transformer_hook_inputs(
 
     rng = _DeterministicRNG()
     layout = _infer_transformer_layout(param_names)
-    is_ltx_audio_video_transformer = (
-        "ltx" in model_path
-        and "audio_hidden_states" in param_names
-        and "audio_encoder_hidden_states" in param_names
-    )
     requires_audio_stream_inputs = (
         "audio_hidden_states" in param_names
         and "audio_encoder_hidden_states" in param_names
+    )
+    requires_audio_video_shape_inputs = requires_audio_stream_inputs and all(
+        key in param_names for key in ("num_frames", "height", "width")
     )
     in_channels = _read_config_value(
         model,
@@ -277,7 +274,7 @@ def _build_transformer_hook_inputs(
         default=I2V_IMAGE_DIM,
     )
 
-    if is_ltx_audio_video_transformer:
+    if requires_audio_video_shape_inputs:
         patch_size = getattr(model, "patch_size", None)
         if not (
             isinstance(patch_size, tuple)
@@ -355,7 +352,7 @@ def _build_transformer_hook_inputs(
         )
         inputs["audio_timestep"] = inputs["timestep"].clone()
         inputs["audio_num_frames"] = DEFAULT_AUDIO_FRAME_COUNT
-        if is_ltx_audio_video_transformer:
+        if requires_audio_video_shape_inputs:
             inputs["num_frames"] = num_frames
             inputs["height"] = height
             inputs["width"] = width
