@@ -8,6 +8,7 @@ __all__ = [
     "HWBackend",
     "CIRegistry",
     "collect_tests",
+    "auto_partition",
     "register_cpu_ci",
     "register_cuda_ci",
     "register_amd_ci",
@@ -30,10 +31,14 @@ class HWBackend(Enum):
 class CIRegistry:
     backend: HWBackend
     filename: str
+    # Estimated time to run the test in seconds.
     est_time: float
+    # The suite this test is registered in.
     suite: str
+    # Whether the test is a nightly test.
     nightly: bool = False
-    disabled: Optional[str] = None  # None = enabled, string = disabled with reason
+    # Reason for disabling the test. None = enabled, string = disabled with reason.
+    disabled: Optional[str] = None
 
 
 def register_cpu_ci(
@@ -194,6 +199,32 @@ def ut_parse_one_file(filename: str) -> List[CIRegistry]:
     visitor = RegistryVisitor(filename=filename)
     visitor.visit(tree)
     return visitor.registries
+
+
+def auto_partition(files: List[CIRegistry], rank: int, size: int) -> List[CIRegistry]:
+    """Partition files into `size` sublists with approximately equal sums of
+    estimated times using a greedy algorithm (LPT heuristic), and return the
+    partition for the specified rank.
+    """
+    if not files or size <= 0:
+        return []
+
+    # Sort by estimated_time descending; filename as tie-breaker for
+    # deterministic partitioning regardless of glob ordering.
+    sorted_files = sorted(files, key=lambda f: (-f.est_time, f.filename))
+
+    partitions: List[List[CIRegistry]] = [[] for _ in range(size)]
+    partition_sums = [0.0] * size
+
+    # Greedily assign each file to the partition with the smallest current total time
+    for file in sorted_files:
+        min_sum_idx = min(range(size), key=partition_sums.__getitem__)
+        partitions[min_sum_idx].append(file)
+        partition_sums[min_sum_idx] += file.est_time
+
+    if rank < size:
+        return partitions[rank]
+    return []
 
 
 def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistry]:

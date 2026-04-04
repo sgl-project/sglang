@@ -63,6 +63,21 @@ class GenerationBatchResult:
                 self.logits_output.input_token_logprobs = (
                     self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
                 )
+            if self.logits_output.next_token_top_logprobs_val is not None:
+                self.logits_output.next_token_top_logprobs_val = [
+                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    for v in self.logits_output.next_token_top_logprobs_val
+                ]
+            if self.logits_output.next_token_top_logprobs_idx is not None:
+                self.logits_output.next_token_top_logprobs_idx = [
+                    x.to("cpu", non_blocking=True) if torch.is_tensor(x) else x
+                    for x in self.logits_output.next_token_top_logprobs_idx
+                ]
+            if self.logits_output.next_token_token_ids_logprobs_val is not None:
+                self.logits_output.next_token_token_ids_logprobs_val = [
+                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    for v in self.logits_output.next_token_token_ids_logprobs_val
+                ]
         if self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True

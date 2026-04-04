@@ -77,11 +77,19 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_non_idle_and_non_empty,
+    is_npu,
+    make_layers,
+)
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class LLaDA2MoeMLP(nn.Module):
@@ -189,6 +197,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.score_function = getattr(config, "score_function", None)
+
+        # fused_topk_npu() conducting norm before scale with routed_scaling_factor by default
+        # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
+        if _is_npu:
+            self.norm_topk_prob = False
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -474,12 +487,13 @@ class LLaDA2MoeAttention(nn.Module):
             self.rotary_dim = config.rotary_dim
         else:
             self.rotary_dim = self.head_dim
+        rope_theta, rope_scaling = get_rope_config(config)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_scaling=config.rope_scaling,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
 
         self.attn = RadixAttention(

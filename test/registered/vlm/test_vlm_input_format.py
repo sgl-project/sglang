@@ -35,8 +35,9 @@ if not hasattr(_hf_activations, "PytorchGELUTanh"):
 from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
 
-register_cuda_ci(est_time=447, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=447, suite="stage-b-test-1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
@@ -61,6 +62,7 @@ class VLMInputTestBase:
         cls.processor = AutoProcessor.from_pretrained(
             cls.model_path, trust_remote_code=True, use_fast=True
         )
+        _fix_added_tokens_encoding(cls.processor.tokenizer)
         cls._init_visual()
 
     @classmethod
@@ -199,16 +201,22 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
 
     @classmethod
     def _init_visual(cls):
-        cls.visual_model = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                cls.model_path, torch_dtype=torch.bfloat16
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            cls.model_path, torch_dtype=torch.bfloat16
+        ).eval()
+        # In transformers v5, .visual moved under .model
+        visual = model.model.visual
+        cls.visual_model = visual.to(cls.device)
+
+        # In transformers v5, the visual encoder returns BaseModelOutputWithPooling;
+        # pooler_output has the spatially-merged embeddings we need.
+        def visual(processor_output):
+            out = cls.visual_model(
+                processor_output["pixel_values"], processor_output["image_grid_thw"]
             )
-            .eval()
-            .visual.to(cls.device)
-        )
-        cls.visual = lambda processor_output: cls.visual_model(
-            processor_output["pixel_values"], processor_output["image_grid_thw"]
-        )
+            return out.pooler_output if hasattr(out, "pooler_output") else out
+
+        cls.visual = visual
 
     def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
@@ -251,13 +259,47 @@ class TestKimiVLImageUnderstandsImage(
 
     @classmethod
     def _init_visual(cls):
-        model = AutoModel.from_pretrained(cls.model_path, trust_remote_code=True)
+        import inspect
+
+        from transformers import AutoConfig
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+        config = AutoConfig.from_pretrained(cls.model_path, trust_remote_code=True)
+
+        # Transformers v5 auto-populates rope_scaling with
+        # {"rope_theta": ..., "rope_type": "default"} even when the original
+        # config had rope_scaling: null. The remote KimiVL code branches on
+        # `if self.config.rope_scaling is None` so we must reset it.
+        tc = getattr(config, "text_config", None)
+        if tc is not None:
+            rs = getattr(tc, "rope_scaling", None)
+            if isinstance(rs, dict) and rs.get("rope_type") == "default":
+                tc.rope_scaling = None
+
+        # Transformers v5 calls tie_weights(recompute_mapping=False) in
+        # post_init, but KimiVL's tie_weights doesn't accept that kwarg.
+        auto_map = getattr(config, "auto_map", {})
+        model_ref = auto_map.get("AutoModel")
+        if model_ref:
+            model_cls = get_class_from_dynamic_module(model_ref, cls.model_path)
+            orig_tie = model_cls.tie_weights
+            if "recompute_mapping" not in inspect.signature(orig_tie).parameters:
+
+                def _patched_tie(self, **kwargs):
+                    return orig_tie(self)
+
+                model_cls.tie_weights = _patched_tie
+
+        model = AutoModel.from_pretrained(
+            cls.model_path, config=config, trust_remote_code=True
+        )
         cls.vision_tower = model.vision_tower.eval().to(cls.device)
         cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+        _vt_dtype = next(cls.vision_tower.parameters()).dtype
 
         cls.visual = lambda tokenizer_output: cls.mm_projector(
             cls.vision_tower(
-                pixel_values=tokenizer_output["pixel_values"],
+                pixel_values=tokenizer_output["pixel_values"].to(_vt_dtype),
                 grid_hws=tokenizer_output["image_grid_hws"],
             )
         )
@@ -376,9 +418,41 @@ class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
 
     @classmethod
     def _init_visual(cls):
-        model = AutoModel.from_pretrained(
-            cls.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
-        )
+        try:
+            model = AutoModel.from_pretrained(
+                cls.model_path,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=False,
+            )
+        except RuntimeError as e:
+            if "meta" not in str(e):
+                raise
+            # Transformers v5 always uses meta tensors for init, which breaks
+            # models calling .item() in __init__ (e.g. InternVL's drop_path_rate).
+            # Fall back to from_config + manual weight loading.
+            import gc
+            import glob
+            import os
+
+            from huggingface_hub import snapshot_download
+            from safetensors.torch import load_file
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(cls.model_path, trust_remote_code=True)
+            with torch.device("cpu"):
+                model = AutoModel.from_config(
+                    config,
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                )
+            model_dir = snapshot_download(cls.model_path)
+            for f in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+                shard = load_file(f)
+                model.load_state_dict(shard, strict=False)
+                del shard
+            gc.collect()
+
         cls.vision_model = model.vision_model.eval().to(cls.device)
         cls.mlp1 = model.mlp1.eval().to(cls.device)
 
@@ -497,6 +571,119 @@ class TestInternVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
             "input_ids": input_ids,
             "pixel_values": pixel_values,
         }, text
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
+
+
+class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    model_path = "openbmb/MiniCPM-V-4"
+    chat_template = "minicpmv"
+
+    @classmethod
+    def setUpClass(cls):
+        assert cls.model_path is not None, "Set model_path in subclass"
+        assert cls.chat_template is not None, "Set chat_template in subclass"
+        cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        cls.main_image = []
+        for image_url in cls.image_urls:
+            response = requests.get(image_url)
+            cls.main_image.append(Image.open(BytesIO(response.content)))
+
+        cls.processor = AutoProcessor.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        _fix_added_tokens_encoding(cls.processor.tokenizer)
+        cls._init_visual()
+
+    @classmethod
+    def _init_visual(cls):
+        try:
+            model = AutoModel.from_pretrained(
+                cls.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+            )
+        except (AttributeError, RuntimeError) as e:
+            err = str(e)
+            if "all_tied_weights_keys" not in err and "meta" not in err:
+                raise
+            # Transformers v5: remote model code may lack all_tied_weights_keys
+            # or meta-tensor init may break .item() calls.  Fall back to
+            # from_config + manual weight loading.
+            import gc
+            import glob
+            import os
+
+            from huggingface_hub import snapshot_download
+            from safetensors.torch import load_file
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(cls.model_path, trust_remote_code=True)
+            with torch.device("cpu"):
+                model = AutoModel.from_config(
+                    config,
+                    trust_remote_code=True,
+                    torch_dtype=torch.bfloat16,
+                )
+            model_dir = snapshot_download(cls.model_path)
+            for f in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+                shard = load_file(f)
+                model.load_state_dict(shard, strict=False)
+                del shard
+            gc.collect()
+
+        cls.vpm_model = model.vpm.eval().to(cls.device)
+        cls.resampler_model = model.resampler.eval().to(cls.device)
+        del model
+
+        def visual_func(processor_output):
+            pixel_values = processor_output["pixel_values"]
+            tgt_sizes = processor_output["tgt_sizes"]
+
+            pixel_values_flat = []
+            tgt_sizes_flat = []
+            for pixel_b, tgt_b in zip(pixel_values, tgt_sizes):
+                if isinstance(pixel_b, (list, tuple)):
+                    for pixel_n, tgt_n in zip(pixel_b, tgt_b):
+                        pixel_values_flat.append(pixel_n)
+                        tgt_sizes_flat.append(tgt_n)
+                else:
+                    pixel_values_flat.append(pixel_b)
+                    tgt_sizes_flat.append(tgt_b)
+
+            tgt_sizes_tensor = torch.stack(tgt_sizes_flat, dim=0)
+            device = cls.vpm_model.embeddings.position_embedding.weight.device
+            dtype = cls.vpm_model.embeddings.position_embedding.weight.dtype
+
+            all_pixel_values_lst = [
+                i.flatten(end_dim=1).permute(1, 0) for i in pixel_values_flat
+            ]
+            max_patches = int(
+                (tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]).max().item()
+            )
+            all_pixel_values = torch.nn.utils.rnn.pad_sequence(
+                all_pixel_values_lst, batch_first=True, padding_value=0.0
+            )
+            B, L, _ = all_pixel_values.shape
+            all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
+            patch_attn_mask = torch.zeros(
+                (B, 1, max_patches), dtype=torch.bool, device=device
+            )
+            tgt_sizes_dev = tgt_sizes_tensor.to(device)
+            mask_shapes = tgt_sizes_dev[:, 0] * tgt_sizes_dev[:, 1]
+            patch_attn_mask[:, 0, :] = torch.arange(
+                max_patches, device=device
+            ).unsqueeze(0) < mask_shapes.unsqueeze(1)
+
+            vision_output = cls.vpm_model(
+                all_pixel_values.type(dtype),
+                patch_attention_mask=patch_attn_mask,
+                tgt_sizes=tgt_sizes_tensor,
+            )
+            vision_embedding = vision_output.last_hidden_state
+            return cls.resampler_model(vision_embedding, tgt_sizes_tensor)
+
+        cls.visual = visual_func
 
     def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")

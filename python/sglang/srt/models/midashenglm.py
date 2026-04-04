@@ -10,6 +10,7 @@ import torchaudio.functional as F
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -79,7 +80,7 @@ class AudioPatchEmbed(nn.Module):
         )
         self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.flatten = flatten
-        self.proj = nn.Conv2d(
+        self.proj = Conv2dLayer(
             in_chans,
             embed_dim,
             kernel_size=self.patch_size,
@@ -475,20 +476,12 @@ class MiDashengLMModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        if (
-            hasattr(config.text_config, "rope_scaling")
-            and config.text_config.rope_scaling
-        ):
-            if "mrope_section" in config.text_config.rope_scaling:
-
-                new_rope_scaling = {
-                    k: v
-                    for k, v in config.text_config.rope_scaling.items()
-                    if k != "mrope_section"
-                }
-                config.text_config.rope_scaling = (
-                    new_rope_scaling if new_rope_scaling else None
-                )
+        rope_scaling = config.text_config.rope_parameters
+        if rope_scaling:
+            if "mrope_section" in rope_scaling:
+                # Remove mrope_section from rope_parameters so downstream
+                # code treats this as standard rotary embedding.
+                del rope_scaling["mrope_section"]
         self.audio_encoder = DashengAudioTransformer(
             config.audio_encoder_config,
             quant_config=quant_config,

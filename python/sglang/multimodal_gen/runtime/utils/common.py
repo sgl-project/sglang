@@ -261,6 +261,15 @@ def set_cuda_arch():
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
 
 
+# musa
+
+
+def set_musa_arch():
+    capability = torch.cuda.get_device_capability()
+    arch = f"{capability[0]}{capability[1]}"
+    os.environ["TORCH_MUSA_ARCH_LIST"] = f"{arch}"
+
+
 # env var managements
 
 _warned_bool_env_var_keys = set()

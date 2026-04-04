@@ -429,6 +429,16 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                 forward_batch,
             )
 
+            # Chain-style MTP: overwrite self.hidden_states with the draft model's
+            # output (hidden_states_before_norm) so that assign_new_state_triton
+            # propagates each MTP layer's own output to the next MTP layer,
+            # rather than always feeding the target model's hidden states.
+            if (
+                self.eagle_worker.chain_mtp_hidden_states
+                and ret.hidden_states is not None
+            ):
+                self.hidden_states[:num_tokens].copy_(ret.hidden_states[:num_tokens])
+
             select_index = (
                 torch.arange(bs, device=self.model_runner.device)
                 * (self.speculative_num_draft_tokens + self.step)
@@ -659,7 +669,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                 dtype=torch.int32,
             )
             self.cuda_graph_buffers["req_pool_indices"] = torch.zeros(
-                (self.max_bs,), dtype=torch.int32
+                (self.max_bs,), dtype=torch.int64
             )
             self.cuda_graph_buffers["accept_length"] = torch.full(
                 (self.max_bs,), 1, dtype=torch.int32
