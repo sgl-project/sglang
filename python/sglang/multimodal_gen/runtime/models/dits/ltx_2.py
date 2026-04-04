@@ -1559,6 +1559,13 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 device=audio_hidden_states.device,
             )
 
+        video_coords = video_coords.to(
+            device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        audio_coords = audio_coords.to(
+            device=audio_hidden_states.device, dtype=audio_hidden_states.dtype
+        )
+
         _ltx2_maybe_dump_coords(
             video_coords=video_coords,
             audio_coords=audio_coords,
