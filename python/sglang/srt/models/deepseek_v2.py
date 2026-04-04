@@ -165,7 +165,10 @@ if _use_aiter:
     pass
 
 if _is_cuda:
+    from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
     from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
+
+    from sglang.srt.utils.custom_op import register_custom_op
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -324,11 +327,20 @@ class MoEGate(nn.Module):
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
+                if _device_sm >= 100 and self.weight.shape[0] == 256:
+                    # router gemm output float32
+                    logits = torch.empty(
+                        hidden_states.shape[0],
+                        self.weight.shape[0],
+                        device=hidden_states.device,
+                        dtype=torch.float32,
+                    )
+                    flashinfer_dsv3_router_gemm(logits, hidden_states, self.weight)
+                else:
+                    logits = dsv3_router_gemm(
+                        hidden_states, self.weight, out_dtype=torch.float32
+                    )
 
-                # router gemm output float32
-                logits = dsv3_router_gemm(
-                    hidden_states, self.weight, out_dtype=torch.float32
-                )
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             else:
@@ -2257,6 +2269,24 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 
 class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
+
+
+@register_custom_op(
+    op_name="flashinfer_dsv3_router_gemm",
+    mutates_args=[],
+    fake_impl=lambda logits, hidden_states, weight: None,
+)
+def flashinfer_dsv3_router_gemm(
+    logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    _raw_dsv3_router_gemm(
+        hidden_states,
+        weight.t(),
+        logits,
+        launch_with_pdl=True,
+    )
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
