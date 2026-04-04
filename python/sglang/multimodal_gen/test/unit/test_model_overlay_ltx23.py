@@ -13,6 +13,9 @@ from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
+    LTX2AVDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     maybe_load_overlay_model_index,
     resolve_model_overlay_target,
@@ -87,6 +90,32 @@ def test_ltx23_prepare_request_sets_stage1_guider_defaults():
         "audio_skip_step": 0,
         "audio_stg_blocks": [28],
     }
+
+
+def test_ltx23_stage1_guider_params_apply_to_one_stage_path():
+    sampling_params = SamplingParams.from_pretrained(
+        "Lightricks/LTX-2.3",
+        backend="sglang",
+    )
+    server_args = SimpleNamespace(
+        attention_backend_config=SimpleNamespace(VSA_sparsity=0.0),
+    )
+
+    req = prepare_request(server_args, sampling_params)
+    stage = SimpleNamespace(pipeline=None)
+
+    assert (
+        LTX2AVDenoisingStage._get_ltx2_stage1_guider_params(
+            stage, req, server_args, "stage1"
+        )
+        == req.extra["ltx2_stage1_guider_params"]
+    )
+    assert (
+        LTX2AVDenoisingStage._get_ltx2_stage1_guider_params(
+            stage, req, server_args, "stage2"
+        )
+        is None
+    )
 
 
 def test_pack_text_embeds_v2_masks_padding():

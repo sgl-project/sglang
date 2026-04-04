@@ -116,13 +116,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
     ) -> dict[str, object] | None:
         if stage != "stage1":
             return None
-
-        pipeline_ref = getattr(self, "pipeline", None)
-        pipeline = pipeline_ref() if callable(pipeline_ref) else pipeline_ref
-        pipeline_name = getattr(pipeline, "pipeline_name", None)
-        if pipeline_name != "LTX2TwoStagePipeline":
-            return None
-
         return batch.extra.get("ltx2_stage1_guider_params")
 
     @staticmethod
