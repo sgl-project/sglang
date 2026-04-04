@@ -76,7 +76,7 @@ struct KernelConfigLargeM {
   using OutputType = T;
   using MmaTileShape = Shape<_256, _256, _256>;
   using ClusterShape = Shape<int, int, _1>;
-  using EpilogueTile = Shape<_128, _64>;  // Avoid register spilling
+  using EpilogueTile = Shape<_128, _64>;
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
   using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100;
   const static dim3 preferred_cluster;

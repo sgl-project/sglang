@@ -326,7 +326,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         K_padded = round_up(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
-        # Blockwise interleave for the CUTLASS TMA layout expected by the kernel.
+        # Blockwise interleave for CUTLASS TMA layout required by CUTLASS kernel
         padded_scales = padded_scales.reshape(
             B, M_padded // 128, 4, 32, K_padded // 4, 4
         )

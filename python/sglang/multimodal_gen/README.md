@@ -9,7 +9,7 @@ SGLang diffusion features an end-to-end unified pipeline for accelerating diffus
 ## Key Features
 
 SGLang Diffusion has the following features:
-  - Broad model support: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image
+  - Broad model support: Wan series, FastWan series, Hunyuan, LTX-2, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image
   - Fast inference speed: enpowered by highly optimized kernel from sgl-kernel and efficient scheduler loop
   - Ease of use: OpenAI-compatible api, CLI, and python sdk support
   - Multi-platform support:
@@ -75,6 +75,11 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A curious raccoon" \
     --save-output
 ```
+
+For LTX-2 two-stage generation, use `--pipeline-class-name LTX2TwoStagePipeline`. The
+spatial upsampler and distilled LoRA are auto-resolved from the same model snapshot by
+default, and can still be overridden with `--spatial-upsampler-path` and
+`--distilled-lora-path` when needed.
 
 ### LoRA support
 
