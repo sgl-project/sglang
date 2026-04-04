@@ -68,6 +68,19 @@ def test_ltx23_model_info_uses_ltx23_sampling_params():
     assert model_info.sampling_param_cls.__name__ == "LTX23SamplingParams"
 
 
+def test_ltx23_defaults_to_cuda_generator():
+    sampling_params = SamplingParams.from_pretrained(
+        "Lightricks/LTX-2.3",
+        backend="sglang",
+    )
+    pipeline_config = get_model_info(
+        "Lightricks/LTX-2.3", backend="sglang"
+    ).pipeline_config_cls()
+
+    assert sampling_params.generator_device == "cuda"
+    assert pipeline_config.generator_device == "cuda"
+
+
 def test_ltx23_prepare_request_sets_stage1_guider_defaults():
     sampling_params = SamplingParams.from_pretrained(
         "Lightricks/LTX-2.3",
