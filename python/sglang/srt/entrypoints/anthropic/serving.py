@@ -65,6 +65,16 @@ class AnthropicServing:
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
 
+    def _thinking_enabled(self, request: AnthropicMessagesRequest) -> bool:
+        return request.thinking is not None and request.thinking.type == "enabled"
+
+    def _signature_delta_event(self, index: int) -> AnthropicStreamEvent:
+        return AnthropicStreamEvent(
+            type="content_block_delta",
+            index=index,
+            delta=AnthropicDelta(type="signature_delta", signature=""),
+        )
+
     async def handle_messages(
         self,
         request: AnthropicMessagesRequest,
@@ -184,7 +194,25 @@ class AnthropicServing:
             content_parts = []
             tool_calls = []
 
+            if msg.role == "assistant":
+                thinking_parts = [
+                    block.thinking
+                    for block in msg.content
+                    if block.type == "thinking" and block.thinking
+                ]
+                if thinking_parts:
+                    content_parts.append(
+                        {
+                            "type": "text",
+                            "text": "<think>\n"
+                            + "\n".join(thinking_parts)
+                            + "\n</think>",
+                        }
+                    )
+
             for block in msg.content:
+                if block.type in ("thinking", "redacted_thinking"):
+                    continue
                 if block.type == "text" and block.text:
                     content_parts.append({"type": "text", "text": block.text})
 
@@ -269,22 +297,12 @@ class AnthropicServing:
 
         chat_request = ChatCompletionRequest(**request_data)
 
-        # Wire thinking parameter
         if anthropic_request.thinking is not None:
-            # Pick the correct kwarg key based on the model's reasoning parser
-            reasoning_parser = self.openai_serving_chat.reasoning_parser
-            if reasoning_parser in ("deepseek-v3", "kimi_k2"):
-                thinking_key = "thinking"
-            else:
-                thinking_key = "enable_thinking"
-
-            enabled = anthropic_request.thinking.type == "enabled"
-            chat_request.separate_reasoning = enabled
-            if enabled:
-                chat_request.stream_reasoning = True
-            if chat_request.chat_template_kwargs is None:
-                chat_request.chat_template_kwargs = {}
-            chat_request.chat_template_kwargs[thinking_key] = enabled
+            self.openai_serving_chat.apply_reasoning_enabled(
+                chat_request, self._thinking_enabled(anthropic_request)
+            )
+            if anthropic_request.thinking.budget_tokens is not None:
+                logger.warning("Anthropic thinking budget_tokens is not supported")
 
         # Convert tools
         if anthropic_request.tools:
@@ -376,7 +394,7 @@ class AnthropicServing:
             )
 
         # Convert to Anthropic response
-        anthropic_response = self._convert_response(response)
+        anthropic_response = self._convert_response(response, anthropic_request)
         return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
@@ -446,6 +464,7 @@ class AnthropicServing:
         content_block_index = 0
         content_block_open = False
         thinking_block_open = False
+        emit_thinking = self._thinking_enabled(anthropic_request)
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -460,6 +479,12 @@ class AnthropicServing:
             if data_str == "[DONE]":
                 # Close any open thinking block
                 if thinking_block_open:
+                    yield _wrap_sse_event(
+                        self._signature_delta_event(
+                            content_block_index
+                        ).model_dump_json(exclude_none=True),
+                        "content_block_delta",
+                    )
                     stop_event = AnthropicStreamEvent(
                         type="content_block_stop",
                         index=content_block_index,
@@ -571,7 +596,11 @@ class AnthropicServing:
             delta = choice.delta
 
             # Handle reasoning/thinking content deltas
-            if delta.reasoning_content is not None and delta.reasoning_content != "":
+            if (
+                emit_thinking
+                and delta.reasoning_content is not None
+                and delta.reasoning_content != ""
+            ):
                 # Start a thinking content block if needed
                 if not thinking_block_open:
                     start_event = AnthropicStreamEvent(
@@ -606,6 +635,12 @@ class AnthropicServing:
             if thinking_block_open and (
                 delta.tool_calls or (delta.content is not None and delta.content != "")
             ):
+                yield _wrap_sse_event(
+                    self._signature_delta_event(content_block_index).model_dump_json(
+                        exclude_none=True
+                    ),
+                    "content_block_delta",
+                )
                 stop_event = AnthropicStreamEvent(
                     type="content_block_stop",
                     index=content_block_index,
@@ -715,7 +750,9 @@ class AnthropicServing:
                 )
 
     def _convert_response(
-        self, response: ChatCompletionResponse
+        self,
+        response: ChatCompletionResponse,
+        anthropic_request: AnthropicMessagesRequest,
     ) -> AnthropicMessagesResponse:
         """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
         if not response.choices:
@@ -730,10 +767,15 @@ class AnthropicServing:
         content: list[AnthropicContentBlock] = []
 
         # Add thinking content if present
-        if choice.message.reasoning_content:
+        if (
+            self._thinking_enabled(anthropic_request)
+            and choice.message.reasoning_content
+        ):
             content.append(
                 AnthropicContentBlock(
-                    type="thinking", thinking=choice.message.reasoning_content
+                    type="thinking",
+                    thinking=choice.message.reasoning_content,
+                    signature="",
                 )
             )
 
@@ -806,6 +848,7 @@ class AnthropicServing:
                 messages=request.messages,
                 max_tokens=1,  # dummy, not used for counting
                 system=request.system,
+                thinking=request.thinking,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
             )

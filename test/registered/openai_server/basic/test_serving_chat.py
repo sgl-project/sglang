@@ -133,6 +133,30 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
 
+    def test_apply_reasoning_enabled_uses_qwen_control_key(self):
+        self.chat.reasoning_parser = "qwen3"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+
+        self.chat.apply_reasoning_enabled(request, False)
+
+        self.assertEqual(request.chat_template_kwargs, {"enable_thinking": False})
+        self.assertFalse(self.chat._get_reasoning_from_request(request))
+
+    def test_apply_reasoning_enabled_uses_deepseek_control_key(self):
+        self.chat.reasoning_parser = "deepseek-v3"
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+
+        self.chat.apply_reasoning_enabled(request, True)
+
+        self.assertEqual(request.chat_template_kwargs, {"thinking": True})
+        self.assertTrue(self.chat._get_reasoning_from_request(request))
+
     def test_jinja_uses_openai_tool_schema_first(self):
         """Ensure Jinja chat templates receive OpenAI-shaped tools by default."""
         self.template_manager.chat_template_name = None

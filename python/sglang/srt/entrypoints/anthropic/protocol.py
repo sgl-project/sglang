@@ -48,6 +48,7 @@ class AnthropicContentBlock(BaseModel):
     # For thinking content
     thinking: Optional[str] = None
     signature: Optional[str] = None
+    data: Optional[str] = None
 
 
 class AnthropicMessage(BaseModel):
@@ -87,6 +88,7 @@ class AnthropicCountTokensRequest(BaseModel):
     model: str
     messages: list[AnthropicMessage]
     system: Optional[str | list[AnthropicContentBlock]] = None
+    thinking: Optional["AnthropicThinkingParam"] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
 
@@ -139,9 +141,12 @@ class AnthropicMessagesRequest(BaseModel):
 class AnthropicDelta(BaseModel):
     """Delta for streaming responses"""
 
-    type: Optional[Literal["text_delta", "input_json_delta", "thinking_delta"]] = None
+    type: Optional[
+        Literal["text_delta", "input_json_delta", "thinking_delta", "signature_delta"]
+    ] = None
     text: Optional[str] = None
     thinking: Optional[str] = None
+    signature: Optional[str] = None
     partial_json: Optional[str] = None
 
     # Message delta fields

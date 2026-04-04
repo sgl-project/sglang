@@ -88,6 +88,14 @@ class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
     _default_sampling_params_logged = False
+    _REASONING_TEMPLATE_CONTROL = {
+        "deepseek-v3": ("thinking", False),
+        "kimi_k2": ("thinking", True),
+        "qwen3": ("enable_thinking", True),
+        "glm45": ("enable_thinking", True),
+        "nano_v3": ("enable_thinking", True),
+        "interns1": ("enable_thinking", True),
+    }
 
     def __init__(
         self,
@@ -1210,27 +1218,42 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
+    def _get_reasoning_template_control(self) -> Optional[tuple[str, bool]]:
+        return self._REASONING_TEMPLATE_CONTROL.get(self.reasoning_parser)
+
+    def apply_reasoning_enabled(
+        self, request: ChatCompletionRequest, enabled: bool
+    ) -> None:
+        """Apply parser-specific reasoning controls to a chat request."""
+        control = self._get_reasoning_template_control()
+        if control is None:
+            if not enabled:
+                chat_template_kwargs = dict(request.chat_template_kwargs or {})
+                chat_template_kwargs["thinking"] = False
+                chat_template_kwargs["enable_thinking"] = False
+                request.chat_template_kwargs = chat_template_kwargs
+            return
+
+        control_key, _ = control
+        chat_template_kwargs = dict(request.chat_template_kwargs or {})
+        chat_template_kwargs[control_key] = enabled
+        request.chat_template_kwargs = chat_template_kwargs
+
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Judge whether the request needs reasoning"""
         if not self.reasoning_parser:
             return False
-        if self.reasoning_parser in ["deepseek-v3"]:
-            # Models that require explicit enable thinking (thinking=True)
+        control = self._get_reasoning_template_control()
+        if control is not None:
+            control_key, default_enabled = control
+            if default_enabled:
+                return (
+                    not request.chat_template_kwargs
+                    or request.chat_template_kwargs.get(control_key) is not False
+                )
             return (
                 request.chat_template_kwargs is not None
-                and request.chat_template_kwargs.get("thinking") is True
-            )
-        if self.reasoning_parser in ["kimi_k2"]:
-            # Models that thinking by default, and can be disabled by setting thinking=False
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("thinking") is not False
-            )
-        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
-            # Models that thinking by default, and can be disabled by setting enable_thinking=False
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking") is not False
+                and request.chat_template_kwargs.get(control_key) is True
             )
         return True  # default
 
