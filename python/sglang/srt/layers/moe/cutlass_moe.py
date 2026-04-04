@@ -17,9 +17,9 @@ if _is_cuda:
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
         shuffle_rows,
-        silu_and_mul,
     )
 
+    from sglang.jit_kernel.activation import silu_and_mul
     from sglang.jit_kernel.nvfp4 import (
         cutlass_fp4_group_mm,
         scaled_fp4_experts_quant,
