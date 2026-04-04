@@ -103,7 +103,7 @@ class TestNVFP4Method(unittest.TestCase):
 
         m = NVFP4Method(num_layers=4, device="cpu", sm_version=120)
         self.assertEqual(m.name, "nvfp4")
-        self.assertEqual(m.scale_block_size, 16)
+        self.assertEqual(m.SCALE_BLOCK_SIZE, 16)
         self.assertTrue(m.needs_dequant_workspace())
         self.assertTrue(m.needs_global_scale())
 

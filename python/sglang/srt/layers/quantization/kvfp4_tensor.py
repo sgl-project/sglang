@@ -146,47 +146,66 @@ class KVFP4QuantizeUtil:
 
 
 class NVFP4QuantizeUtil:
-    """Utility class for NVFP4 quantization and dequantization with two-level scaling (global FP32 + block FP8).
+    """Utility class for NVFP4 quantization and dequantization with two-level scaling
+    (global FP32 + block FP8 E4M3).
 
     Quantize formula:  x_fp4 * block_scale * global_scale = x_bf16
-    - Quantize: via FlashInfer ``fp4_quantize`` (fi_nvfp4_quantize)
-    - Dequantize: pure PyTorch E2M1 LUT lookup (dequantize)
+
+    Uses FlashInfer's ``nvfp4_kv_quantize`` and ``nvfp4_kv_dequantize`` kernels.
+    Falls back to ``fp4_quantize`` for quantization on SM90 (Hopper) where
+    ``nvfp4_kv_quantize`` is not available.
     """
 
     @staticmethod
-    def fi_nvfp4_quantize(tensor: torch.Tensor, global_scale: torch.Tensor):
-        # input and output shape [B, M, N]
-        # return uint8 cache and fp8 block scales
-        try:
-            from flashinfer import fp4_quantize
-        except ImportError:
-            raise ImportError(
-                "flashinfer is required for NVFP4 KV cache. Please install flashinfer."
-            )
-        global_scale_inv = 1.0 / global_scale
-        if isinstance(global_scale_inv, float):
-            global_scale_inv = torch.tensor(
-                global_scale_inv, dtype=torch.float32, device=tensor.device
-            )
-        assert (
-            global_scale_inv.device == tensor.device
-        ), "global_scale and tensor must be on the same device"
+    def quantize(
+        tensor: torch.Tensor, global_scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize BF16/FP16 tensor to NVFP4 format.
+
+        Args:
+            tensor: Input tensor of shape [B, M, N]
+            global_scale: Global scale factor (float32 scalar or 1-element tensor)
+
+        Returns:
+            (fp4_data, block_scales, global_scale):
+                fp4_data: shape [B, M, N/2], dtype uint8
+                block_scales: shape [B, M, N/16], dtype float8_e4m3fn
+                global_scale: passthrough
+        """
         b, m, n = tensor.shape
-        tensor_reshaped = tensor.reshape(b * m, n)
-        tensor_fp4, tensor_fp4_sf = fp4_quantize(
-            tensor_reshaped,
-            global_scale_inv,
-            sf_vec_size=16,
-            sf_use_ue8m0=False,
-            is_sf_swizzled_layout=False,
-            is_sf_8x4_layout=False,
-            enable_pdl=None,
-        )
-        tensor_fp4 = tensor_fp4.view(b, m, tensor_fp4.shape[-1])
-        tensor_fp4_sf = tensor_fp4_sf.view(b, m, tensor_fp4_sf.shape[-1]).view(
+        tensor_2d = tensor.reshape(b * m, n)
+
+        if isinstance(global_scale, (int, float)):
+            global_scale = torch.tensor(
+                [global_scale], dtype=torch.float32, device=tensor.device
+            )
+        elif global_scale.dim() == 0:
+            global_scale = global_scale.unsqueeze(0)
+
+        try:
+            from flashinfer import nvfp4_kv_quantize
+
+            fp4_2d, scales_2d = nvfp4_kv_quantize(tensor_2d, global_scale)
+        except (ImportError, AttributeError):
+            # Fallback: fp4_quantize available on SM90+
+            from flashinfer import fp4_quantize
+
+            global_scale_inv = 1.0 / global_scale
+            fp4_2d, scales_2d = fp4_quantize(
+                tensor_2d,
+                global_scale_inv,
+                sf_vec_size=16,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=False,
+                is_sf_8x4_layout=False,
+                enable_pdl=None,
+            )
+
+        fp4_data = fp4_2d.view(b, m, fp4_2d.shape[-1])
+        block_scales = scales_2d.view(b, m, scales_2d.shape[-1]).view(
             torch.float8_e4m3fn
         )
-        return tensor_fp4, tensor_fp4_sf, global_scale
+        return fp4_data, block_scales, global_scale
 
     @staticmethod
     def dequantize(
@@ -195,39 +214,47 @@ class NVFP4QuantizeUtil:
         global_scale: torch.Tensor,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
-        """
-        Dequantize NVFP4 tensor with two-level scaling (global FP32 + block FP8 E4M3)
+        """Dequantize NVFP4 tensor to BF16/FP16.
 
         Args:
-            quant_tensor: Quantized E2M1 tensor of shape [B, M, N/2] (packed uint8)
-            block_scales: Block scale factors of shape [B, M*N/16] (FP8 E4M3)
-            global_scale: Global scale factor (float32 scalar)
-            dtype: Target dtype for output
+            quant_tensor: Packed FP4 data of shape [B, M, N/2] (uint8)
+            block_scales: Per-block FP8 E4M3 scales of shape [B, M, N/16]
+            global_scale: Global scale factor (float32)
+            dtype: Output dtype (bfloat16 or float16)
 
         Returns:
             Dequantized tensor of shape [B, M, N]
         """
         b, m, n_half = quant_tensor.shape
-        n = n_half * 2
 
-        # More efficient unpacking using bit operations
-        fp4_vals = torch.empty(b, m, n, dtype=torch.uint8, device=quant_tensor.device)
-        fp4_vals[..., 0::2] = quant_tensor & 0x0F
-        fp4_vals[..., 1::2] = (quant_tensor >> 4) & 0x0F
+        if isinstance(global_scale, (int, float)):
+            global_scale = torch.tensor(
+                [global_scale], dtype=torch.float32, device=quant_tensor.device
+            )
+        elif global_scale.dim() == 0:
+            global_scale = global_scale.unsqueeze(0)
 
-        # Directly map 4-bit E2M1 values (0x0-0xF) to float
-        # E2M1_VALUES[0-7] = positive, E2M1_VALUES[8-15] = negative
-        float_vals = E2M1_VALUES[fp4_vals.long()]
+        quant_2d = quant_tensor.view(torch.uint8).reshape(b * m, n_half)
+        scales_2d = block_scales.view(torch.uint8).reshape(b * m, -1)
 
-        # Reshape for block-wise scaling
-        reshaped = float_vals.view(b, m * n // 16, 16)
+        try:
+            from flashinfer import nvfp4_kv_dequantize
 
-        # Apply block scale factors (inverse scaling: divide by FP8 block scales)
-        # Convert FP8 back to float32 for computation
-        block_scales_float = block_scales.float().unsqueeze(-1)  # [B, M*N/16, 1]
-        scaled = reshaped * block_scales_float
+            output_2d = nvfp4_kv_dequantize(
+                quant_2d, scales_2d, global_scale, output_dtype=dtype
+            )
+        except (ImportError, AttributeError):
+            # Pure PyTorch fallback
+            n = n_half * 2
+            fp4_vals = torch.empty(
+                b * m, n, dtype=torch.uint8, device=quant_tensor.device
+            )
+            fp4_vals[..., 0::2] = quant_2d & 0x0F
+            fp4_vals[..., 1::2] = (quant_2d >> 4) & 0x0F
+            float_vals = E2M1_VALUES[fp4_vals.long()]
+            reshaped = float_vals.view(b * m, -1, 16)
+            block_scales_float = scales_2d.view(torch.float8_e4m3fn).float()
+            scaled = reshaped * block_scales_float.unsqueeze(-1)
+            output_2d = (scaled.view(b * m, n) * global_scale).to(dtype)
 
-        # Apply inverse global scaling
-        dequantized = scaled.view(b, m, n) * global_scale
-
-        return dequantized.to(dtype)
+        return output_2d.reshape(b, m, -1)
