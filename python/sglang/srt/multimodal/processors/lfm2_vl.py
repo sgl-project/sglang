@@ -12,9 +12,9 @@
 # limitations under the License.
 """Multimodal processor for LFM2-VL models with SigLip2 NaFlex support."""
 
-from typing import Any, Dict, List, Optional, Union
+from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.lfm2_vl import Lfm2VlForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -22,8 +22,6 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 
 
 class Lfm2VlImageProcessor(SGLangBaseProcessor):
