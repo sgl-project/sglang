@@ -34,6 +34,7 @@ default parameters when initializing and generating videos.
 | TurboWan2.1 T2V 14B 720P     | `IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers`  | 720p                |    ✅     |         ❌         |     ❌     |              ❌               |              ✅               |              ✅               |    ⭕     |
 | TurboWan2.2 I2V A14B         | `IPostYellow/TurboWan2.2-I2V-A14B-Diffusers`      | 720p                |    ✅     |         ❌         |     ❌     |              ❌               |              ✅               |              ✅               |    ⭕     |
 | LTX-2                        | `Lightricks/LTX-2`                                | 1536×1024           |    ❌     |         ❌         |     ❌     |              ❌               |              ❌               |              ❌               |    ❌     |
+| LTX-2.3                      | `Lightricks/LTX-2.3`                              | 1536×1024           |    ❌     |         ❌         |     ❌     |              ❌               |              ❌               |              ❌               |    ❌     |
 
 **Note**:
 1. Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.
