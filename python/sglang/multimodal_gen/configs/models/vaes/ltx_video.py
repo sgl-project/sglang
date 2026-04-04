@@ -65,18 +65,14 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
         if not self.condition_encoder_subdir and legacy_image_encoder_subdir:
             self.condition_encoder_subdir = str(legacy_image_encoder_subdir)
 
-        if (
-            self.ltx_variant == "ltx_2"
-            and (
-                self.extra_attrs.get("use_official_image_encoder", False)
-                or self.extra_attrs.get("use_official_video_decoder", False)
-            )
+        if self.ltx_variant == "ltx_2" and (
+            self.extra_attrs.get("use_official_image_encoder", False)
+            or self.extra_attrs.get("use_official_video_decoder", False)
         ):
             self.ltx_variant = "ltx_2_3"
 
-        if (
-            self.video_decoder_variant == "ltx_2"
-            and self.extra_attrs.get("use_official_video_decoder", False)
+        if self.video_decoder_variant == "ltx_2" and self.extra_attrs.get(
+            "use_official_video_decoder", False
         ):
             self.video_decoder_variant = "ltx_2_3"
 

@@ -8,8 +8,8 @@ This package contains diffusion pipelines for generating videos and images.
 """
 
 from typing import cast
-from sglang.multimodal_gen.registry import get_model_info
 
+from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )

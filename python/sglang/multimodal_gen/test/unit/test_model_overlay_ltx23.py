@@ -123,7 +123,9 @@ def test_ltx23_sigma_preparation_uses_official_schedule_only_for_ltx23_marker():
 
     ltx23_server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2_3"))
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(ltx_variant="ltx_2_3")
+            )
         )
     )
     legacy_server_args = SimpleNamespace(
@@ -176,7 +178,9 @@ def test_ltx23_skips_mu_when_using_official_sigma_schedule():
     )
     ltx23_server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2_3"))
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(ltx_variant="ltx_2_3")
+            )
         )
     )
 
