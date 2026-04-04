@@ -16,10 +16,6 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
-from sglang.srt.layers.attention.nsa.nsa_mtp_verification import (
-    verify_multi_backend_fused_metadata_copy,
-    verify_single_backend_fused_metadata_copy,
-)
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
@@ -71,14 +67,9 @@ else:
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
 
-# Control whether to use fused metadata copy kernel (default: enabled)
+# Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
-
-# Control whether to verify fused metadata copy against individual copies (default: disabled)
-# Set SGLANG_VERIFY_FUSED_METADATA_COPY=1 or true to enable verification
-# This will crash with detailed error message if any inconsistency is detected
-_VERIFY_FUSED_METADATA_COPY = envs.SGLANG_VERIFY_FUSED_METADATA_COPY.get()
 
 
 @dataclass(frozen=True)
@@ -147,6 +138,8 @@ class NSAMetadata:
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     # seq lens for each batch.
     indexer_seq_lens_cpu: Optional[torch.Tensor] = None
+    # seq lens for each batch.
+    indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
@@ -184,6 +177,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: NSAMetadata
     topk_transform_method: TopkTransformMethod
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    force_unfused_topk: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -202,6 +196,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.attn_metadata.indexer_k_start_end
+
+    def get_indexer_seq_len(self) -> torch.Tensor:
+        return self.attn_metadata.indexer_seq_lens
 
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         return self.attn_metadata.indexer_seq_lens_cpu
@@ -250,7 +247,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
-        if not envs.SGLANG_NSA_FUSE_TOPK.get():
+        if not envs.SGLANG_NSA_FUSE_TOPK.get() or self.force_unfused_topk:
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
@@ -263,6 +260,11 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 row_starts=ks,
             )
         elif self.topk_transform_method == TopkTransformMethod.RAGGED:
+            if cu_topk_indices_offset is None:
+                raise RuntimeError(
+                    "RAGGED topk_transform requires topk_indices_offset; "
+                    "expected extend-without-speculative metadata."
+                )
             return fast_topk_transform_ragged_fused(
                 score=logits,
                 lengths=seq_lens_topk,
@@ -317,8 +319,6 @@ class NativeSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        # Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT), controlled by env var.
-        self._force_attn_forward_mla: bool = envs.SGLANG_NSA_FORCE_MLA.get()
         self.nsa_prefill_impl: _NSA_IMPL_T = (
             model_runner.server_args.nsa_prefill_backend
         )
@@ -407,7 +407,9 @@ class NativeSparseAttnBackend(
 
         # Centralized dispatch: decide all strategies for this batch
         self.set_nsa_prefill_impl(forward_batch)
-        topk_transform_method = self.get_topk_transform_method()
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
         # Batch indices selected when cp enabled: After splitting multiple sequences,
         # a certain cp rank may not have some of these sequences.
         # We use bs_idx_cpu to mark which sequences are finally selected by the current cp rank,
@@ -415,6 +417,7 @@ class NativeSparseAttnBackend(
         bs_idx_cpu = None
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
+        indexer_seq_lens = forward_batch.seq_lens
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
@@ -515,6 +518,7 @@ class NativeSparseAttnBackend(
                     )
                 )
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
+                indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_k = (
@@ -652,6 +656,7 @@ class NativeSparseAttnBackend(
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
+            indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
         )
         self.forward_metadata = metadata
@@ -1182,18 +1187,6 @@ class NativeSparseAttnBackend(
                 # Successfully used fused kernel
                 fused_kernel_succeeded = True
 
-                # Verification: compare fused kernel results against individual copies
-                if _VERIFY_FUSED_METADATA_COPY:
-                    verify_single_backend_fused_metadata_copy(
-                        metadata=metadata,
-                        precomputed=precomputed,
-                        forward_mode=forward_mode,
-                        bs=bs,
-                        flashmla_num_splits_src=flashmla_num_splits_src,
-                        flashmla_metadata_src=flashmla_metadata_src,
-                        flashmla_num_splits_dst=flashmla_num_splits_dst,
-                        flashmla_metadata_dst=flashmla_metadata_dst,
-                    )
             except ImportError:
                 print(
                     "Warning: Fused metadata copy kernel not available, falling back to individual copies."
@@ -1304,6 +1297,7 @@ class NativeSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                is_prefill=True,
             )
 
         if k is not None:
@@ -1357,7 +1351,9 @@ class NativeSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         # NOTE(dark): here, we use page size = 1
-        topk_transform_method = self.get_topk_transform_method()
+        topk_transform_method = self.get_topk_transform_method(
+            forward_batch.forward_mode
+        )
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
@@ -1381,6 +1377,14 @@ class NativeSparseAttnBackend(
                     extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
                     page_size=1,
                 )
+
+        # todo hisparse: to cover more backends
+        if forward_batch.hisparse_coordinator is not None:
+            page_table_1 = (
+                forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table_1
+                )
+            )
 
         if nsa_impl == "tilelang":
             if q_rope is not None:
@@ -1527,7 +1531,14 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if forward_batch.hisparse_coordinator is not None:
+            page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                topk_indices,
+                layer.layer_id,
+            )
+        elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -1780,6 +1791,7 @@ class NativeSparseAttnBackend(
                 enable_pdl=False,
                 is_causal=causal,
                 return_lse=False,
+                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
 
         # Use FA3 for SM90 (Hopper/H200)
@@ -1918,6 +1930,7 @@ class NativeSparseAttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
@@ -1979,6 +1992,13 @@ class NativeSparseAttnBackend(
 
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
+        elif is_prefill:
+            page_table_1 = transform_index_page_table_prefill(
+                page_table=metadata.page_table_1,
+                topk_indices=topk_indices,
+                extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
+                page_size=1,
+            )
         else:
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
@@ -2015,6 +2035,7 @@ class NativeSparseAttnBackend(
             sparse_mla_top_k=self.nsa_index_topk,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
         )
         # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
         return out.squeeze(1)
@@ -2058,29 +2079,22 @@ class NativeSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # when nsa prefill impl is trtllm, use its max chunk capacity as mha max kv len
-            mha_max_kv_len = (
-                forward_batch.get_max_chunk_capacity()
-                if self.nsa_prefill_impl == "trtllm"
-                else self.nsa_index_topk
-            )
-
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
             self.use_mha = (
                 (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
-                and max_kv_len <= mha_max_kv_len  # Short enough for MHA
+                and max_kv_len
+                <= envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_nsa_enable_prefill_cp())  # CP not enabled
+                and (forward_batch.hisparse_coordinator is None)
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
-        if self._force_attn_forward_mla:
-            self.use_mha = False
 
         # Set MLA implementation only if not using MHA
         if not self.use_mha and self.enable_auto_select_prefill_impl:
@@ -2101,7 +2115,9 @@ class NativeSparseAttnBackend(
                 # bf16 kv cache
                 self.nsa_prefill_impl = "flashmla_sparse"
 
-    def get_topk_transform_method(self) -> TopkTransformMethod:
+    def get_topk_transform_method(
+        self, forward_mode: Optional[ForwardMode] = None
+    ) -> TopkTransformMethod:
         """
         SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
@@ -2112,6 +2128,9 @@ class NativeSparseAttnBackend(
             and self.nsa_prefill_impl == "flashmla_sparse"
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
+
+            if forward_mode is not None and (forward_mode.is_decode_or_idle()):
+                topk_transform_method = TopkTransformMethod.PAGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
@@ -2119,10 +2138,17 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
+        force_unfused = (
+            forward_batch.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_decode_or_idle()
+        )
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
-            topk_transform_method=self.get_topk_transform_method(),
+            topk_transform_method=self.get_topk_transform_method(
+                forward_batch.forward_mode
+            ),
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
+            force_unfused_topk=force_unfused,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
@@ -2305,18 +2331,6 @@ class NativeSparseAttnMultiStepBackend:
                         precomputed.max_len,
                         precomputed.seqlens_expanded_size,
                     )
-
-                    # Verification: compare fused kernel results against individual copies
-                    if _VERIFY_FUSED_METADATA_COPY:
-                        verify_multi_backend_fused_metadata_copy(
-                            metadata0=metadata0,
-                            metadata1=metadata1,
-                            metadata2=metadata2,
-                            precomputed=precomputed,
-                            bs=bs,
-                            flashmla_num_splits_src=flashmla_num_splits_src,
-                            flashmla_metadata_src=flashmla_metadata_src,
-                        )
 
                     # Copy remaining backends one by one (if > 3 backends)
                     for i in range(3, self.speculative_num_steps - 1):

@@ -22,6 +22,11 @@ class NPUACLFormat(IntEnum):
     ACL_FORMAT_FRACTAL_NZ = 29
 
 
+class FusedMoEMode(IntEnum):
+    FUSED_DEEP_MOE = 1
+    DISPATCH_FFN_COMBINE = 2
+
+
 def _call_once(fn: Callable):
 
     @functools.wraps(fn)
@@ -102,6 +107,28 @@ def init_npu_backend():
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
+def _is_nz_aligned(tensor: torch.Tensor) -> bool:
+    """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
+
+    Ascend FRACTAL_NZ requires:
+      BF16 / FP16 : both dims divisible by 16
+      INT8         : k % 16 == 0  and  n % 32 == 0
+      INT4         : k % 16 == 0  and  n % 64 == 0
+      FP4          : both dims divisible by 64
+    """
+    if tensor.dim() < 2:
+        return False
+    k, n = tensor.shape[-2], tensor.shape[-1]
+    if tensor.dtype in (torch.bfloat16, torch.float16):
+        return k % 16 == 0 and n % 16 == 0
+    if tensor.dtype == torch.int8:
+        return k % 16 == 0 and n % 32 == 0
+    if tensor.dtype in (torch.uint8, torch.int32):
+        # INT4 is typically packed into uint8/int32; be conservative
+        return k % 16 == 0 and n % 64 == 0
+    return True
+
+
 def npu_format_cast(
     tensor: torch.Tensor,
     acl_format: NPUACLFormat = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
@@ -123,9 +150,27 @@ def npu_format_cast(
     if envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
         return tensor
 
-    import torch_npu
+    if tensor.device == torch.device("cpu"):
+        logger.warning_once(
+            "Warning: The conversion from 'ND' to 'NZ' does not work on the CPU. "
+            "Please disable offloading, otherwise the performance will be "
+            "significantly reduced."
+        )
+        return tensor
 
-    return torch_npu.npu_format_cast(tensor, acl_format.value)
+    if acl_format == NPUACLFormat.ACL_FORMAT_FRACTAL_NZ and not _is_nz_aligned(tensor):
+        k, n = tensor.shape[-2], tensor.shape[-1]
+        logger.warning_once(
+            "Skipping FRACTAL_NZ format cast: tensor shape (%d, %d) dtype %s "
+            "is not aligned to NZ requirements. Falling back to 'ND' format, "
+            "which may reduce NPU performance.",
+            k,
+            n,
+            tensor.dtype,
+        )
+        return tensor
+
+    return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
 def get_indexer_weight_stream():
@@ -133,3 +178,67 @@ def get_indexer_weight_stream():
     if indexer_weight_stream is None:
         indexer_weight_stream = torch.npu.Stream()
     return indexer_weight_stream
+
+
+share_stream = None
+routed_stream = None
+
+
+def get_share_stream():
+    global share_stream
+    return share_stream
+
+
+def set_share_stream(stream):
+    global share_stream
+    share_stream = stream
+    # TODO LKL: set stream limit has impact on precision
+    # torch.npu.set_stream_limit(share_stream, 8, 16)
+
+
+def get_routed_stream():
+    global routed_stream
+    return routed_stream
+
+
+def set_routed_stream(stream):
+    global routed_stream
+    routed_stream = stream
+    # TODO LKL: set stream limit has impact on precision
+    # torch.npu.set_stream_limit(routed_stream, 16, 32)
+
+
+def wait_share_stream():
+    stream = get_share_stream()
+    if stream is not None:
+        cur_stream = torch.get_device_module().current_stream()
+        cur_stream.wait_stream(stream)
+
+
+def wait_routed_stream():
+    stream = get_routed_stream()
+    if stream is not None:
+        cur_stream = torch.get_device_module().current_stream()
+        cur_stream.wait_stream(stream)
+
+
+def process_shared_expert(hidden_states, forward_func):
+    stream = get_share_stream()
+    if stream is None:
+        stream = torch.get_device_module().Stream()
+        set_share_stream(stream)
+    stream.wait_stream(torch.get_device_module().current_stream())
+    with torch.get_device_module().stream(stream):
+        shared_output = forward_func(hidden_states)
+    return shared_output
+
+
+def process_routed_expert(hidden_states, topk_output, forward_func):
+    stream = get_routed_stream()
+    if stream is None:
+        stream = torch.get_device_module().Stream()
+        set_routed_stream(stream)
+    stream.wait_stream(torch.get_device_module().current_stream())
+    with torch.get_device_module().stream(stream):
+        shared_output = forward_func(hidden_states, topk_output)
+    return shared_output

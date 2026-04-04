@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -406,6 +407,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         logger=logger,
                         metrics=batch.metrics,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
+                        record_as_step=True,
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
@@ -704,10 +706,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
             batch.latents = latents
             batch.audio_latents = audio_latents
 
-        # 4. Cleanup
-        offload_mgr = getattr(self.transformer, "_layerwise_offload_manager", None)
-        if offload_mgr is not None and getattr(offload_mgr, "enabled", False):
-            offload_mgr.release_all()
+        if isinstance(self.transformer, OffloadableDiTMixin):
+            for manager in self.transformer.layerwise_offload_managers:
+                manager.release_all()
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify denoising stage inputs.

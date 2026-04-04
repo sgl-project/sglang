@@ -60,6 +60,8 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         request_id,
         prompt=request.prompt,
         size=request.size,
+        width=request.width,
+        height=request.height,
         num_frames=num_frames,
         fps=fps,
         image_path=request.input_reference,
@@ -75,9 +77,13 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         frame_interpolation_exp=request.frame_interpolation_exp,
         frame_interpolation_scale=request.frame_interpolation_scale,
         frame_interpolation_model_path=request.frame_interpolation_model_path,
+        enable_upscaling=request.enable_upscaling,
+        upscaling_model_path=request.upscaling_model_path,
+        upscaling_scale=request.upscaling_scale,
         output_path=request.output_path,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
+        perf_dump_path=request.perf_dump_path,
     )
 
 
@@ -181,6 +187,9 @@ async def create_video(
     frame_interpolation_exp: Optional[int] = Form(1),
     frame_interpolation_scale: Optional[float] = Form(1.0),
     frame_interpolation_model_path: Optional[str] = Form(None),
+    enable_upscaling: Optional[bool] = Form(False),
+    upscaling_model_path: Optional[str] = Form(None),
+    upscaling_scale: Optional[int] = Form(4),
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
@@ -256,6 +265,9 @@ async def create_video(
             frame_interpolation_exp=frame_interpolation_exp,
             frame_interpolation_scale=frame_interpolation_scale,
             frame_interpolation_model_path=frame_interpolation_model_path,
+            enable_upscaling=enable_upscaling,
+            upscaling_model_path=upscaling_model_path,
+            upscaling_scale=upscaling_scale,
             output_compression=output_compression,
             output_quality=output_quality,
             **(
