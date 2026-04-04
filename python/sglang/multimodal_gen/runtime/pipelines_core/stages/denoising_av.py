@@ -8,10 +8,10 @@ import av
 import numpy as np
 import PIL.Image
 import torch
-from safetensors.torch import load_file as safetensors_load_file
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.utils.torch_utils import randn_tensor
+from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
@@ -387,7 +387,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
             enabled=vae_autocast_enabled,
         ):
             try:
-                if official_image_encoder is None and server_args.pipeline_config.vae_tiling:
+                if (
+                    official_image_encoder is None
+                    and server_args.pipeline_config.vae_tiling
+                ):
                     self.vae.enable_tiling()
             except Exception:
                 pass
@@ -397,7 +400,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
             if official_image_encoder is not None:
                 latent = official_image_encoder(video_condition)
             else:
-                latent_dist: DiagonalGaussianDistribution = self.vae.encode(video_condition)
+                latent_dist: DiagonalGaussianDistribution = self.vae.encode(
+                    video_condition
+                )
                 if isinstance(latent_dist, AutoencoderKLOutput):
                     latent_dist = latent_dist.latent_dist
 
@@ -798,10 +803,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         sigma_val = float(sigma.item())
                         video_sigma_for_x0: float | torch.Tensor = sigma_val
                         if do_ti2v and denoise_mask is not None:
-                            video_sigma_for_x0 = (
-                                sigma.to(device=latents.device, dtype=torch.float32)
-                                * denoise_mask.squeeze(-1)
-                            )
+                            video_sigma_for_x0 = sigma.to(
+                                device=latents.device, dtype=torch.float32
+                            ) * denoise_mask.squeeze(-1)
                         denoised_video = self._ltx2_velocity_to_x0(
                             latents, v_pos, video_sigma_for_x0
                         )
@@ -872,15 +876,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                             stage1_guider_params["audio_stg_blocks"]
                                         ),
                                     )
-                                denoised_video_perturbed = (
-                                    self._ltx2_velocity_to_x0(
-                                        latents, v_ptb.float(), video_sigma_for_x0
-                                    )
+                                denoised_video_perturbed = self._ltx2_velocity_to_x0(
+                                    latents, v_ptb.float(), video_sigma_for_x0
                                 )
-                                denoised_audio_perturbed = (
-                                    self._ltx2_velocity_to_x0(
-                                        audio_latents, a_v_ptb.float(), sigma_val
-                                    )
+                                denoised_audio_perturbed = self._ltx2_velocity_to_x0(
+                                    audio_latents, a_v_ptb.float(), sigma_val
                                 )
 
                             need_modality = (
@@ -914,15 +914,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         disable_a2v_cross_attn=True,
                                         disable_v2a_cross_attn=True,
                                     )
-                                denoised_video_modality = (
-                                    self._ltx2_velocity_to_x0(
-                                        latents, v_mod.float(), video_sigma_for_x0
-                                    )
+                                denoised_video_modality = self._ltx2_velocity_to_x0(
+                                    latents, v_mod.float(), video_sigma_for_x0
                                 )
-                                denoised_audio_modality = (
-                                    self._ltx2_velocity_to_x0(
-                                        audio_latents, a_v_mod.float(), sigma_val
-                                    )
+                                denoised_audio_modality = self._ltx2_velocity_to_x0(
+                                    audio_latents, a_v_mod.float(), sigma_val
                                 )
 
                             if not video_skip:

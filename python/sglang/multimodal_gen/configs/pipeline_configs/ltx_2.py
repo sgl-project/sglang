@@ -110,7 +110,9 @@ def pack_text_embeds_v2(
     normalized_hidden_states = text_hidden_states * torch.rsqrt(variance + eps)
     normalized_hidden_states = normalized_hidden_states.flatten(2)
     mask = attention_mask.bool().unsqueeze(-1)
-    return torch.where(mask, normalized_hidden_states, torch.zeros_like(normalized_hidden_states))
+    return torch.where(
+        mask, normalized_hidden_states, torch.zeros_like(normalized_hidden_states)
+    )
 
 
 def is_ltx23_native_variant(arch_config: object) -> bool:

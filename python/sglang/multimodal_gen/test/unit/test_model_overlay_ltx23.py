@@ -7,13 +7,14 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     _gemma_postprocess_func,
     is_ltx23_native_variant,
     pack_text_embeds,
     pack_text_embeds_v2,
 )
-from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
     _build_transformer_config,
     _build_vae_config,
@@ -21,26 +22,25 @@ from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
     _repack_ltx23_image_encoder_weights,
     _repack_ltx23_video_decoder_weights,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_model_info
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
-    LTX2AVDenoisingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
-    LTX2AVDecodingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av import (
-    LTX2AVLatentPreparationStage,
-)
-from sglang.multimodal_gen.runtime.models.vocoder.ltx_2_vocoder import LTX2Vocoder
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.models.vocoder.ltx_2_vocoder import LTX2Vocoder
 from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
     LTX2SigmaPreparationStage,
     _resolve_ltx2_two_stage_component_paths,
     build_official_ltx2_sigmas,
     prepare_ltx2_mu,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
+    LTX2AVDecodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
+    LTX2AVDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av import (
+    LTX2AVLatentPreparationStage,
 )
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     maybe_load_overlay_model_index,
@@ -372,12 +372,18 @@ def test_ltx2_gemma_postprocess_keeps_legacy_pack_path():
 
 
 def test_ltx23_connector_repack_renames_qk_norm_keys():
-    assert _rename_connector_key(
-        "model.diffusion_model.video_embeddings_connector.transformer_1d_blocks.0.attn1.q_norm.weight"
-    ) == "video_connector.transformer_blocks.0.attn1.norm_q.weight"
-    assert _rename_connector_key(
-        "model.diffusion_model.audio_embeddings_connector.transformer_1d_blocks.1.attn1.k_norm.weight"
-    ) == "audio_connector.transformer_blocks.1.attn1.norm_k.weight"
+    assert (
+        _rename_connector_key(
+            "model.diffusion_model.video_embeddings_connector.transformer_1d_blocks.0.attn1.q_norm.weight"
+        )
+        == "video_connector.transformer_blocks.0.attn1.norm_q.weight"
+    )
+    assert (
+        _rename_connector_key(
+            "model.diffusion_model.audio_embeddings_connector.transformer_1d_blocks.1.attn1.k_norm.weight"
+        )
+        == "audio_connector.transformer_blocks.1.attn1.norm_k.weight"
+    )
 
 
 def test_ltx23_transformer_config_forces_sdpa_for_v2a_cross_attention():

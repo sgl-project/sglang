@@ -107,21 +107,19 @@ class UpSample1d(nn.Module):
             self.pad_left = 2 * width * ratio
             self.pad_right = self.kernel_size - ratio
             time_axis = (torch.arange(self.kernel_size) / ratio - width) * rolloff
-            time_clamped = time_axis.clamp(
-                -lowpass_filter_width, lowpass_filter_width
+            time_clamped = time_axis.clamp(-lowpass_filter_width, lowpass_filter_width)
+            window = torch.cos(time_clamped * math.pi / lowpass_filter_width / 2) ** 2
+            sinc_filter = (torch.sinc(time_axis) * window * rolloff / ratio).view(
+                1, 1, -1
             )
-            window = torch.cos(
-                time_clamped * math.pi / lowpass_filter_width / 2
-            ) ** 2
-            sinc_filter = (
-                torch.sinc(time_axis) * window * rolloff / ratio
-            ).view(1, 1, -1)
         else:
             self.kernel_size = (
                 int(6 * ratio // 2) * 2 if kernel_size is None else kernel_size
             )
             self.pad = self.kernel_size // ratio - 1
-            self.pad_left = self.pad * self.stride + (self.kernel_size - self.stride) // 2
+            self.pad_left = (
+                self.pad * self.stride + (self.kernel_size - self.stride) // 2
+            )
             self.pad_right = (
                 self.pad * self.stride + (self.kernel_size - self.stride + 1) // 2
             )
@@ -137,7 +135,9 @@ class UpSample1d(nn.Module):
         _, channels, _ = x.shape
         x = F.pad(x, (self.pad, self.pad), mode="replicate")
         filt = self.filter.to(dtype=x.dtype, device=x.device).expand(channels, -1, -1)
-        x = self.ratio * F.conv_transpose1d(x, filt, stride=self.stride, groups=channels)
+        x = self.ratio * F.conv_transpose1d(
+            x, filt, stride=self.stride, groups=channels
+        )
         return x[..., self.pad_left : -self.pad_right]
 
 
@@ -494,9 +494,7 @@ class LTX23VocoderCore(nn.Module):
                     )
 
         self.act_post = (
-            Activation1d(SnakeBeta(final_channels))
-            if self.is_amp
-            else nn.LeakyReLU()
+            Activation1d(SnakeBeta(final_channels)) if self.is_amp else nn.LeakyReLU()
         )
         self.conv_post = nn.Conv1d(
             in_channels=final_channels,
@@ -699,7 +697,9 @@ class LTX2Vocoder(ABC, nn.Module):
                 waveform = self.vocoder(hidden_states.float())
                 length_low_rate = waveform.shape[-1]
                 output_length = (
-                    length_low_rate * self.output_sampling_rate // self.input_sampling_rate
+                    length_low_rate
+                    * self.output_sampling_rate
+                    // self.input_sampling_rate
                 )
                 remainder = length_low_rate % self.hop_length
                 if remainder != 0:

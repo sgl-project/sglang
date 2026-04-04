@@ -1,4 +1,3 @@
-import math
 from typing import Any
 
 import torch
@@ -53,7 +52,9 @@ class LTX23PerChannelStatistics(nn.Module):
 
 
 class LTX23VideoResBlockStack(nn.Module):
-    def __init__(self, channels: int, num_layers: int, spatial_padding_mode: str) -> None:
+    def __init__(
+        self, channels: int, num_layers: int, spatial_padding_mode: str
+    ) -> None:
         super().__init__()
         self.res_blocks = nn.ModuleList(
             [

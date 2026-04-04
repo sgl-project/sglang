@@ -311,7 +311,8 @@ def prepare_request(
     )
     if all(hasattr(sampling_params, field) for field in ltx2_stage1_guider_fields):
         req.extra["ltx2_stage1_guider_params"] = {
-            field: getattr(sampling_params, field) for field in ltx2_stage1_guider_fields
+            field: getattr(sampling_params, field)
+            for field in ltx2_stage1_guider_fields
         }
 
     req.adjust_size(server_args)

@@ -45,14 +45,14 @@ def main() -> None:
     sys.path.insert(0, str(LTX_REPO_ROOT / "packages/ltx-core/src"))
     sys.path.insert(0, str(LTX_REPO_ROOT / "packages/ltx-pipelines/src"))
 
-    from ltx_core.loader.registry import DummyRegistry
     from ltx_core.components.patchifiers import VideoLatentPatchifier
-    from ltx_core.types import VideoLatentShape
+    from ltx_core.loader.registry import DummyRegistry
     from ltx_core.model.video_vae import (
-        TilingConfig,
         VAE_DECODER_COMFY_KEYS_FILTER,
+        TilingConfig,
         VideoDecoderConfigurator,
     )
+    from ltx_core.types import VideoLatentShape
     from ltx_pipelines.utils.blocks import Builder
 
     payload = torch.load(FINAL_LATENTS_PATH, map_location="cpu")

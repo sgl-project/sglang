@@ -90,8 +90,8 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
-    LTX23SamplingParams,
     LTX2SamplingParams,
+    LTX23SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,

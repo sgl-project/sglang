@@ -157,8 +157,10 @@ def main() -> None:
         )
     )
 
-    sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(
-        dtype=torch.float32, device=device
+    sigmas = (
+        LTX2Scheduler()
+        .execute(steps=params.num_inference_steps)
+        .to(dtype=torch.float32, device=device)
     )
     video_guider_factory = create_multimodal_guider_factory(
         params=MultiModalGuiderParams(

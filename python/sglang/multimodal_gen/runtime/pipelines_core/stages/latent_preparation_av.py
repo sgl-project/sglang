@@ -70,7 +70,9 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
         patch_size = int(pipeline_config.patch_size)
         return (
             batch_size,
-            (num_frames // patch_size_t) * (height // patch_size) * (width // patch_size),
+            (num_frames // patch_size_t)
+            * (height // patch_size)
+            * (width // patch_size),
             channels * patch_size_t * patch_size * patch_size,
         )
 
@@ -101,7 +103,9 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
                 batch, batch_size, num_frames
             )
             latents = randn_tensor(
-                self._packed_video_latent_shape(latent_shape, server_args.pipeline_config),
+                self._packed_video_latent_shape(
+                    latent_shape, server_args.pipeline_config
+                ),
                 generator=generator,
                 device=device,
                 dtype=dtype,

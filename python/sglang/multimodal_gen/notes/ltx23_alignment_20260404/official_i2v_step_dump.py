@@ -10,7 +10,10 @@ DEFAULT_LTX_REPO_ROOTS = ["/tmp/LTX-2-official", "/tmp/LTX-2"]
 LTX_REPO_ROOT = Path(
     os.environ.get(
         "LTX_REPO_ROOT",
-        next((p for p in DEFAULT_LTX_REPO_ROOTS if Path(p).exists()), DEFAULT_LTX_REPO_ROOTS[0]),
+        next(
+            (p for p in DEFAULT_LTX_REPO_ROOTS if Path(p).exists()),
+            DEFAULT_LTX_REPO_ROOTS[0],
+        ),
     )
 )
 CHECKPOINT_GLOB = (
@@ -23,7 +26,9 @@ GEMMA_ROOT_GLOB = (
 )
 PROMPT = os.environ.get("LTX23_PROMPT", "A beautiful sunset over the ocean")
 IMAGE_PATH = os.environ.get("LTX23_IMAGE_PATH", "/tmp/ltx23_i2v_input_sunset.png")
-DUMP_PATH = Path(os.environ.get("LTX23_OFFICIAL_STEP_DUMP", "/tmp/ltx23_official_i2v_step0.pt"))
+DUMP_PATH = Path(
+    os.environ.get("LTX23_OFFICIAL_STEP_DUMP", "/tmp/ltx23_official_i2v_step0.pt")
+)
 TARGET_STEP = int(os.environ.get("LTX23_TARGET_STEP", "0"))
 STREAMING_PREFETCH_COUNT = int(os.environ.get("LTX23_STREAMING_PREFETCH_COUNT", "1"))
 ATTN_DUMP_DIR = os.environ.get("LTX23_ATTN_DUMP_DIR")
@@ -45,7 +50,10 @@ def main() -> None:
     sys.path.insert(0, str(LTX_REPO_ROOT / "packages/ltx-core/src"))
     sys.path.insert(0, str(LTX_REPO_ROOT / "packages/ltx-pipelines/src"))
 
-    from ltx_core.components.guiders import MultiModalGuiderParams, create_multimodal_guider_factory
+    from ltx_core.components.guiders import (
+        MultiModalGuiderParams,
+        create_multimodal_guider_factory,
+    )
     from ltx_core.components.noisers import GaussianNoiser
     from ltx_core.components.schedulers import LTX2Scheduler
     from ltx_core.guidance.perturbations import (
@@ -54,16 +62,22 @@ def main() -> None:
         PerturbationConfig,
         PerturbationType,
     )
+    from ltx_core.model.transformer.rope import apply_rotary_emb
+    from ltx_pipelines.utils import denoisers as denoisers_mod
     from ltx_pipelines.utils.args import ImageConditioningInput
-    from ltx_pipelines.utils.blocks import DiffusionStage, ImageConditioner, PromptEncoder
+    from ltx_pipelines.utils.blocks import (
+        DiffusionStage,
+        ImageConditioner,
+        PromptEncoder,
+        generate_enhanced_prompt,
+        gpu_model,
+    )
     from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, LTX_2_3_PARAMS
     from ltx_pipelines.utils.helpers import (
         combined_image_conditionings,
         modality_from_latent_state,
         post_process_latent,
     )
-    from ltx_pipelines.utils.blocks import generate_enhanced_prompt, gpu_model
-    from ltx_pipelines.utils import denoisers as denoisers_mod
     from ltx_pipelines.utils.samplers import _step_state
     from ltx_pipelines.utils.types import ModalitySpec
 
@@ -154,8 +168,10 @@ def main() -> None:
         )
     )
 
-    sigmas = LTX2Scheduler().execute(steps=params.num_inference_steps).to(
-        dtype=torch.float32, device=device
+    sigmas = (
+        LTX2Scheduler()
+        .execute(steps=params.num_inference_steps)
+        .to(dtype=torch.float32, device=device)
     )
     video_guider_factory = create_multimodal_guider_factory(
         params=MultiModalGuiderParams(
@@ -203,11 +219,24 @@ def main() -> None:
             return last_denoised_video, last_denoised_audio
 
         _pass = tuple[str, torch.Tensor | None, torch.Tensor | None, PerturbationConfig]
-        passes: list[_pass] = [("cond", v_context, a_context, PerturbationConfig.empty())]
+        passes: list[_pass] = [
+            ("cond", v_context, a_context, PerturbationConfig.empty())
+        ]
 
-        if video_guider.do_unconditional_generation() or audio_guider.do_unconditional_generation():
-            v_neg = video_guider.negative_context if video_guider.negative_context is not None else v_context
-            a_neg = audio_guider.negative_context if audio_guider.negative_context is not None else a_context
+        if (
+            video_guider.do_unconditional_generation()
+            or audio_guider.do_unconditional_generation()
+        ):
+            v_neg = (
+                video_guider.negative_context
+                if video_guider.negative_context is not None
+                else v_context
+            )
+            a_neg = (
+                audio_guider.negative_context
+                if audio_guider.negative_context is not None
+                else a_context
+            )
             passes.append(("uncond", v_neg, a_neg, PerturbationConfig.empty()))
 
         stg_perturbations: list[Perturbation] = []
@@ -226,9 +255,14 @@ def main() -> None:
                 )
             )
         if stg_perturbations:
-            passes.append(("ptb", v_context, a_context, PerturbationConfig(stg_perturbations)))
+            passes.append(
+                ("ptb", v_context, a_context, PerturbationConfig(stg_perturbations))
+            )
 
-        if video_guider.do_isolated_modality_generation() or audio_guider.do_isolated_modality_generation():
+        if (
+            video_guider.do_isolated_modality_generation()
+            or audio_guider.do_isolated_modality_generation()
+        ):
             passes.append(
                 (
                     "mod",
@@ -236,8 +270,12 @@ def main() -> None:
                     a_context,
                     PerturbationConfig(
                         [
-                            Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None),
-                            Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None),
+                            Perturbation(
+                                type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None
+                            ),
+                            Perturbation(
+                                type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None
+                            ),
                         ]
                     ),
                 )
@@ -294,7 +332,9 @@ def main() -> None:
 
         splits_v = list(all_v.chunk(n)) if all_v is not None else [0.0] * n
         splits_a = list(all_a.chunk(n)) if all_a is not None else [0.0] * n
-        result = dict(zip(pass_names, zip(splits_v, splits_a, strict=True), strict=True))
+        result = dict(
+            zip(pass_names, zip(splits_v, splits_a, strict=True), strict=True)
+        )
 
         cond_v, cond_a = result["cond"]
         uncond_v, uncond_a = result.get("uncond", (None, None))
@@ -358,9 +398,9 @@ def main() -> None:
         nonlocal dumped, attn_hook_patched, attn_dump_call_idx
         if not attn_hook_patched and ATTN_DUMP_DIR:
             Path(ATTN_DUMP_DIR).mkdir(parents=True, exist_ok=True)
-            target_attn = (
-                transformer._model.velocity_model.transformer_blocks[0].video_to_audio_attn
-            )
+            target_attn = transformer._model.velocity_model.transformer_blocks[
+                0
+            ].video_to_audio_attn
             original_forward = target_attn.forward
 
             def _dumping_forward(
@@ -374,6 +414,18 @@ def main() -> None:
             ):
                 nonlocal attn_dump_call_idx
                 context_ = x if context is None else context
+                v = target_attn.to_v(context_)
+                q = target_attn.to_q(x)
+                k = target_attn.to_k(context_)
+                q = target_attn.q_norm(q)
+                k = target_attn.k_norm(k)
+                if pe is not None:
+                    q = apply_rotary_emb(q, pe, target_attn.rope_type)
+                    k = apply_rotary_emb(
+                        k,
+                        pe if k_pe is None else k_pe,
+                        target_attn.rope_type,
+                    )
                 out = original_forward(
                     x,
                     context=context,
@@ -393,8 +445,15 @@ def main() -> None:
                             "mask": None if mask is None else mask.detach().cpu(),
                             "pe_cos": None if pe is None else pe[0].detach().cpu(),
                             "pe_sin": None if pe is None else pe[1].detach().cpu(),
-                            "k_pe_cos": None if k_pe is None else k_pe[0].detach().cpu(),
-                            "k_pe_sin": None if k_pe is None else k_pe[1].detach().cpu(),
+                            "k_pe_cos": (
+                                None if k_pe is None else k_pe[0].detach().cpu()
+                            ),
+                            "k_pe_sin": (
+                                None if k_pe is None else k_pe[1].detach().cpu()
+                            ),
+                            "q": q.detach().cpu(),
+                            "k": k.detach().cpu(),
+                            "v": v.detach().cpu(),
                             "out": out.detach().cpu(),
                         },
                         Path(ATTN_DUMP_DIR)
@@ -419,13 +478,17 @@ def main() -> None:
                     denoised_audio, audio_state.denoise_mask, audio_state.clean_latent
                 )
 
-            video_next = _step_state(video_state, denoised_video, stepper, sigmas, step_idx)
-            audio_next = _step_state(audio_state, denoised_audio, stepper, sigmas, step_idx)
+            video_next = _step_state(
+                video_state, denoised_video, stepper, sigmas, step_idx
+            )
+            audio_next = _step_state(
+                audio_state, denoised_audio, stepper, sigmas, step_idx
+            )
 
             if step_idx == TARGET_STEP:
                 image_latent = None
                 if video_state is not None:
-                    cond_mask = (video_state.denoise_mask.squeeze(-1) < 1.0)
+                    cond_mask = video_state.denoise_mask.squeeze(-1) < 1.0
                     num_img_tokens = int(cond_mask[0].sum().item())
                     image_latent = video_state.clean_latent[:, :num_img_tokens]
                 DUMP_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -439,25 +502,101 @@ def main() -> None:
                         "negative_audio_prompt_embeds": ctx_n.audio_encoding.detach().cpu(),
                         "prompt_attention_mask": ctx_p.attention_mask.detach().cpu(),
                         "negative_attention_mask": ctx_n.attention_mask.detach().cpu(),
-                        "video_latent_before": None if video_state is None else video_state.latent.detach().cpu(),
-                        "video_denoised": None if denoised_video is None else denoised_video.detach().cpu(),
-                        "video_latent_after": None if video_next is None else video_next.latent.detach().cpu(),
-                        "audio_latent_before": None if audio_state is None else audio_state.latent.detach().cpu(),
-                        "audio_denoised": None if denoised_audio is None else denoised_audio.detach().cpu(),
-                        "audio_latent_after": None if audio_next is None else audio_next.latent.detach().cpu(),
-                        "video_cond": None if pass_dump.get("video_cond") is None else pass_dump["video_cond"].detach().cpu(),
-                        "video_uncond": None if pass_dump.get("video_uncond") is None else pass_dump["video_uncond"].detach().cpu(),
-                        "video_ptb": None if pass_dump.get("video_ptb") is None else pass_dump["video_ptb"].detach().cpu(),
-                        "video_mod": None if pass_dump.get("video_mod") is None else pass_dump["video_mod"].detach().cpu(),
-                        "audio_cond": None if pass_dump.get("audio_cond") is None else pass_dump["audio_cond"].detach().cpu(),
-                        "audio_uncond": None if pass_dump.get("audio_uncond") is None else pass_dump["audio_uncond"].detach().cpu(),
-                        "audio_ptb": None if pass_dump.get("audio_ptb") is None else pass_dump["audio_ptb"].detach().cpu(),
-                        "audio_mod": None if pass_dump.get("audio_mod") is None else pass_dump["audio_mod"].detach().cpu(),
-                        "video_clean_latent": None if video_state is None else video_state.clean_latent.detach().cpu(),
-                        "video_denoise_mask": None if video_state is None else video_state.denoise_mask.detach().cpu(),
-                        "video_positions": None if video_state is None else video_state.positions.detach().cpu(),
-                        "audio_positions": None if audio_state is None else audio_state.positions.detach().cpu(),
-                        "image_latent": None if image_latent is None else image_latent.detach().cpu(),
+                        "video_latent_before": (
+                            None
+                            if video_state is None
+                            else video_state.latent.detach().cpu()
+                        ),
+                        "video_denoised": (
+                            None
+                            if denoised_video is None
+                            else denoised_video.detach().cpu()
+                        ),
+                        "video_latent_after": (
+                            None
+                            if video_next is None
+                            else video_next.latent.detach().cpu()
+                        ),
+                        "audio_latent_before": (
+                            None
+                            if audio_state is None
+                            else audio_state.latent.detach().cpu()
+                        ),
+                        "audio_denoised": (
+                            None
+                            if denoised_audio is None
+                            else denoised_audio.detach().cpu()
+                        ),
+                        "audio_latent_after": (
+                            None
+                            if audio_next is None
+                            else audio_next.latent.detach().cpu()
+                        ),
+                        "video_cond": (
+                            None
+                            if pass_dump.get("video_cond") is None
+                            else pass_dump["video_cond"].detach().cpu()
+                        ),
+                        "video_uncond": (
+                            None
+                            if pass_dump.get("video_uncond") is None
+                            else pass_dump["video_uncond"].detach().cpu()
+                        ),
+                        "video_ptb": (
+                            None
+                            if pass_dump.get("video_ptb") is None
+                            else pass_dump["video_ptb"].detach().cpu()
+                        ),
+                        "video_mod": (
+                            None
+                            if pass_dump.get("video_mod") is None
+                            else pass_dump["video_mod"].detach().cpu()
+                        ),
+                        "audio_cond": (
+                            None
+                            if pass_dump.get("audio_cond") is None
+                            else pass_dump["audio_cond"].detach().cpu()
+                        ),
+                        "audio_uncond": (
+                            None
+                            if pass_dump.get("audio_uncond") is None
+                            else pass_dump["audio_uncond"].detach().cpu()
+                        ),
+                        "audio_ptb": (
+                            None
+                            if pass_dump.get("audio_ptb") is None
+                            else pass_dump["audio_ptb"].detach().cpu()
+                        ),
+                        "audio_mod": (
+                            None
+                            if pass_dump.get("audio_mod") is None
+                            else pass_dump["audio_mod"].detach().cpu()
+                        ),
+                        "video_clean_latent": (
+                            None
+                            if video_state is None
+                            else video_state.clean_latent.detach().cpu()
+                        ),
+                        "video_denoise_mask": (
+                            None
+                            if video_state is None
+                            else video_state.denoise_mask.detach().cpu()
+                        ),
+                        "video_positions": (
+                            None
+                            if video_state is None
+                            else video_state.positions.detach().cpu()
+                        ),
+                        "audio_positions": (
+                            None
+                            if audio_state is None
+                            else audio_state.positions.detach().cpu()
+                        ),
+                        "image_latent": (
+                            None
+                            if image_latent is None
+                            else image_latent.detach().cpu()
+                        ),
                     },
                     DUMP_PATH,
                 )

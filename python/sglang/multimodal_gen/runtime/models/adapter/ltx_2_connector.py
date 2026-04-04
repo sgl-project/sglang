@@ -592,7 +592,9 @@ class LTX2TextConnectors(nn.Module):
         )
 
     @staticmethod
-    def _rescale_v2_features(x: torch.Tensor, target_dim: int, source_dim: int) -> torch.Tensor:
+    def _rescale_v2_features(
+        x: torch.Tensor, target_dim: int, source_dim: int
+    ) -> torch.Tensor:
         return x * math.sqrt(target_dim / source_dim)
 
     def forward(
@@ -625,7 +627,10 @@ class LTX2TextConnectors(nn.Module):
                 # Pad with a large negative value to mask out the new tokens
                 attention_mask = F.pad(attention_mask, (0, pad_len), value=-1000000.0)
 
-        if self.video_aggregate_embed is not None and self.audio_aggregate_embed is not None:
+        if (
+            self.video_aggregate_embed is not None
+            and self.audio_aggregate_embed is not None
+        ):
             video_hidden_states = text_encoder_hidden_states
             audio_hidden_states = text_encoder_hidden_states
             if video_hidden_states.dtype != self.video_aggregate_embed.weight.dtype:

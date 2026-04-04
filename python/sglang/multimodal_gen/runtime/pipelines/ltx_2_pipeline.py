@@ -120,8 +120,7 @@ def build_official_ltx2_sigmas(
     non_zero_mask = sigmas != 0
     shifted = torch.where(
         non_zero_mask,
-        math.exp(sigma_shift)
-        / (math.exp(sigma_shift) + (1.0 / sigmas - 1.0)),
+        math.exp(sigma_shift) / (math.exp(sigma_shift) + (1.0 / sigmas - 1.0)),
         torch.zeros_like(sigmas),
     )
 

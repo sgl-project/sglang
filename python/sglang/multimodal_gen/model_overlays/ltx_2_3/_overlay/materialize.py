@@ -140,9 +140,7 @@ def _build_connectors_config(config_donor_dir: str) -> dict:
         "connector_rope_base_seq_len": text_encoder_config[
             "connector_positional_embedding_max_pos"
         ][0],
-        "rope_double_precision": text_encoder_config[
-            "connector_double_precision_rope"
-        ],
+        "rope_double_precision": text_encoder_config["connector_double_precision_rope"],
         "rope_theta": text_encoder_config["connector_positional_embedding_theta"],
         "rope_type": text_encoder_config["connector_rope_type"],
         "text_proj_in_factor": text_encoder_config["feature_extractor_in_features"]
