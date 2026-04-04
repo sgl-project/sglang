@@ -26,6 +26,9 @@ FINAL_LATENTS_PATH = Path(
 DUMP_PATH = Path(
     os.environ.get("LTX23_OFFICIAL_DECODE_DUMP", "/tmp/ltx23_official_i2v_decode.pt")
 )
+HEIGHT = int(os.environ.get("LTX23_HEIGHT", "512"))
+WIDTH = int(os.environ.get("LTX23_WIDTH", "768"))
+NUM_FRAMES = int(os.environ.get("LTX23_NUM_FRAMES", "121"))
 
 
 def resolve_single_path(pattern: str) -> Path:
@@ -43,6 +46,8 @@ def main() -> None:
     sys.path.insert(0, str(LTX_REPO_ROOT / "packages/ltx-pipelines/src"))
 
     from ltx_core.loader.registry import DummyRegistry
+    from ltx_core.components.patchifiers import VideoLatentPatchifier
+    from ltx_core.types import VideoLatentShape
     from ltx_core.model.video_vae import (
         TilingConfig,
         VAE_DECODER_COMFY_KEYS_FILTER,
@@ -52,6 +57,17 @@ def main() -> None:
 
     payload = torch.load(FINAL_LATENTS_PATH, map_location="cpu")
     latent = payload["video_latent_after"].to(device="cuda", dtype=torch.bfloat16)
+    if latent.ndim == 3:
+        latent = VideoLatentPatchifier(patch_size=1).unpatchify(
+            latent,
+            VideoLatentShape(
+                batch=int(latent.shape[0]),
+                channels=int(latent.shape[2]),
+                frames=(NUM_FRAMES - 1) // 8 + 1,
+                height=HEIGHT // 32,
+                width=WIDTH // 32,
+            ),
+        )
 
     builder = Builder(
         model_path=str(checkpoint_path),
