@@ -342,7 +342,7 @@ def test_ltx23_connector_repack_renames_qk_norm_keys():
     ) == "audio_connector.transformer_blocks.1.attn1.norm_k.weight"
 
 
-def test_ltx23_transformer_config_enables_local_av_cross_attention():
+def test_ltx23_transformer_config_forces_sdpa_for_v2a_cross_attention():
     with tempfile.TemporaryDirectory() as tmpdir:
         donor_dir = os.path.join(tmpdir, "donor")
         os.makedirs(os.path.join(donor_dir, "transformer"), exist_ok=True)
@@ -352,7 +352,7 @@ def test_ltx23_transformer_config_enables_local_av_cross_attention():
         config = _build_transformer_config(donor_dir)
 
     assert config["_class_name"] == "LTX2VideoTransformer3DModel"
-    assert config["use_local_av_cross_attention"] is True
+    assert config["force_sdpa_v2a_cross_attention"] is True
 
 
 def test_ltx23_vae_config_adds_official_image_encoder_marker():

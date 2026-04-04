@@ -719,6 +719,7 @@ class LTX2TransformerBlock(nn.Module):
         apply_gated_attention: bool = False,
         cross_attention_adaln: bool = False,
         use_local_av_cross_attention: bool = False,
+        force_sdpa_v2a_cross_attention: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
@@ -806,7 +807,11 @@ class LTX2TransformerBlock(nn.Module):
             qk_norm=qk_norm,
             use_local_attention=use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
-            supported_attention_backends=supported_attention_backends,
+            supported_attention_backends=(
+                {AttentionBackendEnum.TORCH_SDPA}
+                if force_sdpa_v2a_cross_attention
+                else supported_attention_backends
+            ),
             prefix=f"{prefix}.video_to_audio_attn",
             quant_config=quant_config,
         )
@@ -1359,6 +1364,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     use_local_av_cross_attention=bool(
                         getattr(arch, "use_local_av_cross_attention", False)
                     ),
+                    force_sdpa_v2a_cross_attention=bool(
+                        getattr(arch, "force_sdpa_v2a_cross_attention", False)
+                    ),
                     supported_attention_backends=self._supported_attention_backends,
                     prefix=config.prefix,
                     quant_config=quant_config,
@@ -1516,27 +1524,27 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # 3.2. Prepare global modality cross attention modulation parameters
         hidden_dtype = hidden_states.dtype
         temb_ca_scale_shift, _ = self.av_ca_video_scale_shift_adaln_single(
-            audio_timestep.flatten(), hidden_dtype=hidden_dtype
+            timestep.flatten(), hidden_dtype=hidden_dtype
         )
         temb_ca_scale_shift = temb_ca_scale_shift.view(
             batch_size, -1, temb_ca_scale_shift.shape[-1]
         )
 
         temb_ca_gate, _ = self.av_ca_a2v_gate_adaln_single(
-            audio_timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            timestep.flatten() * self.av_ca_timestep_scale_multiplier,
             hidden_dtype=hidden_dtype,
         )
         temb_ca_gate = temb_ca_gate.view(batch_size, -1, temb_ca_gate.shape[-1])
 
         temb_ca_audio_scale_shift, _ = self.av_ca_audio_scale_shift_adaln_single(
-            timestep.flatten(), hidden_dtype=audio_hidden_states.dtype
+            audio_timestep.flatten(), hidden_dtype=audio_hidden_states.dtype
         )
         temb_ca_audio_scale_shift = temb_ca_audio_scale_shift.view(
             batch_size, -1, temb_ca_audio_scale_shift.shape[-1]
         )
 
         temb_ca_audio_gate, _ = self.av_ca_v2a_gate_adaln_single(
-            timestep.flatten() * self.av_ca_timestep_scale_multiplier,
+            audio_timestep.flatten() * self.av_ca_timestep_scale_multiplier,
             hidden_dtype=audio_hidden_states.dtype,
         )
         temb_ca_audio_gate = temb_ca_audio_gate.view(
