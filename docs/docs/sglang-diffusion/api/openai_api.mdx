@@ -1,9 +1,9 @@
 ---
 title: OpenAI API
 sidebarTitle: OpenAI API
-description: Image and video generation endpoints with LoRA adapter management.
+description: Image, video, and audio generation endpoints with LoRA adapter management.
 ---
-The SGLang diffusion HTTP server implements an OpenAI-compatible API for image and video generation, as well as LoRA adapter management.
+The SGLang diffusion HTTP server implements an OpenAI-compatible API for image, video, and audio generation, as well as LoRA adapter management.
 
 ## Prerequisites
 
@@ -189,6 +189,69 @@ the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
 curl -sS -L "http://localhost:30010/v1/images/<IMAGE_ID>/content" \
   -H "Authorization: Bearer sk-proj-1234567890" \
   -o output.png
+```
+
+### Audio Speech
+
+The server implements an OpenAI-compatible Speech API under `/v1/audio/speech` for LongCat-AudioDiT. The POST is synchronous: JSON (or multipart) in, raw audio bytes out.
+
+**Endpoint:** `POST /v1/audio/speech`
+
+OpenAI fields:
+
+- `input` (required): text to synthesize. `prompt` is accepted as an alias.
+- `model` (optional): served model name.
+- `voice` (optional): OpenAI voice label such as `alloy`. Not a filesystem path.
+- `response_format` (optional): `wav` (default), `mp3`, `opus`, `aac`, `flac`, or `pcm`.
+- `speed` (optional): `0.25`–`4.0`. Default `1.0`. Values other than `1.0` require `librosa`.
+- `stream_format`: only `audio` is supported (`sse` returns 400).
+
+SGLang extensions (voice cloning and sampling):
+
+- `prompt_text`: transcript of the reference clip.
+- `prompt_audio_path`: **http(s) URL only**. Local filesystem paths are rejected on HTTP; pass them to `sglang generate --prompt-audio-path`.
+- `prompt_audio`: multipart file upload for the reference clip.
+- `guidance_method`: `cfg` (default) or `apg`.
+- `guidance_scale`, `num_inference_steps`, `seed`.
+- `duration_seconds`: target length in seconds. Omitted: estimate from text (when cloning, this is the generated region after the prompt audio).
+
+**Curl Example (TTS JSON):**
+
+```bash curl
+curl -sS -X POST "http://localhost:30010/v1/audio/speech" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "input": "Hello from LongCat-AudioDiT.",
+        "response_format": "wav"
+      }' \
+  --output tts.wav
+```
+
+**Curl Example (clone with uploaded reference):**
+
+```bash curl
+curl -sS -X POST "http://localhost:30010/v1/audio/speech" \
+  -F "input=Target text to synthesize." \
+  -F "prompt_text=Transcript of the reference audio." \
+  -F "prompt_audio=@/path/to/reference.wav" \
+  -F "guidance_method=cfg" \
+  --output clone.wav
+```
+
+**Python Example:**
+
+```python Python
+from openai import OpenAI
+
+client = OpenAI(api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1")
+
+speech = client.audio.speech.create(
+    model="longcat-audiodit",
+    input="Hello from LongCat-AudioDiT.",
+    voice="alloy",
+)
+with open("tts.wav", "wb") as f:
+    f.write(speech.read())
 ```
 
 ### Video Generation

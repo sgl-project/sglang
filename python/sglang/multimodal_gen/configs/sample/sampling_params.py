@@ -83,6 +83,7 @@ class DataType(Enum):
     VIDEO = auto()
     MESH = auto()
     ACTION = auto()
+    AUDIO = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
@@ -91,6 +92,8 @@ class DataType(Enum):
             return "mp4"
         if self == DataType.ACTION:
             return "json"
+        if self == DataType.AUDIO:
+            return "wav"
         return "glb"
 
 
@@ -279,7 +282,16 @@ class SamplingParams:
 
     def _set_output_file_ext(self):
         # add extension if needed
-        output_extensions = (".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".json")
+        output_extensions = (
+            ".mp4",
+            ".jpg",
+            ".png",
+            ".webp",
+            ".obj",
+            ".glb",
+            ".json",
+            ".wav",
+        )
         if not any(self.output_file_name.endswith(ext) for ext in output_extensions):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
@@ -622,6 +634,10 @@ class SamplingParams:
             self._adjust_mesh_fields(server_args, pipeline_config)
             return
 
+        if task_type.is_audio_gen():
+            self._adjust_audio_fields(server_args)
+            return
+
         if task_type.is_visual_gen():
             self._adjust_visual_fields(server_args, pipeline_config)
 
@@ -639,6 +655,12 @@ class SamplingParams:
         self.return_file_paths_only = False
         self.num_frames = 1
         self.adjust_frames = False
+        if self.save_output and not server_args.comfyui_mode:
+            self._set_output_file_name()
+
+    def _adjust_audio_fields(self, server_args):
+        # Same as action/mesh: visual adjust is the only other place that
+        # assigns output_file_name, so T2A otherwise saves as [None].
         if self.save_output and not server_args.comfyui_mode:
             self._set_output_file_name()
 
@@ -1239,6 +1261,40 @@ class SamplingParams:
                 "Path(s) to input video(s) for video-to-video generation. "
                 "The first/last frames of the video become the conditioning "
                 "frames for the generated output."
+            ),
+        )
+        add_argument(
+            "--prompt-audio-path",
+            type=str,
+            help=(
+                "Path to a reference audio file for voice cloning. "
+                "LongCat-AudioDiT only; ignored by other pipelines."
+            ),
+        )
+        add_argument(
+            "--prompt-text",
+            type=str,
+            help=(
+                "Transcript of the reference audio for voice cloning. "
+                "LongCat-AudioDiT only; ignored by other pipelines."
+            ),
+        )
+        add_argument(
+            "--guidance-method",
+            type=str,
+            help=(
+                "Guidance method: 'cfg' or 'apg'. "
+                "LongCat-AudioDiT only; ignored by other pipelines."
+            ),
+        )
+        add_argument(
+            "--duration-seconds",
+            type=float,
+            help=(
+                "Target generated-audio duration in seconds. Omitted: estimate "
+                "from text length. When cloning, this is the generated region "
+                "after the prompt audio. LongCat-AudioDiT only; ignored by "
+                "other pipelines."
             ),
         )
         add_argument(
