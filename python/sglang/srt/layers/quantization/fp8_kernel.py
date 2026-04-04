@@ -133,7 +133,7 @@ def _per_token_group_quant_8bit(
     y_stride,
     # Columns of input
     N,
-    # Avoid to divide zero
+    # Avoid division by zero
     eps,
     # Information for float8
     bit8_min,
@@ -177,7 +177,7 @@ def _per_token_group_quant_8bit_colmajor(
     y_num_columns,
     # Stride from one column to the next of y_s
     y_s_col_stride,
-    # Avoid to divide zero
+    # Avoid division by zero
     eps,
     # Information for float8
     bit8_min,
