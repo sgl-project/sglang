@@ -161,6 +161,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
         audio_latents_before: torch.Tensor | None,
         denoised_audio: torch.Tensor | None,
         audio_latents_after: torch.Tensor | None,
+        video_cond: torch.Tensor | None = None,
+        video_uncond: torch.Tensor | None = None,
+        video_ptb: torch.Tensor | None = None,
+        video_mod: torch.Tensor | None = None,
+        audio_cond: torch.Tensor | None = None,
+        audio_uncond: torch.Tensor | None = None,
+        audio_ptb: torch.Tensor | None = None,
+        audio_mod: torch.Tensor | None = None,
     ) -> None:
         torch.save(
             {
@@ -183,6 +191,18 @@ class LTX2AVDenoisingStage(DenoisingStage):
                     if audio_latents_after is None
                     else audio_latents_after.detach().cpu()
                 ),
+                "video_cond": None if video_cond is None else video_cond.detach().cpu(),
+                "video_uncond": (
+                    None if video_uncond is None else video_uncond.detach().cpu()
+                ),
+                "video_ptb": None if video_ptb is None else video_ptb.detach().cpu(),
+                "video_mod": None if video_mod is None else video_mod.detach().cpu(),
+                "audio_cond": None if audio_cond is None else audio_cond.detach().cpu(),
+                "audio_uncond": (
+                    None if audio_uncond is None else audio_uncond.detach().cpu()
+                ),
+                "audio_ptb": None if audio_ptb is None else audio_ptb.detach().cpu(),
+                "audio_mod": None if audio_mod is None else audio_mod.detach().cpu(),
             },
             dump_dir / f"{stage}_step{step_index}.pt",
         )
@@ -770,6 +790,8 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         denoised_audio = (
                             audio_latents.float() - sigma_val * a_v_pos
                         ).to(audio_latents.dtype)
+                        denoised_video_cond = denoised_video
+                        denoised_audio_cond = denoised_audio
                         denoised_video_neg = None
                         denoised_audio_neg = None
                         denoised_video_perturbed = None
@@ -993,6 +1015,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 audio_latents_before=audio_latents_before_dump,
                                 denoised_audio=denoised_audio,
                                 audio_latents_after=audio_latents,
+                                video_cond=denoised_video_cond,
+                                video_uncond=denoised_video_neg,
+                                video_ptb=denoised_video_perturbed,
+                                video_mod=denoised_video_modality,
+                                audio_cond=denoised_audio_cond,
+                                audio_uncond=denoised_audio_neg,
+                                audio_ptb=denoised_audio_perturbed,
+                                audio_mod=denoised_audio_modality,
                             )
 
                         latents = self.post_forward_for_ti2v_task(
