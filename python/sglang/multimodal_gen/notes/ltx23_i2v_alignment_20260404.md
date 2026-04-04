@@ -217,7 +217,62 @@
   - cross-modality sigma 复验（commit `e83b234f3`）：
     - `video_denoised mean_abs = 0.5880815386772156`
     - `video_denoised cosine = 0.5293195843696594`
-    - `audio_denoised mean_abs = 1.307675838470459`
+  - `audio_denoised mean_abs = 1.307675838470459`
+
+## 2026-04-04 二分结果更新 4：image latent 根因已收窄到 2.3 官方 VideoEncoder
+
+- 触发点：
+  - 在 `step0` clean-state dump 里，`video_denoise_mask cosine = 1.0`
+  - 但 `video_clean_latent cosine = 0.0080`
+  - `image_latent cosine = 0.0370`
+  - 说明 mask 语义已经对齐，真正没对齐的是 conditioning image encode 本身
+
+- 官方源码确认：
+  - `ltx_pipelines/utils/helpers.py`
+    - `combined_image_conditionings(...)` 直接走 `encoded_image = video_encoder(image)`
+  - `ltx_core/model/video_vae/video_vae.py`
+    - `VideoEncoder.forward()` 最后返回的是 `per_channel_statistics.normalize(means)`
+    - 不是 diffusers `AutoencoderKL.encode(...).latent_dist.mode()/sample()` 那条旧路径
+
+- 与当前 SGLang 的差异：
+  - `runtime/pipelines_core/stages/denoising_av.py::_prepare_ltx2_image_latent()`
+  - 当前仍然走：
+    - `self.vae.encode(video_condition)`
+    - `latent_dist.mode()/sample()`
+    - 手动 `(latent - latents_mean) / latents_std`
+  - 这条逻辑更接近旧 `LTX-2` diffusers VAE，不是 2.3 官方 native `VideoEncoder`
+
+- 进一步核对 HF donor 后的结论：
+  - `FastVideo/LTX-2.3-Distilled-Diffusers/vae/model.safetensors`
+    - 确实包含 top-level `per_channel_statistics.mean-of-means/std-of-means`
+    - 但主体 VAE key-space 不是旧 `LTX-2` 那套
+  - 结构性差异例子：
+    - 旧 `LTX-2`：
+      - `encoder.down_blocks.{0..3}.resnets`
+      - `encoder.down_blocks.{0..3}.downsamplers`
+      - `encoder.mid_block`
+      - `encoder.conv_out` 输入通道是 `2048`
+    - 2.3 / FastVideo：
+      - `encoder.down_blocks.{0..8}` 交替出现 `res_blocks` 和单独 `conv`
+      - 没有旧语义上的 `mid_block`
+      - `encoder.conv_out` 输入通道是 `1024`
+
+- 结论：
+  - “把 2.3 整套 `vae` donor 直接塞进当前 native `AutoencoderKLLTX2Video`”不是可行路径
+  - 当前首个未对齐 stage 已进一步收窄到：
+    - official `VideoEncoder(image)` / SGLang `condition image latent encode`
+  - 下一条正确路线应是：
+    - 为 `LTX-2.3` i2v 增加 dedicated native `VideoEncoder`
+    - 或在现有 native VAE 侧补 2.3 encoder block schema
+  - 在这之前，继续尝试整套 2.3 `vae` donor 替换没有意义
+
+- 当前精度对齐进度：60%
+  - 已完全对齐到的 stage：
+    - native example 输入语义
+    - initial latent construction / step0 latent-before
+    - i2v denoise mask / clean-state 的高层 conditioning 语义
+  - 当前首个未对齐的大阶段：
+    - condition image -> official `VideoEncoder` -> image latent
     - `audio_denoised cosine = -0.7909688949584961`
 
 - 结论：
