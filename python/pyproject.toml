@@ -122,6 +122,7 @@ diffusion = [
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "websockets",
   "xatlas",
+  "librosa",
 ]
 
 diffusion-qvg = [

@@ -78,6 +78,7 @@ diffusion = [
   "diffusers==0.37.0",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
+  "librosa",
   "moviepy>=2.0.0",
   "opencv-python==4.10.0.84",
   "PyYAML==6.0.1",
