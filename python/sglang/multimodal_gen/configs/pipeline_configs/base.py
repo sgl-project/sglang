@@ -169,6 +169,7 @@ class PipelineConfig:
     # controls the timestep embedding generation
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0
+    generator_device: str | None = None
     flow_shift: float | None = None
     disable_autocast: bool = False
 
@@ -419,6 +420,9 @@ class PipelineConfig:
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
+
+    def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
+        raise NotImplementedError("not yet implemented")
 
     @staticmethod
     def add_cli_args(

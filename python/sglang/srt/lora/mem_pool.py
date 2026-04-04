@@ -315,7 +315,7 @@ class LoRAMemoryPool:
                     # MoE expert version (4D)
                     moe_key = f"{module_name}_moe"
                     buffer[moe_key] = [
-                        torch.empty(
+                        torch.zeros(
                             get_lora_shape_fn(
                                 moe_key, base_model, self.max_lora_rank, idx
                             ),
@@ -327,7 +327,7 @@ class LoRAMemoryPool:
                 else:
                     # Standard allocation for unambiguous modules
                     buffer[module_name] = [
-                        torch.empty(
+                        torch.zeros(
                             get_lora_shape_fn(
                                 module_name,
                                 base_model,
@@ -347,7 +347,7 @@ class LoRAMemoryPool:
         ):
             target_modules = target_modules & set(EMBEDDING_NAMES)
             for module_name in target_modules:
-                buffer[module_name] = torch.empty(
+                buffer[module_name] = torch.zeros(
                     get_lora_shape_fn(
                         module_name,
                         base_model,
@@ -359,7 +359,7 @@ class LoRAMemoryPool:
                 )
 
         if self.lora_added_tokens_size > 0:
-            self.new_embeddings_buffer["input_embeddings"] = torch.empty(
+            self.new_embeddings_buffer["input_embeddings"] = torch.zeros(
                 (
                     self.max_loras_per_batch,
                     self.lora_added_tokens_size,

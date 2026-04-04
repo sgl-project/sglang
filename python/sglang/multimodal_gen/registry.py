@@ -264,6 +264,29 @@ def _normalize_hf_cache_path(path: str) -> str:
     return os.path.normpath(path).lower().replace("\\", "/")
 
 
+def has_registered_diffusion_model_path(model_path: str) -> bool:
+    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+
+    if model_path in _MODEL_HF_PATH_TO_NAME:
+        return True
+
+    model_short_name = get_model_short_name(model_path.lower())
+    for registered_model_hf_id in all_model_hf_paths:
+        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
+        if registered_model_name in model_short_name:
+            return True
+
+    normalized_model_path = _normalize_hf_cache_path(model_path)
+    for registered_model_hf_id in all_model_hf_paths:
+        cache_repo_fragment = (
+            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
+        )
+        if cache_repo_fragment in normalized_model_path:
+            return True
+
+    return False
+
+
 @lru_cache(maxsize=1)
 def _get_config_info(
     model_path: str, model_id: Optional[str] = None
@@ -570,6 +593,9 @@ def _register_configs():
     register_configs(
         sampling_param_cls=LTX2SamplingParams,
         pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=[
+            "Lightricks/LTX-2",
+        ],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
             lambda path: "ltx-2" in path.lower(),

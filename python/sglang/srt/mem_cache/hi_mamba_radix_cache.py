@@ -296,7 +296,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 extra_pools=extra_pools,
             )
         if host_indices is not None:
-            node.host_value = host_indices
+            node.host_value = host_indices.clone()
             if extra_pools is not None:
                 self.mamba_backup_commit(node, extra_pools)
             assert len(node.host_value) > 0
@@ -2044,7 +2044,7 @@ class HiMambaRadixCache(MambaRadixCache):
             return
         host_indices = transfers[0].host_indices
         if node.mamba_host_value is None and host_indices is not None:
-            node.mamba_host_value = host_indices
+            node.mamba_host_value = host_indices.clone()
             self.mamba_host_lru_list.insert_mru(node)
 
     def mamba_archive_transfers(self, node: TreeNode) -> Optional[list[PoolTransfer]]:

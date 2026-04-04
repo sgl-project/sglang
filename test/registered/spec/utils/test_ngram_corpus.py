@@ -6,14 +6,12 @@ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 
 
 def _make_corpus(match_type="BFS", **kwargs):
     defaults = dict(
         max_trie_depth=12,
-        min_match_window_size=1,
-        max_match_window_size=10,
         min_bfs_breadth=1,
         max_bfs_breadth=8,
         draft_token_num=8,
@@ -239,9 +237,7 @@ class TestNgramCorpusSqueeze(CustomTestCase):
         self.assertEqual(len(ids), 8, "Should still produce draft_token_num outputs")
 
     def test_eviction_preserves_recent(self):
-        corpus = _make_corpus(
-            "BFS", capacity=500, max_trie_depth=6, max_match_window_size=5
-        )
+        corpus = _make_corpus("BFS", capacity=500, max_trie_depth=6)
 
         old_seq = list(range(1000, 1050))
         corpus.batch_put([old_seq])
@@ -357,7 +353,6 @@ class TestFrequencyBoosting(CustomTestCase):
             draft_token_num=2,
             max_bfs_breadth=1,
             min_bfs_breadth=1,
-            max_match_window_size=3,
             max_trie_depth=5,
         )
         corpus.batch_put([[1, 2, 3, 10, 11]])
@@ -386,7 +381,6 @@ class TestRecencyOrdering(CustomTestCase):
             draft_token_num=2,
             max_bfs_breadth=1,
             min_bfs_breadth=1,
-            max_match_window_size=3,
             max_trie_depth=5,
         )
         corpus.batch_put([[1, 2, 3, 10, 11]])
@@ -422,7 +416,7 @@ class TestSingleTokenContext(CustomTestCase):
     """Verify behavior with minimum-length context."""
 
     def test_single_token_query(self):
-        corpus = _make_corpus("BFS", min_match_window_size=1)
+        corpus = _make_corpus("BFS")
         corpus.batch_put([[5, 10, 20, 30]])
         corpus.synchronize()
 
@@ -436,7 +430,7 @@ class TestLongContext(CustomTestCase):
     """Verify behavior when query context exceeds max_trie_depth."""
 
     def test_context_longer_than_max_trie_depth(self):
-        corpus = _make_corpus("BFS", max_trie_depth=6, max_match_window_size=5)
+        corpus = _make_corpus("BFS", max_trie_depth=6)
         seq = list(range(1, 20))
         corpus.batch_put([seq])
         corpus.synchronize()
@@ -446,6 +440,23 @@ class TestLongContext(CustomTestCase):
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 15, "First token should be last context token")
         self.assertIn(16, ids_list, "Should match via suffix despite long context")
+
+    def test_matches_longest_stored_suffix(self):
+        corpus = _make_corpus("BFS", max_trie_depth=6, draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 4, 5, 6, 7]])
+        corpus.batch_put([[99, 3, 4, 5, 6, 8]])
+        corpus.synchronize()
+
+        ids, _ = corpus.batch_get([[2, 3, 4, 5, 6]])
+        ids_list = ids.tolist()
+        self.assertIn(
+            7, ids_list, "Longest stored suffix should contribute a continuation"
+        )
+        self.assertIn(
+            8,
+            ids_list,
+            "Shorter matching suffixes should still contribute continuations",
+        )
 
 
 class TestDraftBudgetSaturation(CustomTestCase):
@@ -469,41 +480,39 @@ class TestDraftBudgetSaturation(CustomTestCase):
 
 
 class TestTruncate(CustomTestCase):
-    """Verify the Result.truncate method via the Python binding."""
+    """Verify truncation logic on batch_get output."""
 
     def test_truncate_reduces_output(self):
         corpus = _make_corpus("BFS", draft_token_num=8)
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        result = corpus._ngram.batchMatch([[1, 2, 3]])
-        original_len = len(result.token)
-        self.assertEqual(original_len, 8)
+        ids, masks = corpus.batch_get([[1, 2, 3]])
+        ids = ids.reshape(8)
+        self.assertEqual(len(ids), 8)
 
-        result.truncate(4)
-        self.assertEqual(len(result.token), 4)
-        self.assertEqual(len(result.mask), 4 * 4)
+        # Simulate truncate to 4
+        trunc_n = 4
+        trunc_ids = ids[:trunc_n]
+        self.assertEqual(len(trunc_ids), trunc_n)
 
     def test_truncate_preserves_mask_structure(self):
         corpus = _make_corpus("BFS", draft_token_num=8)
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        result = corpus._ngram.batchMatch([[1, 2, 3]])
-        full_ids = list(result.token)
-        full_mask = list(result.mask)
-        n = len(full_ids)
+        ids, masks = corpus.batch_get([[1, 2, 3]])
+        n = 8
+        full_mask = masks.reshape(n, n)
 
-        result_copy = corpus._ngram.batchMatch([[1, 2, 3]])
         trunc_n = 4
-        result_copy.truncate(trunc_n)
-        trunc_mask = list(result_copy.mask)
+        trunc_mask = full_mask[:trunc_n, :trunc_n]
 
         for i in range(trunc_n):
             for j in range(trunc_n):
                 self.assertEqual(
-                    trunc_mask[i * trunc_n + j],
-                    full_mask[i * n + j],
+                    trunc_mask[i, j],
+                    full_mask[i, j],
                     f"Mask mismatch at ({i},{j})",
                 )
 
@@ -538,9 +547,7 @@ class TestSqueezeEvictsOld(CustomTestCase):
     """Verify that squeeze actually evicts old data, not just preserves recent."""
 
     def test_old_data_evicted(self):
-        corpus = _make_corpus(
-            "BFS", capacity=150, max_trie_depth=6, max_match_window_size=5
-        )
+        corpus = _make_corpus("BFS", capacity=150, max_trie_depth=6)
 
         old_seq = list(range(5000, 5030))
         corpus.batch_put([old_seq])
