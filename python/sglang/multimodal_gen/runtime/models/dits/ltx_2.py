@@ -1493,7 +1493,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         if self.prompt_adaln_single is not None:
             prompt_timestep = self._collapse_prompt_timestep(timestep)
             temb_prompt, _ = self.prompt_adaln_single(
-                prompt_timestep.flatten(), hidden_dtype=hidden_dtype
+                prompt_timestep.flatten(), hidden_dtype=hidden_states.dtype
             )
             temb_prompt = temb_prompt.view(batch_size, -1, temb_prompt.size(-1))
         if self.audio_prompt_adaln_single is not None:
