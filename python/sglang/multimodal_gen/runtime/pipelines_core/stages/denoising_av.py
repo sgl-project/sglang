@@ -1,4 +1,5 @@
 import copy
+import json
 import math
 import os
 import time
@@ -9,11 +10,15 @@ import av
 import numpy as np
 import PIL.Image
 import torch
+from safetensors.torch import load_file as safetensors_load_file
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
+    LTX23VideoConditionEncoder,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     load_image,
     normalize,
@@ -334,6 +339,40 @@ class LTX2AVDenoisingStage(DenoisingStage):
             return True
         return int(getattr(batch, "sp_video_start_frame", 0)) == 0
 
+    def _get_ltx23_condition_image_encoder(
+        self,
+        server_args: ServerArgs,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> LTX23VideoConditionEncoder | None:
+        arch_config = server_args.pipeline_config.vae_config.arch_config
+        if not getattr(arch_config, "use_official_image_encoder", False):
+            return None
+
+        vae_model_path = server_args.model_paths["vae"]
+        subdir = str(getattr(arch_config, "official_image_encoder_subdir"))
+        encoder_dir = os.path.join(vae_model_path, subdir)
+        config_path = os.path.join(encoder_dir, "config.json")
+        weights_path = os.path.join(encoder_dir, "model.safetensors")
+        if not os.path.exists(config_path) or not os.path.exists(weights_path):
+            raise ValueError(
+                f"LTX-2.3 official image encoder files not found under {encoder_dir}"
+            )
+
+        cached_dir = getattr(self, "_ltx23_condition_image_encoder_dir", None)
+        encoder = getattr(self, "_ltx23_condition_image_encoder", None)
+        if encoder is None or cached_dir != encoder_dir:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+            encoder = LTX23VideoConditionEncoder(config)
+            encoder.load_state_dict(safetensors_load_file(weights_path), strict=True)
+            self._ltx23_condition_image_encoder = encoder
+            self._ltx23_condition_image_encoder_dir = encoder_dir
+
+        encoder = encoder.to(device=device, dtype=dtype)
+        return encoder
+
     def _prepare_ltx2_image_latent(self, batch: Req, server_args: ServerArgs) -> None:
         """Encode `batch.image_path` into packed token latents for LTX-2 TI2V."""
         if (
@@ -372,10 +411,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
         )
         encode_dtype = batch.latents.dtype
         original_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-        self.vae = self.vae.to(device=latents_device, dtype=encode_dtype)
         vae_autocast_enabled = (
             original_dtype != torch.float32
         ) and not server_args.disable_autocast
+        official_image_encoder = self._get_ltx23_condition_image_encoder(
+            server_args, device=latents_device, dtype=encode_dtype
+        )
+        if official_image_encoder is None:
+            self.vae = self.vae.to(device=latents_device, dtype=encode_dtype)
 
         video_condition = self._resize_center_crop_tensor(
             conditioned_img,
@@ -392,31 +435,37 @@ class LTX2AVDenoisingStage(DenoisingStage):
             enabled=vae_autocast_enabled,
         ):
             try:
-                if server_args.pipeline_config.vae_tiling:
+                if official_image_encoder is None and server_args.pipeline_config.vae_tiling:
                     self.vae.enable_tiling()
             except Exception:
                 pass
             if not vae_autocast_enabled:
                 video_condition = video_condition.to(encode_dtype)
 
-            latent_dist: DiagonalGaussianDistribution = self.vae.encode(video_condition)
-            if isinstance(latent_dist, AutoencoderKLOutput):
-                latent_dist = latent_dist.latent_dist
+            if official_image_encoder is not None:
+                latent = official_image_encoder(video_condition)
+            else:
+                latent_dist: DiagonalGaussianDistribution = self.vae.encode(video_condition)
+                if isinstance(latent_dist, AutoencoderKLOutput):
+                    latent_dist = latent_dist.latent_dist
 
-        mode = server_args.pipeline_config.vae_config.encode_sample_mode()
-        if mode == "argmax":
-            latent = latent_dist.mode()
-        elif mode == "sample":
-            if batch.generator is None:
-                raise ValueError("Generator must be provided for VAE sampling.")
-            latent = latent_dist.sample(batch.generator)
+        if official_image_encoder is None:
+            mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+            if mode == "argmax":
+                latent = latent_dist.mode()
+            elif mode == "sample":
+                if batch.generator is None:
+                    raise ValueError("Generator must be provided for VAE sampling.")
+                latent = latent_dist.sample(batch.generator)
+            else:
+                raise ValueError(f"Unsupported encode_sample_mode: {mode}")
+
+            # Per-channel normalization: normalized = (x - mean) / std
+            mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latent)
+            std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latent)
+            latent = (latent - mean) / std
         else:
-            raise ValueError(f"Unsupported encode_sample_mode: {mode}")
-
-        # Per-channel normalization: normalized = (x - mean) / std
-        mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latent)
-        std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latent)
-        latent = (latent - mean) / std
+            latent = latent.to(dtype=encode_dtype)
 
         packed = server_args.pipeline_config.maybe_pack_latents(
             latent, latent.shape[0], batch
@@ -448,9 +497,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                 batch.height,
             )
 
-        self.vae.to(original_dtype)
+        if official_image_encoder is None:
+            self.vae.to(original_dtype)
         if server_args.vae_cpu_offload:
             self.vae = self.vae.to("cpu")
+            if official_image_encoder is not None:
+                self._ltx23_condition_image_encoder = official_image_encoder.to("cpu")
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:

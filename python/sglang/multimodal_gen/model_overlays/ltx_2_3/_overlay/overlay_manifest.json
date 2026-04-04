@@ -11,5 +11,5 @@
     "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
   ],
   "custom_materializer": "_overlay/materialize.py",
-  "materializer_version": "v2"
+  "materializer_version": "v4"
 }

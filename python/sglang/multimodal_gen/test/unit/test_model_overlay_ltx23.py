@@ -14,7 +14,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
     _build_vae_config,
     _rename_connector_key,
-    _repack_vae_weights,
+    _repack_ltx23_image_encoder_weights,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_model_info
@@ -195,12 +195,10 @@ def test_ltx23_connector_repack_renames_qk_norm_keys():
     ) == "audio_connector.transformer_blocks.1.attn1.norm_k.weight"
 
 
-def test_ltx23_vae_config_uses_23_padding_and_scaling():
+def test_ltx23_vae_config_adds_official_image_encoder_marker():
     with tempfile.TemporaryDirectory() as tmpdir:
         auxiliary_dir = os.path.join(tmpdir, "aux")
-        vae_donor_dir = os.path.join(tmpdir, "donor")
         os.makedirs(os.path.join(auxiliary_dir, "vae"), exist_ok=True)
-        os.makedirs(os.path.join(vae_donor_dir, "vae"), exist_ok=True)
 
         with open(os.path.join(auxiliary_dir, "vae", "config.json"), "w") as f:
             json.dump(
@@ -215,53 +213,35 @@ def test_ltx23_vae_config_uses_23_padding_and_scaling():
                 },
                 f,
             )
-        with open(os.path.join(vae_donor_dir, "vae", "config.json"), "w") as f:
-            json.dump(
-                {
-                    "vae": {
-                        "scaling_factor": 1.0,
-                        "patch_size": 4,
-                        "causal_decoder": False,
-                        "timestep_conditioning": False,
-                        "spatial_padding_mode": "zeros",
-                    }
-                },
-                f,
-            )
-
-        config = _build_vae_config(auxiliary_dir, vae_donor_dir)
+        config = _build_vae_config(auxiliary_dir)
 
     assert config["encoder_spatial_padding_mode"] == "zeros"
-    assert config["decoder_spatial_padding_mode"] == "zeros"
-    assert config["scaling_factor"] == 1.0
+    assert config["decoder_spatial_padding_mode"] == "reflect"
+    assert config["use_official_image_encoder"] is True
+    assert config["official_image_encoder_subdir"] == "ltx23_image_encoder"
 
 
-def test_ltx23_vae_repack_maps_per_channel_stats():
+def test_ltx23_repack_image_encoder_keeps_only_encoder_tensors():
     with tempfile.TemporaryDirectory() as tmpdir:
         source_path = os.path.join(tmpdir, "source.safetensors")
         output_path = os.path.join(tmpdir, "output.safetensors")
         save_file(
             {
-                "encoder.conv_in.weight": torch.ones(1),
-                "decoder.conv_in.weight": torch.full((1,), 2.0),
-                "encoder.per_channel_statistics.mean-of-means": torch.full((2,), 3.0),
-                "encoder.per_channel_statistics.std-of-means": torch.full((2,), 4.0),
-                "decoder.per_channel_statistics.mean-of-means": torch.full((2,), 5.0),
+                "encoder.conv_in.conv.weight": torch.ones(1),
+                "decoder.conv_in.conv.weight": torch.full((1,), 2.0),
+                "per_channel_statistics.mean-of-means": torch.full((2,), 3.0),
             },
             source_path,
         )
 
-        _repack_vae_weights(source_path, output_path)
+        _repack_ltx23_image_encoder_weights(source_path, output_path)
 
         with safe_open(output_path, framework="pt") as f:
             keys = sorted(f.keys())
-            assert "encoder.conv_in.weight" in keys
-            assert "decoder.conv_in.weight" in keys
-            assert "latents_mean" in keys
-            assert "latents_std" in keys
-            assert not any("per_channel_statistics" in key for key in keys)
-            assert torch.equal(f.get_tensor("latents_mean"), torch.full((2,), 3.0))
-            assert torch.equal(f.get_tensor("latents_std"), torch.full((2,), 4.0))
+            assert keys == [
+                "encoder.conv_in.conv.weight",
+                "per_channel_statistics.mean-of-means",
+            ]
 
 
 def test_ltx23_latent_preparation_samples_directly_in_packed_space():

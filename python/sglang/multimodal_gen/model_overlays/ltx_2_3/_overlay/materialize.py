@@ -13,21 +13,21 @@ from sglang.multimodal_gen.runtime.utils.model_overlay import (
 
 AUXILIARY_MODEL_ID = "Lightricks/LTX-2"
 CONFIG_DONOR_MODEL_ID = "FastVideo/LTX-2.3-Distilled-Diffusers"
-VAE_DONOR_MODEL_ID = CONFIG_DONOR_MODEL_ID
 
 AUXILIARY_PATTERNS = [
     "audio_vae/**",
     "scheduler/**",
     "text_encoder/**",
     "tokenizer/**",
+    "vae/**",
     "vocoder/**",
 ]
 
 CONFIG_DONOR_PATTERNS = [
     "transformer/config.json",
     "text_encoder/config.json",
+    "vae/**",
 ]
-VAE_DONOR_PATTERNS = ["vae/**"]
 
 MONOLITH_PREFIX = "model.diffusion_model."
 VIDEO_CONNECTOR_PREFIX = f"{MONOLITH_PREFIX}video_embeddings_connector."
@@ -161,53 +161,21 @@ def _build_connectors_config(config_donor_dir: str) -> dict:
     }
 
 
-def _build_vae_config(auxiliary_dir: str, vae_donor_dir: str) -> dict:
+def _build_vae_config(auxiliary_dir: str) -> dict:
     config = _load_json(os.path.join(auxiliary_dir, "vae", "config.json"))
-    donor_config = _load_json(os.path.join(vae_donor_dir, "vae", "config.json")).get(
-        "vae", {}
-    )
-
-    config["scaling_factor"] = donor_config.get(
-        "scaling_factor", config.get("scaling_factor", 1.0)
-    )
-    config["patch_size"] = donor_config.get("patch_size", config.get("patch_size", 4))
-    config["decoder_causal"] = donor_config.get(
-        "causal_decoder", config.get("decoder_causal", False)
-    )
-    config["timestep_conditioning"] = donor_config.get(
-        "timestep_conditioning", config.get("timestep_conditioning", False)
-    )
-    spatial_padding_mode = donor_config.get("spatial_padding_mode")
-    if spatial_padding_mode is not None:
-        config["encoder_spatial_padding_mode"] = spatial_padding_mode
-        config["decoder_spatial_padding_mode"] = spatial_padding_mode
+    config["use_official_image_encoder"] = True
+    config["official_image_encoder_subdir"] = "ltx23_image_encoder"
     return config
 
 
-def _repack_vae_weights(source_path: str, output_path: str) -> None:
+def _repack_ltx23_image_encoder_weights(source_path: str, output_path: str) -> None:
     tensors = {}
-    latents_mean = None
-    latents_std = None
-
     with safe_open(source_path, framework="pt") as f:
         for key in f.keys():
-            tensor = f.get_tensor(key)
-            if key.endswith("per_channel_statistics.mean-of-means"):
-                if latents_mean is None:
-                    latents_mean = tensor
-                continue
-            if key.endswith("per_channel_statistics.std-of-means"):
-                if latents_std is None:
-                    latents_std = tensor
-                continue
-            tensors[key] = tensor
-
-    if latents_mean is not None:
-        tensors["latents_mean"] = latents_mean
-    if latents_std is not None:
-        tensors["latents_std"] = latents_std
+            if key.startswith("encoder.") or key.startswith("per_channel_statistics."):
+                tensors[key] = f.get_tensor(key)
     if not tensors:
-        raise ValueError("No VAE tensors found in 2.3 donor checkpoint.")
+        raise ValueError("No LTX-2.3 image-encoder tensors found in donor checkpoint.")
     save_file(tensors, output_path)
 
 
@@ -230,17 +198,13 @@ def materialize(
         allow_patterns=CONFIG_DONOR_PATTERNS,
         max_workers=8,
     )
-    vae_donor_dir = snapshot_download(
-        repo_id=VAE_DONOR_MODEL_ID,
-        allow_patterns=VAE_DONOR_PATTERNS,
-        max_workers=8,
-    )
 
     for component_name in (
         "audio_vae",
         "scheduler",
         "text_encoder",
         "tokenizer",
+        "vae",
         "vocoder",
     ):
         _copytree_link_or_copy(
@@ -271,14 +235,17 @@ def materialize(
     )
 
     vae_dir = os.path.join(output_dir, "vae")
-    _ensure_dir(vae_dir)
-    _write_json(
-        os.path.join(vae_dir, "config.json"),
-        _build_vae_config(auxiliary_dir, vae_donor_dir),
+    _write_json(os.path.join(vae_dir, "config.json"), _build_vae_config(auxiliary_dir))
+
+    image_encoder_dir = os.path.join(vae_dir, "ltx23_image_encoder")
+    _ensure_dir(image_encoder_dir)
+    _link_or_copy_file(
+        os.path.join(config_donor_dir, "vae", "config.json"),
+        os.path.join(image_encoder_dir, "config.json"),
     )
-    _repack_vae_weights(
-        os.path.join(vae_donor_dir, "vae", "model.safetensors"),
-        os.path.join(vae_dir, "model.safetensors"),
+    _repack_ltx23_image_encoder_weights(
+        os.path.join(config_donor_dir, "vae", "model.safetensors"),
+        os.path.join(image_encoder_dir, "model.safetensors"),
     )
 
     _link_or_copy_file(
