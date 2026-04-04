@@ -368,3 +368,73 @@
   - 下一刀应继续看：
     - i2v video `timesteps / denoise_mask / positions`
     - 或 native block0 `cond/mod` 内部输出
+
+## 2026-04-04 二分结果更新 6：`clean_latent` 非条件 token 不该继承初始噪声，只对 `LTX-2.3` official-image-encoder 分支置零
+
+- 触发原因：
+  - 读官方 `ltx_core/tools.py::VideoLatentTools.create_initial_state()` 和 `ltx_core/conditioning/types/latent_cond.py::VideoConditionByLatentIndex.apply_to()`
+  - 官方语义是：
+    - 初始 `clean_latent` 全 0
+    - 然后只把 image latent 写进目标 token
+    - `GaussianNoiser` 再用 `noise * denoise_mask + latent * (1 - denoise_mask)` 生成 `latent_before`
+  - SGLang 之前的 `runtime/pipelines_core/stages/denoising_av.py`
+    - 用 `clean_latent = latents.detach().clone()`
+    - 这会把非 image token 的初始噪声错误带进 `clean_latent`
+
+- 修复 commit：
+  - `e4c7def18 Fix LTX2.3 TI2V clean latent state`
+
+- 动作：
+  - 新增一个很小的局部 helper：`LTX2AVDenoisingStage._prepare_ltx2_ti2v_clean_state(...)`
+  - 仅当 `vae_config.arch_config.use_official_image_encoder == true` 时，走 `zero_clean_latent=True`
+    - 也就是只影响 `LTX-2.3` overlay 产物
+  - 旧 `LTX2` 路径继续保留原有 background 语义，不动默认行为
+  - 补两条最小单测：
+    - `LTX-2.3` 走 zero clean latent
+    - legacy `LTX2` 仍保留旧 background 语义
+
+- 本地校验：
+  - `python -m py_compile runtime/pipelines_core/stages/denoising_av.py test/unit/test_model_overlay_ltx23.py`
+  - 通过
+
+- 远端 H100 step0 compare：
+  - 代码同步到 `mick/ltx-2.3@e4c7def18`
+  - 关键文件 hash：
+    - `denoising_av.py = ae209fb28913f74a9a6f940ee27bd60af57b2b4d`
+    - `test_model_overlay_ltx23.py = 1ff54890a7ce04ef9deda678cbf534ebdf644048`
+  - 运行结果：
+    - `video_clean_latent cosine = 0.9998642`
+    - `image_latent cosine = 0.9998641`
+    - `video_latent_before cosine = 0.9999685`
+    - `video_cond cosine = 0.9607990`
+    - `video_denoised cosine = 0.9915146`
+    - `video_latent_after cosine = 0.9999637`
+  - 结论：
+    - `condition image -> image latent -> clean_state -> step0 video latent_after` 这一整段现在已经基本对齐
+    - 之前 `video_clean_latent cosine ≈ 0.2158` 的问题已经解决
+
+- 黑盒视频 compare：
+  - official: `/tmp/ltx23_official_i2v_blackbox.mp4`
+  - sglang: `/tmp/ltx23_sglang_i2v_step_dump_native23/sglang_i2v.mp4`
+  - 当前结果仍然很差：
+    - `aggregate mean_abs = 36.8914`
+    - `aggregate psnr = 14.4569`
+    - `frame0 mean_abs = 35.7956`
+    - `frame60 mean_abs = 36.1781`
+    - `frame120 mean_abs = 39.9998`
+  - 解释：
+    - step0 clean-state 已对齐，但最终视频没有跟着收敛
+    - 这说明主发散点已经后移到 `step1+` 的 denoise loop / guider state update，而不是 image encoder 或 initial clean-state
+
+- 当前精度对齐进度：74%
+  - 已完全对齐到的 stage：
+    - native example 输入语义
+    - initial latent construction / step0 latent-before
+    - `condition image -> image latent`
+    - `step0 clean_latent / denoise_mask`
+    - `step0 video denoised / latent_after`
+  - 当前首个未对齐的大阶段：
+    - `step1+` denoise loop 的状态推进
+  - 下一步：
+    - 优先继续 native step dump，把 compare 从 `step0` 扩到 `step1`
+    - 若 `step1 latent_before` 已开始发散，就直接查 scheduler step / guider update / `post_process_latent` 之后的状态推进
