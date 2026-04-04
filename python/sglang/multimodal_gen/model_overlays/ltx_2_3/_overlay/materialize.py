@@ -21,13 +21,13 @@ AUXILIARY_PATTERNS = [
     "tokenizer/**",
     "vae/config.json",
     "vae/diffusion_pytorch_model.safetensors",
-    "vocoder/**",
 ]
 
 CONFIG_DONOR_PATTERNS = [
     "transformer/config.json",
     "text_encoder/config.json",
     "vae/**",
+    "vocoder/**",
 ]
 
 MONOLITH_PREFIX = "model.diffusion_model."
@@ -237,17 +237,15 @@ def materialize(
         max_workers=8,
     )
 
-    for component_name in (
-        "audio_vae",
-        "scheduler",
-        "text_encoder",
-        "tokenizer",
-        "vocoder",
-    ):
+    for component_name in ("audio_vae", "scheduler", "text_encoder", "tokenizer"):
         _copytree_link_or_copy(
             os.path.join(auxiliary_dir, component_name),
             os.path.join(output_dir, component_name),
         )
+    _copytree_link_or_copy(
+        os.path.join(config_donor_dir, "vocoder"),
+        os.path.join(output_dir, "vocoder"),
+    )
 
     source_checkpoint = os.path.join(source_dir, "ltx-2.3-22b-dev.safetensors")
 

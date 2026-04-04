@@ -11,6 +11,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     _gemma_postprocess_func,
     pack_text_embeds_v2,
 )
+from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
 from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
     _build_vae_config,
     _rename_connector_key,
@@ -24,9 +25,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
     LTX2AVDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
+    LTX2AVDecodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av import (
     LTX2AVLatentPreparationStage,
 )
+from sglang.multimodal_gen.runtime.models.vocoder.ltx_2_vocoder import LTX2Vocoder
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
     LTX2SigmaPreparationStage,
@@ -461,6 +466,60 @@ def test_ltx23_decode_skips_external_denorm():
         )
         is True
     )
+
+
+def test_ltx23_vocoder_uses_bwe_config():
+    vocoder_config = LTXVocoderConfig()
+    vocoder_config.update_model_arch(
+        {
+            "vocoder": {
+                "vocoder": {
+                    "upsample_initial_channel": 1536,
+                    "resblock": "AMP1",
+                    "upsample_rates": [5, 2, 2, 2, 2, 2],
+                    "resblock_kernel_sizes": [3, 7, 11],
+                    "upsample_kernel_sizes": [11, 4, 4, 4, 4, 4],
+                    "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+                    "activation": "snakebeta",
+                    "use_tanh_at_final": False,
+                    "use_bias_at_final": False,
+                },
+                "bwe": {
+                    "upsample_initial_channel": 512,
+                    "resblock": "AMP1",
+                    "upsample_rates": [6, 5, 2, 2, 2],
+                    "resblock_kernel_sizes": [3, 7, 11],
+                    "upsample_kernel_sizes": [12, 11, 4, 4, 4],
+                    "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+                    "activation": "snakebeta",
+                    "apply_final_activation": False,
+                    "use_tanh_at_final": False,
+                    "use_bias_at_final": False,
+                    "input_sampling_rate": 16000,
+                    "output_sampling_rate": 48000,
+                    "hop_length": 80,
+                    "n_fft": 512,
+                    "win_size": 512,
+                    "num_mels": 64,
+                },
+            }
+        }
+    )
+
+    vocoder = LTX2Vocoder(vocoder_config)
+
+    assert hasattr(vocoder, "vocoder")
+    assert hasattr(vocoder, "bwe_generator")
+    assert hasattr(vocoder, "mel_stft")
+    assert vocoder.sample_rate == 48000
+
+
+def test_ltx2_legacy_vocoder_keeps_flat_path():
+    vocoder = LTX2Vocoder(LTXVocoderConfig())
+
+    assert hasattr(vocoder, "conv_in")
+    assert not hasattr(vocoder, "bwe_generator")
+    assert vocoder.sample_rate == 24000
 
 
 def test_ltx23_latent_preparation_samples_directly_in_packed_space():
