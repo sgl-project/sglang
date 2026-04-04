@@ -56,6 +56,33 @@
       "triton": "triton_kernel",
       "CUDA mem": "non-gpu-H_D_memops",
       ".*": "misc"
+    },
+    "zimage": {
+      "deep_gemm::sm90_fp8_gemm": "fp8_deepgemm",
+      "deep_gemm::transpose": "fp8_transpose",
+      "per_token_group_quant|quantize|cvt_": "fp8_quantize",
+      "nvjet_": "bf16_gemm",
+      "sm80_xmma_gemm_f32f32|cutlass_80_tensorop_s1688gemm": "fp32_gemm",
+      "sm90_xmma_gemm": "tf32_gemm",
+      "splitKreduce": "gemm_splitk",
+      "flash::FlashAttn|fmha_cutlass": "flash_attention",
+      "fprop_implicit_gemm|sm90_xmma_fprop": "conv_cudnn",
+      "nchwToNhwc|nhwcToNchw": "layout_transform",
+      "upsample_nearest": "upsample",
+      "RMSNormKernel|FusedAddRMSNormKernel|_rms_norm_tiled": "rmsnorm",
+      "fused_qknorm_warp": "qknorm",
+      "BatchQKApplyRotaryPosIds": "rope",
+      "act_and_mul_kernel": "silu_gate",
+      "silu_kernel": "silu",
+      "GroupNormKernelImplInternal|RowwiseMomentsCUDAKernel|ComputeFusedParamsCUDAKernel": "groupnorm_vae",
+      "softmax_warp_forward": "softmax",
+      "tanh_kernel": "tanh",
+      "CatArrayBatchedCopy": "cat_concat",
+      "FillFunctor": "fill",
+      "reduce_kernel": "reduce",
+      "elementwise_kernel|vectorized_elementwise_kernel": "elementwise",
+      "CUDA memcpy|CUDA memset": "memops",
+      ".*": "misc"
     }
   }
 }

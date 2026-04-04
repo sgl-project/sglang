@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -113,13 +114,31 @@ class TimestepEmbedder(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         # Use MergedColumnParallelLinear for gate and up projection (fused)
         self.w13 = MergedColumnParallelLinear(
-            dim, [hidden_dim, hidden_dim], bias=False, gather_output=False
+            dim,
+            [hidden_dim, hidden_dim],
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w13",
         )
-        self.w2 = RowParallelLinear(hidden_dim, dim, bias=False, input_is_parallel=True)
+        self.w2 = RowParallelLinear(
+            hidden_dim,
+            dim,
+            bias=False,
+            input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.w2",
+        )
         self.act = SiluAndMul()
 
     def forward(self, x):
@@ -408,7 +427,12 @@ class ZImageTransformerBlock(nn.Module):
             if hasattr(self.feed_forward, "net") and len(self.feed_forward.net) > 2:
                 self.feed_forward.net[2].act_unsigned = quant_config.act_unsigned
         else:
-            self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim)
+            self.feed_forward = FeedForward(
+                dim=dim,
+                hidden_dim=hidden_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.feed_forward",
+            )
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
@@ -439,8 +463,9 @@ class ZImageTransformerBlock(nn.Module):
             scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
 
             # Attention block
+            attn_in = self.attention_norm1(x) * scale_msa
             attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa,
+                attn_in,
                 freqs_cis=freqs_cis,
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
@@ -448,11 +473,9 @@ class ZImageTransformerBlock(nn.Module):
             x = x + gate_msa * self.attention_norm2(attn_out)
 
             # FFN block
-            x = x + gate_mlp * self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
-                )
-            )
+            ffn_in = self.ffn_norm1(x) * scale_mlp
+            ffn_out = self.feed_forward(ffn_in)
+            x = x + gate_mlp * self.ffn_norm2(ffn_out)
         else:
             # Attention block
             attn_input = self.attention_norm1(x)
@@ -466,9 +489,7 @@ class ZImageTransformerBlock(nn.Module):
 
             # FFN block
             ffn_input = self.ffn_norm1(x)
-            ffn_out = self.feed_forward(
-                ffn_input,
-            )
+            ffn_out = self.feed_forward(ffn_input)
             x = x + self.ffn_norm2(ffn_out)
 
         return x
@@ -562,6 +583,19 @@ class RopeEmbedder:
             sin_out.append(self.sin_cached[i][index])
 
         return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
+
+
+@dataclass
+class PreBlockOutput:
+    """Output of forward_pre_block, separating GPU tensors from metadata."""
+
+    unified: torch.Tensor
+    unified_freqs_cis: Tuple[torch.Tensor, torch.Tensor]
+    adaln_input: torch.Tensor
+    x_size: list
+    x_local_seq_len: int
+    use_full_unified_sequence: bool
+    num_replicated_suffix: int
 
 
 class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
@@ -835,8 +869,10 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         t = timestep
         bsz = 1
         device = x[0].device
+
         t = self.t_embedder(t)
         adaln_input = t.type_as(x)
+
         (
             x,
             cap_feats,
@@ -863,13 +899,11 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             x = layer(x, x_freqs_cis, adaln_input)
 
         cap_feats = torch.cat(cap_feats, dim=0)
-
         cap_feats, _ = self.cap_embedder(cap_feats)
         if cap_valid_lens[0] < cap_feats.shape[0]:
             cap_feats[cap_valid_lens[0] :] = self.cap_pad_token.to(
                 dtype=cap_feats.dtype
             )
-
         cap_freqs_cis = freqs_cis[0]
 
         cap_feats = cap_feats.unsqueeze(0)
@@ -899,7 +933,21 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
 
         for layer_id, layer in enumerate(self.layers):
-            layer.attention.attn.skip_sequence_parallel = use_full_unified_sequence
+            # When cache-dit is enabled, self.layers may contain CachedBlocks
+            # wrappers instead of raw ZImageTransformerBlock objects. The
+            # wrapper stores original blocks in .transformer_blocks.  We need
+            # to set skip_sequence_parallel on every *original* block's
+            # attention so the flag is correct regardless of which blocks
+            # cache-dit decides to execute vs skip in a given step.
+            if hasattr(layer, "transformer_blocks"):
+                # CachedBlocks wrapper — set on all original blocks inside
+                for block in layer.transformer_blocks:
+                    block.attention.attn.skip_sequence_parallel = (
+                        use_full_unified_sequence
+                    )
+            else:
+                # Normal ZImageTransformerBlock
+                layer.attention.attn.skip_sequence_parallel = use_full_unified_sequence
             unified = layer(
                 unified,
                 unified_freqs_cis,
@@ -910,6 +958,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
         )
+
         if use_full_unified_sequence:
             sp_rank = get_sp_parallel_rank()
             start = sp_rank * x_local_seq_len
@@ -918,6 +967,179 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         x = list(unified.unbind(dim=0))
         x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 
+        return -x[0]
+
+    def _get_raw_block(self, block_idx: int):
+        """Get the underlying ZImageTransformerBlock, bypassing CachedBlock wrapper."""
+        layer = self.layers[block_idx]
+        if hasattr(layer, "transformer_blocks"):
+            return layer.transformer_blocks[0]
+        return layer
+
+    def forward_pre_block(
+        self,
+        hidden_states: List[torch.Tensor],
+        encoder_hidden_states: List[torch.Tensor],
+        timestep,
+        guidance=0,
+        patch_size=2,
+        f_patch_size=1,
+        freqs_cis=None,
+    ) -> "PreBlockOutput":
+        x = hidden_states
+        cap_feats = encoder_hidden_states
+        timestep = 1000.0 - timestep
+        t = timestep
+
+        t = self.t_embedder(t)
+        adaln_input = t.to(dtype=self.t_embedder.mlp[0].weight.dtype)
+
+        (
+            x,
+            cap_feats,
+            x_size,
+            x_valid_lens,
+            cap_valid_lens,
+        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+
+        x = torch.cat(x, dim=0)
+        x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
+        x[x_valid_lens[0] :] = self.x_pad_token.to(dtype=x.dtype)
+        x_freqs_cis = freqs_cis[1]
+
+        x = x.unsqueeze(0)
+        for layer_id, layer in enumerate(self.noise_refiner):
+            x = layer(x, x_freqs_cis, adaln_input)
+
+        cap_feats = torch.cat(cap_feats, dim=0)
+        cap_feats, _ = self.cap_embedder(cap_feats)
+        cap_feats[cap_valid_lens[0] :] = self.cap_pad_token.to(dtype=cap_feats.dtype)
+        cap_freqs_cis = freqs_cis[0]
+
+        cap_feats = cap_feats.unsqueeze(0)
+        for layer_id, layer in enumerate(self.context_refiner):
+            cap_feats = layer(
+                cap_feats,
+                cap_freqs_cis,
+            )
+
+        cap_seq_len = cap_feats.shape[1]
+        use_full_unified_sequence = (
+            get_sp_world_size() > 1 and get_ring_parallel_world_size() > 1
+        )
+        x_local_seq_len = x.shape[1]
+        if use_full_unified_sequence:
+            x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
+            x_freqs_cis = (
+                sequence_model_parallel_all_gather(x_freqs_cis[0].contiguous(), dim=0),
+                sequence_model_parallel_all_gather(x_freqs_cis[1].contiguous(), dim=0),
+            )
+        unified = torch.cat([x, cap_feats], dim=1)
+        unified_freqs_cis = (
+            torch.cat([x_freqs_cis[0], cap_freqs_cis[0]], dim=0),
+            torch.cat([x_freqs_cis[1], cap_freqs_cis[1]], dim=0),
+        )
+        num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
+
+        return PreBlockOutput(
+            unified=unified,
+            unified_freqs_cis=unified_freqs_cis,
+            adaln_input=adaln_input,
+            x_size=x_size,
+            x_local_seq_len=x_local_seq_len,
+            use_full_unified_sequence=use_full_unified_sequence,
+            num_replicated_suffix=num_replicated_suffix,
+        )
+
+    def forward_fn_blocks(
+        self,
+        unified: torch.Tensor,
+        unified_freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+        adaln_input: torch.Tensor,
+        num_replicated_suffix: int,
+        fn_count: int,
+        use_full_unified_sequence: bool = False,
+    ) -> torch.Tensor:
+        """Execute first fn_count main transformer blocks (always full compute)."""
+        for i in range(fn_count):
+            raw_block = self._get_raw_block(i)
+            raw_block.attention.attn.skip_sequence_parallel = use_full_unified_sequence
+            unified = raw_block(
+                unified,
+                unified_freqs_cis,
+                adaln_input,
+                num_replicated_suffix=num_replicated_suffix,
+            )
+        return unified
+
+    def forward_middle_blocks(
+        self,
+        unified: torch.Tensor,
+        unified_freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+        adaln_input: torch.Tensor,
+        num_replicated_suffix: int,
+        fn_count: int,
+        bn_count: int,
+        use_full_unified_sequence: bool = False,
+    ) -> torch.Tensor:
+        """Execute middle blocks (Fn..N-Bn-1) in full compute mode."""
+        end = len(self.layers) - bn_count
+        for i in range(fn_count, end):
+            raw_block = self._get_raw_block(i)
+            raw_block.attention.attn.skip_sequence_parallel = use_full_unified_sequence
+            unified = raw_block(
+                unified,
+                unified_freqs_cis,
+                adaln_input,
+                num_replicated_suffix=num_replicated_suffix,
+            )
+        return unified
+
+    def forward_bn_blocks(
+        self,
+        unified: torch.Tensor,
+        unified_freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+        adaln_input: torch.Tensor,
+        num_replicated_suffix: int,
+        bn_count: int,
+        use_full_unified_sequence: bool = False,
+    ) -> torch.Tensor:
+        """Execute last bn_count blocks (always full compute). No-op when bn_count=0."""
+        if bn_count == 0:
+            return unified
+        start = len(self.layers) - bn_count
+        for i in range(start, len(self.layers)):
+            raw_block = self._get_raw_block(i)
+            raw_block.attention.attn.skip_sequence_parallel = use_full_unified_sequence
+            unified = raw_block(
+                unified,
+                unified_freqs_cis,
+                adaln_input,
+                num_replicated_suffix=num_replicated_suffix,
+            )
+        return unified
+
+    def forward_post_block(
+        self,
+        unified: torch.Tensor,
+        adaln_input: torch.Tensor,
+        patch_size: int,
+        f_patch_size: int,
+        x_size: list,
+        x_local_seq_len: int,
+        use_full_unified_sequence: bool,
+    ) -> torch.Tensor:
+        """Post-block: final_layer -> SP restore -> unpatchify -> output."""
+        unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
+            unified, adaln_input
+        )
+        if use_full_unified_sequence:
+            sp_rank = get_sp_parallel_rank()
+            start = sp_rank * x_local_seq_len
+            end = start + x_local_seq_len
+            unified = unified[:, start:end]
+        x = list(unified.unbind(dim=0))
+        x = self.unpatchify(x, x_size, patch_size, f_patch_size)
         return -x[0]
 
 

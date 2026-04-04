@@ -220,7 +220,6 @@ class StageProfiler:
             ):
                 torch.get_device_module().synchronize()
             self.start_time = time.perf_counter()
-
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

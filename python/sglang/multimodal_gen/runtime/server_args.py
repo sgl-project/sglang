@@ -176,6 +176,9 @@ class ServerArgs:
     # Compilation
     enable_torch_compile: bool = False
 
+    # CUDA Graph for diffusion denoising (captures dit.forward())
+    enable_diffusion_cuda_graph: bool = False
+
     # warmup
     warmup: bool = False
     warmup_resolutions: list[str] = None
@@ -697,6 +700,15 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-diffusion-cuda-graph",
+            action=StoreBoolean,
+            default=ServerArgs.enable_diffusion_cuda_graph,
+            help="Capture dit.forward() into a CUDA Graph to eliminate CPU-side "
+            "kernel launch latency. Effective for FP8 quantized models where "
+            "GPU kernels are fast but launch overhead dominates. "
+            "Requires FlashAttention backend and no mid-request model switching.",
         )
 
         # warmup

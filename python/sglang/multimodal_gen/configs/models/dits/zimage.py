@@ -49,8 +49,32 @@ class ZImageArchConfig(DiTArchConfig):
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
+            # Weight mappings: w1/w3 -> w13
             r"(.*)\.feed_forward\.w1\.weight$": (r"\1.feed_forward.w13.weight", 0, 2),
             r"(.*)\.feed_forward\.w3\.weight$": (r"\1.feed_forward.w13.weight", 1, 2),
+            # FP8 block-quantized scale mappings: w1/w3 -> w13
+            r"(.*)\.feed_forward\.w1\.weight_scale_inv$": (
+                r"\1.feed_forward.w13.weight_scale_inv",
+                0,
+                2,
+            ),
+            r"(.*)\.feed_forward\.w3\.weight_scale_inv$": (
+                r"\1.feed_forward.w13.weight_scale_inv",
+                1,
+                2,
+            ),
+            # FP8 per-tensor scale mappings: w1/w3 -> w13
+            r"(.*)\.feed_forward\.w1\.weight_scale$": (
+                r"\1.feed_forward.w13.weight_scale",
+                0,
+                2,
+            ),
+            r"(.*)\.feed_forward\.w3\.weight_scale$": (
+                r"\1.feed_forward.w13.weight_scale",
+                1,
+                2,
+            ),
+            # LoRA mappings
             r"(.*)\.feed_forward\.w1\.(lora_A|lora_B)$": (
                 r"\1.feed_forward.w13.\2",
                 0,

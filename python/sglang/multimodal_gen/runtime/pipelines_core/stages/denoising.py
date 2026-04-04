@@ -58,6 +58,10 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
+from sglang.multimodal_gen.runtime.managers.diffusion_cuda_graph_runner import (
+    DiffusionCudaGraphRunner,
+    StepLevelCudaGraphRunner,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -130,6 +134,18 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
+        # CUDA Graph runner cache: keyed by latent shape tuple.
+        # Persists across requests — first request captures, subsequent
+        # requests only copy new data into persistent buffers + replay.
+        self._cuda_graph_runners: dict[tuple, "DiffusionCudaGraphRunner"] = {}
+
+        # Shared CUDA Graph memory pool across all runners (both types).
+        # Created lazily on first use to avoid import-time CUDA init.
+        self._graph_pool = None
+
+        # Step-level runners: keyed by latent shape, used when cache-dit enabled.
+        self._step_level_runners: dict[tuple, "StepLevelCudaGraphRunner"] = {}
+
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
@@ -161,6 +177,12 @@ class DenoisingStage(PipelineStage):
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(**compile_kwargs)
+
+    def _get_graph_pool(self):
+        """Get or create the shared CUDA Graph memory pool."""
+        if self._graph_pool is None:
+            self._graph_pool = torch.cuda.graph_pool_handle()
+        return self._graph_pool
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -1001,6 +1023,105 @@ class DenoisingStage(PipelineStage):
         seq_len = prepared_vars["seq_len"]
         guidance = prepared_vars["guidance"]
 
+        # CUDA Graph setup for denoising
+        cuda_graph_enabled = server_args.enable_diffusion_cuda_graph
+        graph_runner = None  # DiffusionCudaGraphRunner (whole graph, no cache-dit)
+        step_level_runner = None  # StepLevelCudaGraphRunner (cache-dit compatible)
+        scm_mask = None
+
+        if cuda_graph_enabled:
+            # Runtime safety checks
+            _TIMESTEP_DEPENDENT_BACKENDS = {
+                AttentionBackendEnum.SLIDING_TILE_ATTN,
+                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+                AttentionBackendEnum.VMOBA_ATTN,
+            }
+            assert self.attn_backend.get_enum() not in _TIMESTEP_DEPENDENT_BACKENDS, (
+                f"Diffusion CUDA Graph is incompatible with attention backend "
+                f"'{self.attn_backend.get_enum().name}'. These backends use "
+                f"current_timestep for kernel path selection, which cannot "
+                f"change after graph capture. Use FlashAttention instead."
+            )
+            assert boundary_timestep is None, (
+                f"Diffusion CUDA Graph does not support mid-request model "
+                f"switching (boundary_timestep={boundary_timestep}). All "
+                f"denoising steps must use the same transformer."
+            )
+
+            static_kwargs = self.prepare_extra_func_kwargs(
+                getattr(self.transformer, "forward", self.transformer),
+                {
+                    "encoder_hidden_states": pos_cond_kwargs.get(
+                        "encoder_hidden_states"
+                    ),
+                    "guidance": guidance,
+                    "freqs_cis": pos_cond_kwargs.get("freqs_cis"),
+                },
+            )
+
+            latent_shape = tuple(latents.shape)
+            pool = self._get_graph_pool()
+
+            # Determine which runner type to use.
+            # Check both the runtime flag (_cache_dit_enabled, set after first
+            # non-warmup request) AND the env var (always available).
+            # This ensures warmup requests capture step-level graphs when
+            # cache-dit is configured, even though _cache_dit_enabled hasn't
+            # been set yet (it's only set on the first real request).
+            use_step_level = self._cache_dit_enabled or envs.SGLANG_CACHE_DIT_ENABLED
+
+            if use_step_level:
+                # === Step-level runner (cache-dit compatible) ===
+                step_level_runner = self._step_level_runners.get(latent_shape)
+
+                if step_level_runner is not None:
+                    step_level_runner.update_static_kwargs(static_kwargs)
+                    logger.info(
+                        "StepLevel CUDA Graph: reusing cached runner for shape %s",
+                        latent_shape,
+                    )
+                else:
+                    step_level_runner = StepLevelCudaGraphRunner(
+                        device=get_local_torch_device(),
+                        num_blocks=len(self.transformer.layers),
+                        fn_blocks=envs.SGLANG_CACHE_DIT_FN,
+                        bn_blocks=envs.SGLANG_CACHE_DIT_BN,
+                        pool=pool,
+                    )
+                    logger.info(
+                        "StepLevel CUDA Graph: will capture for shape %s "
+                        "(Fn=%d, Bn=%d)",
+                        latent_shape,
+                        envs.SGLANG_CACHE_DIT_FN,
+                        envs.SGLANG_CACHE_DIT_BN,
+                    )
+
+                # Pre-compute SCM mask
+                scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+                if scm_preset != "none":
+                    scm_mask = get_scm_mask(scm_preset, num_inference_steps)
+
+            else:
+                # === Whole-graph runner (no cache-dit) ===
+                graph_runner = self._cuda_graph_runners.get(latent_shape)
+
+                if graph_runner is not None:
+                    graph_runner.update_static_kwargs(static_kwargs)
+                    logger.info(
+                        "Diffusion CUDA Graph: reusing cached graph for shape %s",
+                        latent_shape,
+                    )
+                else:
+                    graph_runner = DiffusionCudaGraphRunner(
+                        device=get_local_torch_device(),
+                        pool=pool,
+                    )
+                    logger.info(
+                        "Diffusion CUDA Graph: will capture for shape %s",
+                        latent_shape,
+                    )
+
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
@@ -1063,29 +1184,91 @@ class DenoisingStage(PipelineStage):
                         )
 
                         # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(
-                            i,
-                            batch,
-                            server_args,
-                            timestep_value=t_int,
-                            timesteps=timesteps_cpu,
-                        )
-                        noise_pred = self._predict_noise_with_cfg(
-                            current_model=current_model,
-                            latent_model_input=latent_model_input,
-                            timestep=timestep,
-                            batch=batch,
-                            timestep_index=i,
-                            attn_metadata=attn_metadata,
-                            target_dtype=target_dtype,
-                            current_guidance_scale=current_guidance_scale,
-                            image_kwargs=image_kwargs,
-                            pos_cond_kwargs=pos_cond_kwargs,
-                            neg_cond_kwargs=neg_cond_kwargs,
-                            server_args=server_args,
-                            guidance=guidance,
-                            latents=latents,
-                        )
+                        if step_level_runner is not None:
+                            # === Step-level CUDA Graph (cache-dit compatible) ===
+                            with set_forward_context(
+                                current_timestep=i,
+                                attn_metadata=None,
+                                forward_batch=batch,
+                            ):
+                                if not step_level_runner.captured:
+                                    noise_pred = step_level_runner.capture(
+                                        dit_model=self.transformer,
+                                        timestep=timestep,
+                                        latents=latent_model_input,
+                                        static_kwargs=static_kwargs,
+                                    )
+                                    self._step_level_runners[latent_shape] = (
+                                        step_level_runner
+                                    )
+                                else:
+                                    step_is_all_cached = (
+                                        scm_mask is not None and scm_mask[i] == 0
+                                    )
+                                    noise_pred = step_level_runner.replay_step(
+                                        timestep=timestep,
+                                        latents=latent_model_input,
+                                        step_is_all_cached=step_is_all_cached,
+                                    )
+
+                        elif (
+                            cuda_graph_enabled
+                            and graph_runner is not None
+                            and not graph_runner.captured
+                        ):
+                            # === Whole-graph capture (no cache-dit) ===
+                            with set_forward_context(
+                                current_timestep=i,
+                                attn_metadata=None,
+                                forward_batch=batch,
+                            ):
+                                noise_pred = graph_runner.capture(
+                                    dit_forward_fn=current_model,
+                                    timestep=timestep,
+                                    latents=latent_model_input,
+                                    static_kwargs=static_kwargs,
+                                )
+                            self._cuda_graph_runners[latent_shape] = graph_runner
+
+                        elif (
+                            cuda_graph_enabled
+                            and graph_runner is not None
+                            and graph_runner.captured
+                        ):
+                            # === Whole-graph replay (no cache-dit) ===
+                            with set_forward_context(
+                                current_timestep=i,
+                                attn_metadata=None,
+                                forward_batch=batch,
+                            ):
+                                noise_pred = graph_runner.replay(
+                                    timestep, latent_model_input
+                                )
+                        else:
+                            # === Eager fallback ===
+                            attn_metadata = self._build_attn_metadata(
+                                i,
+                                batch,
+                                server_args,
+                                timestep_value=t_int,
+                                timesteps=timesteps_cpu,
+                            )
+                            noise_pred = self._predict_noise_with_cfg(
+                                current_model=current_model,
+                                latent_model_input=latent_model_input,
+                                timestep=timestep,
+                                batch=batch,
+                                timestep_index=i,
+                                attn_metadata=attn_metadata,
+                                target_dtype=target_dtype,
+                                current_guidance_scale=current_guidance_scale,
+                                image_kwargs=image_kwargs,
+                                pos_cond_kwargs=pos_cond_kwargs,
+                                neg_cond_kwargs=neg_cond_kwargs,
+                                server_args=server_args,
+                                guidance=guidance,
+                                latents=latents,
+                            )
 
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
                         if server_args.comfyui_mode:
@@ -1120,6 +1303,12 @@ class DenoisingStage(PipelineStage):
                         if not is_warmup:
                             self.step_profile()
 
+        # Synchronize before timing to ensure all GPU work (including
+        # async CUDA Graph replays) has completed. Without this, the
+        # elapsed time only measures CPU-side enqueue time, not actual
+        # GPU execution time.
+        if cuda_graph_enabled and graph_runner is not None and graph_runner.captured:
+            torch.cuda.synchronize()
         denoising_end_time = time.time()
 
         if num_timesteps > 0 and not is_warmup:
