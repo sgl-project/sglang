@@ -266,6 +266,64 @@ class LTX2AVDenoisingStage(DenoisingStage):
             dump_dir / f"{stage}_step{step_index}.pt",
         )
 
+    @staticmethod
+    def _ltx2_maybe_load_injected_latents(
+        latents: torch.Tensor,
+        audio_latents: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        inject_path = os.environ.get(
+            "SGLANG_DIFFUSION_LTX2_POST_DENOISE_INJECT_PATH"
+        )
+        if not inject_path:
+            return latents, audio_latents
+
+        payload = torch.load(inject_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Expected injected latent payload at {inject_path} to be a dict."
+            )
+
+        injected_video = payload.get("video_latent_after", payload.get("video_latents"))
+        if not isinstance(injected_video, torch.Tensor):
+            raise ValueError(
+                f"Injected latent payload at {inject_path} is missing `video_latent_after`."
+            )
+        if tuple(injected_video.shape) != tuple(latents.shape):
+            raise ValueError(
+                "Injected video latents shape mismatch: "
+                f"expected {tuple(latents.shape)}, got {tuple(injected_video.shape)}."
+            )
+
+        injected_audio = payload.get("audio_latent_after", payload.get("audio_latents"))
+        if audio_latents is None:
+            if injected_audio is not None:
+                logger.warning(
+                    "Ignoring injected audio latents from %s because request has no audio latents.",
+                    inject_path,
+                )
+        elif injected_audio is None:
+            logger.warning(
+                "Injected latent payload at %s has no audio latents; keeping native audio latents.",
+                inject_path,
+            )
+        elif not isinstance(injected_audio, torch.Tensor):
+            raise ValueError(
+                f"Injected audio latents at {inject_path} must be a tensor when provided."
+            )
+        elif tuple(injected_audio.shape) != tuple(audio_latents.shape):
+            raise ValueError(
+                "Injected audio latents shape mismatch: "
+                f"expected {tuple(audio_latents.shape)}, got {tuple(injected_audio.shape)}."
+            )
+
+        logger.info("Injecting post-denoising LTX2 latents from %s", inject_path)
+        latents = injected_video.to(device=latents.device, dtype=latents.dtype)
+        if audio_latents is not None and isinstance(injected_audio, torch.Tensor):
+            audio_latents = injected_audio.to(
+                device=audio_latents.device, dtype=audio_latents.dtype
+            )
+        return latents, audio_latents
+
     @classmethod
     def _ltx2_calculate_guided_x0(
         cls,
@@ -1213,6 +1271,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
         else:
             trajectory_tensor = None
             trajectory_timesteps_tensor = None
+
+        latents, batch.audio_latents = self._ltx2_maybe_load_injected_latents(
+            latents, batch.audio_latents
+        )
 
         latents, trajectory_tensor = self._postprocess_sp_latents(
             batch, latents, trajectory_tensor

@@ -258,6 +258,31 @@ def test_ltx23_velocity_to_x0_supports_tokenwise_sigma():
     assert torch.allclose(denoised, expected)
 
 
+def test_ltx23_post_denoise_injection_overrides_latents(tmp_path):
+    inject_path = tmp_path / "official_final.pt"
+    torch.save(
+        {
+            "video_latent_after": torch.full((1, 2, 3), 7.0, dtype=torch.float32),
+            "audio_latent_after": torch.full((1, 4, 5), 9.0, dtype=torch.float32),
+        },
+        inject_path,
+    )
+    os.environ["SGLANG_DIFFUSION_LTX2_POST_DENOISE_INJECT_PATH"] = str(inject_path)
+
+    try:
+        latents, audio_latents = LTX2AVDenoisingStage._ltx2_maybe_load_injected_latents(
+            torch.zeros((1, 2, 3), dtype=torch.float32),
+            torch.zeros((1, 4, 5), dtype=torch.float32),
+        )
+    finally:
+        os.environ.pop("SGLANG_DIFFUSION_LTX2_POST_DENOISE_INJECT_PATH", None)
+
+    assert torch.equal(latents, torch.full((1, 2, 3), 7.0, dtype=torch.float32))
+    assert torch.equal(
+        audio_latents, torch.full((1, 4, 5), 9.0, dtype=torch.float32)
+    )
+
+
 def test_pack_text_embeds_v2_masks_padding():
     hidden_states = torch.tensor(
         [
