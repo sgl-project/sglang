@@ -98,7 +98,7 @@ def _run_simple_eval(
             model.model_path,
             base_url,
             other_args=model.extra_args,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env=model.env,
         )
 
@@ -275,7 +275,7 @@ def _run_nemo_skills_eval(
             model.model_path,
             base_url,
             other_args=model.extra_args,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env=model.env,
         )
 

@@ -620,11 +620,23 @@ class LoRAMemoryPool:
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     if self.experts_shared_outer_loras and name == "gate_up_proj_moe":
                         if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                            if weights.shape[0] != 1:
+                                raise ValueError(
+                                    f"experts_shared_outer_loras is enabled but "
+                                    f"gate_up_proj_moe lora_A has expert_dim="
+                                    f"{weights.shape[0]} (expected 1)."
+                                )
                             buffer_view = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
                             ]
                             load_lora_weight_tensor(buffer_view, weights[0])
                         elif isinstance(weights, dict) and len(weights) > 0:
+                            if len(weights) != 1:
+                                raise ValueError(
+                                    f"experts_shared_outer_loras is enabled but "
+                                    f"gate_up_proj_moe lora_A dict has "
+                                    f"{len(weights)} entries (expected 1)."
+                                )
                             rep = next(iter(weights.values()))
                             buffer_view = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
@@ -658,12 +670,24 @@ class LoRAMemoryPool:
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     if self.experts_shared_outer_loras and name == "down_proj_moe":
                         if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                            if weights.shape[0] != 1:
+                                raise ValueError(
+                                    f"experts_shared_outer_loras is enabled but "
+                                    f"down_proj_moe lora_B has expert_dim="
+                                    f"{weights.shape[0]} (expected 1)."
+                                )
                             buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
                             w = weights[0]
                             if w is not None:
                                 w = w * lora_adapter.scaling
                             load_lora_weight_tensor(buffer_view, w)
                         elif isinstance(weights, dict) and len(weights) > 0:
+                            if len(weights) != 1:
+                                raise ValueError(
+                                    f"experts_shared_outer_loras is enabled but "
+                                    f"down_proj_moe lora_B dict has "
+                                    f"{len(weights)} entries (expected 1)."
+                                )
                             rep = next(iter(weights.values()))
                             buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
                             if rep is not None:

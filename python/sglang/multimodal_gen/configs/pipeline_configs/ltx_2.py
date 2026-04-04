@@ -1,6 +1,6 @@
 import dataclasses
 from dataclasses import field
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 
@@ -11,6 +11,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
 )
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
 from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfig
+from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
@@ -93,8 +94,11 @@ def pack_text_embeds(
 
 
 def _gemma_postprocess_func(
-    outputs: BaseEncoderOutput, text_inputs: dict
+    outputs: BaseEncoderOutput,
+    text_inputs: dict,
+    pipeline_config: Optional["LTX2PipelineConfig"] = None,
 ) -> torch.Tensor:
+    _ = pipeline_config
     # LTX-2 requires all hidden states concatenated for the connector
     if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
         # outputs.hidden_states is a tuple of tensors
@@ -116,6 +120,7 @@ class LTX2PipelineConfig(PipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.TI2V
     skip_input_image_preprocess: bool = True
+    generator_device: str = "cpu"
     dit_config: LTX2Config = field(default_factory=LTX2Config)
 
     # Model architecture
@@ -125,35 +130,23 @@ class LTX2PipelineConfig(PipelineConfig):
     patch_size_t: int = 1
 
     # Audio VAE configuration
+    vae_config: LTXVideoVAEConfig = field(default_factory=LTXVideoVAEConfig)
     audio_vae_config: LTXAudioVAEConfig = field(default_factory=LTXAudioVAEConfig)
     audio_vae_precision: str = "fp32"
-    audio_vae_temporal_compression_ratio: int = 4
-    audio_vae_mel_compression_ratio: int = 4
 
     @property
     def vae_scale_factor(self):
-        return getattr(self.vae_config.arch_config, "spatial_compression_ratio", 32)
+        return self.vae_config.arch_config.spatial_compression_ratio
 
     @property
     def vae_temporal_compression(self):
-        return getattr(self.vae_config.arch_config, "temporal_compression_ratio", 8)
+        return self.vae_config.arch_config.temporal_compression_ratio
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
-        """Return packed latent shape [B, seq, C] directly."""
+        """Return unpacked latent shape [B, C, F, H, W]."""
         height = batch.height // self.vae_scale_factor
         width = batch.width // self.vae_scale_factor
-
-        post_patch_num_frames = num_frames // self.patch_size_t
-        post_patch_height = height // self.patch_size
-        post_patch_width = width // self.patch_size
-        seq_len = post_patch_num_frames * post_patch_height * post_patch_width
-
-        num_channels = (
-            self.in_channels * self.patch_size_t * self.patch_size * self.patch_size
-        )
-
-        shape = (batch_size, seq_len, num_channels)
-        return shape
+        return (batch_size, self.in_channels, num_frames, height, width)
 
     def prepare_audio_latent_shape(self, batch, batch_size, num_frames):
         # Adapted from diffusers pipeline prepare_audio_latents
@@ -161,7 +154,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
         sample_rate = self.audio_vae_config.arch_config.sample_rate
         hop_length = self.audio_vae_config.arch_config.mel_hop_length
-        temporal_compression = self.audio_vae_temporal_compression_ratio
+        temporal_compression = (
+            self.audio_vae_config.arch_config.temporal_compression_ratio
+        )
 
         latents_per_second = (
             float(sample_rate) / float(hop_length) / float(temporal_compression)
@@ -169,15 +164,13 @@ class LTX2PipelineConfig(PipelineConfig):
         latent_length = round(duration_s * latents_per_second)
 
         num_mel_bins = self.audio_vae_config.arch_config.mel_bins
-        mel_compression_ratio = self.audio_vae_mel_compression_ratio
+        mel_compression_ratio = self.audio_vae_config.arch_config.mel_compression_ratio
         latent_mel_bins = num_mel_bins // mel_compression_ratio
 
         # Default to 8
         num_channels_latents = self.audio_vae_config.arch_config.latent_channels
 
-        shape = (batch_size, latent_length, num_channels_latents * latent_mel_bins)
-
-        return shape
+        return (batch_size, num_channels_latents, latent_length, latent_mel_bins)
 
     # Text encoding stage (Gemma)
     # LTX-2 needs separate contexts for video/audio streams. We model this as
@@ -221,6 +214,7 @@ class LTX2PipelineConfig(PipelineConfig):
             padding="max_length",
             max_length=max_sequence_length,
             truncation=True,
+            add_special_tokens=True,
             return_tensors="pt",
         )
         return text_inputs
@@ -524,7 +518,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
         sample_rate = self.audio_vae_config.arch_config.sample_rate
         hop_length = self.audio_vae_config.arch_config.mel_hop_length
-        temporal_compression = self.audio_vae_temporal_compression_ratio
+        temporal_compression = (
+            self.audio_vae_config.arch_config.temporal_compression_ratio
+        )
         duration_s = num_frames / batch.fps
 
         latents_per_second = (
@@ -533,42 +529,8 @@ class LTX2PipelineConfig(PipelineConfig):
         audio_num_frames = round(duration_s * latents_per_second)
 
         num_mel_bins = self.audio_vae_config.arch_config.mel_bins
-        mel_compression_ratio = self.audio_vae_mel_compression_ratio
+        mel_compression_ratio = self.audio_vae_config.arch_config.mel_compression_ratio
         latent_mel_bins = num_mel_bins // mel_compression_ratio
-
-        audio_latents_mean = getattr(audio_vae, "latents_mean", None)
-        audio_latents_std = getattr(audio_vae, "latents_std", None)
-        if (
-            isinstance(audio_latents_mean, torch.Tensor)
-            and isinstance(audio_latents_std, torch.Tensor)
-            and audio_latents_mean.numel() == audio_latents_std.numel()
-        ):
-            audio_latents_mean = audio_latents_mean.to(
-                device=audio_latents.device, dtype=audio_latents.dtype
-            )
-            audio_latents_std = audio_latents_std.to(
-                device=audio_latents.device, dtype=audio_latents.dtype
-            )
-            if audio_latents.ndim == 3:
-                if audio_latents.shape[-1] != audio_latents_mean.numel():
-                    raise ValueError(
-                        f"audio_latents last dim {audio_latents.shape[-1]} "
-                        f"does not match audio_vae stats {audio_latents_mean.numel()}"
-                    )
-                audio_latents = audio_latents * audio_latents_std.view(
-                    1, 1, -1
-                ) + audio_latents_mean.view(1, 1, -1)
-            elif audio_latents.ndim == 2:
-                if audio_latents.shape[-1] != audio_latents_mean.numel():
-                    raise ValueError(
-                        f"audio_latents last dim {audio_latents.shape[-1]} "
-                        f"does not match audio_vae stats {audio_latents_mean.numel()}"
-                    )
-                audio_latents = audio_latents * audio_latents_std.view(
-                    1, -1
-                ) + audio_latents_mean.view(1, -1)
-            else:
-                audio_latents = audio_latents * audio_latents_std + audio_latents_mean
 
         audio_latents = self._unpack_audio_latents(
             audio_latents, audio_num_frames, num_mel_bins=latent_mel_bins
