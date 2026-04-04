@@ -44,6 +44,7 @@ def main() -> None:
 
     from ltx_core.loader.registry import DummyRegistry
     from ltx_core.model.video_vae import (
+        TilingConfig,
         VAE_DECODER_COMFY_KEYS_FILTER,
         VideoDecoderConfigurator,
     )
@@ -63,16 +64,17 @@ def main() -> None:
     )
     decoder.eval()
 
-    raw_video = decoder(latent)
-    uint8_chunks = list(decoder.decode_video(latent))
-    if len(uint8_chunks) != 1:
-        raise RuntimeError(f"Expected single decode chunk, got {len(uint8_chunks)}")
+    tiling_config = TilingConfig.default()
+    raw_chunks = list(decoder.tiled_decode(latent, tiling_config=tiling_config))
+    raw_video = torch.cat(raw_chunks, dim=2)
+    uint8_chunks = list(decoder.decode_video(latent, tiling_config=tiling_config))
+    postprocessed_video = torch.cat(uint8_chunks, dim=0)
 
     DUMP_PATH.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "raw_video": raw_video.detach().cpu().float(),
-            "postprocessed_video": uint8_chunks[0].detach().cpu(),
+            "postprocessed_video": postprocessed_video.detach().cpu(),
         },
         DUMP_PATH,
     )
