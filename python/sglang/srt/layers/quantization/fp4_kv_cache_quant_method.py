@@ -27,7 +27,7 @@ from torch import Tensor
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
 
 
-class KVCacheQuantMethod(ABC):
+class FP4KVCacheQuantMethod(ABC):
     """Abstract base for KV cache quantization strategies.
 
     Owns the quantize/dequantize computation.  The Pool owns the buffers and
@@ -102,7 +102,7 @@ class KVCacheQuantMethod(ABC):
         pass
 
 
-class NoneMethod(KVCacheQuantMethod):
+class NoneMethod(FP4KVCacheQuantMethod):
     """Identity method for BF16 / FP8 KV cache — no extra quantization."""
 
     name = "none"
@@ -133,7 +133,7 @@ class NoneMethod(KVCacheQuantMethod):
         return 0  # base pool handles BF16/FP8 sizing
 
 
-class NVFP4Method(KVCacheQuantMethod):
+class NVFP4Method(FP4KVCacheQuantMethod):
     """NVFP4 two-level scaling: global FP32 + per-block FP8 E4M3.
 
     Supported on SM100 and SM120.
@@ -325,7 +325,7 @@ class NVFP4Method(KVCacheQuantMethod):
         return fp4_size + scale_size + dq_size
 
 
-class MXFP4Method(KVCacheQuantMethod):
+class MXFP4Method(FP4KVCacheQuantMethod):
     """MXFP4 single-level block-wise scaling."""
 
     name = "mxfp4"
@@ -430,17 +430,17 @@ class MXFP4Method(KVCacheQuantMethod):
 
 
 # Registry: name → class.  Only classes for fp4_e2m1 dtype need to be listed.
-KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethod]] = {
+FP4_KV_CACHE_QUANT_REGISTRY: dict[str, type[FP4KVCacheQuantMethod]] = {
     "nvfp4": NVFP4Method,
     "mxfp4": MXFP4Method,
 }
 
 
-def get_kv_cache_quant_method(name: str, **kwargs) -> KVCacheQuantMethod:
-    """Instantiate a KVCacheQuantMethod by recipe name."""
-    if name not in KV_CACHE_QUANT_REGISTRY:
+def get_fp4_kv_cache_quant_method(name: str, **kwargs) -> FP4KVCacheQuantMethod:
+    """Instantiate a FP4KVCacheQuantMethod by recipe name."""
+    if name not in FP4_KV_CACHE_QUANT_REGISTRY:
         raise ValueError(
             f"Unknown fp4_kv_cache_recipe: '{name}'. "
-            f"Available: {list(KV_CACHE_QUANT_REGISTRY)}"
+            f"Available: {list(FP4_KV_CACHE_QUANT_REGISTRY)}"
         )
-    return KV_CACHE_QUANT_REGISTRY[name](**kwargs)
+    return FP4_KV_CACHE_QUANT_REGISTRY[name](**kwargs)
