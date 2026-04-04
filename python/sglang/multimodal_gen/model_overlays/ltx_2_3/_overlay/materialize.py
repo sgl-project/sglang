@@ -172,7 +172,10 @@ def _repack_ltx23_image_encoder_weights(source_path: str, output_path: str) -> N
     tensors = {}
     with safe_open(source_path, framework="pt") as f:
         for key in f.keys():
-            if key.startswith("encoder.") or key.startswith("per_channel_statistics."):
+            if key.startswith("encoder."):
+                tensors[key[len("encoder.") :]] = f.get_tensor(key)
+                continue
+            if key.startswith("per_channel_statistics."):
                 tensors[key] = f.get_tensor(key)
     if not tensors:
         raise ValueError("No LTX-2.3 image-encoder tensors found in donor checkpoint.")

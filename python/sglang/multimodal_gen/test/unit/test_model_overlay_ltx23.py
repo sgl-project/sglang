@@ -239,7 +239,7 @@ def test_ltx23_repack_image_encoder_keeps_only_encoder_tensors():
         with safe_open(output_path, framework="pt") as f:
             keys = sorted(f.keys())
             assert keys == [
-                "encoder.conv_in.conv.weight",
+                "conv_in.conv.weight",
                 "per_channel_statistics.mean-of-means",
             ]
 
