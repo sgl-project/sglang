@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
     LTX2SigmaPreparationStage,
     build_official_ltx2_sigmas,
+    prepare_ltx2_mu,
 )
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     maybe_load_overlay_model_index,
@@ -136,6 +137,23 @@ def test_ltx23_sigma_preparation_uses_official_schedule_only_for_ltx23_marker():
 
     assert abs(ltx23_batch.sigmas[1] - 0.99495703) < 1e-6
     assert abs(legacy_batch.sigmas[1] - (29.0 / 30.0)) < 1e-6
+
+
+def test_ltx23_skips_mu_when_using_official_sigma_schedule():
+    req = Req(
+        sampling_params=SamplingParams(num_frames=121, height=512, width=768),
+        prompt="prompt",
+        prompt_embeds=[torch.zeros(1, 1, 1)],
+    )
+    ltx23_server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(use_official_image_encoder=True)
+            )
+        )
+    )
+
+    assert prepare_ltx2_mu(req, ltx23_server_args) == ("mu", None)
 
 
 def test_ltx23_prepare_request_sets_stage1_guider_defaults():

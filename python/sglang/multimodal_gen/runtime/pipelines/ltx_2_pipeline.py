@@ -86,6 +86,14 @@ def calculate_ltx2_shift(
 
 
 def prepare_ltx2_mu(batch: Req, server_args: ServerArgs):
+    if bool(
+        getattr(
+            server_args.pipeline_config.vae_config.arch_config,
+            "use_official_image_encoder",
+            False,
+        )
+    ):
+        return "mu", None
     latent_num_frames = (int(batch.num_frames) - 1) // int(
         server_args.pipeline_config.vae_temporal_compression
     ) + 1
