@@ -1,7 +1,9 @@
 import copy
 import math
+import os
 import time
 from io import BytesIO
+from pathlib import Path
 
 import av
 import numpy as np
@@ -133,6 +135,57 @@ class LTX2AVDenoisingStage(DenoisingStage):
         factor = cond.std() / pred.std()
         factor = rescale_scale * factor + (1.0 - rescale_scale)
         return pred * factor
+
+    @staticmethod
+    def _ltx2_step_dump_dir(step_index: int) -> Path | None:
+        dump_dir = os.environ.get("SGLANG_DIFFUSION_LTX2_STEP_DUMP_DIR")
+        if not dump_dir:
+            return None
+        target_step = int(os.environ.get("SGLANG_DIFFUSION_LTX2_STEP_DUMP_INDEX", "-1"))
+        if step_index != target_step:
+            return None
+        path = Path(dump_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _ltx2_dump_step_tensors(
+        dump_dir: Path,
+        *,
+        step_index: int,
+        stage: str,
+        sigma: float,
+        latents_before: torch.Tensor,
+        denoised_video: torch.Tensor,
+        latents_after: torch.Tensor,
+        audio_latents_before: torch.Tensor | None,
+        denoised_audio: torch.Tensor | None,
+        audio_latents_after: torch.Tensor | None,
+    ) -> None:
+        torch.save(
+            {
+                "stage": stage,
+                "step_index": step_index,
+                "sigma": sigma,
+                "video_latent_before": latents_before.detach().cpu(),
+                "video_denoised": denoised_video.detach().cpu(),
+                "video_latent_after": latents_after.detach().cpu(),
+                "audio_latent_before": (
+                    None
+                    if audio_latents_before is None
+                    else audio_latents_before.detach().cpu()
+                ),
+                "audio_denoised": (
+                    None if denoised_audio is None else denoised_audio.detach().cpu()
+                ),
+                "audio_latent_after": (
+                    None
+                    if audio_latents_after is None
+                    else audio_latents_after.detach().cpu()
+                ),
+            },
+            dump_dir / f"{stage}_step{step_index}.pt",
+        )
 
     @classmethod
     def _ltx2_calculate_guided_x0(
@@ -483,6 +536,13 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             device=latents.device, dtype=torch.float32
                         )
                         dt = sigma_next - sigma
+                        step_dump_dir = self._ltx2_step_dump_dir(i)
+                        latents_before_dump = (
+                            latents if step_dump_dir is not None else None
+                        )
+                        audio_latents_before_dump = (
+                            audio_latents if step_dump_dir is not None else None
+                        )
 
                         latent_model_input = latents.to(target_dtype)
                         audio_latent_model_input = audio_latents.to(target_dtype)
@@ -609,11 +669,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             audio_latents = audio_scheduler.step(
                                 a_v_pos, t_device, audio_latents, return_dict=False
                             )[0]
-                            if do_ti2v:
-                                latents[:, :num_img_tokens, :] = batch.image_latent[
-                                    :, :num_img_tokens, :
-                                ].to(device=latents.device, dtype=latents.dtype)
-
                             latents = self.post_forward_for_ti2v_task(
                                 batch, server_args, reserved_frames_mask, latents, z
                             )
@@ -926,11 +981,19 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         audio_latents = (
                             audio_latents.float() + v_audio.float() * dt
                         ).to(dtype=audio_latents.dtype)
-
-                        if do_ti2v:
-                            latents[:, :num_img_tokens, :] = batch.image_latent[
-                                :, :num_img_tokens, :
-                            ].to(device=latents.device, dtype=latents.dtype)
+                        if step_dump_dir is not None:
+                            self._ltx2_dump_step_tensors(
+                                step_dump_dir,
+                                step_index=i,
+                                stage=stage,
+                                sigma=sigma_val,
+                                latents_before=latents_before_dump,
+                                denoised_video=denoised_video,
+                                latents_after=latents,
+                                audio_latents_before=audio_latents_before_dump,
+                                denoised_audio=denoised_audio,
+                                audio_latents_after=audio_latents,
+                            )
 
                         latents = self.post_forward_for_ti2v_task(
                             batch, server_args, reserved_frames_mask, latents, z
