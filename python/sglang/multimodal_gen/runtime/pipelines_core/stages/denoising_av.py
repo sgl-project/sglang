@@ -582,7 +582,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         if use_official_cfg_path:
                             encoder_hidden_states = batch.prompt_embeds[0]
                             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                            encoder_attention_mask = None
+                            encoder_attention_mask = batch.prompt_attention_mask
                             if batch.do_classifier_free_guidance:
                                 latent_model_input = torch.cat(
                                     [latent_model_input] * 2, dim=0
@@ -605,15 +605,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     dim=0,
                                 )
                                 encoder_attention_mask = torch.cat(
-                                    None
-                                    if batch.negative_attention_mask is None
-                                    else torch.cat(
-                                        [
-                                            batch.negative_attention_mask,
-                                            batch.prompt_attention_mask,
-                                        ],
-                                        dim=0,
-                                    )
+                                    [
+                                        batch.negative_attention_mask,
+                                        encoder_attention_mask,
+                                    ],
+                                    dim=0,
                                 )
                                 timestep_video = timestep_video.expand(
                                     int(latent_model_input.shape[0])
@@ -698,7 +694,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             # then apply CFG on denoised (x0) predictions.
                             encoder_hidden_states = batch.prompt_embeds[0]
                             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                            encoder_attention_mask = None
+                            encoder_attention_mask = batch.prompt_attention_mask
                             with set_forward_context(
                                 current_timestep=i, attn_metadata=attn_metadata
                             ):
@@ -732,7 +728,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     neg_audio_encoder_hidden_states = (
                                         batch.negative_audio_prompt_embeds[0]
                                     )
-                                    neg_encoder_attention_mask = None
+                                    neg_encoder_attention_mask = (
+                                        batch.negative_attention_mask
+                                    )
 
                                     v_neg, a_v_neg = current_model(
                                         hidden_states=latent_model_input,
