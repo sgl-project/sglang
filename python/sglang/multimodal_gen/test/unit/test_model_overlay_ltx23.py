@@ -13,9 +13,14 @@ from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
     LTX2AVDenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av import (
+    LTX2AVLatentPreparationStage,
+)
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
     maybe_load_overlay_model_index,
     resolve_model_overlay_target,
@@ -168,3 +173,55 @@ def test_ltx23_connector_repack_renames_qk_norm_keys():
     assert _rename_connector_key(
         "model.diffusion_model.audio_embeddings_connector.transformer_1d_blocks.1.attn1.k_norm.weight"
     ) == "audio_connector.transformer_blocks.1.attn1.norm_k.weight"
+
+
+def test_ltx23_latent_preparation_samples_directly_in_packed_space():
+    device = get_local_torch_device()
+    generator_device = device.type
+    generator = torch.Generator(generator_device).manual_seed(123)
+    req = Req(
+        sampling_params=SamplingParams(
+            num_outputs_per_prompt=1,
+            num_frames=121,
+            height=512,
+            width=768,
+        ),
+        prompt="prompt",
+        prompt_embeds=[torch.zeros(1, 1, 1)],
+        generator=[generator],
+        generate_audio=True,
+    )
+    pipeline_config = get_model_info(
+        "Lightricks/LTX-2.3", backend="sglang"
+    ).pipeline_config_cls()
+    server_args = SimpleNamespace(pipeline_config=pipeline_config)
+    stage = LTX2AVLatentPreparationStage(
+        scheduler=SimpleNamespace(init_noise_sigma=1.0)
+    )
+
+    batch = stage.forward(req, server_args)
+
+    video_shape = pipeline_config.prepare_latent_shape(
+        batch, batch.batch_size, stage.adjust_video_length(batch, server_args)
+    )
+    audio_shape = pipeline_config.prepare_audio_latent_shape(
+        batch, batch.batch_size, batch.num_frames
+    )
+    expected_generator = torch.Generator(generator_device).manual_seed(123)
+    expected_video = torch.randn(
+        LTX2AVLatentPreparationStage._packed_video_latent_shape(
+            video_shape, pipeline_config
+        ),
+        generator=expected_generator,
+        device=device,
+        dtype=torch.float32,
+    )
+    expected_audio = torch.randn(
+        LTX2AVLatentPreparationStage._packed_audio_latent_shape(audio_shape),
+        generator=expected_generator,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    assert torch.allclose(batch.latents, expected_video)
+    assert torch.allclose(batch.audio_latents, expected_audio)
