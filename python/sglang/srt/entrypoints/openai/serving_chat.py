@@ -649,6 +649,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Usage tracking
         prompt_tokens = {}
+        reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
@@ -669,6 +670,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
+                )
+                reasoning_tokens[index] = content["meta_info"].get(
+                    "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
@@ -752,6 +756,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
 
@@ -805,6 +810,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
 
@@ -885,8 +891,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
+                    reasoning_tokens,
                     completion_tokens,
-                    cached_tokens,
+                    cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
@@ -1356,9 +1363,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1406,9 +1415,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
