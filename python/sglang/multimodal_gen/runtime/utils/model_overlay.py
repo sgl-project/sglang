@@ -28,6 +28,7 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     "Lightricks/LTX-2.3": {
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
         "overlay_revision": "main",
+        "bundled_overlay_subdir": "ltx_2_3",
     },
 }
 
@@ -44,6 +45,26 @@ MODEL_OVERLAY_METADATA_PATTERNS = [
 ]
 
 _MODEL_OVERLAY_REGISTRY_CACHE: dict[str, dict[str, Any]] | None = None
+
+
+def _resolve_bundled_overlay_dir(overlay_spec: dict[str, Any]) -> str | None:
+    bundled_overlay_subdir = overlay_spec.get("bundled_overlay_subdir")
+    if not bundled_overlay_subdir:
+        return None
+    bundled_overlay_dir = os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "model_overlays",
+            str(bundled_overlay_subdir),
+        )
+    )
+    if not os.path.isdir(bundled_overlay_dir):
+        return None
+    if load_overlay_manifest_if_present(bundled_overlay_dir) is None:
+        return None
+    return bundled_overlay_dir
 
 
 def get_diffusion_cache_root() -> str:
@@ -304,6 +325,15 @@ def download_overlay_metadata(
     *,
     snapshot_download_fn: Callable[..., str],
 ) -> str:
+    bundled_overlay_dir = _resolve_bundled_overlay_dir(overlay_spec)
+    if bundled_overlay_dir is not None:
+        logger.info(
+            "Using bundled overlay metadata for %s from %s",
+            source_model_id,
+            bundled_overlay_dir,
+        )
+        return bundled_overlay_dir
+
     overlay_repo_id = str(overlay_spec["overlay_repo_id"])
     if os.path.exists(overlay_repo_id):
         logger.info(

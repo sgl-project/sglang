@@ -13,13 +13,13 @@ from sglang.multimodal_gen.runtime.utils.model_overlay import (
 
 AUXILIARY_MODEL_ID = "Lightricks/LTX-2"
 CONFIG_DONOR_MODEL_ID = "FastVideo/LTX-2.3-Distilled-Diffusers"
+VAE_DONOR_MODEL_ID = CONFIG_DONOR_MODEL_ID
 
 AUXILIARY_PATTERNS = [
     "audio_vae/**",
     "scheduler/**",
     "text_encoder/**",
     "tokenizer/**",
-    "vae/**",
     "vocoder/**",
 ]
 
@@ -27,6 +27,7 @@ CONFIG_DONOR_PATTERNS = [
     "transformer/config.json",
     "text_encoder/config.json",
 ]
+VAE_DONOR_PATTERNS = ["vae/**"]
 
 MONOLITH_PREFIX = "model.diffusion_model."
 VIDEO_CONNECTOR_PREFIX = f"{MONOLITH_PREFIX}video_embeddings_connector."
@@ -160,6 +161,56 @@ def _build_connectors_config(config_donor_dir: str) -> dict:
     }
 
 
+def _build_vae_config(auxiliary_dir: str, vae_donor_dir: str) -> dict:
+    config = _load_json(os.path.join(auxiliary_dir, "vae", "config.json"))
+    donor_config = _load_json(os.path.join(vae_donor_dir, "vae", "config.json")).get(
+        "vae", {}
+    )
+
+    config["scaling_factor"] = donor_config.get(
+        "scaling_factor", config.get("scaling_factor", 1.0)
+    )
+    config["patch_size"] = donor_config.get("patch_size", config.get("patch_size", 4))
+    config["decoder_causal"] = donor_config.get(
+        "causal_decoder", config.get("decoder_causal", False)
+    )
+    config["timestep_conditioning"] = donor_config.get(
+        "timestep_conditioning", config.get("timestep_conditioning", False)
+    )
+    spatial_padding_mode = donor_config.get("spatial_padding_mode")
+    if spatial_padding_mode is not None:
+        config["encoder_spatial_padding_mode"] = spatial_padding_mode
+        config["decoder_spatial_padding_mode"] = spatial_padding_mode
+    return config
+
+
+def _repack_vae_weights(source_path: str, output_path: str) -> None:
+    tensors = {}
+    latents_mean = None
+    latents_std = None
+
+    with safe_open(source_path, framework="pt") as f:
+        for key in f.keys():
+            tensor = f.get_tensor(key)
+            if key.endswith("per_channel_statistics.mean-of-means"):
+                if latents_mean is None:
+                    latents_mean = tensor
+                continue
+            if key.endswith("per_channel_statistics.std-of-means"):
+                if latents_std is None:
+                    latents_std = tensor
+                continue
+            tensors[key] = tensor
+
+    if latents_mean is not None:
+        tensors["latents_mean"] = latents_mean
+    if latents_std is not None:
+        tensors["latents_std"] = latents_std
+    if not tensors:
+        raise ValueError("No VAE tensors found in 2.3 donor checkpoint.")
+    save_file(tensors, output_path)
+
+
 def materialize(
     *,
     overlay_dir: str,
@@ -179,13 +230,17 @@ def materialize(
         allow_patterns=CONFIG_DONOR_PATTERNS,
         max_workers=8,
     )
+    vae_donor_dir = snapshot_download(
+        repo_id=VAE_DONOR_MODEL_ID,
+        allow_patterns=VAE_DONOR_PATTERNS,
+        max_workers=8,
+    )
 
     for component_name in (
         "audio_vae",
         "scheduler",
         "text_encoder",
         "tokenizer",
-        "vae",
         "vocoder",
     ):
         _copytree_link_or_copy(
@@ -213,6 +268,17 @@ def materialize(
     )
     _repack_connectors_weights(
         source_checkpoint, os.path.join(connectors_dir, "model.safetensors")
+    )
+
+    vae_dir = os.path.join(output_dir, "vae")
+    _ensure_dir(vae_dir)
+    _write_json(
+        os.path.join(vae_dir, "config.json"),
+        _build_vae_config(auxiliary_dir, vae_donor_dir),
+    )
+    _repack_vae_weights(
+        os.path.join(vae_donor_dir, "vae", "model.safetensors"),
+        os.path.join(vae_dir, "model.safetensors"),
     )
 
     _link_or_copy_file(

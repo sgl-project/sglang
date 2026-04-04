@@ -1,14 +1,20 @@
+import json
 import os
+import tempfile
 from types import SimpleNamespace
 
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     _gemma_postprocess_func,
     pack_text_embeds_v2,
 )
 from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
+    _build_vae_config,
     _rename_connector_key,
+    _repack_vae_weights,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_model_info
@@ -35,6 +41,7 @@ def test_ltx23_builtin_overlay_target_is_hf_repo():
     assert source_model_id == "Lightricks/LTX-2.3"
     assert str(overlay_spec["overlay_revision"]) == "main"
     assert str(overlay_spec["overlay_repo_id"]) == "MickJ/LTX-2.3-overlay"
+    assert str(overlay_spec["bundled_overlay_subdir"]) == "ltx_2_3"
 
 
 def test_ltx23_overlay_model_index_is_native():
@@ -186,6 +193,75 @@ def test_ltx23_connector_repack_renames_qk_norm_keys():
     assert _rename_connector_key(
         "model.diffusion_model.audio_embeddings_connector.transformer_1d_blocks.1.attn1.k_norm.weight"
     ) == "audio_connector.transformer_blocks.1.attn1.norm_k.weight"
+
+
+def test_ltx23_vae_config_uses_23_padding_and_scaling():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        auxiliary_dir = os.path.join(tmpdir, "aux")
+        vae_donor_dir = os.path.join(tmpdir, "donor")
+        os.makedirs(os.path.join(auxiliary_dir, "vae"), exist_ok=True)
+        os.makedirs(os.path.join(vae_donor_dir, "vae"), exist_ok=True)
+
+        with open(os.path.join(auxiliary_dir, "vae", "config.json"), "w") as f:
+            json.dump(
+                {
+                    "_class_name": "AutoencoderKLLTX2Video",
+                    "scaling_factor": 1.0,
+                    "patch_size": 4,
+                    "decoder_causal": False,
+                    "timestep_conditioning": False,
+                    "encoder_spatial_padding_mode": "zeros",
+                    "decoder_spatial_padding_mode": "reflect",
+                },
+                f,
+            )
+        with open(os.path.join(vae_donor_dir, "vae", "config.json"), "w") as f:
+            json.dump(
+                {
+                    "vae": {
+                        "scaling_factor": 1.0,
+                        "patch_size": 4,
+                        "causal_decoder": False,
+                        "timestep_conditioning": False,
+                        "spatial_padding_mode": "zeros",
+                    }
+                },
+                f,
+            )
+
+        config = _build_vae_config(auxiliary_dir, vae_donor_dir)
+
+    assert config["encoder_spatial_padding_mode"] == "zeros"
+    assert config["decoder_spatial_padding_mode"] == "zeros"
+    assert config["scaling_factor"] == 1.0
+
+
+def test_ltx23_vae_repack_maps_per_channel_stats():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source_path = os.path.join(tmpdir, "source.safetensors")
+        output_path = os.path.join(tmpdir, "output.safetensors")
+        save_file(
+            {
+                "encoder.conv_in.weight": torch.ones(1),
+                "decoder.conv_in.weight": torch.full((1,), 2.0),
+                "encoder.per_channel_statistics.mean-of-means": torch.full((2,), 3.0),
+                "encoder.per_channel_statistics.std-of-means": torch.full((2,), 4.0),
+                "decoder.per_channel_statistics.mean-of-means": torch.full((2,), 5.0),
+            },
+            source_path,
+        )
+
+        _repack_vae_weights(source_path, output_path)
+
+        with safe_open(output_path, framework="pt") as f:
+            keys = sorted(f.keys())
+            assert "encoder.conv_in.weight" in keys
+            assert "decoder.conv_in.weight" in keys
+            assert "latents_mean" in keys
+            assert "latents_std" in keys
+            assert not any("per_channel_statistics" in key for key in keys)
+            assert torch.equal(f.get_tensor("latents_mean"), torch.full((2,), 3.0))
+            assert torch.equal(f.get_tensor("latents_std"), torch.full((2,), 4.0))
 
 
 def test_ltx23_latent_preparation_samples_directly_in_packed_space():
