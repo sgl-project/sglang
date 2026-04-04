@@ -2,6 +2,7 @@
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+WORKTREE="${WORKTREE:-/sgl-workspace/sglang}"
 export LTX23_PROMPT="${LTX23_PROMPT:-A beautiful sunset over the ocean}"
 export LTX23_IMAGE_PATH="${LTX23_IMAGE_PATH:-/tmp/ltx23_i2v_input_sunset.png}"
 export LTX23_OFFICIAL_FINAL_LATENTS="${LTX23_OFFICIAL_FINAL_LATENTS:-/tmp/ltx23_official_i2v_final.pt}"
@@ -20,4 +21,4 @@ fi
 . "$LTX23_OFFICIAL_VENV/bin/activate"
 export PYTHONPATH="$LTX_REPO_ROOT/packages/ltx-core/src:$LTX_REPO_ROOT/packages/ltx-pipelines/src"
 
-python /sgl-workspace/sglang/python/sglang/multimodal_gen/notes/ltx23_alignment_20260404/official_i2v_final_latents_dump.py
+python "$WORKTREE/python/sglang/multimodal_gen/notes/ltx23_alignment_20260404/official_i2v_final_latents_dump.py"
