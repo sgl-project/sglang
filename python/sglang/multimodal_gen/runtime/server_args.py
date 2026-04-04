@@ -48,7 +48,6 @@ from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
     expand_path_fields,
-    expand_path_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -573,6 +572,15 @@ class ServerArgs:
                 "(e.g. 'Qwen-Image' for 'Qwen/Qwen-Image')."
             ),
         )
+        parser.add_argument(
+            "--pipeline-class-name",
+            type=str,
+            default=ServerArgs.pipeline_class_name,
+            help=(
+                "Override pipeline class selection from model_index.json. "
+                "Must match a registered pipeline_name."
+            ),
+        )
         # attention
         parser.add_argument(
             "--attention-backend",
@@ -936,7 +944,11 @@ class ServerArgs:
         unknown_args: list[str],
     ) -> tuple[dict[str, str], list[str]]:
         """
-        Extract dynamic ``--<component>-path`` args from unrecognised CLI args.
+        Extract dynamic component path args from unrecognised CLI args.
+
+        Supported forms:
+        - ``--<component>-path /path/to/component``
+        - ``--component-paths.<component> /path/to/component`` (expanded from config)
         """
         component_paths: dict[str, str] = {}
         remaining: list[str] = []
@@ -944,8 +956,15 @@ class ServerArgs:
         while i < len(unknown_args):
             arg = unknown_args[i]
             key_part = arg.split("=", 1)[0] if "=" in arg else arg
-            if key_part.startswith("--") and key_part.endswith("-path"):
+            component = None
+            if key_part.startswith("--component-paths."):
+                component = key_part[len("--component-paths.") :].replace("-", "_")
+            elif key_part.startswith("--component_paths."):
+                component = key_part[len("--component_paths.") :].replace("-", "_")
+            elif key_part.startswith("--") and key_part.endswith("-path"):
                 component = key_part[2:-5].replace("-", "_")
+
+            if component is not None:
                 if "=" in arg:
                     component_paths[component] = arg.split("=", 1)[1]
                 elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
@@ -997,7 +1016,6 @@ class ServerArgs:
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
-        kwargs = expand_path_kwargs(dict(kwargs))
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
 
