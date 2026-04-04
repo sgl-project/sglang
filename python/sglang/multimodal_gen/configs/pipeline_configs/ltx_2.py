@@ -116,13 +116,7 @@ def pack_text_embeds_v2(
 
 
 def is_ltx23_native_variant(arch_config: object) -> bool:
-    variant = getattr(arch_config, "ltx_variant", None)
-    if variant is not None:
-        return str(variant) == "ltx_2_3"
-    return bool(
-        getattr(arch_config, "use_official_image_encoder", False)
-        or getattr(arch_config, "use_official_video_decoder", False)
-    )
+    return str(getattr(arch_config, "ltx_variant", "ltx_2")) == "ltx_2_3"
 
 
 def _gemma_postprocess_func(

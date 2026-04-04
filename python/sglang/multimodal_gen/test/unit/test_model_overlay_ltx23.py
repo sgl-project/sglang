@@ -7,6 +7,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEArchConfig
 from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     _gemma_postprocess_func,
@@ -122,16 +123,12 @@ def test_ltx23_sigma_preparation_uses_official_schedule_only_for_ltx23_marker():
 
     ltx23_server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(
-                arch_config=SimpleNamespace(use_official_image_encoder=True)
-            )
+            vae_config=SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2_3"))
         )
     )
     legacy_server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(
-                arch_config=SimpleNamespace(use_official_image_encoder=False)
-            )
+            vae_config=SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2"))
         )
     )
 
@@ -149,14 +146,26 @@ def test_ltx23_sigma_preparation_uses_official_schedule_only_for_ltx23_marker():
     assert abs(legacy_batch.sigmas[1] - (29.0 / 30.0)) < 1e-6
 
 
-def test_ltx23_native_variant_uses_explicit_marker_when_present():
+def test_ltx23_native_variant_uses_explicit_marker_only():
     ltx23_arch = SimpleNamespace(ltx_variant="ltx_2_3")
     legacy_arch = SimpleNamespace(ltx_variant="ltx_2")
-    fallback_arch = SimpleNamespace(use_official_image_encoder=True)
 
     assert is_ltx23_native_variant(ltx23_arch) is True
     assert is_ltx23_native_variant(legacy_arch) is False
-    assert is_ltx23_native_variant(fallback_arch) is True
+
+
+def test_ltx23_arch_config_normalizes_legacy_overlay_flags():
+    arch_config = LTXVideoVAEArchConfig()
+    arch_config.use_official_image_encoder = True
+    arch_config.official_image_encoder_subdir = "ltx23_image_encoder"
+    arch_config.use_official_video_decoder = True
+    arch_config.official_vae_config = {"decoder_base_channels": 128}
+    arch_config.__post_init__()
+
+    assert arch_config.ltx_variant == "ltx_2_3"
+    assert arch_config.condition_encoder_subdir == "ltx23_image_encoder"
+    assert arch_config.video_decoder_variant == "ltx_2_3"
+    assert arch_config.video_decoder_config == {"decoder_base_channels": 128}
 
 
 def test_ltx23_skips_mu_when_using_official_sigma_schedule():
@@ -167,9 +176,7 @@ def test_ltx23_skips_mu_when_using_official_sigma_schedule():
     )
     ltx23_server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(
-                arch_config=SimpleNamespace(use_official_image_encoder=True)
-            )
+            vae_config=SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2_3"))
         )
     )
 
@@ -436,10 +443,9 @@ def test_ltx23_vae_config_adds_official_image_encoder_marker():
     assert config["encoder_spatial_padding_mode"] == "zeros"
     assert config["decoder_spatial_padding_mode"] == "reflect"
     assert config["ltx_variant"] == "ltx_2_3"
-    assert config["use_official_image_encoder"] is True
-    assert config["official_image_encoder_subdir"] == "ltx23_image_encoder"
-    assert config["use_official_video_decoder"] is True
-    assert config["official_vae_config"]["decoder_base_channels"] == 128
+    assert config["condition_encoder_subdir"] == "ltx23_image_encoder"
+    assert config["video_decoder_variant"] == "ltx_2_3"
+    assert config["video_decoder_config"]["decoder_base_channels"] == 128
 
 
 def test_ltx23_repack_image_encoder_keeps_only_encoder_tensors():
@@ -503,14 +509,14 @@ def test_ltx23_decode_skips_external_denorm():
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
             vae_config=SimpleNamespace(
-                arch_config=SimpleNamespace(use_official_video_decoder=True)
+                arch_config=SimpleNamespace(video_decoder_variant="ltx_2_3")
             )
         )
     )
     legacy_server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
             vae_config=SimpleNamespace(
-                arch_config=SimpleNamespace(use_official_video_decoder=False)
+                arch_config=SimpleNamespace(video_decoder_variant="ltx_2")
             )
         )
     )

@@ -164,10 +164,9 @@ def _build_connectors_config(config_donor_dir: str) -> dict:
 def _build_vae_config(auxiliary_dir: str, config_donor_dir: str) -> dict:
     config = _load_json(os.path.join(auxiliary_dir, "vae", "config.json"))
     config["ltx_variant"] = "ltx_2_3"
-    config["use_official_image_encoder"] = True
-    config["official_image_encoder_subdir"] = "ltx23_image_encoder"
-    config["use_official_video_decoder"] = True
-    config["official_vae_config"] = _load_json(
+    config["condition_encoder_subdir"] = "ltx23_image_encoder"
+    config["video_decoder_variant"] = "ltx_2_3"
+    config["video_decoder_config"] = _load_json(
         os.path.join(config_donor_dir, "vae", "config.json")
     )["vae"]
     return config

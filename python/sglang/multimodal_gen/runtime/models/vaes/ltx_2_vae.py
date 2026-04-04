@@ -1413,8 +1413,9 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         timestep_conditioning = getattr(
             config.arch_config, "timestep_conditioning", False
         )
-        use_official_video_decoder = bool(
-            getattr(config.arch_config, "use_official_video_decoder", False)
+        use_ltx23_video_decoder = (
+            str(getattr(config.arch_config, "video_decoder_variant", "ltx_2"))
+            == "ltx_2_3"
         )
         decoder_causal = config.arch_config.decoder_causal
         decoder_spatial_padding_mode = config.arch_config.decoder_spatial_padding_mode
@@ -1434,34 +1435,32 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             encoder_spatial_padding_mode,
         )
 
-        if use_official_video_decoder:
-            official_vae_config = dict(
-                getattr(config.arch_config, "official_vae_config", {})
-            )
-            if not official_vae_config:
+        if use_ltx23_video_decoder:
+            video_decoder_config = dict(config.arch_config.video_decoder_config)
+            if not video_decoder_config:
                 raise ValueError(
-                    "LTX-2.3 official video decoder requires official_vae_config."
+                    "LTX-2.3 native video decoder requires video_decoder_config."
                 )
             self.decoder = LTX23VideoDecoder3d(
                 in_channels=latent_channels,
                 out_channels=out_channels,
-                decoder_blocks=tuple(official_vae_config["decoder_blocks"]),
-                patch_size=int(official_vae_config.get("patch_size", patch_size)),
+                decoder_blocks=tuple(video_decoder_config["decoder_blocks"]),
+                patch_size=int(video_decoder_config.get("patch_size", patch_size)),
                 patch_size_t=patch_size_t,
                 resnet_norm_eps=resnet_norm_eps,
                 is_causal=bool(
-                    official_vae_config.get("causal_decoder", decoder_causal)
+                    video_decoder_config.get("causal_decoder", decoder_causal)
                 ),
                 timestep_conditioning=bool(
-                    official_vae_config.get(
+                    video_decoder_config.get(
                         "timestep_conditioning", timestep_conditioning
                     )
                 ),
                 base_channels=int(
-                    official_vae_config.get("decoder_base_channels", 128)
+                    video_decoder_config.get("decoder_base_channels", 128)
                 ),
                 spatial_padding_mode=str(
-                    official_vae_config.get(
+                    video_decoder_config.get(
                         "spatial_padding_mode", decoder_spatial_padding_mode
                     )
                 ),

@@ -28,7 +28,7 @@ class LTX2AVDecodingStage(DecodingStage):
     @staticmethod
     def _ltx2_should_externally_denorm_video_latents(server_args: ServerArgs) -> bool:
         arch_config = server_args.pipeline_config.vae_config.arch_config
-        return not bool(getattr(arch_config, "use_official_video_decoder", False))
+        return str(getattr(arch_config, "video_decoder_variant", "ltx_2")) != "ltx_2_3"
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
