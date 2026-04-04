@@ -254,12 +254,10 @@ class NGRAMWorker:
                     # and will be applied to produce wrong results
                     batch.sampling_info.vocab_mask = None
 
-            (
-                logits_output,
-                next_token_ids,
-                num_accepted_tokens,
-                accept_length_per_req_cpu,
-            ) = verify_input.verify(batch, logits_output, self.page_size, vocab_mask)
+            logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
+                batch, logits_output, self.page_size, vocab_mask
+            )
+            accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
             if batch.return_logprob:
