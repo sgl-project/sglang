@@ -137,7 +137,7 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
 
         if audio_latents is None:
             latent_shape = server_args.pipeline_config.prepare_audio_latent_shape(
-                batch, batch_size, num_frames
+                batch, batch_size, batch.num_frames
             )
 
             audio_latents = randn_tensor(
