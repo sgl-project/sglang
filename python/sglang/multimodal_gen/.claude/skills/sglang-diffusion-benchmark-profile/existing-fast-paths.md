@@ -115,6 +115,14 @@ configuration first before writing a new Triton or CUDA kernel.
 - Scope: this is a model-specific fast path for Nunchaku-quantized FLUX-family checkpoints.
 - Workflow rule: if a Nunchaku trace shows split `fc1 -> gelu -> quant -> fc2.lora_down`, treat it as a missing existing fast path before proposing a new fusion.
 
+**NVFP4 / Nunchaku Packed QKV**
+
+- Entry points: `runtime/models/dits/flux.py`, `runtime/models/dits/flux_2.py`, and the FLUX config remapping in `configs/models/dits/flux.py`.
+- Fast path: quantized FLUX-family checkpoints can store attention projections in packed QKV form, and SGLang intentionally switches to `MergedColumnParallelLinear` paths such as `to_qkv`, `to_added_qkv`, and `to_qkv_mlp_proj` instead of separate `to_q`, `to_k`, `to_v`.
+- FLUX.2 NVFP4 note: `flux_2.py` explicitly enables fused packed QKV when `quant_config` is `ModelOptFp4Config`, because the NVFP4 checkpoint stores image-attention QKV packed on disk.
+- Nunchaku note: raw and converted Nunchaku checkpoint names are remapped onto fused `to_qkv` / `to_added_qkv` names in `configs/models/dits/flux.py`; correctness on NVFP4-style checkpoints also depends on quant metadata such as `wtscale` and attention `wcscales`.
+- Workflow rule: if an NVFP4 or Nunchaku trace shows split `to_q -> to_k -> to_v` where packed QKV is expected, treat it as a missing quantized fast path or checkpoint-format mismatch before proposing a new attention fusion.
+
 **Common Entry Points in Diffusion Models**
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Qwen-Image gating: `fuse_scale_shift_gate_select01_kernel` in `qwen_image.py`.
@@ -122,6 +130,7 @@ configuration first before writing a new Triton or CUDA kernel.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
 - Nunchaku fused GELU MLP: `_fused_gelu_mlp` in `flux.py` for quantized FLUX-family checkpoints.
+- NVFP4 / packed QKV attention: `to_qkv`, `to_added_qkv`, and `to_qkv_mlp_proj` in FLUX-family quantized paths.
 - RoPE: `_apply_rotary_emb` prefers Triton; Q/K RoPE prefers FlashInfer when present.
 
 **Existing Overlap / Communication Families**
