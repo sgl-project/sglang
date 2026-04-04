@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -24,6 +27,24 @@ class LTX2AVDecodingStage(DecodingStage):
         from diffusers.video_processor import VideoProcessor
 
         self.video_processor = VideoProcessor(vae_scale_factor=32)
+
+    @staticmethod
+    def _ltx2_maybe_dump_decode_tensors(
+        *,
+        raw_video: torch.Tensor,
+        postprocessed_video,
+    ) -> None:
+        dump_path = os.environ.get("SGLANG_DIFFUSION_LTX2_DECODE_DUMP_PATH")
+        if not dump_path:
+            return
+
+        payload = {
+            "raw_video": raw_video.detach().cpu().float(),
+            "postprocessed_video": torch.from_numpy(postprocessed_video).cpu(),
+        }
+        path = Path(dump_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payload, path)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
@@ -66,7 +87,12 @@ class LTX2AVDecodingStage(DecodingStage):
                 video = decode_output
 
         self.vae.to(original_dtype)
+        raw_video = video
         video = self.video_processor.postprocess_video(video, output_type="np")
+        self._ltx2_maybe_dump_decode_tensors(
+            raw_video=raw_video,
+            postprocessed_video=video,
+        )
 
         output_batch = OutputBatch(
             output=video,
