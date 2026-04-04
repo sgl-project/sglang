@@ -41,6 +41,7 @@ logger = init_logger(__name__)
 ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
 _LTX2_ATTENTION_DUMP_CALL_COUNTS: dict[str, int] = {}
+_LTX2_COORDS_DUMPED = False
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
@@ -95,6 +96,28 @@ def _ltx2_maybe_dump_attention_tensors(
         "out": out.detach().cpu(),
     }
     torch.save(payload, os.path.join(dump_dir, f"{prefix}.call{call_idx}.pt"))
+
+
+def _ltx2_maybe_dump_coords(
+    *,
+    video_coords: torch.Tensor | None,
+    audio_coords: torch.Tensor | None,
+) -> None:
+    global _LTX2_COORDS_DUMPED
+    dump_path = os.environ.get("SGLANG_DIFFUSION_LTX2_COORD_DUMP_PATH")
+    if not dump_path or _LTX2_COORDS_DUMPED:
+        return
+
+    payload = {
+        "video_coords": (
+            None if video_coords is None else video_coords.detach().cpu()
+        ),
+        "audio_coords": (
+            None if audio_coords is None else audio_coords.detach().cpu()
+        ),
+    }
+    torch.save(payload, dump_path)
+    _LTX2_COORDS_DUMPED = True
 
 
 def apply_interleaved_rotary_emb(
@@ -1535,6 +1558,11 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 num_frames=audio_num_frames,
                 device=audio_hidden_states.device,
             )
+
+        _ltx2_maybe_dump_coords(
+            video_coords=video_coords,
+            audio_coords=audio_coords,
+        )
 
         video_rotary_emb = self.rope(video_coords, device=hidden_states.device)
         audio_rotary_emb = self.audio_rope(

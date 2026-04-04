@@ -455,6 +455,8 @@ def main() -> None:
                         "audio_mod": None if pass_dump.get("audio_mod") is None else pass_dump["audio_mod"].detach().cpu(),
                         "video_clean_latent": None if video_state is None else video_state.clean_latent.detach().cpu(),
                         "video_denoise_mask": None if video_state is None else video_state.denoise_mask.detach().cpu(),
+                        "video_positions": None if video_state is None else video_state.positions.detach().cpu(),
+                        "audio_positions": None if audio_state is None else audio_state.positions.detach().cpu(),
                         "image_latent": None if image_latent is None else image_latent.detach().cpu(),
                     },
                     DUMP_PATH,
