@@ -2181,12 +2181,14 @@ class ModelLaunchSettings:
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
         variant: Optional[str] = None,
+        launch_timeout: Optional[float] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
         self.variant = variant
+        self.launch_timeout = launch_timeout
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])
