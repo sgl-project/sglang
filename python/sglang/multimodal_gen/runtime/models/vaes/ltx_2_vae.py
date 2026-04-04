@@ -1135,6 +1135,28 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             config.arch_config.decoder_spatio_temporal_scaling
         )
         decoder_layers_per_block = config.arch_config.decoder_layers_per_block
+        decoder_inject_noise = getattr(
+            config.arch_config, "decoder_inject_noise", (False, False, False, False)
+        )
+        if isinstance(decoder_inject_noise, bool):
+            decoder_inject_noise = (decoder_inject_noise,) * 4
+        else:
+            decoder_inject_noise = tuple(decoder_inject_noise)
+        upsample_residual = getattr(
+            config.arch_config, "upsample_residual", (True, True, True)
+        )
+        if isinstance(upsample_residual, bool):
+            upsample_residual = (upsample_residual,) * 3
+        else:
+            upsample_residual = tuple(upsample_residual)
+        upsample_factor = getattr(config.arch_config, "upsample_factor", (2, 2, 2))
+        if isinstance(upsample_factor, int):
+            upsample_factor = (upsample_factor,) * 3
+        else:
+            upsample_factor = tuple(upsample_factor)
+        timestep_conditioning = getattr(
+            config.arch_config, "timestep_conditioning", False
+        )
         decoder_causal = config.arch_config.decoder_causal
         decoder_spatial_padding_mode = config.arch_config.decoder_spatial_padding_mode
 
@@ -1154,16 +1176,20 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         )
 
         self.decoder = LTX2VideoDecoder3d(
-            latent_channels,
-            out_channels,
-            decoder_block_out_channels,
-            decoder_spatio_temporal_scaling,
-            decoder_layers_per_block,
-            patch_size,
-            patch_size_t,
-            resnet_norm_eps,
-            decoder_causal,
-            decoder_spatial_padding_mode,
+            in_channels=latent_channels,
+            out_channels=out_channels,
+            block_out_channels=decoder_block_out_channels,
+            spatio_temporal_scaling=decoder_spatio_temporal_scaling,
+            layers_per_block=decoder_layers_per_block,
+            patch_size=patch_size,
+            patch_size_t=patch_size_t,
+            resnet_norm_eps=resnet_norm_eps,
+            is_causal=decoder_causal,
+            inject_noise=decoder_inject_noise,
+            timestep_conditioning=timestep_conditioning,
+            upsample_residual=upsample_residual,
+            upsample_factor=upsample_factor,
+            spatial_padding_mode=decoder_spatial_padding_mode,
         )
 
         latents_mean = torch.zeros((latent_channels,), requires_grad=False)

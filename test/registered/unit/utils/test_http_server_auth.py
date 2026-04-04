@@ -2,38 +2,15 @@
 Unit tests for HTTP server admin auth.
 
 Usage:
-    python3 -m pytest test/test_http_server_auth.py -v
+    python3 -m pytest test/registered/unit/utils/test_http_server_auth.py -v
 """
 
-import importlib.util
-import os
-import sys
 import unittest
 
+from sglang.srt.utils.auth import AuthLevel, decide_request_auth
+from sglang.test.ci.ci_register import register_cpu_ci
 
-def _load_auth_module():
-    """Load auth.py directly, avoiding importing the full sglang package.
-
-    This keeps the test importable even if optional runtime deps (e.g. orjson/httpx)
-    are not installed in the unit test environment.
-    """
-    this_dir = os.path.dirname(__file__)
-    python_dir = os.path.abspath(os.path.join(this_dir, "..", ".."))
-    auth_path = os.path.join(python_dir, "sglang", "srt", "utils", "auth.py")
-
-    module_name = "_sglang_srt_utils_auth_for_test"
-    spec = importlib.util.spec_from_file_location(module_name, auth_path)
-    assert spec is not None and spec.loader is not None
-    m = importlib.util.module_from_spec(spec)
-    # dataclasses (py3.12) may consult sys.modules during class processing
-    sys.modules[module_name] = m
-    spec.loader.exec_module(m)
-    return m
-
-
-_auth = _load_auth_module()
-decide_request_auth = _auth.decide_request_auth
-AuthLevel = _auth.AuthLevel
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 class TestHttpServerAdminAuth(unittest.TestCase):

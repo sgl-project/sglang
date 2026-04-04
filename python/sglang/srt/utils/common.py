@@ -127,7 +127,7 @@ BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elaps
 
 @lru_cache(maxsize=1)
 def is_cuda():
-    return torch.cuda.is_available() and torch.version.cuda
+    return torch.cuda.is_available() and torch.version.cuda is not None
 
 
 @lru_cache(maxsize=1)
@@ -234,6 +234,18 @@ def _check_cuda_device_version(
     )
 
 
+def _check_cuda_device_exact(
+    device_capability: Tuple[int, int], cuda_version: Tuple[int, int]
+):
+    """Check for an exact compute capability (major, minor) match."""
+    if not is_cuda():
+        return False
+    return (
+        torch.cuda.get_device_capability() == device_capability
+        and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
+    )
+
+
 is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
@@ -260,6 +272,11 @@ is_sm100_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
+)
+# TODO(mmangkad): Remove the TRTLLM attention skips for SM103 once FlashInfer
+# ships a fix. Tracking: https://github.com/flashinfer-ai/flashinfer/issues/2939
+is_sm103_supported = lru_cache(maxsize=1)(
+    partial(_check_cuda_device_exact, device_capability=(10, 3), cuda_version=(13, 0))
 )
 is_sm90_supported = lru_cache(maxsize=1)(
     partial(

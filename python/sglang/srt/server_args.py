@@ -52,12 +52,12 @@ from sglang.srt.utils.common import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_mps,
-    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm103_supported,
     is_sm120_supported,
     is_triton_kernels_available,
     is_xpu,
@@ -290,7 +290,7 @@ class ServerArgs:
     The arguments of the server.
 
     NOTE: When you add new arguments, please make sure the order
-    in this class definition the same as the order in the the function
+    in this class definition the same as the order in the function
     `ServerArgs.add_cli_args`.
     Please follow the existing style to group the new arguments into related groups or create new groups.
     """
@@ -374,6 +374,7 @@ class ServerArgs:
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
+    stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     random_seed: Optional[int] = None
@@ -1134,6 +1135,9 @@ class ServerArgs:
         # 16. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
             self.disable_piecewise_cuda_graph = True
+        # 17. Context parallel
+        if self.attn_cp_size > 1:
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -1460,8 +1464,13 @@ class ServerArgs:
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
-                self.nsa_prefill_backend = "trtllm"
-                self.nsa_decode_backend = "trtllm"
+                # TODO: Set sm103 default to trtllm after the hanging bug is fixed (#21904)
+                if is_sm103_supported():
+                    self.nsa_prefill_backend = "flashmla_sparse"
+                    self.nsa_decode_backend = "flashmla_kv"
+                else:
+                    self.nsa_prefill_backend = "trtllm"
+                    self.nsa_decode_backend = "trtllm"
             else:
                 # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
                 if not user_set_prefill:
@@ -1596,7 +1605,7 @@ class ServerArgs:
                 if not self.disable_piecewise_cuda_graph:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
-                if is_sm100_supported():
+                if is_sm100_supported() and not is_sm103_supported():
                     if (
                         self.attention_backend is None
                         and self.prefill_attention_backend is None
@@ -1694,7 +1703,7 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
-                if is_sm100_supported():
+                if is_sm100_supported() and not is_sm103_supported():
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
@@ -1832,7 +1841,7 @@ class ServerArgs:
         elif "Llama4" in model_arch and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
-                if is_sm100_supported():
+                if is_sm100_supported() and not is_sm103_supported():
                     self.attention_backend, platform = "trtllm_mha", "sm100"
                 elif is_sm90_supported():
                     self.attention_backend, platform = "fa3", "sm90"
@@ -1891,7 +1900,7 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
             if self.attention_backend is None:
-                if is_cuda() and is_sm100_supported():
+                if is_cuda() and is_sm100_supported() and not is_sm103_supported():
                     self.attention_backend = "trtllm_mha"
                 elif is_cuda() and get_device_sm() >= 80:
                     self.attention_backend = "fa3"
@@ -1977,7 +1986,7 @@ class ServerArgs:
                 "Qwen3_5ForConditionalGeneration",
             ]:
                 sm100_default_attn_backend = "triton"
-                if is_sm100_supported():
+                if is_sm100_supported() and not is_sm103_supported():
                     # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
                     # _get_default_attn_backend handles the eagle_topk check.
                     # There is only one case where page_size=1 is required,
@@ -2126,6 +2135,7 @@ class ServerArgs:
     ):
         if (
             is_sm100_supported()
+            and not is_sm103_supported()
             and self.attention_backend is None
             and sm100_default_attention_backend is not None
         ):
@@ -2240,6 +2250,7 @@ class ServerArgs:
                 return "fa3"
             elif (
                 is_sm100_supported()
+                and not is_sm103_supported()
                 and is_no_spec_infer_or_topk_one(self)
                 and (
                     self.speculative_algorithm is None
@@ -2367,9 +2378,13 @@ class ServerArgs:
                 if self.prefill_attention_backend is not None
                 else self.attention_backend
             )
-            if prefill_backend == "trtllm_mha" and not is_sm100_supported():
+            if prefill_backend == "trtllm_mha" and (
+                not is_sm100_supported() or is_sm103_supported()
+            ):
                 raise ValueError(
-                    "TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100). Please use a different prefill backend."
+                    "TRTLLM MHA backend for prefill is only supported on SM100. "
+                    "(G)B300 (SM103) is temporarily disabled due to hangs at high concurrency. "
+                    "Please use a different prefill backend."
                 )
 
             # Check decode backend
@@ -2379,10 +2394,14 @@ class ServerArgs:
                 else self.attention_backend
             )
             if decode_backend == "trtllm_mha" and not (
-                is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+                is_sm90_supported()
+                or (is_sm100_supported() and not is_sm103_supported())
+                or is_sm120_supported()
             ):
                 raise ValueError(
-                    "TRTLLM MHA backend for decode is only supported on Hopper (SM90), Blackwell (SM100) and (SM120) GPUs. Please use a different decode backend."
+                    "TRTLLM MHA backend for decode is only supported on Hopper (SM90), SM100, and SM120 GPUs. "
+                    "(G)B300 (SM103) is temporarily disabled due to hangs at high concurrency. "
+                    "Please use a different decode backend."
                 )
 
             if self.page_size not in [16, 32, 64]:
@@ -2412,13 +2431,6 @@ class ServerArgs:
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
-
-        # MUSA platforms compatible backends
-        if is_musa() and self.attention_backend == "fa3":
-            logger.warning(
-                "FA3 attention backend on MUSA ignores any user-provided page_size and enforces a fixed value of 64."
-            )
-            self.page_size = 64
 
         # Other platforms backends
         if (
@@ -4143,6 +4155,12 @@ class ServerArgs:
             "--incremental-streaming-output",
             action="store_true",
             help="Whether to output as a sequence of disjoint segments.",
+        )
+        parser.add_argument(
+            "--stream-response-default-include-usage",
+            action="store_true",
+            help="Include usage in every streaming response "
+            "(even when stream_options is not specified).",
         )
         parser.add_argument(
             "--stream-output",
@@ -6175,6 +6193,14 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            hf_config = self.get_model_config().hf_config
+            assert is_deepseek_nsa(hf_config), (
+                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
+                "(e.g., DeepSeek V3.2, GLM-5). "
+            )
+
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
