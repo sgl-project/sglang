@@ -82,6 +82,7 @@ diffusion_common = [
   "scikit-image==0.25.2",
   "trimesh>=4.0.0",
   "xatlas",
+  "librosa",
 ]
 
 tracing = [
@@ -159,6 +160,7 @@ diffusion_mps = [
   "sglang[diffusion_common]",
   "trimesh>=4.0.0",
   "xatlas",
+  "librosa",
 ]
 
 test = [

@@ -728,9 +728,47 @@ def post_process_sample(
     upscaling_model_path: Optional[str] = None,
     upscaling_scale: int = 4,
 ) -> list[Any]:
-    """materialize frames and save outputs (optional)"""
+    """materialize frames and save outputs (optional)
+
+    Dispatches on ``data_type``:
+        - ``DataType.AUDIO``: writes a WAV file via soundfile and returns None.
+        - ``DataType.IMAGE`` / ``DataType.VIDEO``: converts tensor/array to uint8
+            HWC frames, optionally runs frame interpolation and upscaling, saves as
+            PNG/MP4, and returns the frame list.
+      """
     if data_type == DataType.ACTION:
         return []
+
+    # Audio-only path (DataType.AUDIO)
+    if data_type == DataType.AUDIO:
+        if save_output and save_file_path:
+            try:
+                import soundfile as sf
+            except ImportError as e:
+                raise ImportError(
+                    "soundfile is required for audio output. "
+                    "Install with: pip install soundfile"
+                ) from e
+            if isinstance(sample, torch.Tensor):
+                audio_np = sample.squeeze().detach().cpu().numpy()
+            else:
+                audio_np = np.squeeze(sample)
+            sr = audio_sample_rate or 24000
+            os.makedirs(os.path.dirname(os.path.abspath(save_file_path)), exist_ok=True)
+            sf.write(save_file_path, audio_np, sr)
+            logger.info(
+                "Audio saved to %s%s%s  (%.2fs @ %dHz)",
+                CYAN,
+                save_file_path,
+                RESET,
+                len(audio_np) / sr,
+                sr,
+            )
+        return None  # no video frames to return
+
+    audio = None
+    if isinstance(sample, (tuple, list)) and len(sample) == 2:
+        sample, audio = sample
 
     materialized = materialize_output_sample(
         sample,
