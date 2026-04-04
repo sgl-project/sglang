@@ -122,21 +122,6 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     @lru_cache(maxsize=1)
-    def get_modelopt_fp4_linear_backend(cls) -> str:
-        backend = (envs.SGLANG_DIFFUSION_NVFP4_LINEAR_BACKEND or "cutlass").lower()
-        if backend in ("", "auto"):
-            return "cutlass"
-        if backend not in {"cutlass", "comfy"}:
-            logger.warning(
-                "Unsupported SGLANG_DIFFUSION_NVFP4_LINEAR_BACKEND=%r. "
-                "Falling back to 'cutlass'.",
-                backend,
-            )
-            return "cutlass"
-        return backend
-
-    @classmethod
-    @lru_cache(maxsize=1)
     def get_modelopt_flashinfer_fp4_backend(cls) -> str:
         backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
         if backend is None:
@@ -169,60 +154,6 @@ class CudaPlatformBase(Platform):
             return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
         except ImportError:
             return None, None
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def has_modelopt_fp4_best_performance_kit(cls) -> bool:
-        try:
-            import comfy_kitchen.backends.cuda  # noqa: F401
-
-            return True
-        except Exception:
-            return False
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def can_use_modelopt_fp4_best_performance_kit(cls) -> bool:
-        if not cls.is_blackwell() or not cls.has_modelopt_fp4_best_performance_kit():
-            return False
-
-        try:
-            import comfy_kitchen.backends.cuda as ck_cuda
-
-            device = cls.get_local_torch_device()
-            x = torch.zeros((16, 16), dtype=torch.bfloat16, device=device)
-            scale = torch.ones((), dtype=torch.float32, device=device)
-            ck_cuda.quantize_nvfp4(x, scale, pad_16x=True)
-            return True
-        except Exception as e:
-            logger.warning(
-                "Requested comfy-kitchen NVFP4 backend is installed but unusable on "
-                "this system (%s). Blackwell NVFP4 will fall back to the generic "
-                "ModelOpt FP4 path.",
-                e,
-            )
-            return False
-
-    @classmethod
-    def should_use_modelopt_fp4_best_performance_kit(cls) -> bool:
-        if cls.get_modelopt_fp4_linear_backend() != "comfy":
-            return False
-        return cls.can_use_modelopt_fp4_best_performance_kit()
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def warn_if_modelopt_fp4_best_performance_kit_missing(cls) -> None:
-        if cls.get_modelopt_fp4_linear_backend() != "comfy":
-            return
-
-        if cls.is_blackwell() and not cls.has_modelopt_fp4_best_performance_kit():
-            logger.warning(
-                "Requested comfy-kitchen NVFP4 backend is not installed. "
-                "Blackwell NVFP4 will fall back to the generic ModelOpt FP4 path. "
-                "Install it with `pip install comfy-kitchen[cublas]` or unset "
-                "`SGLANG_DIFFUSION_NVFP4_LINEAR_BACKEND=comfy` to keep using "
-                "the default CUTLASS path."
-            )
 
     @classmethod
     def is_full_nvlink(cls, device_ids: list[int]) -> bool:

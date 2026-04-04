@@ -10,7 +10,6 @@ from typing import Any, Callable
 import flashinfer
 import sgl_kernel
 import torch
-from comfy_kitchen.backends import cuda as ck_cuda
 
 from sglang.jit_kernel.benchmark.utils import DEFAULT_DTYPE
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -35,7 +34,7 @@ WARMUP = 8
 ITERS = 20
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-METHODS = ("cutlass", "comfy", "flashinfer_auto", "flashinfer_cudnn")
+METHODS = ("cutlass", "flashinfer_auto", "flashinfer_cudnn")
 
 
 def benchmark_provider(
@@ -91,25 +90,18 @@ def build_quantized_inputs(
     if w_sf.dtype == torch.uint8:
         w_sf = w_sf.view(torch.float8_e4m3fn)
 
-    x_ck_fp4, x_ck_sf = ck_cuda.quantize_nvfp4(x, x_global_scale, pad_16x=True)
-    w_ck_fp4, w_ck_sf = ck_cuda.quantize_nvfp4(w, w_global_scale, pad_16x=True)
-
     return {
         "x_fp4": x_fp4,
         "w_fp4": w_fp4,
         "x_sf": x_sf,
         "w_sf": w_sf,
-        "x_ck_fp4": x_ck_fp4,
-        "w_ck_fp4": w_ck_fp4,
-        "x_ck_sf": x_ck_sf,
-        "w_ck_sf": w_ck_sf,
-        "x_global_scale": x_global_scale,
-        "w_global_scale": w_global_scale,
         "alpha": alpha,
     }
 
 
-def make_shape_id(model: str, shape_kind: str, prefix: str, m: int, n: int, k: int) -> str:
+def make_shape_id(
+    model: str, shape_kind: str, prefix: str, m: int, n: int, k: int
+) -> str:
     prefix_slug = re.sub(r"[^a-zA-Z0-9]+", "_", prefix).strip("_")
     return f"{model}_{shape_kind}_{prefix_slug}_{m}x{n}x{k}"
 
@@ -117,12 +109,16 @@ def make_shape_id(model: str, shape_kind: str, prefix: str, m: int, n: int, k: i
 def load_shape_cases(shape_library: Path) -> list[dict[str, Any]]:
     payload = json.loads(shape_library.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or not payload:
-        raise RuntimeError(f"Expected a non-empty model->shape list mapping in {shape_library}.")
+        raise RuntimeError(
+            f"Expected a non-empty model->shape list mapping in {shape_library}."
+        )
 
     rows: list[dict[str, Any]] = []
     for model, shapes in payload.items():
         if not isinstance(shapes, list):
-            raise RuntimeError(f"Expected {model} to map to a list of shapes in {shape_library}.")
+            raise RuntimeError(
+                f"Expected {model} to map to a list of shapes in {shape_library}."
+            )
         for shape in shapes:
             m, n, k = (int(x) for x in shape["shape"])
             count = int(shape["count"])
@@ -263,15 +259,6 @@ def run_shape_suite(shape_cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 quantized["w_sf"],
                 quantized["alpha"],
                 DTYPE,
-            ),
-            "comfy": lambda: ck_cuda.scaled_mm_nvfp4(
-                quantized["x_ck_fp4"],
-                quantized["w_ck_fp4"],
-                tensor_scale_a=quantized["x_global_scale"],
-                tensor_scale_b=quantized["w_global_scale"],
-                block_scale_a=quantized["x_ck_sf"],
-                block_scale_b=quantized["w_ck_sf"],
-                out_dtype=DTYPE,
             ),
             "flashinfer_auto": lambda: flashinfer.mm_fp4(
                 quantized["x_fp4"],

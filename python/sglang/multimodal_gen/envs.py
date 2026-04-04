@@ -277,10 +277,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
-    # Diffusion NVFP4 linear backend: cutlass (default) or comfy.
-    "SGLANG_DIFFUSION_NVFP4_LINEAR_BACKEND": _lazy_str(
-        "SGLANG_DIFFUSION_NVFP4_LINEAR_BACKEND", "cutlass"
-    ),
     # FlashInfer FP4 GEMM backend for the generic diffusion NVFP4 fallback.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
