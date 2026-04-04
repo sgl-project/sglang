@@ -83,6 +83,7 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
+        return_lse=return_softmax_lse,
     )
 
     if return_softmax_lse:
