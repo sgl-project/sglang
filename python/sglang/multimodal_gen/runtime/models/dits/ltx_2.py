@@ -1098,6 +1098,12 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     reverse_param_names_mapping = LTX2ArchConfig().reverse_param_names_mapping
     lora_param_names_mapping = LTX2ArchConfig().lora_param_names_mapping
 
+    @staticmethod
+    def _collapse_prompt_timestep(timestep: torch.Tensor) -> torch.Tensor:
+        if timestep.ndim <= 1:
+            return timestep
+        return timestep.amax(dim=tuple(range(1, timestep.ndim)))
+
     def _validate_tp_config(self, *, arch: LTX2ArchConfig, tp_size: int) -> None:
         """Validate TP-related dimension constraints (fail-fast)."""
         if tp_size < 1:
@@ -1485,11 +1491,16 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         temb_prompt = None
         temb_audio_prompt = None
         if self.prompt_adaln_single is not None:
-            temb_prompt, _ = self.prompt_adaln_single(timestep.flatten())
+            prompt_timestep = self._collapse_prompt_timestep(timestep)
+            temb_prompt, _ = self.prompt_adaln_single(
+                prompt_timestep.flatten(), hidden_dtype=hidden_dtype
+            )
             temb_prompt = temb_prompt.view(batch_size, -1, temb_prompt.size(-1))
         if self.audio_prompt_adaln_single is not None:
+            audio_prompt_timestep = self._collapse_prompt_timestep(audio_timestep)
             temb_audio_prompt, _ = self.audio_prompt_adaln_single(
-                audio_timestep.flatten()
+                audio_prompt_timestep.flatten(),
+                hidden_dtype=audio_hidden_states.dtype,
             )
             temb_audio_prompt = temb_audio_prompt.view(
                 batch_size, -1, temb_audio_prompt.size(-1)
