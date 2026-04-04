@@ -247,6 +247,17 @@ def test_ltx2_ti2v_clean_latent_keeps_legacy_background_when_requested():
     assert torch.equal(clean_latent[:, 2:], latents[:, 2:])
 
 
+def test_ltx23_velocity_to_x0_supports_tokenwise_sigma():
+    sample = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], dtype=torch.float32)
+    velocity = torch.tensor([[[0.5, 0.5], [1.0, 1.0]]], dtype=torch.float32)
+    sigma = torch.tensor([[0.0, 0.5]], dtype=torch.float32)
+
+    denoised = LTX2AVDenoisingStage._ltx2_velocity_to_x0(sample, velocity, sigma)
+
+    expected = torch.tensor([[[1.0, 2.0], [2.5, 3.5]]], dtype=torch.float32)
+    assert torch.allclose(denoised, expected)
+
+
 def test_pack_text_embeds_v2_masks_padding():
     hidden_states = torch.tensor(
         [

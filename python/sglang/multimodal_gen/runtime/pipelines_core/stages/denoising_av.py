@@ -167,6 +167,19 @@ class LTX2AVDenoisingStage(DenoisingStage):
         return latents, denoise_mask, clean_latent
 
     @staticmethod
+    def _ltx2_velocity_to_x0(
+        sample: torch.Tensor,
+        velocity: torch.Tensor,
+        sigma: float | torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(sigma, torch.Tensor):
+            sigma = sigma.to(device=sample.device, dtype=torch.float32)
+            while sigma.ndim < sample.ndim:
+                sigma = sigma.unsqueeze(-1)
+            return (sample.float() - sigma * velocity.float()).to(sample.dtype)
+        return (sample.float() - float(sigma) * velocity.float()).to(sample.dtype)
+
+    @staticmethod
     def _ltx2_step_dump_dir(step_index: int) -> Path | None:
         dump_dir = os.environ.get("SGLANG_DIFFUSION_LTX2_STEP_DUMP_DIR")
         if not dump_dir:
@@ -879,14 +892,19 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             if a_v_neg is not None:
                                 a_v_neg = a_v_neg.float()
 
-                        # Velocity -> denoised (x0): x0 = x - sigma * v
                         sigma_val = float(sigma.item())
-                        denoised_video = (latents.float() - sigma_val * v_pos).to(
-                            latents.dtype
+                        video_sigma_for_x0: float | torch.Tensor = sigma_val
+                        if do_ti2v and denoise_mask is not None:
+                            video_sigma_for_x0 = (
+                                sigma.to(device=latents.device, dtype=torch.float32)
+                                * denoise_mask.squeeze(-1)
+                            )
+                        denoised_video = self._ltx2_velocity_to_x0(
+                            latents, v_pos, video_sigma_for_x0
                         )
-                        denoised_audio = (
-                            audio_latents.float() - sigma_val * a_v_pos
-                        ).to(audio_latents.dtype)
+                        denoised_audio = self._ltx2_velocity_to_x0(
+                            audio_latents, a_v_pos, sigma_val
+                        )
                         denoised_video_cond = denoised_video
                         denoised_audio_cond = denoised_audio
                         denoised_video_neg = None
@@ -904,12 +922,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             and v_neg is not None
                             and a_v_neg is not None
                         ):
-                            denoised_video_neg = (
-                                latents.float() - sigma_val * v_neg
-                            ).to(latents.dtype)
-                            denoised_audio_neg = (
-                                audio_latents.float() - sigma_val * a_v_neg
-                            ).to(audio_latents.dtype)
+                            denoised_video_neg = self._ltx2_velocity_to_x0(
+                                latents, v_neg, video_sigma_for_x0
+                            )
+                            denoised_audio_neg = self._ltx2_velocity_to_x0(
+                                audio_latents, a_v_neg, sigma_val
+                            )
                         if stage1_guider_params is not None:
                             video_skip = self._ltx2_should_skip_step(
                                 i, int(stage1_guider_params["video_skip_step"])
@@ -952,11 +970,15 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         ),
                                     )
                                 denoised_video_perturbed = (
-                                    latents.float() - sigma_val * v_ptb.float()
-                                ).to(latents.dtype)
+                                    self._ltx2_velocity_to_x0(
+                                        latents, v_ptb.float(), video_sigma_for_x0
+                                    )
+                                )
                                 denoised_audio_perturbed = (
-                                    audio_latents.float() - sigma_val * a_v_ptb.float()
-                                ).to(audio_latents.dtype)
+                                    self._ltx2_velocity_to_x0(
+                                        audio_latents, a_v_ptb.float(), sigma_val
+                                    )
+                                )
 
                             need_modality = (
                                 float(stage1_guider_params["video_modality_scale"])
@@ -990,11 +1012,15 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         disable_v2a_cross_attn=True,
                                     )
                                 denoised_video_modality = (
-                                    latents.float() - sigma_val * v_mod.float()
-                                ).to(latents.dtype)
+                                    self._ltx2_velocity_to_x0(
+                                        latents, v_mod.float(), video_sigma_for_x0
+                                    )
+                                )
                                 denoised_audio_modality = (
-                                    audio_latents.float() - sigma_val * a_v_mod.float()
-                                ).to(audio_latents.dtype)
+                                    self._ltx2_velocity_to_x0(
+                                        audio_latents, a_v_mod.float(), sigma_val
+                                    )
+                                )
 
                             if not video_skip:
                                 denoised_video = self._ltx2_calculate_guided_x0(
