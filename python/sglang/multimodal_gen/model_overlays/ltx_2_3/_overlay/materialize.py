@@ -205,12 +205,12 @@ def _repack_ltx23_video_decoder_weights(
             if key == "per_channel_statistics.mean-of-means":
                 tensor = f.get_tensor(key)
                 tensors["decoder.per_channel_statistics.mean_of_means"] = tensor
-                tensors["latents_mean"] = tensor
+                tensors["latents_mean"] = tensor.clone()
                 continue
             if key == "per_channel_statistics.std-of-means":
                 tensor = f.get_tensor(key)
                 tensors["decoder.per_channel_statistics.std_of_means"] = tensor
-                tensors["latents_std"] = tensor
+                tensors["latents_std"] = tensor.clone()
                 continue
     if not tensors:
         raise ValueError("No LTX-2.3 decoder tensors found in donor checkpoint.")
