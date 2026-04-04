@@ -90,6 +90,141 @@ def align_fp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     layer.output2_scales_scalar = Parameter(output2_scales_scalar, requires_grad=False)
 
 
+def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
+    """Prepare MXFP8 MoE weights/scales for FlashInfer TRT-LLM kernels."""
+    from flashinfer import (
+        reorder_rows_for_gated_act_gemm,
+        shuffle_matrix_a,
+        shuffle_matrix_sf_a,
+    )
+
+    w13_weight = cast(torch.Tensor, layer.w13_weight).contiguous()
+    w2_weight = cast(torch.Tensor, layer.w2_weight).contiguous()
+    w13_scale = cast(torch.Tensor, layer.w13_weight_scale_inv).contiguous()
+    w2_scale = cast(torch.Tensor, layer.w2_weight_scale_inv).contiguous()
+
+    assert w13_scale.dtype == torch.uint8
+    assert w2_scale.dtype == torch.uint8
+
+    num_experts, two_n, _ = w13_weight.shape
+    _, hidden_size, _ = w2_weight.shape
+    epilogue_tile_m = 128
+
+    w13_interleaved = [
+        reorder_rows_for_gated_act_gemm(w13_weight[i]) for i in range(num_experts)
+    ]
+    w13_scale_interleaved = [
+        reorder_rows_for_gated_act_gemm(w13_scale[i]) for i in range(num_experts)
+    ]
+
+    w13_shuffled = [
+        shuffle_matrix_a(w13_interleaved[i].view(torch.uint8), epilogue_tile_m)
+        for i in range(num_experts)
+    ]
+    w2_shuffled = [
+        shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
+        for i in range(num_experts)
+    ]
+    w13_scale_shuffled = [
+        shuffle_matrix_sf_a(
+            w13_scale_interleaved[i].view(torch.uint8).reshape(two_n, -1),
+            epilogue_tile_m,
+        )
+        for i in range(num_experts)
+    ]
+    w2_scale_shuffled = [
+        shuffle_matrix_sf_a(
+            w2_scale[i].view(torch.uint8).reshape(hidden_size, -1),
+            epilogue_tile_m,
+        )
+        for i in range(num_experts)
+    ]
+
+    # Keep parameter identities stable for CUDA graph capture reuse.
+    copy_or_rebind_param(
+        layer, "w13_weight", torch.stack(w13_shuffled).view(torch.float8_e4m3fn)
+    )
+    copy_or_rebind_param(
+        layer, "w2_weight", torch.stack(w2_shuffled).view(torch.float8_e4m3fn)
+    )
+    copy_or_rebind_param(
+        layer,
+        "w13_weight_scale_inv",
+        torch.stack(w13_scale_shuffled).reshape_as(w13_scale).contiguous(),
+    )
+    copy_or_rebind_param(
+        layer,
+        "w2_weight_scale_inv",
+        torch.stack(w2_scale_shuffled).reshape_as(w2_scale).contiguous(),
+    )
+    layer.w13_weight_scale_inv.format_ue8m0 = True
+    layer.w2_weight_scale_inv.format_ue8m0 = True
+
+
+def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
+    """Prepare FP4 MoE weights/scales for FlashInfer TRT-LLM kernels.
+
+    This function handles the weight transformation needed for FP4 TRTLLM MoE:
+    - Reorders weights for gated activation GEMM
+    - Shuffles weights and scales for transposed MMA output
+    - Computes the output scale factors
+    """
+    from sglang.srt.layers.quantization.utils import (
+        prepare_static_weights_for_trtllm_fp4_moe,
+    )
+
+    w13_weight = cast(torch.Tensor, layer.w13_weight)
+    w2_weight = cast(torch.Tensor, layer.w2_weight)
+    w13_weight_scale = cast(torch.Tensor, layer.w13_weight_scale)
+    w2_weight_scale = cast(torch.Tensor, layer.w2_weight_scale)
+
+    (
+        gemm1_weights_fp4_shuffled,
+        gemm1_scales_fp4_shuffled,
+        gemm2_weights_fp4_shuffled,
+        gemm2_scales_fp4_shuffled,
+    ) = prepare_static_weights_for_trtllm_fp4_moe(
+        w13_weight,
+        w2_weight,
+        w13_weight_scale,
+        w2_weight_scale,
+        w2_weight.size(-2),  # hidden_size
+        w13_weight.size(-2) // 2,  # intermediate_size
+        w13_weight.size(0),  # num_experts
+    )
+
+    # Set flashinfer parameters
+    copy_or_rebind_param(
+        layer, "gemm1_weights_fp4_shuffled", gemm1_weights_fp4_shuffled
+    )
+    copy_or_rebind_param(
+        layer, "gemm2_weights_fp4_shuffled", gemm2_weights_fp4_shuffled
+    )
+    copy_or_rebind_param(layer, "gemm1_scales_fp4_shuffled", gemm1_scales_fp4_shuffled)
+    copy_or_rebind_param(layer, "gemm2_scales_fp4_shuffled", gemm2_scales_fp4_shuffled)
+
+    # Compute additional scaling factor needed for TRT-LLM
+    w2_input_scale_quant = cast(torch.Tensor, layer.w2_input_scale_quant)
+    g1_alphas = cast(torch.Tensor, layer.g1_alphas)
+    copy_or_rebind_param(
+        layer,
+        "g1_scale_c",
+        (w2_input_scale_quant * g1_alphas).to(torch.float32),
+    )
+
+    # In RL mode (enable_memory_saver), keep original weights/scales so that
+    # in-place weight updates can re-write and re-process them.
+    # In pure inference mode, delete to save GPU memory.
+    from sglang.srt.server_args import get_global_server_args
+    if not get_global_server_args().enable_memory_saver:
+        del (
+            layer.w2_weight,
+            layer.w2_weight_scale,
+            layer.w13_weight,
+            layer.w13_weight_scale,
+        )
+
+
 @dataclass
 class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer TRT-LLM FP8 MoE kernels."""

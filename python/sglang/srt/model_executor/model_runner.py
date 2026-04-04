@@ -1357,7 +1357,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
+        self._post_process_nvfp4_weights_if_needed()
         return True, "Success"
+
+    def _post_process_nvfp4_weights_if_needed(self):
+        """Re-run process_weights_after_loading on NVFP4 layers after weight update.
+
+        NVFP4 layers need padding/shuffling for GEMM kernels after raw weights
+        are updated. This is a no-op if the model has no NVFP4 quantization.
+        """
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp4LinearMethod,
+            ModelOptNvFp4FusedMoEMethod,
+        )
+        target_types = (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)
+        for _, module in self.model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if isinstance(quant_method, target_types):
+                quant_method.process_weights_after_loading(module)
 
     def _update_weights_from_flattened_bucket(
         self,
@@ -1388,6 +1405,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Load the reconstructed tensors using the standard method
         self.model.load_weights(reconstructed_tensors)
+        self._post_process_nvfp4_weights_if_needed()
 
         return True, "Success"
 
