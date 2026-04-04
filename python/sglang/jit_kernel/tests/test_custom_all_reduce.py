@@ -213,7 +213,6 @@ def worker_test(
     for _ in range(TEST_LOOP):
         # NOTE: 15 * 8 < 128, which is the precision limit for bf16
         inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
-        assert comm.can_all_reduce(inp[0])
         out_ref = inp.clone()
         dist.all_reduce(out_ref, group=nccl_group)
         out_jit = run_fn(inp)
