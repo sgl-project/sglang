@@ -51,10 +51,14 @@ def _rename_connector_key(key: str) -> str | None:
     if key.startswith(VIDEO_CONNECTOR_PREFIX):
         suffix = key[len(VIDEO_CONNECTOR_PREFIX) :]
         suffix = suffix.replace("transformer_1d_blocks", "transformer_blocks")
+        suffix = suffix.replace(".attn1.q_norm.", ".attn1.norm_q.")
+        suffix = suffix.replace(".attn1.k_norm.", ".attn1.norm_k.")
         return f"video_connector.{suffix}"
     if key.startswith(AUDIO_CONNECTOR_PREFIX):
         suffix = key[len(AUDIO_CONNECTOR_PREFIX) :]
         suffix = suffix.replace("transformer_1d_blocks", "transformer_blocks")
+        suffix = suffix.replace(".attn1.q_norm.", ".attn1.norm_q.")
+        suffix = suffix.replace(".attn1.k_norm.", ".attn1.norm_k.")
         return f"audio_connector.{suffix}"
     if key.startswith(TEXT_PROJ_IN_PREFIX):
         return key[len(MONOLITH_PREFIX) :]

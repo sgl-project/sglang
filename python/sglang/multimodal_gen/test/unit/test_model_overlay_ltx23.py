@@ -7,6 +7,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     _gemma_postprocess_func,
     pack_text_embeds_v2,
 )
+from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
+    _rename_connector_key,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -127,3 +130,12 @@ def test_ltx23_gemma_postprocess_uses_v2_norm():
 
     expected = torch.tensor([[[0.6, 0.8]]], dtype=packed.dtype, device=packed.device)
     assert torch.allclose(packed, expected, atol=1e-6)
+
+
+def test_ltx23_connector_repack_renames_qk_norm_keys():
+    assert _rename_connector_key(
+        "model.diffusion_model.video_embeddings_connector.transformer_1d_blocks.0.attn1.q_norm.weight"
+    ) == "video_connector.transformer_blocks.0.attn1.norm_q.weight"
+    assert _rename_connector_key(
+        "model.diffusion_model.audio_embeddings_connector.transformer_1d_blocks.1.attn1.k_norm.weight"
+    ) == "audio_connector.transformer_blocks.1.attn1.norm_k.weight"
