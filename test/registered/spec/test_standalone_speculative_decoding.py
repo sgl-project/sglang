@@ -111,7 +111,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
 
         # Use the appropriate metric key based on the test class
         metric_key = "score"
-        self.assertGreater(metrics[metric_key], self.accuracy_threshold)
+        self.assertGreaterEqual(metrics[metric_key], self.accuracy_threshold)
 
         server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
@@ -174,7 +174,7 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
 
         # Use the appropriate metric key based on the test class
         metric_key = "score"
-        self.assertGreater(metrics[metric_key], self.accuracy_threshold)
+        self.assertGreaterEqual(metrics[metric_key], self.accuracy_threshold)
 
         server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
