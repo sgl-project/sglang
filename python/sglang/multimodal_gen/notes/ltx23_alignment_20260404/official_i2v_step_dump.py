@@ -26,6 +26,8 @@ IMAGE_PATH = os.environ.get("LTX23_IMAGE_PATH", "/tmp/ltx23_i2v_input_sunset.png
 DUMP_PATH = Path(os.environ.get("LTX23_OFFICIAL_STEP_DUMP", "/tmp/ltx23_official_i2v_step0.pt"))
 TARGET_STEP = int(os.environ.get("LTX23_TARGET_STEP", "0"))
 STREAMING_PREFETCH_COUNT = int(os.environ.get("LTX23_STREAMING_PREFETCH_COUNT", "1"))
+ATTN_DUMP_DIR = os.environ.get("LTX23_ATTN_DUMP_DIR")
+ATTN_DUMP_MAX_CALLS = int(os.environ.get("LTX23_ATTN_DUMP_MAX_CALLS", "4"))
 
 
 def resolve_single_path(pattern: str) -> Path:
@@ -349,9 +351,61 @@ def main() -> None:
     )
 
     dumped = False
+    attn_hook_patched = False
+    attn_dump_call_idx = 0
 
     def dump_loop(sigmas, video_state, audio_state, stepper, transformer, denoiser):
-        nonlocal dumped
+        nonlocal dumped, attn_hook_patched, attn_dump_call_idx
+        if not attn_hook_patched and ATTN_DUMP_DIR:
+            Path(ATTN_DUMP_DIR).mkdir(parents=True, exist_ok=True)
+            target_attn = (
+                transformer._model.velocity_model.transformer_blocks[0].video_to_audio_attn
+            )
+            original_forward = target_attn.forward
+
+            def _dumping_forward(
+                x,
+                context=None,
+                mask=None,
+                pe=None,
+                k_pe=None,
+                perturbation_mask=None,
+                all_perturbed=False,
+            ):
+                nonlocal attn_dump_call_idx
+                context_ = x if context is None else context
+                out = original_forward(
+                    x,
+                    context=context,
+                    mask=mask,
+                    pe=pe,
+                    k_pe=k_pe,
+                    perturbation_mask=perturbation_mask,
+                    all_perturbed=all_perturbed,
+                )
+                if attn_dump_call_idx < ATTN_DUMP_MAX_CALLS:
+                    torch.save(
+                        {
+                            "prefix": "transformer_blocks.0.video_to_audio_attn",
+                            "call_index": attn_dump_call_idx,
+                            "x": x.detach().cpu(),
+                            "context": context_.detach().cpu(),
+                            "mask": None if mask is None else mask.detach().cpu(),
+                            "pe_cos": None if pe is None else pe[0].detach().cpu(),
+                            "pe_sin": None if pe is None else pe[1].detach().cpu(),
+                            "k_pe_cos": None if k_pe is None else k_pe[0].detach().cpu(),
+                            "k_pe_sin": None if k_pe is None else k_pe[1].detach().cpu(),
+                            "out": out.detach().cpu(),
+                        },
+                        Path(ATTN_DUMP_DIR)
+                        / f"transformer_blocks.0.video_to_audio_attn.call{attn_dump_call_idx}.pt",
+                    )
+                attn_dump_call_idx += 1
+                return out
+
+            target_attn.forward = _dumping_forward
+            attn_hook_patched = True
+
         for step_idx, _ in enumerate(sigmas[:-1]):
             denoised_video, denoised_audio = denoiser(
                 transformer, video_state, audio_state, sigmas, step_idx

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -39,12 +40,61 @@ logger = init_logger(__name__)
 
 ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
+_LTX2_ATTENTION_DUMP_CALL_COUNTS: dict[str, int] = {}
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
     return ADALN_NUM_BASE_PARAMS + (
         ADALN_NUM_CROSS_ATTN_PARAMS if cross_attention_adaln else 0
     )
+
+
+def _ltx2_maybe_dump_attention_tensors(
+    *,
+    prefix: str,
+    x: torch.Tensor,
+    context: torch.Tensor,
+    mask: torch.Tensor | None,
+    pe: tuple[torch.Tensor, torch.Tensor] | None,
+    k_pe: tuple[torch.Tensor, torch.Tensor] | None,
+    q: torch.Tensor | None,
+    k: torch.Tensor | None,
+    v: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    dump_dir = os.environ.get("SGLANG_DIFFUSION_LTX2_ATTN_DUMP_DIR")
+    if not dump_dir:
+        return
+
+    name_filter = os.environ.get(
+        "SGLANG_DIFFUSION_LTX2_ATTN_DUMP_FILTER", "video_to_audio_attn"
+    )
+    if name_filter and name_filter not in prefix:
+        return
+
+    max_calls = int(os.environ.get("SGLANG_DIFFUSION_LTX2_ATTN_DUMP_MAX_CALLS", "4"))
+    call_idx = _LTX2_ATTENTION_DUMP_CALL_COUNTS.get(prefix, 0)
+    if call_idx >= max_calls:
+        return
+    _LTX2_ATTENTION_DUMP_CALL_COUNTS[prefix] = call_idx + 1
+
+    os.makedirs(dump_dir, exist_ok=True)
+    payload = {
+        "prefix": prefix,
+        "call_index": call_idx,
+        "x": x.detach().cpu(),
+        "context": context.detach().cpu(),
+        "mask": None if mask is None else mask.detach().cpu(),
+        "pe_cos": None if pe is None else pe[0].detach().cpu(),
+        "pe_sin": None if pe is None else pe[1].detach().cpu(),
+        "k_pe_cos": None if k_pe is None else k_pe[0].detach().cpu(),
+        "k_pe_sin": None if k_pe is None else k_pe[1].detach().cpu(),
+        "q": None if q is None else q.detach().cpu(),
+        "k": None if k is None else k.detach().cpu(),
+        "v": v.detach().cpu(),
+        "out": out.detach().cpu(),
+    }
+    torch.save(payload, os.path.join(dump_dir, f"{prefix}.call{call_idx}.pt"))
 
 
 def apply_interleaved_rotary_emb(
@@ -472,6 +522,7 @@ class LTX2Attention(nn.Module):
         self.qk_norm = bool(qk_norm)
         self.use_local_attention = bool(use_local_attention)
         self.apply_gated_attention = bool(apply_gated_attention)
+        self.prefix = prefix
 
         tp_size = get_tp_world_size()
         if tp_size <= 0:
@@ -636,6 +687,19 @@ class LTX2Attention(nn.Module):
             out = out.view(b, t, self.local_heads, self.dim_head)
             out = out * (2.0 * torch.sigmoid(gate_logits).unsqueeze(-1))
             out = out.view(b, t, self.local_heads * self.dim_head)
+
+        _ltx2_maybe_dump_attention_tensors(
+            prefix=self.prefix,
+            x=x,
+            context=context_,
+            mask=mask,
+            pe=pe,
+            k_pe=k_pe,
+            q=q if use_attention else None,
+            k=k if use_attention else None,
+            v=v,
+            out=out,
+        )
 
         out = out.flatten(2)
         out, _ = self.to_out[0](out)
