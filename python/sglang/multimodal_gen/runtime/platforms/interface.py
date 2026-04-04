@@ -208,6 +208,14 @@ class Platform:
         return None, None
 
     @classmethod
+    def get_modelopt_fp4_linear_backend(cls) -> str:
+        return "cutlass"
+
+    @classmethod
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        return "auto"
+
+    @classmethod
     def has_modelopt_fp4_best_performance_kit(cls) -> bool:
         return False
 
