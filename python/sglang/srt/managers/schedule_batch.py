@@ -1281,15 +1281,18 @@ class Req(ReqDllmMixin):
         )
 
     def update_reasoning_tokens(self, token_id, think_end_id):
+        if self._is_reasoning_over:
+            return
+
         if not isinstance(token_id, list):
             token_id = [token_id]
 
-        if not self._is_reasoning_over:
-            for tok_id in token_id:
-                self.reasoning_tokens += 1
-                if tok_id == think_end_id:
-                    self._is_reasoning_over = True
-                    break
+        try:
+            end_pos = token_id.index(think_end_id)
+            self.reasoning_tokens += end_pos + 1
+            self._is_reasoning_over = True
+        except ValueError:
+            self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
         return (
