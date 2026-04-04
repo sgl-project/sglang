@@ -1730,21 +1730,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
-        for mm_input in multimodal_inputs:
-            if mm_input is None:
-                continue
-            for mm_item in mm_input.mm_items:
-                pixel_values = getattr(mm_item, "feature", None)
-                if isinstance(pixel_values, torch.Tensor):
-                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
-                if get_global_server_args().language_only:
-                    precomputed_embeddings = getattr(
-                        mm_item, "precomputed_embeddings", None
-                    )
-                    if isinstance(precomputed_embeddings, torch.Tensor):
-                        mm_item.precomputed_embeddings = precomputed_embeddings.to(
-                            self.device, non_blocking=True
-                        )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
