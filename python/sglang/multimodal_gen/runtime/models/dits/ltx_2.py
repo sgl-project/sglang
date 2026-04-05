@@ -1271,6 +1271,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         rope_double_precision = bool(
             hf_config.get("rope_double_precision", arch.double_precision_rope)
         )
+        self.quantize_video_rope_coords_to_hidden_dtype = bool(
+            hf_config.get("quantize_video_rope_coords_to_hidden_dtype", False)
+        )
         causal_offset = int(hf_config.get("causal_offset", 1))
 
         pos_embed_max_pos = int(arch.positional_embedding_max_pos[0])
@@ -1474,9 +1477,12 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 device=audio_hidden_states.device,
             )
 
-        video_coords = video_coords.to(
-            device=hidden_states.device, dtype=hidden_states.dtype
-        )
+        if self.quantize_video_rope_coords_to_hidden_dtype:
+            video_coords = video_coords.to(
+                device=hidden_states.device, dtype=hidden_states.dtype
+            )
+        else:
+            video_coords = video_coords.to(device=hidden_states.device)
         audio_coords = audio_coords.to(device=audio_hidden_states.device)
 
         video_rotary_emb = self.rope(video_coords, device=hidden_states.device)

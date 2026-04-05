@@ -124,6 +124,7 @@ class LTX2ArchConfig(DiTArchConfig):
     attention_type: LTX2AttentionFunction = LTX2AttentionFunction.DEFAULT
     rope_type: LTX2RopeType = LTX2RopeType.INTERLEAVED
     double_precision_rope: bool = False
+    quantize_video_rope_coords_to_hidden_dtype: bool = False
     apply_gated_attention: bool = False
     cross_attention_adaln: bool = False
     caption_proj_before_connector: bool = False
