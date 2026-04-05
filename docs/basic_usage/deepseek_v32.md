@@ -1,10 +1,9 @@
-# DeepSeek V3.2 Usage
+# DeepSeek V3.2/GLM-5 Usage
 
 DeepSeek-V3.2 model family equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
 
-For reporting issues or tracking upcoming features, please refer to this [Roadmap](https://github.com/sgl-project/sglang/issues/11060).
 
-Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser.
+Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser. [GLM-5](https://huggingface.co/zai-org/GLM-5) model also applies DSA(Deepseek sparse attention) structure, so can share most of the usage here, except for reasoning parser and tool call parser.
 
 
 ## Installation
@@ -38,7 +37,8 @@ cd sglang
 pip3 install pip --upgrade
 pip3 install -e "python"
 ```
-## Launch DeepSeek V3.2 with SGLang
+
+## Launch DeepSeek V3.2/GLM-5 with SGLang
 
 To serve [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) on 8xH200/B200 GPUs:
 
@@ -56,23 +56,26 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
 ```
 
+To server GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
+
 ### Configuration Tips
-- **DP Attention (Recommended)**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`, so DP attention (`--dp 8 --enable-dp-attention`) is the recommended configuration for better stability and performance. All test cases use this configuration by default.
-- **Pure TP Mode**: Launching with pure TP (without `--dp` and `--enable-dp-attention`) is also supported. Note that this mode has not been fully validated in PD disaggregation scenarios.
-- **Short-sequence MHA prefill (adaptive)**: For short prefill sequences (default threshold: **2048 tokens**), the NSA backend uses standard MHA automatically (no extra flags). On H200 (SM90) this path uses the FlashAttention variable-length kernel; on B200 (SM100) it uses TRT-LLM ragged MHA. MHA uses `MHA_ONE_SHOT` for best performance. `MHA_ONE_SHOT` computes multi-head attention over all tokens (both cached prefix and newly extended tokens) in a single kernel invocation, avoiding the overhead of chunked KV cache processing. This achieves optimal throughput for short sequences where total sequence length fits within the chunk capacity limit.
+- **DP Attention**: To enable [DP Attention](../advanced_features/dp_dpa_smg_guide.md), please include `--enable-dp-attention --dp <dp-size>` in command. DP Attention is better for large concurrency scenarios.
+- **TP Attention**: Launching with TP attention is also supported. TP attention is better for low latency scenarios.
+- **Short-sequence MHA prefill (adaptive)**: For short prefill sequences (default threshold: **2048 tokens**), the NSA backend uses standard MHA automatically (no extra flags). On H200 (SM90) this path uses the FlashAttention variable-length kernel; on B200 (SM100) it uses TRT-LLM ragged MHA. MHA uses `MHA_ONE_SHOT` for best performance, which computes multi-head attention over all tokens (both cached prefix and newly extended tokens) in a single kernel invocation, avoiding the overhead of chunked KV cache processing. This achieves optimal throughput for short sequences where total sequence length fits within the chunk capacity limit.
+- **MHA prefill threshold relax** To apply MHA attention to requests longer than 2048 tokens, please set flag `SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` to a value larger than 2048. As threshold grows larger, the prefill performance can be improved, but at the cost of potential accuracy drop.
 - **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill-backend` and `--nsa-decode-backend` server arguments. The choices of nsa prefill/decode attention kernels include:
   - `flashmla_sparse`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, kv inputs.
   - `flashmla_kv`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, fp8 k_cache inputs.
+  - `flashmla_auto`: enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. When FP8 KV cache is enabled and `total_kv_tokens < total_q_tokens * 512`, it uses the `flashmla_sparse` kernel; otherwise, it falls back to the `flashmla_kv` kernel. The heuristics may need to be tuned if the performance of either the `flashmla_sparse` or `flashmla_kv` kernel changes significantly.
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs. It requires bf16 q, kv inputs.
   - `tilelang`: `tilelang` implementation that can run on GPU, HPU and NPU.
   - `aiter`: Aiter kernel on AMD HPUs. Can only be used as decode kernel.
-  - `trtllm`: `trtllm-mla` sparse kernel from flashinfer library. Only run on blackwell GPUs. It requires QKV bf16 or QKV fp8.
-- On the basis of performance benchmarks, the default configuration on H200 and B200 are set as follows :
-  - H200: `flashmla_sparse` prefill attention (short-seq prefill uses MHA via FlashAttention varlen), `fa3` decode attention, `bf16` kv cache dtype.
-  - B200: `flashmla_auto` prefill attention (short-seq prefill uses MHA via TRT-LLM ragged), `flashmla_kv` decode attention, `fp8_e4m3` kv cache dtype. `flashmla_auto` enables automatic selection of either `flashmla_sparse` or `flashmla_kv` kernel for prefill based on KV cache dtype, hardware, and heuristics. When FP8 KV cache is enabled and `total_kv_tokens < total_q_tokens * 512`, it uses the `flashmla_sparse` kernel; otherwise, it falls back to the `flashmla_kv` kernel. The heuristics may need to be tuned if the performance of either the `flashmla_sparse` or `flashmla_kv` kernel changes significantly.
-- On Blackwell platform, with slightly accuracy drop, the performance can boost up to 3x-5x
-  - B200: by choosing `trtllm` for both `--nsa-prefill-backend` and `--nsa-decode-backend`, the prefill attention use MHA via TRT-LLM ragged for both short and long sequence (**accuracy impact**). Combine the `trtllm` with `fp8_e4m3` kv cache, the kv cache dim is `576` (kv_lora_rank + qk_rope_head_dim) (**accuracy impact**), compare to the combination of `flashmla_auto` and `fp8_e4m` kv cache dim is `656` (kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage).
-
+  - `trtllm`: `trtllm-mla` sparse kernel from flashinfer library. Only run on blackwell GPUs. It requires q,k,v to be uniformly bf16 or fp8_e4m3 format.
+  - On the basis of performance benchmarks, the default configuration of DSA kernels on Hopper and Blackwell are set as follows :
+    - Bfloat 16 kv cache: On Hopper, `flashmla_sparse` prefill attention, `fa3` decode attention; On Blackwell, `flashmla_sparse` prefill attention, `trtllm` decode attention
+    - Float8_e3m4 kv cachew: On Hopper, `flashmla_auto` prefill attention, `flashmla_kv` decode attention; On Blackwell, `trtllm` prefill attention and `trtllm` decode attention.
+- **Skip Softmax Attention**: Introduced in [BLAAST](https://arxiv.org/abs/2512.12087), skip-softmax attention can improve speed by dynamically pruning attention matrices. Use `SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR` for controlling prefill kernel sparsity, and use `SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR` for controlling decode kernel sparsity. Setting a higher sparsity can gain more speedup, but at the risk of lower accuracy. Skip-softmax attention can only be applied to trtllm-gem kernels on Blackwell.
+- **Index Cache**: Introduce in [this paper](https://arxiv.org/abs/2603.12201), IndexCache improves speed by reusing the result of indexer across different layers, only at cost of negligible accuracy loss.  We recommend appending `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to command for better tradeoff between speedup and performance.
 
 ## Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
@@ -91,7 +94,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --sp
 - The default value of  `--max-running-requests` is set to `48` for MTP. For larger batch sizes, this value should be increased beyond the default value.
 
 ```{tip}
-To enable the experimental overlap scheduler for EAGLE speculative decoding, set the environment variable `SGLANG_ENABLE_SPEC_V2=1`. This can improve performance by enabling overlap scheduling between draft and verification stages.
+To enable overlap scheduler for EAGLE speculative decoding, we recommend setting the environment variable `SGLANG_ENABLE_SPEC_V2=1`. This can improve performance by enabling overlap scheduling between draft and verification stages.
 ```
 
 
@@ -127,6 +130,15 @@ python3 -m sglang.launch_server \
   --trust-remote-code \
   --tp-size 8 --dp-size 8 --enable-dp-attention \
   --reasoning-parser deepseek-v3
+```
+
+To launch `GLM-5` with function calling and reasoning parser:
+```bash
+python -m sglang.launch_server \
+  --model zai-org/GLM-5-FP8 \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
 ```
 
 ## NVFP4 Checkpoint
