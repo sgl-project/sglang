@@ -293,7 +293,9 @@ class TestFusedTemperatureSoftmax(CustomTestCase):
         fused = fused_temperature_softmax(logits, temps)
         fi = flashinfer_softmax(logits, temperature=temps.view(-1))
         moderate = temps.view(-1) >= 0.5
-        self._check_close(fused[moderate], fi[moderate], *_TOL[torch.bfloat16]["native_ref"])
+        self._check_close(
+            fused[moderate], fi[moderate], *_TOL[torch.bfloat16]["native_ref"]
+        )
 
 
 if __name__ == "__main__":
