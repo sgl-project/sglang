@@ -388,7 +388,9 @@ class TestCreateGrammarBackend(unittest.TestCase):
         tokenizer = MagicMock()
         tokenizer.think_end_id = 42
 
-        result = create_grammar_backend(args, tokenizer, 32000)
+        result = create_grammar_backend(
+            args, tokenizer, 32000, think_end_id=tokenizer.think_end_id
+        )
         self.assertIsInstance(result, ReasonerGrammarBackend)
         self.assertEqual(result.think_end_id, 42)
         self.assertIs(result.grammar_backend, mock_backend)
@@ -401,7 +403,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         args = self._make_server_args("outlines", reasoning_parser="deepseek")
         tokenizer = MagicMock(spec=[])  # No think_end_id attribute
 
-        result = create_grammar_backend(args, tokenizer, 32000)
+        result = create_grammar_backend(args, tokenizer, 32000, think_end_id=None)
         self.assertIs(result, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
@@ -413,7 +415,9 @@ class TestCreateGrammarBackend(unittest.TestCase):
         tokenizer = MagicMock()
         tokenizer.think_end_id = 42
 
-        result = create_grammar_backend(args, tokenizer, 32000)
+        result = create_grammar_backend(
+            args, tokenizer, 32000, think_end_id=tokenizer.think_end_id
+        )
         self.assertIs(result, mock_backend)
 
     @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
