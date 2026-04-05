@@ -27,7 +27,7 @@ QWEN35_FP4_MODEL = "nvidia/Qwen3.5-397B-A17B-NVFP4"
 ACC_THRESHOLDS = {QWEN35_FP4_MODEL: {"gsm8k": 0.95}}
 
 
-class TestQwen35FP4(unittest.TestCase):
+class TestQwen35FP4(CustomTestCase):
     def test_gsm8k(self):
         base_args = [
             "--tp-size",
