@@ -233,9 +233,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             spec_result = get_linear_attn_config(runner.model_config.hf_config)
             if spec_result is not None:
                 spec, _ = spec_result
-                assert not (
-                    spec.mla_incompatible and runner.use_mla_backend
-                ), f"MLA backend is not compatible with {spec.config_class.__name__}"
                 BackendClass = import_backend_class(spec.backend_class_name)
                 linear_attn_backend = BackendClass(runner)
             else:

@@ -36,7 +36,6 @@ class LinearAttnModelSpec:
     support_mamba_cache: bool = True
     support_mamba_cache_extra_buffer: bool = False
     unwrap_text_config: bool = False  # call get_text_config() before isinstance check
-    mla_incompatible: bool = False
 
 
 _LINEAR_ATTN_MODEL_REGISTRY: list[LinearAttnModelSpec] = []
