@@ -1592,8 +1592,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # Lazy-initialized on first forward; None means "not yet computed"
-        self._gfx95_quant_format: Optional[str] = "" if not _is_gfx95_supported else None
+        self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
         if self.nsa_enable_prefill_cp:
             self.layer_communicator = NSACPLayerCommunicator(
@@ -1649,9 +1648,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self._gfx95_quant_format is None:
-            self._gfx95_quant_format = self._detect_gfx95_quant_format()
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
