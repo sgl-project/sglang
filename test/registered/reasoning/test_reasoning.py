@@ -1,12 +1,14 @@
 import json
 import unittest
 
-import openai
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.reasoning_tokens_kit import ReasoningTokenUsageMixin
+from sglang.test.kits.reasoning_kit import (
+    ReasoningTokenUsageMixin,
+    SeparateReasoningMixin,
+)
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -19,7 +21,9 @@ register_cuda_ci(est_time=109, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
+class TestEnableThinking(
+    ReasoningTokenUsageMixin, SeparateReasoningMixin, CustomTestCase
+):
     reasoning_parser_name = "qwen3"
 
     @classmethod
@@ -45,7 +49,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_chat_completion_with_reasoning(self):
-        # Test non-streaming with "enable_thinking": True, reasoning_content should not be empty
         client = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -69,7 +72,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
         self.assertIsNotNone(data["choices"][0]["message"]["reasoning_content"])
 
     def test_chat_completion_without_reasoning(self):
-        # Test non-streaming with "enable_thinking": False, reasoning_content should be empty
         client = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -94,7 +96,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
             self.assertIsNone(data["choices"][0]["message"]["reasoning_content"])
 
     def test_stream_chat_completion_with_reasoning(self):
-        # Test streaming with "enable_thinking": True, reasoning_content should not be empty
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -115,7 +116,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
         has_reasoning = False
         has_content = False
 
-        print("\n=== Stream With Reasoning ===")
         for line in response.iter_lines():
             if line:
                 line = line.decode("utf-8")
@@ -139,7 +139,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
         )
 
     def test_stream_chat_completion_without_reasoning(self):
-        # Test streaming with "enable_thinking": False, reasoning_content should  be empty
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -160,7 +159,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
         has_reasoning = False
         has_content = False
 
-        print("\n=== Stream Without Reasoning ===")
         for line in response.iter_lines():
             if line:
                 line = line.decode("utf-8")
@@ -183,160 +181,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
             has_content, "The stream response does not contain normal content"
         )
 
-    def test_streaming_separate_reasoning_false(self):
-        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": "What is 1+3?"}],
-            "max_tokens": 100,
-            "stream": True,
-            "extra_body": {"separate_reasoning": False},
-        }
-        response = client.chat.completions.create(**payload)
-
-        reasoning_content = ""
-        content = ""
-        for chunk in response:
-            if chunk.choices[0].delta.content:
-                content += chunk.choices[0].delta.content
-            elif chunk.choices[0].delta.reasoning_content:
-                reasoning_content += chunk.choices[0].delta.reasoning_content
-
-        assert len(reasoning_content) == 0
-        assert len(content) > 0
-
-    def test_streaming_separate_reasoning_true(self):
-        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": "What is 1+3?"}],
-            "max_tokens": 100,
-            "stream": True,
-            "extra_body": {"separate_reasoning": True},
-        }
-        response = client.chat.completions.create(**payload)
-
-        reasoning_content = ""
-        content = ""
-        for chunk in response:
-            if chunk.choices[0].delta.content:
-                content += chunk.choices[0].delta.content
-            elif chunk.choices[0].delta.reasoning_content:
-                reasoning_content += chunk.choices[0].delta.reasoning_content
-
-        assert len(reasoning_content) > 0
-        assert len(content) > 0
-
-    def test_streaming_separate_reasoning_true_stream_reasoning_false(self):
-        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": "What is 1+3?"}],
-            "max_tokens": 100,
-            "stream": True,
-            "extra_body": {"separate_reasoning": True, "stream_reasoning": False},
-        }
-        response = client.chat.completions.create(**payload)
-
-        reasoning_content = ""
-        content = ""
-        first_chunk = False
-        for chunk in response:
-            if chunk.choices[0].delta.reasoning_content:
-                reasoning_content = chunk.choices[0].delta.reasoning_content
-                first_chunk = True
-            if chunk.choices[0].delta.content:
-                content += chunk.choices[0].delta.content
-                if not first_chunk:
-                    reasoning_content = chunk.choices[0].delta.reasoning_content
-                first_chunk = True
-            if not first_chunk:
-                assert (
-                    not chunk.choices[0].delta.reasoning_content
-                    or len(chunk.choices[0].delta.reasoning_content) == 0
-                )
-        assert len(reasoning_content) > 0
-        assert len(content) > 0
-
-    def test_nonstreaming_separate_reasoning_false(self):
-        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": "What is 1+3?"}],
-            "max_tokens": 100,
-            "extra_body": {"separate_reasoning": False},
-        }
-        response = client.chat.completions.create(**payload)
-
-        assert (
-            not response.choices[0].message.reasoning_content
-            or len(response.choices[0].message.reasoning_content) == 0
-        )
-        assert len(response.choices[0].message.content) > 0
-
-    def test_nonstreaming_separate_reasoning_true(self):
-        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": "What is 1+3?"}],
-            "max_tokens": 100,
-            "extra_body": {"separate_reasoning": True},
-        }
-        response = client.chat.completions.create(**payload)
-
-        assert len(response.choices[0].message.reasoning_content) > 0
-        assert len(response.choices[0].message.content) > 0
-
-
-# Skip for ci test
-# class TestGLM45EnableThinking(TestEnableThinking):
-#     @classmethod
-#     def setUpClass(cls):
-#         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-#         cls.model = "THUDM/GLM-4.5"
-#         cls.base_url = DEFAULT_URL_FOR_TEST
-#         cls.api_key = "sk-1234"
-#         cls.process = popen_launch_server(
-#             cls.model,
-#             cls.base_url,
-#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-#             api_key=cls.api_key,
-#             other_args=[
-#                 "--tool-call-parser",
-#                 "glm45",
-#                 "--reasoning-parser",
-#                 "glm45",
-#                 "--tp-size",
-#                 "8"
-#             ],
-#         )
-
-#         # Validate whether enable-thinking conflict with tool_calls
-#         cls.additional_chat_kwargs = {
-#             "tools": [
-#                 {
-#                     "type": "function",
-#                     "function": {
-#                         "name": "add",
-#                         "description": "Compute the sum of two numbers",
-#                         "parameters": {
-#                             "type": "object",
-#                             "properties": {
-#                                 "a": {
-#                                     "type": "int",
-#                                     "description": "A number",
-#                                 },
-#                                 "b": {
-#                                     "type": "int",
-#                                     "description": "A number",
-#                                 },
-#                             },
-#                             "required": ["a", "b"],
-#                         },
-#                     },
-#                 }
-#             ]
-#         }
 
 if __name__ == "__main__":
     unittest.main()

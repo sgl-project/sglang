@@ -7,7 +7,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.reasoning_tokens_kit import ReasoningTokenUsageMixin
+from sglang.test.kits.reasoning_kit import ReasoningTokenUsageMixin
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
