@@ -194,9 +194,7 @@ def init_process_dst(
             remote_instance_weight_loader_send_weights_group_ports=ports,
             load_format="remote_instance",
             remote_instance_weight_loader_backend=remote_instance_loader_backend,
-            remote_instance_weight_loader_start_seed_via_transfer_engine=(
-                remote_instance_loader_backend == "transfer_engine"
-            ),
+            remote_instance_weight_loader_start_seed_via_transfer_engine=False,
         )
     else:
         host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
