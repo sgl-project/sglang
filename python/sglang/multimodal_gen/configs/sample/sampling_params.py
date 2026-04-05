@@ -240,13 +240,6 @@ class SamplingParams:
         if self.height is None and self._default_height is not None:
             self.height = self._default_height
 
-    def build_request_extra(self) -> dict[str, Any]:
-        extra = {}
-        diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
-        if diffusers_kwargs:
-            extra["diffusers_kwargs"] = diffusers_kwargs
-        return extra
-
         # Handle output_quality to output_compression conversion
         if self.output_compression is None and self.output_quality is not None:
             self.output_compression = self._adjust_output_quality(
@@ -259,6 +252,13 @@ class SamplingParams:
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+    def build_request_extra(self) -> dict[str, Any]:
+        extra = {}
+        diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
+        if diffusers_kwargs:
+            extra["diffusers_kwargs"] = diffusers_kwargs
+        return extra
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""

@@ -47,6 +47,23 @@ MODEL_OVERLAY_METADATA_PATTERNS = [
 _MODEL_OVERLAY_REGISTRY_CACHE: dict[str, dict[str, Any]] | None = None
 
 
+def _compute_overlay_fingerprint(overlay_dir: str) -> str:
+    hasher = hashlib.sha256()
+    for root, dir_names, file_names in os.walk(overlay_dir):
+        dir_names[:] = sorted(
+            d for d in dir_names if d != "__pycache__" and not d.endswith(".egg-info")
+        )
+        for file_name in sorted(file_names):
+            if file_name.endswith((".safetensors", ".bin", ".pth", ".pt")):
+                continue
+            file_path = os.path.join(root, file_name)
+            rel_path = os.path.relpath(file_path, overlay_dir).replace(os.sep, "/")
+            hasher.update(rel_path.encode("utf-8"))
+            with open(file_path, "rb") as f:
+                hasher.update(hashlib.sha256(f.read()).digest())
+    return hasher.hexdigest()
+
+
 def _resolve_bundled_overlay_dir(overlay_spec: dict[str, Any]) -> str | None:
     bundled_overlay_subdir = overlay_spec.get("bundled_overlay_subdir")
     if not bundled_overlay_subdir:
@@ -453,6 +470,7 @@ def materialize_overlay_model(
     materializer_version = str(manifest.get("materializer_version", "v1"))
     overlay_repo_id = str(overlay_spec["overlay_repo_id"])
     overlay_revision = str(overlay_spec.get("overlay_revision", "main"))
+    overlay_fingerprint = _compute_overlay_fingerprint(overlay_dir)
     cache_key = hashlib.sha256(
         json.dumps(
             {
@@ -460,6 +478,7 @@ def materialize_overlay_model(
                 "overlay_repo_id": overlay_repo_id,
                 "overlay_revision": overlay_revision,
                 "materializer_version": materializer_version,
+                "overlay_fingerprint": overlay_fingerprint,
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -536,6 +555,7 @@ def materialize_overlay_model(
                     "overlay_repo_id": overlay_repo_id,
                     "overlay_revision": overlay_revision,
                     "materializer_version": materializer_version,
+                    "overlay_fingerprint": overlay_fingerprint,
                 },
                 f,
                 indent=2,

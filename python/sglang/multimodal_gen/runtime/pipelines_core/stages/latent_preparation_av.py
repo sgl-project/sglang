@@ -87,7 +87,9 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
         return (batch_size, latent_length, channels * mel_bins)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if not is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+        if not is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        ):
             batch = super().forward(batch, server_args)
 
             try:

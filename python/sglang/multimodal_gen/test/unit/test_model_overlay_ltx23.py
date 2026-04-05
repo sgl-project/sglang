@@ -10,7 +10,6 @@ from safetensors.torch import save_file
 
 pytest.importorskip("triton.compiler")
 
-from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEArchConfig
 from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     _gemma_postprocess_func,
@@ -172,20 +171,6 @@ def test_ltx23_native_variant_uses_explicit_marker_only():
     assert is_ltx23_native_variant(legacy_arch) is False
 
 
-def test_ltx23_arch_config_normalizes_legacy_overlay_flags():
-    arch_config = LTXVideoVAEArchConfig()
-    arch_config.use_official_image_encoder = True
-    arch_config.official_image_encoder_subdir = "ltx23_image_encoder"
-    arch_config.use_official_video_decoder = True
-    arch_config.official_vae_config = {"decoder_base_channels": 128}
-    arch_config.__post_init__()
-
-    assert arch_config.ltx_variant == "ltx_2_3"
-    assert arch_config.condition_encoder_subdir == "ltx23_image_encoder"
-    assert arch_config.video_decoder_variant == "ltx_2_3"
-    assert arch_config.video_decoder_config == {"decoder_base_channels": 128}
-
-
 def test_ltx23_skips_mu_when_using_official_sigma_schedule():
     req = Req(
         sampling_params=SamplingParams(num_frames=121, height=512, width=768),
@@ -329,10 +314,20 @@ def test_ltx2_legacy_latent_preparation_keeps_unpacked_noise_path():
 
     server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2")),
-            prepare_latent_shape=lambda _batch, _batch_size, _num_frames: (1, 2, 3, 4, 5),
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(ltx_variant="ltx_2")
+            ),
+            prepare_latent_shape=lambda _batch, _batch_size, _num_frames: (
+                1,
+                2,
+                3,
+                4,
+                5,
+            ),
             maybe_prepare_latent_ids=lambda latents: None,
-            maybe_pack_latents=lambda latents, _batch_size, _batch: latents.flatten(2, 4).transpose(1, 2),
+            maybe_pack_latents=lambda latents, _batch_size, _batch: latents.flatten(
+                2, 4
+            ).transpose(1, 2),
             use_temporal_scaling_frames=True,
         )
     )

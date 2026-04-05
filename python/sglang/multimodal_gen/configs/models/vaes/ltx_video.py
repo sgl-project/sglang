@@ -58,28 +58,6 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
     video_decoder_variant: str = "ltx_2"
     video_decoder_config: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        legacy_image_encoder_subdir = self.extra_attrs.get(
-            "official_image_encoder_subdir"
-        )
-        if not self.condition_encoder_subdir and legacy_image_encoder_subdir:
-            self.condition_encoder_subdir = str(legacy_image_encoder_subdir)
-
-        if self.ltx_variant == "ltx_2" and (
-            self.extra_attrs.get("use_official_image_encoder", False)
-            or self.extra_attrs.get("use_official_video_decoder", False)
-        ):
-            self.ltx_variant = "ltx_2_3"
-
-        if self.video_decoder_variant == "ltx_2" and self.extra_attrs.get(
-            "use_official_video_decoder", False
-        ):
-            self.video_decoder_variant = "ltx_2_3"
-
-        legacy_video_decoder_config = self.extra_attrs.get("official_vae_config")
-        if not self.video_decoder_config and legacy_video_decoder_config:
-            self.video_decoder_config = dict(legacy_video_decoder_config)
-
 
 @dataclass
 class LTXVideoVAEConfig(VAEConfig):
