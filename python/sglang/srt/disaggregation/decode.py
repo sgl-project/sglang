@@ -949,7 +949,10 @@ class DecodeTransferQueue:
         self.queue.extend(decode_reqs)
         if self.enable_staging:
             for dr in decode_reqs:
-                if dr.kv_receiver.require_staging:
+                if (
+                    hasattr(dr.kv_receiver, "require_staging")
+                    and dr.kv_receiver.require_staging
+                ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
