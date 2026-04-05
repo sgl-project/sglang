@@ -431,8 +431,6 @@ class SchedulerOutputProcessorMixin:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
-            # Spec V1: output_ids, check_finished, grammar, reasoning tokens, and logprob
-            # are handled in the verify phase. Only common bookkeeping remains here.
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
