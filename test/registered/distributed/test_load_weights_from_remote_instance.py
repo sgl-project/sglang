@@ -15,7 +15,6 @@ weights from the seed instance at any time.
 
 import gc
 import os
-import random
 import unittest
 
 import numpy as np
@@ -358,8 +357,9 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend, dst_instance_id
         if is_in_ci():
-            mode = random.choice(["Engine", "Server"])
-            remote_instance_loader_backend = random.choice(["nccl", "transfer_engine"])
+            # DEBUG: fix to Engine+nccl to reproduce race condition
+            mode = "Engine"
+            remote_instance_loader_backend = "nccl"
             test_suits = [
                 (
                     1,
