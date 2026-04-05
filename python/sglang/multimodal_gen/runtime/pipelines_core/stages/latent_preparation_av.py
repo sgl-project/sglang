@@ -1,6 +1,9 @@
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    is_ltx23_native_variant,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
@@ -84,8 +87,11 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
         return (batch_size, latent_length, channels * mel_bins)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if not is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+            return super().forward(batch, server_args)
+
         # 1. Prepare video latents directly in packed token space.
-        # Official LTX2 pipelines sample noise after patchify; generating unpacked
+        # Official LTX-2.3 pipelines sample noise after patchify; generating unpacked
         # [B, C, F, H, W] noise and packing afterwards changes token ordering.
         latent_num_frames = self.adjust_video_length(batch, server_args)
         batch_size = batch.batch_size

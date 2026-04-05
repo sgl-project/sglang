@@ -148,7 +148,7 @@ class LTX2PipelineConfig(PipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.TI2V
     skip_input_image_preprocess: bool = True
-    generator_device: str = "cuda"
+    generator_device: str = "cpu"
     dit_config: LTX2Config = field(default_factory=LTX2Config)
 
     # Model architecture

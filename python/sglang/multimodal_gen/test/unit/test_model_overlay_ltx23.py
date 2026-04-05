@@ -107,6 +107,19 @@ def test_ltx23_defaults_to_cuda_generator():
     assert pipeline_config.generator_device == "cuda"
 
 
+def test_ltx2_defaults_to_cpu_generator():
+    sampling_params = SamplingParams.from_pretrained(
+        "Lightricks/LTX-2",
+        backend="sglang",
+    )
+    pipeline_config = get_model_info(
+        "Lightricks/LTX-2", backend="sglang"
+    ).pipeline_config_cls()
+
+    assert sampling_params.generator_device == "cpu"
+    assert pipeline_config.generator_device == "cpu"
+
+
 def test_ltx23_uses_official_sigma_schedule():
     sigmas = build_official_ltx2_sigmas(30)
 
@@ -287,6 +300,46 @@ def test_ltx23_ti2v_clean_latent_uses_zero_background():
     assert torch.equal(clean_latent[:, 2:], torch.zeros_like(clean_latent[:, 2:]))
     assert torch.equal(denoise_mask[:, :2], torch.zeros_like(denoise_mask[:, :2]))
     assert torch.equal(denoise_mask[:, 2:], torch.ones_like(denoise_mask[:, 2:]))
+
+
+def test_ltx2_legacy_latent_preparation_keeps_unpacked_noise_path():
+    stage = LTX2AVLatentPreparationStage(
+        scheduler=SimpleNamespace(init_noise_sigma=1.0),
+    )
+    batch = Req(
+        sampling_params=SamplingParams(
+            height=32,
+            width=32,
+            num_frames=9,
+            fps=24,
+            seed=1,
+            num_outputs_per_prompt=1,
+        ),
+        prompt="prompt",
+        prompt_embeds=[torch.zeros(1, 1, 1)],
+    )
+    batch.generator = [torch.Generator(device="cpu").manual_seed(1)]
+    batch.batch_size = 1
+    batch.latents = None
+    batch.audio_latents = None
+    batch.generate_audio = False
+    batch.height = 32
+    batch.width = 32
+    batch.num_frames = 9
+
+    server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2")),
+            prepare_latent_shape=lambda _batch, _batch_size, _num_frames: (1, 2, 3, 4, 5),
+            maybe_prepare_latent_ids=lambda latents: None,
+            maybe_pack_latents=lambda latents, _batch_size, _batch: latents.flatten(2, 4).transpose(1, 2),
+            use_temporal_scaling_frames=True,
+        )
+    )
+
+    out = stage.forward(batch, server_args)
+
+    assert out.latents.shape == (1, 60, 2)
 
 
 def test_ltx2_ti2v_clean_latent_keeps_legacy_background_when_requested():

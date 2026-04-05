@@ -12,7 +12,7 @@ class LTX2SamplingParams(SamplingParams):
     # Match the reference defaults used by ltx-pipelines (one-stage).
     # See: LTX-2/packages/ltx-pipelines/src/ltx_pipelines/utils/constants.py
     seed: int = 10
-    generator_device: str = "cuda"
+    generator_device: str = "cpu"
 
     # Video parameters
     height: int = 512
@@ -47,6 +47,7 @@ class LTX2SamplingParams(SamplingParams):
 class LTX23SamplingParams(LTX2SamplingParams):
     """Sampling parameters matching official LTX-2.3 one-stage defaults."""
 
+    generator_device: str = "cuda"
     guidance_scale: float = 3.0
     num_inference_steps: int = 30
 
