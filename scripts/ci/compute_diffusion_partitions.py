@@ -53,7 +53,7 @@ def compute_partition_count(
         Number of partitions needed
     """
     if not cases:
-        return max(0, min_partitions)
+        return 0
 
     total_time = sum(c.est_time for c in cases)
 
