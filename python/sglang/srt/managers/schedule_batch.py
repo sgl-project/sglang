@@ -331,7 +331,15 @@ class MultimodalDataItem:
         return ret
 
     def reconstruct(self):
-        if not isinstance(self.feature, CudaIpcTensorTransportProxy):
+        has_proxy = (
+            isinstance(self.feature, CudaIpcTensorTransportProxy)
+            or isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
+            or any(
+                isinstance(v, CudaIpcTensorTransportProxy)
+                for v in self.model_specific_data.values()
+            )
+        )
+        if not has_proxy:
             return
 
         reconstruct_device = torch.cuda.current_device()
