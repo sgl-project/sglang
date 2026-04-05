@@ -63,6 +63,7 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.semantic_prefix import SemanticPrefixProvider
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -331,6 +332,7 @@ class RadixCache(BasePrefixCache):
             )
 
         self.evictable_leaves = set()
+        self._semantic_provider: Optional[SemanticPrefixProvider] = None
         self.reset()
 
     @classmethod
@@ -371,6 +373,24 @@ class RadixCache(BasePrefixCache):
     ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
         return maybe_bigram_convert(self.is_eagle, key, value)
 
+    def set_semantic_provider(
+        self, provider: Optional[SemanticPrefixProvider]
+    ) -> None:
+        """Register a :class:`~sglang.srt.mem_cache.semantic_prefix.SemanticPrefixProvider`.
+
+        When set, :meth:`match_prefix` will call
+        :meth:`~SemanticPrefixProvider.on_prefix_miss` whenever the exact
+        radix-tree lookup returns zero cached tokens and ``params.req`` is
+        available.  Pass ``None`` to unregister a previously registered
+        provider.
+
+        Args:
+            provider: Provider instance, or ``None`` to clear.
+        """
+        self._semantic_provider = provider
+        if provider is not None:
+            provider.on_init()
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 
@@ -407,6 +427,57 @@ class RadixCache(BasePrefixCache):
             * If the lookup ends inside a stored segment the node is split once
                 to expose a precise boundary; this structural refinement improves
                 subsequent match efficiency and does not duplicate data.
+
+        Semantic fallback:
+            When a :class:`~sglang.srt.mem_cache.semantic_prefix.SemanticPrefixProvider`
+            has been registered via :meth:`set_semantic_provider` and the exact
+            lookup returns zero cached tokens, the provider's
+            :meth:`~SemanticPrefixProvider.on_prefix_miss` is called with the
+            request ID and token IDs.  If the provider returns an alternate
+            donor token sequence, a second exact lookup is performed against
+            those tokens, allowing the engine to reuse a semantically similar
+            cached prefix without re-computing the full prefill.
+        """
+        result = self._match_prefix_exact(params)
+
+        # Semantic fallback: if no tokens matched and a provider is registered,
+        # ask the provider for an alternate donor whose KV is already cached.
+        if (
+            len(result.device_indices) == 0
+            and self._semantic_provider is not None
+            and params.req is not None
+        ):
+            semantic_result = self._semantic_provider.on_prefix_miss(
+                rid=params.req.rid,
+                token_ids=list(params.key.token_ids),
+            )
+            if semantic_result is not None:
+                if semantic_result.source_id:
+                    logger.debug(
+                        "Semantic KV hit for req %s via donor %s "
+                        "(expected %d cached tokens)",
+                        params.req.rid,
+                        semantic_result.source_id,
+                        semantic_result.num_cached_tokens,
+                    )
+                alternate_key = RadixKey(
+                    semantic_result.alternate_token_ids,
+                    params.key.extra_key,
+                )
+                alternate_params = MatchPrefixParams(
+                    key=alternate_key,
+                    req=params.req,
+                )
+                result = self._match_prefix_exact(alternate_params)
+
+        return result
+
+    def _match_prefix_exact(self, params: MatchPrefixParams) -> MatchResult:
+        """Exact radix-tree prefix lookup with no semantic fallback.
+
+        This is the inner implementation called by :meth:`match_prefix`.
+        Callers that need the full semantic-fallback behaviour should use
+        :meth:`match_prefix` instead.
         """
         key = params.key
         key, _ = self.maybe_bigram_convert(key)
@@ -496,6 +567,13 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
+            # Notify the semantic provider so it can register this request as
+            # a potential future donor for approximate KV reuse.
+            if self._semantic_provider is not None:
+                self._semantic_provider.on_request_cached(
+                    rid=req.rid,
+                    token_ids=list(token_ids),
+                )
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : len(keys)]
