@@ -41,6 +41,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
+    should_include_usage,
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -648,6 +649,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Usage tracking
         prompt_tokens = {}
+        reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
@@ -655,6 +657,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         try:
+            include_usage, continuous_usage_stats = should_include_usage(
+                request.stream_options,
+                self.tokenizer_manager.server_args.stream_response_default_include_usage,
+            )
+
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
@@ -663,6 +670,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
+                )
+                reasoning_tokens[index] = content["meta_info"].get(
+                    "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
@@ -743,12 +753,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
 
                         # Add usage stats if continuous_usage_stats is enabled
-                        if (
-                            request.stream_options
-                            and request.stream_options.continuous_usage_stats
-                        ):
+                        if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
 
@@ -767,6 +775,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         content,
                         request,
                         has_tool_calls,
+                        continuous_usage_stats,
                     ):
                         if chunk:
                             yield chunk
@@ -798,12 +807,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
 
                         # Add usage stats if continuous_usage_stats is enabled
-                        if (
-                            request.stream_options
-                            and request.stream_options.continuous_usage_stats
-                        ):
+                        if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
 
@@ -881,11 +888,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
-            if request.stream_options and request.stream_options.include_usage:
+            if include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
+                    reasoning_tokens,
                     completion_tokens,
-                    cached_tokens,
+                    cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
@@ -1313,6 +1321,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
+        continuous_usage_stats: bool = False,
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
@@ -1351,12 +1360,14 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             # Add usage stats if continuous_usage_stats is enabled
-            if request.stream_options and request.stream_options.continuous_usage_stats:
+            if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1401,12 +1412,14 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
             # Add usage stats if continuous_usage_stats is enabled
-            if request.stream_options and request.stream_options.continuous_usage_stats:
+            if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"

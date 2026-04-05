@@ -545,7 +545,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             )
             return config
     except EntryNotFoundError:
-        logger.warning(
+        logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )
