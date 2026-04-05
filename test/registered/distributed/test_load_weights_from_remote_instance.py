@@ -357,9 +357,9 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend, dst_instance_id
         if is_in_ci():
-            # DEBUG: fix to Engine+nccl to reproduce race condition
+            # DEBUG: fix to Engine+transfer_engine to reproduce flaky hang
             mode = "Engine"
-            remote_instance_loader_backend = "nccl"
+            remote_instance_loader_backend = "transfer_engine"
             test_suits = [
                 (
                     1,

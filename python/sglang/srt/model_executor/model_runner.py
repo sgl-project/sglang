@@ -1430,14 +1430,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         success = False
         message = ""
         try:
-            # DEBUG: delay seed NCCL group creation to reproduce race condition
-            import time
-
-            logger.info(
-                "DEBUG: sleeping 30s before init_custom_process_group on seed side"
-            )
-            time.sleep(30)
-
             na = NetworkAddress(master_address, group_port)
             self._weights_send_group[group_name] = init_custom_process_group(
                 backend=backend,
