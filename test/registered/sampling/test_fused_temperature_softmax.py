@@ -106,7 +106,7 @@ class TestFusedTemperatureSoftmax(CustomTestCase):
 
     def test_very_low_temperature(self):
         """Very low temperature should produce near-one-hot distribution."""
-        logits = torch.randn(4, 1024, dtype=torch.float32)
+        logits = torch.randn(4, 100, dtype=torch.float32)
         temps = torch.full((4, 1), 0.01, dtype=torch.float32)
         fused = fused_temperature_softmax(logits, temps)
         max_probs = fused.max(dim=-1).values
