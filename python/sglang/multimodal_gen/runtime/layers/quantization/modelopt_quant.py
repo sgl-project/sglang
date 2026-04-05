@@ -43,16 +43,6 @@ def _get_fp4_gemm_op():
     return current_platform.get_modelopt_fp4_gemm_op()
 
 
-@lru_cache(maxsize=1)
-def _get_comfy_kitchen_cuda_backend():
-    try:
-        import comfy_kitchen.backends.cuda as ck_cuda
-
-        return ck_cuda
-    except Exception:
-        return None
-
-
 class ModelOptQuantConfig(QuantizationConfig):
     def __init__(
         self,
@@ -224,20 +214,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         return False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        should_use_best_perf_kit = getattr(
-            current_platform, "should_use_modelopt_fp4_best_performance_kit", None
-        )
-        warn_missing_best_perf_kit = getattr(
-            current_platform, "warn_if_modelopt_fp4_best_performance_kit_missing", None
-        )
-
-        if callable(should_use_best_perf_kit) and should_use_best_perf_kit():
-            linear_cls = ComfyUIFp4LinearMethod
-        else:
-            if callable(warn_missing_best_perf_kit):
-                warn_missing_best_perf_kit()
-            linear_cls = ModelOptFp4LinearMethod
-        return self._get_quant_method(layer, prefix, Linear=linear_cls)
+        return self._get_quant_method(layer, prefix, Linear=ModelOptFp4LinearMethod)
 
 
 class ModelOptFp4LinearMethod(LinearMethodBase):
@@ -349,6 +326,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         K_padded = round_up(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
+        # Blockwise interleave for CUTLASS TMA layout required by CUTLASS kernel
+        padded_scales = padded_scales.reshape(
+            B, M_padded // 128, 4, 32, K_padded // 4, 4
+        )
+        padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
             padded_scales.reshape(M_padded, K_padded)
@@ -416,147 +398,4 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         if bias is not None:
             out = out + bias
-        return out.view(*output_shape)
-
-
-class ComfyUIFp4LinearMethod(LinearMethodBase):
-    """NVFP4 linear method using comfy-kitchen cuBLAS kernels (Blackwell)."""
-
-    def __init__(self, quant_config: ModelOptFp4Config):
-        self.quant_config = quant_config
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        del input_size, output_size
-        if not self.quant_config.is_checkpoint_nvfp4_serialized:
-            raise ValueError(
-                "NVFP4 quantization was selected, "
-                "dynamic quantization is not supported."
-            )
-        if input_size_per_partition % 16 != 0:
-            raise ValueError(
-                f"Unsupported model when input features size is {input_size_per_partition}, "
-                "not multiple of 16, for NVFP4 quantization."
-            )
-
-        output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
-
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // 2,
-                dtype=torch.uint8,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
-
-        input_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        set_weight_attrs(input_scale, {"missing_param_init": "ones"})
-        layer.register_parameter("input_scale", input_scale)
-
-        weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale_2", weight_scale_2)
-
-        weight_scale = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // self.quant_config.group_size,
-                dtype=torch.float8_e4m3fn,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from comfy_kitchen.float_utils import from_blocked, to_blocked
-
-        input_scale = layer.input_scale.max().to(torch.float32)
-        weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
-
-        copy_or_rebind_param(layer, "input_scale_ck", input_scale.cuda())
-        copy_or_rebind_param(layer, "weight_scale_2_ck", weight_scale_2.cuda())
-        layer.output_size_per_partition = layer.weight.shape[0]
-        copy_or_rebind_param(layer, "weight", layer.weight.data.contiguous().cuda())
-
-        # Checkpoint block scales are already in cuBLAS tiled layout.
-        # Pad to (roundup(N, 128), roundup(K//16, 4)) if needed.
-        scales = layer.weight_scale.data
-        N, Ks = scales.shape
-        N_padded = round_up(N, 128)
-        Ks_padded = round_up(Ks, 4)
-
-        if N == N_padded and Ks == Ks_padded:
-            weight_scale_ck = scales.cuda()
-        else:
-            scales_rm = from_blocked(scales, num_rows=N, num_cols=Ks)
-            padded_rm = torch.zeros((N_padded, Ks_padded), dtype=scales.dtype)
-            padded_rm[:N, :Ks] = scales_rm
-            weight_scale_ck = to_blocked(padded_rm, flatten=False).cuda()
-
-        copy_or_rebind_param(layer, "weight_scale_ck", weight_scale_ck)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        ck_cuda = _get_comfy_kitchen_cuda_backend()
-        if ck_cuda is None:
-            raise RuntimeError(
-                "comfy_kitchen is not available. "
-                "Install it to use ComfyUIFp4LinearMethod."
-            )
-
-        output_dtype = x.dtype
-        input_shape = x.shape
-        x_2d = x.view(-1, input_shape[-1])  # [M, K]
-        M = x_2d.shape[0]
-
-        output_size = layer.output_size_per_partition
-        output_shape = list(input_shape[:-1]) + [output_size]
-
-        if not x_2d.is_contiguous():
-            x_2d = x_2d.contiguous()
-
-        x_fp4, x_block_scale = ck_cuda.quantize_nvfp4(
-            x_2d, layer.input_scale_ck, pad_16x=True
-        )
-
-        out = ck_cuda.scaled_mm_nvfp4(
-            x_fp4,
-            layer.weight,
-            tensor_scale_a=layer.input_scale_ck,
-            tensor_scale_b=layer.weight_scale_2_ck,
-            block_scale_a=x_block_scale,
-            block_scale_b=layer.weight_scale_ck,
-            bias=bias,
-            out_dtype=output_dtype,
-        )
-        out = out[:M, :output_size].contiguous()
-
         return out.view(*output_shape)

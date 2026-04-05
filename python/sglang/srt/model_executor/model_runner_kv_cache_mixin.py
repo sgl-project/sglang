@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -32,6 +33,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllo
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
+    is_hip,
     is_npu,
 )
 
@@ -66,6 +68,7 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
@@ -255,9 +258,17 @@ class ModelRunnerKVCacheMixin:
         ):
             return kv_cache_dim
 
+        # On HIP with TileLang backend, keep the default MLA KV cache dimension.
+        # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
+        if _is_hip and (
+            self.server_args.nsa_prefill_backend == "tilelang"
+            or self.server_args.nsa_decode_backend == "tilelang"
+        ):
+            return kv_cache_dim
+
         quant_block_size = NSATokenToKVPool.quant_block_size
         rope_storage_dtype = NSATokenToKVPool.rope_storage_dtype
-        # Calculate override_kv_cache_dim for FP8 storage for non-trtllm attention backends:
+        # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
@@ -392,7 +403,11 @@ class ModelRunnerKVCacheMixin:
 
                 # subscribe memory for pre-allocated requests
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
-                pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
+
+                pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
+                pre_alloc_size = (
+                    max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
+                )
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_num_reqs,
@@ -401,11 +416,19 @@ class ModelRunnerKVCacheMixin:
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         cache_params=config.mamba2_cache_params,
+                        mamba_layer_ids=(
+                            [
+                                i
+                                for i in config.mamba2_cache_params.layers
+                                if self.start_layer <= i < self.end_layer
+                            ]
+                        ),
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                         mamba_size=self.server_args.max_mamba_cache_size,
+                        start_layer=self.start_layer,
                     )
                 else:
                     self.req_to_token_pool = DecodeReqToTokenPool(
@@ -426,9 +449,17 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
+                    mamba_layer_ids=(
+                        [
+                            i
+                            for i in config.mamba2_cache_params.layers
+                            if self.start_layer <= i < self.end_layer
+                        ]
+                    ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+                    start_layer=self.start_layer,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
@@ -643,6 +674,7 @@ class ModelRunnerKVCacheMixin:
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
+                    start_layer=self.start_layer,
                     **extra_args,
                 )
             else:

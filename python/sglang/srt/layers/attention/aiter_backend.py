@@ -2012,6 +2012,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
                 ):
+
                     token_to_kv_pool = forward_batch.token_to_kv_pool
                     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -2036,7 +2037,6 @@ class AiterAttnBackend(AttentionBackend):
                         k_scale=k_descale,
                         v_scale=v_descale,
                     )
-
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
@@ -2419,6 +2419,7 @@ class AiterAttnBackend(AttentionBackend):
             # use standard set_kv_buffer, as they lack SWA-specific attributes
             # like full_to_swa_index_mapping.
             if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
+
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -2502,7 +2503,7 @@ class AiterAttnBackend(AttentionBackend):
 
                 o = torch.empty_like(q, dtype=self.input_dtype)
 
-                max_kv_len = page_table.shape[1]
+                max_kv_len = page_table.shape[1] * self.page_size
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

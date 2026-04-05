@@ -2056,6 +2056,44 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
         dist.destroy_process_group()
 
 
+def maybe_stub_sgl_kernel():
+    """Stub sgl_kernel if it cannot be imported (e.g. no GPU).
+
+    Must be called before any import that transitively depends on sgl_kernel.
+    On machines with a working sgl_kernel this is a no-op.
+    """
+    try:
+        import sgl_kernel  # noqa: F401
+
+        return
+    except (ImportError, OSError):
+        pass
+
+    import importlib.abc
+    import importlib.machinery
+
+    class _SglKernelLoader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            from unittest.mock import MagicMock
+
+            module.__getattr__ = lambda name: MagicMock()
+
+    class _SglKernelFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "sgl_kernel" or fullname.startswith("sgl_kernel."):
+                return importlib.machinery.ModuleSpec(
+                    fullname,
+                    _SglKernelLoader(),
+                    is_package=True,
+                )
+            return None
+
+    sys.meta_path.insert(0, _SglKernelFinder())
+
+
 class CustomTestCase(unittest.TestCase):
 
     def __init_subclass__(cls, **kwargs):
@@ -2068,9 +2106,11 @@ class CustomTestCase(unittest.TestCase):
         if getattr(setup, "_safe_setup_wrapped", False):
             return
 
-        def safe_setUpClass(klass, _orig=setup):
+        orig_func = setup.__func__
+
+        def safe_setUpClass(klass):
             try:
-                _orig.__func__(klass)
+                orig_func(klass)
             except Exception:
                 # Best-effort cleanup; suppress teardown errors so the
                 # original setUpClass exception propagates clearly.
@@ -2141,12 +2181,14 @@ class ModelLaunchSettings:
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
         variant: Optional[str] = None,
+        launch_timeout: Optional[float] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
         self.variant = variant
+        self.launch_timeout = launch_timeout
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])

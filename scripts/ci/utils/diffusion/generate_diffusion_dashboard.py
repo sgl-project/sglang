@@ -26,7 +26,7 @@ CI_DATA_REPO_OWNER = "sglang-bot"
 CI_DATA_REPO_NAME = "sglang-ci-data"
 CI_DATA_BRANCH = "main"
 HISTORY_PREFIX = "diffusion-comparisons"
-MAX_HISTORY_RUNS = 7
+MAX_HISTORY_RUNS = 14
 
 # Base URL for chart images pushed to sglang-ci-data
 CHARTS_RAW_BASE_URL = (
@@ -239,8 +239,11 @@ def generate_dashboard(
     current: dict,
     history: list[dict],
     charts_dir: str | None = None,
-) -> str:
+) -> tuple[str, list[str]]:
     """Generate full markdown dashboard.
+
+    Returns (markdown_string, alert_reasons) where alert_reasons is a list of
+    human-readable strings for cases that need attention (empty if all is well).
 
     If charts_dir is provided, saves chart PNGs as files to that directory
     and references them via raw.githubusercontent URLs. Otherwise, charts
@@ -342,45 +345,7 @@ def generate_dashboard(
             row += f" {_fmt_speedup(sg_lat, case_fws.get(ofw))} |"
         lines.append(row)
 
-    # ---- Section 2: SGLang Performance Trend ----
-    if history:
-        lines.append("\n## SGLang Performance Trend (Last 7 Runs)\n")
-
-        # Build header
-        header = "| Date | Commit |"
-        sep = "|------|--------|"
-        for cid in case_ids:
-            header += f" {cid} (s) |"
-            sep += "---------|"
-        header += " Trend |"
-        sep += "-------|"
-        lines.append(header)
-        lines.append(sep)
-
-        # Current run first
-        all_runs = [current] + history
-        for i, run in enumerate(all_runs):
-            run_cases = _extract_case_results(run)
-            date = _short_date(run.get("timestamp", ""))
-            sha_s = _short_sha(run.get("commit_sha", ""))
-            row = f"| {date} | `{sha_s}` |"
-            for cid in case_ids:
-                lat = run_cases.get(cid, {}).get("sglang")
-                row += f" {_fmt_latency(lat)} |"
-            # Trend vs next (older) run
-            if i + 1 < len(all_runs):
-                prev_cases = _extract_case_results(all_runs[i + 1])
-                emojis = []
-                for cid in case_ids:
-                    cur = run_cases.get(cid, {}).get("sglang")
-                    prev = prev_cases.get(cid, {}).get("sglang")
-                    emojis.append(_trend_emoji(cur, prev))
-                row += " ".join(emojis) + " |"
-            else:
-                row += " -- |"
-            lines.append(row)
-
-    # ---- Section 3: Cross-Framework Speedup Trend (only if multiple frameworks) ----
+    # ---- Section 2: Cross-Framework Speedup Trend (only if multiple frameworks) ----
     if history and other_frameworks:
         lines.append("\n## SGLang vs vLLM-Omni Speedup Over Time\n")
 
@@ -491,9 +456,16 @@ def generate_dashboard(
                 ax.set_xticklabels(labels, fontsize=7)
                 ax.set_ylabel("Latency (s)")
                 ax.set_title(f"Latency Trend -- {cid}", fontsize=11, fontweight="bold")
-                ax.legend(loc="upper right", fontsize=8)
+                ax.legend(loc="lower right", fontsize=8, framealpha=0.8)
                 ax.grid(True, alpha=0.3)
-                ax.set_ylim(bottom=0)
+                all_vals = sg_vals + [v for v in vl_vals if v is not None]
+                y_min = min(all_vals)
+                y_max = max(all_vals)
+                y_range = y_max - y_min if y_max > y_min else max(y_max * 0.1, 0.1)
+                ax.set_ylim(
+                    bottom=max(0, y_min - y_range * 0.3),
+                    top=y_max + y_range * 0.3,
+                )
 
                 filename = f"latency_{_sanitize_filename(cid)}.png"
                 chart_path = os.path.join(charts_dir, filename)
@@ -555,6 +527,41 @@ def generate_dashboard(
         except ImportError:
             lines.append("\n*Charts unavailable (matplotlib not installed)*\n")
 
+    # ---- SGLang Performance Trend (raw data table, at the end) ----
+    if history:
+        lines.append(f"\n## SGLang Performance Trend (Last {len(history) + 1} Runs)\n")
+
+        header = "| Date | Commit |"
+        sep = "|------|--------|"
+        for cid in case_ids:
+            header += f" {cid} (s) |"
+            sep += "---------|"
+        header += " Trend |"
+        sep += "-------|"
+        lines.append(header)
+        lines.append(sep)
+
+        all_runs = [current] + history
+        for i, run in enumerate(all_runs):
+            run_cases = _extract_case_results(run)
+            date = _short_date(run.get("timestamp", ""))
+            sha_s = _short_sha(run.get("commit_sha", ""))
+            row = f"| {date} | `{sha_s}` |"
+            for cid in case_ids:
+                lat = run_cases.get(cid, {}).get("sglang")
+                row += f" {_fmt_latency(lat)} |"
+            if i + 1 < len(all_runs):
+                prev_cases = _extract_case_results(all_runs[i + 1])
+                emojis = []
+                for cid in case_ids:
+                    cur = run_cases.get(cid, {}).get("sglang")
+                    prev = prev_cases.get(cid, {}).get("sglang")
+                    emojis.append(_trend_emoji(cur, prev))
+                row += " ".join(emojis) + " |"
+            else:
+                row += " -- |"
+            lines.append(row)
+
     # ---- Risk Notification ----
     alert_cases = [
         (cid, emoji, reason)
@@ -568,8 +575,7 @@ def generate_dashboard(
         lines.append("> The following cases need attention:")
         for _cid, _emoji, reason in alert_cases:
             lines.append(f"> - {reason}")
-        lines.append(">")
-        lines.append("> cc @mickqian @bbuf @yhyang201\n")
+        lines.append("")
 
     # Footer
     lines.append("\n---")
@@ -577,7 +583,164 @@ def generate_dashboard(
         "*Generated by `generate_diffusion_dashboard.py` in SGLang nightly CI.*"
     )
 
-    return "\n".join(lines) + "\n"
+    alert_reasons = [reason for _, _, reason in alert_cases]
+    return "\n".join(lines) + "\n", alert_reasons
+
+
+ALERT_ASSIGNEES = ["mickqian", "bbuf", "yhyang201"]
+ALERT_LABEL = "perf-regression"
+
+
+ALERT_ISSUE_TITLE = "[Diffusion CI] Performance regression tracker"
+
+
+def _find_alert_issue(repo: str) -> tuple[str | None, bool]:
+    """Find the perf-regression tracker issue (open OR closed).
+
+    Returns (issue_number, is_open).  Prefers an open issue; if none,
+    returns the most recent closed one so it can be reopened.
+    """
+    import subprocess
+
+    for state in ("open", "closed"):
+        result = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                repo,
+                "--label",
+                ALERT_LABEL,
+                "--state",
+                state,
+                "--json",
+                "number",
+                "--limit",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            continue
+        issues = json.loads(result.stdout)
+        if issues:
+            return str(issues[0]["number"]), state == "open"
+    return None, False
+
+
+def _create_alert_issue(alert_reasons: list[str]) -> None:
+    """Create or update the single perf-regression tracker issue.
+
+    Logic:
+    - If an open issue exists  → add a comment with the new alert.
+    - If a closed issue exists → reopen it, then add a comment.
+    - If no issue exists       → create one.
+
+    This guarantees at most one tracker issue ever exists.
+
+    Uses `gh` (GitHub CLI) which is available in all GitHub Actions runners.
+    Falls back silently outside CI.
+    """
+    import subprocess
+
+    run_url = ""
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "sgl-project/sglang")
+    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    if run_id:
+        run_url = f"{server_url}/{repo}/actions/runs/{run_id}"
+
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    body_lines = [
+        f"## Performance Alert — {date}",
+        "",
+        "The nightly diffusion benchmark detected the following issue(s):",
+        "",
+    ]
+    for reason in alert_reasons:
+        body_lines.append(f"- {reason}")
+    if run_url:
+        body_lines += ["", f"**CI Run:** {run_url}"]
+    body = "\n".join(body_lines)
+
+    try:
+        existing, is_open = _find_alert_issue(repo)
+
+        if existing:
+            # Reopen if closed
+            if not is_open:
+                subprocess.run(
+                    [
+                        "gh",
+                        "issue",
+                        "reopen",
+                        existing,
+                        "--repo",
+                        repo,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                print(f"Reopened alert issue #{existing}")
+
+            # Add comment
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "comment",
+                    existing,
+                    "--repo",
+                    repo,
+                    "--body",
+                    body,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                print(f"Commented on alert issue #{existing}")
+            else:
+                print(
+                    f"Warning: failed to comment on issue #{existing} "
+                    f"(rc={result.returncode}): {result.stderr.strip()}"
+                )
+        else:
+            # Create a new issue
+            cmd = [
+                "gh",
+                "issue",
+                "create",
+                "--repo",
+                repo,
+                "--title",
+                ALERT_ISSUE_TITLE,
+                "--body",
+                body,
+                "--label",
+                ALERT_LABEL,
+            ]
+            for user in ALERT_ASSIGNEES:
+                cmd += ["--assignee", user]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                print(f"Created alert issue: {result.stdout.strip()}")
+            else:
+                print(
+                    f"Warning: failed to create alert issue "
+                    f"(rc={result.returncode}): {result.stderr.strip()}"
+                )
+    except FileNotFoundError:
+        print("Warning: `gh` CLI not found — skipping alert issue creation")
+    except Exception as e:
+        print(f"Warning: failed to create/update alert issue: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +805,9 @@ def main():
         print(f"Loaded {len(history)} historical run(s) from {args.history_dir}")
 
     # Generate dashboard
-    markdown = generate_dashboard(current, history, charts_dir=args.charts_dir)
+    markdown, alert_reasons = generate_dashboard(
+        current, history, charts_dir=args.charts_dir
+    )
 
     # Write output
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
@@ -659,6 +824,12 @@ def main():
             print("Dashboard appended to $GITHUB_STEP_SUMMARY")
         else:
             print("Warning: $GITHUB_STEP_SUMMARY not set, skipping")
+
+    # Create GitHub Issue for performance alerts (so assignees get notified)
+    if alert_reasons:
+        _create_alert_issue(alert_reasons)
+    else:
+        print("No performance alerts — skipping issue creation.")
 
 
 if __name__ == "__main__":
