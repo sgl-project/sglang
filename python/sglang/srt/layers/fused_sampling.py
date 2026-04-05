@@ -6,7 +6,7 @@ kernel launch overhead and global memory traffic during decode.
 Two kernel variants:
   - Single-pass: vocab fits in one tile (1 read + 1 write). Used when
     next_power_of_2(vocab) <= 32768.
-  - Multi-pass: 2-pass online softmax with autotune (2 reads + 1 write).
+  - Multi-pass: 3-pass softmax with autotune (3 reads + 1 write).
     Used for large vocabs (e.g. 128K+).
 """
 
@@ -83,7 +83,7 @@ def _single_pass_temperature_softmax_inplace_kernel(
 
 # ---------------------------------------------------------------------------
 # Multi-pass kernel: vocab too large for one tile.
-# 2-pass online softmax with autotune over (BLOCK_SIZE, num_warps).
+# 3-pass softmax with autotune over (BLOCK_SIZE, num_warps).
 # ---------------------------------------------------------------------------
 
 _MULTI_PASS_AUTOTUNE_CONFIGS = [
