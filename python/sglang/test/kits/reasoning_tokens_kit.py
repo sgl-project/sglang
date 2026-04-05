@@ -7,6 +7,18 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
 class ReasoningTokenUsageMixin:
+    """Mixin for reasoning_tokens usage tests.
+
+    Required attributes on the test class:
+        model: str
+        base_url: str
+        reasoning_parser_name: str
+
+    Optional attributes:
+        api_key: str (if not set, no auth)
+
+    Call cls.init_reasoning_token_verifier() in setUpClass.
+    """
 
     reasoning_parser_name = None
 
