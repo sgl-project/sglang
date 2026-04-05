@@ -404,7 +404,10 @@ def format_text_input(prompts: List[str], system_message: str = None):
 
 
 def flux_2_preprocess_text(prompt: str):
-    system_message = "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object attribution and actions without speculation."
+    system_message = (
+        "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object\n"
+        "attribution and actions without speculation."
+    )
     return format_text_input([prompt], system_message=system_message)
 
 
