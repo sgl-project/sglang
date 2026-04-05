@@ -1,18 +1,3 @@
-"""Correctness tests for fused_temperature_softmax Triton kernel.
-
-Two reference implementations are used:
-
-  1. fp32 reference — logits.float()/temp then softmax in fp32.
-     The Triton kernel also promotes to fp32 internally, so this reference
-     shares the same precision path and can be checked with tight tolerance.
-     This proves **kernel correctness**.
-
-  2. Native-dtype reference — logits.div_(temp) in the original dtype then
-     softmax.  The in-place div_ truncates intermediates to bf16/fp16, so
-     a looser tolerance is needed.  This covers the **dtype truncation gap**
-     between the fused kernel and the existing PyTorch sampling path.
-"""
-
 import unittest
 
 import torch
