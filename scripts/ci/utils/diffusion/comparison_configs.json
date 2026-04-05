@@ -1,5 +1,5 @@
 {
-    "_comment": "Per-model comparison config. Only frameworks listed under each case are tested. vLLM-Omni disabled until dep install issues resolved.",
+    "_comment": "Per-model comparison config. Sampling params omitted where model defaults are correct — only override resolution, seed, and params that differ from defaults.",
     "test_image_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png",
     "cases": [
         {
@@ -9,8 +9,6 @@
             "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
             "width": 1024,
             "height": 1024,
-            "num_inference_steps": 50,
-            "guidance_scale": 4.0,
             "seed": 42,
             "num_gpus": 1,
             "frameworks": {
@@ -27,8 +25,6 @@
             "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
             "width": 1024,
             "height": 1024,
-            "num_inference_steps": 50,
-            "guidance_scale": 4.0,
             "seed": 42,
             "num_gpus": 1,
             "frameworks": {
@@ -45,8 +41,6 @@
             "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
             "width": 1024,
             "height": 1024,
-            "num_inference_steps": 50,
-            "guidance_scale": 4.0,
             "seed": 42,
             "num_gpus": 1,
             "frameworks": {
@@ -64,8 +58,6 @@
             "reference_image": true,
             "width": 1024,
             "height": 1024,
-            "num_inference_steps": 50,
-            "guidance_scale": 4.0,
             "seed": 42,
             "num_gpus": 1,
             "frameworks": {
@@ -82,8 +74,6 @@
             "prompt": "A futuristic cyberpunk city at night, neon lights reflecting on wet streets",
             "width": 1024,
             "height": 1024,
-            "num_inference_steps": 9,
-            "guidance_scale": 4.0,
             "seed": 42,
             "num_gpus": 1,
             "frameworks": {
@@ -101,8 +91,6 @@
             "width": 1280,
             "height": 720,
             "num_frames": 81,
-            "num_inference_steps": 2,
-            "guidance_scale": 5.0,
             "seed": 42,
             "num_gpus": 4,
             "frameworks": {
@@ -121,13 +109,28 @@
             "width": 1280,
             "height": 720,
             "num_frames": 81,
-            "num_inference_steps": 50,
-            "guidance_scale": 5.0,
             "seed": 42,
             "num_gpus": 1,
             "frameworks": {
                 "sglang": {
                     "serve_args": "--enable-torch-compile --warmup",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
+            "id": "ltx2_twostage_t2v",
+            "model": "Lightricks/LTX-2",
+            "task": "text-to-video",
+            "prompt": "A cat and a dog baking a cake together in a kitchen.",
+            "width": 768,
+            "height": 512,
+            "num_frames": 121,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--enable-torch-compile --warmup --enable-cfg-parallel --pipeline-class-name LTX2TwoStagePipeline",
                     "extra_env": {}
                 }
             }
@@ -141,8 +144,6 @@
             "width": 1280,
             "height": 720,
             "num_frames": 81,
-            "num_inference_steps": 2,
-            "guidance_scale": 5.0,
             "seed": 42,
             "num_gpus": 4,
             "frameworks": {
