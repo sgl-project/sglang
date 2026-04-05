@@ -200,6 +200,11 @@ class Platform:
         return True
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return True
+
+    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 
