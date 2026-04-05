@@ -2131,7 +2131,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        if self.is_spec_v2:
+        if self.is_spec_v2 and not self.spec_algorithm.is_ngram():
+            # NOTE: ngram spec synchronizes in NgramWorker before draft
             draft_input: EagleDraftInput = self.spec_info
             assert draft_input is not None
             if draft_input.verify_done is not None:

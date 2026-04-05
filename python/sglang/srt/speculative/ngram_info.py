@@ -507,9 +507,18 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         ]
         self.verified_tokens = self.verified_tokens.flatten()
         self.accept_lens = self.accept_lens[new_indices]
+        if self.future_indices is not None:
+            self.future_indices.indices = self.future_indices.indices[new_indices]
 
     def merge_batch(self, spec_info: NgramVerifyInput):
         self.verified_tokens = torch.cat(
             (self.verified_tokens, spec_info.verified_tokens), dim=0
         )
         self.accept_lens = torch.cat((self.accept_lens, spec_info.accept_lens), dim=0)
+        if self.future_indices is not None:
+            assert spec_info.future_indices is not None
+            self.future_indices = FutureIndices(
+                indices=torch.cat(
+                    [self.future_indices.indices, spec_info.future_indices.indices]
+                )
+            )

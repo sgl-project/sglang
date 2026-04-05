@@ -131,7 +131,14 @@ class FutureMap:
         if self.spec_algo.is_ngram():
             # FIXME: ngram draft requires synced token ids to query the ngram table,
             # so future resolve is skipped. Remove once precomputed draft is supported.
+            draft_input: EagleDraftInput = model_worker_batch.spec_info
+            if draft_input is None:
+                return
+            indices = draft_input.future_indices.indices
+            indices.record_stream(torch.get_device_module(self.device).current_stream())
+            model_worker_batch.new_seq_lens = self.new_seq_lens_buf[indices]
             return
+
         if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
@@ -167,7 +174,16 @@ class FutureMap:
     ):
         if self.spec_algo.is_ngram():
             # FIXME: same as resolve_future — remove once precomputed draft is supported.
+            draft_input: EagleDraftInput = batch_result.next_draft_input
+            intv = future_indices.interval
+            if self.is_empty_slice(intv):
+                # idle indices in dp attention do not need store info
+                return
+            if not self.buf_initialized:
+                self._lazy_init_buf(draft_input)
+            self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
             return
+
         if self.spec_algo.is_none():
             intv = future_indices.interval
             self.token_ids_buf[intv] = batch_result.next_token_ids
