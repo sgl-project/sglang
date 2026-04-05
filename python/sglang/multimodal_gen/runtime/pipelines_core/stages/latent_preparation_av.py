@@ -88,7 +88,43 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if not is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
-            return super().forward(batch, server_args)
+            batch = super().forward(batch, server_args)
+
+            try:
+                generate_audio = batch.generate_audio
+            except AttributeError:
+                generate_audio = True
+            if not generate_audio:
+                batch.audio_latents = None
+                batch.raw_audio_latent_shape = None
+                return batch
+
+            device = get_local_torch_device()
+            dtype = self._get_latent_dtype(batch, server_args)
+            generator = batch.generator
+
+            audio_latents = batch.audio_latents
+            batch_size = batch.batch_size
+            num_frames = batch.num_frames
+
+            if audio_latents is None:
+                shape = server_args.pipeline_config.prepare_audio_latent_shape(
+                    batch, batch_size, num_frames
+                )
+
+                audio_latents = randn_tensor(
+                    shape, generator=generator, device=device, dtype=dtype
+                )
+            else:
+                audio_latents = audio_latents.to(device)
+
+            audio_latents = server_args.pipeline_config.maybe_pack_audio_latents(
+                audio_latents, batch_size, batch
+            )
+
+            batch.audio_latents = audio_latents
+            batch.raw_audio_latent_shape = audio_latents.shape
+            return batch
 
         # 1. Prepare video latents directly in packed token space.
         # Official LTX-2.3 pipelines sample noise after patchify; generating unpacked
