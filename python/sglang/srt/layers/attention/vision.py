@@ -41,12 +41,12 @@ if _is_cuda:
     try:
         from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-        from sglang.jit_kernel.flash_attention_v4 import (
-            flash_attn_varlen_func as flash_attn_varlen_func_fa4,
-        )
-
         def flash_attn_func(*args, ver: int = 3, **kwargs):
             if ver == 4:
+                from sglang.jit_kernel.flash_attention_v4 import (
+                    flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+                )
+
                 return flash_attn_varlen_func_fa4(*args, **kwargs)
             return flash_attn_varlen_func(*args, **kwargs)
 
@@ -56,8 +56,6 @@ if _is_cuda:
 
 if _is_npu:
     import torch_npu
-
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 from sglang.srt.distributed import (
     split_tensor_along_last_dim,
@@ -77,6 +75,8 @@ from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
@@ -888,7 +888,9 @@ class VisionAttention(nn.Module):
         Priority: server args override > constructor arg > platform default.
 
         Platform defaults:
-        - CUDA: "triton_attn"
+        - CUDA (Hopper SM90): "fa3"
+        - CUDA (Blackwell SM100): "fa4"
+        - CUDA (other): "triton_attn"
         - Non-CUDA: "sdpa"
         """
         override_backend = get_global_server_args().mm_attention_backend
@@ -900,6 +902,8 @@ class VisionAttention(nn.Module):
             major, minor = get_device_capability()
             if major == 9:
                 backend = "fa3"
+            elif major == 10:
+                backend = "fa4"
             else:
                 backend = "triton_attn"
         elif _is_hip:

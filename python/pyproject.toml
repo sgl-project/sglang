@@ -27,8 +27,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.6", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.6",
+  "flashinfer_python==0.6.7.post2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.7.post2",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
@@ -58,7 +58,7 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "flash-attn-4>=4.0.0b4",
-  "sglang-kernel==0.4.0",
+  "sglang-kernel==0.4.1",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -97,6 +97,7 @@ torch = [
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle==3.1.2",
@@ -108,7 +109,7 @@ diffusion = [
   "remote-pdb==2.1.0",
   "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
-  "runai_model_streamer>=0.15.5",
+  "runai_model_streamer>=0.15.7",
   "cache-dit==1.3.0",
   "addict==2.4.0",
   "av==16.1.0",
@@ -139,6 +140,7 @@ test = [
   "pandas",
   "parameterized",
   "peft>=0.18.0",
+  "polars",
   "pytest",
   "pytest-cov",
   "diff-cover",

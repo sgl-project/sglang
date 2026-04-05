@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     _patch_nunchaku_scales,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -134,14 +133,6 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         if quant_name != "modelopt_fp4":
             return
 
-        use_best_perf_kit = getattr(
-            current_platform,
-            "should_use_modelopt_fp4_best_performance_kit",
-            None,
-        )
-        if callable(use_best_perf_kit) and use_best_perf_kit():
-            return
-
         weights_path = os.path.basename(server_args.transformer_weights_path or "")
         if not weights_path.endswith("-mixed.safetensors") or server_args.tp_size <= 1:
             return
@@ -150,10 +141,10 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
             server_args.dit_cpu_offload = False
             server_args.text_encoder_cpu_offload = False
             logger.warning(
-                "FLUX.2 mixed NVFP4 is using the generic ModelOpt FP4 fallback with "
-                "tp_size=%d; disabling dit/text-encoder CPU offload to avoid TP "
-                "all-gather launch failures. Override the offload flags explicitly if "
-                "you need the old behavior.",
+                "FLUX.2 mixed NVFP4 is using the ModelOpt FP4 path with tp_size=%d; "
+                "disabling dit/text-encoder CPU offload to avoid TP all-gather "
+                "launch failures. Override the offload flags explicitly if you need "
+                "the old behavior.",
                 server_args.tp_size,
             )
 

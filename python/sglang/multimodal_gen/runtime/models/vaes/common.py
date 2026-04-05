@@ -220,54 +220,6 @@ class ParallelTiledVAE(ABC, nn.Module):
                 _start_shape += mul_shape
                 global_idx += 1
 
-    def _merge_parallel_tiled_results(
-        self,
-        gathered_results: torch.Tensor,
-        gathered_dim_metadata: list[list[torch.Size]],
-        num_t_tiles: int,
-        num_h_tiles: int,
-        num_w_tiles: int,
-        total_spatial_tiles: int,
-        blend_height: int,
-        blend_width: int,
-    ) -> torch.Tensor:
-        data: list = [
-            [[[] for _ in range(num_w_tiles)] for _ in range(num_h_tiles)]
-            for _ in range(num_t_tiles)
-        ]
-        for current_data, global_idx in self._parallel_data_generator(
-            gathered_results, gathered_dim_metadata
-        ):
-            t_idx = global_idx // total_spatial_tiles
-            spatial_idx = global_idx % total_spatial_tiles
-            h_idx = spatial_idx // num_w_tiles
-            w_idx = spatial_idx % num_w_tiles
-            data[t_idx][h_idx][w_idx] = current_data
-
-        result_slices = []
-        last_slice_data = None
-        for i, tem_data in enumerate(data):
-            slice_data = self._merge_spatial_tiles(
-                tem_data,
-                blend_height,
-                blend_width,
-                self.tile_sample_stride_height,
-                self.tile_sample_stride_width,
-            )
-            if i > 0:
-                slice_data = self.blend_t(
-                    last_slice_data, slice_data, self.blend_num_frames
-                )
-                result_slices.append(
-                    slice_data[:, :, : self.tile_sample_stride_num_frames, :, :]
-                )
-            else:
-                result_slices.append(
-                    slice_data[:, :, : self.tile_sample_stride_num_frames + 1, :, :]
-                )
-            last_slice_data = slice_data
-        return torch.cat(result_slices, dim=2)
-
     def parallel_tiled_decode(self, z: torch.FloatTensor) -> torch.FloatTensor:
         """
         Parallel version of tiled_decode that distributes both temporal and spatial computation across GPUs
@@ -365,17 +317,43 @@ class ParallelTiledVAE(ABC, nn.Module):
         dist.all_gather_into_tensor(gathered_results, padded_results)
         dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
         gathered_dim_metadata = cast(list[list[torch.Size]], gathered_dim_metadata)
-        dec = self._merge_parallel_tiled_results(
-            gathered_results,
-            gathered_dim_metadata,
-            num_t_tiles,
-            num_h_tiles,
-            num_w_tiles,
-            total_spatial_tiles,
-            blend_height,
-            blend_width,
-        )
-        return dec
+
+        data: list = [
+            [[[] for _ in range(num_w_tiles)] for _ in range(num_h_tiles)]
+            for _ in range(num_t_tiles)
+        ]
+        for current_data, global_idx in self._parallel_data_generator(
+            gathered_results, gathered_dim_metadata
+        ):
+            t_idx = global_idx // total_spatial_tiles
+            spatial_idx = global_idx % total_spatial_tiles
+            h_idx = spatial_idx // num_w_tiles
+            w_idx = spatial_idx % num_w_tiles
+            data[t_idx][h_idx][w_idx] = current_data
+
+        result_slices = []
+        last_slice_data = None
+        for i, tem_data in enumerate(data):
+            slice_data = self._merge_spatial_tiles(
+                tem_data,
+                blend_height,
+                blend_width,
+                self.tile_sample_stride_height,
+                self.tile_sample_stride_width,
+            )
+            if i > 0:
+                slice_data = self.blend_t(
+                    last_slice_data, slice_data, self.blend_num_frames
+                )
+                result_slices.append(
+                    slice_data[:, :, : self.tile_sample_stride_num_frames, :, :]
+                )
+            else:
+                result_slices.append(
+                    slice_data[:, :, : self.tile_sample_stride_num_frames + 1, :, :]
+                )
+            last_slice_data = slice_data
+        return torch.cat(result_slices, dim=2)
 
     def _merge_spatial_tiles(
         self, tiles, blend_height, blend_width, stride_height, stride_width
