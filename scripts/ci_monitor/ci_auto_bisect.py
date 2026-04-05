@@ -274,7 +274,7 @@ def _find_last_running_test(logs: str) -> Optional[Dict]:
 
 
 def analyze_scheduled_failures(
-    token: str, min_streak: int = 2, max_failures: int = 10
+    token: str, min_streak: int = 1, max_failures: int = 10
 ) -> Tuple[List[FailureTarget], Dict[int, str]]:
     """
     Fetch Nvidia scheduled runs, analyze job/test failure streaks, return targets.
