@@ -337,6 +337,9 @@ class MambaPool:
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
 
+    def mamba1_layer_cache(self, layer_id: int):
+        return self.mamba_cache.at_layer_idx(layer_id)
+
     def available_size(self):
         return len(self.free_slots)
 
@@ -582,6 +585,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
+
+    def mamba1_layer_cache(self, layer_id: int):
+        assert layer_id in self.mamba_map
+        return self.mamba_pool.mamba1_layer_cache(self.mamba_map[layer_id])
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()

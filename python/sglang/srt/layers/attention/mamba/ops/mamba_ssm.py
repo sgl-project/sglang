@@ -6,10 +6,13 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 from packaging import version
+from sgl_kernel import selective_scan_fwd
 
 PAD_SLOT_ID = -1
 
@@ -372,6 +375,7 @@ def selective_state_update(
             z = z.unsqueeze(1)
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
+
     if out.dim() == 2:
         out = out.unsqueeze(1)
     if out.dim() == 3:
@@ -492,3 +496,72 @@ def selective_state_update(
             DISABLE_STATE_UPDATE=disable_state_update,
             num_warps=num_warps,
         )
+
+
+def selective_scan_fn(
+    u: torch.Tensor,
+    delta: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
+    delta_bias: Optional[torch.Tensor] = None,
+    delta_softplus: bool = False,
+    return_last_state: bool = False,
+    initial_state: Optional[torch.Tensor] = None,
+):
+    """
+    Args:
+        u: (batch, seqlen, dim) - input
+        delta: (batch, seqlen, dim) - time step
+        A: (dim, dstate) - A matrix
+        B: (batch, seqlen, dstate) - B projection
+        C: (batch, seqlen, dstate) - C projection
+        D: (dim,) - optional D parameter
+        z: (batch, seqlen, dim) - optional gate
+        delta_bias: (dim,) - optional delta bias
+        delta_softplus: whether to apply softplus to delta
+        return_last_state: whether to return the final state
+        initial_state: (batch, dim, dstate)
+
+    Returns:
+        out: (batch, seqlen, dim) - output
+        last_state: (batch, dim, dstate) - final state (if return_last_state)
+    """
+    u = u.transpose(1, 2)
+    if u.stride(-1) != 1:
+        u = u.contiguous()
+    delta = delta.transpose(1, 2)
+    if delta.stride(-1) != 1:
+        delta = delta.contiguous()
+    B = B.transpose(1, 2).unsqueeze(1)
+    if B.stride(-1) != 1:
+        B = B.contiguous()
+    C = C.transpose(1, 2).unsqueeze(1)
+    if C.stride(-1) != 1:
+        C = C.contiguous()
+    if z is not None:
+        z = z.transpose(1, 2)
+        if z.stride(-1) != 1:
+            z = z.contiguous()
+
+    results = selective_scan_fwd(
+        u,
+        delta,
+        A,
+        B,
+        C,
+        D,
+        z,
+        delta_bias,
+        initial_state,
+        delta_softplus,
+        True,
+    )
+
+    out = results[0].transpose(1, 2)
+
+    if return_last_state:
+        return out, results[1]
+    return out

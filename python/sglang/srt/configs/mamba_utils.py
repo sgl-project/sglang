@@ -58,7 +58,7 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
                 mamba_ssm_dtype from it. For VL models, reads from text_config.
 
     Returns:
-        Mamba2StateDType with conv and temporal dtypes
+        Mamba2StateDType with conv and temporal dtypes (also used for Mamba1)
     """
     dtype_map = {
         "float32": torch.float32,
@@ -123,6 +123,42 @@ class BaseLinearStateParams(ABC):
             conv_numel * self.dtype.conv.itemsize
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
+
+
+@dataclass(kw_only=True, frozen=True)
+class Mamba1StateShape:
+    conv: list[tuple[int, int]]
+    temporal: tuple[int, int]  # (intermediate_size/tp, state_size) - 2D for Mamba1
+
+    intermediate_size: int
+    ssm_state_size: int
+    state_size: int
+    conv_kernel: int
+
+    @staticmethod
+    def create(
+        *,
+        tp_world_size: int,
+        intermediate_size: int,
+        state_size: int,
+        conv_kernel: int,
+    ) -> "Mamba1StateShape":
+        conv_state_shape = divide(intermediate_size, tp_world_size), conv_kernel - 1
+
+        temporal_state_shape = (divide(intermediate_size, tp_world_size), state_size)
+        return Mamba1StateShape(
+            conv=[conv_state_shape],
+            temporal=temporal_state_shape,
+            intermediate_size=intermediate_size,
+            ssm_state_size=state_size,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+        )
+
+
+@dataclass(kw_only=True, frozen=True)
+class Mamba1CacheParams(BaseLinearStateParams):
+    shape: Mamba1StateShape
 
 
 @dataclass(kw_only=True, frozen=True)

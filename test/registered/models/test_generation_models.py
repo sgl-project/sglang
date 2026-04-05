@@ -119,6 +119,10 @@ ALL_MODELS = [
         "ibm-granite/granite-4.0-h-micro",
         trust_remote_code=True,
     ),
+    ModelCase(
+        "ai21labs/Jamba-tiny-dev",
+        trust_remote_code=True,
+    ),
 ]
 
 MAMBA_MODEL_PATHS = [

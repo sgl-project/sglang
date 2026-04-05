@@ -37,6 +37,7 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    JambaConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
@@ -1891,9 +1892,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     @property
+    def mamba1_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, JambaConfig):
+            return config
+        return None
+
+    @property
     def mambaish_config(self):
         return (
             self.mamba2_config
+            or self.mamba1_config
             or self.hybrid_gdn_config
             or self.kimi_linear_config
             or self.hybrid_lightning_config
