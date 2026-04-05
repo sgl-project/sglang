@@ -49,6 +49,7 @@ class TestEnableThinking(
         kill_process_tree(cls.process.pid)
 
     def test_chat_completion_with_reasoning(self):
+        # Test non-streaming with "enable_thinking": True, reasoning_content should not be empty
         client = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -72,6 +73,7 @@ class TestEnableThinking(
         self.assertIsNotNone(data["choices"][0]["message"]["reasoning_content"])
 
     def test_chat_completion_without_reasoning(self):
+        # Test non-streaming with "enable_thinking": False, reasoning_content should be empty
         client = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -96,6 +98,7 @@ class TestEnableThinking(
             self.assertIsNone(data["choices"][0]["message"]["reasoning_content"])
 
     def test_stream_chat_completion_with_reasoning(self):
+        # Test streaming with "enable_thinking": True, reasoning_content should not be empty
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -139,6 +142,7 @@ class TestEnableThinking(
         )
 
     def test_stream_chat_completion_without_reasoning(self):
+        # Test streaming with "enable_thinking": False, reasoning_content should be empty
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
