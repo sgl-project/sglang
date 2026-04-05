@@ -1201,7 +1201,7 @@ class MambaPoolHost(HostKVCache):
             "page_first",
             "page_first_direct",
             "layer_first",
-        ], "Unsupported layout: {layout}"
+        ], f"Unsupported layout: {layout}"
 
         self.layout = layout
         self.pin_memory = pin_memory
