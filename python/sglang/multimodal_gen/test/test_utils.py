@@ -171,6 +171,13 @@ def post_json(
     return httpx.post(urljoin(base_url, path), json=payload, timeout=timeout)
 
 
+def run_command(command: list[str]) -> bool:
+    """Run a CLI command and return whether it succeeded."""
+    print(f"Running command: {' '.join(command)}", flush=True)
+    result = subprocess.run(command, check=False)
+    return result.returncode == 0
+
+
 # ---------------------------------------------------------------------------
 # GPU memory helpers (nvidia-smi)
 # ---------------------------------------------------------------------------
