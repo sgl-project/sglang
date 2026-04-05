@@ -776,6 +776,7 @@ class DecodePreallocQueue:
             )
             if (
                 self.transfer_queue.enable_staging
+                and hasattr(decode_req.kv_receiver, "require_staging")
                 and decode_req.kv_receiver.require_staging
             ):
                 self.transfer_queue.staging_handler.register_decode_req(

@@ -40,11 +40,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-    prepare_fp4_layer_for_marlin,
-    prepare_moe_fp4_layer_for_marlin,
-    should_use_fp4_marlin_fallback,
-)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -1147,7 +1142,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75  # SM75+ (Turing) supports Marlin FP4 fallback; SM100 for native FP4
+        return 100
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
@@ -1321,7 +1316,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
 
         layer.logical_widths = output_partition_sizes
-        layer.params_dtype = params_dtype
 
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
@@ -1376,20 +1370,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if should_use_fp4_marlin_fallback():
-            # Marlin FP4 fallback: consolidate global scale then repack weights
-            weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
-            layer.weight_scale_2_marlin = Parameter(weight_scale_2, requires_grad=False)
-            prepare_fp4_layer_for_marlin(
-                layer,
-                weight_attr="weight",
-                weight_scale_attr="weight_scale",
-                weight_global_scale_attr="weight_scale_2_marlin",
-            )
-            layer.use_marlin_fallback = True
-            return
-
-        layer.use_marlin_fallback = False
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
@@ -1490,18 +1470,6 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if layer.use_marlin_fallback:
-            return torch.ops.sglang.apply_fp4_marlin_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                weight_global_scale=layer.weight_scale_2_marlin,
-                workspace=layer.marlin_workspace,
-                size_n=layer.output_size_per_partition,
-                size_k=layer.input_size_per_partition,
-                bias=bias,
-            )
-
         output_dtype = x.dtype
         x_m, _ = x.shape
 
@@ -1558,24 +1526,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-
-        if should_use_fp4_marlin_fallback():
-            logger.warning_once(
-                "GPU is not Blackwell (SM100+). Using Marlin FP4 fallback kernel "
-                "for MoE layers. Weights remain compressed in FP4 format."
-            )
-            self.use_marlin_fallback = True
-            self.enable_flashinfer_trtllm_moe = False
-        elif not is_blackwell_supported():
+        if not is_blackwell_supported():
             raise ValueError(
                 "Current platform does not support NVFP4"
-                " quantization. Please use SM75+ (Turing or newer)."
+                " quantization. Please use Blackwell and"
+                " above."
             )
-        else:
-            self.use_marlin_fallback = False
-            self.enable_flashinfer_trtllm_moe = (
-                get_moe_runner_backend().is_flashinfer_trtllm()
-            )
+        self.enable_flashinfer_trtllm_moe = (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+        )
         self._cache_permute_indices = {}
 
     @property
@@ -1729,9 +1688,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-        if self.use_marlin_fallback:
-            prepare_moe_fp4_layer_for_marlin(layer)
-            return
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
@@ -1944,9 +1900,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_marlin_fallback:
-            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
-            return
         if get_moe_runner_backend().is_flashinfer_trtllm():
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
@@ -1968,34 +1921,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             activation in ACT_STR_TO_TYPE_MAP
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
-
-        # Marlin FP4 fallback path for non-Blackwell GPUs (SM75-SM89)
-        if self.use_marlin_fallback:
-            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-
-            expert_map = None
-            global_num_experts = -1
-            if hasattr(layer, "dispatcher") and hasattr(
-                layer.dispatcher, "local_expert_mapping"
-            ):
-                expert_map = layer.dispatcher.local_expert_mapping
-                if expert_map is not None:
-                    global_num_experts = moe_runner_config.num_experts
-
-            quant_info = MarlinMoeQuantInfo(
-                w13_qweight=layer.w13_weight,
-                w2_qweight=layer.w2_weight,
-                w13_scales=layer.w13_weight_scale,
-                w2_scales=layer.w2_weight_scale,
-                w13_g_idx_sort_indices=None,
-                w2_g_idx_sort_indices=None,
-                weight_bits=4,
-                w13_global_scale=layer.w13_weight_scale_2,
-                w2_global_scale=layer.w2_weight_scale_2,
-                expert_map=expert_map,
-                global_num_experts=global_num_experts,
-            )
-            return self.runner.run(dispatch_output, quant_info)
 
         # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
         # backend is flashinfer_trtllm
