@@ -102,10 +102,30 @@ class LoRAManager:
     def init_cuda_graph_batch_info(
         self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
     ):
+        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
+
+        Called during CudaGraphRunner.__init__(), after init_memory_pool().
+        Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
+        """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
         self.lora_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
+        )
+
+    def init_cuda_graph_moe_buffers(
+        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+    ):
+        """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
+
+        Called before init_memory_pool() so memory profiling accounts for them.
+        Phase 2 (dense batch metadata) is handled later via init_cuda_graph_batch_info().
+        """
+        self.lora_backend.init_cuda_graph_moe_buffers(
+            max_bs=max_bs,
+            max_loras=max_loras,
+            compute_dtype=compute_dtype,
+            moe_layer=moe_layer,
         )
 
     def create_lora_update_result(
@@ -297,6 +317,9 @@ class LoRAManager:
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
         )
+        self.lora_backend.batch_info.has_active_lora = any(
+            lora_ranks[wi] > 0 for wi in weight_indices
+        )
 
     def update_lora_info(self):
         """
@@ -444,8 +467,13 @@ class LoRAManager:
         dim[0]=1 indicates weights shared across all experts, while
         dim[0]=num_experts indicates per-expert weights.
         Returns True if gate_up lora_A has expert_dim=1 (shared).
+
+        All loaded adapters that expose a 3D gate_up lora_A must agree;
+        mixed formats raise RuntimeError.
         """
-        for adapter in self.loras.values():
+        shared_outer: Optional[bool] = None
+        for adapter_id, adapter in self.loras.items():
+            found = False
             for layer in adapter.layers:
                 for name, weight in layer.weights.items():
                     if (
@@ -453,9 +481,21 @@ class LoRAManager:
                         and "lora_A" in name
                         and weight.dim() == 3
                     ):
-                        return weight.shape[0] == 1
-            break
-        return False
+                        is_shared = weight.shape[0] == 1
+                        if shared_outer is None:
+                            shared_outer = is_shared
+                        elif shared_outer != is_shared:
+                            raise RuntimeError(
+                                "Mixed shared-outer LoRA formats detected across "
+                                f"loaded adapters (conflict in adapter '{adapter_id}'). "
+                                "All MoE adapters must either all use shared outer "
+                                "experts (expert_dim=1) or all use per-expert weights."
+                            )
+                        found = True
+                        break
+                if found:
+                    break
+        return bool(shared_outer) if shared_outer is not None else False
 
     def init_lora_shapes(
         self,

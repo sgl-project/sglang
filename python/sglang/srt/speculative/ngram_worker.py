@@ -215,6 +215,7 @@ class NGRAMWorker:
         spec_info = model_worker_batch.spec_info
         num_accepted_tokens = 0
         accept_lens = None
+        accept_length_per_req_cpu = None
 
         if model_worker_batch.forward_mode.is_target_verify():
             if batch.has_grammar:
@@ -256,6 +257,7 @@ class NGRAMWorker:
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
                 batch, logits_output, self.page_size, vocab_mask
             )
+            accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
             if batch.return_logprob:
@@ -277,6 +279,7 @@ class NGRAMWorker:
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
         )
