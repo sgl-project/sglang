@@ -27,8 +27,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.7", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.7",
+  "flashinfer_python==0.6.7.post2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.7.post2",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
@@ -58,7 +58,7 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "flash-attn-4>=4.0.0b4",
-  "sglang-kernel==0.4.0",
+  "sglang-kernel==0.4.1",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",

@@ -53,6 +53,13 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
         result.add_check("latents", batch.latents, V.none_or_tensor)
         return result
 
+    def _get_latent_dtype(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ):
+        return torch.float32
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # 1. Prepare Video Latents using base class logic
         # This sets batch.latents and batch.raw_latent_shape
@@ -70,12 +77,7 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
             return batch
 
         device = get_local_torch_device()
-        if isinstance(batch.prompt_embeds, list) and batch.prompt_embeds:
-            dtype = batch.prompt_embeds[0].dtype
-        elif isinstance(batch.prompt_embeds, torch.Tensor):
-            dtype = batch.prompt_embeds.dtype
-        else:
-            dtype = torch.float16
+        dtype = self._get_latent_dtype(batch, server_args)
         generator = batch.generator
 
         audio_latents = batch.audio_latents

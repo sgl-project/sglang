@@ -644,9 +644,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             self.num_attention_heads,
             rope_dim_list,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
             rope_theta=10000,
             start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
@@ -776,9 +776,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             self.num_attention_heads,
             rope_dim_list,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
             rope_theta=10000,
             start_frame=start_frame,
