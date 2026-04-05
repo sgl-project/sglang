@@ -301,6 +301,8 @@ class FlexKVConnector(BaseKVConnector):
         self._ongoing_stores: Dict[int, int] = {}
         # ext_task_ids whose store has completed or was skipped (rank 0 only)
         self._completed_stores: List[int] = []
+        # flexkv task ids for periodic drain to prevent pipe deadlock
+        self._load_fkv_tids: List[int] = []
 
         if self.rank == 0:
             while not self.kv_manager.is_ready():
@@ -387,6 +389,8 @@ class FlexKVConnector(BaseKVConnector):
                     counter_id=producer_id,
                 )
 
+            if self.rank == 0:
+                self._load_fkv_tids.extend(flexkv_task_ids)
             self._ongoing_loads[task_id] = producer_id
         else:
             if self.rank == 0:
@@ -411,6 +415,10 @@ class FlexKVConnector(BaseKVConnector):
             self._completed_loads.append(task_id)
 
     def check_completed_load_tasks(self) -> List[int]:
+        if self.rank == 0 and len(self._load_fkv_tids) >= 100:
+            self.kv_manager.try_wait(task_ids=self._load_fkv_tids)
+            self._load_fkv_tids.clear()
+
         for ext_tid, producer_id in list(self._ongoing_loads.items()):
             if self._layer_done_counter.events[producer_id]._finished:
                 self._completed_loads.append(ext_tid)
@@ -487,6 +495,7 @@ class FlexKVConnector(BaseKVConnector):
         self._pending_loads.clear()
         self._ongoing_loads.clear()
         self._completed_loads.clear()
+        self._load_fkv_tids.clear()
 
         if self.rank == 0:
             for fk_tid in list(self._ongoing_stores.values()):
