@@ -45,6 +45,7 @@ logger = init_logger(__name__)
 
 # Track test cases missing estimated_full_test_time_s for time measurement output
 _MISSING_ESTIMATED_TIME_CASES: set[str] = set()
+_PENDING_BASELINE_DUMPS: dict[str, tuple["PerformanceSummary", bool]] = {}
 
 
 @pytest.fixture
@@ -176,13 +177,24 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
         _fixture_end_time = time.perf_counter()
         _measured_full_time = _fixture_end_time - _fixture_start_time
+        is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
+
+        pending_dump = _PENDING_BASELINE_DUMPS.pop(case.id, None)
+        if pending_dump is not None:
+            summary, missing_scenario = pending_dump
+            DiffusionServerBase()._dump_baseline_for_testcase(
+                case,
+                summary,
+                missing_scenario=missing_scenario,
+                measured_full_time=_measured_full_time,
+            )
 
         scenario = BASELINE_CONFIG.scenarios.get(case.id)
         needs_estimated_time = (
             scenario is None or scenario.estimated_full_test_time_s is None
         )
 
-        if needs_estimated_time:
+        if needs_estimated_time and not is_baseline_generation_mode:
             _MISSING_ESTIMATED_TIME_CASES.add(case.id)
             logger.error(
                 f'\n{"=" * 60}\n'
@@ -329,7 +341,11 @@ Consider updating perf_baselines.json with the snippets below:
         summary = validator.collect_metrics(perf_record)
 
         if case.run_perf_check:
-            if is_baseline_generation_mode or missing_scenario:
+            if is_baseline_generation_mode:
+                _PENDING_BASELINE_DUMPS[case.id] = (summary, missing_scenario)
+                return
+
+            if missing_scenario:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 if missing_scenario:
                     pytest.fail(
