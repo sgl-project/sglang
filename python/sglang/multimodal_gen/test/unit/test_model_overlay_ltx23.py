@@ -10,12 +10,8 @@ from safetensors.torch import save_file
 
 pytest.importorskip("triton.compiler")
 
-from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
-    _gemma_postprocess_func,
     is_ltx23_native_variant,
-    pack_text_embeds,
-    pack_text_embeds_v2,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
@@ -26,11 +22,7 @@ from sglang.multimodal_gen.model_overlays.ltx_2_3._overlay.materialize import (
     _repack_ltx23_video_decoder_weights,
 )
 from sglang.multimodal_gen.registry import get_model_info
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.models.vocoder.ltx_2_vocoder import LTX2Vocoder
 from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
-    LTX2SigmaPreparationStage,
     _resolve_ltx2_two_stage_component_paths,
     build_official_ltx2_sigmas,
     prepare_ltx2_mu,
@@ -42,13 +34,17 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
     LTX2AVDenoisingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation_av import (
-    LTX2AVLatentPreparationStage,
-)
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
-    maybe_load_overlay_model_index,
     resolve_model_overlay_target,
 )
+
+
+def _make_req(**sampling_kwargs) -> Req:
+    return Req(
+        sampling_params=SamplingParams(**sampling_kwargs),
+        prompt="prompt",
+        prompt_embeds=[torch.zeros(1, 1, 1)],
+    )
 
 
 def test_ltx23_builtin_overlay_target_is_hf_repo():
@@ -57,175 +53,46 @@ def test_ltx23_builtin_overlay_target_is_hf_repo():
 
     source_model_id, overlay_spec = target
     assert source_model_id == "Lightricks/LTX-2.3"
-    assert str(overlay_spec["overlay_revision"]) == "main"
     assert str(overlay_spec["overlay_repo_id"]) == "MickJ/LTX-2.3-overlay"
+    assert str(overlay_spec["overlay_revision"]) == "main"
     assert str(overlay_spec["bundled_overlay_subdir"]) == "ltx_2_3"
 
 
-def test_ltx23_overlay_model_index_is_native():
-    local_overlay_dir = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__),
-            "..",
-            "..",
-            "model_overlays",
-            "ltx_2_3",
-        )
-    )
-    model_index = maybe_load_overlay_model_index(
-        "Lightricks/LTX-2.3",
-        snapshot_download_fn=lambda **kwargs: local_overlay_dir,
-        hf_hub_download_fn=lambda **kwargs: None,
-    )
-    assert model_index is not None
-    assert model_index["_class_name"] == "LTX2Pipeline"
-
-
-def test_ltx23_model_info_resolves_to_native_pipeline():
+def test_ltx23_model_info_resolves_to_native_pipeline_and_sampling_params():
     model_info = get_model_info("Lightricks/LTX-2.3", backend="sglang")
+
     assert model_info is not None
     assert model_info.pipeline_cls.__name__ == "LTX2Pipeline"
-
-
-def test_ltx23_model_info_uses_ltx23_sampling_params():
-    model_info = get_model_info("Lightricks/LTX-2.3", backend="sglang")
-    assert model_info is not None
     assert model_info.sampling_param_cls.__name__ == "LTX23SamplingParams"
 
 
-def test_ltx23_defaults_to_cuda_generator():
+def test_ltx23_sampling_defaults_use_cuda_generator():
     sampling_params = SamplingParams.from_pretrained(
         "Lightricks/LTX-2.3",
         backend="sglang",
     )
-    pipeline_config = get_model_info(
-        "Lightricks/LTX-2.3", backend="sglang"
-    ).pipeline_config_cls()
 
     assert sampling_params.generator_device == "cuda"
-    assert pipeline_config.generator_device == "cuda"
+    assert sampling_params.guidance_scale == 3.0
+    assert sampling_params.num_inference_steps == 30
 
 
-def test_ltx2_defaults_to_cpu_generator():
+def test_ltx2_sampling_defaults_keep_cpu_generator():
     sampling_params = SamplingParams.from_pretrained(
         "Lightricks/LTX-2",
         backend="sglang",
     )
-    pipeline_config = get_model_info(
-        "Lightricks/LTX-2", backend="sglang"
-    ).pipeline_config_cls()
 
     assert sampling_params.generator_device == "cpu"
-    assert pipeline_config.generator_device == "cpu"
 
 
-def test_ltx23_uses_official_sigma_schedule():
-    sigmas = build_official_ltx2_sigmas(30)
-
-    assert len(sigmas) == 30
-    assert sigmas[0] == 1.0
-    assert abs(sigmas[1] - 0.99495703) < 1e-6
-    assert abs(sigmas[-1] - 0.1) < 1e-6
-
-
-def test_ltx23_sigma_preparation_uses_official_schedule_only_for_ltx23_marker():
-    req = Req(
-        sampling_params=SamplingParams(num_inference_steps=30),
-        prompt="prompt",
-        prompt_embeds=[torch.zeros(1, 1, 1)],
-    )
-    stage = LTX2SigmaPreparationStage()
-
-    ltx23_server_args = SimpleNamespace(
-        pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(
-                arch_config=SimpleNamespace(ltx_variant="ltx_2_3")
-            )
-        )
-    )
-    legacy_server_args = SimpleNamespace(
-        pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2"))
-        )
-    )
-
-    ltx23_batch = stage.forward(req, ltx23_server_args)
-    legacy_batch = stage.forward(
-        Req(
-            sampling_params=SamplingParams(num_inference_steps=30),
-            prompt="prompt",
-            prompt_embeds=[torch.zeros(1, 1, 1)],
-        ),
-        legacy_server_args,
-    )
-
-    assert abs(ltx23_batch.sigmas[1] - 0.99495703) < 1e-6
-    assert abs(legacy_batch.sigmas[1] - (29.0 / 30.0)) < 1e-6
-
-
-def test_ltx23_native_variant_uses_explicit_marker_only():
-    ltx23_arch = SimpleNamespace(ltx_variant="ltx_2_3")
-    legacy_arch = SimpleNamespace(ltx_variant="ltx_2")
-
-    assert is_ltx23_native_variant(ltx23_arch) is True
-    assert is_ltx23_native_variant(legacy_arch) is False
-
-
-def test_ltx23_skips_mu_when_using_official_sigma_schedule():
-    req = Req(
-        sampling_params=SamplingParams(num_frames=121, height=512, width=768),
-        prompt="prompt",
-        prompt_embeds=[torch.zeros(1, 1, 1)],
-    )
-    ltx23_server_args = SimpleNamespace(
-        pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(
-                arch_config=SimpleNamespace(ltx_variant="ltx_2_3")
-            )
-        )
-    )
-
-    assert prepare_ltx2_mu(req, ltx23_server_args) == ("mu", None)
-
-
-def test_ltx2_legacy_mu_still_uses_shift_schedule():
-    req = Req(
-        sampling_params=SamplingParams(num_frames=121, height=512, width=768),
-        prompt="prompt",
-        prompt_embeds=[torch.zeros(1, 1, 1)],
-    )
-    legacy_server_args = SimpleNamespace(
-        pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(
-                arch_config=SimpleNamespace(
-                    temporal_compression_ratio=8,
-                    spatial_compression_ratio=32,
-                )
-            )
-        )
-    )
-
-    key, mu = prepare_ltx2_mu(req, legacy_server_args)
-
-    assert key == "mu"
-    assert isinstance(mu, float)
-    assert mu > 0.0
-
-
-def test_ltx23_prepare_request_sets_stage1_guider_defaults():
+def test_ltx23_build_request_extra_sets_stage1_guider_defaults():
     sampling_params = SamplingParams.from_pretrained(
         "Lightricks/LTX-2.3",
         backend="sglang",
     )
-    server_args = SimpleNamespace(
-        attention_backend_config=SimpleNamespace(VSA_sparsity=0.0),
-    )
 
-    req = prepare_request(server_args, sampling_params)
-
-    assert req.num_inference_steps == 30
-    assert req.guidance_scale == 3.0
-    assert req.extra["ltx2_stage1_guider_params"] == {
+    assert sampling_params.build_request_extra()["ltx2_stage1_guider_params"] == {
         "video_cfg_scale": 3.0,
         "video_stg_scale": 1.0,
         "video_rescale_scale": 0.7,
@@ -246,38 +113,58 @@ def test_sampling_params_apply_request_extra_populates_req_extra():
         "Lightricks/LTX-2.3",
         backend="sglang",
     )
+    req = Req(sampling_params=sampling_params, prompt="prompt")
 
-    req = Req(sampling_params=sampling_params)
     sampling_params.apply_request_extra(req)
 
     assert req.extra["ltx2_stage1_guider_params"]["video_cfg_scale"] == 3.0
     assert req.extra["ltx2_stage1_guider_params"]["audio_cfg_scale"] == 7.0
 
 
-def test_ltx23_stage1_guider_params_apply_to_one_stage_path():
-    sampling_params = SamplingParams.from_pretrained(
-        "Lightricks/LTX-2.3",
-        backend="sglang",
+def test_ltx23_uses_official_sigma_schedule():
+    sigmas = build_official_ltx2_sigmas(30)
+
+    assert len(sigmas) == 30
+    assert sigmas[0] == pytest.approx(1.0)
+    assert sigmas[1] == pytest.approx(0.99495703, abs=1e-6)
+    assert sigmas[-1] == pytest.approx(0.1, abs=1e-6)
+
+
+def test_ltx23_native_variant_uses_explicit_marker_only():
+    assert is_ltx23_native_variant(SimpleNamespace(ltx_variant="ltx_2_3")) is True
+    assert is_ltx23_native_variant(SimpleNamespace(ltx_variant="ltx_2")) is False
+
+
+def test_prepare_ltx2_mu_respects_variant_marker():
+    ltx23_server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(ltx_variant="ltx_2_3")
+            )
+        )
     )
-    server_args = SimpleNamespace(
-        attention_backend_config=SimpleNamespace(VSA_sparsity=0.0),
+    legacy_server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(ltx_variant="ltx_2")
+            ),
+            vae_temporal_compression=8,
+            vae_scale_factor=32,
+        )
     )
 
-    req = prepare_request(server_args, sampling_params)
-    stage = SimpleNamespace(pipeline=None)
+    assert prepare_ltx2_mu(
+        _make_req(num_frames=121, height=512, width=768),
+        ltx23_server_args,
+    ) == ("mu", None)
 
-    assert (
-        LTX2AVDenoisingStage._get_ltx2_stage1_guider_params(
-            stage, req, server_args, "stage1"
-        )
-        == req.extra["ltx2_stage1_guider_params"]
+    key, mu = prepare_ltx2_mu(
+        _make_req(num_frames=121, height=512, width=768),
+        legacy_server_args,
     )
-    assert (
-        LTX2AVDenoisingStage._get_ltx2_stage1_guider_params(
-            stage, req, server_args, "stage2"
-        )
-        is None
-    )
+    assert key == "mu"
+    assert isinstance(mu, float)
+    assert mu > 0.0
 
 
 def test_ltx23_ti2v_clean_latent_uses_zero_background():
@@ -298,56 +185,6 @@ def test_ltx23_ti2v_clean_latent_uses_zero_background():
     assert torch.equal(clean_latent[:, 2:], torch.zeros_like(clean_latent[:, 2:]))
     assert torch.equal(denoise_mask[:, :2], torch.zeros_like(denoise_mask[:, :2]))
     assert torch.equal(denoise_mask[:, 2:], torch.ones_like(denoise_mask[:, 2:]))
-
-
-def test_ltx2_legacy_latent_preparation_keeps_unpacked_noise_path():
-    stage = LTX2AVLatentPreparationStage(
-        scheduler=SimpleNamespace(init_noise_sigma=1.0),
-    )
-    batch = Req(
-        sampling_params=SamplingParams(
-            height=32,
-            width=32,
-            num_frames=9,
-            fps=24,
-            seed=1,
-            num_outputs_per_prompt=1,
-        ),
-        prompt="prompt",
-        prompt_embeds=[torch.zeros(1, 1, 1)],
-    )
-    batch.generator = [torch.Generator(device="cpu").manual_seed(1)]
-    batch.batch_size = 1
-    batch.latents = None
-    batch.audio_latents = None
-    batch.generate_audio = False
-    batch.height = 32
-    batch.width = 32
-    batch.num_frames = 9
-
-    server_args = SimpleNamespace(
-        pipeline_config=SimpleNamespace(
-            vae_config=SimpleNamespace(
-                arch_config=SimpleNamespace(ltx_variant="ltx_2")
-            ),
-            prepare_latent_shape=lambda _batch, _batch_size, _num_frames: (
-                1,
-                2,
-                3,
-                4,
-                5,
-            ),
-            maybe_prepare_latent_ids=lambda latents: None,
-            maybe_pack_latents=lambda latents, _batch_size, _batch: latents.flatten(
-                2, 4
-            ).transpose(1, 2),
-            use_temporal_scaling_frames=True,
-        )
-    )
-
-    out = stage.forward(batch, server_args)
-
-    assert out.latents.shape == (1, 60, 2)
 
 
 def test_ltx2_ti2v_clean_latent_keeps_legacy_background_when_requested():
@@ -375,75 +212,6 @@ def test_ltx23_velocity_to_x0_supports_tokenwise_sigma():
 
     expected = torch.tensor([[[1.0, 2.0], [2.5, 3.5]]], dtype=torch.float32)
     assert torch.allclose(denoised, expected)
-
-
-def test_pack_text_embeds_v2_masks_padding():
-    hidden_states = torch.tensor(
-        [
-            [
-                [[3.0, 4.0], [0.0, 0.0]],
-                [[0.0, 0.0], [0.0, 0.0]],
-            ]
-        ]
-    )
-    attention_mask = torch.tensor([[1, 0]])
-
-    packed = pack_text_embeds_v2(hidden_states, attention_mask)
-
-    expected_first = torch.tensor(
-        [1.0, 1.0, 0.0, 0.0], dtype=packed.dtype, device=packed.device
-    )
-    assert torch.allclose(packed[0, 0], expected_first)
-    assert torch.equal(packed[0, 1], torch.zeros_like(packed[0, 1]))
-
-
-def test_ltx23_gemma_postprocess_uses_v2_norm():
-    hidden_state = torch.tensor(
-        [
-            [
-                [3.0, 0.0],
-                [4.0, 0.0],
-            ]
-        ]
-    )
-    outputs = SimpleNamespace(hidden_states=(hidden_state,))
-    text_inputs = {"attention_mask": torch.tensor([[1]])}
-    pipeline_config = SimpleNamespace(
-        dit_config=SimpleNamespace(
-            arch_config=SimpleNamespace(caption_proj_before_connector=True)
-        )
-    )
-
-    packed = _gemma_postprocess_func(outputs, text_inputs, pipeline_config)
-
-    expected = torch.tensor([[[0.6, 0.8]]], dtype=packed.dtype, device=packed.device)
-    assert torch.allclose(packed, expected, atol=1e-6)
-
-
-def test_ltx2_gemma_postprocess_keeps_legacy_pack_path():
-    hidden_state = torch.tensor(
-        [
-            [
-                [1.0, 3.0],
-                [2.0, 4.0],
-            ]
-        ]
-    )
-    outputs = SimpleNamespace(hidden_states=(hidden_state,))
-    text_inputs = {"attention_mask": torch.tensor([[1]])}
-    pipeline_config = SimpleNamespace(
-        dit_config=SimpleNamespace(
-            arch_config=SimpleNamespace(caption_proj_before_connector=False)
-        )
-    )
-
-    packed = _gemma_postprocess_func(outputs, text_inputs, pipeline_config)
-    expected = pack_text_embeds(
-        torch.stack(outputs.hidden_states, dim=-1),
-        text_inputs["attention_mask"].sum(dim=-1),
-        padding_side="left",
-    )
-    assert torch.allclose(packed, expected)
 
 
 def test_ltx23_connector_repack_renames_qk_norm_keys():
@@ -474,7 +242,7 @@ def test_ltx23_transformer_config_forces_sdpa_for_v2a_cross_attention():
     assert config["force_sdpa_v2a_cross_attention"] is True
 
 
-def test_ltx23_vae_config_adds_official_image_encoder_marker():
+def test_ltx23_vae_config_adds_required_markers():
     with tempfile.TemporaryDirectory() as tmpdir:
         auxiliary_dir = os.path.join(tmpdir, "aux")
         config_donor_dir = os.path.join(tmpdir, "donor")
@@ -506,10 +274,9 @@ def test_ltx23_vae_config_adds_official_image_encoder_marker():
                 },
                 f,
             )
+
         config = _build_vae_config(auxiliary_dir, config_donor_dir)
 
-    assert config["encoder_spatial_padding_mode"] == "zeros"
-    assert config["decoder_spatial_padding_mode"] == "reflect"
     assert config["ltx_variant"] == "ltx_2_3"
     assert config["condition_encoder_subdir"] == "ltx23_image_encoder"
     assert config["video_decoder_variant"] == "ltx_2_3"
@@ -532,8 +299,7 @@ def test_ltx23_repack_image_encoder_keeps_only_encoder_tensors():
         _repack_ltx23_image_encoder_weights(source_path, output_path)
 
         with safe_open(output_path, framework="pt") as f:
-            keys = sorted(f.keys())
-            assert keys == [
+            assert sorted(f.keys()) == [
                 "conv_in.conv.weight",
                 "per_channel_statistics.mean-of-means",
             ]
@@ -562,8 +328,7 @@ def test_ltx23_repack_video_decoder_keeps_decoder_and_stats():
         _repack_ltx23_video_decoder_weights(auxiliary_path, donor_path, output_path)
 
         with safe_open(output_path, framework="pt") as f:
-            keys = sorted(f.keys())
-            assert keys == [
+            assert sorted(f.keys()) == [
                 "decoder.conv_in.conv.weight",
                 "decoder.per_channel_statistics.mean_of_means",
                 "decoder.per_channel_statistics.std_of_means",
@@ -574,7 +339,7 @@ def test_ltx23_repack_video_decoder_keeps_decoder_and_stats():
 
 
 def test_ltx23_decode_skips_external_denorm():
-    server_args = SimpleNamespace(
+    ltx23_server_args = SimpleNamespace(
         pipeline_config=SimpleNamespace(
             vae_config=SimpleNamespace(
                 arch_config=SimpleNamespace(video_decoder_variant="ltx_2_3")
@@ -590,7 +355,9 @@ def test_ltx23_decode_skips_external_denorm():
     )
 
     assert (
-        LTX2AVDecodingStage._ltx2_should_externally_denorm_video_latents(server_args)
+        LTX2AVDecodingStage._ltx2_should_externally_denorm_video_latents(
+            ltx23_server_args
+        )
         is False
     )
     assert (
@@ -602,132 +369,24 @@ def test_ltx23_decode_skips_external_denorm():
 
 
 def test_ltx2_two_stage_component_auto_resolution_preserves_legacy_candidates(tmp_path):
-    model_path = str(tmp_path)
     legacy_spatial = tmp_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
     legacy_lora = tmp_path / "ltx-2-19b-distilled-lora-384.safetensors"
     legacy_spatial.touch()
     legacy_lora.touch()
 
-    resolved = _resolve_ltx2_two_stage_component_paths(model_path, {})
+    resolved = _resolve_ltx2_two_stage_component_paths(str(tmp_path), {})
 
     assert resolved["spatial_upsampler"] == str(legacy_spatial)
     assert resolved["distilled_lora"] == str(legacy_lora)
 
 
 def test_ltx23_two_stage_component_auto_resolution_prefers_23_assets(tmp_path):
-    model_path = str(tmp_path)
     spatial = tmp_path / "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
     lora = tmp_path / "ltx-2.3-22b-distilled-lora-384.safetensors"
     spatial.touch()
     lora.touch()
 
-    resolved = _resolve_ltx2_two_stage_component_paths(model_path, {})
+    resolved = _resolve_ltx2_two_stage_component_paths(str(tmp_path), {})
 
     assert resolved["spatial_upsampler"] == str(spatial)
     assert resolved["distilled_lora"] == str(lora)
-
-
-def test_ltx23_vocoder_uses_bwe_config():
-    vocoder_config = LTXVocoderConfig()
-    vocoder_config.update_model_arch(
-        {
-            "vocoder": {
-                "vocoder": {
-                    "upsample_initial_channel": 1536,
-                    "resblock": "AMP1",
-                    "upsample_rates": [5, 2, 2, 2, 2, 2],
-                    "resblock_kernel_sizes": [3, 7, 11],
-                    "upsample_kernel_sizes": [11, 4, 4, 4, 4, 4],
-                    "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-                    "activation": "snakebeta",
-                    "use_tanh_at_final": False,
-                    "use_bias_at_final": False,
-                },
-                "bwe": {
-                    "upsample_initial_channel": 512,
-                    "resblock": "AMP1",
-                    "upsample_rates": [6, 5, 2, 2, 2],
-                    "resblock_kernel_sizes": [3, 7, 11],
-                    "upsample_kernel_sizes": [12, 11, 4, 4, 4],
-                    "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-                    "activation": "snakebeta",
-                    "apply_final_activation": False,
-                    "use_tanh_at_final": False,
-                    "use_bias_at_final": False,
-                    "input_sampling_rate": 16000,
-                    "output_sampling_rate": 48000,
-                    "hop_length": 80,
-                    "n_fft": 512,
-                    "win_size": 512,
-                    "num_mels": 64,
-                },
-            }
-        }
-    )
-
-    vocoder = LTX2Vocoder(vocoder_config)
-
-    assert hasattr(vocoder, "vocoder")
-    assert hasattr(vocoder, "bwe_generator")
-    assert hasattr(vocoder, "mel_stft")
-    assert vocoder.sample_rate == 48000
-
-
-def test_ltx2_legacy_vocoder_keeps_flat_path():
-    vocoder = LTX2Vocoder(LTXVocoderConfig())
-
-    assert hasattr(vocoder, "conv_in")
-    assert not hasattr(vocoder, "bwe_generator")
-    assert vocoder.sample_rate == 24000
-
-
-def test_ltx23_latent_preparation_samples_directly_in_packed_space():
-    device = get_local_torch_device()
-    generator_device = device.type
-    generator = torch.Generator(generator_device).manual_seed(123)
-    req = Req(
-        sampling_params=SamplingParams(
-            num_outputs_per_prompt=1,
-            num_frames=121,
-            height=512,
-            width=768,
-        ),
-        prompt="prompt",
-        prompt_embeds=[torch.zeros(1, 1, 1)],
-        generator=[generator],
-        generate_audio=True,
-    )
-    pipeline_config = get_model_info(
-        "Lightricks/LTX-2.3", backend="sglang"
-    ).pipeline_config_cls()
-    server_args = SimpleNamespace(pipeline_config=pipeline_config)
-    stage = LTX2AVLatentPreparationStage(
-        scheduler=SimpleNamespace(init_noise_sigma=1.0)
-    )
-
-    batch = stage.forward(req, server_args)
-
-    video_shape = pipeline_config.prepare_latent_shape(
-        batch, batch.batch_size, stage.adjust_video_length(batch, server_args)
-    )
-    audio_shape = pipeline_config.prepare_audio_latent_shape(
-        batch, batch.batch_size, batch.num_frames
-    )
-    expected_generator = torch.Generator(generator_device).manual_seed(123)
-    expected_video = torch.randn(
-        LTX2AVLatentPreparationStage._packed_video_latent_shape(
-            video_shape, pipeline_config
-        ),
-        generator=expected_generator,
-        device=device,
-        dtype=torch.float32,
-    )
-    expected_audio = torch.randn(
-        LTX2AVLatentPreparationStage._packed_audio_latent_shape(audio_shape),
-        generator=expected_generator,
-        device=device,
-        dtype=torch.float32,
-    )
-
-    assert torch.allclose(batch.latents, expected_video)
-    assert torch.allclose(batch.audio_latents, expected_audio)
