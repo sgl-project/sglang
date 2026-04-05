@@ -34,7 +34,7 @@ REPO = "sgl-project/sglang"
 GITHUB_API = "https://api.github.com"
 
 # Claude model to use
-CLAUDE_MODEL = "claude-sonnet-4-5-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Path to the bisect skill definition (relative to repo root)
 BISECT_SKILL_PATH = ".claude/skills/sglang-bisect-ci-regression/SKILL.md"
