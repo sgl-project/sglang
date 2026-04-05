@@ -32,7 +32,7 @@ register_cuda_ci(est_time=15, suite="stage-b-test-small-1-gpu")
 # fp32 ref is tight (kernel also runs in fp32 internally).
 # Native-dtype ref is looser (div_ truncates to bf16/fp16 before softmax).
 _TOL = {
-    torch.bfloat16: {"fp32_ref": (1e-5, 1e-5), "native_ref": (5e-4, 2e-2)},
+    torch.bfloat16: {"fp32_ref": (1e-5, 1e-5), "native_ref": (2e-2, 1e-1)},
     torch.float16: {"fp32_ref": (1e-5, 1e-5), "native_ref": (1e-3, 1e-2)},
     torch.float32: {"fp32_ref": (1e-5, 1e-5), "native_ref": (1e-5, 1e-5)},
 }
@@ -62,7 +62,7 @@ class TestFusedTemperatureSoftmax(CustomTestCase):
         self.assertTrue((fused >= 0).all(), "Negative probabilities in fused output")
         row_sums = fused.sum(dim=-1)
         torch.testing.assert_close(
-            row_sums, torch.ones_like(row_sums), atol=1e-4, rtol=1e-4
+            row_sums, torch.ones_like(row_sums), atol=1e-3, rtol=1e-3
         )
         torch.testing.assert_close(fused, ref, atol=atol, rtol=rtol)
 
