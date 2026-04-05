@@ -79,6 +79,11 @@ class InputValidationStage(PipelineStage):
         # Create generators based on generator_device parameter
         # Note: This will overwrite any existing batch.generator
         generator_device = batch.generator_device
+        if generator_device is None:
+            generator_device = (
+                getattr(server_args.pipeline_config, "generator_device", None)
+                or current_platform.device_type
+            )
 
         if generator_device == "cpu":
             device_str = "cpu"

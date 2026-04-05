@@ -208,20 +208,8 @@ class Platform:
         return None, None
 
     @classmethod
-    def has_modelopt_fp4_best_performance_kit(cls) -> bool:
-        return False
-
-    @classmethod
-    def can_use_modelopt_fp4_best_performance_kit(cls) -> bool:
-        return False
-
-    @classmethod
-    def should_use_modelopt_fp4_best_performance_kit(cls) -> bool:
-        return False
-
-    @classmethod
-    def warn_if_modelopt_fp4_best_performance_kit_missing(cls) -> None:
-        pass
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        return "auto"
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:

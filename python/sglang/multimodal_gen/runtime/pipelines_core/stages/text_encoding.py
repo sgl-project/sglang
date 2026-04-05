@@ -7,6 +7,8 @@ Prompt encoding stages for diffusion pipelines.
 This module contains implementations of prompt encoding stages for diffusion pipelines.
 """
 
+import inspect
+
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
@@ -263,14 +265,22 @@ class TextEncodingStage(PipelineStage):
                 attention_mask = torch.ones(input_ids.shape[:2], device=target_device)
             else:
                 attention_mask = text_inputs["attention_mask"]
+            encoder_forward_kwargs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "output_hidden_states": True,
+            }
+            if "use_cache" in inspect.signature(text_encoder.forward).parameters:
+                encoder_forward_kwargs["use_cache"] = False
             with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs: BaseEncoderOutput = text_encoder(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    use_cache=False,
-                )
-            prompt_embeds = postprocess_func(outputs, text_inputs)
+                outputs: BaseEncoderOutput = text_encoder(**encoder_forward_kwargs)
+            postprocess_sig = inspect.signature(postprocess_func)
+
+            postprocess_kwargs = {}
+            if "pipeline_config" in postprocess_sig.parameters:
+                # required by models like LTX
+                postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
+            prompt_embeds = postprocess_func(outputs, text_inputs, **postprocess_kwargs)
             if dtype is not None:
                 prompt_embeds = prompt_embeds.to(dtype=dtype)
 
