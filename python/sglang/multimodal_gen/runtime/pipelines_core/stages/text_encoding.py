@@ -259,17 +259,14 @@ class TextEncodingStage(PipelineStage):
             is_flux_v1 = isinstance(
                 server_args.pipeline_config, FluxPipelineConfig
             ) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
-            is_flux_t5 = is_flux_v1 and i == 1
 
-            if is_flux_t5:
-                attention_mask = torch.ones(input_ids.shape[:2], device=target_device)
-            else:
-                attention_mask = text_inputs["attention_mask"]
+            attention_mask = None if is_flux_v1 else text_inputs["attention_mask"]
             encoder_forward_kwargs = {
                 "input_ids": input_ids,
-                "attention_mask": attention_mask,
                 "output_hidden_states": True,
             }
+            if attention_mask is not None:
+                encoder_forward_kwargs["attention_mask"] = attention_mask
             if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                 encoder_forward_kwargs["use_cache"] = False
             with set_forward_context(current_timestep=0, attn_metadata=None):
@@ -288,7 +285,12 @@ class TextEncodingStage(PipelineStage):
             if is_flux_v1:
                 pooled_embeds_list.append(outputs.pooler_output)
             if return_attention_mask:
-                attn_masks_list.append(attention_mask)
+                mask_to_store = (
+                    attention_mask
+                    if attention_mask is not None
+                    else torch.ones(input_ids.shape[:2], device=target_device)
+                )
+                attn_masks_list.append(mask_to_store)
 
         # Shape results according to return_type
         if return_type == "list":
