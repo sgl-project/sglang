@@ -29,9 +29,7 @@
 namespace {
 
 constexpr uint32_t kBlockSize = 1024;
-constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;  // 32
 
-// Target occupancy is 2
 #define SGL_SOFTMAX_KERNEL __global__ void __launch_bounds__(kBlockSize, 2)
 
 // ============================================================================
@@ -58,37 +56,30 @@ struct SoftmaxParams {
 
 /// Warp-level online softmax merge across all 32 lanes.
 SGL_DEVICE fp32x2_t warp_online_softmax_merge(fp32x2_t ms) {
-  namespace math = device::math;
+  using namespace device;
   auto [m, s] = ms;
-#pragma unroll
-  for (int mask = 16; mask > 0; mask >>= 1) {
-    float om = __shfl_xor_sync(0xffffffffu, m, mask);
-    float os = __shfl_xor_sync(0xffffffffu, s, mask);
-    float nm = math::max(m, om);
-    s = s * math::exp(m - nm) + os * math::exp(om - nm);
-    m = nm;
-  }
-  return fp32x2_t{m, s};
+  const auto warp_max = warp::reduce_max(m);
+  const auto warp_sum = warp::reduce_sum(s * math::exp(m - warp_max));
+  return {warp_max, warp_sum};
 }
 
 /// CTA-level online softmax merge.
-/// smem must have at least 2 * kNumWarps floats.
-/// After return, all threads see the final (max, sum) in (m, s).
+/// smem_ms must have at least 32 fp32x2_t entries (caller-owned).
+/// num_warps is the number of active warps (blockDim.x / 32).
+/// After return, all threads see the final (max, sum).
 [[maybe_unused]]
-SGL_DEVICE fp32x2_t cta_online_softmax_merge(float m, float s) {
-  __shared__ fp32x2_t smem_ms[kNumWarps];
-
+SGL_DEVICE fp32x2_t cta_online_softmax_merge(float m, float s, fp32x2_t* smem_ms, uint32_t num_warps) {
   const uint32_t warp_id = threadIdx.x / device::kWarpThreads;
   const uint32_t lane_id = threadIdx.x % device::kWarpThreads;
 
   smem_ms[warp_id] = warp_online_softmax_merge({m, s});
   __syncthreads();
   if (warp_id == 0) {
-    const auto ms = lane_id < kNumWarps ? smem_ms[lane_id] : fp32x2_t{-FLT_MAX, 0.0f};
-    smem_ms[lane_id] = warp_online_softmax_merge(ms);
+    const auto ms = lane_id < num_warps ? smem_ms[lane_id] : fp32x2_t{-FLT_MAX, 0.0f};
+    smem_ms[0] = warp_online_softmax_merge(ms);
   }
   __syncthreads();
-  return smem_ms[warp_id];
+  return smem_ms[0];
 }
 
 // ============================================================================
@@ -119,16 +110,25 @@ SGL_SOFTMAX_KERNEL softmax_fused_kernel(const __grid_constant__ SoftmaxParams pa
   for (uint32_t vi = threadIdx.x; vi < n_vecs; vi += kBlockSize) {
     vec_t v;
     v.load(row_in, vi);
+    float cache[kVecN];
+    float vec_max = -FLT_MAX;
 #pragma unroll
     for (int i = 0; i < kVecN; ++i) {
-      float val = cast<fp32_t>(v[i]) * inv_temp;
-      float old_m = m;
-      m = math::max(m, val);
-      s = s * math::exp(old_m - m) + math::exp(val - m);
+      const auto val = cast<fp32_t>(v[i]) * inv_temp;
+      vec_max = (i == 0) ? val : math::max(vec_max, val);
+      cache[i] = val;
+    }
+    const auto old_max = m;
+    m = math::max(m, vec_max);
+    s *= math::exp(old_max - m);
+#pragma unroll
+    for (int i = 0; i < kVecN; ++i) {
+      s += math::exp(cache[i] - m);
     }
   }
 
-  const auto [global_max, global_sum] = cta_online_softmax_merge(m, s);
+  __shared__ fp32x2_t smem_ms[32];
+  const auto [global_max, global_sum] = cta_online_softmax_merge(m, s, smem_ms, kBlockSize / kWarpThreads);
   const float row_max = global_max;
   const float inv_sum = 1.0f / global_sum;
 
@@ -181,50 +181,40 @@ SGL_SOFTMAX_KERNEL softmax_split_kernel(const __grid_constant__ SoftmaxParams pa
   if (c_start >= vocab_size) return;
   const uint32_t c_len = c_end - c_start;
 
-  __shared__ float smem_max[kNumWarps];
+  __shared__ fp32x2_t smem_ms[32];
 
   const DType* c_in = row_in + c_start;
-  DType* c_out = row_out + c_start;
 
   const uint32_t n_vecs = c_len / kVecN;
 
   // --- local max ---
-  float tmax = -FLT_MAX;
+  float m = -FLT_MAX;
+  float s = 0.0f;
   for (uint32_t vi = threadIdx.x; vi < n_vecs; vi += kBlockSize) {
     vec_t v;
     v.load(c_in, vi);
+    float cache[kVecN];
+    float vec_max = -FLT_MAX;
 #pragma unroll
     for (int i = 0; i < kVecN; ++i) {
-      tmax = math::max(tmax, cast<fp32_t>(v[i]) * inv_temp);
+      const auto val = cast<fp32_t>(v[i]) * inv_temp;
+      vec_max = (i == 0) ? val : math::max(vec_max, val);
+      cache[i] = val;
     }
-  }
-
-  cta::reduce_max(tmax, smem_max, /*min_value=*/-FLT_MAX);
-  __syncthreads();
-  const float local_max = smem_max[0];
-
-  // --- local sum + write partial exp (as DType) ---
-  float tsum = 0.0f;
-  for (uint32_t vi = threadIdx.x; vi < n_vecs; vi += kBlockSize) {
-    vec_t v_in;
-    v_in.load(c_in, vi);
-    vec_t v_out;
+    const auto old_max = m;
+    m = math::max(m, vec_max);
+    s *= math::exp(old_max - m);
 #pragma unroll
     for (int i = 0; i < kVecN; ++i) {
-      float e = math::exp(cast<fp32_t>(v_in[i]) * inv_temp - local_max);
-      v_out[i] = cast<DType>(e);
-      tsum += e;
+      s += math::exp(cache[i] - m);
     }
-    v_out.store(c_out, vi);
-  }
-
-  cta::reduce_sum(tsum, smem_max);
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    partial_ms[row * num_splits + sid] = fp32x2_t{local_max, smem_max[0]};
   }
 
   PDLTriggerSecondary<kUsePDL>();
+  const auto partial_result = cta_online_softmax_merge(m, s, smem_ms, kBlockSize / kWarpThreads);
+  if (threadIdx.x == 0) {
+    partial_ms[row * num_splits + sid] = partial_result;
+  }
 }
 
 // ============================================================================
@@ -240,8 +230,7 @@ SGL_SOFTMAX_KERNEL softmax_merge_kernel(const __grid_constant__ SoftmaxParams pa
   using namespace device;
   using vec_t = AlignedVector<DType, kVecN>;
 
-  PDLWaitPrimary<kUsePDL>();
-
+  const auto input = static_cast<const DType*>(params.input);
   const auto output = static_cast<DType*>(params.output);
   const auto partial_ms = static_cast<const fp32x2_t*>(params.workspace);
   const auto vocab_size = params.vocab_size;
@@ -249,7 +238,9 @@ SGL_SOFTMAX_KERNEL softmax_merge_kernel(const __grid_constant__ SoftmaxParams pa
 
   const uint32_t row = blockIdx.x;
   const uint32_t sid = blockIdx.y;
+  const DType* row_in = input + static_cast<uint64_t>(row) * vocab_size;
   DType* row_out = output + static_cast<uint64_t>(row) * vocab_size;
+  const float inv_temp = 1.0f / params.get_temperature(row);
 
   // Compute this block's chunk range (same formula as split kernel)
   const uint32_t chunk_raw = div_ceil(vocab_size, num_splits);
@@ -262,30 +253,32 @@ SGL_SOFTMAX_KERNEL softmax_merge_kernel(const __grid_constant__ SoftmaxParams pa
   const uint32_t lane = threadIdx.x % kWarpThreads;
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
 
+  PDLWaitPrimary<kUsePDL>();
+
   // --- Warp 0: merge all partial (max, sum) -> correction for this chunk ---
-  __shared__ float shared_corr;  // correction = exp(local_max - global_max) / global_sum
-  const auto [local_max, local_sum] = partial_ms[row * num_splits + sid];
+  __shared__ fp32x2_t shared_result;
   if (warp_id == 0) {
     const auto ms = lane < num_splits ? partial_ms[row * num_splits + lane] : fp32x2_t{-FLT_MAX, 0.0f};
-    const auto [global_max, global_sum] = warp_online_softmax_merge(ms);
-    shared_corr = math::exp(local_max - global_max) / global_sum;
+    shared_result = warp_online_softmax_merge(ms);
   }
   __syncthreads();
+  const auto [row_max, row_sum] = shared_result;
 
   // --- All threads: apply uniform correction to this chunk ---
-  const float corr = shared_corr;
+  const DType* c_in = row_in + c_start;
   DType* c_out = row_out + c_start;
-
   const uint32_t n_vecs = c_len / kVecN;
 
   for (uint32_t vi = threadIdx.x; vi < n_vecs; vi += kBlockSize) {
     vec_t v;
-    v.load(c_out, vi);
+    v.load(c_in, vi);
+    vec_t v_out;
 #pragma unroll
     for (int i = 0; i < kVecN; ++i) {
-      v[i] = cast<DType>(cast<fp32_t>(v[i]) * corr);
+      const auto val = cast<fp32_t>(v[i]) * inv_temp;
+      v_out[i] = cast<DType>(math::exp(val - row_max) / row_sum);
     }
-    v.store(c_out, vi);
+    v_out.store(c_out, vi);
   }
 
   PDLTriggerSecondary<kUsePDL>();
