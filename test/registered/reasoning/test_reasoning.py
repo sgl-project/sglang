@@ -1,11 +1,3 @@
-"""
-Usage:
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_chat_completion_with_reasoning
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_chat_completion_without_reasoning
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_with_reasoning
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_without_reasoning
-"""
-
 import json
 import unittest
 
@@ -13,7 +5,10 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.reasoning_tokens_kit import ReasoningTokenUsageMixin
+from sglang.test.kits.reasoning_kit import (
+    ReasoningTokenUsageMixin,
+    SeparateReasoningMixin,
+)
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -26,7 +21,9 @@ register_cuda_ci(est_time=109, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
+class TestEnableThinking(
+    ReasoningTokenUsageMixin, SeparateReasoningMixin, CustomTestCase
+):
     reasoning_parser_name = "qwen3"
 
     @classmethod
@@ -122,7 +119,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
         has_reasoning = False
         has_content = False
 
-        print("\n=== Stream With Reasoning ===")
         for line in response.iter_lines():
             if line:
                 line = line.decode("utf-8")
@@ -146,7 +142,7 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
         )
 
     def test_stream_chat_completion_without_reasoning(self):
-        # Test streaming with "enable_thinking": False, reasoning_content should  be empty
+        # Test streaming with "enable_thinking": False, reasoning_content should be empty
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -167,7 +163,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
         has_reasoning = False
         has_content = False
 
-        print("\n=== Stream Without Reasoning ===")
         for line in response.iter_lines():
             if line:
                 line = line.decode("utf-8")
@@ -190,56 +185,6 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
             has_content, "The stream response does not contain normal content"
         )
 
-
-# Skip for ci test
-# class TestGLM45EnableThinking(TestEnableThinking):
-#     @classmethod
-#     def setUpClass(cls):
-#         # Replace with the model name needed for testing; if not required, reuse DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-#         cls.model = "THUDM/GLM-4.5"
-#         cls.base_url = DEFAULT_URL_FOR_TEST
-#         cls.api_key = "sk-1234"
-#         cls.process = popen_launch_server(
-#             cls.model,
-#             cls.base_url,
-#             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-#             api_key=cls.api_key,
-#             other_args=[
-#                 "--tool-call-parser",
-#                 "glm45",
-#                 "--reasoning-parser",
-#                 "glm45",
-#                 "--tp-size",
-#                 "8"
-#             ],
-#         )
-
-#         # Validate whether enable-thinking conflict with tool_calls
-#         cls.additional_chat_kwargs = {
-#             "tools": [
-#                 {
-#                     "type": "function",
-#                     "function": {
-#                         "name": "add",
-#                         "description": "Compute the sum of two numbers",
-#                         "parameters": {
-#                             "type": "object",
-#                             "properties": {
-#                                 "a": {
-#                                     "type": "int",
-#                                     "description": "A number",
-#                                 },
-#                                 "b": {
-#                                     "type": "int",
-#                                     "description": "A number",
-#                                 },
-#                             },
-#                             "required": ["a", "b"],
-#                         },
-#                     },
-#                 }
-#             ]
-#         }
 
 if __name__ == "__main__":
     unittest.main()

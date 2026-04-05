@@ -1,5 +1,6 @@
 import json
 
+import openai
 import requests
 
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -112,3 +113,85 @@ class ReasoningTokenUsageMixin:
         reported = data["meta_info"]["reasoning_tokens"]
         actual = data["output_ids"].index(self.think_end_token_id) + 1
         self.assertEqual(reported, actual)
+
+
+class SeparateReasoningMixin:
+    """Mixin for separate_reasoning tests.
+
+    Required attributes on the test class:
+        model: str
+        base_url: str (without /v1)
+        api_key: str
+    """
+
+    def _openai_client(self):
+        return openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+
+    def _chat(self, stream=False, extra_body=None):
+        return self._openai_client().chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": "What is 1+3?"}],
+            max_tokens=1024,
+            stream=stream,
+            extra_body=extra_body,
+        )
+
+    def _collect_stream(self, response):
+        reasoning_content = ""
+        content = ""
+        for chunk in response:
+            if chunk.choices[0].delta.content:
+                content += chunk.choices[0].delta.content
+            elif chunk.choices[0].delta.reasoning_content:
+                reasoning_content += chunk.choices[0].delta.reasoning_content
+        return reasoning_content, content
+
+    def test_streaming_separate_reasoning_false(self):
+        response = self._chat(stream=True, extra_body={"separate_reasoning": False})
+        reasoning_content, content = self._collect_stream(response)
+        self.assertEqual(len(reasoning_content), 0)
+        self.assertGreater(len(content), 0)
+
+    def test_streaming_separate_reasoning_true(self):
+        response = self._chat(stream=True, extra_body={"separate_reasoning": True})
+        reasoning_content, content = self._collect_stream(response)
+        self.assertGreater(len(reasoning_content), 0)
+        self.assertGreater(len(content), 0)
+
+    def test_streaming_separate_reasoning_true_stream_reasoning_false(self):
+        response = self._chat(
+            stream=True,
+            extra_body={"separate_reasoning": True, "stream_reasoning": False},
+        )
+        reasoning_content = ""
+        content = ""
+        first_chunk = False
+        for chunk in response:
+            if chunk.choices[0].delta.reasoning_content:
+                reasoning_content = chunk.choices[0].delta.reasoning_content
+                first_chunk = True
+            if chunk.choices[0].delta.content:
+                content += chunk.choices[0].delta.content
+                if not first_chunk:
+                    reasoning_content = chunk.choices[0].delta.reasoning_content
+                first_chunk = True
+            if not first_chunk:
+                assert (
+                    not chunk.choices[0].delta.reasoning_content
+                    or len(chunk.choices[0].delta.reasoning_content) == 0
+                )
+        self.assertGreater(len(reasoning_content), 0)
+        self.assertGreater(len(content), 0)
+
+    def test_nonstreaming_separate_reasoning_false(self):
+        response = self._chat(extra_body={"separate_reasoning": False})
+        assert (
+            not response.choices[0].message.reasoning_content
+            or len(response.choices[0].message.reasoning_content) == 0
+        )
+        self.assertGreater(len(response.choices[0].message.content), 0)
+
+    def test_nonstreaming_separate_reasoning_true(self):
+        response = self._chat(extra_body={"separate_reasoning": True})
+        self.assertGreater(len(response.choices[0].message.reasoning_content), 0)
+        self.assertGreater(len(response.choices[0].message.content), 0)
