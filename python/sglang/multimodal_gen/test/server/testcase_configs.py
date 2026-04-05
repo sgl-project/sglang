@@ -1042,7 +1042,7 @@ TWO_GPU_CASES_B = [
     DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
-            model_path="Lightricks/LTX-2",
+            model_path="Lightricks/LTX-2.3",
             modality="video",
             num_gpus=2,
         ),
