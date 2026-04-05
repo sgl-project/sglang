@@ -4,11 +4,17 @@ python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinki
 python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_chat_completion_without_reasoning
 python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_with_reasoning
 python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_without_reasoning
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_streaming_separate_reasoning_false
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_streaming_separate_reasoning_true
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_streaming_separate_reasoning_true_stream_reasoning_false
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_nonstreaming_separate_reasoning_false
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_nonstreaming_separate_reasoning_true
 """
 
 import json
 import unittest
 
+import openai
 import requests
 
 from sglang.srt.utils import kill_process_tree
@@ -189,6 +195,110 @@ class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
         self.assertTrue(
             has_content, "The stream response does not contain normal content"
         )
+
+    def test_streaming_separate_reasoning_false(self):
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "What is 1+3?"}],
+            "max_tokens": 100,
+            "stream": True,
+            "extra_body": {"separate_reasoning": False},
+        }
+        response = client.chat.completions.create(**payload)
+
+        reasoning_content = ""
+        content = ""
+        for chunk in response:
+            if chunk.choices[0].delta.content:
+                content += chunk.choices[0].delta.content
+            elif chunk.choices[0].delta.reasoning_content:
+                reasoning_content += chunk.choices[0].delta.reasoning_content
+
+        assert len(reasoning_content) == 0
+        assert len(content) > 0
+
+    def test_streaming_separate_reasoning_true(self):
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "What is 1+3?"}],
+            "max_tokens": 100,
+            "stream": True,
+            "extra_body": {"separate_reasoning": True},
+        }
+        response = client.chat.completions.create(**payload)
+
+        reasoning_content = ""
+        content = ""
+        for chunk in response:
+            if chunk.choices[0].delta.content:
+                content += chunk.choices[0].delta.content
+            elif chunk.choices[0].delta.reasoning_content:
+                reasoning_content += chunk.choices[0].delta.reasoning_content
+
+        assert len(reasoning_content) > 0
+        assert len(content) > 0
+
+    def test_streaming_separate_reasoning_true_stream_reasoning_false(self):
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "What is 1+3?"}],
+            "max_tokens": 100,
+            "stream": True,
+            "extra_body": {"separate_reasoning": True, "stream_reasoning": False},
+        }
+        response = client.chat.completions.create(**payload)
+
+        reasoning_content = ""
+        content = ""
+        first_chunk = False
+        for chunk in response:
+            if chunk.choices[0].delta.reasoning_content:
+                reasoning_content = chunk.choices[0].delta.reasoning_content
+                first_chunk = True
+            if chunk.choices[0].delta.content:
+                content += chunk.choices[0].delta.content
+                if not first_chunk:
+                    reasoning_content = chunk.choices[0].delta.reasoning_content
+                first_chunk = True
+            if not first_chunk:
+                assert (
+                    not chunk.choices[0].delta.reasoning_content
+                    or len(chunk.choices[0].delta.reasoning_content) == 0
+                )
+        assert len(reasoning_content) > 0
+        assert len(content) > 0
+
+    def test_nonstreaming_separate_reasoning_false(self):
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "What is 1+3?"}],
+            "max_tokens": 100,
+            "extra_body": {"separate_reasoning": False},
+        }
+        response = client.chat.completions.create(**payload)
+
+        assert (
+            not response.choices[0].message.reasoning_content
+            or len(response.choices[0].message.reasoning_content) == 0
+        )
+        assert len(response.choices[0].message.content) > 0
+
+    def test_nonstreaming_separate_reasoning_true(self):
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "What is 1+3?"}],
+            "max_tokens": 100,
+            "extra_body": {"separate_reasoning": True},
+        }
+        response = client.chat.completions.create(**payload)
+
+        assert len(response.choices[0].message.reasoning_content) > 0
+        assert len(response.choices[0].message.content) > 0
 
 
 # Skip for ci test
