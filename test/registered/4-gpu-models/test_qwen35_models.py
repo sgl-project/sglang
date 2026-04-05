@@ -7,7 +7,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.reasoning_tokens_kit import run_reasoning_tokens_test
+from sglang.test.kits.reasoning_tokens_kit import ReasoningTokenUsageMixin
 
 # This eval harness applies the chat_template, which is critical for qwen3.5
 # to get good accuracy on gsm8k
@@ -83,11 +83,14 @@ class TestQwen35FP4(unittest.TestCase):
         )
 
 
-class TestQwen35FP4MTP(CustomTestCase):
+class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
+    reasoning_parser_name = "qwen3"
+
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN35_FP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.init_reasoning_token_verifier()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -157,15 +160,15 @@ class TestQwen35FP4MTP(CustomTestCase):
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, 3.3)
 
-    def test_reasoning_tokens_usage(self):
-        run_reasoning_tokens_test(self.base_url, self.model, "qwen3")
 
+class TestQwen35FP4MTPV2(ReasoningTokenUsageMixin, CustomTestCase):
+    reasoning_parser_name = "qwen3"
 
-class TestQwen35FP4MTPV2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN35_FP4_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.init_reasoning_token_verifier()
         envs.SGLANG_ENABLE_SPEC_V2.set(True)
         cls.process = popen_launch_server(
             cls.model,
@@ -236,9 +239,6 @@ class TestQwen35FP4MTPV2(CustomTestCase):
         ]
         print(f"{avg_spec_accept_length=}")
         self.assertGreater(avg_spec_accept_length, 3.3)
-
-    def test_reasoning_tokens_usage(self):
-        run_reasoning_tokens_test(self.base_url, self.model, "qwen3")
 
 
 if __name__ == "__main__":
