@@ -268,55 +268,6 @@ class ParallelTiledVAE(ABC, nn.Module):
             last_slice_data = slice_data
         return torch.cat(result_slices, dim=2)
 
-    def _process_parallel_tiled_outputs(
-        self,
-        results: torch.Tensor,
-        local_dim_metadata: list[torch.Size],
-        z: torch.Tensor,
-        world_size: int,
-        rank: int,
-        num_t_tiles: int,
-        num_h_tiles: int,
-        num_w_tiles: int,
-        total_spatial_tiles: int,
-        blend_height: int,
-        blend_width: int,
-    ) -> torch.Tensor:
-        local_size = torch.tensor(
-            [results.size(0)], device=results.device, dtype=torch.int64
-        )
-        all_sizes = [
-            torch.zeros(1, device=results.device, dtype=torch.int64)
-            for _ in range(world_size)
-        ]
-        dist.all_gather(all_sizes, local_size)
-        max_size = max(size.item() for size in all_sizes)
-
-        padded_results = torch.zeros(
-            max_size, device=results.device, dtype=results.dtype
-        )
-        padded_results[: results.size(0)] = results
-
-        gathered_dim_metadata = [None] * world_size
-        gathered_results = (
-            torch.zeros_like(padded_results)
-            .repeat(world_size, *[1] * len(padded_results.shape))
-            .contiguous()
-        )
-        dist.all_gather_into_tensor(gathered_results, padded_results)
-        dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
-        gathered_dim_metadata = cast(list[list[torch.Size]], gathered_dim_metadata)
-        return self._merge_parallel_tiled_results(
-            gathered_results,
-            gathered_dim_metadata,
-            num_t_tiles,
-            num_h_tiles,
-            num_w_tiles,
-            total_spatial_tiles,
-            blend_height,
-            blend_width,
-        )
-
     def parallel_tiled_decode(self, z: torch.FloatTensor) -> torch.FloatTensor:
         """
         Parallel version of tiled_decode that distributes both temporal and spatial computation across GPUs
@@ -390,12 +341,33 @@ class ParallelTiledVAE(ABC, nn.Module):
             results = z.new_empty((0,), dtype=z.dtype)
         del local_results
 
-        dec = self._process_parallel_tiled_outputs(
-            results,
-            local_dim_metadata,
-            z,
-            world_size,
-            rank,
+        local_size = torch.tensor(
+            [results.size(0)], device=results.device, dtype=torch.int64
+        )
+        all_sizes = [
+            torch.zeros(1, device=results.device, dtype=torch.int64)
+            for _ in range(world_size)
+        ]
+        dist.all_gather(all_sizes, local_size)
+        max_size = max(size.item() for size in all_sizes)
+
+        padded_results = torch.zeros(
+            max_size, device=results.device, dtype=results.dtype
+        )
+        padded_results[: results.size(0)] = results
+
+        gathered_dim_metadata = [None] * world_size
+        gathered_results = (
+            torch.zeros_like(padded_results)
+            .repeat(world_size, *[1] * len(padded_results.shape))
+            .contiguous()
+        )
+        dist.all_gather_into_tensor(gathered_results, padded_results)
+        dist.all_gather_object(gathered_dim_metadata, local_dim_metadata)
+        gathered_dim_metadata = cast(list[list[torch.Size]], gathered_dim_metadata)
+        dec = self._merge_parallel_tiled_results(
+            gathered_results,
+            gathered_dim_metadata,
             num_t_tiles,
             num_h_tiles,
             num_w_tiles,
