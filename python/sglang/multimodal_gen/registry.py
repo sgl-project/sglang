@@ -76,6 +76,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
+    Flux2SamplingParams,
     FluxSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
@@ -747,7 +748,7 @@ def _register_configs():
         ],
     )
     register_configs(
-        sampling_param_cls=FluxSamplingParams,
+        sampling_param_cls=Flux2SamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
