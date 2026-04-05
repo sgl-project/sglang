@@ -11,6 +11,8 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
     in_channels: int = 3
     latent_channels: int = 128
     out_channels: int = 3
+    temporal_compression_ratio: int = 8
+    spatial_compression_ratio: int = 32
     block_out_channels: List[int] = field(
         default_factory=lambda: [256, 512, 1024, 2048]
     )

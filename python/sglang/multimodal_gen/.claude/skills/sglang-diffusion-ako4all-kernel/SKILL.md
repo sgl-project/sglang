@@ -6,7 +6,7 @@ description: Use when optimizing an existing SGLang diffusion kernel with AKO4AL
 # SGLang Diffusion AKO4ALL Kernel
 
 Use this skill to run the full AKO4ALL-based optimization loop for an existing SGLang diffusion kernel.
-It packages the workflow we used for diffusion Triton and JIT kernel tuning: bootstrap a custom AKO harness, benchmark and profile the kernel, iterate with `ncu`, port the best version back to `sglang`, then validate with targeted tests and model-level denoise runs.
+It is the default implementation path once the benchmark/profile skill has already shown that a hotspot is real and not covered by an existing fast path. This workflow bootstraps a custom AKO harness, benchmarks and profiles the kernel, iterates with `ncu`, ports the best version back to `sglang`, then validates with targeted tests and model-level denoise runs.
 
 This skill assumes a sibling repo layout like:
 
@@ -21,16 +21,19 @@ If `AKO4ALL/` is missing under the current base directory, clone it first.
 ## Use This Skill When
 
 - tuning an existing diffusion Triton, CUDA JIT, CuTeDSL, or runtime-integrated kernel in `sglang`
+- `sglang-diffusion-benchmark-profile` has already ruled out an existing in-repo fast path or overlap family
 - creating a custom AKO4ALL harness for a real diffusion kernel instead of using the default benchmark tasks
 - validating that a kernel-level win transfers to Qwen, FLUX, Wan, Hunyuan, MOVA, or other diffusion denoise latency
 - preparing PR artifacts such as microbench tables, `ncu` before/after data, and proof image outputs
 
-Do not use this skill when adding a brand-new kernel from scratch with no existing SGLang integration.
-For that, start from the sibling kernel-authoring skills first:
+Do not start here when the bottleneck has not been proven yet.
+First use [../sglang-diffusion-benchmark-profile/SKILL.md](../sglang-diffusion-benchmark-profile/SKILL.md) to:
+- measure the real denoise regression
+- collect the perf dump baseline
+- capture one representative `torch.profiler` trace
+- rule out existing merged fast paths
 
-- Triton: [../sglang-diffusion-triton-kernel/SKILL.md](../sglang-diffusion-triton-kernel/SKILL.md)
-- CUDA JIT: [../sglang-diffusion-cuda-kernel/SKILL.md](../sglang-diffusion-cuda-kernel/SKILL.md)
-- Denoise benchmark/profile: [../sglang-diffusion-benchmark-profile/SKILL.md](../sglang-diffusion-benchmark-profile/SKILL.md)
+If a future specialized optimization skill matches the kernel family better than AKO4ALL, hand off there instead. The diagnosis contract stays the same.
 
 ## Mandatory AKO4ALL Preflight
 
@@ -54,8 +57,6 @@ By default it uses the existing `origin` URL, or `AKO4ALL_URL` if you need to ov
 - Identify the exact kernel entry point and runtime call sites in `sglang`.
 - Record the target shapes, dtypes, model families, and whether the kernel is on a hot path.
 - Reuse existing unit tests and benchmark entry points when they already exist.
-
-If the implementation work is primarily Triton or CUDA authoring, read only the relevant sibling skill from the list above.
 
 ### 2. Bootstrap the AKO Harness
 

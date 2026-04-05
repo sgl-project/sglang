@@ -768,8 +768,6 @@ def run_lora_multiple_batch_on_model_cases(
                 else {
                     "speculative_algorithm": "NGRAM",
                     "speculative_num_draft_tokens": 5,
-                    "speculative_ngram_min_match_window_size": 2,
-                    "speculative_ngram_max_match_window_size": 15,
                 }
             )
             srt_runner = SRTRunner(

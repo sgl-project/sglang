@@ -38,7 +38,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode import (
@@ -120,8 +120,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
-    PinPrefixReqInput,
-    PinPrefixReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -187,6 +185,7 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.req_time_stats import (
     real_time,
@@ -550,7 +549,7 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            self.tokenizer.think_end_id = self.tokenizer.encode(
+            self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
@@ -701,6 +700,9 @@ class Scheduler(
 
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
+        uses_transformers_backend = (
+            get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
+        )
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
@@ -720,9 +722,21 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
-        # Create cache
+        self.disable_radix_cache = server_args.disable_radix_cache or (
+            self.model_config.is_multimodal and uses_transformers_backend
+        )
+        if self.disable_radix_cache and not server_args.disable_radix_cache:
+            logger.warning(
+                "Radix cache is disabled for multimodal models with the "
+                "Transformers backend to avoid multimodal prefix-cache mismatches."
+            )
+
+        effective_chunked_prefill_size = server_args.chunked_prefill_size
+        if self.model_config.is_multimodal and uses_transformers_backend:
+            effective_chunked_prefill_size = None
+
         params = CacheInitParams(
-            disable=server_args.disable_radix_cache,
+            disable=self.disable_radix_cache,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             page_size=self.page_size,
@@ -738,14 +752,11 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
-            chunked_prefill_size=server_args.chunked_prefill_size,
+            chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
         )
 
-        if (
-            server_args.chunked_prefill_size is not None
-            and server_args.disable_radix_cache
-        ):
+        if effective_chunked_prefill_size is not None and self.disable_radix_cache:
             if not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
@@ -846,9 +857,22 @@ class Scheduler(
         self._engine_paused = False
 
     def init_chunked_prefill(self):
-        # Init chunked prefill
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
-        if self.chunked_prefill_size <= 0:  # -1 means disable
+        uses_transformers_backend = (
+            get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
+        )
+        if (
+            self.chunked_prefill_size is not None
+            and self.chunked_prefill_size > 0
+            and self.model_config.is_multimodal
+            and uses_transformers_backend
+        ):
+            logger.warning(
+                "Chunked prefill is disabled for multimodal models with the "
+                "Transformers backend to avoid partial multimodal chunk mismatches."
+            )
+            self.chunked_prefill_size = None
+        elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
         self.is_mixed_chunk = (
@@ -1185,7 +1209,6 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
-                (PinPrefixReqInput, self.pin_prefix_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -1595,17 +1618,17 @@ class Scheduler(
 
     def _process_and_broadcast_mm_inputs(
         self,
-        raw_mm_inputs: Optional[dict],
+        raw_mm_inputs,
     ):
         """Materialize MultimodalInputs once on the entry rank and broadcast to others.
 
         Entry rank:
-        - constructs MultimodalInputs.from_dict(raw_mm_inputs) once
+        - constructs MultimodalInputs.from_processor_output() once
         - broadcasts to other ranks in self.cpu_group (if world_size > 1)
 
         Non-entry ranks:
         - receive the object via broadcast (if world_size > 1)
-        - otherwise (single-rank / no group) fall back to local from_dict
+        - otherwise (single-rank / no group) fall back to local from_processor_output
 
         Returns:
             MultimodalInputs | None
@@ -1636,7 +1659,7 @@ class Scheduler(
         # increase the CUDA kernel launch time.
         if self.dp_tp_group.rank_in_group == 0:
             # Only the entry rank materializes once from dict.
-            image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+            image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
             # Broadcast to other TP ranks (use src=0 within the group).
             if group_world_size > 1:
                 obj_list = [image_inputs]
@@ -1657,15 +1680,15 @@ class Scheduler(
                 )
                 image_inputs = obj_list[0]
             else:
-                image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+                image_inputs = MultimodalInputs.from_processor_output(raw_mm_inputs)
 
         return image_inputs
 
-    def _get_multimodal_inputs(self, mm_inputs_dict: dict):
+    def _get_multimodal_inputs(self, mm_inputs_dict):
         if self.server_args.enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
-            return MultimodalInputs.from_dict(mm_inputs_dict)
+            return MultimodalInputs.from_processor_output(mm_inputs_dict)
 
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
@@ -1727,6 +1750,7 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
+                token_type_ids=recv_req.token_type_ids,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
@@ -1809,10 +1833,12 @@ class Scheduler(
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 
             # The following steps are already fast, execute locally on each rank.
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
-            )
+            # Expand a single image token into multiple dummy tokens for receiving image embeddings.
+            # The pad function is model-specific and can be None for some backends.
+            if self.pad_input_ids_func:
+                req.origin_input_ids = self.pad_input_ids_func(
+                    req.origin_input_ids, image_inputs
+                )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
 
@@ -3009,37 +3035,6 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def pin_prefix_wrapped(self, recv_req: PinPrefixReqInput):
-        if not hasattr(self.tree_cache, "pin_prefix"):
-            return PinPrefixReqOutput(
-                success=False,
-                nodes_pinned=0,
-                message="PIN requires --enable-hierarchical-cache",
-            )
-        if getattr(self.tree_cache, "_max_pinned_tokens", 0) <= 0:
-            return PinPrefixReqOutput(
-                success=False,
-                nodes_pinned=0,
-                message="Pinning is disabled (SGLANG_HICACHE_MAX_PINNED_RATIO is 0)",
-            )
-        nodes_pinned, reject_reason = self.tree_cache.pin_prefix(
-            recv_req.token_ids, recv_req.ttl_seconds
-        )
-        if nodes_pinned == 0:
-            return PinPrefixReqOutput(
-                success=False,
-                nodes_pinned=0,
-                message=reject_reason or "No matching prefix found in cache to pin",
-            )
-        msg = f"Pinned {nodes_pinned} nodes (ttl={recv_req.ttl_seconds}s)"
-        if reject_reason:
-            msg += f"; {reject_reason}"
-        return PinPrefixReqOutput(
-            success=True,
-            nodes_pinned=nodes_pinned,
-            message=msg,
-        )
-
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if self.is_fully_idle():
@@ -3283,7 +3278,14 @@ class Scheduler(
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
-            if not self.last_batch.is_empty():
+            # Skip merge for disagg prefill: completed prefill requests are
+            # already in disagg_prefill_inflight_queue. Merging them into
+            # running_batch leaks them, since the prefill event loop never
+            # calls update_running_batch to clean them up.
+            if (
+                not self.last_batch.is_empty()
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
@@ -3292,7 +3294,7 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch = None
 
-        if recv_req.mode == "retract":
+        if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)

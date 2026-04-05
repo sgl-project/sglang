@@ -106,6 +106,23 @@ class LTX2AVDecodingStage(DecodingStage):
                 logger.warning(
                     "audio_vae.latents_std is all zeros; audio denorm may be incorrect."
                 )
+            try:
+                latents_mean = self.audio_vae.latents_mean
+            except AttributeError:
+                latents_mean = None
+            if isinstance(latents_mean, torch.Tensor) and isinstance(
+                latents_std, torch.Tensor
+            ):
+                latents_mean = latents_mean.to(device=device, dtype=dtype)
+                latents_std = latents_std.to(device=device, dtype=dtype)
+                if audio_latents.ndim == 4:
+                    latents_mean = latents_mean.view(
+                        1, audio_latents.shape[1], 1, audio_latents.shape[3]
+                    )
+                    latents_std = latents_std.view(
+                        1, audio_latents.shape[1], 1, audio_latents.shape[3]
+                    )
+                audio_latents = audio_latents * latents_std + latents_mean
 
             with torch.no_grad():
                 # Decode latents to spectrogram

@@ -66,6 +66,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import destroy_distributed_environment
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -453,7 +454,8 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
-            attn_tp_size=1,
+            attn_tp_size=get_attention_tp_size(),
+            attn_cp_size=model_runner.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=model_runner.server_args.disable_cuda_graph,

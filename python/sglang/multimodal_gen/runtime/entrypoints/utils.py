@@ -270,7 +270,6 @@ def _maybe_mux_audio_into_mp4(
             sample_rate=selected_sr,
             ffmpeg_exe=ffmpeg_exe,
         )
-        logger.info(f"Merged video saved to {CYAN}{save_file_path}{RESET}")
     except Exception as e:
         logger.warning(
             "Failed to mux audio into mp4 (saved silent video): %s",
