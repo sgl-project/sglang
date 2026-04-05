@@ -451,6 +451,7 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = len(next_token_id)
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
+            # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
             req.check_finished(new_accepted_len)
@@ -458,6 +459,8 @@ class SchedulerOutputProcessorMixin:
             self._handle_finished_req(req, i, logits_output)
 
             if req.return_logprob:
+                # Spec v1 handles logprobs inside its own worker.
+                # Normalize: non-spec has 1 token, spec v2 has multiple.
                 if batch.is_spec_v2:
                     accepted_logprobs = next_token_logprobs[i]
                     accepted_ids = next_token_id
