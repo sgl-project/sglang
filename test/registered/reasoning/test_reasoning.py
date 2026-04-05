@@ -1,16 +1,3 @@
-"""
-Usage:
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_chat_completion_with_reasoning
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_chat_completion_without_reasoning
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_with_reasoning
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_without_reasoning
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_streaming_separate_reasoning_false
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_streaming_separate_reasoning_true
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_streaming_separate_reasoning_true_stream_reasoning_false
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_nonstreaming_separate_reasoning_false
-python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_nonstreaming_separate_reasoning_true
-"""
-
 import json
 import unittest
 
