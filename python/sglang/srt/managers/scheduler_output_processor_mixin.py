@@ -435,6 +435,10 @@ class SchedulerOutputProcessorMixin:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finished_req(req, i, logits_output)
+                if req.return_hidden_states and logits_output.hidden_states is not None:
+                    req.hidden_states.append(
+                        logits_output.hidden_states[i].cpu().clone().tolist()
+                    )
                 if req.grammar is not None:
                     req.grammar.finished = req.finished()
                 continue
@@ -447,6 +451,7 @@ class SchedulerOutputProcessorMixin:
             else:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
             # Update Mamba last track seqlen
