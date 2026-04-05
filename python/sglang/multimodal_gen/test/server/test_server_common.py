@@ -44,7 +44,11 @@ logger = init_logger(__name__)
 
 
 def _is_lora_case(case: DiffusionTestCase) -> bool:
-    return bool(case.server_args.lora_path or case.server_args.dynamic_lora_path)
+    return bool(
+        case.server_args.lora_path
+        or case.server_args.dynamic_lora_path
+        or case.server_args.second_lora_path
+    )
 
 
 @pytest.fixture
