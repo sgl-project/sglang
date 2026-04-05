@@ -683,6 +683,7 @@ jobs:
         if: always()
         env:
           GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/ci/utils/diffusion/generate_diffusion_dashboard.py \
             --results comparison-results.json \
