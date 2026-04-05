@@ -289,7 +289,7 @@ class ServerArgs:
     The arguments of the server.
 
     NOTE: When you add new arguments, please make sure the order
-    in this class definition the same as the order in the the function
+    in this class definition the same as the order in the function
     `ServerArgs.add_cli_args`.
     Please follow the existing style to group the new arguments into related groups or create new groups.
     """
@@ -373,6 +373,7 @@ class ServerArgs:
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
+    stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     random_seed: Optional[int] = None
@@ -1132,6 +1133,9 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 16. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 17. Context parallel
+        if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
@@ -4137,6 +4141,12 @@ class ServerArgs:
             help="Whether to output as a sequence of disjoint segments.",
         )
         parser.add_argument(
+            "--stream-response-default-include-usage",
+            action="store_true",
+            help="Include usage in every streaming response "
+            "(even when stream_options is not specified).",
+        )
+        parser.add_argument(
             "--stream-output",
             action=DeprecatedStoreTrueAction,
             dest="incremental_streaming_output",
@@ -4637,10 +4647,11 @@ class ServerArgs:
         parser.add_argument(
             "--experts-shared-outer-loras",
             default=ServerArgs.experts_shared_outer_loras,
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             help="Force shared outer LoRA mode for MoE models. "
             "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
-            "(expert_dim=1). By default this is auto-detected from adapter weights.",
+            "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
+            "By default this is auto-detected from adapter weights.",
         )
 
         # Kernel backend
@@ -6167,6 +6178,14 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            hf_config = self.get_model_config().hf_config
+            assert is_deepseek_nsa(hf_config), (
+                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
+                "(e.g., DeepSeek V3.2, GLM-5). "
+            )
+
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
