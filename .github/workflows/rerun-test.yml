@@ -87,7 +87,7 @@ jobs:
           echo "${{ inputs.test_command }}" | while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
             echo ">>> Running: python3 $cmd"
-            python3 $cmd || exit 1
+            python3 $cmd -f || exit 1
           done
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -132,5 +132,5 @@ jobs:
           echo "${{ inputs.test_command }}" | while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
             echo ">>> Running: python3 $cmd"
-            python3 $cmd || exit 1
+            python3 $cmd -f || exit 1
           done
