@@ -131,7 +131,7 @@ class SeparateReasoningMixin:
         return self._openai_client().chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": "What is 1+3?"}],
-            max_tokens=100,
+            max_tokens=1024,
             stream=stream,
             extra_body=extra_body,
         )
