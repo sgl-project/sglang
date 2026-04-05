@@ -30,7 +30,12 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.utils.common import get_bool_env_var, is_hip, is_sm120_supported
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    get_device,
+    is_hip,
+    is_sm120_supported,
+)
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -43,7 +48,7 @@ try:
     if is_sm120_supported():
         from flashinfer import fp4_quantize
     else:
-        from sgl_kernel import scaled_fp4_quant as fp4_quantize
+        from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 
     from flashinfer import fp4_quantize as fp4_quantize_flashinfer
 except ImportError:
@@ -86,6 +91,9 @@ class StandardDispatcher(BaseDispatcher):
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
         )
+        self.enable_flashinfer_trtllm_routed_moe = (
+            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
         self.num_local_routed_experts = (
@@ -125,6 +133,7 @@ class StandardDispatcher(BaseDispatcher):
             topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
                 [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
             )
+            # TODO: fuse into cutlass moe
             x_sf = nvfp4_block_scale_interleave(x_sf)
 
             hidden_states = x
@@ -141,18 +150,20 @@ class StandardDispatcher(BaseDispatcher):
         if (
             self.moe_ep_size > 1
             and not self.enable_flashinfer_cutlass_moe
+            and not self.enable_flashinfer_trtllm_routed_moe
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
             if self.local_expert_mapping is None:
+                device = get_device()
                 self.local_expert_mapping = torch.full(
-                    (self.num_experts,), -1, dtype=torch.int32, device="cuda"
+                    (self.num_experts,), -1, dtype=torch.int32, device=device
                 )
                 self.local_expert_mapping[
                     self.moe_ep_rank
                     * self.num_local_routed_experts : (self.moe_ep_rank + 1)
                     * self.num_local_routed_experts
                 ] = torch.arange(
-                    0, self.num_local_routed_experts, dtype=torch.int32, device="cuda"
+                    0, self.num_local_routed_experts, dtype=torch.int32, device=device
                 )
 
                 if self.num_local_shared_experts > 0:

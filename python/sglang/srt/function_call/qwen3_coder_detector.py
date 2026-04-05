@@ -1,12 +1,10 @@
 import ast
-import html
 import json
 import logging
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -17,334 +15,457 @@ from sglang.srt.function_call.core_types import (
 logger = logging.getLogger(__name__)
 
 
-def _safe_val(raw: str) -> Any:
-    raw = html.unescape(raw.strip())
-    try:
-        return json.loads(raw)
-    except Exception:
-        try:
-            return ast.literal_eval(raw)
-        except Exception:
-            return raw
-
-
 class Qwen3CoderDetector(BaseFormatDetector):
-    """
-    Detector for Qwen 3 models.
-    Assumes function call format:
-        <tool_call>
-        <function=execute_bash>
-        <parameter=command>
-        pwd && ls
-        </parameter>
-        </function>
-        </tool_call>
-    """
-
     def __init__(self):
         super().__init__()
+
+        # Sentinel tokens
         self.tool_call_start_token: str = "<tool_call>"
         self.tool_call_end_token: str = "</tool_call>"
         self.tool_call_prefix: str = "<function="
-        self.tool_call_regex = re.compile(
-            r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
-        )
+        self.function_end_token: str = "</function>"
+        self.parameter_prefix: str = "<parameter="
+        self.parameter_end_token: str = "</parameter>"
+
+        # Regex for non-streaming fallback
+        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
         self.tool_call_function_regex = re.compile(
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
         self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL
+            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+            re.DOTALL,
         )
-        self._buf: str = ""
 
-        # Streaming state variables
-        self._current_function_name: str = ""
-        self._current_parameters: Dict[str, Any] = {}
-        self._streamed_parameters: Dict[str, str] = (
-            {}
-        )  # Track what parameter content we've streamed
-        self._in_tool_call: bool = False
-        self._function_name_sent: bool = False
+        # Streaming State
+        # Base class already initializes _buffer, we just use it directly
+        # No need to check with hasattr - we control the lifecycle through inheritance
+
+        # Index pointing to the next character to be processed in buffer
+        self.parsed_pos: int = 0
+        # Parameter count inside the current tool being processed, used to determine whether to add comma
+        self.current_tool_param_count: int = 0
+        # Flag indicating whether current tool has already sent '{'
+        self.json_started: bool = False
+
+        # [FIX] New state flag: mark whether inside tool_call structure block
+        self.is_inside_tool_call: bool = False
+
+        # Initialize attributes that were missing in the original PR
+        self.current_func_name: Optional[str] = None
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
+    def _get_arguments_config(
+        self, func_name: str, tools: Optional[list[Tool]]
+    ) -> dict:
+        """Extract argument configuration for a function."""
+        if tools is None:
+            return {}
+        for config in tools:
+            try:
+                config_type = config.type
+                config_function = config.function
+                config_function_name = config_function.name
+            except AttributeError:
+                continue
+
+            if config_type == "function" and config_function_name == func_name:
+                try:
+                    params = config_function.parameters
+                except AttributeError:
+                    return {}
+
+                if isinstance(params, dict) and "properties" in params:
+                    return params["properties"]
+                elif isinstance(params, dict):
+                    return params
+                else:
+                    return {}
+        logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
+        return {}
+
+    def _convert_param_value(
+        self, param_value: str, param_name: str, param_config: dict, func_name: str
+    ) -> Any:
+        """Convert parameter value based on its type in the schema."""
+        # Handle null value for any type
+        if param_value.lower() == "null":
+            return None
+
+        if param_name not in param_config:
+            if param_config != {}:
+                logger.warning(
+                    f"Parsed parameter '{param_name}' is not defined in the tool "
+                    f"parameters for tool '{func_name}', directly returning the string value."
+                )
+            return param_value
+
+        if (
+            isinstance(param_config[param_name], dict)
+            and "type" in param_config[param_name]
+        ):
+            param_type = str(param_config[param_name]["type"]).strip().lower()
+        else:
+            param_type = "string"
+        if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
+            return param_value
+        elif (
+            param_type.startswith("int")
+            or param_type.startswith("uint")
+            or param_type.startswith("long")
+            or param_type.startswith("short")
+            or param_type.startswith("unsigned")
+        ):
+            try:
+                param_value = int(param_value)
+            except Exception:
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not an integer in tool "
+                    f"'{func_name}', degenerating to string."
+                )
+            return param_value
+        elif param_type.startswith("num") or param_type.startswith("float"):
+            try:
+                maybe_convert = (
+                    False if "." in param_value or "e" in param_value.lower() else True
+                )
+                param_value: float = float(param_value)
+                if maybe_convert and param_value.is_integer():
+                    param_value = int(param_value)
+            except Exception:
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool "
+                    f"'{func_name}', degenerating to string."
+                )
+            return param_value
+        elif param_type in ["boolean", "bool", "binary"]:
+            param_value = param_value.lower()
+            if param_value not in ["true", "false"]:
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
+                )
+            return param_value == "true"
+        else:
+            if (
+                param_type in ["object", "array", "arr"]
+                or param_type.startswith("dict")
+                or param_type.startswith("list")
+            ):
+                try:
+                    param_value = json.loads(param_value)
+                    return param_value
+                except Exception:
+                    logger.warning(
+                        f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
+                        f"'{func_name}', will try other methods to parse it."
+                    )
+            try:
+                param_value = ast.literal_eval(param_value)  # safer
+            except Exception:
+                logger.warning(
+                    f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
+                )
+            return param_value
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        normal, calls = self._extract(text, tools)
-        return StreamingParseResult(normal_text=normal, calls=calls)
+        """One-shot parsing for non-streaming scenarios."""
+        if self.tool_call_start_token not in text:
+            return StreamingParseResult(normal_text=text)
+
+        calls = []
+        try:
+            # Simple cleanup of the text to find tool calls
+            # Note: This is a simplified regex approach consistent with vLLM
+            raw_tool_calls = self.tool_call_regex.findall(text)
+            if not raw_tool_calls:
+                # Fallback: maybe the whole text is inside the tag or tags are stripped
+                if self.tool_call_prefix in text:
+                    raw_tool_calls = [text]
+
+            tool_idx = 0
+            for tool_content in raw_tool_calls:
+                # Find function calls
+                funcs = self.tool_call_function_regex.findall(tool_content)
+                for func_match in funcs:
+                    func_body = func_match[0] or func_match[1]
+                    if ">" not in func_body:
+                        continue
+
+                    name_end = func_body.index(">")
+                    func_name = func_body[:name_end]
+                    params_str = func_body[name_end + 1 :]
+
+                    param_config = self._get_arguments_config(func_name, tools)
+                    parsed_params = {}
+
+                    for p_match in self.tool_call_parameter_regex.findall(params_str):
+                        if ">" not in p_match:
+                            continue
+                        p_idx = p_match.index(">")
+                        p_name = p_match[:p_idx]
+                        p_val = p_match[p_idx + 1 :]
+                        # Remove prefixing and trailing \n
+                        if p_val.startswith("\n"):
+                            p_val = p_val[1:]
+                        if p_val.endswith("\n"):
+                            p_val = p_val[:-1]
+
+                        parsed_params[p_name] = self._convert_param_value(
+                            p_val, p_name, param_config, func_name
+                        )
+
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=tool_idx,
+                            name=func_name,
+                            parameters=json.dumps(parsed_params, ensure_ascii=False),
+                        )
+                    )
+                    tool_idx += 1
+
+            # Determine normal text (text before the first tool call)
+            start_idx = text.find(self.tool_call_start_token)
+            if start_idx == -1:
+                start_idx = text.find(self.tool_call_prefix)
+            normal_text = text[:start_idx] if start_idx > 0 else ""
+
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+        except Exception as e:
+            logger.error(f"Error in detect_and_parse: {e}")
+            return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        self._buf += new_text
-        normal = ""
-        calls: List[ToolCallItem] = []
+        """
+        Robust cursor-based streaming parser.
+        """
+        self._buffer += new_text
 
-        # Build tool indices for validation
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
+        # Guard against empty buffer
+        if not self._buffer:
+            return StreamingParseResult()
+
+        calls = []
+        normal_text_chunks = []
 
         while True:
-            # If we're not in a tool call and don't see a start token, return normal text
-            if not self._in_tool_call and self.tool_call_start_token not in self._buf:
-                normal += self._buf
-                self._buf = ""
+            # Working text slice
+            current_slice = self._buffer[self.parsed_pos :]
+
+            # Optimization: If almost empty, wait for more
+            if not current_slice:
                 break
 
-            # Look for tool call start
-            if not self._in_tool_call:
-                s = self._buf.find(self.tool_call_start_token)
-                if s == -1:
-                    normal += self._buf
-                    self._buf = ""
-                    break
-
-                normal += self._buf[:s]
-                self._buf = self._buf[s:]
-
-                self._in_tool_call = True
-                self._function_name_sent = False
-                self._current_function_name = ""
-                self._current_parameters = {}
-                self._streamed_parameters = {}
-
-                # Remove the start token
-                self._buf = self._buf[len(self.tool_call_start_token) :]
+            # -------------------------------------------------------
+            # 1. Priority detection: check if it's the start of Tool Call
+            # -------------------------------------------------------
+            if current_slice.startswith(self.tool_call_start_token):
+                self.parsed_pos += len(self.tool_call_start_token)
+                self.is_inside_tool_call = True
                 continue
 
-            # We're in a tool call, try to parse function name if not sent yet
-            if not self._function_name_sent:
-                # Look for function name pattern: <function=name>
-                function_match = re.search(r"<function=([^>]+)>", self._buf)
-                if function_match:
-                    function_name = function_match.group(1).strip()
+            # -------------------------------------------------------
+            # 2. Function Name: <function=name>
+            # -------------------------------------------------------
+            if current_slice.startswith(self.tool_call_prefix):
+                end_angle = current_slice.find(">")
+                if end_angle != -1:
+                    func_name = current_slice[len(self.tool_call_prefix) : end_angle]
 
-                    # Validate function name
-                    is_valid = function_name in self._tool_indices
-                    if not is_valid:
-                        logger.warning(f"Invalid function name: {function_name}")
-                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                            # Reset state and skip (default legacy behavior)
-                            self._reset_streaming_state()
-                            normal += self._buf
-                            self._buf = ""
-                            break
+                    self.current_tool_id += 1
+                    self.current_tool_name_sent = True
+                    self.current_tool_param_count = 0
+                    self.json_started = False
+                    self.current_func_name = func_name
 
-                    # Process tool call (valid or unknown with env=TRUE)
-                    self._current_function_name = function_name
-                    self._function_name_sent = True
-
-                    # Initialize tool call tracking
-                    if self.current_tool_id == -1:
-                        self.current_tool_id = 0
-
-                    # Ensure tracking arrays are large enough
-                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                        self.prev_tool_call_arr.append({})
-                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                        self.streamed_args_for_tool.append("")
-
-                    # Store tool call info
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": function_name,
-                        "arguments": {},
-                    }
-
-                    # Send tool name with empty parameters
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
-                            name=function_name,
+                            name=func_name,
                             parameters="",
                         )
                     )
 
-                    # Remove the processed function declaration
-                    self._buf = self._buf[function_match.end() :]
+                    self.parsed_pos += end_angle + 1
                     continue
                 else:
-                    # Function name not complete yet, wait for more text
+                    # Incomplete tag
                     break
 
-            # Parse parameters incrementally
-            if self._function_name_sent:
-                # Process parameters and get any calls to emit
-                parameter_calls = self._parse_and_stream_parameters(self._buf)
-                calls.extend(parameter_calls)
+            # -------------------------------------------------------
+            # 3. Parameter: <parameter=name>value...
+            # -------------------------------------------------------
+            if current_slice.startswith(self.parameter_prefix):
+                name_end = current_slice.find(">")
+                if name_end != -1:
+                    value_start_idx = name_end + 1
+                    rest_of_slice = current_slice[value_start_idx:]
 
-                # Check if tool call is complete
-                if self.tool_call_end_token in self._buf:
-                    end_pos = self._buf.find(self.tool_call_end_token)
+                    # A parameter can end in multiple ways:
+                    # 1. [Normal] Encounter </parameter>
+                    # 2. [Abnormal] Encounter next <parameter=
+                    # 3. [Abnormal] Encounter </function>
+                    # So we need to find the smallest one as the parameter end position.
+                    cand_end_param = rest_of_slice.find(self.parameter_end_token)
+                    cand_next_param = rest_of_slice.find(self.parameter_prefix)
+                    cand_end_func = rest_of_slice.find(self.function_end_token)
 
-                    # Add closing brace to complete the JSON object
-                    current_streamed = self.streamed_args_for_tool[self.current_tool_id]
-                    if current_streamed:
-                        # Count opening and closing braces to check if JSON is complete
-                        open_braces = current_streamed.count("{")
-                        close_braces = current_streamed.count("}")
-                        if open_braces > close_braces:
+                    candidates = []
+                    if cand_end_param != -1:
+                        candidates.append(
+                            (cand_end_param, len(self.parameter_end_token))
+                        )
+                    if cand_next_param != -1:
+                        candidates.append((cand_next_param, 0))
+                    if cand_end_func != -1:
+                        candidates.append((cand_end_func, 0))
+
+                    if candidates:
+                        best_cand = min(candidates, key=lambda x: x[0])
+                        end_pos = best_cand[0]
+                        end_token_len = best_cand[1]
+
+                        param_name = current_slice[
+                            len(self.parameter_prefix) : name_end
+                        ]
+                        raw_value = rest_of_slice[:end_pos]
+
+                        # Cleanup value
+                        if raw_value.startswith("\n"):
+                            raw_value = raw_value[1:]
+                        if raw_value.endswith("\n"):
+                            raw_value = raw_value[:-1]
+
+                        # JSON Construction
+                        if not self.json_started:
                             calls.append(
                                 ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters="}",
+                                    tool_index=self.current_tool_id, parameters="{"
                                 )
                             )
-                            self.streamed_args_for_tool[self.current_tool_id] = (
-                                current_streamed + "}"
+                            self.json_started = True
+
+                        param_config = self._get_arguments_config(
+                            self.current_func_name, tools
+                        )
+                        converted_val = self._convert_param_value(
+                            raw_value, param_name, param_config, self.current_func_name
+                        )
+
+                        # Construct JSON fragment: "key": value
+                        # Note: We must be careful with json.dumps to ensure valid JSON streaming
+                        json_key_val = f"{json.dumps(param_name)}: {json.dumps(converted_val, ensure_ascii=False)}"
+
+                        if self.current_tool_param_count > 0:
+                            fragment = f", {json_key_val}"
+                        else:
+                            fragment = json_key_val
+
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id, parameters=fragment
                             )
+                        )
+                        self.current_tool_param_count += 1
 
-                    # Complete the tool call
-                    self._buf = self._buf[end_pos + len(self.tool_call_end_token) :]
-                    self._reset_streaming_state()
-                    self.current_tool_id += 1
-                    continue
-                else:
-                    # Tool call not complete yet, wait for more text
-                    break
+                        # Advance cursor
+                        total_len = (name_end + 1) + end_pos + end_token_len
+                        self.parsed_pos += total_len
+                        continue
 
-        return StreamingParseResult(normal_text=normal, calls=calls)
+                # Incomplete parameter tag or value
+                break
 
-    def _parse_and_stream_parameters(self, text_to_parse: str) -> List[ToolCallItem]:
-        """
-        Parse complete parameter blocks from text and return any tool call items to emit.
-
-        This method:
-        1. Finds all complete <parameter> blocks
-        2. Parses them into a dictionary
-        3. Compares with current parameters and generates diff if needed
-        4. Updates internal state
-
-        Args:
-            text_to_parse: The text to search for parameter blocks
-
-        Returns:
-            List of ToolCallItem objects to emit (may be empty)
-        """
-        calls: List[ToolCallItem] = []
-
-        # Find all complete parameter patterns
-        param_matches = list(
-            re.finditer(
-                r"<parameter=([^>]+)>(.*?)</parameter>", text_to_parse, re.DOTALL
-            )
-        )
-
-        # Build new parameters dictionary
-        new_params = {}
-        for match in param_matches:
-            param_name = match.group(1).strip()
-            param_value = match.group(2)
-            new_params[param_name] = _safe_val(param_value)
-
-        # Calculate parameter diff to stream with proper incremental JSON building
-        if new_params != self._current_parameters:
-            previous_args_json = self.streamed_args_for_tool[self.current_tool_id]
-
-            # Build incremental JSON properly
-            if not self._current_parameters:
-                # First parameter(s) - start JSON object but don't close it yet
-                items = []
-                for key, value in new_params.items():
-                    items.append(
-                        f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
+            # -------------------------------------------------------
+            # 4. Function End: </function>
+            # -------------------------------------------------------
+            if current_slice.startswith(self.function_end_token):
+                if not self.json_started:
+                    calls.append(
+                        ToolCallItem(tool_index=self.current_tool_id, parameters="{")
                     )
-                json_fragment = "{" + ", ".join(items)
+                    self.json_started = True
 
                 calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id,
-                        name=None,
-                        parameters=json_fragment,
-                    )
+                    ToolCallItem(tool_index=self.current_tool_id, parameters="}")
                 )
-                self.streamed_args_for_tool[self.current_tool_id] = json_fragment
+                self.parsed_pos += len(self.function_end_token)
+                self.current_func_name = None
+                continue
+
+            # -------------------------------------------------------
+            # 5. Tool Call End: </tool_call>
+            # -------------------------------------------------------
+            if current_slice.startswith(self.tool_call_end_token):
+                self.parsed_pos += len(self.tool_call_end_token)
+                self.is_inside_tool_call = False  # [FIX] Exit tool call region
+                continue
+
+            # -------------------------------------------------------
+            # 6. Handling content / whitespace / normal text
+            # -------------------------------------------------------
+            # If current position is not the start of a tag (i.e., doesn't start with <), it might be plain text,
+            # or a newline between two tags.
+            # But we need to be careful not to output truncated tags like "<fun" as text.
+
+            next_open_angle = current_slice.find("<")
+
+            if next_open_angle == -1:
+                # This entire segment is plain text
+                if not self.is_inside_tool_call:
+                    normal_text_chunks.append(current_slice)
+                # [FIX] If inside tool call, discard this text (usually \n), don't append
+                self.parsed_pos += len(current_slice)
+                continue
+
+            elif next_open_angle == 0:
+                # Looks like a Tag, but doesn't match any known Tag above
+
+                possible_tags = [
+                    self.tool_call_start_token,
+                    self.tool_call_end_token,
+                    self.tool_call_prefix,
+                    self.function_end_token,
+                    self.parameter_prefix,
+                    self.parameter_end_token,
+                ]
+
+                is_potential_tag = False
+                for tag in possible_tags:
+                    if tag.startswith(current_slice):
+                        is_potential_tag = True
+                        break
+
+                if is_potential_tag:
+                    break  # Wait for more
+                else:
+                    # Just a plain '<' symbol
+                    if not self.is_inside_tool_call:
+                        normal_text_chunks.append("<")
+                    self.parsed_pos += 1
+                    continue
 
             else:
-                # Additional parameters - add them incrementally
-                new_keys = set(new_params.keys()) - set(self._current_parameters.keys())
-                if new_keys:
-                    # Build the continuation part (no closing brace yet)
-                    continuation_parts = []
-                    for key in new_keys:
-                        value = new_params[key]
-                        continuation_parts.append(
-                            f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
-                        )
-
-                    json_fragment = ", " + ", ".join(continuation_parts)
-
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=None,
-                            parameters=json_fragment,
-                        )
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] = (
-                        previous_args_json + json_fragment
-                    )
-
-            # Update current state
-            self._current_parameters = new_params
-            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = new_params
-
-        return calls
-
-    def _reset_streaming_state(self):
-        """Reset streaming state for the next tool call"""
-        self._in_tool_call = False
-        self._function_name_sent = False
-        self._current_function_name = ""
-        self._current_parameters = {}
-        self._streamed_parameters = {}
-        self.current_tool_name_sent = False
-
-    def _extract(self, text: str, tools: List[Tool]) -> Tuple[str, List[ToolCallItem]]:
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
-        cursor = 0
-        while True:
-            s = text.find(self.tool_call_start_token, cursor)
-            if s == -1:
-                normal_parts.append(text[cursor:])
-                break
-            normal_parts.append(text[cursor:s])
-            e = text.find(self.tool_call_end_token, s)
-            if e == -1:
-                normal_parts.append(text[s:])
-                break
-            block = text[s : e + len(self.tool_call_end_token)]
-            cursor = e + len(self.tool_call_end_token)
-            calls.extend(self._parse_block(block, tools))
-        return "".join(normal_parts), calls
-
-    def _parse_block(self, block: str, tools: List[Tool]) -> List[ToolCallItem]:
-        res: List[ToolCallItem] = []
-        for m in self.tool_call_function_regex.findall(block):
-            txt = m[0] if m[0] else m[1]
-            if ">" not in txt:
+                # '<' is in the middle
+                text_segment = current_slice[:next_open_angle]
+                if not self.is_inside_tool_call:
+                    normal_text_chunks.append(text_segment)
+                # [FIX] If inside tool call, discard whitespace/text before Tag
+                self.parsed_pos += next_open_angle
                 continue
-            idx = txt.index(">")
-            fname = txt[:idx].strip()
-            body = txt[idx + 1 :]
-            params: Dict[str, Any] = {}
-            for pm in self.tool_call_parameter_regex.findall(body):
-                ptxt = pm[0] if pm[0] else pm[1]
-                if ">" not in ptxt:
-                    continue
-                pidx = ptxt.index(">")
-                pname = ptxt[:pidx].strip()
-                pval = ptxt[pidx + 1 :].lstrip("\n").rstrip("\n")
-                params[pname] = _safe_val(pval)
-            raw = {"name": fname, "arguments": params}
-            try:
-                # TODO: fix idx in function call, the index for a function
-                # call will always be -1 in parse_base_json
-                res.extend(self.parse_base_json(raw, tools))
-            except Exception:
-                logger.warning("invalid tool call for %s dropped", fname)
-        return res
+
+        # Memory Cleanup: Slice the buffer
+        # Keep unparsed part, discard parsed part
+        if self.parsed_pos > 0:
+            self._buffer = self._buffer[self.parsed_pos :]
+            self.parsed_pos = 0
+
+        normal_text = "".join(normal_text_chunks) if normal_text_chunks else ""
+        return StreamingParseResult(calls=calls, normal_text=normal_text)
 
     def supports_structural_tag(self) -> bool:
         return False

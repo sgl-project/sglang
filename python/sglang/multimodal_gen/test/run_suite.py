@@ -1,70 +1,89 @@
 """
 Test runner for multimodal_gen that manages test suites and parallel execution.
 
-Uses LPT (Longest Processing Time First) algorithm for load-balanced partitioning
-based on estimated test times from perf_baselines.json.
-
-Usage:
-    python3 run_suite.py --suite <suite_name> --partition-id <id> --total-partitions <num>
-
-Example:
-    python3 run_suite.py --suite 1-gpu --partition-id 0 --total-partitions 4
+For diffusion 1-gpu/2-gpu suites, cases are partitioned by estimated runtime
+using LPT so each CI shard has a similar total runtime.
 """
 
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List
+
+import tabulate
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
-    ONE_GPU_CASES,
-    TWO_GPU_CASES,
+    ONE_GPU_CASES_A,
+    ONE_GPU_CASES_B,
+    TWO_GPU_CASES_A,
+    TWO_GPU_CASES_B,
     DiffusionTestCase,
 )
 
 logger = init_logger(__name__)
 
-# Suite definitions
-SUITES = {
-    "1-gpu": ONE_GPU_CASES,
-    "2-gpu": TWO_GPU_CASES,
-}
-
-# Default estimated time for cases without baseline (5 minutes)
 DEFAULT_EST_TIME_SECONDS = 300.0
-
-# Fixed overhead for server startup when estimated_full_test_time_s is not set
 STARTUP_OVERHEAD_SECONDS = 120.0
 
-# Parametrized test files (use case ID filter)
-PARAMETRIZED_FILES = {
-    "1-gpu": ["test_server_1_gpu.py"],
-    "2-gpu": ["test_server_2_gpu.py"],
+_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
+_UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
+_UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
+    "FLUX.2-klein-base-4B",
+    "Qwen-Image",
+)
+
+
+def _discover_unit_tests() -> list[str]:
+    unit_dir = Path(__file__).resolve().parent / "unit"
+    if not unit_dir.is_dir():
+        return []
+    return sorted(
+        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
+    )
+
+
+FILE_SUITES = {
+    "unit": _discover_unit_tests(),
+    "1-gpu-b200": ["test_server_c.py"],
 }
 
-# Standalone test files (each gets its own partition, no filter, run last)
-# NOTE: This is parsed by diffusion_case_parser.py using AST
+suites_ascend = {
+    "1-npu": ["ascend/test_server_1_npu.py"],
+    "2-npu": ["ascend/test_server_2_npu.py"],
+    "8-npu": ["ascend/test_server_8_npu.py"],
+}
+FILE_SUITES.update(suites_ascend)
+
+PARAMETRIZED_CASE_GROUPS = {
+    "1-gpu": [
+        ("test_server_a.py", ONE_GPU_CASES_A),
+        ("test_server_b.py", ONE_GPU_CASES_B),
+    ],
+    "2-gpu": [
+        ("test_server_2_gpu_a.py", TWO_GPU_CASES_A),
+        ("test_server_2_gpu_b.py", TWO_GPU_CASES_B),
+    ],
+}
+
+# NOTE: This is parsed by diffusion_case_parser.py using AST.
 STANDALONE_FILES = {
     "1-gpu": [
-        "test_lora_format_adapter.py",
-        # cli test
         "../cli/test_generate_t2i_perf.py",
+        "test_update_weights_from_disk.py",
     ],
     "2-gpu": [],
 }
 
+STRICT_SUITES = {"unit"}
+
 
 def get_case_est_time(case_id: str) -> float:
-    """
-    Get estimated time in seconds from perf_baselines.json.
-    Returns default value if case has no baseline.
-    """
     scenario = BASELINE_CONFIG.scenarios.get(case_id)
     if scenario is None:
         return DEFAULT_EST_TIME_SECONDS
@@ -74,100 +93,32 @@ def get_case_est_time(case_id: str) -> float:
 
 
 def auto_partition(
-    cases: List[DiffusionTestCase],
-    rank: int,
-    size: int,
-) -> List[DiffusionTestCase]:
-    """
-    Partition cases using LPT (Longest Processing Time First) greedy algorithm.
-
-    This algorithm distributes cases across partitions to balance the total
-    estimated time in each partition.
-
-    Args:
-        cases: List of DiffusionTestCase objects
-        rank: Index of the partition to return (0 to size-1)
-        size: Total number of partitions
-
-    Returns:
-        List of DiffusionTestCase objects assigned to the specified partition
-    """
+    cases: list[DiffusionTestCase], rank: int, size: int
+) -> list[DiffusionTestCase]:
     if not cases or size <= 0:
         return []
 
-    # Sort by time descending (LPT heuristic)
     sorted_cases = sorted(cases, key=lambda c: get_case_est_time(c.id), reverse=True)
-
-    # Initialize partitions
-    partitions: List[List[DiffusionTestCase]] = [[] for _ in range(size)]
+    partitions: list[list[DiffusionTestCase]] = [[] for _ in range(size)]
     partition_sums = [0.0] * size
 
-    # Greedy assignment: assign each case to partition with smallest current sum
     for case in sorted_cases:
         min_idx = partition_sums.index(min(partition_sums))
         partitions[min_idx].append(case)
         partition_sums[min_idx] += get_case_est_time(case.id)
 
-    if rank < size:
-        return partitions[rank]
-    return []
-
-
-def get_parametrized_files(suite: str, target_dir: Path) -> List[str]:
-    """
-    Get parametrized test file paths for the specified suite.
-
-    Args:
-        suite: Suite name (e.g., "1-gpu", "2-gpu")
-        target_dir: Base directory for test files
-
-    Returns:
-        List of absolute file paths
-    """
-    files = PARAMETRIZED_FILES.get(suite, [])
-    result = []
-    for f in files:
-        f_path = target_dir / f
-        if f_path.exists():
-            result.append(str(f_path))
-        else:
-            logger.warning(f"Test file {f} not found in {target_dir}")
-    return result
-
-
-def get_standalone_file(
-    standalone_files: List[str], target_dir: Path, index: int
-) -> str | None:
-    """
-    Get a standalone test file path by index.
-
-    Args:
-        standalone_files: List of standalone file names
-        target_dir: Base directory for test files
-        index: Index of the standalone file (0-based)
-
-    Returns:
-        Absolute file path, or None if not found
-    """
-    if index < 0 or index >= len(standalone_files):
-        return None
-    f_path = target_dir / standalone_files[index]
-    if f_path.exists():
-        return str(f_path)
-    logger.warning(
-        f"Standalone test file {standalone_files[index]} not found in {target_dir}"
-    )
-    return None
+    return partitions[rank] if rank < size else []
 
 
 def parse_args():
+    suite_choices = sorted(set(FILE_SUITES) | set(PARAMETRIZED_CASE_GROUPS))
     parser = argparse.ArgumentParser(description="Run multimodal_gen test suite")
     parser.add_argument(
         "--suite",
         type=str,
         required=True,
-        choices=["1-gpu", "2-gpu"],
-        help="The test suite to run (e.g., 1-gpu, 2-gpu)",
+        choices=suite_choices,
+        help="The test suite to run.",
     )
     parser.add_argument(
         "--partition-id",
@@ -198,18 +149,12 @@ def parse_args():
         "--continue-on-error",
         action="store_true",
         default=False,
-        help="Continue running remaining tests even if one fails (for CI consistency; pytest already continues by default)",
+        help="Continue running remaining tests even if one fails.",
     )
     return parser.parse_args()
 
 
 def parse_junit_xml_for_executed_cases(xml_path: str) -> list[str]:
-    """
-    Parse JUnit XML to extract case IDs that were actually executed (not skipped).
-
-    Returns:
-        List of case IDs that were executed (passed or failed, not skipped).
-    """
     if not Path(xml_path).exists():
         return []
 
@@ -218,12 +163,10 @@ def parse_junit_xml_for_executed_cases(xml_path: str) -> list[str]:
     root = tree.getroot()
 
     for testcase in root.iter("testcase"):
-        # Check if test was skipped
         if testcase.find("skipped") is not None:
             continue
 
         name = testcase.get("name", "")
-        # Extract case ID from test name like "test_diffusion_server[qwen_image_t2i]"
         if "[" in name and "]" in name:
             case_id = name[name.index("[") + 1 : name.index("]")]
             executed_cases.append(case_id)
@@ -232,12 +175,6 @@ def parse_junit_xml_for_executed_cases(xml_path: str) -> list[str]:
 
 
 def parse_junit_xml_for_case_results(xml_path: str) -> dict[str, str]:
-    """
-    Parse JUnit XML to extract case IDs and their pass/fail status.
-
-    Returns:
-        Dictionary mapping case_id to status ("pass", "fail", or "error").
-    """
     if not Path(xml_path).exists():
         return {}
 
@@ -246,22 +183,20 @@ def parse_junit_xml_for_case_results(xml_path: str) -> dict[str, str]:
     root = tree.getroot()
 
     for testcase in root.iter("testcase"):
-        # Check if test was skipped
         if testcase.find("skipped") is not None:
             continue
 
         name = testcase.get("name", "")
-        # Extract case ID from test name like "test_diffusion_server[qwen_image_t2i]"
-        if "[" in name and "]" in name:
-            case_id = name[name.index("[") + 1 : name.index("]")]
+        if "[" not in name or "]" not in name:
+            continue
 
-            # Determine status based on child elements
-            if testcase.find("failure") is not None:
-                case_results[case_id] = "fail"
-            elif testcase.find("error") is not None:
-                case_results[case_id] = "error"
-            else:
-                case_results[case_id] = "pass"
+        case_id = name[name.index("[") + 1 : name.index("]")]
+        if testcase.find("failure") is not None:
+            case_results[case_id] = "fail"
+        elif testcase.find("error") is not None:
+            case_results[case_id] = "error"
+        else:
+            case_results[case_id] = "pass"
 
     return case_results
 
@@ -275,12 +210,6 @@ def write_execution_report(
     standalone_file: str | None = None,
     case_results: dict[str, str] | None = None,
 ) -> str:
-    """
-    Write execution report to JSON file.
-
-    Returns:
-        Path to the generated report file.
-    """
     report = {
         "suite": suite,
         "partition_id": partition_id,
@@ -293,63 +222,49 @@ def write_execution_report(
 
     report_filename = f"execution_report_{suite}_{partition_id}.json"
     report_path = Path(__file__).parent / report_filename
-
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
-    logger.info(f"Execution report written to: {report_path}")
+    logger.info("Execution report written to: %s", report_path)
     return str(report_path)
 
 
 def run_pytest(
-    files, filter_expr=None, junit_xml_path=None
+    files: list[str],
+    filter_expr: str | None = None,
+    junit_xml_path: str | None = None,
 ) -> tuple[int, list[str], dict[str, str]]:
-    """
-    Run pytest with retry logic for flaky tests.
-
-    Returns:
-        Tuple of (exit_code, executed_cases, case_results) where:
-        - executed_cases is a list of case IDs that were executed
-        - case_results is a dict mapping case_id to status ("pass", "fail", "error")
-    """
     if not files:
         print("No files to run.")
         return (0, [], {})
 
-    # Accumulate executed cases across all retry attempts
     all_executed_cases: set[str] = set()
-    # Track case results (later runs overwrite earlier status for retried cases)
     all_case_results: dict[str, str] = {}
 
     base_cmd = [
         sys.executable,
         "-m",
         "pytest",
-        "-s",  # Don't capture stdout/stderr
-        "-v",  # Verbose output
-        "--tb=long",  # Show full traceback
-        "--log-cli=true",  # Enable live logging
-        "--log-cli-level=INFO",  # Set log level to INFO
-        "--log-cli-format=%(asctime)s [%(levelname)8s] %(name)s: %(message)s",  # Log format
-        "--log-cli-date-format=%Y-%m-%d %H:%M:%S",  # Date format
+        "-s",
+        "-v",
+        "--tb=long",
+        "--log-cli=true",
+        "--log-cli-level=INFO",
+        "--log-cli-format=%(asctime)s [%(levelname)8s] %(name)s: %(message)s",
+        "--log-cli-date-format=%Y-%m-%d %H:%M:%S",
     ]
 
-    # Add JUnit XML output for coverage tracking
     if junit_xml_path:
         base_cmd.extend(["--junit-xml", junit_xml_path])
-
-    # Add pytest -k filter if provided
     if filter_expr:
         base_cmd.extend(["-k", filter_expr])
 
     max_retries = 6
-    # retry if the perf assertion failed, for {max_retries} times
     for i in range(max_retries + 1):
         cmd = list(base_cmd)
         if i > 0:
             cmd.append("--last-failed")
-        else:
-            cmd.extend(files)
+        cmd.extend(files)
 
         if i > 0:
             print(
@@ -377,19 +292,14 @@ def run_pytest(
         process.wait()
         returncode = process.returncode
 
-        # Accumulate executed cases and results from this run before checking return code
         if junit_xml_path:
-            cases_this_run = parse_junit_xml_for_executed_cases(junit_xml_path)
-            all_executed_cases.update(cases_this_run)
-            # Get case results (later runs overwrite earlier status for retried cases)
-            results_this_run = parse_junit_xml_for_case_results(junit_xml_path)
-            all_case_results.update(results_this_run)
+            all_executed_cases.update(
+                parse_junit_xml_for_executed_cases(junit_xml_path)
+            )
+            all_case_results.update(parse_junit_xml_for_case_results(junit_xml_path))
 
         if returncode == 0:
             return (0, list(all_executed_cases), all_case_results)
-
-        # Exit code 5 means no tests were collected/selected - treat as success
-        # when using filters, since some partitions may have all tests filtered out
         if returncode == 5:
             print(
                 "No tests collected (exit code 5). This is expected when filters "
@@ -397,17 +307,16 @@ def run_pytest(
             )
             return (0, list(all_executed_cases), all_case_results)
 
-        # check if the failure is due to an assertion in test_server_utils.py
         full_output = output_bytes.decode("utf-8", errors="replace")
         is_perf_assertion = (
             "multimodal_gen/test/server/test_server_utils.py" in full_output
             and "AssertionError" in full_output
         )
-
         is_flaky_ci_assertion = (
-            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+            "SafetensorError" in full_output
+            or "FileNotFoundError" in full_output
+            or "TimeoutError" in full_output
         )
-
         is_oom_error = (
             "out of memory" in full_output.lower()
             or "oom killer" in full_output.lower()
@@ -420,52 +329,119 @@ def run_pytest(
     return (returncode, list(all_executed_cases), all_case_results)
 
 
-def main():
-    args = parse_args()
+def _is_in_ci() -> bool:
+    return os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("1", "true", "yes", "on")
 
-    # 1. Resolve base path
-    current_file_path = Path(__file__).resolve()
-    test_root_dir = current_file_path.parent
-    target_dir = test_root_dir / args.base_dir
 
-    if not target_dir.exists():
-        print(f"Error: Target directory {target_dir} does not exist.")
-        sys.exit(1)
+def _maybe_pin_update_weights_model_pair(suite_files_rel: list[str]) -> None:
+    if not _is_in_ci():
+        return
+    if _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE not in suite_files_rel:
+        return
+    if os.environ.get(_UPDATE_WEIGHTS_MODEL_PAIR_ENV):
+        print(
+            f"Using preset {_UPDATE_WEIGHTS_MODEL_PAIR_ENV}="
+            f"{os.environ[_UPDATE_WEIGHTS_MODEL_PAIR_ENV]}"
+        )
+        return
 
-    # 2. Get test cases from imported configuration
-    all_cases = SUITES.get(args.suite)
-    if all_cases is None:
-        print(f"Unknown suite: {args.suite}")
-        sys.exit(1)
+    selected_pair = random.choice(_UPDATE_WEIGHTS_MODEL_PAIR_IDS)
+    os.environ[_UPDATE_WEIGHTS_MODEL_PAIR_ENV] = selected_pair
+    print(f"Selected {_UPDATE_WEIGHTS_MODEL_PAIR_ENV}={selected_pair} for this CI run")
 
+
+def _resolve_suite_files(
+    target_dir: Path, suite_files_rel: list[str], strict: bool
+) -> list[str]:
+    suite_files_abs = []
+    for f_rel in suite_files_rel:
+        f_abs = target_dir / f_rel
+        if not f_abs.exists():
+            msg = f"Test file {f_rel} not found in {target_dir}."
+            if strict:
+                print(f"Error: {msg}")
+                sys.exit(1)
+            print(f"Warning: {msg} Skipping.")
+            continue
+        suite_files_abs.append(str(f_abs))
+    return suite_files_abs
+
+
+def _run_file_suite(args, target_dir: Path) -> int:
+    suite_files_rel = FILE_SUITES[args.suite]
+    _maybe_pin_update_weights_model_pair(suite_files_rel)
+    suite_files_abs = _resolve_suite_files(
+        target_dir, suite_files_rel, args.suite in STRICT_SUITES
+    )
+
+    if not suite_files_abs:
+        print(f"No valid test files found for suite '{args.suite}'.")
+        return 1 if args.suite in STRICT_SUITES else 0
+
+    exit_code, _, _ = run_pytest(
+        suite_files_abs,
+        filter_expr=args.filter,
+        junit_xml_path=None,
+    )
+    return exit_code
+
+
+def _get_dynamic_suite_cases(suite: str) -> list[DiffusionTestCase]:
+    cases = []
+    for _, case_group in PARAMETRIZED_CASE_GROUPS[suite]:
+        cases.extend(case_group)
+    return cases
+
+
+def _get_parametrized_files_for_case_ids(
+    suite: str, case_ids: set[str], target_dir: Path
+) -> list[str]:
+    files = []
+    for filename, case_group in PARAMETRIZED_CASE_GROUPS[suite]:
+        if any(case.id in case_ids for case in case_group):
+            file_path = target_dir / filename
+            if file_path.exists():
+                files.append(str(file_path))
+            else:
+                logger.warning("Test file %s not found in %s", filename, target_dir)
+    return files
+
+
+def _get_standalone_file(target_dir: Path, suite: str, index: int) -> str | None:
+    standalone_files = STANDALONE_FILES.get(suite, [])
+    if index < 0 or index >= len(standalone_files):
+        return None
+    file_path = target_dir / standalone_files[index]
+    if file_path.exists():
+        return str(file_path)
+    logger.warning(
+        "Standalone test file %s not found in %s", standalone_files[index], target_dir
+    )
+    return None
+
+
+def _run_dynamic_suite(args, target_dir: Path) -> int:
+    all_cases = _get_dynamic_suite_cases(args.suite)
     standalone_files = STANDALONE_FILES.get(args.suite, [])
-
-    # 3. Calculate partition allocation
-    num_standalone = len(standalone_files)
-    parametrized_partitions = args.total_partitions - num_standalone
+    parametrized_partitions = args.total_partitions - len(standalone_files)
 
     if parametrized_partitions < 0:
         print(
             f"Error: total_partitions ({args.total_partitions}) must be >= "
-            f"standalone files ({num_standalone})"
+            f"standalone files ({len(standalone_files)})"
         )
-        sys.exit(1)
+        return 1
 
-    # 4. Determine partition type and execute
     if args.partition_id < parametrized_partitions:
-        # === Parametrized test partition ===
         if not all_cases:
             print(f"No cases found for suite '{args.suite}'.")
-            sys.exit(0)
+            return 0
 
-        # Use LPT algorithm to partition cases among parametrized partitions
         my_cases = auto_partition(all_cases, args.partition_id, parametrized_partitions)
-
         if not my_cases:
             print(
                 f"No cases assigned to partition {args.partition_id}. Exiting success."
             )
-            # Write empty execution report for coverage tracking
             write_execution_report(
                 suite=args.suite,
                 partition_id=args.partition_id,
@@ -473,50 +449,45 @@ def main():
                 executed_cases=[],
                 is_standalone=False,
             )
-            sys.exit(0)
+            return 0
 
-        # Print partition info
-        print(
-            f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions} (parametrized)"
-        )
-        print(f"Running {len(my_cases)} cases in this partition:")
-        total_est_time = 0.0
-        for case in my_cases:
-            est_time = get_case_est_time(case.id)
-            total_est_time += est_time
-            print(f"  - {case.id} (est: {est_time:.1f}s)")
-        print(
-            f"Total estimated time: {total_est_time:.1f}s ({total_est_time/60:.1f} min)"
-        )
-        print()
-
-        # Build pytest filter expression from case IDs
         case_ids = [case.id for case in my_cases]
-        partition_filter = " or ".join([f"[{cid}]" for cid in case_ids])
-
-        # Combine with additional filter if provided
-        if args.filter:
-            filter_expr = f"({partition_filter}) and ({args.filter})"
-        else:
-            filter_expr = partition_filter
-
-        # Get parametrized test files
-        suite_files = get_parametrized_files(args.suite, target_dir)
+        case_id_set = set(case_ids)
+        total_est_time = sum(get_case_est_time(case.id) for case in my_cases)
+        suite_files = _get_parametrized_files_for_case_ids(
+            args.suite, case_id_set, target_dir
+        )
 
         if not suite_files:
             print(f"No valid parametrized test files found for suite '{args.suite}'.")
-            sys.exit(0)
+            return 0
 
-        print(f"Test files: {[os.path.basename(f) for f in suite_files]}")
-        print(f"Filter expression: {filter_expr}")
-        print()
-
-        junit_xml_path = str(target_dir / "junit_results.xml")
-        exit_code, executed_cases, case_results = run_pytest(
-            suite_files, filter_expr=filter_expr, junit_xml_path=junit_xml_path
+        partition_filter = " or ".join(f"[{case_id}]" for case_id in case_ids)
+        filter_expr = (
+            f"({partition_filter}) and ({args.filter})"
+            if args.filter
+            else partition_filter
         )
 
-        # Generate execution report (executed_cases already collected from run_pytest)
+        rows = [[args.suite, f"{args.partition_id + 1}/{args.total_partitions}"]]
+        print(tabulate.tabulate(rows, headers=["Suite", "Partition"], tablefmt="psql"))
+        print(
+            f"Running {len(my_cases)} cases with estimated total "
+            f"{total_est_time:.1f}s:"
+        )
+        for case in my_cases:
+            print(f"  - {case.id} ({get_case_est_time(case.id):.1f}s)")
+        print(f"Test files: {[Path(f).name for f in suite_files]}")
+        print(f"Filter expression: {filter_expr}")
+
+        junit_xml_path = str(
+            target_dir / f"junit_results_{args.suite}_{args.partition_id}.xml"
+        )
+        exit_code, executed_cases, case_results = run_pytest(
+            suite_files,
+            filter_expr=filter_expr,
+            junit_xml_path=junit_xml_path,
+        )
         write_execution_report(
             suite=args.suite,
             partition_id=args.partition_id,
@@ -525,58 +496,67 @@ def main():
             is_standalone=False,
             case_results=case_results,
         )
+        return exit_code
 
-    else:
-        # === Standalone test partition ===
-        standalone_idx = args.partition_id - parametrized_partitions
-
+    standalone_idx = args.partition_id - parametrized_partitions
+    if standalone_idx >= len(standalone_files):
         print(
-            f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions} (standalone)"
+            f"ERROR: Standalone partition index {standalone_idx} exceeds available "
+            f"standalone files ({len(standalone_files)}) for suite '{args.suite}'."
         )
+        return 1
 
-        standalone_file = get_standalone_file(
-            standalone_files, target_dir, standalone_idx
+    standalone_rel = standalone_files[standalone_idx]
+    if standalone_rel == _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE:
+        _maybe_pin_update_weights_model_pair([standalone_rel])
+
+    standalone_file = _get_standalone_file(target_dir, args.suite, standalone_idx)
+    if not standalone_file:
+        print(
+            f"ERROR: Standalone test file '{standalone_rel}' not found for suite "
+            f"'{args.suite}'."
         )
+        return 1
 
-        if standalone_idx >= len(standalone_files):
-            print(
-                f"ERROR: Standalone partition index {standalone_idx} exceeds available "
-                f"standalone files ({len(standalone_files)}) for suite '{args.suite}'."
-            )
-            sys.exit(1)
+    print(
+        f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions} (standalone)"
+    )
+    print(f"Running standalone test file: {Path(standalone_file).name}")
 
-        if not standalone_file:
-            print(
-                f"ERROR: Standalone test file '{standalone_files[standalone_idx]}' "
-                f"not found on disk for suite '{args.suite}'."
-            )
-            sys.exit(1)
+    junit_xml_path = str(
+        target_dir / f"junit_results_{args.suite}_{args.partition_id}.xml"
+    )
+    exit_code, _, _ = run_pytest(
+        [standalone_file],
+        filter_expr=args.filter,
+        junit_xml_path=junit_xml_path,
+    )
+    standalone_key = f"standalone:{standalone_rel}"
+    write_execution_report(
+        suite=args.suite,
+        partition_id=args.partition_id,
+        total_partitions=args.total_partitions,
+        executed_cases=[],
+        is_standalone=True,
+        standalone_file=standalone_rel,
+        case_results={standalone_key: "pass" if exit_code == 0 else "fail"},
+    )
+    return exit_code
 
-        print(f"Running standalone test file: {os.path.basename(standalone_file)}")
-        print()
 
-        # Run without case ID filter (standalone tests are not parametrized)
-        junit_xml_path = str(target_dir / "junit_results.xml")
-        exit_code, _, _ = run_pytest(
-            [standalone_file], filter_expr=args.filter, junit_xml_path=junit_xml_path
-        )
+def main():
+    args = parse_args()
+    test_root_dir = Path(__file__).resolve().parent
+    target_dir = test_root_dir / args.base_dir
 
-        # Generate execution report for standalone
-        standalone_filename = standalone_files[standalone_idx]
-        # Determine standalone status based on exit code
-        standalone_key = f"standalone:{standalone_filename}"
-        standalone_status = "pass" if exit_code == 0 else "fail"
-        standalone_case_results = {standalone_key: standalone_status}
+    if not target_dir.exists():
+        print(f"Error: Target directory {target_dir} does not exist.")
+        sys.exit(1)
 
-        write_execution_report(
-            suite=args.suite,
-            partition_id=args.partition_id,
-            total_partitions=args.total_partitions,
-            executed_cases=[],  # Standalone doesn't have parametrized cases
-            is_standalone=True,
-            standalone_file=standalone_filename,
-            case_results=standalone_case_results,
-        )
+    if args.suite in PARAMETRIZED_CASE_GROUPS:
+        exit_code = _run_dynamic_suite(args, target_dir)
+    else:
+        exit_code = _run_file_suite(args, target_dir)
 
     sys.exit(exit_code)
 

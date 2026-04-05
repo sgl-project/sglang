@@ -11,11 +11,11 @@ wit_bindgen::generate!({
     world: "sgl-model-gateway",
 });
 
-use exports::sgl::router::{
+use exports::sgl::model_gateway::{
     middleware_on_request::Guest as OnRequestGuest,
     middleware_on_response::Guest as OnResponseGuest,
 };
-use sgl::router::middleware_types::{Action, Request, Response};
+use sgl::model_gateway::middleware_types::{Action, Request, Response};
 
 /// Expected API Key (in production, this should be passed as configuration)
 const EXPECTED_API_KEY: &str = "secret-api-key-12345";
@@ -25,7 +25,7 @@ struct Middleware;
 
 // Helper function to find header value
 fn find_header_value(
-    headers: &[sgl::router::middleware_types::Header],
+    headers: &[sgl::model_gateway::middleware_types::Header],
     name: &str,
 ) -> Option<String> {
     headers

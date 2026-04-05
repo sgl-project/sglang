@@ -72,7 +72,7 @@ impl PipelineStage for RequestExecutionStage {
             )
         })?;
 
-        ctx.state.load_guards = Some(LoadGuards::from(workers));
+        ctx.state.load_guards = Some(LoadGuards::new(workers, ctx.input.headers.as_ref()));
 
         // Extract dispatch metadata for tracing span
         let request_id = ctx

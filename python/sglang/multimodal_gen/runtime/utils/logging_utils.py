@@ -3,14 +3,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/logger.py
 """Logging configuration for sglang.multimodal_gen."""
+
 import argparse
 import contextlib
+import dataclasses
 import datetime
+import inspect
 import logging
 import os
 import sys
 import time
 from contextlib import contextmanager
+from enum import Enum
 from functools import lru_cache, partial
 from logging import Logger
 from types import MethodType
@@ -68,21 +72,7 @@ DEFAULT_LOGGING_CONFIG = {
 }
 
 
-class NewLineFormatter(logging.Formatter):
-    """Adds logging prefix to newlines to align multi-line messages."""
-
-    def __init__(self, fmt, datefmt=None, style="%"):
-        logging.Formatter.__init__(self, fmt, datefmt, style)
-
-    def format(self, record):
-        msg = logging.Formatter.format(self, record)
-        if record.message != "":
-            parts = msg.split(record.message)
-            msg = msg.replace("\n", "\r\n" + parts[0])
-        return msg
-
-
-class ColoredFormatter(NewLineFormatter):
+class ColoredFormatter(logging.Formatter):
     """A logging formatter that adds color to log levels."""
 
     LEVEL_COLORS = {
@@ -91,16 +81,13 @@ class ColoredFormatter(NewLineFormatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:
-        """Adds color to the log level name."""
-        original_levelname = record.levelname
-        color = self.LEVEL_COLORS.get(record.levelno)
-        if color:
-            record.levelname = f"{color}{original_levelname}{RESET}"
+        """Adds color to the log"""
 
         formatted_message = super().format(record)
 
+        color = self.LEVEL_COLORS.get(record.levelno)
         if color:
-            record.levelname = original_levelname
+            formatted_message = f"{color}{formatted_message}{RESET}"
 
         return formatted_message
 
@@ -142,6 +129,7 @@ def get_is_local_main_process():
 
 
 def _log_process_aware(
+    server_log_level: int,
     level: int,
     logger_self: Logger,
     msg: object,
@@ -153,18 +141,21 @@ def _log_process_aware(
     """Helper function to log a message if the process rank matches the criteria."""
     is_main_process = get_is_main_process()
     is_local_main_process = get_is_local_main_process()
-
     should_log = (
         not main_process_only
         and not local_main_process_only
         or (main_process_only and is_main_process)
         or (local_main_process_only and is_local_main_process)
+        or server_log_level <= logging.DEBUG
     )
 
     if should_log:
         # stacklevel=3 to show the original caller's location,
         # as this function is called by the patched methods.
-        logger_self.log(level, msg, *args, stacklevel=3, **kwargs)
+        if "stacklevel" in kwargs:
+            logger_self.log(level, msg, *args, **kwargs)
+        else:
+            logger_self.log(level, msg, *args, stacklevel=3, **kwargs)
 
 
 class _SGLDiffusionLogger(Logger):
@@ -234,6 +225,8 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
     logger = logging.getLogger(name)
 
+    server_log_level = logger.getEffectiveLevel()
+
     # Patch instance methods
     setattr(logger, "info_once", MethodType(_print_info_once, logger))
     setattr(logger, "warning_once", MethodType(_print_warning_once, logger))
@@ -252,6 +245,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
+                server_log_level,
                 level,
                 self,
                 msg,
@@ -281,13 +275,114 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
     setattr(
         logger,
         "error",
-        MethodType(_create_patched_method(logging.ERROR, False, True), logger),
+        MethodType(_create_patched_method(logging.ERROR, False, False), logger),
     )
 
     return cast(_SGLDiffusionLogger, logger)
 
 
 logger = init_logger(__name__)
+
+
+def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
+    """Return (is_tensor, torch_module_or_None) without importing torch at module import time."""
+    try:
+        import torch  # type: ignore
+
+        return isinstance(obj, torch.Tensor), torch
+    except Exception:
+        return False, None
+
+
+def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
+    """Recursively convert objects to JSON-serializable forms for concise logging.
+
+    Rules:
+    - Drop any field/dict key named 'param_names_mapping'.
+    - Render Enums using their value.
+    - Render torch.Tensor as a compact summary; if key name is 'scaling_factor', include stats.
+    - Dataclasses are expanded to dicts and sanitized recursively.
+    - Callables/functions are rendered as their qualified name.
+    - Redact sensitive fields like 'prompt' and 'negative_prompt' (only show length).
+    - Fallback to str(...) for unknown types.
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        if key_hint in ("prompt", "negative_prompt"):
+            if isinstance(obj, str):
+                return f"<redacted, len={len(obj)}>"
+        return obj
+
+    if isinstance(obj, Enum):
+        return obj.value
+
+    is_tensor, torch_mod = _is_torch_tensor(obj)
+    if is_tensor:
+        try:
+            ten = obj.detach().cpu()
+            if key_hint == "scaling_factor":
+                stats = {
+                    "shape": list(ten.shape),
+                    "dtype": str(ten.dtype),
+                }
+                try:
+                    stats["min"] = float(ten.min().item())
+                except Exception:
+                    pass
+                try:
+                    stats["max"] = float(ten.max().item())
+                except Exception:
+                    pass
+                try:
+                    stats["mean"] = float(ten.float().mean().item())
+                except Exception:
+                    pass
+                return {"tensor": "scaling_factor", **stats}
+            return {"tensor": True, "shape": list(ten.shape), "dtype": str(ten.dtype)}
+        except Exception:
+            return "<tensor>"
+
+    if dataclasses.is_dataclass(obj):
+        result: dict[str, Any] = {}
+        for f in dataclasses.fields(obj):
+            if not f.repr:
+                continue
+            name = f.name
+            if "names_mapping" in name:
+                continue
+            try:
+                value = getattr(obj, name)
+            except Exception:
+                continue
+            result[name] = _sanitize_for_logging(value, key_hint=name)
+        return result
+
+    if isinstance(obj, dict):
+        result_dict: dict[str, Any] = {}
+        for k, v in obj.items():
+            try:
+                key_str = str(k)
+            except Exception:
+                key_str = "<key>"
+            if key_str == "param_names_mapping":
+                continue
+            result_dict[key_str] = _sanitize_for_logging(v, key_hint=key_str)
+        return result_dict
+
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_logging(x, key_hint=key_hint) for x in obj]
+
+    try:
+        if inspect.isroutine(obj) or inspect.isclass(obj):
+            module = getattr(obj, "__module__", "")
+            qn = getattr(obj, "__qualname__", getattr(obj, "__name__", "<callable>"))
+            return f"{module}.{qn}" if module else qn
+    except Exception:
+        pass
+
+    try:
+        return str(obj)
+    except Exception:
+        return "<unserializable>"
 
 
 def _trace_calls(log_path, root_dir, frame, event, arg=None):
@@ -356,7 +451,7 @@ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
     sys.settrace(partial(_trace_calls, log_file_path, root_dir))
 
 
-def set_uvicorn_logging_configs():
+def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
     LOGGING_CONFIG["formatters"]["default"][
@@ -368,18 +463,80 @@ def set_uvicorn_logging_configs():
     ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
+    # Install access log path filter into LOGGING_CONFIG so it survives
+    # uvicorn's internal dictConfig() call during startup.
+    prefixes = getattr(server_args, "uvicorn_access_log_exclude_prefixes", None)
+    if prefixes:
+        _install_access_log_filter(LOGGING_CONFIG, prefixes)
+
+
+def _install_access_log_filter(config: dict, prefixes: list[str]):
+    """Register a path-based access log filter into uvicorn's LOGGING_CONFIG dict.
+
+    Only attaches to the ``access`` handler (not the ``uvicorn.access`` logger)
+    to avoid filtering the same record twice.
+    """
+    # Sanitize: drop empty strings (would match all paths) and deduplicate.
+    prefixes = [str(p) for p in prefixes if p]
+    prefixes = list(dict.fromkeys(prefixes))
+    if not prefixes:
+        return
+
+    name = "sglang_diffusion_path_filter"
+    config.setdefault("filters", {})[name] = {
+        "()": "sglang.multimodal_gen.runtime.utils.logging_utils._UvicornAccessLogFilter",
+        "prefixes": prefixes,
+    }
+
+    handler_cfg = config.get("handlers", {}).get("access")
+    if handler_cfg is not None:
+        fl = handler_cfg.setdefault("filters", [])
+        if name not in fl:
+            fl.append(name)
+
+
+class _UvicornAccessLogFilter(logging.Filter):
+    """Suppress uvicorn access logs whose path starts with an excluded prefix.
+
+    uvicorn's ``AccessFormatter`` injects ``request_line`` during ``format()``,
+    which runs *after* filters.  We therefore extract the path from
+    ``record.args`` which uvicorn populates as::
+
+        (client_addr, method, full_path, http_version, status_code)
+    """
+
+    def __init__(self, prefixes: list[str] | None = None):
+        super().__init__()
+        self.prefixes = tuple(str(p) for p in (prefixes or ()) if p)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            path = str(args[2]).split("?", 1)[0]
+            return not path.startswith(self.prefixes)
+        return True
+
 
 def configure_logger(server_args, prefix: str = ""):
     log_format = f"[%(asctime)s{prefix}] %(message)s"
     datefmt = "%m-%d %H:%M:%S"
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format=log_format,
-        datefmt=datefmt,
-        force=True,
-    )
 
-    set_uvicorn_logging_configs()
+    formatter = ColoredFormatter(log_format, datefmt=datefmt)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(getattr(logging, server_args.log_level.upper()))
+
+    set_uvicorn_logging_configs(server_args)
+
+
+@lru_cache(maxsize=1)
+def get_log_level() -> int:
+    root = logging.getLogger()
+    return root.level
 
 
 def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):
@@ -403,6 +560,8 @@ def globally_suppress_loggers():
         "python_multipart.multipart",
         "filelock",
         "urllib3",
+        "httpx",
+        "httpcore",
     ]
 
     for name in target_names:
@@ -457,7 +616,7 @@ def log_generation_timer(
             "Processing prompt %d/%d: %s",
             request_idx,
             total_requests,
-            prompt[:100],
+            _sanitize_for_logging(prompt, key_hint="prompt"),
         )
 
     timer = GenerationTimer()

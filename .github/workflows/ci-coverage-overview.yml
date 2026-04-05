@@ -1,0 +1,154 @@
+name: CI Coverage Overview
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+  pull_request:
+    paths:
+      - '.github/workflows/ci-coverage-overview.yml'
+      - 'scripts/ci/utils/ci_coverage_report.py'
+      - 'test/registered/**'
+  workflow_dispatch:
+    inputs:
+      output_format:
+        description: 'Output format'
+        required: false
+        default: 'markdown'
+        type: choice
+        options:
+          - markdown
+          - json
+
+jobs:
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate Summary Report
+        run: |
+          python scripts/ci/utils/ci_coverage_report.py --section summary
+
+  by-folder:
+    name: Tests by Folder
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate Tests by Folder Report
+        run: |
+          python scripts/ci/utils/ci_coverage_report.py --section by-folder
+
+  by-suite:
+    name: Tests by Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate Tests by Suite Report
+        run: |
+          python scripts/ci/utils/ci_coverage_report.py --section by-suite
+
+  unit-test-coverage:
+    name: Unit Test Code Coverage
+    if: github.event_name != 'pull_request'
+    runs-on: 1-gpu-h100
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          pip install -e "python/[test]"
+
+      - name: Run unit tests with coverage
+        timeout-minutes: 10
+        run: |
+          pytest test/registered/unit/ \
+            --cov --cov-config=.coveragerc \
+            --cov-report=term-missing:skip-covered \
+            --continue-on-collection-errors \
+            -v | tee coverage_output.txt
+
+      - name: Write coverage to summary
+        if: always()
+        run: |
+          echo "## Unit Test Code Coverage" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${GITHUB_SHA::8}\` | **Branch:** \`${GITHUB_REF_NAME}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Test result line (e.g., "== 42 passed, 1 failed in 23.5s ==")
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -E '^=+.*passed' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
+          echo "" >> $GITHUB_STEP_SUMMARY
+          # Coverage total
+          grep -E '^TOTAL ' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          # Partially covered core modules (1-49%) — most actionable for contributors
+          # Only show modules with testable logic; skip configs, models, layers, etc.
+          LOW_COV=$(awk '/^python\/.*%/ {
+            for (i=1; i<=NF; i++) {
+              if ($i ~ /^[0-9]+%$/) {
+                pct = $i + 0
+                if (pct >= 1 && pct < 50) printf "%-80s %5s  %s\n", $1, $(i-2), $i
+                break
+              }
+            }
+          }' coverage_output.txt \
+            | grep -E '/(mem_cache|managers|sampling|parser|observability|function_call|entrypoints|speculative|multimodal|utils)/' \
+            | head -40 || true)
+          if [ -n "$LOW_COV" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "<details><summary>Core modules with coverage below 50% — good candidates for more unit tests</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "$LOW_COV" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  json-export:
+    name: JSON Export
+    runs-on: ubuntu-latest
+    if: inputs.output_format == 'json'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate JSON Report
+        run: |
+          python scripts/ci/utils/ci_coverage_report.py --output-format json > ci_coverage.json
+
+      - name: Upload JSON artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-coverage-report
+          path: ci_coverage.json

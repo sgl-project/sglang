@@ -13,11 +13,11 @@ use std::{io, sync::Arc};
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::{json, to_value, Value};
+use smg_mcp as mcp;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::{
-    mcp,
     protocols::{
         event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
         responses::{generate_id, ResponseInput, ResponsesRequest},
@@ -198,8 +198,8 @@ pub(super) async fn execute_streaming_tool_calls(
 // Payload Transformation
 // ============================================================================
 
-/// Transform payload to replace MCP tools with function tools for streaming
-pub(super) fn prepare_mcp_payload_for_streaming(
+/// Transform payload to replace MCP tools with function tools
+pub(super) fn prepare_mcp_tools_as_functions(
     payload: &mut Value,
     active_mcp: &Arc<mcp::McpManager>,
     server_keys: &[String],

@@ -55,11 +55,10 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**"
-              - "python/*.toml"
-              - "scripts/ci/**"
-              - "test/**"
-              - "sgl-kernel/**"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/pyproject_cpu.toml"
+              - "test/**/!(*.md)"
+              - "sgl-kernel/**/*.!(md|txt)"
               - ".github/workflows/pr-test-xeon.yml"
               - "docker/xeon.Dockerfile"
 

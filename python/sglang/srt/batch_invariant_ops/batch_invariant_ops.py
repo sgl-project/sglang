@@ -297,7 +297,10 @@ def matmul_persistent(
         return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
 
     if _ENABLE_MM_FALLBACK_VARIANT:
-        return torch.einsum("ik,kj->ij", a, b)
+        out = torch.einsum("ik,kj->ij", a, b)
+        if bias is not None:
+            out += bias
+        return out
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
@@ -306,9 +309,9 @@ def matmul_persistent(
 def _log_softmax_kernel(
     input_ptr,
     output_ptr,
-    input_row_stride,
-    output_row_stride,
-    n_cols,
+    input_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -811,9 +814,9 @@ def _rms_norm_kernel(
     input_ptr,
     weight_ptr,
     output_ptr,
-    input_row_stride,
-    output_row_stride,
-    n_cols,
+    input_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
     eps,
     BLOCK_SIZE: tl.constexpr,
 ):

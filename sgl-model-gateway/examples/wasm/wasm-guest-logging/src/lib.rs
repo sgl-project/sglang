@@ -12,11 +12,11 @@ wit_bindgen::generate!({
     world: "sgl-model-gateway",
 });
 
-use exports::sgl::router::{
+use exports::sgl::model_gateway::{
     middleware_on_request::Guest as OnRequestGuest,
     middleware_on_response::Guest as OnResponseGuest,
 };
-use sgl::router::middleware_types::{Action, Header, ModifyAction, Request, Response};
+use sgl::model_gateway::middleware_types::{Action, Header, ModifyAction, Request, Response};
 
 /// Main middleware implementation
 struct Middleware;

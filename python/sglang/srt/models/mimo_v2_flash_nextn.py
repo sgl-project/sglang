@@ -64,8 +64,13 @@ class MiMoV2MTPLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
 
-        rope_theta = getattr(config, "rope_theta", 1000000)
+        rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
+        if (
+            isinstance(rope_scaling, dict)
+            and rope_scaling.get("rope_type") == "default"
+        ):
+            rope_scaling = None
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
         self.self_attn = MiMoV2Attention(
@@ -165,7 +170,7 @@ class MiMoV2ModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -229,6 +234,7 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        draft_model_idx: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)

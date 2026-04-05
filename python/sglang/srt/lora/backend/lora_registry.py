@@ -1,4 +1,5 @@
 import logging
+from typing import Type
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 
@@ -50,7 +51,7 @@ def create_flashinfer_backend():
     )
 
 
-def get_backend_from_name(name: str) -> BaseLoRABackend:
+def get_backend_from_name(name: str) -> Type[BaseLoRABackend]:
     """
     Get corresponding backend class from backend's name
     """

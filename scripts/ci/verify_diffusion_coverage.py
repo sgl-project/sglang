@@ -25,6 +25,8 @@ from diffusion_case_parser import (
     collect_diffusion_suites,
 )
 
+DYNAMIC_SUITES = {"1-gpu", "2-gpu"}
+
 
 def load_execution_reports(reports_dir: Path) -> list[dict]:
     """Load all execution report JSON files from the given directory."""
@@ -55,6 +57,8 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
 
     expected = {}
     for suite_name, suite_info in suites.items():
+        if suite_name not in DYNAMIC_SUITES:
+            continue
         case_ids = set(case.case_id for case in suite_info.cases)
         # Add standalone files as special case IDs
         for standalone_file in suite_info.standalone_files:

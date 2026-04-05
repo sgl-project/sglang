@@ -187,6 +187,8 @@ def main():
 
     # Process each suite
     for suite_name, suite_info in suites.items():
+        if suite_name not in SUITE_OUTPUT_NAMES:
+            continue
         cases = suite_info.cases
         standalone_files = suite_info.standalone_files
 
@@ -235,7 +237,7 @@ def main():
             print()
 
         # Output GitHub Actions matrix
-        output_name = SUITE_OUTPUT_NAMES.get(suite_name, suite_name.replace("-", ""))
+        output_name = SUITE_OUTPUT_NAMES[suite_name]
         output_github_matrix(output_name, total_partitions)
 
 

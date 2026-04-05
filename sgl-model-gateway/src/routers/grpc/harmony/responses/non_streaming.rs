@@ -14,7 +14,6 @@ use super::{
         build_mcp_tool_names_set, build_next_request_with_tools, inject_mcp_metadata,
         load_previous_messages, McpCallTracking,
     },
-    context::HarmonyResponsesContext,
     execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools, ToolResult},
 };
 use crate::{
@@ -29,7 +28,9 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::responses::{ensure_mcp_connection, persist_response_if_needed},
+            common::responses::{
+                ensure_mcp_connection, persist_response_if_needed, ResponsesContext,
+            },
             harmony::processor::ResponsesIterationResult,
         },
         mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
@@ -47,7 +48,7 @@ use crate::{
 ///    - Repeat from step 1 (full pipeline re-execution)
 /// 4. If no tool calls, return final response
 pub(crate) async fn serve_harmony_responses(
-    ctx: &HarmonyResponsesContext,
+    ctx: &ResponsesContext,
     request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
     // Clone request for persistence
@@ -90,7 +91,7 @@ pub(crate) async fn serve_harmony_responses(
 ///
 /// Automatically executes MCP tools in a loop until no more tool calls or max iterations
 async fn execute_with_mcp_loop(
-    ctx: &HarmonyResponsesContext,
+    ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
     let mut iteration_count = 0;
@@ -319,7 +320,7 @@ async fn execute_with_mcp_loop(
 ///
 /// For function tools or no tools - executes pipeline once and returns
 async fn execute_without_mcp_loop(
-    ctx: &HarmonyResponsesContext,
+    ctx: &ResponsesContext,
     current_request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
     debug!("Executing Harmony Responses without MCP loop");

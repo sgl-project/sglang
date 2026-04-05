@@ -1,7 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=890, suite="stage-b-test-small-1-gpu")
-
 """
 Usage:
 python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_batch
@@ -12,6 +8,7 @@ import unittest
 
 import openai
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.vlm_utils import *
 from sglang.test.vlm_utils import (
     AudioOpenAITestMixin,
@@ -22,9 +19,15 @@ from sglang.test.vlm_utils import (
     VideoOpenAITestMixin,
 )
 
+register_cuda_ci(est_time=957, suite="stage-b-test-1-gpu-large")
+
 
 class TestLlavaServer(ImageOpenAITestMixin):
     model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
+
+
+class TestLfm2VlServer(ImageOpenAITestMixin):
+    model = "LiquidAI/LFM2.5-VL-1.6B"
 
 
 class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):

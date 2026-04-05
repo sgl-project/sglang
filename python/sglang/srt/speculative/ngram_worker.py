@@ -11,9 +11,10 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
+from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import generate_token_bitmask
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,8 @@ class NGRAMWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -37,28 +40,24 @@ class NGRAMWorker:
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
-        self.branch_length: int = server_args.speculative_ngram_branch_length
-        self.max_match_window_size: int = (
-            server_args.speculative_ngram_max_match_window_size
-        )
+        self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
 
         self._init_preallocated_tensors()
 
-        self.ngram_cache = NgramCache(
-            min_match_window_size=server_args.speculative_ngram_min_match_window_size,
-            max_match_window_size=server_args.speculative_ngram_max_match_window_size,
+        self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
+            match_type=server_args.speculative_ngram_match_type,
             capacity=server_args.speculative_ngram_capacity,
-            branch_length=server_args.speculative_ngram_branch_length,
+            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
             draft_token_num=server_args.speculative_num_draft_tokens,
         )
 
     def clear_cache_pool(self):
-        self.ngram_cache.reset()
+        self.ngram_corpus.reset()
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)
@@ -123,14 +122,14 @@ class NGRAMWorker:
     ) -> tuple[np.ndarray, np.ndarray]:
         bs = batch.batch_size()
 
-        self.ngram_cache.synchronize()
+        self.ngram_corpus.synchronize()
         batch_tokens = []
         for req in batch.reqs:
             check_token = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids, self.max_match_window_size
+                req.origin_input_ids, req.output_ids, self.max_trie_depth
             )
             batch_tokens.append(check_token)
-        req_drafts, mask = self.ngram_cache.batch_get(batch_tokens)
+        req_drafts, mask = self.ngram_corpus.batch_get(batch_tokens)
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -196,7 +195,7 @@ class NGRAMWorker:
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
-    def _update_ngram_cache(self, batch: ScheduleBatch):
+    def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
@@ -205,18 +204,27 @@ class NGRAMWorker:
             #     put_ids = req.origin_input_ids + req.output_ids
             # else:
             put_ids = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids, self.branch_length
+                req.origin_input_ids, req.output_ids, self.max_trie_depth
             )
             batch_tokens.append(put_ids)
-        self.ngram_cache.batch_put(batch_tokens)
+        self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
+        spec_info = model_worker_batch.spec_info
         num_accepted_tokens = 0
         accept_lens = None
+        accept_length_per_req_cpu = None
 
         if model_worker_batch.forward_mode.is_target_verify():
+            if batch.has_grammar:
+                retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
+                retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+                draft_tokens_cpu = spec_info.draft_token.view(
+                    spec_info.retrive_next_token.shape
+                ).cpu()
+
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
@@ -224,15 +232,37 @@ class NGRAMWorker:
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
             )
+
             verify_input: NgramVerifyInput = model_worker_batch.spec_info
+            vocab_mask = None
+            if batch.has_grammar:
+                # Generate the logit mask for structured output.
+                # Overlap the CPU operations for bitmask generation with the forward pass.
+                vocab_mask = generate_token_bitmask(
+                    batch.reqs,
+                    verify_input,
+                    retrieve_next_token_cpu,
+                    retrieve_next_sibling_cpu,
+                    draft_tokens_cpu,
+                    batch.sampling_info.vocab_size,
+                )
+
+                if vocab_mask is not None:
+                    assert verify_input.grammar is not None
+                    vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
+                    # and will be applied to produce wrong results
+                    batch.sampling_info.vocab_mask = None
+
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
-                batch, logits_output, self.page_size
+                batch, logits_output, self.page_size, vocab_mask
             )
+            accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
-            self._update_ngram_cache(batch)
+            self._update_ngram_corpus(batch)
             batch.forward_mode = ForwardMode.DECODE
 
         else:
@@ -249,6 +279,7 @@ class NGRAMWorker:
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
         )

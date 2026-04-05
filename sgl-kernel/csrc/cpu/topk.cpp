@@ -227,11 +227,9 @@ void topk_softmax_kernel_impl(
         queue[e] = {scores[e], e};
       }
 
-      std::partial_sort(
-          queue.begin(),
-          queue.begin() + num_experts_per_group,
-          queue.end(),
-          [](const elem_t& x, const elem_t& y) -> bool { return x.first > y.first; });
+      std::partial_sort(queue.begin(), queue.begin() + topk, queue.end(), [](const elem_t& x, const elem_t& y) -> bool {
+        return x.first > y.first;
+      });
 
       for (int64_t j = 0; j < topk; ++j) {
         topk_weights[i * topk + j] = queue[j].first;
@@ -524,6 +522,12 @@ topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t t
         break;
       case 256:
         LAUNCH_TOPK_SOFTMAX_KERNEL(256);
+        break;
+      case 384:
+        LAUNCH_TOPK_SOFTMAX_KERNEL(384);
+        break;
+      case 512:
+        LAUNCH_TOPK_SOFTMAX_KERNEL(512);
         break;
       default:
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);

@@ -6,7 +6,7 @@ What makes SGLang essential for post-training?
 
 - Open-To-Use Refit Functionality: diverse method for colocate or disaggregate
 - Easy To Postpone Generation: enable partial rollout and dedicated rollout control
-- Fine-Grained Engine Sleep And Wake Up: facilitate maxium-powered rollout and training
+- Fine-Grained Engine Sleep And Wake Up: facilitate maximum-powered rollout and training
 - Training Serving Alignment: ensure the performance consistency in training and serving
 - Load Balancing Router: cache-aware load-balancing for high-throughput rollout
 - Deterministic Inference: ensure zero kl divergence between rollout and training
@@ -28,4 +28,4 @@ These capabilities, combined with native integration support across major framew
 
 ## Collaboration
 
-Due to the privacy of the design parternes, we cannot list the companies that adopt SGLang for post-training. However, we are happy to share the details with you if you are interested and trust the choice among 10+ top companies and frontier labs across US and China. If you are interested in integrating SGLang with your training framework or need technical support, we're here to help! Reach out to us at **rl_team@lmsys.org** for partnerships, integration guidance, and custom feature development.
+Due to the privacy of the design partners, we cannot list the companies that adopt SGLang for post-training. However, we are happy to share the details with you if you are interested and trust the choice among 10+ top companies and frontier labs across US and China. If you are interested in integrating SGLang with your training framework or need technical support, we're here to help! Reach out to us at **rl_team@lmsys.org** for partnerships, integration guidance, and custom feature development.

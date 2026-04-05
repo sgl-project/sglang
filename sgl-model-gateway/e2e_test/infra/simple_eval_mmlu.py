@@ -25,6 +25,9 @@ from .simple_eval_common import (
 if TYPE_CHECKING:
     from .simple_eval_common import SamplerBase
 
+# MMLU dataset URL (hosted by OpenAI)
+MMLU_DATASET_URL = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+
 SUBJECT_TO_CATEGORY = {
     "abstract_algebra": "stem",
     "anatomy": "other",
@@ -90,7 +93,10 @@ class MMLUEval(Eval):
     """MMLU benchmark evaluation."""
 
     def __init__(self, filename: str, num_examples: int | None, num_threads: int):
-        df = pandas.read_csv(filename)
+        if "://" in filename:
+            df = pandas.read_csv(filename, storage_options={"timeout": 30})
+        else:
+            df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         if num_examples:
             examples = random.Random(0).sample(examples, num_examples)

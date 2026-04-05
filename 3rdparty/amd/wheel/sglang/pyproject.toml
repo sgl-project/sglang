@@ -1,0 +1,213 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amd-sglang"
+dynamic = ["version"]
+description = "SGLang is a fast serving framework for large language models and vision language models."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+]
+dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle"]
+
+[project.optional-dependencies]
+runtime_common = [
+  "IPython",
+  "aiohttp",
+  "anthropic>=0.20.0",
+  "blobfile==3.0.0",
+  "build",
+  "compressed-tensors",
+  "decord2",
+  "datasets",
+  "einops",
+  "fastapi",
+  "gguf",
+  "hf_transfer",
+  "huggingface_hub",
+  "interegular",
+  "llguidance>=0.7.11,<0.8.0",
+  "modelscope",
+  "msgspec",
+  "ninja",
+  "numpy",
+  "openai-harmony==0.0.4",
+  "openai==2.6.1",
+  "orjson",
+  "outlines==0.1.11",
+  "packaging",
+  "partial_json_parser",
+  "pillow",
+  "prometheus-client>=0.20.0",
+  "psutil",
+  "py-spy",
+  "pybase64",
+  "pydantic",
+  "python-multipart",
+  "pyzmq>=25.1.2",
+  "requests",
+  "scipy",
+  "sentencepiece",
+  "setproctitle",
+  "soundfile==0.13.1",
+  "tiktoken",
+  "timm==1.0.16",
+  "torchao==0.9.0",
+  "tqdm",
+  "transformers==4.57.1",
+  "uvicorn",
+  "uvloop",
+  "xgrammar==0.1.32",
+  "smg-grpc-servicer>=0.5.0",
+]
+
+# ROCm specific packages (https://repo.radeon.com/rocm/manylinux/)
+# Existing practice for daily rocm700 docker images relies on 700-rc
+# versions of software that are not public available. Here we pin some
+# from rocm702 as the closest set as daily rocm700 images.
+rocm700 = [
+  "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torch-2.9.1.dev20251204%2Brocm7.0.2.lw.git351ff442-cp310-cp310-linux_x86_64.whl",
+  "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/triton-3.5.1%2Brocm7.0.2.gita272dfa8-cp310-cp310-linux_x86_64.whl",
+  "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
+  "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
+  "mooncake-transfer-engine-non-cuda==0.3.8.post1",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.0/sglang_kernel-0.4.0+rocm700-cp310-abi3-manylinux2014_x86_64.whl",
+]
+
+rocm720 = [
+  "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl",
+  "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl",
+  "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
+  "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
+  "mooncake-transfer-engine-non-cuda==0.3.8.post1",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.0/sglang_kernel-0.4.0+rocm720-cp310-abi3-manylinux2014_x86_64.whl",
+]
+
+# HIP (Heterogeneous-computing Interface for Portability) for AMD
+# Install with one of:
+#   pip install "amd-sglang[srt_hip,rocm700]"
+#   pip install "amd-sglang[srt_hip,rocm720]"
+srt_hip = [
+  "amd-sglang[runtime_common]",
+  "petit_kernel==0.0.2",
+  "wave-lang==3.8.2",
+]
+
+diffusion_hip = [
+  "PyYAML==6.0.1",
+  "cloudpickle",
+  "diffusers==0.37.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python-headless==4.10.0.84",
+  "remote-pdb",
+  "st_attn==0.0.7",
+  "vsa==0.0.4",
+  "runai_model_streamer>=0.15.5",
+  "cache-dit==1.1.8",
+  "addict",
+]
+
+# For Intel Gaudi(device : hpu) follow the installation guide
+# https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
+srt_hpu = ["sglang[runtime_common]"]
+
+# https://docs.sglang.io/platforms/mthreads_gpu.md
+srt_musa = [
+  "sglang[runtime_common]",
+  "torch",
+  "torch_musa",
+  "torchada>=0.1.45",
+  "mthreads-ml-py",
+  "numpy<2.0",
+]
+
+diffusion_musa = [
+  "PyYAML==6.0.1",
+  "cloudpickle",
+  "diffusers==0.37.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python-headless==4.10.0.84",
+  "remote-pdb",
+  "st_attn==0.0.7",
+  "vsa==0.0.4",
+  "runai_model_streamer>=0.15.5",
+  "cache-dit==1.1.8",
+  "addict",
+]
+
+tracing = [
+  "opentelemetry-sdk",
+  "opentelemetry-api",
+  "opentelemetry-exporter-otlp",
+  "opentelemetry-exporter-otlp-proto-grpc",
+]
+
+test = [
+  "accelerate",
+  "expecttest",
+  "gguf",
+  "jsonlines",
+  "matplotlib",
+  "pandas",
+  "peft",
+  "pytest",
+  "sentence_transformers",
+  "tabulate",
+]
+
+all_hip = ["amd-sglang[srt_hip]", "amd-sglang[diffusion_hip]"]
+all_hpu = ["sglang[srt_hpu]"]
+all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
+
+dev_hip = ["amd-sglang[all_hip]", "amd-sglang[test]"]
+dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+dev_musa = ["sglang[all_musa]", "sglang[test]"]
+
+[project.urls]
+"Homepage" = "https://github.com/sgl-project/sglang"
+"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
+
+[tool.setuptools.package-data]
+"sglang" = [
+  "srt/**/*",
+  "jit_kernel/**/*",
+]
+
+[tool.setuptools.packages.find]
+exclude = [
+  "assets*",
+  "benchmark*",
+  "docs*",
+  "dist*",
+  "playground*",
+  "scripts*",
+  "tests*",
+]
+
+[tool.wheel]
+exclude = [
+  "assets*",
+  "benchmark*",
+  "docs*",
+  "dist*",
+  "playground*",
+  "scripts*",
+  "tests*",
+]
+
+[tool.setuptools_scm]
+root = ".."
+version_file = "sglang/_version.py"
+git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]

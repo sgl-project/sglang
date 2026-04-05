@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 
 import torch
 
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hip, is_mps, is_musa, is_npu
 
 
 def is_cuda_v2():
@@ -20,7 +20,7 @@ def is_cuda_v2():
 # List of packages to check versions
 PACKAGE_LIST = [
     "sglang",
-    "sgl_kernel",
+    "sglang-kernel",
     "flashinfer_python",
     "flashinfer_cubin",
     "flashinfer_jit_cache",
@@ -30,7 +30,6 @@ PACKAGE_LIST = [
     "numpy",
     "aiohttp",
     "fastapi",
-    "hf_transfer",
     "huggingface_hub",
     "interegular",
     "modelscope",
@@ -50,7 +49,7 @@ PACKAGE_LIST = [
     "tiktoken",
     "anthropic",
     "litellm",
-    "decord2",
+    "torchcodec",
 ]
 
 
@@ -195,22 +194,12 @@ class GPUEnv(BaseEnv):
         """
         Get CUDA driver version.
         """
-        versions = set()
-        try:
-            output = subprocess.check_output(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=driver_version",
-                    "--format=csv,noheader,nounits",
-                ]
-            )
-            versions = set(output.decode().strip().split("\n"))
-            if len(versions) == 1:
-                return {"CUDA Driver Version": versions.pop()}
-            else:
-                return {"CUDA Driver Versions": ", ".join(sorted(versions))}
-        except subprocess.SubprocessError:
+        from sglang.srt.utils.common import get_nvidia_driver_version_str
+
+        ver = get_nvidia_driver_version_str()
+        if ver is None:
             return {"CUDA Driver Version": "Not Available"}
+        return {"CUDA Driver Version": ver}
 
     def get_topology(self):
         """
@@ -423,6 +412,172 @@ class NPUEnv(BaseEnv):
             return {}
 
 
+class MUSAEnv(BaseEnv):
+    """Environment checker for MThreads GPU"""
+
+    def get_info(self):
+        musa_info = {"MUSA available": torch.musa.is_available()}
+
+        if musa_info["MUSA available"]:
+            musa_info.update(self.get_device_info())
+            musa_info.update(self._get_musa_version_info())
+
+        return musa_info
+
+    def _get_musa_version_info(self):
+        """
+        Get MUSA version information.
+        """
+        from torch_musa.utils.musa_extension import MUSA_HOME
+
+        musa_info = {"MUSA_HOME": MUSA_HOME}
+
+        if MUSA_HOME and os.path.isdir(MUSA_HOME):
+            musa_info.update(self._get_mcc_info())
+            musa_info.update(self._get_musa_driver_version())
+
+        return musa_info
+
+    def _get_mcc_info(self):
+        """
+        Get MCC version information.
+        """
+        from torch_musa.utils.musa_extension import MUSA_HOME
+
+        try:
+            mcc = os.path.join(MUSA_HOME, "bin/mcc")
+            mcc_output = (
+                subprocess.check_output(f'"{mcc}" --version', shell=True)
+                .decode("utf-8")
+                .strip()
+            )
+            return {
+                "MCC": mcc_output[
+                    mcc_output.rfind("mcc version") : mcc_output.rfind("Target")
+                ].strip()
+            }
+        except subprocess.SubprocessError:
+            return {"MCC": "Not Available"}
+
+    def _get_musa_driver_version(self):
+        """
+        Get MUSA driver version.
+        """
+        try:
+            output = subprocess.check_output(
+                [
+                    "mthreads-gmi",
+                    "-q",
+                ],
+                text=True,
+            )
+            driver_version = None
+            for line in output.splitlines():
+                if "Driver Version" in line:
+                    driver_version = line.split(":", 1)[1].strip()
+                    break
+
+            return {"MUSA Driver Version": driver_version}
+        except subprocess.SubprocessError:
+            return {"MUSA Driver Version": "Not Available"}
+
+    def get_topology(self):
+        """
+        Get GPU topology information.
+        """
+        try:
+            result = subprocess.run(
+                ["mthreads-gmi", "topo", "-m"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            return {
+                "MTHREADS Topology": (
+                    "\n" + result.stdout if result.returncode == 0 else None
+                )
+            }
+        except subprocess.SubprocessError:
+            return {}
+
+
+class MPSEnv(BaseEnv):
+    """Environment checker for Apple Silicon MPS"""
+
+    EXTRA_PACKAGE_LIST = ["mlx", "mlx-lm", "mlx-metal"]
+
+    def __init__(self):
+        super().__init__()
+        self.package_list.extend(MPSEnv.EXTRA_PACKAGE_LIST)
+
+    def get_info(self):
+        import platform
+
+        info = {"MPS available": torch.backends.mps.is_available()}
+        if not info["MPS available"]:
+            return info
+
+        info["macOS Version"] = platform.mac_ver()[0]
+
+        try:
+            info["macOS Build"] = subprocess.check_output(
+                ["sw_vers", "-buildVersion"], text=True
+            ).strip()
+        except Exception:
+            info["macOS Build"] = "Not Available"
+
+        for label, key in [
+            ("Apple Silicon", "machdep.cpu.brand_string"),
+            ("Unified Memory", "hw.memsize"),
+            ("CPU Cores (Total)", "hw.ncpu"),
+        ]:
+            try:
+                info[label] = subprocess.check_output(
+                    ["sysctl", "-n", key], text=True
+                ).strip()
+            except Exception:
+                info[label] = "Not Available"
+
+        try:
+            mem_bytes = int(info["Unified Memory"])
+            info["Unified Memory"] = f"{mem_bytes / 1024**3:.1f} GB"
+        except Exception:
+            pass
+
+        for label, key in [
+            ("CPU Cores (Performance)", "hw.perflevel0.logicalcpu"),
+            ("CPU Cores (Efficiency)", "hw.perflevel1.logicalcpu"),
+        ]:
+            try:
+                info[label] = subprocess.check_output(
+                    ["sysctl", "-n", key], text=True
+                ).strip()
+            except Exception:
+                pass
+
+        # Single system_profiler call for both Metal support and GPU cores
+        info["Metal Support"] = "Not Available"
+        info["GPU Cores"] = "Not Available"
+        try:
+            sp = subprocess.check_output(
+                ["system_profiler", "SPDisplaysDataType"], text=True
+            )
+            for line in sp.splitlines():
+                line = line.strip()
+                if "Metal Support" in line or "Metal Family" in line:
+                    info["Metal Support"] = line.partition(":")[2].strip()
+                if "Total Number of Cores" in line:
+                    info["GPU Cores"] = line.partition(":")[2].strip()
+        except Exception:
+            pass
+
+        return info
+
+    def get_topology(self):
+        return {}
+
+
 if __name__ == "__main__":
     if is_cuda_v2():
         env = GPUEnv()
@@ -430,4 +585,8 @@ if __name__ == "__main__":
         env = HIPEnv()
     elif is_npu():
         env = NPUEnv()
+    elif is_musa():
+        env = MUSAEnv()
+    elif is_mps():
+        env = MPSEnv()
     env.check_env()

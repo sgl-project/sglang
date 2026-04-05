@@ -2,8 +2,7 @@ import os
 import unittest
 import warnings
 
-from nightly_utils import NightlyBenchmarkRunner
-
+from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,

@@ -10,7 +10,7 @@ import weakref
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.loader.component_loader import VAELoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -56,10 +56,11 @@ class DecodingStage(PipelineStage):
     output format (e.g., pixel values).
     """
 
-    def __init__(self, vae, pipeline=None) -> None:
+    def __init__(self, vae, pipeline=None, component_name: str = "vae") -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
+        self.component_name = component_name
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -118,10 +119,9 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
-        self.vae = self.vae.to(get_local_torch_device())
-        latents = latents.to(get_local_torch_device())
-        # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
+        latents = latents.to(get_local_torch_device())
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
@@ -157,14 +157,17 @@ class DecodingStage(PipelineStage):
     def load_model(self):
         # load vae if not already loaded (used for memory constrained devices)
         pipeline = self.pipeline() if self.pipeline else None
-        if not self.server_args.model_loaded["vae"]:
+        if not self.server_args.model_loaded[self.component_name]:
             loader = VAELoader()
-            self.vae = loader.load(
-                self.server_args.model_paths["vae"], self.server_args
+            self.vae, _ = loader.load(
+                self.server_args.model_paths[self.component_name],
+                self.server_args,
+                component_name=self.component_name,
+                transformers_or_diffusers=loader.expected_library,
             )
             if pipeline:
-                pipeline.add_module("vae", self.vae)
-            self.server_args.model_loaded["vae"] = True
+                pipeline.add_module(self.component_name, self.vae)
+            self.server_args.model_loaded[self.component_name] = True
 
     def offload_model(self):
         # Offload models if needed
@@ -174,11 +177,13 @@ class DecodingStage(PipelineStage):
             self.vae.to("cpu", non_blocking=True)
 
         if torch.backends.mps.is_available():
+            # Flush lazy MPS kernels before freeing weights to avoid hangs.
+            torch.mps.synchronize()
             del self.vae
             pipeline = self.pipeline() if self.pipeline else None
-            if pipeline is not None and "vae" in pipeline.modules:
-                del pipeline.modules["vae"]
-            self.server_args.model_loaded["vae"] = False
+            if pipeline is not None and self.component_name in pipeline.modules:
+                del pipeline.modules[self.component_name]
+            self.server_args.model_loaded[self.component_name] = False
 
     @torch.no_grad()
     def forward(
@@ -193,21 +198,6 @@ class DecodingStage(PipelineStage):
         representations to pixel-space video/images. It also optionally decodes
         trajectory latents for visualization purposes.
 
-        Args:
-            batch: The current batch containing:
-                - latents: Tensor to decode (batch, channels, frames, height_latents, width_latents)
-                - return_trajectory_decoded (optional): Flag to decode trajectory latents
-                - trajectory_latents (optional): Latents at different timesteps
-                - trajectory_timesteps (optional): Corresponding timesteps
-            server_args: Configuration containing:
-                - vae_cpu_offload: Whether to offload VAE to CPU after decoding
-                - model_loaded: Track VAE loading state
-                - model_paths: Path to VAE model if loading needed
-
-        Returns:
-            Modified batch with:
-                - output: Decoded frames (batch, channels, frames, height, width) as CPU float32
-                - trajectory_decoded (if requested): List of decoded frames per timestep
         """
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
@@ -239,15 +229,20 @@ class DecodingStage(PipelineStage):
         else:
             trajectory_decoded = None
 
+        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
             trajectory_decoded=trajectory_decoded,
-            timings=batch.timings,
+            metrics=batch.metrics,
+            noise_pred=None,
         )
 
-        self.offload_model()
+        # Keep VAE resident during warmup; the real request needs it next.
+        if not getattr(batch, "is_warmup", False):
+            self.offload_model()
 
         return output_batch

@@ -30,11 +30,9 @@ if TYPE_CHECKING:
     from .simple_eval_common import Eval
 
 from .simple_eval_common import ChatCompletionSampler, set_ulimit
+from .simple_eval_mmlu import MMLU_DATASET_URL
 
 logger = logging.getLogger(__name__)
-
-# MMLU dataset URL
-MMLU_DATASET_URL = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
 
 
 @dataclass
@@ -85,6 +83,7 @@ def run_eval(args: Any) -> dict:
     # Build base URL
     base_url = getattr(args, "base_url", None)
     if base_url:
+        base_url = base_url.rstrip("/")  # Remove trailing slashes
         if not base_url.endswith("/v1"):
             base_url = f"{base_url}/v1"
     else:

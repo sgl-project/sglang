@@ -6,6 +6,7 @@ import triton
 from torch.nn import functional as F
 from transformers import AutoConfig
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe as fused_moe_triton,
 )
@@ -258,8 +259,8 @@ def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
         )
     torch.cuda.synchronize()
 
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench(
+    quantiles = (0.5, 0.2, 0.8)
+    ms, min_ms, max_ms = run_bench(
         lambda: api_func(
             x,
             w1,

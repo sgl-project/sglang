@@ -19,8 +19,11 @@ from typing import Dict, List, Optional
 
 # Mapping from list variable names to suite names
 CASE_LIST_TO_SUITE = {
-    "ONE_GPU_CASES": "1-gpu",
-    "TWO_GPU_CASES": "2-gpu",
+    "ONE_GPU_CASES_A": "1-gpu",
+    "ONE_GPU_CASES_B": "1-gpu",
+    "ONE_GPU_CASES_C": "1-gpu-b200",
+    "TWO_GPU_CASES_A": "2-gpu",
+    "TWO_GPU_CASES_B": "2-gpu",
 }
 
 # Default estimated time for cases without baseline (5 minutes)
@@ -60,7 +63,7 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
     AST visitor to extract DiffusionTestCase definitions from testcase_configs.py.
 
     Parses assignments like:
-        ONE_GPU_CASES: list[DiffusionTestCase] = [
+        ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             DiffusionTestCase("case_id", ...),
             ...
         ]
@@ -181,7 +184,7 @@ def parse_testcase_configs(config_path: Path) -> Dict[str, List[str]]:
 
     Returns:
         Dictionary mapping list name to case IDs.
-        e.g., {"ONE_GPU_CASES": ["qwen_image_t2i", ...], ...}
+        e.g., {"ONE_GPU_CASES_A": ["qwen_image_t2i", ...], ...}
     """
     with open(config_path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -199,7 +202,7 @@ def parse_standalone_files(run_suite_path: Path) -> Dict[str, List[str]]:
 
     Returns:
         Dictionary mapping suite to standalone file list.
-        e.g., {"1-gpu": ["test_lora_format_adapter.py"], "2-gpu": []}
+        e.g., {"1-gpu": ["../cli/test_generate_t2i_perf.py"], "2-gpu": []}
     """
     with open(run_suite_path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -249,10 +252,12 @@ def collect_diffusion_suites(
             for cid in case_ids
         ]
 
-        suites[suite] = DiffusionSuiteInfo(
-            suite=suite,
-            cases=cases,
-            standalone_files=standalone_files.get(suite, []),
-        )
+        if suite not in suites:
+            suites[suite] = DiffusionSuiteInfo(
+                suite=suite,
+                cases=[],
+                standalone_files=standalone_files.get(suite, []),
+            )
+        suites[suite].cases.extend(cases)
 
     return suites

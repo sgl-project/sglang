@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
+
 from __future__ import annotations
 
 import argparse
@@ -19,10 +20,10 @@ import asyncio
 import builtins
 import ctypes
 import functools
+import gc
 import importlib
 import inspect
 import io
-import ipaddress
 import itertools
 import json
 import logging
@@ -35,7 +36,6 @@ import re
 import resource
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -48,6 +48,7 @@ import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from functools import lru_cache, partial
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
@@ -70,7 +71,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import orjson
@@ -78,30 +79,26 @@ import psutil
 import pybase64
 import requests
 import torch
-import torch.distributed
 import torch.distributed as dist
 import triton
-import zmq
-from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
-from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
+from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
-from sglang.srt.metrics.func_timer import enable_func_timer
+from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
-    # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
-    from decord import VideoReader
-
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+torch_release = pkg_version.parse(torch.__version__).release
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -121,10 +118,16 @@ FP8_E4M3_MIN = -FP8_E4M3_MAX
 builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
+# explicitly use pure text format, with a newline at the end
+# this makes it impossible to see the animation in the progress bar
+# but will avoid messing up with ray or multiprocessing, which wraps
+# each line of output with some prefix.
+BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+
 
 @lru_cache(maxsize=1)
 def is_cuda():
-    return torch.cuda.is_available() and torch.version.cuda
+    return torch.cuda.is_available() and torch.version.cuda is not None
 
 
 @lru_cache(maxsize=1)
@@ -165,9 +168,33 @@ def is_host_cpu_x86() -> bool:
     )
 
 
+def is_host_cpu_arm64() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("aarch64", "arm64")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
+
+
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
+    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
+
+
+@lru_cache(maxsize=1)
+def is_musa() -> bool:
+    try:
+        import torchada  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
+@lru_cache(maxsize=1)
+def is_mps() -> bool:
+    return torch.backends.mps.is_available()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -220,7 +247,7 @@ is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
 is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version,
-        device_capability_majors=[10, 12],
+        device_capability_majors=[10, 11, 12],
         cuda_version=(12, 8),
     )
 )
@@ -267,11 +294,15 @@ def use_intel_amx_backend(layer):
 
 
 def xpu_has_xmx_support():
-    # TODO: update with XPU capalibity query
+    # TODO: update with XPU capability query
     if is_xpu():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
     return False
+
+
+def use_intel_xpu_backend():
+    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
 
 
 @lru_cache(maxsize=1)
@@ -285,15 +316,14 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-def is_nvidia_cublas_cu12_version_ge_12_9():
+def is_nvidia_cublas_version_ge_12_9():
     """
-    temporary fix for issue #11272
+    temporary fix for issue #11272 (cublas 12.9+)
     """
-    try:
-        installed_version = version("nvidia-cublas-cu12")
-    except PackageNotFoundError:
-        return False
-    return pkg_version.parse(installed_version) >= pkg_version.parse("12.9")
+    for pkg in ("nvidia-cublas", "nvidia-cublas-cu12"):
+        if check_pkg_version_at_least(pkg, "12.9"):
+            return True
+    return False
 
 
 def random_uuid() -> str:
@@ -316,7 +346,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
         # same invalid value may suppress warnings incorrectly.
         if name not in _warned_bool_env_var_keys:
             logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+                f"get_bool_env_var({name}) encountered unrecognized value={value} and will treat as false"
             )
         _warned_bool_env_var_keys.add(name)
 
@@ -334,19 +364,8 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
 
 
-def get_float_env_var(name: str, default: float = 0.0) -> float:
-    # FIXME: move your environment variable to sglang.srt.environ
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        return default
-
-
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "ascend"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -495,8 +514,8 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        SHARED_SYSMEM_DEVICE_MEM_SMS = (87, 110, 121)  # Orin, Thor, Spark
-        if get_device_sm() in SHARED_SYSMEM_DEVICE_MEM_SMS:
+        props = torch.cuda.get_device_properties(gpu_id)
+        if props.is_integrated:
             # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
             # only reports "free" memory, which can be lower than what is actually
             # available due to not including cache memory. So we use the system available
@@ -550,6 +569,27 @@ def get_available_gpu_memory(
         if empty_cache:
             torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+    elif device == "musa":
+        num_gpus = torch.musa.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.musa.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.musa.current_device()}, ",
+                "which may cause useless memory allocation for torch MUSA context.",
+            )
+        if empty_cache:
+            torch.musa.empty_cache()
+        props = torch.musa.get_device_properties(gpu_id)
+        if props.is_integrated:
+            # On these devices, which use sysmem as device mem, torch.musa.mem_get_info()
+            # only reports "free" memory, which can be lower than what is actually
+            # available due to not including cache memory. So we use the system available
+            # memory metric instead.
+            free_gpu_memory = psutil.virtual_memory().available
+        free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+    elif device == "mps":
+        free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -561,8 +601,12 @@ def get_available_gpu_memory(
     return free_gpu_memory / (1 << 30)
 
 
-def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available()
+def is_pin_memory_available(device=None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if device is not None and str(device) == "cpu":
+        return False
+    return True
 
 
 class LayerFn(Protocol):
@@ -580,7 +624,7 @@ def make_layers(
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
-    # circula imports
+    # circular imports
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
@@ -646,190 +690,70 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def find_process_using_port(port: int) -> Optional[psutil.Process]:
-    for conn in psutil.net_connections(kind="inet"):
-        if conn.laddr.port == port:
-            try:
-                return psutil.Process(conn.pid)
-            except psutil.NoSuchProcess:
-                # It could happen by race condition (the proc dies when psutil.Process is called).
-                pass
-
-    return None
-
-
-def wait_port_available(
-    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
-) -> bool:
-    for i in range(timeout_s):
-        if is_port_available(port):
-            return True
-
-        if i > 10 and i % 5 == 0:
-            process = find_process_using_port(port)
-            if process is None:
-                logger.warning(
-                    f"The port {port} is in use, but we could not find the process that uses it."
-                )
-
-            pid = process.pid
-            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
-            logger.info(
-                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
-            )
-        time.sleep(0.1)
-
-    if raise_exception:
-        raise ValueError(
-            f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}"
-        )
-    return False
-
-
-def is_port_available(port):
-    """Return whether a port is available."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("", port))
-            s.listen(1)
-            return True
-        except socket.error:
-            return False
-        except OverflowError:
-            return False
-
-
-def get_free_port():
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-
-
-def decode_video_base64(video_base64):
-    from PIL import Image
-
-    # Decode the base64 string
-    video_bytes = pybase64.b64decode(video_base64, validate=True)
-
-    # Placeholder for the start indices of each PNG image
-    img_starts = []
-
-    frame_format = "PNG"  # str(os.getenv('FRAME_FORMAT', "JPEG"))
-
-    assert frame_format in [
-        "PNG",
-        "JPEG",
-    ], "FRAME_FORMAT must be either 'PNG' or 'JPEG'"
-
-    if frame_format == "PNG":
-        # Find each PNG start signature to isolate images
-        i = 0
-        while i < len(video_bytes) - 7:  # Adjusted for the length of the PNG signature
-            # Check if we found the start of a PNG file
-            if (
-                video_bytes[i] == 0x89
-                and video_bytes[i + 1] == 0x50
-                and video_bytes[i + 2] == 0x4E
-                and video_bytes[i + 3] == 0x47
-                and video_bytes[i + 4] == 0x0D
-                and video_bytes[i + 5] == 0x0A
-                and video_bytes[i + 6] == 0x1A
-                and video_bytes[i + 7] == 0x0A
-            ):
-                img_starts.append(i)
-                i += 8  # Skip the PNG signature
-            else:
-                i += 1
-    else:
-        # Find each JPEG start (0xFFD8) to isolate images
-        i = 0
-        while (
-            i < len(video_bytes) - 1
-        ):  # Adjusted for the length of the JPEG SOI signature
-            # Check if we found the start of a JPEG file
-            if video_bytes[i] == 0xFF and video_bytes[i + 1] == 0xD8:
-                img_starts.append(i)
-                # Move to the next byte to continue searching for the next image start
-                i += 2
-            else:
-                i += 1
-
-    frames = []
-    for start_idx in img_starts:
-        # Assuming each image is back-to-back, the end of one image is the start of another
-        # The last image goes until the end of the byte string
-        end_idx = (
-            img_starts[img_starts.index(start_idx) + 1]
-            if img_starts.index(start_idx) + 1 < len(img_starts)
-            else len(video_bytes)
-        )
-        img_bytes = video_bytes[start_idx:end_idx]
-
-        # Convert bytes to a PIL Image
-        img = Image.open(BytesIO(img_bytes))
-
-        # Convert PIL Image to a NumPy array
-        frame = np.array(img)
-
-        # Append the frame to the list of frames
-        frames.append(frame)
-
-    # Ensure there's at least one frame to avoid errors with np.stack
-    if frames:
-        return np.stack(frames, axis=0), img.size
-    else:
-        return np.array([]), (
-            0,
-            0,
-        )  # Return an empty array and size tuple if no frames were found
-
-
 def load_audio(
     audio_file: str, sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
-    # Use soundfile here, since librosa use it under the hood,
-    # and librosa will not support audio loading in the future
-    import soundfile as sf
-    from scipy.signal import resample
-
     if sr is None:
         sr = 16000
 
-    # Load audio data
+    # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
-        audio, original_sr = sf.read(BytesIO(audio_file))
-    elif audio_file.startswith("data:"):
-        audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(
-            BytesIO(pybase64.b64decode(audio_file, validate=True))
-        )
-    elif audio_file.startswith("http://") or audio_file.startswith("https://"):
+        source = audio_file
+    elif isinstance(audio_file, str) and audio_file.startswith("data:"):
+        source = pybase64.b64decode(audio_file.split(",")[1], validate=True)
+    elif isinstance(audio_file, str) and (
+        audio_file.startswith("http://") or audio_file.startswith("https://")
+    ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
-        audio_file = BytesIO(response.content)
-        response.close()
-        audio, original_sr = sf.read(audio_file)
+        with requests.get(audio_file, timeout=timeout) as response:
+            response.raise_for_status()
+            source = response.content
+    elif isinstance(audio_file, str) and audio_file.startswith("file://"):
+        source = unquote(urlparse(audio_file).path)
     elif isinstance(audio_file, str):
-        audio, original_sr = sf.read(audio_file)
+        source = audio_file
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
-    # Resample audio if the original sample rate is different from the desired sample rate
-    if original_sr != sr:
-        num_samples = int(len(audio) * float(sr) / original_sr)
-        audio = resample(audio, num_samples)
+    if _BACKEND == "torchcodec":
+        from torchcodec.decoders import AudioDecoder
 
-    # Convert to mono if requested and audio is stereo
+        decoder = AudioDecoder(
+            source,
+            sample_rate=sr,
+            num_channels=1 if mono else None,
+        )
+        samples = decoder.get_all_samples()
+        if mono:
+            return samples.data.squeeze(0).numpy()
+        return samples.data.T.numpy()
+
+    # Fallback: soundfile + torchaudio (ARM / no FFmpeg)
+    import soundfile as sf
+    import torch
+    import torchaudio
+
+    if isinstance(source, bytes):
+        audio, original_sr = sf.read(BytesIO(source))
+    else:
+        audio, original_sr = sf.read(source)
+
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
+
+    if original_sr != sr:
+        audio_tensor = torch.from_numpy(audio).float()
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        else:
+            audio_tensor = audio_tensor.T
+        audio_tensor = torchaudio.functional.resample(
+            audio_tensor, orig_freq=original_sr, new_freq=sr
+        )
+        if audio_tensor.shape[0] == 1:
+            audio = audio_tensor.squeeze(0).numpy()
+        else:
+            audio = audio_tensor.T.numpy()
 
     return audio
 
@@ -841,123 +765,160 @@ class ImageData:
     max_dynamic_patch: Optional[int] = None
 
 
+image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+    """
+    Check three conditions:
+    1. whether CUDA is available.
+    2. whether input is recognized as JPEG.
+    3. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
+    """
+    if not is_cuda() or not gpu_image_decode:
+        return False
+    if image_bytes != b"":
+        return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
+    return False
+
+
+def _load_image(
+    image_bytes: bytes = b"",
+    image_file: str = "",
+    gpu_image_decode: bool = True,
+) -> Union[torch.Tensor, Image.Image]:
+    """
+    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
+    otherwise fallback to decode with PIL on CPU and return a PIL Image.
+    Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
+    """
+    if image_file != "":
+        image_bytes = get_image_bytes(image_file)
+    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
+        try:
+            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            return image_tensor
+        except Exception as e:
+            logger.warning(
+                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
+            )
+    return Image.open(BytesIO(image_bytes))
+
+
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
-) -> tuple[Image.Image, tuple[int, int]]:
+    gpu_image_decode: bool = True,
+) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
+    """
+    Load image from multiple input formats, including:
+    ImageData, PIL Image, bytes, URL, file path, or base64 string.
+    """
     if isinstance(image_file, ImageData):
         image_file = image_file.url
 
-    image = image_size = None
+    image = None
+    image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
         image = image_file
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = Image.open(BytesIO(image_file))
-    elif image_file.startswith("http://") or image_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout)
-        try:
-            response.raise_for_status()
-            image = Image.open(response.raw)
-            image.load()  # Force loading to avoid issues after closing the stream
-        finally:
-            response.close()
-    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
-        image = Image.open(image_file)
-    elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
-    elif isinstance(image_file, str):
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("file://"):
+        image = _load_image(
+            image_file=unquote(urlparse(image_file).path),
+            gpu_image_decode=gpu_image_decode,
+        )
+    elif isinstance(image_file, str) and image_file.lower().endswith(
+        image_extension_names
+    ):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("data:"):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(
+        image_file, str
+    ):  # Other formats, try to decode as base64 by default
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
-
     return image, image_size
 
 
-def get_image_bytes(image_file: Union[str, bytes]):
+def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
+    """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
-    elif image_file.startswith("http://") or image_file.startswith("https://"):
+    if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
-        return response.content
-    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+        try:
+            response.raise_for_status()
+            result = response.content
+        finally:
+            response.close()
+        return result
+    if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
             return f.read()
-    elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
+    if isinstance(image_file, str) and image_file.startswith("data:"):
+        _, encoded = image_file.split(",", 1)
+        return pybase64.b64decode(encoded, validate=True)
+    if isinstance(image_file, str):
         return pybase64.b64decode(image_file, validate=True)
-    elif isinstance(image_file, str):
-        return pybase64.b64decode(image_file, validate=True)
+    raise NotImplementedError(f"Invalid image: {image_file}")
+
+
+def _normalize_video_input(
+    video_file: Union[str, bytes],
+) -> Union[str, bytes, None]:
+    """Normalize video input (URL, base64, file://, etc.) to a file path or bytes.
+
+    Returns a file path or bytes suitable for a decoder, or None on failure.
+    URLs and base64 are returned as bytes (no temp files needed since both
+    torchcodec and VideoDecoderWrapper accept bytes natively).
+    """
+    if isinstance(video_file, bytes):
+        return video_file
+    elif isinstance(video_file, str):
+        if video_file.startswith(("http://", "https://")):
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            response = requests.get(video_file, stream=True, timeout=timeout)
+            response.raise_for_status()
+            return response.content
+        elif video_file.startswith("data:"):
+            _, encoded = video_file.split(",", 1)
+            return pybase64.b64decode(encoded, validate=True)
+        elif video_file.startswith("file://"):
+            return unquote(urlparse(video_file).path)
+        elif os.path.isfile(unquote(urlparse(video_file).path)):
+            return video_file
+        else:
+            return pybase64.b64decode(video_file, validate=True)
     else:
-        raise NotImplementedError(f"Invalid image: {image_file}")
+        return None
 
 
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
-    # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
-    from decord import VideoReader, cpu, gpu
+    if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+        return video_file
 
-    try:
-        from decord.bridge import decord_bridge
+    source = _normalize_video_input(video_file)
+    if source is None:
+        raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
-        ctx = gpu(0)
-        _ = decord_bridge.get_ctx_device(ctx)
-    except Exception:
-        ctx = cpu(0)
-
-    tmp_file = None
-    vr = None
-    try:
-        if isinstance(video_file, bytes):
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            tmp_file.write(video_file)
-            tmp_file.close()
-            vr = VideoReader(tmp_file.name, ctx=ctx)
-        elif isinstance(video_file, str):
-            if video_file.startswith(("http://", "https://")):
-                timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-                response = requests.get(video_file, stream=True, timeout=timeout)
-                response.raise_for_status()
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                for chunk in response.iter_content(chunk_size=8192):
-                    tmp_file.write(chunk)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif video_file.startswith("data:"):
-                _, encoded = video_file.split(",", 1)
-                video_bytes = pybase64.b64decode(encoded, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-            # `urlparse` supports file:// paths, and so does VideoReader
-            elif os.path.isfile(urlparse(video_file).path):
-                vr = VideoReader(video_file, ctx=ctx)
-            else:
-                video_bytes = pybase64.b64decode(video_file, validate=True)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
-        else:
-            raise ValueError(f"Unsupported video input type: {type(video_file)}")
-
-        return vr
-
-    finally:
-        if tmp_file and os.path.exists(tmp_file.name):
-            os.unlink(tmp_file.name)
+    device = "cuda" if use_gpu else "cpu"
+    return VideoDecoderWrapper(source, device=device)
 
 
-def sample_video_frames(
-    video: "VideoReader", *, desired_fps: int, max_frames: int
-) -> list[int]:
+def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:
     total_frames = len(video)
     assert total_frames > 0, "Video must have at least one frame"
 
-    duration = total_frames / video.get_avg_fps()
-    fps = min(desired_fps, video.get_avg_fps())
+    avg_fps = video.avg_fps
+    duration = total_frames / avg_fps if avg_fps > 0 else 0
+    fps = min(desired_fps, avg_fps)
 
     num_frames = math.floor(duration * fps)
     num_frames = min(max_frames, num_frames, total_frames)
@@ -969,9 +930,6 @@ def sample_video_frames(
 
 
 def encode_video(video_path, frame_count_limit=None):
-    # Lazy import because decord is not available on some arm platforms.
-    from decord import VideoReader, cpu
-
     if not os.path.exists(video_path):
         logger.error(f"Video {video_path} does not exist")
         return []
@@ -984,21 +942,50 @@ def encode_video(video_path, frame_count_limit=None):
         idxs = [int(i * gap + gap / 2) for i in range(n)]
         return [l[i] for i in idxs]
 
-    vr = VideoReader(video_path, ctx=cpu(0))
-    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
-    frame_indices = [i for i in range(0, len(vr), sample_fps)]
+    decoder = VideoDecoderWrapper(video_path)
+    avg_fps = decoder.avg_fps
+    total_frames = len(decoder)
+
+    sample_fps = round(avg_fps / 1)
+    if sample_fps == 0:
+        sample_fps = 1
+    frame_indices = [i for i in range(0, total_frames, sample_fps)]
     if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
         frame_indices = uniform_sample(frame_indices, frame_count_limit)
 
-    frames = vr.get_batch(frame_indices).asnumpy()
-    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
+    if not frame_indices:
+        return []
+
+    frames_data = decoder.get_frames_at(frame_indices)
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames_data]
+
     return frames
 
 
-def suppress_other_loggers():
+def suppress_noisy_warnings():
+    """Suppress known noisy warnings from third-party libraries."""
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.cudart module is deprecated",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.nvrtc module is deprecated",
+        category=FutureWarning,
+    )
+
+    # Suppress noisy third-party HTTP loggers.
+    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def suppress_other_loggers():
+    suppress_noisy_warnings()
 
     try:
         from vllm.logger import logger as vllm_default_logger
@@ -1030,12 +1017,26 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
         )
 
 
+def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
+    """
+    Check if a package is installed and meets the minimum version requirement.
+
+    Args:
+        pkg: Package name (distribution name, e.g., "flashinfer-python")
+        min_version: Minimum version required (e.g., "0.6.7.post2")
+
+    Returns:
+        True if package is installed and version >= min_version, False otherwise
+    """
+    try:
+        installed_version = version(pkg)
+        return pkg_version.parse(installed_version) >= pkg_version.parse(min_version)
+    except PackageNotFoundError:
+        return False
+
+
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -1121,20 +1122,6 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def add_api_key_middleware(app, api_key: str):
-    @app.middleware("http")
-    async def authentication(request, call_next):
-        if request.method == "OPTIONS":
-            return await call_next(request)
-        if request.url.path.startswith("/health") or request.url.path.startswith(
-            "/metrics"
-        ):
-            return await call_next(request)
-        if request.headers.get("Authorization") != "Bearer " + api_key:
-            return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
-
-
 def configure_logger(server_args, prefix: str = ""):
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
@@ -1154,6 +1141,12 @@ def configure_logger(server_args, prefix: str = ""):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    # Suppress noisy httpx/httpcore loggers in every process that calls
+    # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
+    # don't inherit the parent's logger state, so this must run here too.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
@@ -1199,7 +1192,9 @@ def broadcast_pyobj(
     of dist_group argument).
     """
     device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+        "cuda"
+        if torch.cuda.is_available() and not force_cpu_device
+        else "musa" if is_musa() and not force_cpu_device else "cpu"
     )
 
     if rank == src:
@@ -1302,161 +1297,6 @@ def point_to_point_pyobj(
     return []
 
 
-step_counter = 0
-
-
-def pytorch_profile(name, func, *args, data_size=-1):
-    """
-    Args:
-        name (string): the name of recorded function.
-        func: the function to be profiled.
-        args: the arguments of the profiled function.
-        data_size (int): some measurement of the computation complexity.
-            Usually, it could be the batch size.
-    """
-    global step_counter
-    os.makedirs("trace", exist_ok=True)
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-    ) as prof:
-        with record_function(name):
-            with open(f"trace/size_{step_counter}.json", "w") as f:
-                json.dump({"size": data_size}, f)
-            result = func(*args)
-    prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
-    step_counter += 1
-    return result
-
-
-def get_zmq_socket(
-    context: zmq.Context,
-    socket_type: zmq.SocketType,
-    endpoint: Optional[str] = None,
-    bind: bool = True,
-) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
-    """Create and configure a ZeroMQ socket.
-
-    Args:
-        context: ZeroMQ context to create the socket from.
-        socket_type: Type of ZeroMQ socket to create.
-        endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
-        bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
-
-    Returns:
-        If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
-        If endpoint is provided: The configured ZeroMQ socket.
-    """
-    socket = context.socket(socket_type)
-
-    if endpoint is None:
-        # Bind to random TCP port
-        config_socket(socket, socket_type)
-        port = socket.bind_to_random_port("tcp://*")
-        return port, socket
-    else:
-        # Handle IPv6 if endpoint contains brackets
-        if endpoint.find("[") != -1:
-            socket.setsockopt(zmq.IPV6, 1)
-
-        config_socket(socket, socket_type)
-
-        if bind:
-            socket.bind(endpoint)
-        else:
-            socket.connect(endpoint)
-
-        return socket
-
-
-def get_zmq_socket_on_host(
-    context: zmq.Context,
-    socket_type: zmq.SocketType,
-    host: Optional[str] = None,
-) -> Tuple[int, zmq.Socket]:
-    """Create and configure a ZeroMQ socket.
-
-    Args:
-        context: ZeroMQ context to create the socket from.
-        socket_type: Type of ZeroMQ socket to create.
-        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
-
-    Returns:
-        Tuple of (port, socket) where port is the randomly assigned TCP port.
-    """
-    socket = context.socket(socket_type)
-    # Bind to random TCP port
-    config_socket(socket, socket_type)
-    bind_host = f"tcp://{host}" if host else "tcp://*"
-    port = socket.bind_to_random_port(bind_host)
-    return port, socket
-
-
-def config_socket(socket, socket_type: zmq.SocketType):
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
-    else:
-        buf_size = -1
-
-    def set_send_opt():
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    def set_recv_opt():
-        socket.setsockopt(zmq.RCVHWM, 0)
-        socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
-        set_send_opt()
-        set_recv_opt()
-    else:
-        raise ValueError(f"Unsupported socket type: {socket_type}")
-
-
-def dump_to_file(dirpath, name, value):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() != 0:
-        return
-
-    os.makedirs(dirpath, exist_ok=True)
-    if value.dtype is torch.bfloat16:
-        value = value.float()
-    value = value.cpu().numpy()
-    output_filename = os.path.join(dirpath, f"pytorch_dump_{name}.npy")
-    logger.info(f"Dump a tensor to {output_filename}. Shape = {value.shape}")
-    np.save(output_filename, value)
-
-
-def is_triton_3():
-    return triton.__version__.startswith("3.")
-
-
-def maybe_torch_compile(*args, **kwargs):
-    """
-    torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
-    Therefore, we disable it here.
-    """
-
-    def decorator(func):
-        if is_triton_3():
-            return torch.compile(*args, **kwargs)(func)
-        return func
-
-    return decorator
-
-
 def delete_directory(dirpath):
     try:
         # This will remove the directory and all its contents
@@ -1501,6 +1341,26 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
+class RefCountedGauge:
+    def __init__(self, gauge):
+        self._gauge = gauge
+        self._refcount: Dict[str, int] = {}
+
+    def inc(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] += 1
+        else:
+            self._refcount[key] = 1
+            self._gauge.inc()
+
+    def dec(self, key: str):
+        if key in self._refcount:
+            self._refcount[key] -= 1
+            if self._refcount[key] == 0:
+                del self._refcount[key]
+                self._gauge.dec()
+
+
 def add_prometheus_track_response_middleware(app):
     from prometheus_client import Counter, Gauge
 
@@ -1523,15 +1383,32 @@ def add_prometheus_track_response_middleware(app):
         multiprocess_mode="livesum",
     )
 
+    routing_keys_active = RefCountedGauge(
+        Gauge(
+            name="sglang:routing_keys_active",
+            documentation="Number of unique routing keys with active requests",
+            multiprocess_mode="livesum",
+        )
+    )
+
+    # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
+    # that passes `receive` through, so request.is_disconnected() keeps working.
+    from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
+
+    patch_app_http_middleware(app)
+
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
         # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
         # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
         path, is_handled_path = _get_fastapi_request_path(request)
         method = request.method
+        routing_key = request.headers.get("x-smg-routing-key")
 
         http_request_counter.labels(endpoint=path, method=method).inc()
         http_requests_active.labels(endpoint=path, method=method).inc()
+        if routing_key:
+            routing_keys_active.inc(routing_key)
 
         try:
             response = await call_next(request)
@@ -1545,6 +1422,8 @@ def add_prometheus_track_response_middleware(app):
             return response
         finally:
             http_requests_active.labels(endpoint=path, method=method).dec()
+            if routing_key:
+                routing_keys_active.dec(routing_key)
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
@@ -1557,15 +1436,6 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
             return route.path, True
 
     return request.url.path, False
-
-
-def bind_port(port):
-    """Bind to a specific port, assuming it's available."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allows address reuse
-    sock.bind(("", port))
-    sock.listen(1)
-    return sock
 
 
 def get_amdgpu_memory_capacity():
@@ -1608,6 +1478,39 @@ def get_device_sm():
     return 0
 
 
+def _cuda_mem_fallback(reason: str) -> int:
+    """Fallback to torch.cuda.mem_get_info() and return total GPU memory in MiB.
+
+    Queries all visible CUDA devices and returns the minimum total memory,
+    consistent with the nvidia-smi path that takes min(memory_values).
+
+    Returns the total memory in MiB, or raises RuntimeError if CUDA is
+    unavailable or mem_get_info() fails.
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError(reason)
+    try:
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            # Include the original failure reason for diagnostics
+            raise RuntimeError(f"{reason} No CUDA devices found via torch.cuda.")
+        memory_values = []
+        for i in range(device_count):
+            total = torch.cuda.mem_get_info(i)[1] // 1024 // 1024  # unit: MiB
+            memory_values.append(total)
+        result = min(memory_values)
+        logger.warning(
+            f"{reason} Falling back to torch.cuda.mem_get_info(). "
+            f"Reported total GPU memory per device (MiB): {memory_values}, "
+            f"using min: {result} MiB."
+        )
+        return result
+    except (RuntimeError, ValueError, OSError) as e:
+        raise RuntimeError(
+            f"{reason} torch.cuda.mem_get_info() fallback also failed: {e}"
+        ) from e
+
+
 def get_nvgpu_memory_capacity():
     try:
         # Run nvidia-smi and capture the output
@@ -1619,7 +1522,9 @@ def get_nvgpu_memory_capacity():
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+            return _cuda_mem_fallback(
+                f"nvidia-smi failed (exit code {result.returncode}: {result.stderr.strip()})."
+            )
 
         # Parse the output to extract memory values
         memory_values = [
@@ -1629,20 +1534,17 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
-            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
+            # Fallback when nvidia-smi returns no parseable values,
             # typically in NVIDIA MIG mode.
-            if torch.cuda.is_available():
-                logger.warning(
-                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
-                )
-                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
-            raise ValueError("No GPU memory values found.")
+            return _cuda_mem_fallback(
+                "Failed to get GPU memory capacity from nvidia-smi."
+            )
 
         # Return the minimum memory value
         return min(memory_values)
 
     except FileNotFoundError:
-        raise RuntimeError(
+        return _cuda_mem_fallback(
             "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
         )
 
@@ -1727,6 +1629,47 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mtgpu_memory_capacity():
+    try:
+        # Run mthreads-gmi and capture the output
+        result = subprocess.run(
+            [
+                "mthreads-gmi --query | grep 'FB Memory Usage' -A 2 | grep 'Total' | awk -F':' '{print $2}' | awk '{print $1}' | sed 's/MiB//'"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"mthreads-gmi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem)
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            # Fallback to torch.musa.mem_get_info() when failed to get memory capacity from mthreads-gmi.
+            if hasattr(torch, "musa") and torch.musa.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from mthreads-gmi, falling back to torch.musa.mem_get_info()."
+                )
+                return torch.musa.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "mthreads-gmi not found. Ensure Moore Threads drivers are installed and accessible."
+        )
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1740,6 +1683,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_cpu_memory_capacity()
     elif device == "xpu":
         gpu_mem = get_xpu_memory_capacity()
+    elif device == "musa":
+        gpu_mem = get_mtgpu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1802,7 +1747,7 @@ def init_custom_process_group(
     # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
     # We need to determine the appropriate parameter name based on PyTorch version
     pg_options_param_name = (
-        "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+        "backend_options" if torch_release >= (2, 6) else "pg_options"
     )
     pg, _ = _new_process_group_helper(
         world_size,
@@ -1826,9 +1771,10 @@ def crash_on_warnings():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+@functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
-    logger.warning(msg, stacklevel=2)
+    logger.warning(msg)
 
 
 @functools.lru_cache(None)
@@ -1837,7 +1783,7 @@ def print_info_once(msg: str) -> None:
 
 
 def get_device_name(device_id: int = 0) -> str:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -1872,12 +1818,12 @@ def get_device(device_id: Optional[int] = None) -> str:
         return "cuda:{}".format(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
-        if device_id == None:
+        if device_id is None:
             return "xpu"
         return "xpu:{}".format(device_id)
 
     if is_npu():
-        if device_id == None:
+        if device_id is None:
             return "npu"
         return "npu:{}".format(device_id)
 
@@ -1886,20 +1832,30 @@ def get_device(device_id: Optional[int] = None) -> str:
             import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
-                if device_id == None:
+                if device_id is None:
                     return "hpu"
                 return "hpu:{}".format(device_id)
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU) is available.")
+    if is_musa():
+        if device_id is None:
+            return "musa"
+        return "musa:{}".format(device_id)
+
+    if is_mps():
+        if device_id is None:
+            return "mps"
+        return "mps:{}".format(device_id)
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available.")
 
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
         except RuntimeError:
@@ -1924,7 +1880,7 @@ def get_device_count() -> int:
 
 
 def get_device_core_count(device_id: int = 0) -> int:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
 
     return 0
@@ -1932,7 +1888,7 @@ def get_device_core_count(device_id: int = 0) -> int:
 
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -1990,8 +1946,11 @@ def direct_register_custom_op(
     mutates_args: List[str],
     fake_impl: Optional[Callable] = None,
     target_lib: Optional[Library] = None,
-):
+) -> None:
     """
+    NOTE: Please try to use `register_custom_op` instead of this function.
+    See `python/sglang/srt/utils/custom_op.py` for details.
+
     `torch.library.custom_op` can have significant overhead because it
     needs to consider complicated dispatching logic. This function
     directly registers a custom op and dispatches it to the CUDA backend.
@@ -2038,7 +1997,13 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA" if not is_npu() else "PrivateUse1")
+        if is_npu():
+            # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            my_lib.impl(op_name, op_func, "PrivateUse1")
+        elif is_xpu():
+            my_lib.impl(op_name, op_func, "XPU")
+        else:
+            my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
@@ -2191,6 +2156,7 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        "torch_npu.",
     }
 
     DENY_CLASSES = {
@@ -2225,6 +2191,11 @@ class SafeUnpickler(pickle.Unpickler):
         )
 
 
+def safe_pickle_load(fp):
+    """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
+    return SafeUnpickler(fp).load()
+
+
 def debug_timing(func):
     # todo: replace with a more organized instrumentation
     def wrapper(*args, **kwargs):
@@ -2255,6 +2226,44 @@ def nullable_str(val: str):
     return val
 
 
+def human_readable_int(value: str) -> int:
+    """Supports standard SI suffixes (k, M, G, T) and IEC suffixes
+    (Ki, Mi, Gi, Ti). Suffixes are case-sensitive.
+
+    Decimals are allowed for SI suffixes only.
+
+    Examples:
+        '1k' -> 1000      '1M' -> 1000000    '25.6k' -> 25600
+        '1Ki' -> 1024     '1Mi' -> 1048576
+    """
+    value = value.strip()
+
+    si_multiplier = {"k": 10**3, "M": 10**6, "G": 10**9, "T": 10**12}
+    iec_multiplier = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|k|M|G|T)", value)
+    if match:
+        number, suffix = match.groups()
+        if suffix in iec_multiplier:
+            if "." in number:
+                raise argparse.ArgumentTypeError(
+                    f"Decimals are not allowed with IEC suffixes like '{suffix}'. "
+                    f"Use an integer IEC value such as '{int(Decimal(number))}{suffix}', "
+                    f"or an SI value such as '{number}{suffix[0]}'."
+                )
+            return int(number) * iec_multiplier[suffix]
+        return int(Decimal(number) * si_multiplier[suffix])
+
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid integer value: '{value}'. "
+            "Use a plain integer, SI suffixes (1k, 1M), or IEC suffixes (1Ki, 1Mi). "
+            "Suffixes are case-sensitive."
+        )
+
+
 def pyspy_dump_schedulers():
     """py-spy dump on all scheduler in a local node."""
     try:
@@ -2279,7 +2288,64 @@ def kill_itself_when_parent_died():
         logger.warning("kill_itself_when_parent_died is only supported in linux.")
 
 
-def set_uvicorn_logging_configs():
+class UvicornAccessLogFilter(logging.Filter):
+    """Filter uvicorn access logs by request path.
+
+    Notes:
+    - Uvicorn access records usually provide `request_line` like: "GET /metrics HTTP/1.1".
+    - We defensively fall back to parsing `record.getMessage()` if needed.
+    """
+
+    def __init__(self, excluded_path_prefixes=None):
+        super().__init__()
+        excluded_path_prefixes = excluded_path_prefixes or []
+        # Normalize once: drop empty prefixes, stringify, keep as tuple (fast iteration, immutable).
+        self.excluded_path_prefixes = tuple(str(p) for p in excluded_path_prefixes if p)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        path = None
+
+        request_line = getattr(record, "request_line", None)
+        if request_line:
+            parts = str(request_line).split()
+            if len(parts) >= 2:
+                path = parts[1]
+
+        if not path:
+            # Fallback for non-standard formatters/records
+            try:
+                msg = record.getMessage()
+            except Exception:
+                msg = None
+            if msg:
+                q1 = msg.find('"')
+                q2 = msg.find('"', q1 + 1) if q1 != -1 else -1
+                if q1 != -1 and q2 != -1:
+                    rl = msg[q1 + 1 : q2]
+                    parts = rl.split()
+                    if len(parts) >= 2:
+                        path = parts[1]
+
+        if not path:
+            return True
+
+        # Strip query string for matching
+        path = str(path)
+        # Some proxies/clients may emit absolute-form request-target in logs:
+        # e.g. "GET https://example.com/metrics HTTP/1.1" -> extract "/metrics".
+        if "://" in path:
+            try:
+                path = urlparse(path).path or path
+            except Exception:
+                # If parsing fails, fall back to the raw value.
+                pass
+        path = path.split("?", 1)[0]
+        return not any(
+            path.startswith(prefix) for prefix in self.excluded_path_prefixes
+        )
+
+
+def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
     LOGGING_CONFIG["formatters"]["default"][
@@ -2291,79 +2357,67 @@ def set_uvicorn_logging_configs():
     ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
-
-def get_open_port() -> int:
-    port = os.getenv("SGLANG_PORT")
-    if port is not None:
-        port = int(port)
-        while True:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("", port))
-                    return port
-            except OSError:
-                port += 1  # Increment port number if already in use
-                logger.info("Port %d is already in use, trying port %d", port - 1, port)
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+    _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)
 
 
-def is_valid_ipv6_address(address: str) -> bool:
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ValueError:
-        return False
+def _configure_uvicorn_access_log_filter(
+    uvicorn_logging_config: dict, server_args=None
+):
+    """Configure uvicorn access log path filter into uvicorn LOGGING_CONFIG.
 
+    This optionally filters uvicorn access logs (e.g., suppress noisy /metrics polling).
 
-def maybe_wrap_ipv6_address(address: str) -> str:
-    if is_valid_ipv6_address(address):
-        return f"[{address}]"
-    return address
+    Args:
+        uvicorn_logging_config: The dict-like LOGGING_CONFIG from uvicorn.
+        server_args: Parsed server args object that may contain:
+            - uvicorn_access_log_exclude_prefixes (list[str] | tuple[str] | None)
+    """
+    # Optionally filter uvicorn access logs (e.g., suppress noisy /metrics polling).
+    if server_args is None:
+        return
 
+    filter_name = "sglang_uvicorn_access_path_filter"
 
-def format_tcp_address(ip: str, port: int) -> str:
-    return f"tcp://{maybe_wrap_ipv6_address(ip)}:{port}"
+    excluded_prefixes = getattr(
+        server_args, "uvicorn_access_log_exclude_prefixes", None
+    )
+    if not excluded_prefixes:
+        return
 
+    # Normalize: accept list/tuple; treat a single string as one prefix (not an iterable of chars).
+    if isinstance(excluded_prefixes, str):
+        excluded_prefixes = [excluded_prefixes]
 
-def configure_ipv6(dist_init_addr):
-    addr = dist_init_addr
-    end = addr.find("]")
-    if end == -1:
-        raise ValueError("invalid IPv6 address format: missing ']'")
+    # De-duplicate while keeping order; drop empty prefixes.
+    excluded_prefixes = [p for p in excluded_prefixes if p]
+    excluded_prefixes = list(dict.fromkeys(excluded_prefixes))
+    if not excluded_prefixes:
+        return
 
-    host = addr[: end + 1]
+    uvicorn_logging_config.setdefault("filters", {})
+    uvicorn_logging_config["filters"][filter_name] = {
+        "()": "sglang.srt.utils.common.UvicornAccessLogFilter",
+        "excluded_path_prefixes": excluded_prefixes,
+    }
 
-    # this only validates the address without brackets: we still need the below checks.
-    # if it's invalid, immediately raise an error so we know it's not formatting issues.
-    if not is_valid_ipv6_address(host[1:end]):
-        raise ValueError(f"invalid IPv6 address: {host}")
+    # Attach filter to access handler and/or uvicorn.access logger (best-effort across uvicorn versions).
+    handlers = uvicorn_logging_config.get("handlers", {})
+    if "access" in handlers:
+        filters_list = handlers["access"].setdefault("filters", [])
+        if not isinstance(filters_list, list):
+            filters_list = list(filters_list)
+            handlers["access"]["filters"] = filters_list
+        if filter_name not in filters_list:
+            filters_list.append(filter_name)
 
-    port_str = None
-    if len(addr) > end + 1:
-        if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
-        else:
-            raise ValueError("received IPv6 address format: expected ':' after ']'")
-
-    if not port_str:
-        raise ValueError(
-            "a port must be specified in IPv6 address (format: [ipv6]:port)"
-        )
-
-    try:
-        port = int(port_str)
-    except ValueError:
-        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
-    return port, host
+    loggers_cfg = uvicorn_logging_config.get("loggers", {})
+    if "uvicorn.access" in loggers_cfg:
+        filters_list = loggers_cfg["uvicorn.access"].setdefault("filters", [])
+        if not isinstance(filters_list, list):
+            filters_list = list(filters_list)
+            loggers_cfg["uvicorn.access"]["filters"] = filters_list
+        if filter_name not in filters_list:
+            filters_list.append(filter_name)
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):
@@ -2371,6 +2425,8 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
     import uvicorn
     from fastapi import FastAPI, Response
+
+    from sglang.srt.utils.network import NetworkAddress
 
     app = FastAPI()
 
@@ -2414,14 +2470,16 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
             logger.error(f"Dummy health check server failed to start: {e}")
             raise
         finally:
-            logger.info(f"Dummy health check server stopped at {host}:{port}")
+            logger.info(
+                f"Dummy health check server stopped at {NetworkAddress(host, port).to_host_port_str()}"
+            )
 
     thread = threading.Thread(
         target=run_server, daemon=True, name="health-check-server"
     )
     thread.start()
     logger.info(
-        f"Dummy health check server started in background thread at {host}:{port}"
+        f"Dummy health check server started in background thread at {NetworkAddress(host, port).to_host_port_str()}"
     )
 
 
@@ -2432,6 +2490,11 @@ def set_cuda_arch():
         os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
             f"{arch}{'a' if capability[0] >= 9 else ''}"
         )
+
+
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
+    return -(a // -b)
 
 
 def next_power_of_2(n: int):
@@ -2538,8 +2601,18 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
+    # Check if the model_path is a local path
     if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
         return True
+
+    from huggingface_hub import try_to_load_from_cache
+
+    # Check if the model_path is a HuggingFace model ID and exists locally
+    result = try_to_load_from_cache(model_path, "hf_quant_config.json")
+    if isinstance(result, str):
+        return True
+
+    # Check if the model_path is a remote URL and exists on the HuggingFace Hub
     try:
         from huggingface_hub import HfApi
 
@@ -2547,6 +2620,14 @@ def has_hf_quant_config(model_path: str) -> bool:
         return hf_api.file_exists(model_path, "hf_quant_config.json")
     except Exception:
         return False
+
+
+def get_quantization_config(hf_config) -> str | None:
+    """Extract quantization method from HuggingFace config."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if quantization_config is not None:
+        return quantization_config.get("quant_method")
+    return None
 
 
 def flatten_nested_list(nested_list):
@@ -2583,107 +2664,6 @@ def bind_or_assign(target, source):
         return source
 
 
-def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
-    if not (interface := interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)):
-        return None
-    try:
-        import netifaces
-    except ImportError as e:
-        raise ImportError(
-            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
-        ) from e
-
-    try:
-        addresses = netifaces.ifaddresses(interface)
-        if netifaces.AF_INET in addresses:
-            for addr_info in addresses[netifaces.AF_INET]:
-                ip = addr_info.get("addr")
-                if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-                    return ip
-        if netifaces.AF_INET6 in addresses:
-            for addr_info in addresses[netifaces.AF_INET6]:
-                ip = addr_info.get("addr")
-                if ip and not ip.startswith("fe80::") and ip != "::1":
-                    return ip.split("%")[0]
-    except (ValueError, OSError) as e:
-        logger.warning(
-            f"{e} Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
-        )
-    return None
-
-
-def get_local_ip_by_remote() -> Optional[str]:
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
-
-    try:
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-            return ip
-    except Exception:
-        pass
-
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        logger.warning("Can not get local ip by remote")
-    return None
-
-
-def get_local_ip_auto(fallback: str = None) -> str:
-    """
-    Automatically detect the local IP address using multiple fallback strategies.
-
-    This function attempts to obtain the local IP address through several methods.
-    If all methods fail, it returns the specified fallback value or raises an exception.
-
-    Args:
-        fallback (str, optional): Fallback IP address to return if all detection
-            methods fail. For server applications, explicitly set this to
-            "0.0.0.0" (IPv4) or "::" (IPv6) to bind to all available interfaces.
-            Defaults to None.
-
-    Returns:
-        str: The detected local IP address, or the fallback value if detection fails.
-
-    Raises:
-        ValueError: If IP detection fails and no fallback value is provided.
-
-    Note:
-        The function tries detection methods in the following order:
-        1. Direct IP detection via get_ip()
-        2. Network interface enumeration via get_local_ip_by_nic()
-        3. Remote connection method via get_local_ip_by_remote()
-    """
-    # Try environment variable
-    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
-    if host_ip:
-        return host_ip
-    logger.debug("get_ip failed")
-    # Fallback
-    if ip := get_local_ip_by_nic():
-        return ip
-    logger.debug("get_local_ip_by_nic failed")
-    # Fallback
-    if ip := get_local_ip_by_remote():
-        return ip
-    logger.debug("get_local_ip_by_remote failed")
-    if fallback:
-        return fallback
-    raise ValueError("Can not get local ip")
-
-
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
@@ -2703,6 +2683,7 @@ def is_fa3_default_architecture(hf_config):
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "MixtralForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -2711,7 +2692,10 @@ def is_fa3_default_architecture(hf_config):
         "Glm4MoeForCausalLM",
         "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
+        "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
+        "StepVLForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs
 
@@ -3012,8 +2996,6 @@ def configure_gc_warning(warn_threshold_secs):
 
 
 def freeze_gc(context: str):
-    import gc
-
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
@@ -3027,8 +3009,6 @@ def freeze_gc(context: str):
 
 def configure_gc_logger():
     logger.info("Enable GC Logger")
-
-    import gc
 
     gc_start_time = {}
 
@@ -3073,7 +3053,12 @@ def parse_lscpu_topology():
     cpu_info = []
     for line in output.splitlines():
         if not line.startswith("#"):
-            cpu, core, socket, node = map(int, line.strip().split(","))
+            parts = line.strip().split(",")
+            if len(parts) != 4:
+                logger.warning("Skipping malformed lscpu line: %s", line.strip())
+                continue
+            cpu = int(parts[0])  # CPU id must always be present
+            core, socket, node = [int(p) if p else 0 for p in parts[1:]]
             cpu_info.append((cpu, core, socket, node))
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
@@ -3128,7 +3113,7 @@ def get_cpu_ids_by_node():
 
 def is_shm_available(dtype, world_size, local_size):
     return (
-        cpu_has_amx_support()
+        (cpu_has_amx_support() or is_host_cpu_arm64())
         and dtype in [torch.bfloat16, torch.float16, torch.float]
         and world_size >= 1
         and world_size == local_size
@@ -3414,6 +3399,41 @@ def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
 
 
+@lru_cache(maxsize=1)
+def get_nvidia_driver_version() -> tuple:
+    """Return the NVIDIA driver version as a tuple of ints, e.g. (595, 58, 3).
+    Returns (0,) on failure."""
+    version_str = get_nvidia_driver_version_str()
+    if version_str is None:
+        return (0,)
+    try:
+        return tuple(int(x) for x in version_str.split("."))
+    except ValueError:
+        return (0,)
+
+
+@lru_cache(maxsize=1)
+def get_nvidia_driver_version_str() -> str:
+    """Return the NVIDIA driver version string, e.g. '595.58.03'.
+    Returns None on failure."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        version_str = result.stdout.strip().split("\n")[0].strip()
+        return version_str if version_str else None
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+        return None
+
+
 def check_cuda_result(raw_output):
     import cuda.bindings.runtime as cuda_rt
 
@@ -3424,19 +3444,27 @@ def check_cuda_result(raw_output):
     return results
 
 
-def get_physical_device_id() -> int:
+def get_physical_device_id(pytorch_device_id: int) -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
+
+    When CUDA_VISIBLE_DEVICES is set, maps the logical device ID (as seen by PyTorch)
+    to the actual physical device ID. If CUDA_VISIBLE_DEVICES is not set, returns
+    the device ID unchanged.
+
+    Args:
+        pytorch_device_id: The logical device ID from PyTorch (e.g., torch.cuda.current_device())
+
+    Returns:
+        The physical device ID
     """
+    device_idx = int(pytorch_device_id)
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    assert (
-        cuda_visible_devices is not None
-    ), "CUDA_VISIBLE_DEVICES should be set in a scheduler"
-    device_list = cuda_visible_devices.split(",")
-    assert (
-        len(device_list) == 1
-    ), "CUDA_VISIBLE_DEVICES should be set to a single device in a scheduler"
-    return int(device_list[0])
+    if cuda_visible_devices:
+        device_list = cuda_visible_devices.split(",")
+        return int(device_list[device_idx])
+    else:
+        return device_idx
 
 
 def get_device_sm_nvidia_smi():
@@ -3460,15 +3488,6 @@ def get_device_sm_nvidia_smi():
         # Handle cases where nvidia-smi isn't available or output is unexpected
         print(f"Error getting compute capability: {e}")
         return (0, 0)  # Default/fallback value
-
-
-def numa_bind_to_node(node: int):
-    libnuma = ctypes.CDLL("libnuma.so")
-    if libnuma.numa_available() < 0:
-        raise SystemError("numa not available on this system")
-
-    libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_localalloc()
 
 
 def json_list_type(value):
@@ -3724,6 +3743,20 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+@contextmanager
+def temp_attr_context(obj, attr, value):
+    if obj is None:
+        yield
+        return
+
+    original_value = getattr(obj, attr)
+    setattr(obj, attr, value)
+    try:
+        yield
+    finally:
+        setattr(obj, attr, original_value)
 
 
 cached_device_index = -1

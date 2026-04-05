@@ -2,13 +2,13 @@ import json
 from typing import Dict, List, TypedDict
 
 import torch
-from transformers import AutoConfig
 
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import get_config_dtype_str
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
     get_config_file_name,
 )
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.hf_transformers_utils import get_config
 
 
 class BenchmarkConfig(TypedDict):
@@ -36,8 +36,8 @@ def get_model_config(
     disable_shared_experts_fusion: bool = False,
     topk_ids_dir: str = None,
 ) -> Dict:
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-
+    config = get_config(model_name, trust_remote_code=True)
+    architecture = config.architectures[0]
     block_shape = None
     if (
         hasattr(config, "quantization_config")
@@ -46,8 +46,17 @@ def get_model_config(
         block_shape = config.quantization_config["weight_block_size"]
         assert len(block_shape) == 2
 
-    architecture = config.architectures[0]
-
+    if (
+        hasattr(config, "quantization_config")
+        and "config_groups" in config.quantization_config
+    ):
+        config_groups = config.quantization_config["config_groups"]
+        # Get group_size from the first group's weights config
+        first_group = next(iter(config_groups.values()), {})
+        weights_config = first_group.get("weights", {})
+        group_size = weights_config.get("group_size")
+        block_shape = [0, group_size]
+        assert len(block_shape) == 2
     # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
     if hasattr(config, "text_config"):
         config = config.get_text_config()
@@ -66,6 +75,7 @@ def get_model_config(
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
     ]:
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
@@ -73,7 +83,9 @@ def get_model_config(
     elif architecture in [
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
         "Glm4MoeForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "MistralLarge3ForCausalLM",
     ]:
         E = (config.n_routed_experts // ep_size) + (
@@ -82,7 +94,9 @@ def get_model_config(
             or architecture
             not in [
                 "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
                 "Glm4MoeForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "MistralLarge3ForCausalLM",
             ]
             else 1
@@ -222,6 +236,7 @@ def get_config_filename(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: List[int],
 ) -> str:
@@ -230,13 +245,18 @@ def get_config_filename(
         use_int8_w8a16=use_int8_w8a16,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
+        use_int4_w4a16=use_int4_w4a16,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
     # is the intermediate size after silu_and_mul.
+    N = shard_intermediate_size // 2
+    if use_int4_w4a16:
+        N = N // 2
+
     filename = get_config_file_name(
         num_experts,
-        shard_intermediate_size // 2,
+        N,
         dtype_str,
         block_shape,
         per_channel_quant,

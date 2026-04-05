@@ -26,8 +26,17 @@ where
     }
 }
 
-/// Patch streaming response JSON with metadata from original request
-pub(super) fn patch_streaming_response_json(
+/// Patch response JSON with metadata from original request
+///
+/// The upstream response may be missing fields that were in the original request.
+/// This function ensures these fields are preserved in the final response:
+/// - `previous_response_id` - conversation threading
+/// - `instructions` - system instructions
+/// - `metadata` - user-provided metadata
+/// - `store` - whether to persist the response
+/// - `model` - model identifier
+/// - `safety_identifier` - user identifier for safety
+pub(super) fn patch_response_with_request_metadata(
     response_json: &mut Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<&str>,

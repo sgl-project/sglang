@@ -215,12 +215,11 @@ mod pd_routing_unit_tests {
             let app_context = {
                 use std::sync::{Arc, OnceLock};
 
+                use data_connector::{
+                    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+                };
                 use smg::{
                     core::{LoadMonitor, WorkerRegistry},
-                    data_connector::{
-                        MemoryConversationItemStorage, MemoryConversationStorage,
-                        MemoryResponseStorage,
-                    },
                     middleware::TokenBucket,
                     policies::PolicyRegistry,
                 };
@@ -247,9 +246,9 @@ mod pd_routing_unit_tests {
                     config.worker_startup_check_interval_secs,
                 )));
 
-                // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
+                // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
                 let worker_job_queue = Arc::new(OnceLock::new());
-                let workflow_engine = Arc::new(OnceLock::new());
+                let workflow_engines = Arc::new(OnceLock::new());
                 let mcp_manager = Arc::new(OnceLock::new());
 
                 Arc::new(
@@ -267,7 +266,7 @@ mod pd_routing_unit_tests {
                         .conversation_item_storage(conversation_item_storage)
                         .load_monitor(load_monitor)
                         .worker_job_queue(worker_job_queue)
-                        .workflow_engine(workflow_engine)
+                        .workflow_engines(workflow_engines)
                         .mcp_manager(mcp_manager)
                         .build()
                         .unwrap(),
@@ -766,7 +765,7 @@ mod pd_routing_unit_tests {
         let implemented_endpoints = vec![
             ("/health", "GET", true),
             ("/health_generate", "GET", true), // Note: Python uses POST, we use GET
-            ("/get_server_info", "GET", true),
+            ("/server_info", "GET", true),
             ("/v1/models", "GET", true),
             ("/get_model_info", "GET", true),
             ("/generate", "POST", true),

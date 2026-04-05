@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Attention layer with Dual chunk flash attention and sparse attention.
-"""
+"""Attention layer with Dual chunk flash attention and sparse attention."""
+
 import functools
 import logging
 import math

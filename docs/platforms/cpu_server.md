@@ -93,6 +93,10 @@ name = "torchvision"
 url = "https://download.pytorch.org/whl/cpu"
 
 [[index]]
+name = "torchaudio"
+url = "https://download.pytorch.org/whl/cpu"
+
+[[index]]
 name = "triton"
 url = "https://download.pytorch.org/whl/cpu"
 
@@ -119,7 +123,6 @@ cp pyproject_cpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 uv pip install --upgrade pip setuptools
 uv pip install .
-uv pip install torch==2.9.0 torchvision==0.24.0 triton==3.5.0 --force-reinstall
 
 # Build the CPU backend kernels
 cd ../sgl-kernel
@@ -183,20 +186,37 @@ Notes:
 2. The flag `--tp 6` specifies that tensor parallelism will be applied using 6 ranks (TP6).
     The number of TP specified is how many TP ranks will be used during the execution.
     On a CPU platform, a TP rank means a sub-NUMA cluster (SNC).
-    Usually we can get the SNC information (How many available) from the Operating System.
-    Users can specify TP to be no more than the total available SNCs in current system.
+    Usually we can get the SNC information (How many available) from the Operating System with e.g. `lscpu` command.
 
     If the specified TP rank number differs from the total SNC count,
     the system will automatically utilize the first `n` SNCs.
     Note that `n` cannot exceed the total SNC number, doing so will result in an error.
 
-    To specify the cores to be used, we need to explicitly set the environment variable `SGLANG_CPU_OMP_THREADS_BIND`.
-    For example, if we want to run the SGLang service using the first 40 cores of each SNC on a Xeon® 6980P server,
+    `SGLANG_CPU_OMP_THREADS_BIND` allows explicit control of CPU cores for each tensor parallel (TP) rank.
+
+    **example 1**: Run SGLang service with TP=6, using the first 40 cores of each SNC on a Xeon® 6980P server,
     which has 43-43-42 cores on the 3 SNCs of a socket, we should set:
 
     ```bash
     export SGLANG_CPU_OMP_THREADS_BIND="0-39|43-82|86-125|128-167|171-210|214-253"
     ```
+    This configuration is equivalent to:
+    - rank 0: `numactl -C 0-39 -m 0`
+    - rank 1: `numactl -C 43-82 -m 1`
+    - rank 2: `numactl -C 86-125 -m 2`
+    - rank 3: `numactl -C 128-167 -m 3`
+    - rank 4: `numactl -C 171-210 -m 4`
+    - rank 5: `numactl -C 214-253 -m 5`
+
+
+    **example 2**: Run SGLang service with TP=2, using 96 cores cross 3 SNCs on a Xeon® 6972P server,
+    which has 32-32-32 cores on the 3 SNCs in a socket, we should set:
+    ```bash
+    export SGLANG_CPU_OMP_THREADS_BIND="0-95|96-191"
+    ```
+    This configuration is equivalent to:
+    - rank 0: `numactl -C 0-95 -m 0-2`
+    - rank 1: `numactl -C 96-191 -m 3-5`
 
     Please beware that with SGLANG_CPU_OMP_THREADS_BIND set,
     the available memory amounts of the ranks may not be determined in prior.
@@ -205,8 +225,7 @@ Notes:
 3. For optimizing decoding with torch.compile, please add the flag `--enable-torch-compile`.
     To specify the maximum batch size when using `torch.compile`, set the flag `--torch-compile-max-bs`.
     For example, `--enable-torch-compile --torch-compile-max-bs 4` means using `torch.compile`
-    and setting the maximum batch size to 4. Currently the maximum applicable batch size
-    for optimizing with `torch.compile` is 16.
+    and setting the maximum batch size to 4.
 
 4. A warmup step is automatically triggered when the service is started.
     The server is ready when you see the log `The server is fired up and ready to roll!`.

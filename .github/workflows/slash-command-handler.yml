@@ -12,13 +12,15 @@ permissions:
 
 jobs:
   slash_command:
-    # Only run if it is a PR and the comment starts with a recognized command
+    # Only run if it is a PR and the comment contains a recognized command
+    # Use contains() since startsWith() can't handle leading whitespace/newlines
     if: >
       github.event.issue.pull_request &&
-      (startsWith(github.event.comment.body, '/tag-run-ci-label') ||
-       startsWith(github.event.comment.body, '/rerun-failed-ci') ||
-       startsWith(github.event.comment.body, '/tag-and-rerun-ci') ||
-       startsWith(github.event.comment.body, '/rerun-stage'))
+      (contains(github.event.comment.body, '/tag-run-ci-label') ||
+       contains(github.event.comment.body, '/rerun-failed-ci') ||
+       contains(github.event.comment.body, '/tag-and-rerun-ci') ||
+       contains(github.event.comment.body, '/rerun-stage') ||
+       contains(github.event.comment.body, '/rerun-test'))
     runs-on: ubuntu-latest
 
     steps:
@@ -47,14 +49,34 @@ jobs:
           fi
           echo "is_fork=$IS_FORK" >> $GITHUB_OUTPUT
           echo "ref=$(echo "$PR_DATA" | jq -r '.headRefName')" >> $GITHUB_OUTPUT
+          echo "pr_ref=refs/pull/${{ github.event.issue.number }}/head" >> $GITHUB_OUTPUT
           echo "PR owner: $HEAD_OWNER, Repo owner: $REPO_OWNER, Is fork: $IS_FORK"
+
+      - name: Check commenter permission for fork PRs
+        id: perm
+        if: steps.pr.outputs.is_fork == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission --jq '.permission') || {
+            PERM="none"
+            echo "::warning::Failed to check commenter permission, defaulting to none"
+          }
+          if [[ "$PERM" == "admin" || "$PERM" == "maintain" || "$PERM" == "write" ]]; then
+            echo "safe_to_checkout_pr=true" >> $GITHUB_OUTPUT
+          else
+            echo "safe_to_checkout_pr=false" >> $GITHUB_OUTPUT
+          fi
+          echo "Commenter ${{ github.event.comment.user.login }} permission: $PERM"
 
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          # For non-fork PRs, checkout PR branch to allow testing handler changes
-          # For fork PRs, stay on main for security (don't run untrusted code with elevated permissions)
-          ref: ${{ steps.pr.outputs.is_fork == 'false' && steps.pr.outputs.ref || '' }}
+          # For non-fork PRs: checkout PR branch by name
+          # For fork PRs with trusted commenter: checkout via refs/pull/N/head
+          # For fork PRs with untrusted commenter: stay on main for security
+          ref: ${{ steps.pr.outputs.is_fork == 'false' && steps.pr.outputs.ref || (steps.perm.outputs.safe_to_checkout_pr == 'true' && steps.pr.outputs.pr_ref || '') }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -74,4 +96,4 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           USER_LOGIN: ${{ github.event.comment.user.login }}
         run: |
-          python scripts/ci/slash_command_handler.py
+          python scripts/ci/utils/slash_command_handler.py
