@@ -13,6 +13,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.reasoning_tokens_kit import ReasoningTokenUsageMixin
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -21,16 +22,19 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=103, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=109, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestEnableThinking(CustomTestCase):
+class TestEnableThinking(ReasoningTokenUsageMixin, CustomTestCase):
+    reasoning_parser_name = "qwen3"
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
+        cls.init_reasoning_token_verifier()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
