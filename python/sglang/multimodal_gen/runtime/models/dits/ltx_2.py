@@ -729,6 +729,7 @@ class LTX2TransformerBlock(nn.Module):
         super().__init__()
         self.idx = idx
         self.norm_eps = norm_eps
+        # LTX2.3
         self.cross_attention_adaln = cross_attention_adaln
         self.use_local_av_cross_attention = use_local_av_cross_attention
 
@@ -837,6 +838,7 @@ class LTX2TransformerBlock(nn.Module):
             torch.randn(5, audio_dim)
         )
         if self.cross_attention_adaln:
+            # LTX2.3
             self.prompt_scale_shift_table = nn.Parameter(torch.randn(2, dim))
             self.audio_prompt_scale_shift_table = nn.Parameter(
                 torch.randn(2, audio_dim)
@@ -919,6 +921,7 @@ class LTX2TransformerBlock(nn.Module):
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * agate_msa
         # 2. Prompt Cross-Attention
         if self.cross_attention_adaln:
+            # LTX2.3
             if temb_prompt is None or temb_audio_prompt is None:
                 raise ValueError(
                     "cross_attention_adaln requires prompt modulation tensors."
