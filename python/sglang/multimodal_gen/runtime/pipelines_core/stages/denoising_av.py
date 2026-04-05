@@ -183,6 +183,18 @@ class LTX2AVDenoisingStage(DenoisingStage):
             return (sample.float() - sigma * velocity.float()).to(sample.dtype)
         return (sample.float() - float(sigma) * velocity.float()).to(sample.dtype)
 
+    @staticmethod
+    def _repeat_batch_dim(tensor: torch.Tensor, target_batch_size: int) -> torch.Tensor:
+        """Repeat along batch dim while preserving any tokenwise timestep layout."""
+        if tensor.shape[0] == int(target_batch_size):
+            return tensor
+        if tensor.shape[0] <= 0 or int(target_batch_size) % int(tensor.shape[0]) != 0:
+            raise ValueError(
+                f"Cannot repeat tensor with batch={tensor.shape[0]} to target_batch_size={target_batch_size}"
+            )
+        repeat_factor = int(target_batch_size) // int(tensor.shape[0])
+        return tensor.repeat(repeat_factor, *([1] * (tensor.ndim - 1)))
+
     @classmethod
     def _ltx2_calculate_guided_x0(
         cls,
@@ -652,11 +664,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     ],
                                     dim=0,
                                 )
-                                timestep_video = timestep_video.expand(
-                                    int(latent_model_input.shape[0])
+                                cfg_batch_size = int(latent_model_input.shape[0])
+                                timestep_video = self._repeat_batch_dim(
+                                    timestep_video, cfg_batch_size
                                 )
-                                timestep_audio = timestep_audio.expand(
-                                    int(latent_model_input.shape[0])
+                                timestep_audio = self._repeat_batch_dim(
+                                    timestep_audio, cfg_batch_size
                                 )
 
                             with set_forward_context(
