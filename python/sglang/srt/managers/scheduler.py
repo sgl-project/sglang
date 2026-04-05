@@ -553,6 +553,7 @@ class Scheduler(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
             self._think_end_id = self.tokenizer.think_end_id
+            self.model_config.think_end_id = self._think_end_id
         else:
             self._think_end_id = None
 
