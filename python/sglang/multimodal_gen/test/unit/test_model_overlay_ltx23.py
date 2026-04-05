@@ -241,6 +241,19 @@ def test_ltx23_prepare_request_sets_stage1_guider_defaults():
     }
 
 
+def test_sampling_params_apply_request_extra_populates_req_extra():
+    sampling_params = SamplingParams.from_pretrained(
+        "Lightricks/LTX-2.3",
+        backend="sglang",
+    )
+
+    req = Req(sampling_params=sampling_params)
+    sampling_params.apply_request_extra(req)
+
+    assert req.extra["ltx2_stage1_guider_params"]["video_cfg_scale"] == 3.0
+    assert req.extra["ltx2_stage1_guider_params"]["audio_cfg_scale"] == 7.0
+
+
 def test_ltx23_stage1_guider_params_apply_to_one_stage_path():
     sampling_params = SamplingParams.from_pretrained(
         "Lightricks/LTX-2.3",

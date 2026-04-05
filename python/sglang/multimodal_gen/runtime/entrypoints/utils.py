@@ -288,7 +288,7 @@ def prepare_request(
         sampling_params=sampling_params,
         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
-    req.extra.update(sampling_params.build_request_extra())
+    sampling_params.apply_request_extra(req)
 
     req.adjust_size(server_args)
 

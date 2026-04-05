@@ -254,11 +254,16 @@ class SamplingParams:
             self.num_inference_steps = int(env_steps)
 
     def build_request_extra(self) -> dict[str, Any]:
+        """Return optional request-scoped extras for downstream pipeline stages."""
         extra = {}
         diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
         if diffusers_kwargs:
             extra["diffusers_kwargs"] = diffusers_kwargs
         return extra
+
+    def apply_request_extra(self, req: Any) -> None:
+        """Merge request extras (model specific, e.g., LTX2.3) into an already-created pipeline request."""
+        req.extra.update(self.build_request_extra())
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
