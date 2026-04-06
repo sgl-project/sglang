@@ -102,5 +102,25 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
         self.assertEqual(server_args.pipeline_config.resolution, 768)
 
 
+class TestComponentPathParsing(unittest.TestCase):
+    def test_extract_component_paths_accepts_config_expanded_keys(self):
+        component_paths, remaining = ServerArgs._extract_component_paths(
+            [
+                "--component-paths.spatial-upsampler",
+                "/tmp/latent_upsampler",
+                "--component_paths.distilled-lora=/tmp/distilled.safetensors",
+            ]
+        )
+
+        self.assertEqual(
+            component_paths,
+            {
+                "spatial_upsampler": "/tmp/latent_upsampler",
+                "distilled_lora": "/tmp/distilled.safetensors",
+            },
+        )
+        self.assertEqual(remaining, [])
+
+
 if __name__ == "__main__":
     unittest.main()
