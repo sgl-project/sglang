@@ -375,6 +375,10 @@ class TokenizerCommunicatorMixin:
     ) -> AddExternalCorpusReqOutput:
         self.auto_create_handle_loop()
         try:
+            if not obj.corpus_id:
+                import uuid
+
+                obj.corpus_id = uuid.uuid4().hex
             if obj.file_path is not None:
                 from sglang.srt.speculative.cpp_ngram.external_corpus import (
                     iter_external_corpus_chunks,

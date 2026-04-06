@@ -2894,6 +2894,7 @@ class Scheduler(
             )
             return AddExternalCorpusReqOutput(
                 success=True,
+                corpus_id=recv_req.corpus_id,
                 message=f"Loaded corpus '{recv_req.corpus_id}' with {loaded} tokens.",
                 loaded_token_count=loaded,
             )

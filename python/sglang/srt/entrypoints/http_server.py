@@ -744,6 +744,7 @@ async def add_external_corpus(request: Request):
     return ORJSONResponse(
         {
             "success": result.success,
+            "corpus_id": result.corpus_id,
             "message": result.message,
             "loaded_token_count": result.loaded_token_count,
         },

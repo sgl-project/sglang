@@ -1133,7 +1133,7 @@ class FlushCacheReqOutput(BaseReq):
 
 @dataclass
 class AddExternalCorpusReqInput(BaseReq):
-    corpus_id: str
+    corpus_id: Optional[str] = None
     file_path: Optional[str] = None
     documents: Optional[List[str]] = None
     token_chunks: Optional[List[List[int]]] = None
@@ -1142,6 +1142,7 @@ class AddExternalCorpusReqInput(BaseReq):
 @dataclass
 class AddExternalCorpusReqOutput(BaseReq):
     success: bool
+    corpus_id: str = ""
     message: str = ""
     loaded_token_count: int = 0
 
