@@ -93,20 +93,48 @@ def pack_text_embeds(
     return normalized_hidden_states
 
 
+def pack_text_embeds_v2(
+    text_hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    LTX-2.3 feature extractor pre-processing.
+
+    Upstream `FeatureExtractorV2` applies per-token RMS normalization on each
+    Gemma layer and then flattens `[hidden_dim, num_layers]` into the channel
+    dimension, zeroing out padded positions afterwards.
+    """
+
+    variance = torch.mean(text_hidden_states**2, dim=2, keepdim=True)
+    normalized_hidden_states = text_hidden_states * torch.rsqrt(variance + eps)
+    normalized_hidden_states = normalized_hidden_states.flatten(2)
+    mask = attention_mask.bool().unsqueeze(-1)
+    return torch.where(
+        mask, normalized_hidden_states, torch.zeros_like(normalized_hidden_states)
+    )
+
+
+def is_ltx23_native_variant(arch_config: object) -> bool:
+    return str(getattr(arch_config, "ltx_variant", "ltx_2")) == "ltx_2_3"
+
+
 def _gemma_postprocess_func(
     outputs: BaseEncoderOutput,
     text_inputs: dict,
     pipeline_config: Optional["LTX2PipelineConfig"] = None,
 ) -> torch.Tensor:
-    _ = pipeline_config
     # LTX-2 requires all hidden states concatenated for the connector
     if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-        # outputs.hidden_states is a tuple of tensors
-        # We need to stack them along the last dimension and pack them
         hidden_states = torch.stack(outputs.hidden_states, dim=-1)
         attention_mask = text_inputs["attention_mask"]
+        if (
+            pipeline_config is not None
+            and pipeline_config.dit_config.arch_config.caption_proj_before_connector
+        ):
+            return pack_text_embeds_v2(hidden_states, attention_mask)
+
         sequence_lengths = attention_mask.sum(dim=-1)
-        # Assuming left padding for Gemma as per Diffusers
         return pack_text_embeds(hidden_states, sequence_lengths, padding_side="left")
     else:
         raise AttributeError(
