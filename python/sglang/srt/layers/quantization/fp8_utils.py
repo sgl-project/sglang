@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
-from sglang.srt.environ import envs
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -1467,7 +1467,7 @@ def apply_fp8_linear(
             input_scale is not None
             and input_scale.numel() == 1
             and weight_scale.numel() == 1
-            and envs.SGLANG_ENABLE_TORCH_COMPILE.get()
+            and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
         ):
             qinput = (
                 (input_2d * input_scale.reciprocal())

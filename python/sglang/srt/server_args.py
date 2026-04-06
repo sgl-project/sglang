@@ -3616,13 +3616,7 @@ class ServerArgs:
                 self.enable_dynamic_batch_tokenizer = False
 
     def _handle_environment_variables(self):
-        # Also enable torch_compile env when PCG uses inductor compiler,
-        # so that code can check this env to prefer inductor-fusible ops
-        # over custom CUDA kernels that become opaque nodes in the graph.
-        use_torch_compile = self.enable_torch_compile or (
-            self.piecewise_cuda_graph_compiler == "inductor"
-        )
-        envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if use_torch_compile else "0")
+        envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
         if self.mamba_ssm_dtype is not None:
             envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
         envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
