@@ -32,9 +32,11 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.rvv_utils import PackRVVWeightMethod
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     get_compiler_backend,
     is_cpu,
     is_npu,
@@ -45,6 +47,7 @@ from sglang.srt.utils.async_probe import maybe_detect_oob
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_rvv_available = cpu_has_rvv_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 
@@ -588,6 +591,12 @@ class ParallelLMHead(VocabParallelEmbedding):
                 torch.float16,
             ]:
                 self.quant_method = PackWeightMethod(weight_names=["weight"])
+        elif _is_cpu and _is_cpu_rvv_available:
+            if hasattr(self, "weight") and self.weight.dtype in [
+                torch.bfloat16,
+                torch.float16,
+            ]:
+                self.quant_method = PackRVVWeightMethod(weight_names=["weight"])
 
         if bias:
             self.bias = Parameter(
