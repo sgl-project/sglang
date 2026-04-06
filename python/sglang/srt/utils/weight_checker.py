@@ -125,6 +125,21 @@ def _postprocess_tensors(
 
     skip_compare_names = []
 
+    # Skip non-persistent buffers like cos_sin_cache
+    # These buffers are registered with persistent=False and are not saved in checkpoints
+    # They should be recomputed after loading weights, so we don't compare them here
+    non_persistent_buffer_patterns = [
+        "cos_sin_cache",  # RoPE cache
+        "inv_freq",  # RoPE inverse frequency (if it exists as buffer)
+    ]
+
+    for name in raw:
+        for pattern in non_persistent_buffer_patterns:
+            if pattern in name:
+                skip_compare_names.append(name)
+                logger.info(f"[check_tensors] Skipping non-persistent buffer: {name}")
+                break
+
     # dequant fp8
     quant_names = [
         name
