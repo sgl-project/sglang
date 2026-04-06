@@ -7,7 +7,6 @@ and _read_until_stop.
 
 import json
 import re
-import unittest
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import (
     DS32EncodingError,
@@ -26,11 +25,9 @@ from sglang.srt.entrypoints.openai.encoding_dsv32 import (
     thinking_start_token,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
-
-
-CustomTestCase = unittest.TestCase
+register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
 # ---------------------------------------------------------------------------
@@ -869,4 +866,6 @@ class TestReadUntilStop(CustomTestCase):
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main(verbosity=2)
