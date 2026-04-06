@@ -332,6 +332,8 @@ class RotaryEmbedding(MultiPlatformOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
+            if batch_size == 0:
+                return query, key
             q_rope = query.view(batch_size, -1, self.head_size)
             k_rope = key.view(batch_size, -1, self.head_size)
             if self.head_size != self.rotary_dim:

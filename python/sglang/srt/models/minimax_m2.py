@@ -28,10 +28,14 @@ from transformers import PretrainedConfig
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
+    GroupCoordinator,
+    get_attn_tp_group,
+    get_attn_tensor_model_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -248,10 +252,16 @@ def rms_apply_serial(
 class MiniMaxM2RMSNormTP(nn.Module):
     """RMSNorm with Tensor Parallel support for QK normalization."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        tp_group: Optional[GroupCoordinator] = None,
+    ) -> None:
         super().__init__()
-        self.tp_world = get_tensor_model_parallel_world_size()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_group = tp_group or get_tp_group()
+        self.tp_world = self.tp_group.world_size
+        self.tp_rank = self.tp_group.rank_in_group
 
         # Weight parameter is sharded across TP ranks
         self.weight = nn.Parameter(torch.ones(int(hidden_size / self.tp_world)))
@@ -264,8 +274,8 @@ class MiniMaxM2RMSNormTP(nn.Module):
         loaded_weight: torch.Tensor,
     ) -> None:
         """Custom weight loader that handles TP sharding."""
-        tp_world = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_world = loaded_weight.shape[0] // param.shape[0]
+        tp_rank = get_tensor_model_parallel_rank() % tp_world
 
         shard_size = loaded_weight.shape[0] // tp_world
         shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
@@ -288,7 +298,7 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
         if self.tp_world > 1:
             # All-reduce variance across TP ranks to get global variance
-            variance = tensor_model_parallel_all_reduce(variance) / self.tp_world
+            variance = self.tp_group.all_reduce(variance) / self.tp_world
 
         # Normalize and apply local weight shard
         x = x * torch.rsqrt(variance + self.variance_epsilon)
@@ -305,7 +315,7 @@ class MiniMaxM2RMSNormTP(nn.Module):
     ) -> torch.Tensor:
         sum_sq = rms_sumsq_serial(q, k)
         if q_norm.tp_world > 1:
-            sum_sq = tensor_model_parallel_all_reduce(sum_sq)
+            sum_sq = q_norm.tp_group.all_reduce(sum_sq)
 
         q, k = rms_apply_serial(
             q,
@@ -543,23 +553,24 @@ class MiniMaxM2Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        self.attn_tp_size = get_attn_tensor_model_parallel_world_size()
+        self.attn_tp_group = get_attn_tp_group()
 
         # Get dimensions from config
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % self.attn_tp_size == 0
+        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
 
-        if self.total_num_kv_heads >= tp_size:
+        if self.total_num_kv_heads >= self.attn_tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
+            assert self.total_num_kv_heads % self.attn_tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+            assert self.attn_tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
 
         # Use head_dim from config if available, otherwise calculate
         self.head_dim = getattr(
@@ -587,6 +598,7 @@ class MiniMaxM2Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,
+            tp_size=self.attn_tp_size,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
@@ -596,6 +608,7 @@ class MiniMaxM2Attention(nn.Module):
             self.hidden_size,
             bias=False,
             reduce_results=False,
+            tp_size=self.attn_tp_size,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -615,10 +628,14 @@ class MiniMaxM2Attention(nn.Module):
                 # Use RMSNormTP for proper tensor parallel support
                 # Use total dimensions (before TP sharding) for correct normalization
                 self.q_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_heads * self.head_dim,
+                    eps=config.rms_norm_eps,
+                    tp_group=self.attn_tp_group,
                 )
                 self.k_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_kv_heads * self.head_dim,
+                    eps=config.rms_norm_eps,
+                    tp_group=self.attn_tp_group,
                 )
             else:
                 raise ValueError(f"Unsupported qk_norm_type: {self.qk_norm_type}")
