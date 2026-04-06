@@ -36,6 +36,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
 
@@ -310,8 +311,6 @@ def prepare_request(
         )
 
     if server_args.enable_trace and external_trace_header:
-        from sglang.srt.observability.trace import TraceReqContext
-
         trace_ctx = TraceReqContext(
             rid=sampling_params.request_id,
             module_name="diffusion",

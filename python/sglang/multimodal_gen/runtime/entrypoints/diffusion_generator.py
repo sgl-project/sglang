@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_generation_timer,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 
 logger = init_logger(__name__)
 
@@ -121,11 +122,6 @@ class DiffGenerator:
             server_args=server_args,
         )
         if server_args.enable_trace:
-            from sglang.srt.observability.trace import (
-                process_tracing_init,
-                trace_set_thread_info,
-            )
-
             process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
             trace_set_thread_info("DiffGenerator")
 

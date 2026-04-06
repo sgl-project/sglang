@@ -59,6 +59,7 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     capture_memory_snapshot,
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -512,11 +513,6 @@ def run_scheduler_process(
         set_musa_arch()
 
     if server_args.enable_trace:
-        from sglang.srt.observability.trace import (
-            process_tracing_init,
-            trace_set_thread_info,
-        )
-
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
         trace_set_thread_info(f"DiffWorker_rank{rank}")
 

@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
@@ -148,8 +149,6 @@ async def generations(
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
         )
-        from sglang.srt.observability.trace import extract_trace_headers
-
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
             server_args=server_args,
@@ -288,8 +287,6 @@ async def edits(
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
         )
-        from sglang.srt.observability.trace import extract_trace_headers
-
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
             server_args=server_args,
