@@ -83,9 +83,12 @@ void Ngram::finishExternalCorpusLoad() {
     throw std::runtime_error("finishExternalCorpusLoad called without startExternalCorpusLoad");
   }
   staging_sam_->finalize();
-  if (!staging_sam_->empty()) {
-    sams_[staging_corpus_id_] = std::move(staging_sam_);
+  if (staging_sam_->empty()) {
+    staging_sam_.reset();
+    staging_corpus_id_.clear();
+    throw std::runtime_error("External corpus is empty — no tokens were loaded.");
   }
+  sams_[staging_corpus_id_] = std::move(staging_sam_);
   staging_sam_.reset();
   staging_corpus_id_.clear();
 }
@@ -180,13 +183,7 @@ Result Ngram::batchMatch(
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
 
-  // Collect active SAMs (snapshot taken once per batch under mutex)
-  std::vector<const SuffixAutomaton*> active_sams;
-  for (const auto& [_, sam] : sams_) {
-    if (sam && !sam->empty()) {
-      active_sams.push_back(sam.get());
-    }
-  }
+  const size_t num_sams = sams_.size();
 
   Result merged;
   for (size_t i = 0; i < state_ids.size(); ++i) {
@@ -197,7 +194,6 @@ Result Ngram::batchMatch(
 
     auto& state = match_state_[state_ids[i]];
     const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
-    const size_t num_sams = active_sams.size();
     const size_t total_sam_budget =
         num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
     const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};
@@ -214,8 +210,9 @@ Result Ngram::batchMatch(
     auto combined = (trie_.get()->*trie_result_build_fn)(
         suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
 
-    for (const auto* sam : active_sams) {
-      auto sam_res = (sam->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
+    for (const auto& [_, sam] : sams_) {
+      auto sam_res =
+          (sam.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
       combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
     }
 
