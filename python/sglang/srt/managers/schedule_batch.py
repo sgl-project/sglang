@@ -1345,6 +1345,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    mamba_track_indices_cpu: torch.Tensor = None  # shape: [b], int64, cpu
+    mamba_track_mask_cpu: torch.Tensor = None  # shape: [b], bool, cpu
+    mamba_track_seqlens_cpu: torch.Tensor = None  # shape: [b], int64, cpu
+    mamba_cache_indices_cpu: torch.Tensor = None  # shape: [b], int64, cpu
+    has_mamba_track: bool = False
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -1623,6 +1628,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        mamba_cache_indices_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1683,6 +1689,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_mask_cpu,
                     mamba_track_indices_cpu,
                     mamba_track_seqlens_cpu,
+                    mamba_cache_indices_cpu,
                 )
 
             if self.return_logprob:
@@ -1760,20 +1767,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_global_server_args().enable_mamba_extra_buffer():
-            self.mamba_track_indices = torch.tensor(
+            self.mamba_track_indices_cpu = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
-                device=self.device,
+                pin_memory=_pin,
             )
-            self.mamba_track_mask = torch.tensor(
+            self.mamba_track_mask_cpu = torch.tensor(
                 mamba_track_mask_cpu,
                 dtype=torch.bool,
-                device=self.device,
+                pin_memory=_pin,
             )
-            self.mamba_track_seqlens = torch.tensor(
+            self.mamba_track_seqlens_cpu = torch.tensor(
                 mamba_track_seqlens_cpu,
                 dtype=torch.int64,
-                device=self.device,
+                pin_memory=_pin,
+            )
+            self.mamba_cache_indices_cpu = torch.tensor(
+                mamba_cache_indices_cpu,
+                dtype=torch.int64,
+                pin_memory=_pin,
+            )
+            self.has_mamba_track = bool(any(mamba_track_mask_cpu))
+            self.mamba_track_indices = self.mamba_track_indices_cpu.to(
+                self.device, non_blocking=True
+            )
+            self.mamba_track_mask = self.mamba_track_mask_cpu.to(
+                self.device, non_blocking=True
+            )
+            self.mamba_track_seqlens = self.mamba_track_seqlens_cpu.to(
+                self.device, non_blocking=True
             )
 
         if self.model_config.is_encoder_decoder:
@@ -1791,6 +1813,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu: List[bool],
         mamba_track_indices_cpu: List[int],
         mamba_track_seqlens_cpu: List[int],
+        mamba_cache_indices_cpu: List[int],
     ):
         def _force_track_h(i: int) -> int:
             assert i % FLA_CHUNK_SIZE == 0
@@ -1809,6 +1832,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_indices_cpu.append(
             req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         )
+        assert req.mamba_pool_idx is not None
+        mamba_cache_indices_cpu.append(req.mamba_pool_idx.item())
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -2150,6 +2175,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
+                self.mamba_track_indices_cpu = torch.empty((0,), dtype=torch.int64)
             else:
                 # already on device
                 all_buffers = torch.stack(
@@ -2167,12 +2193,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.mamba_track_indices = (
                     torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
                 )
+                self.mamba_track_indices_cpu = torch.tensor(
+                    [
+                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+                        for req in self.reqs
+                    ],
+                    dtype=torch.int64,
+                )
 
-            # async H2D
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
+            self.mamba_track_mask_cpu = (
+                self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0
+            )
+            self.has_mamba_track = bool(self.mamba_track_mask_cpu.any())
+            self.mamba_track_mask = self.mamba_track_mask_cpu.pin_memory().to(
+                device=self.device, non_blocking=True
             )
 
     def maybe_wait_verify_done(self):
@@ -2239,6 +2273,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_indices_cpu = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_cache_indices_cpu = None
+        self.has_mamba_track = False
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -2294,6 +2333,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_indices_cpu = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_cache_indices_cpu = None
+        self.has_mamba_track = False
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -2320,10 +2364,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
-            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+            extend_seq_lens = (
+                extend_prefix_lens
+            ) = extend_start_loc_cpu = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens
             extend_prefix_lens = self.prefix_lens
+            extend_start_loc_cpu = [0]
+            for extend_len in extend_seq_lens[:-1]:
+                extend_start_loc_cpu.append(extend_start_loc_cpu[-1] + extend_len)
             extend_logprob_start_lens = self.extend_logprob_start_lens
 
         if self.sampling_info:
@@ -2358,6 +2407,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc_cpu=extend_start_loc_cpu,
             extend_logprob_start_lens=extend_logprob_start_lens,
             multimodal_inputs=self.multimodal_inputs,
             encoder_cached=self.encoder_cached,
@@ -2393,6 +2443,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_indices_cpu=self.mamba_track_indices_cpu,
+            mamba_track_mask_cpu=self.mamba_track_mask_cpu,
+            mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
+            mamba_cache_indices_cpu=self.mamba_cache_indices_cpu,
+            has_mamba_track=self.has_mamba_track,
         )
 
     def copy(self):
@@ -2420,6 +2475,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_indices_cpu=self.mamba_track_indices_cpu,
+            mamba_track_mask_cpu=self.mamba_track_mask_cpu,
+            mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
+            mamba_cache_indices_cpu=self.mamba_cache_indices_cpu,
+            has_mamba_track=self.has_mamba_track,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
         )
@@ -2519,6 +2579,7 @@ class ModelWorkerBatch:
     extend_num_tokens: Optional[int]
     extend_seq_lens: Optional[List[int]]
     extend_prefix_lens: Optional[List[int]]
+    extend_start_loc_cpu: Optional[List[int]]
     extend_logprob_start_lens: Optional[List[int]]
     extend_input_logprob_token_ids: Optional[torch.Tensor]
 
@@ -2580,3 +2641,8 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_track_indices_cpu: Optional[torch.Tensor] = None  # shape: [b], int64, cpu
+    mamba_track_mask_cpu: Optional[torch.Tensor] = None  # shape: [b], bool, cpu
+    mamba_track_seqlens_cpu: Optional[torch.Tensor] = None  # shape: [b], int64, cpu
+    mamba_cache_indices_cpu: Optional[torch.Tensor] = None  # shape: [b], int64, cpu
+    has_mamba_track: bool = False

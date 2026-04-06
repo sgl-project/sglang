@@ -394,10 +394,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
+            if forward_batch.has_mamba_track:
                 conv_dst = forward_batch.mamba_track_indices
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices

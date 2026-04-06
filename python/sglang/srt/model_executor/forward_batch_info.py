@@ -307,6 +307,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_track_indices_cpu: Optional[torch.Tensor] = None  # shape: [b], int64, cpu
+    mamba_track_mask_cpu: Optional[torch.Tensor] = None  # shape: [b], bool, cpu
+    mamba_track_seqlens_cpu: Optional[torch.Tensor] = None  # shape: [b], int64, cpu
+    mamba_cache_indices_cpu: Optional[torch.Tensor] = None  # shape: [b], int64, cpu
+    has_mamba_track: bool = False
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -331,6 +336,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
     extend_start_loc: Optional[torch.Tensor] = None
+    extend_start_loc_cpu: Optional[List[int]] = None
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
@@ -448,6 +454,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_track_indices_cpu=batch.mamba_track_indices_cpu,
+            mamba_track_mask_cpu=batch.mamba_track_mask_cpu,
+            mamba_track_seqlens_cpu=batch.mamba_track_seqlens_cpu,
+            mamba_cache_indices_cpu=batch.mamba_cache_indices_cpu,
+            has_mamba_track=batch.has_mamba_track,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
@@ -563,6 +574,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             if ret.positions is None:
                 ret.positions = positions
+            ret.extend_start_loc_cpu = batch.extend_start_loc_cpu
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
@@ -890,6 +902,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.extend_start_loc = torch.arange(
                     bs, dtype=torch.int32, device=self.seq_lens.device
                 )
+                self.extend_start_loc_cpu = torch.arange(bs, dtype=torch.int32)
                 self.extend_prefix_lens_cpu = self.extend_prefix_lens.cpu()
                 self.extend_seq_lens_cpu = self.extend_seq_lens.cpu()
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
@@ -960,6 +973,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.mamba_track_seqlens = self._pad_tensor_to_size(
                 self.mamba_track_seqlens, bs
             )
+        if self.mamba_track_indices_cpu is not None:
+            self.mamba_track_indices_cpu = self._pad_tensor_to_size(
+                self.mamba_track_indices_cpu, bs
+            )
+        if self.mamba_track_mask_cpu is not None:
+            self.mamba_track_mask_cpu = self._pad_tensor_to_size(
+                self.mamba_track_mask_cpu, bs
+            )
+        if self.mamba_track_seqlens_cpu is not None:
+            self.mamba_track_seqlens_cpu = self._pad_tensor_to_size(
+                self.mamba_track_seqlens_cpu, bs, value=-1
+            )
+        if self.mamba_cache_indices_cpu is not None:
+            self.mamba_cache_indices_cpu = self._pad_tensor_to_size(
+                self.mamba_cache_indices_cpu, bs
+            )
 
         if self.mrope_positions is not None:
             self.mrope_positions = torch.cat(
@@ -975,6 +1004,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+        if self.extend_start_loc is not None:
+            self.extend_start_loc = self._pad_tensor_to_size(self.extend_start_loc, bs)
+        if self.extend_start_loc_cpu is not None:
+            self.extend_start_loc_cpu = self._pad_tensor_to_size(
+                self.extend_start_loc_cpu, bs
+            )
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
             # FIXME(lsyin): remove this isinstance logic
