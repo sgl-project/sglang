@@ -17,6 +17,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, publish_role
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     get_bool_env_var,
     is_cpu,
     is_cuda,
@@ -39,6 +40,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_rvv_available = cpu_has_rvv_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
@@ -436,7 +438,7 @@ class RotaryEmbedding(BaseFusedOp):
         )
 
         positions = torch.add(positions, offsets) if offsets is not None else positions
-        if _is_cpu_amx_available:
+        if _is_cpu_amx_available or _is_cpu_rvv_available:
             # rotary_embedding_cpu requires query and the cache to share a dtype;
             # forward_cuda/forward_xpu already align them, forward_cpu did not.
             self._match_cos_sin_cache_dtype(query)
