@@ -34,6 +34,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_hf_text_config,
     get_sparse_attention_config,
 )
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ class ModelConfig:
         self._validate_quantize_and_serve_config()
 
         # Get hf config
+        self._maybe_pull_model_for_runai(self.model_path)
         self._maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
@@ -156,7 +158,10 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
             ]
-            if self.hf_config.architectures[0] in mm_disabled_models:
+            if (
+                self.hf_config.architectures[0] in mm_disabled_models
+                and self.model_impl != ModelImpl.TRANSFORMERS
+            ):
                 enable_multimodal = False
                 logger.info(
                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
@@ -175,8 +180,14 @@ class ModelConfig:
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        self.is_multimodal = enable_multimodal and is_multimodal_model(
-            self.hf_config.architectures
+        has_multimodal_subconfig = (
+            self.hf_config is not self.hf_text_config
+            or hasattr(self.hf_config, "vision_config")
+            or hasattr(self.hf_config, "audio_config")
+        )
+        self.is_multimodal = enable_multimodal and (
+            is_multimodal_model(self.hf_config.architectures)
+            or has_multimodal_subconfig
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
@@ -221,6 +232,8 @@ class ModelConfig:
 
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
+        # Set by scheduler when reasoning_parser is enabled
+        self.think_end_id: Optional[int] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -1148,6 +1161,13 @@ class ModelConfig:
 
         return default_sampling_params
 
+    def _maybe_pull_model_for_runai(self, model: str) -> None:
+        if is_runai_obj_uri(model):
+            # local path for loading the config
+            self.model_path = ObjectStorageModel.get_path(model)
+            # remote path for loading the weights
+            self.model_weights = model
+
     def _maybe_pull_model_tokenizer_from_remote(self) -> None:
         """
         Pull the model config files to a temporary
@@ -1293,6 +1313,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
@@ -1314,6 +1335,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "VoxtralForConditionalGeneration",
     "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",

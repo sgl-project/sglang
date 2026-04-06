@@ -46,7 +46,7 @@ def apply_split_rotary_emb(
     r = last // 2
 
     # (..., 2, r)
-    split_x = x.reshape(*x.shape[:-1], 2, r)
+    split_x = x.reshape(*x.shape[:-1], 2, r).float()
     first_x = split_x[..., :1, :]  # (..., 1, r)
     second_x = split_x[..., 1:, :]  # (..., 1, r)
 
@@ -153,12 +153,6 @@ class LTX2Attention(torch.nn.Module):
         query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        batch_size, sequence_length, _ = (
-            hidden_states.shape
-            if encoder_hidden_states is None
-            else encoder_hidden_states.shape
-        )
-
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
@@ -183,16 +177,26 @@ class LTX2Attention(torch.nn.Module):
                     key_rotary_emb if key_rotary_emb is not None else query_rotary_emb,
                 )
 
-        query = query.unflatten(2, (self.heads, -1))
-        key = key.unflatten(2, (self.heads, -1))
-        value = value.unflatten(2, (self.heads, -1))
+        query = query.unflatten(2, (self.heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (self.heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (self.heads, -1)).transpose(1, 2)
 
-        hidden_states = self.attn(
+        if attention_mask is not None:
+            if attention_mask.ndim == 2:
+                attention_mask = attention_mask[:, None, None, :]
+            elif attention_mask.ndim == 3:
+                attention_mask = attention_mask[:, None, :, :]
+            attention_mask = attention_mask.to(dtype=query.dtype)
+
+        hidden_states = F.scaled_dot_product_attention(
             query,
             key,
             value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
         )
-        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
         hidden_states = self.to_out[0](hidden_states)
@@ -464,9 +468,7 @@ class LTX2ConnectorTransformer1d(nn.Module):
             attention_mask = torch.zeros_like(attention_mask)
 
         # 2. Calculate 1D RoPE positional embeddings
-        rotary_emb = self.rope(
-            batch_size, seq_len, device=hidden_states.device, dtype=hidden_states.dtype
-        )
+        rotary_emb = self.rope(batch_size, seq_len, device=hidden_states.device)
 
         # 3. Run 1D transformer blocks
         for block in self.transformer_blocks:

@@ -68,6 +68,7 @@ from sglang.srt.utils.common import (
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ LOAD_FORMAT_CHOICES = [
     "remote_instance",
     "fastsafetensors",
     "private",
+    "runai_streamer",
 ]
 
 QUANTIZATION_CHOICES = [
@@ -287,7 +289,7 @@ class ServerArgs:
     The arguments of the server.
 
     NOTE: When you add new arguments, please make sure the order
-    in this class definition the same as the order in the the function
+    in this class definition the same as the order in the function
     `ServerArgs.add_cli_args`.
     Please follow the existing style to group the new arguments into related groups or create new groups.
     """
@@ -371,6 +373,7 @@ class ServerArgs:
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
+    stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     random_seed: Optional[int] = None
@@ -504,8 +507,6 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
 
     # Speculative decoding (ngram)
-    speculative_ngram_min_match_window_size: int = 1
-    speculative_ngram_max_match_window_size: int = 12
     speculative_ngram_min_bfs_breadth: int = 1
     speculative_ngram_max_bfs_breadth: int = 10
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
@@ -745,6 +746,8 @@ class ServerArgs:
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
 
+        self._maybe_download_model_for_runai()
+
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
 
@@ -845,6 +848,17 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+    def _maybe_download_model_for_runai(self):
+        if is_runai_obj_uri(self.model_path):
+            ObjectStorageModel.download_and_get_path(self.model_path)
+
+        if (
+            self.tokenizer_path is not None
+            and is_runai_obj_uri(self.tokenizer_path)
+            and self.tokenizer_path != self.model_path
+        ):
+            ObjectStorageModel.download_and_get_path(self.tokenizer_path)
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -1119,6 +1133,9 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 16. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 17. Context parallel
+        if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
@@ -1411,15 +1428,10 @@ class ServerArgs:
             )
 
         if self.kv_cache_dtype == "auto":
-            # TODO: Temporarily set default dtype on B200 as bfloat16 to avoid performance regression.
-            # TODO: Remove this after the performance regression is fixed. (Ref: https://github.com/sgl-project/sglang/issues/21291)
-            if quantization == "modelopt_fp4" and major >= 10 and self.dp_size > 1:
+            if major >= 10:
                 self.kv_cache_dtype = "fp8_e4m3"
             else:
                 self.kv_cache_dtype = "bfloat16"
-            # self.kv_cache_dtype = (
-            #     "fp8_e4m3" if (major >= 10 and self.dp_size > 1) else "bfloat16"
-            # )
             logger.warning(
                 f"Setting KV cache dtype to {self.kv_cache_dtype} for DeepSeek DSA on SM{major} device."
             )
@@ -1450,12 +1462,9 @@ class ServerArgs:
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            if self.dp_size == 1 and major >= 10:
+            if major >= 10:
                 self.nsa_prefill_backend = "trtllm"
                 self.nsa_decode_backend = "trtllm"
-                logger.warning(
-                    "Flashmla is not supported on Blackwell device without DP attention. Set NSA prefill/decode backends to trtllm, which runs fast but loses a little accuracy."
-                )
             else:
                 # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
                 if not user_set_prefill:
@@ -1523,14 +1532,6 @@ class ServerArgs:
                         )
                         logger.warning(
                             f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
-                        )
-                    if self.nsa_prefill_backend == "trtllm":
-                        # We temporarily set the threshold to 128k to avoid IMA error. Should be removed after supporting flashmla prefill impl with trtllm decode impl.
-                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
-                            128 * 1024
-                        )
-                        logger.warning(
-                            "TRTLLM sparse MLA kernel requires MHA as prefill impl, the threshold for dense attention is overridden. This will be fixed in the future."
                         )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
@@ -3104,8 +3105,10 @@ class ServerArgs:
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
-                self.speculative_num_draft_tokens = (
-                    self.speculative_ngram_max_match_window_size
+                self.speculative_num_draft_tokens = 12
+                logger.warning(
+                    "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
+                    "You can override this by explicitly setting --speculative-num-draft-tokens."
                 )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
@@ -3141,7 +3144,9 @@ class ServerArgs:
                 "Detected Mistral native format checkpoint, setting load_format='mistral'"
             )
 
-        if is_remote_url(self.model_path):
+        if is_runai_obj_uri(self.model_path):
+            self.load_format = "runai_streamer"
+        elif is_remote_url(self.model_path):
             self.load_format = "remote"
 
         if self.custom_weight_loader is None:
@@ -3247,6 +3252,17 @@ class ServerArgs:
                 self.disable_cuda_graph = True
                 logger.warning(
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
+                )
+
+        if self.disaggregation_mode in ("prefill", "decode"):
+            if (
+                envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+                and self.disaggregation_transfer_backend != "mooncake"
+            ):
+                raise ValueError(
+                    f"SGLANG_DISAGG_STAGING_BUFFER requires "
+                    f"disaggregation_transfer_backend='mooncake', "
+                    f"got '{self.disaggregation_transfer_backend}'."
                 )
 
     def _handle_encoder_disaggregation(self):
@@ -4125,6 +4141,12 @@ class ServerArgs:
             help="Whether to output as a sequence of disjoint segments.",
         )
         parser.add_argument(
+            "--stream-response-default-include-usage",
+            action="store_true",
+            help="Include usage in every streaming response "
+            "(even when stream_options is not specified).",
+        )
+        parser.add_argument(
             "--stream-output",
             action=DeprecatedStoreTrueAction,
             dest="incremental_streaming_output",
@@ -4625,10 +4647,11 @@ class ServerArgs:
         parser.add_argument(
             "--experts-shared-outer-loras",
             default=ServerArgs.experts_shared_outer_loras,
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             help="Force shared outer LoRA mode for MoE models. "
             "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
-            "(expert_dim=1). By default this is auto-detected from adapter weights.",
+            "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
+            "By default this is auto-detected from adapter weights.",
         )
 
         # Kernel backend
@@ -4834,18 +4857,6 @@ class ServerArgs:
         )
 
         # Speculative decoding (ngram)
-        parser.add_argument(
-            "--speculative-ngram-min-match-window-size",
-            type=int,
-            default=ServerArgs.speculative_ngram_min_match_window_size,
-            help="The minimum window size for pattern matching in ngram speculative decoding.",
-        )
-        parser.add_argument(
-            "--speculative-ngram-max-match-window-size",
-            type=int,
-            default=ServerArgs.speculative_ngram_max_match_window_size,
-            help="The maximum window size for pattern matching in ngram speculative decoding.",
-        )
         parser.add_argument(
             "--speculative-ngram-min-bfs-breadth",
             type=int,
@@ -6075,11 +6086,12 @@ class ServerArgs:
         }, "moe_dense_tp_size only support 1 and None currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        assert ":" not in self.served_model_name, (
-            "served_model_name cannot contain a colon (':') character. "
-            "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
-            f"Invalid value: '{self.served_model_name}'"
-        )
+        if not is_runai_obj_uri(self.served_model_name):
+            assert ":" not in self.served_model_name, (
+                "served_model_name cannot contain a colon (':') character. "
+                "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
+                f"Invalid value: '{self.served_model_name}'"
+            )
 
         # Check LoRA
         self.check_lora_server_args()
@@ -6166,6 +6178,14 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            hf_config = self.get_model_config().hf_config
+            assert is_deepseek_nsa(hf_config), (
+                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
+                "(e.g., DeepSeek V3.2, GLM-5). "
+            )
+
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."

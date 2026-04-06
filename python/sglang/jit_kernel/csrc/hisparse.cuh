@@ -24,15 +24,29 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
 
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
-  const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
-  uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
-  const int total_chunks = item_size_bytes / sizeof(uint64_t);
+  // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
+  const int total_pairs = item_size_bytes / 16;  // number of 16-byte chunks
+  {
+    const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
+    uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
+    for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
+      uint64_t lo, hi;
+      const uint64_t* s = src + j * 2;
+      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
+      uint64_t* d = dst + j * 2;
+      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
+    }
+  }
 
-#pragma unroll
-  for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
+  // Tail: 64-bit for remaining 8-byte chunk (if item_size not multiple of 16)
+  const int tail_8B = (item_size_bytes - total_pairs * 16) / 8;
+  if (tail_8B > 0 && lane_id < tail_8B) {
+    const uint64_t* __restrict__ src8 =
+        reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
+    uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
     uint64_t tmp;
-    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
-    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
+    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
+    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
   }
 }
 

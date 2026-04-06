@@ -532,7 +532,7 @@ class WaitingImageRequest:
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs["input_ids"]
+        self.recv_req.input_ids = mm_inputs.input_ids
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
 
@@ -672,6 +672,11 @@ class MMReceiverBase(ABC):
                     server_args,
                     _processor,
                     transport_mode,
+                    model_config=(
+                        getattr(self.scheduler, "model_config", None)
+                        if self.scheduler is not None
+                        else None
+                    ),
                     skip_mm_pool=not enable_adaptive_dispatch_to_encoder,
                 )
 
