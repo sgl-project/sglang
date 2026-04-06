@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
 from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
+    replace_parameter,
     swizzle_blockscale,
 )
 from sglang.srt.utils import next_power_of_2, set_weight_attrs
@@ -257,30 +258,16 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
             )
             logger.debug("Finished shuffling weights for TRT-LLM MOE")
 
-            layer.gemm1_weights_fp4_shuffled = torch.nn.Parameter(
-                gemm1_weights_fp4_shuffled, requires_grad=False
-            )
-            layer.gemm2_weights_fp4_shuffled = torch.nn.Parameter(
-                gemm2_weights_fp4_shuffled, requires_grad=False
-            )
-            layer.gemm1_scales_fp4_shuffled = torch.nn.Parameter(
-                gemm1_scales_fp4_shuffled, requires_grad=False
-            )
-            layer.gemm2_scales_fp4_shuffled = torch.nn.Parameter(
-                gemm2_scales_fp4_shuffled, requires_grad=False
-            )
+            replace_parameter(layer, "w13_weight", gemm1_weights_fp4_shuffled)
+            replace_parameter(layer, "w2_weight", gemm2_weights_fp4_shuffled)
+            replace_parameter(layer, "w13_weight_scale", gemm1_scales_fp4_shuffled)
+            replace_parameter(layer, "w2_weight_scale", gemm2_scales_fp4_shuffled)
 
             # Additional parameter needed for TRT-LLM
             layer.g1_scale_c = torch.nn.Parameter(
                 (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
                 requires_grad=False,
             )
-
-            # Clean up weights that won't be used by TRT-LLM
-            del layer.w2_weight
-            del layer.w2_weight_scale
-            del layer.w13_weight
-            del layer.w13_weight_scale
         else:
             # swizzle weight scales
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -370,18 +357,14 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 routing_bias=correction_bias,
                 hidden_states=hs_fp4,
                 hidden_states_scale=hs_scale,
-                gemm1_weights=layer.gemm1_weights_fp4_shuffled,
-                gemm1_weights_scale=layer.gemm1_scales_fp4_shuffled.view(
-                    torch.float8_e4m3fn
-                ),
+                gemm1_weights=layer.w13_weight,
+                gemm1_weights_scale=layer.w13_weight_scale.view(torch.float8_e4m3fn),
                 gemm1_bias=None,
                 gemm1_alpha=None,
                 gemm1_beta=None,
                 gemm1_clamp_limit=None,
-                gemm2_weights=layer.gemm2_weights_fp4_shuffled,
-                gemm2_weights_scale=layer.gemm2_scales_fp4_shuffled.view(
-                    torch.float8_e4m3fn
-                ),
+                gemm2_weights=layer.w2_weight,
+                gemm2_weights_scale=layer.w2_weight_scale.view(torch.float8_e4m3fn),
                 gemm2_bias=None,
                 output1_scale_scalar=layer.g1_scale_c,
                 output1_scale_gate_scalar=layer.g1_alphas,
