@@ -84,6 +84,7 @@ from sglang.srt.configs import (
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Olmo3Config,
+    Qwen3ASRConfig,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
@@ -124,6 +125,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,
+    Qwen3ASRConfig,
     Step3p5Config,
 ]
 

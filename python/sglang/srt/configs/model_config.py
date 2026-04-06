@@ -1337,6 +1337,7 @@ multimodal_model_archs = [
     "Phi4MMForCausalLM",
     "VoxtralForConditionalGeneration",
     "WhisperForConditionalGeneration",
+    "Qwen3ASRForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
     "DotsVLMForCausalLM",
@@ -1377,6 +1378,7 @@ def is_multimodal_model(model_architectures: List[str]):
 def is_audio_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
+        "Qwen3ASRForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
