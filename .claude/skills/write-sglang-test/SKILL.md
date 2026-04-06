@@ -172,7 +172,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-Use `unittest.mock.patch` / `MagicMock` to mock dependencies and isolate the logic under test. If the module transitively imports GPU-only packages (e.g. `sgl_kernel`), they can be stubbed so the test runs on CPU CI. See `test/registered/unit/README.md` for details and examples.
+Use `unittest.mock.patch` / `MagicMock` to mock dependencies and isolate the logic under test. If the module transitively imports GPU-only packages (e.g. `sgl_kernel`), they can be stubbed so the test runs on CPU CI. Do not modify `sys.modules` at module level — use `setUpModule` + `patch.dict` instead to avoid cross-test pollution. See `test/registered/unit/README.md` for details and examples.
 
 **Quality bar** — test real logic (validation boundaries, state transitions, error paths, branching, etc.). Skip tests that just verify Python itself works (e.g., "does calling an abstract method raise `NotImplementedError`?", "does a dataclass store the field I assigned?"). Consolidate repetitive patterns into parameterized tests. No production code changes in test PRs.
 
@@ -440,5 +440,6 @@ Before submitting a test:
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)
 - [ ] `tearDownClass` is defensive — uses `hasattr`/null checks before accessing resources that may not have been allocated
+- [ ] **No module-level `sys.modules` mutation** — never inject stubs into `sys.modules` at import time; use `setUpModule` + `patch.dict` if unavoidable (see "Avoiding sys.modules pollution")
 - [ ] Has `if __name__ == "__main__": unittest.main()`
 - [ ] `est_time` is reasonable (measure locally)

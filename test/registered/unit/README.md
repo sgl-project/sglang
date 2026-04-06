@@ -83,6 +83,11 @@ register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 The same pattern can be applied to other GPU-only packages: try importing the real package, and if it fails, register a `sys.meta_path` finder that stubs it. See `maybe_stub_sgl_kernel()` in `python/sglang/test/test_utils.py` for the implementation.
 
+Do not inject stubs into `sys.modules` at module level — pytest imports all test files
+before running any of them, so module-level mutations pollute the entire process and
+break other tests. Prefer real imports (most `sglang.srt.*` modules work on CPU CI),
+or use `setUpModule` + `patch.dict("sys.modules", ...)` for unavoidable stubs.
+
 ## Rules
 
 - **No** `popen_launch_server()` or `Engine(...)`.
