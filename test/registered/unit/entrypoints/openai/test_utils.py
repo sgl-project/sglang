@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 import unittest
 from unittest.mock import MagicMock
@@ -14,9 +14,10 @@ from sglang.srt.entrypoints.openai.utils import (
     process_routed_experts_from_ret,
     to_openai_style_logprobs,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestToOpenaiStyleLogprobs(unittest.TestCase):
+class TestToOpenaiStyleLogprobs(CustomTestCase):
     """Tests for to_openai_style_logprobs()."""
 
     def test_all_none_returns_empty_logprobs(self):
@@ -138,7 +139,7 @@ class TestToOpenaiStyleLogprobs(unittest.TestCase):
         self.assertEqual(result.top_logprobs, [])
 
 
-class TestProcessHiddenStatesFromRet(unittest.TestCase):
+class TestProcessHiddenStatesFromRet(CustomTestCase):
     """Tests for process_hidden_states_from_ret()."""
 
     def _make_request(self, return_hidden_states=False):
@@ -190,7 +191,7 @@ class TestProcessHiddenStatesFromRet(unittest.TestCase):
         self.assertEqual(result, [0.9])
 
 
-class TestProcessRoutedExpertsFromRet(unittest.TestCase):
+class TestProcessRoutedExpertsFromRet(CustomTestCase):
     """Tests for process_routed_experts_from_ret()."""
 
     def _make_request(self, return_routed_experts=False):
@@ -225,13 +226,13 @@ class TestProcessRoutedExpertsFromRet(unittest.TestCase):
 
     def test_attribute_not_present_returns_none(self):
         """When request has no return_routed_experts attribute, returns None."""
-        req = MagicMock(spec=[])  # empty spec, no attributes
+        req = object()  # plain object with no attributes
         ret_item = {"meta_info": {"routed_experts": "data"}}
         result = process_routed_experts_from_ret(ret_item, req)
         self.assertIsNone(result)
 
 
-class TestProcessCachedTokensDetailsFromRet(unittest.TestCase):
+class TestProcessCachedTokensDetailsFromRet(CustomTestCase):
     """Tests for process_cached_tokens_details_from_ret()."""
 
     def _make_request(self, return_cached_tokens_details=False):
@@ -318,7 +319,7 @@ class TestProcessCachedTokensDetailsFromRet(unittest.TestCase):
 
     def test_attribute_not_present_returns_none(self):
         """When request has no return_cached_tokens_details attribute, returns None."""
-        req = MagicMock(spec=[])  # empty spec, no attributes
+        req = object()  # plain object with no attributes
         ret_item = {"meta_info": {"cached_tokens_details": {"device": 1, "host": 2}}}
         result = process_cached_tokens_details_from_ret(ret_item, req)
         self.assertIsNone(result)

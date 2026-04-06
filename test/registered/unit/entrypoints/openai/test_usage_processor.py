@@ -2,15 +2,16 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestDetailsIfCached(unittest.TestCase):
+class TestDetailsIfCached(CustomTestCase):
     """Tests for UsageProcessor._details_if_cached()."""
 
     def test_positive_count_returns_details(self):
@@ -30,7 +31,7 @@ class TestDetailsIfCached(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class TestCalculateTokenUsage(unittest.TestCase):
+class TestCalculateTokenUsage(CustomTestCase):
     """Tests for UsageProcessor.calculate_token_usage()."""
 
     def test_basic_usage(self):
@@ -68,7 +69,7 @@ class TestCalculateTokenUsage(unittest.TestCase):
         self.assertIsNone(result.prompt_tokens_details)
 
 
-class TestCalculateResponseUsage(unittest.TestCase):
+class TestCalculateResponseUsage(CustomTestCase):
     """Tests for UsageProcessor.calculate_response_usage()."""
 
     def _make_response(self, prompt_tokens, completion_tokens, cached_tokens=0):
@@ -176,7 +177,7 @@ class TestCalculateResponseUsage(unittest.TestCase):
         self.assertEqual(result.total_tokens, 0)
 
 
-class TestCalculateStreamingUsage(unittest.TestCase):
+class TestCalculateStreamingUsage(CustomTestCase):
     """Tests for UsageProcessor.calculate_streaming_usage()."""
 
     def test_single_choice_streaming(self):
