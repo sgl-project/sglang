@@ -64,6 +64,8 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    cpu_has_amx_support,
+    cpu_has_rvv_support,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -75,7 +77,6 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
-    is_host_cpu_arm64,
     is_mnnvl_fabric_device,
     is_mps,
     is_musa,
@@ -199,6 +200,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "rvv",
 ]
 
 # Attention backends whose kernels read the chunked prefix-cache layout.
@@ -4170,9 +4172,16 @@ class ServerArgs:
     def _handle_cpu_backends(self):
         if self.device == "cpu":
             if self.attention_backend is None:
-                self.attention_backend = (
-                    "torch_native" if is_host_cpu_arm64() else "intel_amx"
-                )
+                if cpu_has_amx_support():
+                    self.attention_backend = "intel_amx"
+                elif cpu_has_rvv_support():
+                    self.attention_backend = "rvv"
+                else:
+                    logger.info(
+                        "No specialized CPU backend detected (AMX/RVV), using torch_native. "
+                        "Performance may be limited."
+                    )
+                    self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
     def _handle_npu_backends(self):
