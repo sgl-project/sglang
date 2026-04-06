@@ -1,9 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared helpers for ModelOpt NVFP4 weight/activation layout."""
+"""Shared helpers for ModelOpt quantization (NVFP4 layout, FlashInfer CUTLASS fused MoE)."""
 
 from __future__ import annotations
 
+from enum import IntEnum
+
 import torch
+
+try:
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
+except ImportError:
+    flashinfer_cutlass_fused_moe = None
+
+    class ActivationType(IntEnum):
+        Swiglu = 3
+        Relu2 = 6
+
+
+ACT_STR_TO_TYPE_MAP = {
+    "silu": ActivationType.Swiglu,
+    "relu2": ActivationType.Relu2,
+}
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
 FP4_GEMM_ALIGNMENT = 32

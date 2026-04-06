@@ -33,7 +33,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.modelopt.modelopt import ModelOptQuantConfig
-from sglang.srt.layers.quantization.modelopt.schemes.modelopt_fp4 import (
+from sglang.srt.layers.quantization.modelopt.utils import (
     ACT_STR_TO_TYPE_MAP,
     ActivationType,
     flashinfer_cutlass_fused_moe,

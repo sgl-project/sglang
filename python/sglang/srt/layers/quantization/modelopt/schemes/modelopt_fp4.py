@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -32,6 +31,8 @@ from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
 from sglang.srt.layers.quantization.modelopt.modelopt import ModelOptQuantConfig
 from sglang.srt.layers.quantization.modelopt.utils import (
+    ACT_STR_TO_TYPE_MAP,
+    flashinfer_cutlass_fused_moe,
     pad_nvfp4_activation_for_cutlass,
     pad_nvfp4_weight,
     round_up_to_multiple,
@@ -87,16 +88,7 @@ if is_cuda():
 else:
     cutlass_fp4_gemm = None
 
-try:
-    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-    from flashinfer.fused_moe.core import ActivationType
-except ImportError:
-    flashinfer_cutlass_fused_moe = None
-
-    # Define a minimal ActivationType enum if flashinfer is not available
-    class ActivationType(IntEnum):
-        Swiglu = 3
-        Relu2 = 6
+logger = logging.getLogger(__name__)
 
 
 def _sglang_fp4_gemm_fake(
@@ -159,13 +151,6 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
-
-ACT_STR_TO_TYPE_MAP = {
-    "silu": ActivationType.Swiglu,  # This is the default
-    "relu2": ActivationType.Relu2,
-}
-
-logger = logging.getLogger(__name__)
 
 
 class ModelOptFp4Config(ModelOptQuantConfig):
