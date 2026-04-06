@@ -607,10 +607,10 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
-    def write_backup(self, node: TreeNode, write_back=False):
+    def write_backup(self, node: TreeNode, write_back=False) -> int:
         # Backup invariant: parent must be backed up before child.
         if node.parent != self.root_node and not node.parent.backuped:
-            return
+            return 0
 
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -801,8 +801,8 @@ class HiRadixCache(RadixCache):
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
                     written = self.write_backup(x, write_back=True)
-                    if written is not None:
-                        num_evicted += written
+                    num_evicted += written
+                    if written > 0:
                         write_back_nodes.append(x)
                 else:
                     num_evicted += self._evict_regular(x)
