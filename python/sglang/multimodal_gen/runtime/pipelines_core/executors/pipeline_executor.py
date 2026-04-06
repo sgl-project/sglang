@@ -6,8 +6,8 @@ Base class for all pipeline executors.
 """
 
 import contextlib
+import copy
 from abc import ABC, abstractmethod
-from copy import deepcopy
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -59,8 +59,8 @@ def _split_stages_by_per_output(
 
 
 def _prepare_single_output_batch(batch: Req, output_index: int) -> Req:
-    """Create a deep copy of batch configured for a single output."""
-    sub_batch = deepcopy(batch)
+    """Create a shallow copy of batch configured for a single output."""
+    sub_batch = copy.copy(batch)
 
     if isinstance(batch.generator, list) and len(batch.generator) > 1:
         sub_batch.generator = [batch.generator[output_index]]
@@ -98,16 +98,37 @@ def _merge_output_batches(output_batches: List[OutputBatch]) -> OutputBatch:
         outputs.numel() > 0 if isinstance(outputs, torch.Tensor) else bool(outputs)
     )
 
+    # Merge trajectory data across outputs.
+    # trajectory_timesteps are identical for every output – take the first.
     merged_trajectory_timesteps = None
-    merged_trajectory_latents = None
-    merged_trajectory_decoded = None
     for ob in output_batches:
         if ob.trajectory_timesteps is not None:
             merged_trajectory_timesteps = ob.trajectory_timesteps
-        if ob.trajectory_latents is not None:
-            merged_trajectory_latents = ob.trajectory_latents
-        if ob.trajectory_decoded is not None:
-            merged_trajectory_decoded = ob.trajectory_decoded
+            break
+
+    # trajectory_latents: concatenate along batch dim (dim 0).
+    merged_trajectory_latents = None
+    traj_latent_parts = [
+        ob.trajectory_latents
+        for ob in output_batches
+        if ob.trajectory_latents is not None
+    ]
+    if traj_latent_parts:
+        merged_trajectory_latents = torch.cat(traj_latent_parts, dim=0)
+
+    # trajectory_decoded: list[Tensor] per timestep, each shaped [B_i, ...].
+    # Concatenate along batch dim so the merged list keeps the same timesteps.
+    merged_trajectory_decoded = None
+    traj_decoded_parts = [
+        ob.trajectory_decoded
+        for ob in output_batches
+        if ob.trajectory_decoded is not None
+    ]
+    if traj_decoded_parts:
+        merged_trajectory_decoded = [
+            torch.cat([part[t] for part in traj_decoded_parts], dim=0)
+            for t in range(len(traj_decoded_parts[0]))
+        ]
 
     return OutputBatch(
         output=outputs if has_outputs else None,
