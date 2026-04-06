@@ -41,6 +41,10 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.rvv_utils import (
+    resolve_rvv_lm_head_weight,
+    use_rvv_lm_head_backend,
+)
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     compute_temp_top_p_normalized_logprobs,
@@ -905,6 +909,14 @@ class LogitsProcessor(nn.Module):
                     lm_head.weight,
                     None,  # bias
                     True,  # is_vnni
+                )
+            elif use_rvv_lm_head_backend(lm_head):
+                rvv_weight = resolve_rvv_lm_head_weight(lm_head)
+                logits = torch.ops.sgl_kernel.weight_packed_linear(
+                    hidden_states.to(rvv_weight.dtype),
+                    rvv_weight,
+                    None,  # bias
+                    True,  # is_packed
                 )
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
