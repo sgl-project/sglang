@@ -86,6 +86,19 @@ def _merge_output_batches(output_batches: List[OutputBatch]) -> OutputBatch:
             elif isinstance(ob.output, torch.Tensor):
                 outputs.append(ob.output)
 
+    # Cat into (N, ...) tensor so enumerate() yields per-sample slices.
+    if outputs and all(isinstance(o, torch.Tensor) for o in outputs):
+        try:
+            outputs = torch.cat(outputs, dim=0)
+        except Exception:
+            pass
+
+    # Bool check safe for both list and tensor.
+    has_outputs = (
+        outputs.numel() > 0 if isinstance(outputs, torch.Tensor)
+        else bool(outputs)
+    )
+
     merged_trajectory_timesteps = None
     merged_trajectory_latents = None
     merged_trajectory_decoded = None
@@ -98,7 +111,7 @@ def _merge_output_batches(output_batches: List[OutputBatch]) -> OutputBatch:
             merged_trajectory_decoded = ob.trajectory_decoded
 
     return OutputBatch(
-        output=outputs if outputs else None,
+        output=outputs if has_outputs else None,
         trajectory_timesteps=merged_trajectory_timesteps,
         trajectory_latents=merged_trajectory_latents,
         trajectory_decoded=merged_trajectory_decoded,
