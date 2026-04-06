@@ -91,6 +91,8 @@ void Trie::squeeze(size_t count) {
 }
 
 void Trie::reset() {
+  // Epoch bump invalidates all cached MatchState objects, so we do not need to
+  // retireNode() on every node individually.
   ++trie_epoch_;
   global_lru_.clear();
   path_.clear();
@@ -150,16 +152,17 @@ bool Trie::advanceMatchState_(MatchState& state, const int32_t* tokens, size_t l
     return false;
   }
 
+  // Reuse a single buffer across iterations to avoid per-token heap allocation.
+  std::vector<NodeRef> next;
+  next.reserve(param_.max_trie_depth);
+
   for (size_t i = 0; i < len; ++i) {
     const auto next_depth = std::min(state.anchors.size() + 1, param_.max_trie_depth);
-    std::vector<NodeRef> next(next_depth);
+    next.assign(next_depth, {});
 
-    const auto root_ref = rootRef();
-    const auto root = resolve(state, root_ref);
-    if (root == nullptr) {
-      return false;
-    }
-    if (auto iter = root->child.find(tokens[i]); iter != root->child.end()) {
+    // Root is never evicted, so we access it directly; the epoch was already
+    // validated above.
+    if (auto iter = root_->child.find(tokens[i]); iter != root_->child.end()) {
       next[0] = capture(iter->second);
     }
 

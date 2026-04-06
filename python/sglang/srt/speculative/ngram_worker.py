@@ -269,6 +269,10 @@ class NGRAMWorker:
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_corpus(batch)
+            # Clean up per-request match state for finished/retracted requests.
+            # State entries are created in _prepare_draft_tokens and cleaned here.
+            # If a request is removed without passing through verify, the entry
+            # persists until reset(); this is acceptable because MatchState is small.
             finished_req_ids = []
             for req in batch.reqs:
                 if req.finished() or req.is_retracted:

@@ -24,6 +24,8 @@ struct TrieNode {
   int32_t freq = 0;
   // Logical generation of this TrieNode. retireNode() bumps it before the node
   // goes back to the pool so stale NodeRefs fail validation after reuse.
+  // Starts at 1 so that a default-constructed NodeRef (version=0) never
+  // accidentally resolves to a live node.
   uint64_t version = 1;
 
   struct CompareByFreq {
