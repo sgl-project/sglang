@@ -139,21 +139,21 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
               - "scripts/ci/amd/*"
               - "scripts/ci/utils/*"
-              - "test/**"
+              - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             sgl_kernel:
-              - "sgl-kernel/**"
+              - "sgl-kernel/**/*.!(md|txt)"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             jit_kernel:
               - "python/sglang/jit_kernel/**"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**"
+              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
               - "python/sglang/cli/**"
               - "python/sglang/jit_kernel/diffusion/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
@@ -794,7 +794,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-4gpu-sglang]
-        part: [0, 1]
+        part: [0]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -826,7 +826,7 @@ jobs:
               --hw amd \
               --suite stage-c-test-4-gpu-amd \
               --auto-partition-id ${{ matrix.part }} \
-              --auto-partition-size 2 \
+              --auto-partition-size 1 \
               --timeout-per-file 1800 \
               --enable-retry \
               --max-attempts 2 \

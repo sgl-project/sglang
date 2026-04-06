@@ -80,6 +80,30 @@ def poll_and_all_reduce_attn_cp_tp_group(
     return tensor_to_reduce.tolist()
 
 
+def poll_and_all_reduce_with_staging(
+    decode_reqs, staging_handler, gloo_group: dist.ProcessGroup
+):
+    """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
+    from sglang.srt.disaggregation.base import KVPoll
+
+    for decode_req in decode_reqs:
+        if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
+            decode_req
+        ):
+            staging_handler.advance_scatter(decode_req)
+
+    raw_polls = [int(dr.kv_receiver.poll()) for dr in decode_reqs]
+    for i, decode_req in enumerate(decode_reqs):
+        if raw_polls[i] == int(KVPoll.Success):
+            if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
+                decode_req
+            ):
+                raw_polls[i] = int(KVPoll.Transferring)
+    poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
+    return poll_tensor.tolist()
+
+
 #########################
 # Metadata Buffers
 #########################
@@ -227,6 +251,9 @@ class MetadataBuffers:
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
+        self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
+        self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
+        self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
