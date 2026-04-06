@@ -46,6 +46,7 @@ class ExternalCorpusManager:
         if thread.is_alive():
             return
         self._pending_load = None
+        thread.join()  # formal happens-before for _load_result visibility
         result = self._load_result
         self._load_result = None
         self._send_response(result, recv_req)
