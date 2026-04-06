@@ -184,6 +184,17 @@ class BreakablePiecewiseCudaGraphRunner:
             )
         )
 
+        # Static buffers for forward_batch tensors read inside graph segments
+        # (especially by the logits processor in the last segment).
+        # These MUST persist so the graph reads from stable addresses.
+        with torch.device(self.device):
+            self.static_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.static_extend_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.static_extend_prefix_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.static_extend_start_loc = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.static_req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.static_orig_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
+
         # Graph storage
         self.graphs = {}
         self.output_buffers = {}
@@ -202,63 +213,76 @@ class BreakablePiecewiseCudaGraphRunner:
         self.raw_num_tokens = 0
 
     def _build_forward_batch(self, num_tokens: int) -> ForwardBatch:
-        """Build a ForwardBatch for capture/warmup."""
+        """Build a ForwardBatch for capture/warmup.
+
+        Uses static buffers for GPU tensors that may be read inside graph
+        segments (e.g., by the logits processor) so addresses are stable.
+        """
         buffers = self.buffers
         bs = 1
-        with torch.device(self.device):
-            return ForwardBatch(
-                forward_mode=ForwardMode.EXTEND,
-                batch_size=bs,
-                input_ids=buffers.input_ids[:num_tokens],
-                input_embeds=(
-                    buffers.input_embeds[:num_tokens] if self.is_multimodal else None
-                ),
-                req_pool_indices=torch.arange(bs, device=self.device),
-                seq_lens=torch.tensor([num_tokens], device=self.device),
-                next_token_logits_buffer=None,
-                orig_seq_lens=torch.tensor([num_tokens], device=self.device),
-                seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                req_to_token_pool=self.model_runner.req_to_token_pool,
-                token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                attn_backend=self.model_runner.attn_backend,
-                out_cache_loc=buffers.out_cache_loc[:num_tokens],
-                out_cache_loc_swa=(
-                    buffers.out_cache_loc_swa[:num_tokens]
-                    if buffers.out_cache_loc_swa is not None
-                    else None
-                ),
-                seq_lens_sum=num_tokens,
-                mamba_track_indices=None,
-                mamba_track_mask=None,
-                mamba_track_seqlens=None,
-                encoder_lens=None,
-                return_logprob=False,
-                extend_num_tokens=num_tokens,
-                extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=torch.tensor([0], device=self.device),
-                extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-                extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor(
-                    [num_tokens], device="cpu"
-                ),
-                positions=buffers.positions[:num_tokens],
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
-                dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
-                mrope_positions=(
-                    buffers.mrope_positions[:, :num_tokens]
-                    if self.is_multimodal
-                    else None
-                ),
-                spec_algorithm=None,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
-                global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
-            )
+        # Set values in static buffers (persistent addresses for graph capture)
+        self.static_seq_lens[:bs].fill_(num_tokens)
+        self.static_extend_seq_lens[:bs].fill_(num_tokens)
+        self.static_extend_prefix_lens[:bs].zero_()
+        self.static_extend_start_loc[:bs].zero_()
+        self.static_req_pool_indices[:bs].copy_(
+            torch.arange(bs, device=self.device)
+        )
+        self.static_orig_seq_lens[:bs].fill_(num_tokens)
+
+        return ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=bs,
+            input_ids=buffers.input_ids[:num_tokens],
+            input_embeds=(
+                buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+            ),
+            req_pool_indices=self.static_req_pool_indices[:bs],
+            seq_lens=self.static_seq_lens[:bs],
+            next_token_logits_buffer=None,
+            orig_seq_lens=self.static_orig_seq_lens[:bs],
+            seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=self.model_runner.attn_backend,
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_swa=(
+                buffers.out_cache_loc_swa[:num_tokens]
+                if buffers.out_cache_loc_swa is not None
+                else None
+            ),
+            seq_lens_sum=num_tokens,
+            mamba_track_indices=None,
+            mamba_track_mask=None,
+            mamba_track_seqlens=None,
+            encoder_lens=None,
+            return_logprob=False,
+            extend_num_tokens=num_tokens,
+            extend_seq_lens=self.static_extend_seq_lens[:bs],
+            extend_prefix_lens=self.static_extend_prefix_lens[:bs],
+            extend_start_loc=self.static_extend_start_loc[:bs],
+            extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
+            extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            extend_logprob_start_lens_cpu=torch.tensor(
+                [num_tokens], device="cpu"
+            ),
+            positions=buffers.positions[:num_tokens],
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=None,
+            mrope_positions=(
+                buffers.mrope_positions[:, :num_tokens]
+                if self.is_multimodal
+                else None
+            ),
+            spec_algorithm=None,
+            spec_info=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=None,
+            global_forward_mode=ForwardMode.EXTEND,
+            lora_ids=None,
+        )
 
     def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
         """Run model forward with proper context."""
@@ -472,6 +496,16 @@ class BreakablePiecewiseCudaGraphRunner:
             self.model_runner.token_to_kv_pool.set_swa_loc(
                 buffers.out_cache_loc_swa[:static_num_tokens]
             )
+
+        # Update static buffers used by graph segments (esp. logits processor).
+        # The graph reads from these addresses — they must have the serving-time values.
+        self.static_seq_lens[:bs].copy_(forward_batch.seq_lens)
+        self.static_extend_seq_lens[:bs].copy_(forward_batch.extend_seq_lens)
+        self.static_extend_prefix_lens[:bs].copy_(forward_batch.extend_prefix_lens)
+        self.static_extend_start_loc[:bs].copy_(forward_batch.extend_start_loc)
+        self.static_req_pool_indices[:bs].copy_(forward_batch.req_pool_indices)
+        if forward_batch.orig_seq_lens is not None:
+            self.static_orig_seq_lens[:bs].copy_(forward_batch.orig_seq_lens)
 
         # Set forward context and replay
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
