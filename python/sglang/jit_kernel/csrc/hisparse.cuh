@@ -24,15 +24,29 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
 
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
-  const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
-  uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
-  const int total_chunks = item_size_bytes / sizeof(uint64_t);
+  // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
+  const int total_pairs = item_size_bytes / 16;  // number of 16-byte chunks
+  {
+    const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
+    uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
+    for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
+      uint64_t lo, hi;
+      const uint64_t* s = src + j * 2;
+      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
+      uint64_t* d = dst + j * 2;
+      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
+    }
+  }
 
-#pragma unroll
-  for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
+  // Tail: 64-bit for remaining 8-byte chunk (if item_size not multiple of 16)
+  const int tail_8B = (item_size_bytes - total_pairs * 16) / 8;
+  if (tail_8B > 0 && lane_id < tail_8B) {
+    const uint64_t* __restrict__ src8 =
+        reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
+    uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
     uint64_t tmp;
-    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
-    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
+    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
+    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
   }
 }
 
@@ -267,20 +281,6 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  // Write back LRU order: evictables at front (LRU), hits at back (MRU).
-  {
-    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
-    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
-      if (i < total_evictable) {
-        // Evictables: source at backward end, dest at LRU front
-        req_lru_slots[i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
-      } else {
-        // Hits: source at forward end, dest at MRU back
-        req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
-      }
-    }
-  }
-
   // Reset offsets for the miss counting phase (only NUM_TOKEN_CHUNKS + 1 entries needed).
   for (int i = tid; i < NUM_TOKEN_CHUNKS + 1; i += BLOCK_SIZE) {
     s_chunk_offset[i] = 0;
@@ -337,6 +337,23 @@ __global__ void load_cache_to_device_buffer_kernel(
   __syncthreads();
 
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  // Write back LRU order: evictables at front (LRU), hits at back (MRU).
+  {
+    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
+    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+      if (i < total_misses) {
+        // Misses: just loaded from host, place right before hits
+        req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else if (i < total_evictable) {
+        // Remaining evictables: truly stale, dest at LRU front
+        req_lru_slots[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else {
+        // Hits: source at forward end, dest at MRU back
+        req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
+      }
+    }
+  }
+
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
