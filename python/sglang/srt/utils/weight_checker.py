@@ -38,6 +38,8 @@ class WeightChecker:
 
     def _reset_tensors(self):
         for name, param in self._model_state():
+            if "cos_sin_cache" in name or "freqs_cis" in name:
+                continue
             param.copy_(_random_like(param))
 
     def _compare(self):
@@ -131,18 +133,20 @@ def _postprocess_tensors(
         if name.endswith("weight") and name.replace("weight", "weight_scale_inv") in raw
     ]
     skip_compare_names += quant_names
+    skip_compare_names += [
+        name.replace("weight", "weight_scale_inv") for name in quant_names
+    ]
     for name in quant_names:
         w_q = raw[name]
         w_s = raw[name.replace("weight", "weight_scale_inv")]
 
         try:
-            # TODO this is only needed for Blackwell
-            w_s_inverse_transformed = inverse_transform_scale_ue8m0(
-                w_s, mn=w_q.shape[-2]
-            )
+            if w_s.dtype == torch.int32:
+                # UE8M0 packed format (Blackwell DeepGEMM)
+                w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
             w_dequant = block_quant_dequant(
                 w_q,
-                w_s_inverse_transformed,
+                w_s,
                 # TODO do not hardcode
                 block_size=[128, 128],
                 dtype=torch.bfloat16,
