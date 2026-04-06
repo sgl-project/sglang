@@ -753,14 +753,12 @@ class MambaRadixCache(BasePrefixCache):
 
     def evict_mamba(self, mamba_num: int) -> int:
         """Evict mamba states. Returns the number of mamba states evicted."""
-        logger.info("evict mamba num: %d", mamba_num)
         if self.eviction_policy == "seglen":
             return self._evict_mamba_seglen(mamba_num)
         return self._evict_mamba_lru(mamba_num)
 
     def evict_full(self, full_num_tokens: int) -> int:
         """Evict full KV cache. Returns the number of tokens evicted."""
-        logger.info("evict_full num tokens: %d", full_num_tokens)
         if self.eviction_policy == "seglen":
             return self._evict_full_seglen(full_num_tokens)
         return self._evict_full_lru(full_num_tokens)
