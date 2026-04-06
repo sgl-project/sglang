@@ -42,6 +42,7 @@ def support_triton(backend: str) -> bool:
     return current_platform.capabilities.supports_triton and backend not in [
         "torch_native",
         "intel_amx",
+        "rvv",
     ]
 
 
