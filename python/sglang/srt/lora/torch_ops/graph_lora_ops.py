@@ -65,10 +65,7 @@ def sgemm_lora_a_graph_fwd(
         x_seq = torch.where(batch_token_mask, inputs, 0)
         w_seq = weights[lora_idx]
 
-        output.add_(
-            scaling_tensor[lora_idx]
-            * torch.where(batch_token_mask, torch.mm(x_seq, w_seq.t()), 0)
-        )
+        output.add_(scaling_tensor[lora_idx] * torch.mm(x_seq, w_seq.t(), 0))
 
     return output
 
@@ -103,6 +100,7 @@ def sgemm_lora_b_graph_fwd(
     for lora_idx in range(num_loras):
 
         batch_token_mask = (weight_indices[:total_seq_len] == lora_idx).unsqueeze(1)
+        inputs_masked = torch.where(batch_token_mask, inputs, 0)
 
         for slice_idx in range(num_slices):
             slice_start_input = slice_idx * max_rank
@@ -111,14 +109,12 @@ def sgemm_lora_b_graph_fwd(
             slice_start_output = slice_offsets[slice_idx]
             slice_end_output = slice_offsets[slice_idx + 1]
 
-            x_slice = torch.where(
-                batch_token_mask, inputs[..., slice_start_input:slice_end_input], 0
-            )  # (total_seq_len, max_rank)
+            x_slice = inputs_masked[..., slice_start_input:slice_end_input]
             w_slice = weights[
                 lora_idx, slice_start_output:slice_end_output
             ]  # (slice_dim, max_rank)
             output[..., slice_start_output:slice_end_output].add_(
-                torch.where(batch_token_mask, torch.mm(x_slice, w_slice.t()), 0)
+                torch.mm(x_slice, w_slice.t())
             )
 
     return output
