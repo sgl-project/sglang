@@ -33,6 +33,7 @@ class TestRing2_5_1T(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args,
                 variant="TP8",
+                launch_timeout=1800,
             ),
         ]
 

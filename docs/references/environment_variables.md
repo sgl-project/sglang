@@ -121,8 +121,6 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_INT4_WEIGHT` | Enable INT4 weight quantization | `false` |
 | `SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2` | Apply per token group quantization kernel with fused silu and mul and masked m | `false` |
 | `SGLANG_FORCE_FP8_MARLIN` | Force using FP8 MARLIN kernels even if other FP8 kernels are available | `false` |
-| `SGLANG_FORCE_NVFP4_MARLIN` | Force using NVFP4 Marlin fallback kernels even on Blackwell GPUs with native FP4 support | `false` |
-| `SGLANG_FLASHINFER_FP4_GEMM_BACKEND` (deprecated) | Select backend for `mm_fp4` on Blackwell GPUs. **DEPRECATED**: Please use `--fp4-gemm-backend` instead. | `` |
 | `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN` | Quantize q_b_proj from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_MOE_NVFP4_DISPATCH` | Use nvfp4 for moe dispatch (on flashinfer_cutlass or flashinfer_cutedsl moe runner backend) | `"false"` |
 | `SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE` | Quantize moe of nextn layer from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
@@ -138,6 +136,15 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_IS_FIRST_RANK_ON_NODE` | Indicates if the current process is the first rank on its node | `"true"` |
 | `SGLANG_PP_LAYER_PARTITION` | Pipeline parallel layer partition specification | Not set |
 | `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` | Set one visible device per process for distributed computing | `false` |
+
+## PD Disaggregation — Staging Buffer (Heterogeneous TP)
+
+| Environment Variable | Description | Default Value |
+| --- | --- | --- |
+| `SGLANG_DISAGG_STAGING_BUFFER` | Enable GPU staging buffer for heterogeneous TP KV transfer. Required when prefill and decode use different TP/attention-TP sizes. Only for non-MLA models (e.g. GQA, MHA). | `false` |
+| `SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB` | Prefill-side per-worker staging buffer size in MB. Used for gathering KV head slices before bulk RDMA transfer. | `64` |
+| `SGLANG_DISAGG_STAGING_POOL_SIZE_MB` | Decode-side ring buffer pool total size in MB. Shared buffer receiving RDMA data from all prefill ranks. Larger values support higher concurrency. | `4096` |
+| `SGLANG_STAGING_USE_TORCH` | Force using PyTorch gather/scatter fallback instead of Triton fused kernels for staging operations. Useful for debugging. | `false` |
 
 ## Testing & Debugging (Internal/CI)
 

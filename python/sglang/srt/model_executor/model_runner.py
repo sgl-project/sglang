@@ -42,6 +42,7 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     Lfm2Config,
     Lfm2MoeConfig,
+    Lfm2VlConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3_5Config,
@@ -593,6 +594,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
+            if not server_args.disable_cuda_graph:
+                # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
+                # intermediate buffers before init_memory_pool() so memory
+                # profiling accounts for them.  Phase 2 (dense LoRA batch
+                # metadata) is handled in CudaGraphRunner.__init__() via
+                # lora_manager.init_cuda_graph_batch_info().
+                self._init_lora_cuda_graph_moe_buffers()
 
         # Init Double Sparsity
         if server_args.enable_double_sparsity:
@@ -1734,6 +1742,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             lora_paths=self.server_args.lora_paths,
         )
 
+    def _init_lora_cuda_graph_moe_buffers(self):
+        """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
+
+        Must be called before init_memory_pool() so that profile_max_num_token()
+        sees the reduced available memory and sizes KV cache correctly.
+        All MoE LoRA layers share one set of buffers (managed by the
+        lora_backend) since they execute sequentially during forward.
+
+        Phase 2 (dense LoRA batch metadata) is handled later in
+        CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
+        because it needs capture-time parameters (max_bs, num_tokens_per_bs)
+        that are only available at that stage.
+        """
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        max_bs = self.server_args.cuda_graph_max_bs
+        max_loras = self.server_args.max_loras_per_batch
+        for module in self.model.modules():
+            if isinstance(module, FusedMoEWithLoRA):
+                self.lora_manager.init_cuda_graph_moe_buffers(
+                    max_bs, max_loras, self.dtype, module
+                )
+                logger.info(
+                    f"Pre-allocated shared MoE LoRA CUDA graph buffers "
+                    f"(max_bs={max_bs}, max_loras={max_loras})"
+                )
+                break
+
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
 
@@ -1816,7 +1852,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if pattern is not None and "M" not in pattern:
                 return None
         if isinstance(
-            config, FalconH1Config | NemotronHConfig | Lfm2Config | Lfm2MoeConfig
+            config,
+            FalconH1Config
+            | NemotronHConfig
+            | Lfm2Config
+            | Lfm2MoeConfig
+            | Lfm2VlConfig,
         ):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
@@ -2018,22 +2059,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
-
-        self._warmup_fused_sampling()
-
-    def _warmup_fused_sampling(self):
-        """Pre-compile and autotune fused sampling Triton kernels."""
-        if _is_hip:
-            return
-        from sglang.srt.layers.fused_sampling import warmup_fused_temperature_softmax
-
-        logits_warmup_dtype = (
-            torch.float32 if self.server_args.enable_fp32_lm_head else self.dtype
-        )
-        warmup_fused_temperature_softmax(
-            self.model_config.vocab_size,
-            logits_dtype=logits_warmup_dtype,
-        )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

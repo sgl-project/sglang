@@ -12,7 +12,7 @@ Usage:
     # Tag the run for later compare_perf.py usage
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
 
-    # All 11 preset models
+    # All 12 preset models
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
 
     # Show preset order, model path, and nightly mapping
@@ -157,7 +157,23 @@ MODELS = {
             "--guidance-scale=5.0",
         ],
     },
-    # 8. Nightly: wan22_i2v_a14b_720p
+    # 8. Nightly: ltx2_twostage_t2v
+    "ltx2": {
+        "nightly_case_id": "ltx2_twostage_t2v",
+        "path": "Lightricks/LTX-2",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=1536",
+            "--height=1024",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-gpus=1",
+        ],
+    },
+    # 9. Nightly: wan22_i2v_a14b_720p
     # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
     "wan-i2v": {
         "nightly_case_id": "wan22_i2v_a14b_720p",
@@ -176,7 +192,7 @@ MODELS = {
             "--pin-cpu-memory",
         ],
     },
-    # 9. Skill-only extra preset
+    # 10. Skill-only extra preset
     "hunyuanvideo": {
         "path": "hunyuanvideo-community/HunyuanVideo",
         "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
@@ -189,7 +205,7 @@ MODELS = {
             "--num-inference-steps=30",
         ],
     },
-    # 10. Skill-only extra preset
+    # 11. Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
@@ -205,7 +221,7 @@ MODELS = {
             "--num-inference-steps=2",
         ],
     },
-    # 11. Skill-only extra preset
+    # 12. Skill-only extra preset
     "helios": {
         "path": "BestWishYsh/Helios-Base",
         "prompt": "A curious raccoon",
@@ -278,8 +294,9 @@ def build_sglang_cmd(
         "--log-level=info",
     ]
 
-    if seed is not None:
-        cmd.append(f"--seed={seed}")
+    effective_seed = cfg.get("seed", seed)
+    if effective_seed is not None:
+        cmd.append(f"--seed={effective_seed}")
 
     if "negative_prompt" in cfg:
         cmd.append(f"--negative-prompt={cfg['negative_prompt']}")
@@ -364,20 +381,28 @@ def run_benchmark_once(
                 float(total_ms) / 1000.0 if total_ms is not None else None
             )
 
-            # denoise latency: accept the canonical "DenoisingStage" plus
-            # model-specific variants such as "MOVADenoisingStage" and
-            # "HeliosChunkedDenoisingStage".
-            # steps = [{"name": "DenoisingStage", "duration_ms": 1234.5}, ...]
+            # denoise latency: sum all true denoise/refinement stages.
+            # This accepts variants such as "MOVADenoisingStage",
+            # "HeliosChunkedDenoisingStage", and the LTX-2 two-stage pair
+            # "LTX2AVDenoisingStage" + "LTX2RefinementStage", while excluding
+            # setup stages like "QwenImageLayeredBeforeDenoisingStage".
             denoise_latency_s = None
+            denoise_stage_total_ms = 0.0
             for step in perf.get("steps", []):
                 step_name = step.get("name")
                 if (
                     isinstance(step_name, str)
-                    and "DenoisingStage" in step_name
                     and step.get("duration_ms") is not None
+                    and (
+                        step_name.endswith("DenoisingStage")
+                        or step_name.endswith("RefinementStage")
+                    )
+                    and "BeforeDenoisingStage" not in step_name
                 ):
-                    denoise_latency_s = float(step["duration_ms"]) / 1000.0
-                    break
+                    denoise_stage_total_ms += float(step["duration_ms"])
+
+            if denoise_stage_total_ms > 0.0:
+                denoise_latency_s = denoise_stage_total_ms / 1000.0
 
             # fallback: sum all per-step durations from denoise_steps_ms
             # denoise_steps_ms = [{"step": 0, "duration_ms": 100.5}, ...]
@@ -432,7 +457,9 @@ def print_results_table(results: list[dict]):
 
     print("-" * 92)
     print()
-    print("★ Denoise latency = total DiT forward pass time across all inference steps.")
+    print(
+        "★ Denoise latency = sum of stages ending with DenoisingStage plus any RefinementStage."
+    )
     print(
         "  Compare two runs with python/sglang/multimodal_gen/benchmarks/compare_perf.py."
     )
@@ -447,7 +474,7 @@ def main():
         choices=list(MODELS.keys()),
         help="Model to benchmark (default: flux)",
     )
-    parser.add_argument("--all", action="store_true", help="Benchmark all 11 models")
+    parser.add_argument("--all", action="store_true", help="Benchmark all 12 models")
     parser.add_argument(
         "--list-models",
         action="store_true",
