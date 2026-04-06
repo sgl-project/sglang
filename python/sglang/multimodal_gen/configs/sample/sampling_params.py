@@ -180,6 +180,11 @@ class SamplingParams:
     progressive_levels: int = 1
     progressive_delta: float = 0.01
 
+    # LongCat-Image parameters
+    enable_cfg_renorm: bool = False
+    cfg_renorm_min: float = 0.0
+    enable_prompt_rewrite: bool = False
+
     # TeaCache parameters
     enable_teacache: bool = False
     teacache_params: Any = (
@@ -783,6 +788,23 @@ class SamplingParams:
         add_argument(
             "--enable-teacache",
             action="store_true",
+        )
+
+        # LongCat-Image parameters
+        add_argument(
+            "--enable-cfg-renorm",
+            action=StoreBoolean,
+            help="Enable CFG renormalization for LongCat-Image (default: false).",
+        )
+        add_argument(
+            "--cfg-renorm-min",
+            type=float,
+            help="Minimum CFG renorm scale for LongCat-Image (default: 0.0).",
+        )
+        add_argument(
+            "--enable-prompt-rewrite",
+            action=StoreBoolean,
+            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (default: false).",
         )
 
         # profiling

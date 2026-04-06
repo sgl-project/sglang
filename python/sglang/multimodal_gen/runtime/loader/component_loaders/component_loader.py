@@ -480,7 +480,7 @@ class ImageProcessorLoader(ComponentLoader):
 class AutoProcessorLoader(ComponentLoader):
     """Loader for auto processor."""
 
-    component_names = ["processor"]
+    component_names = ["processor", "text_processor"]
     expected_library = "transformers"
 
     def load_customized(
