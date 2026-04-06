@@ -13,7 +13,7 @@
 #include "sgl_kernel_ops.h"
 
 // silu_and_mul
-at::Tensor silu_and_mul_cpu(at::Tensor& input);
+at::Tensor silu_and_mul_cpu(const at::Tensor& input);
 
 // gelu_and_mul
 at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input);
@@ -147,14 +147,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm_cpu", torch::kCPU, &gemma_fused_add_rmsnorm_cpu);
   m.def(
-      "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
+      "fused_add_layernorm_cpu(Tensor input, Tensor(a!) residual, Tensor weight, Tensor? bias, float eps) -> "
       "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
 
   // decode
   m.def(
-      "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor(a!) output, Tensor key, Tensor value, "
-      "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
+      "decode_attention_cpu(Tensor query, Tensor(a!) k_cache, Tensor(a!) v_cache, Tensor(a!) output, Tensor key, "
+      "Tensor value, "
+      "Tensor loc, Tensor(a!) attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float "
+      "sm_scale, "
       "float logit_cap) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
