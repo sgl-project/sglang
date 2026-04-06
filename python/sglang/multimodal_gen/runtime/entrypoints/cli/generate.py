@@ -114,7 +114,6 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
 
     sampling_params_kwargs = {}
     config_file = getattr(args, "config", None)
-    # respect config file by overriding args with args parsed from it
     if config_file:
         config_args = ServerArgs.load_config_file(config_file) or {}
         sampling_param_fields = {

@@ -38,11 +38,11 @@ class TransformerLoader(ComponentLoader):
         """Load the transformer based on the model path, and inference args."""
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
-
-        safetensors_list = resolve_transformer_safetensors_to_load(
-            server_args, component_model_path
-        )
-
+        cls_name = config.get("_class_name")
+        if cls_name is None:
+            raise ValueError(
+                f"Transformer config at {component_model_path} does not contain _class_name"
+            )
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
         component_name = _normalize_component_type(component_name)
@@ -55,6 +55,11 @@ class TransformerLoader(ComponentLoader):
             raise ValueError(f"Invalid module name: {component_name}")
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
+
+        # 3. quant config
+        safetensors_list = resolve_transformer_safetensors_to_load(
+            server_args, component_model_path
+        )
 
         cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)

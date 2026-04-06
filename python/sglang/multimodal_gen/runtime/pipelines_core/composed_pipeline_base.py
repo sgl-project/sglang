@@ -234,7 +234,7 @@ class ComposedPipelineBase(ABC):
 
         # some sanity checks
         assert (
-            len(model_index) > 1
+            len(model_index) >= 1
         ), "model_index.json must contain at least one pipeline module"
 
         model_index = {

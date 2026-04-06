@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders import (
+    AudioEncoderConfig,
     BaseEncoderOutput,
     ImageEncoderConfig,
     TextEncoderConfig,
@@ -65,6 +66,24 @@ class ImageEncoder(nn.Module, ABC):
     @abstractmethod
     def forward(self, pixel_values: torch.Tensor, **kwargs) -> BaseEncoderOutput:
         pass
+
+    @property
+    def supported_attention_backends(self) -> set[AttentionBackendEnum]:
+        return self._supported_attention_backends
+
+
+class AudioEncoder(nn.Module, ABC):
+    _supported_attention_backends: set[AttentionBackendEnum] = (
+        AudioEncoderConfig()._supported_attention_backends
+    )
+
+    def __init__(self, config: AudioEncoderConfig) -> None:
+        super().__init__()
+        self.config = config
+        if not self.supported_attention_backends:
+            raise ValueError(
+                f"Subclass {self.__class__.__name__} must define _supported_attention_backends"
+            )
 
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:

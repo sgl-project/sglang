@@ -49,6 +49,7 @@ class ModelTaskType(Enum):
     I2V = auto()  # Image to Video
     T2V = auto()  # Text to Video
     TI2V = auto()  # Text and Image to Video
+    S2V = auto()  # Speech and Image to Video
 
     T2I = auto()  # Text to Image
     I2I = auto()  # Image to Image
@@ -67,6 +68,7 @@ class ModelTaskType(Enum):
             self == ModelTaskType.I2V
             or self == ModelTaskType.I2I
             or self == ModelTaskType.I2M
+            or self == ModelTaskType.S2V
         )
 
     def accepts_image_input(self) -> bool:
@@ -76,7 +78,14 @@ class ModelTaskType(Enum):
             or self == ModelTaskType.TI2I
             or self == ModelTaskType.TI2V
             or self == ModelTaskType.I2M
+            or self == ModelTaskType.S2V
         )
+
+    def requires_audio_input(self) -> bool:
+        return self == ModelTaskType.S2V
+
+    def accepts_audio_input(self) -> bool:
+        return self == ModelTaskType.S2V
 
     def data_type(self) -> DataType:
         if self == ModelTaskType.I2M:
@@ -187,6 +196,10 @@ class PipelineConfig:
     # Image encoder configuration
     image_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
     image_encoder_precision: str = "fp32"
+
+    # Audio encoder configuration
+    audio_encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
+    audio_encoder_precision: str = "fp32"
 
     # Text encoder configuration
     DEFAULT_TEXT_ENCODER_PRECISIONS = ("fp32",)
@@ -341,6 +354,10 @@ class PipelineConfig:
             shift_factor = getattr(vae, "shift_factor", None)
         return scaling_factor, shift_factor
 
+    def skip_decode_scale_and_shift(self, vae) -> bool:
+        del vae
+        return False
+
     # called after latents are prepared
     def maybe_pack_latents(self, latents, batch_size, batch):
         return latents
@@ -355,6 +372,10 @@ class PipelineConfig:
     # called after scale_and_shift, before vae decoding
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
+
+    def prepare_decoding_latents(self, batch, server_args=None, vae=None):
+        del server_args, vae
+        return batch.latents
 
     def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
@@ -413,6 +434,10 @@ class PipelineConfig:
         return latents
 
     def post_decoding(self, frames, server_args):
+        return frames
+
+    def postprocess_decoded_batch(self, frames, batch, server_args):
+        del batch, server_args
         return frames
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -583,8 +608,6 @@ class PipelineConfig:
         kwargs: dictionary of kwargs
         config_cli_prefix: prefix of CLI arguments for this PipelineConfig instance
         """
-        from sglang.multimodal_gen.registry import get_model_info
-
         prefix_with_dot = (
             f"{config_cli_prefix}." if (config_cli_prefix.strip() != "") else ""
         )
@@ -610,7 +633,10 @@ class PipelineConfig:
         from sglang.multimodal_gen.configs.pipeline_configs.flux import (
             Flux2PipelineConfig,
         )
-        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+        from sglang.multimodal_gen.registry import (
+            get_model_info,
+            get_pipeline_config_classes,
+        )
 
         # If model_path is a safetensors file and pipeline_class_name is specified,
         # try to get PipelineConfig from the registry first

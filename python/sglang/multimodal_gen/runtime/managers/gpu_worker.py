@@ -341,6 +341,7 @@ class GPUWorker:
             "text_encoder": self.server_args.text_encoder_cpu_offload,
             "text_encoder_2": self.server_args.text_encoder_cpu_offload,
             "image_encoder": self.server_args.image_encoder_cpu_offload,
+            "audio_encoder": self.server_args.audio_encoder_cpu_offload,
         }
 
         for name, usage in self.pipeline.memory_usages.items():

@@ -214,10 +214,17 @@ def _mux_audio_np_into_mp4(
                 save_file_path,
                 "-i",
                 tmp_wav_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
                 "-c:v",
                 "copy",
                 "-c:a",
                 "aac",
+                "-shortest",
+                "-movflags",
+                "+faststart",
                 "-strict",
                 "experimental",
                 merged_path,
@@ -314,14 +321,21 @@ def attach_audio_to_video_sample(
     sample: Any,
     audio: Any,
     output_idx: int,
+    num_outputs: int,
 ) -> Any:
     """Attach per-sample audio for video outputs when available."""
     if audio is None:
         return sample
-    if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-        audio = audio[output_idx] if audio.shape[0] > output_idx else None
-    elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
-        audio = audio[output_idx] if audio.shape[0] > output_idx else None
+    if isinstance(audio, torch.Tensor):
+        if audio.ndim >= 3:
+            audio = audio[output_idx] if audio.shape[0] > output_idx else None
+        elif audio.ndim == 2 and num_outputs > 1 and audio.shape[0] == num_outputs:
+            audio = audio[output_idx] if audio.shape[0] > output_idx else None
+    elif isinstance(audio, np.ndarray):
+        if audio.ndim >= 3:
+            audio = audio[output_idx] if audio.shape[0] > output_idx else None
+        elif audio.ndim == 2 and num_outputs > 1 and audio.shape[0] == num_outputs:
+            audio = audio[output_idx] if audio.shape[0] > output_idx else None
 
     if audio is not None and not (
         isinstance(sample, (tuple, list)) and len(sample) == 2
@@ -357,7 +371,7 @@ def save_outputs(
         save_file_path = build_output_path(idx)
         sample = output
         if data_type == DataType.VIDEO:
-            sample = attach_audio_to_video_sample(sample, audio, idx)
+            sample = attach_audio_to_video_sample(sample, audio, idx, len(outputs))
 
         frames = post_process_sample(
             sample,
@@ -381,9 +395,23 @@ def save_outputs(
         if audios_out is not None:
             if data_type == DataType.VIDEO:
                 audio_item = audio
-                if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+                if isinstance(audio, torch.Tensor) and (
+                    audio.ndim >= 3
+                    or (
+                        audio.ndim == 2
+                        and len(outputs) > 1
+                        and audio.shape[0] == len(outputs)
+                    )
+                ):
                     audio_item = audio[idx] if audio.shape[0] > idx else None
-                elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
+                elif isinstance(audio, np.ndarray) and (
+                    audio.ndim >= 3
+                    or (
+                        audio.ndim == 2
+                        and len(outputs) > 1
+                        and audio.shape[0] == len(outputs)
+                    )
+                ):
                     audio_item = audio[idx] if audio.shape[0] > idx else None
                 audios_out.append(audio_item)
             else:

@@ -6,7 +6,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 
 import math
-from typing import Any
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -16,9 +16,12 @@ from diffusers.schedulers.scheduling_utils import (
     SchedulerMixin,
     SchedulerOutput,
 )
-from diffusers.utils import deprecate
+from diffusers.utils import deprecate, is_scipy_available
 
 from sglang.multimodal_gen.runtime.models.schedulers.base import BaseScheduler
+
+if is_scipy_available():
+    import scipy.stats
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
@@ -83,7 +86,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         num_train_timesteps: int = 1000,
         solver_order: int = 2,
         prediction_type: str = "flow_prediction",
-        shift: float | None = 1.0,
+        shift: Optional[float] = 1.0,
         use_dynamic_shifting=False,
         thresholding: bool = False,
         dynamic_thresholding_ratio: float = 0.995,
@@ -91,12 +94,11 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         predict_x0: bool = True,
         solver_type: str = "bh2",
         lower_order_final: bool = True,
-        disable_corrector: tuple = (),
+        disable_corrector: List[int] = [],
         solver_p: SchedulerMixin = None,
         timestep_spacing: str = "linspace",
         steps_offset: int = 0,
-        final_sigmas_type: str | None = "zero",  # "zero", "sigma_min"
-        **kwargs,
+        final_sigmas_type: Optional[str] = "zero",  # "zero", "sigma_min"
     ):
 
         if solver_type not in ["bh1", "bh2"]:
@@ -109,7 +111,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         self.predict_x0 = predict_x0
         # setable values
-        self.num_inference_steps: int | None = None
+        self.num_inference_steps = None
         alphas = np.linspace(1, 1 / num_train_timesteps, num_train_timesteps)[
             ::-1
         ].copy()
@@ -118,24 +120,24 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         if not use_dynamic_shifting:
             # when use_dynamic_shifting is True, we apply the timestep shifting on the fly based on the image resolution
-            assert shift is not None
             sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)  # pyright: ignore
 
         self.sigmas = sigmas
-        self.sigma_min = self.sigmas[-1].item()
-        self.sigma_max = self.sigmas[0].item()
-
         self.timesteps = sigmas * num_train_timesteps
         self.num_train_timesteps = num_train_timesteps
 
         self.model_outputs = [None] * solver_order
-        self.timestep_list: list[Any | None] = [None] * solver_order
+        self.timestep_list = [None] * solver_order
         self.lower_order_nums = 0
-        self.disable_corrector = list(disable_corrector)
+        self.disable_corrector = disable_corrector
         self.solver_p = solver_p
         self.last_sample = None
-        self._step_index: int | None = None
-        self._begin_index: int | None = None
+        self._step_index = None
+        self._begin_index = None
+
+        self.sigmas = self.sigmas.to("cpu")
+        self.sigma_min = self.sigmas[-1].item()
+        self.sigma_max = self.sigmas[0].item()
 
         BaseScheduler.__init__(self)
 
@@ -170,11 +172,11 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
     # Modified from diffusers.schedulers.scheduling_flow_match_euler_discrete.FlowMatchEulerDiscreteScheduler.set_timesteps
     def set_timesteps(
         self,
-        num_inference_steps: int | None = None,
-        device: str | torch.device = None,
-        sigmas: list[float] | None = None,
-        mu: float | None | None = None,
-        shift: float | None | None = None,
+        num_inference_steps: Union[int, None] = None,
+        device: Union[str, torch.device] = None,
+        sigmas: Optional[List[float]] = None,
+        mu: Optional[Union[float, None]] = None,
+        shift: Optional[Union[float, None]] = None,
     ):
         """
         Sets the discrete timesteps used for the diffusion chain (to be run before inference).
@@ -191,7 +193,6 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             )
 
         if sigmas is None:
-            assert num_inference_steps is not None
             sigmas = np.linspace(
                 self.sigma_max, self.sigma_min, num_inference_steps + 1
             ).copy()[
@@ -199,12 +200,10 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             ]  # pyright: ignore
 
         if self.config.use_dynamic_shifting:
-            assert mu is not None
             sigmas = self.time_shift(mu, 1.0, sigmas)  # pyright: ignore
         else:
             if shift is None:
                 shift = self.config.shift
-            assert isinstance(sigmas, np.ndarray)
             sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)  # pyright: ignore
 
         if self.config.final_sigmas_type == "sigma_min":
@@ -221,7 +220,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             np.float32
         )  # pyright: ignore
 
-        self.sigmas = torch.from_numpy(sigmas).to(device=device)
+        self.sigmas = torch.from_numpy(sigmas)
         self.timesteps = torch.from_numpy(timesteps).to(
             device=device, dtype=torch.int64
         )
@@ -239,6 +238,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         # add an index counter for schedulers that allow duplicated timesteps
         self._step_index = None
         self._begin_index = None
+        self.sigmas = self.sigmas.to("cpu")
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler._threshold_sample
     def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:
@@ -552,10 +552,13 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         x = last_sample
         x_t = this_sample
         model_t = this_model_output
+        m0 = m0.to(device=this_sample.device)
+        model_t = model_t.to(device=this_sample.device)
 
+        sigmas = self.sigmas.to(device=this_sample.device)
         sigma_t, sigma_s0 = (
-            self.sigmas[self.step_index],
-            self.sigmas[self.step_index - 1],
+            sigmas[self.step_index],
+            sigmas[self.step_index - 1],
         )  # pyright: ignore
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma_t)
         alpha_s0, sigma_s0 = self._sigma_to_alpha_sigma_t(sigma_s0)
@@ -575,7 +578,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             # order == 2 -> only one historical point is used
             si = self.step_index - 2  # i = 1
             mi = model_output_list[-2]
-            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+            alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(sigmas[si])
             lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
             rk = (lambda_si - lambda_s0) / h  # 0-dim tensor on device
             # rks = [rk, 1.0] but keep it on device without list->tensor sync
@@ -589,7 +592,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
             for i in range(1, order):
                 si = self.step_index - (i + 1)
                 mi = model_output_list[-(i + 1)]
-                alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+                alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(sigmas[si])
                 lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
                 rk = (lambda_si - lambda_s0) / h
                 rks_list.append(rk)
@@ -648,7 +651,9 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
             if D1s is not None:
-                corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], D1s)
+                corr_res = torch.einsum(
+                    "k,bkc...->bc...", rhos_c[:-1].to(device), D1s.to(device)
+                )
             else:
                 corr_res = 0
             D1_t = model_t - m0
@@ -656,7 +661,9 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         else:
             x_t_ = alpha_t / alpha_s0 * x - sigma_t * h_phi_1 * m0
             if D1s is not None:
-                corr_res = torch.einsum("k,bkc...->bc...", rhos_c[:-1], D1s)
+                corr_res = torch.einsum(
+                    "k,bkc...->bc...", rhos_c[:-1].to(device), D1s.to(device)
+                )
             else:
                 corr_res = 0
             D1_t = model_t - m0

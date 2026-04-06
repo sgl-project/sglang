@@ -100,7 +100,7 @@ class TextEncoderLoader(ComponentLoader):
             component_model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
-            torch_dtype=PRECISION_TO_TYPE[encoder_dtype],
+            dtype=PRECISION_TO_TYPE[encoder_dtype],
         )
 
     def _prepare_weights(
@@ -123,7 +123,7 @@ class TextEncoderLoader(ComponentLoader):
         allow_patterns = ["*.safetensors", "*.bin"]
 
         if fall_back_to_pt:
-            allow_patterns += ["*.pt"]
+            allow_patterns += ["*.pt", "*.pth"]
 
         if allow_patterns_overrides is not None:
             allow_patterns = allow_patterns_overrides
@@ -212,11 +212,18 @@ class TextEncoderLoader(ComponentLoader):
         cpu_offload_flag: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
-        diffusers_pretrained_config = get_config(
-            component_model_path, trust_remote_code=True
-        )
         model_config = get_diffusers_component_config(
             component_path=component_model_path
+        )
+        cls_name = model_config.get("_class_name")
+        if cls_name is None:
+            raise ValueError(
+                f"Text encoder config at {component_model_path} does not contain _class_name"
+            )
+        model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
+
+        diffusers_pretrained_config = get_config(
+            component_model_path, trust_remote_code=True
         )
 
         def is_not_first_encoder(module_name):

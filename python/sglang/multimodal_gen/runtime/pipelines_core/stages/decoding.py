@@ -83,6 +83,8 @@ class DecodingStage(PipelineStage):
         return result
 
     def scale_and_shift(self, latents: torch.Tensor, server_args):
+        if server_args.pipeline_config.skip_decode_scale_and_shift(self.vae):
+            return latents
         scaling_factor, shift_factor = (
             server_args.pipeline_config.get_decode_scale_and_shift(
                 latents.device, latents.dtype, self.vae
@@ -202,7 +204,10 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
-        frames = self.decode(batch.latents, server_args)
+        decode_latents = server_args.pipeline_config.prepare_decoding_latents(
+            batch, server_args=server_args, vae=self.vae
+        )
+        frames = self.decode(decode_latents, server_args)
 
         # decode trajectory latents if needed
         if batch.return_trajectory_decoded:
@@ -230,6 +235,9 @@ class DecodingStage(PipelineStage):
             trajectory_decoded = None
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        frames = server_args.pipeline_config.postprocess_decoded_batch(
+            frames, batch, server_args
+        )
 
         # Update batch with decoded image
         output_batch = OutputBatch(

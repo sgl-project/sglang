@@ -1111,6 +1111,46 @@ class DenoisingStage(PipelineStage):
                             batch, server_args, reserved_frames_mask, latents, z
                         )
 
+                        dump_dir = os.environ.get("SGLANG_WAN_S2V_STEP_DUMP_DIR")
+                        if (
+                            dump_dir
+                            and server_args.pipeline_config.task_type == ModelTaskType.S2V
+                            and i in (0, 1)
+                            and get_sp_parallel_rank() == 0
+                        ):
+                            os.makedirs(dump_dir, exist_ok=True)
+                            dumped_noise = noise_pred
+                            dumped_latents = latents
+                            if (
+                                get_sp_world_size() > 1
+                                and getattr(batch, "did_sp_shard_latents", False)
+                            ):
+                                dumped_noise = (
+                                    server_args.pipeline_config.gather_noise_pred_for_sp(
+                                        batch, dumped_noise
+                                    )
+                                )
+                                dumped_latents = (
+                                    server_args.pipeline_config.gather_latents_for_sp(
+                                        dumped_latents, batch=batch
+                                    )
+                                )
+                            torch.save(
+                                {
+                                    "latent_model_input": latent_model_input.detach()
+                                    .float()
+                                    .cpu(),
+                                    "noise_pred": dumped_noise.detach().float().cpu(),
+                                    "latents_after_step": dumped_latents.detach()
+                                    .float()
+                                    .cpu(),
+                                },
+                                os.path.join(
+                                    dump_dir,
+                                    f"step_{i}_sp{get_sp_world_size()}_cfg{current_guidance_scale}.pt",
+                                ),
+                            )
+
                         # save trajectory latents if needed
                         if batch.return_trajectory_latents:
                             trajectory_timesteps.append(t_host)

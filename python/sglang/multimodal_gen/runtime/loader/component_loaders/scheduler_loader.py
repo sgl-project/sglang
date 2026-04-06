@@ -29,7 +29,6 @@ class SchedulerLoader(ComponentLoader):
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
         scheduler_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-
         scheduler = scheduler_cls(**config)
         if server_args.pipeline_config.flow_shift is not None:
             scheduler.set_shift(server_args.pipeline_config.flow_shift)

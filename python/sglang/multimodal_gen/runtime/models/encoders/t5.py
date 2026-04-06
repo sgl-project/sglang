@@ -32,7 +32,6 @@ from torch import nn
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, T5Config
 from sglang.multimodal_gen.runtime.distributed import _get_folding_tp_group
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -67,6 +66,21 @@ class AttentionType:
 @dataclass
 class AttentionMetadata:
     attn_bias: torch.Tensor
+
+
+class T5LayerNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states * torch.rsqrt(
+            hidden_states.float().pow(2).mean(dim=-1, keepdim=True) + self.eps
+        )
+        if self.weight.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(self.weight.dtype)
+        return self.weight * hidden_states
 
 
 class T5DenseActDense(nn.Module):
@@ -148,7 +162,7 @@ class T5LayerFF(nn.Module):
         else:
             self.DenseReluDense = T5DenseActDense(config, quant_config=quant_config)
 
-        self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
 
     def forward(self, hidden_states) -> torch.Tensor:
         forwarded_states = self.layer_norm(hidden_states)
@@ -392,7 +406,7 @@ class T5LayerSelfAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.SelfAttention",
         )
-        self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -426,7 +440,7 @@ class T5LayerCrossAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.EncDecAttention",
         )
-        self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
 
     def forward(
         self,
@@ -544,7 +558,9 @@ class T5Stack(nn.Module):
                     for i in range(n_layers)
                 ]
             )
-        self.final_layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.final_layer_norm = T5LayerNorm(
+            config.d_model, eps=config.layer_norm_epsilon
+        )
 
     def forward(
         self,
@@ -655,7 +671,6 @@ class T5EncoderModel(TextEncoder):
 
 
 class UMT5EncoderModel(TextEncoder):
-
     def __init__(self, config: T5Config, prefix: str = ""):
         super().__init__(config)
 
@@ -706,6 +721,31 @@ class UMT5EncoderModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            if name.startswith("token_embedding."):
+                name = name.replace("token_embedding.weight", "shared.weight")
+            elif name == "norm.weight":
+                name = "encoder.final_layer_norm.weight"
+            elif name.startswith("blocks."):
+                name = name.replace("blocks.", "encoder.block.", 1)
+                name = name.replace(".norm1.weight", ".layer.0.layer_norm.weight")
+                name = name.replace(".attn.q.weight", ".layer.0.SelfAttention.q.weight")
+                name = name.replace(".attn.k.weight", ".layer.0.SelfAttention.k.weight")
+                name = name.replace(".attn.v.weight", ".layer.0.SelfAttention.v.weight")
+                name = name.replace(".attn.o.weight", ".layer.0.SelfAttention.o.weight")
+                name = name.replace(".norm2.weight", ".layer.1.layer_norm.weight")
+                name = name.replace(
+                    ".ffn.gate.0.weight", ".layer.1.DenseReluDense.wi_0.weight"
+                )
+                name = name.replace(
+                    ".ffn.fc1.weight", ".layer.1.DenseReluDense.wi_1.weight"
+                )
+                name = name.replace(
+                    ".ffn.fc2.weight", ".layer.1.DenseReluDense.wo.weight"
+                )
+                name = name.replace(
+                    ".pos_embedding.embedding.weight",
+                    ".layer.0.SelfAttention.relative_attention_bias.weight",
+                )
             loaded = False
             if "decoder" in name or "lm_head" in name:
                 continue

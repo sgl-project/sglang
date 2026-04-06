@@ -165,6 +165,7 @@ class ServerArgs:
     dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
+    audio_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
@@ -295,6 +296,9 @@ class ServerArgs:
     def adjust_pipeline_config(self):
         # enable parallel folding when SP is enabled
         if self.tp_size != 1 or self.sp_degree <= 1:
+            return
+
+        if self.pipeline_config.task_type.name == "S2V":
             return
 
         enabled = False
@@ -454,8 +458,9 @@ class ServerArgs:
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
             if (
-                "wan" in pipeline_name_lower or "mova" in pipeline_name_lower
-            ) and self.dit_layerwise_offload is None:
+                ("wan" in pipeline_name_lower or "mova" in pipeline_name_lower)
+                and self.dit_layerwise_offload is None
+            ):
                 auto_enable_layerwise_offload = (
                     current_platform.enable_dit_layerwise_offload_for_wan_by_default()
                 )
@@ -752,6 +757,11 @@ class ServerArgs:
             "--image-encoder-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for image encoder. Enable if run out of memory.",
+        )
+        parser.add_argument(
+            "--audio-encoder-cpu-offload",
+            action=StoreBoolean,
+            help="Use CPU offload for audio encoder. Enable if run out of memory.",
         )
         parser.add_argument(
             "--vae-cpu-offload",

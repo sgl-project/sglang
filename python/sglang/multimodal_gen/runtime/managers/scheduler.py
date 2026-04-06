@@ -203,6 +203,13 @@ class Scheduler:
                 width, height = _parse_size(resolution)
                 task_type = self.server_args.pipeline_config.task_type
 
+                if task_type.requires_audio_input():
+                    logger.warning(
+                        "Skipping request-based warmup for %s because it requires audio input.",
+                        task_type.name,
+                    )
+                    continue
+
                 if task_type in (
                     ModelTaskType.I2I,
                     ModelTaskType.TI2I,

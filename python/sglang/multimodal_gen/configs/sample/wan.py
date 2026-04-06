@@ -272,6 +272,28 @@ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
 
 
 @dataclass
+class Wan2_2_S2V_14B_SamplingParam(Wan2_2_Base_SamplingParams):
+    """Sampling parameters for Wan2.2 S2V 14B model."""
+
+    height: int = 704
+    width: int = 1024
+    num_frames: int = 81
+    fps: int = 16
+    negative_prompt: str | None = (
+        "画面模糊，最差质量，画面模糊，细节模糊不清，情绪激动剧烈，手快速抖动，字幕，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+    )
+    guidance_scale: float = 4.5
+    num_inference_steps: int = 40
+
+    supported_resolutions: list[tuple[int, int]] | None = field(
+        default_factory=lambda: [
+            (1024, 704),
+            (704, 1024),
+        ]
+    )
+
+
+@dataclass
 class Turbo_Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     guidance_scale: float = 3.5  # high_noise
     guidance_scale_2: float = 3.5  # low_noise

@@ -4,10 +4,14 @@ from typing import List
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import get_sp_group
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_group,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
+    get_world_group,
     get_world_rank,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -24,6 +28,35 @@ from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _move_value_to_local_device(value, device: torch.device):
+    if isinstance(value, torch.Tensor):
+        if value.device.type == "cpu":
+            return value
+        return value.to(device=device)
+    if isinstance(value, torch.Generator):
+        if value.device.type == "cpu":
+            return value
+        return torch.Generator(device=device).manual_seed(value.initial_seed())
+    if isinstance(value, list):
+        return [_move_value_to_local_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_value_to_local_device(item, device) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _move_value_to_local_device(item, device)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _relocate_batch_to_local_device(batch: Req) -> Req:
+    device = get_local_torch_device()
+    for field_name in batch.__dataclass_fields__:
+        value = getattr(batch, field_name)
+        setattr(batch, field_name, _move_value_to_local_device(value, device))
+    return batch
 
 
 class ParallelExecutor(PipelineExecutor):
@@ -65,6 +98,7 @@ class ParallelExecutor(PipelineExecutor):
             rank = get_classifier_free_guidance_rank()
         else:
             rank = get_world_rank()
+        world_rank = get_world_rank()
         cfg_group = get_cfg_group()
 
         # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
@@ -72,10 +106,20 @@ class ParallelExecutor(PipelineExecutor):
             paradigm = stage.parallelism_type
 
             if paradigm == StageParallelismType.MAIN_RANK_ONLY:
-                if rank == 0:
-                    # Only main rank executes, others just wait
+                if world_rank == 0:
+                    # Only world rank 0 executes the stage and then shares the
+                    # updated batch with the rest of the distributed workers.
                     batch = stage(batch, server_args)
-                torch.distributed.barrier()
+                if torch.distributed.is_initialized():
+                    world_group = get_world_group()
+                    broadcasted_list = broadcast_pyobj(
+                        [batch] if world_group.rank == 0 else [],
+                        rank=world_group.rank,
+                        dist_group=world_group.cpu_group,
+                        src=world_group.ranks[0],
+                    )
+                    if world_group.rank != 0 and broadcasted_list:
+                        batch = _relocate_batch_to_local_device(broadcasted_list[0])
 
             elif paradigm == StageParallelismType.CFG_PARALLEL:
                 obj_list = [batch] if rank == 0 else []
@@ -83,7 +127,7 @@ class ParallelExecutor(PipelineExecutor):
                     obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
                 )
                 if rank != 0:
-                    batch = broadcasted_list[0]
+                    batch = _relocate_batch_to_local_device(broadcasted_list[0])
                 batch = stage(batch, server_args)
 
                 torch.distributed.barrier()

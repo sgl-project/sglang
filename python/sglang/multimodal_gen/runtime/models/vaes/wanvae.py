@@ -63,6 +63,9 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_dist_utils import (
     split_for_parallel_decode,
     split_for_parallel_encode,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 CACHE_T = 2
 
@@ -810,6 +813,104 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     _supports_gradient_checkpointing = False
 
+    @staticmethod
+    def _remap_official_state_key(key: str) -> str:
+        if key == "encoder.conv1.weight":
+            return "encoder.conv_in.weight"
+        if key == "encoder.conv1.bias":
+            return "encoder.conv_in.bias"
+        if key == "decoder.conv1.weight":
+            return "decoder.conv_in.weight"
+        if key == "decoder.conv1.bias":
+            return "decoder.conv_in.bias"
+        if key == "conv1.weight":
+            return "quant_conv.weight"
+        if key == "conv1.bias":
+            return "quant_conv.bias"
+        if key == "conv2.weight":
+            return "post_quant_conv.weight"
+        if key == "conv2.bias":
+            return "post_quant_conv.bias"
+
+        if key.startswith("encoder.downsamples."):
+            key = key.replace("encoder.downsamples.", "encoder.down_blocks.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            key = key.replace(".shortcut.", ".conv_shortcut.")
+            return key
+
+        if key.startswith("encoder.middle.0."):
+            key = key.replace("encoder.middle.0.", "encoder.mid_block.resnets.0.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("encoder.middle.1."):
+            return key.replace("encoder.middle.1.", "encoder.mid_block.attentions.0.", 1)
+
+        if key.startswith("encoder.middle.2."):
+            key = key.replace("encoder.middle.2.", "encoder.mid_block.resnets.1.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("encoder.head.0.gamma"):
+            return key.replace("encoder.head.0.gamma", "encoder.norm_out.gamma", 1)
+        if key.startswith("encoder.head.2."):
+            return key.replace("encoder.head.2.", "encoder.conv_out.", 1)
+
+        if key.startswith("decoder.middle.0."):
+            key = key.replace("decoder.middle.0.", "decoder.mid_block.resnets.0.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("decoder.middle.1."):
+            return key.replace("decoder.middle.1.", "decoder.mid_block.attentions.0.", 1)
+
+        if key.startswith("decoder.middle.2."):
+            key = key.replace("decoder.middle.2.", "decoder.mid_block.resnets.1.", 1)
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            return key
+
+        if key.startswith("decoder.upsamples."):
+            parts = key.split(".")
+            flat_idx = int(parts[2])
+            block_idx = flat_idx // 4
+            block_offset = flat_idx % 4
+            if block_idx == 3:
+                block_offset = flat_idx - 12
+            prefix = f"decoder.up_blocks.{block_idx}."
+            suffix = ".".join(parts[3:])
+            if block_idx < 3 and block_offset == 3:
+                return prefix + "upsamplers.0." + suffix
+            res_idx = block_offset
+            key = prefix + f"resnets.{res_idx}." + suffix
+            key = key.replace(".residual.0.gamma", ".norm1.gamma")
+            key = key.replace(".residual.2.", ".conv1.")
+            key = key.replace(".residual.3.gamma", ".norm2.gamma")
+            key = key.replace(".residual.6.", ".conv2.")
+            key = key.replace(".shortcut.", ".conv_shortcut.")
+            return key
+
+        if key.startswith("decoder.head.0.gamma"):
+            return key.replace("decoder.head.0.gamma", "decoder.norm_out.gamma", 1)
+        if key.startswith("decoder.head.2."):
+            return key.replace("decoder.head.2.", "decoder.conv_out.", 1)
+
+        return key
+
     def __init__(
         self,
         config: WanVAEConfig,
@@ -914,6 +1015,26 @@ class AutoencoderKLWan(ParallelTiledVAE):
             enc = ParallelTiledVAE.encode(self, x)
 
         return enc
+
+    def encode_video(self, x: torch.Tensor) -> torch.Tensor:
+        self.clear_cache()
+        if self.config.patch_size is not None:
+            x = patchify(x, patch_size=self.config.patch_size)
+        with forward_context(
+            feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
+        ):
+            t = x.shape[2]
+            iter_ = 1 + (t - 1) // 4
+            for i in range(iter_):
+                feat_idx.set(0)
+                if i == 0:
+                    out = self.encoder(x[:, :, :1, :, :])
+                else:
+                    out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
+                    out = torch.cat([out, out_], 2)
+        enc = self.quant_conv(out)
+        self.clear_cache()
+        return enc[:, : self.z_dim]
 
     def _encode(self, x: torch.Tensor, first_frame=False) -> torch.Tensor:
         with forward_context(first_frame_arg=first_frame):

@@ -587,7 +587,6 @@ def maybe_download_model(
         Local path to the model
     """
     if force_diffusers_model and not skip_overlay_resolution:
-        # return overlay model path if applicable
         overlay_model_path = maybe_resolve_overlay_model_path(
             model_name_or_path,
             local_dir=local_dir,
