@@ -1,5 +1,6 @@
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, Optional, Tuple, Type, Union
 
+from sglang.srt.entrypoints.openai.encoding_dsv32 import dsml_token
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.harmony_parser import HarmonyParser
 
@@ -25,7 +26,7 @@ class BaseReasoningFormatDetector:
         think_end_token: str,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
-        tool_start_token: Optional[str] = None,
+        tool_start_token: Optional[Union[str, Tuple[str, ...]]] = None,
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
@@ -51,6 +52,31 @@ class BaseReasoningFormatDetector:
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
 
+    def _tool_start_tokens(self) -> Tuple[str, ...]:
+        if self.tool_start_token is None:
+            return ()
+        if isinstance(self.tool_start_token, tuple):
+            return self.tool_start_token
+        return (self.tool_start_token,)
+
+    def _find_tool_start(self, text: str) -> Optional[Tuple[int, str]]:
+        matches = [
+            (idx, token)
+            for token in self._tool_start_tokens()
+            if (idx := text.find(token)) != -1
+        ]
+        return min(matches, key=lambda match: match[0]) if matches else None
+
+    def _find_partial_tool_start_suffix_len(self, text: str) -> int:
+        longest = 0
+        for token in self._tool_start_tokens():
+            max_prefix_len = min(len(text), len(token) - 1)
+            for prefix_len in range(max_prefix_len, 0, -1):
+                if text.endswith(token[:prefix_len]):
+                    longest = max(longest, prefix_len)
+                    break
+        return longest
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses reasoning sections in the provided text.
@@ -69,13 +95,10 @@ class BaseReasoningFormatDetector:
             and self.think_end_token not in self.previous_content
         ):
             # Check for tool_start_token interruption
-            if (
-                in_reasoning
-                and self.tool_start_token is not None
-                and self.tool_start_token in processed_text
-            ):
+            tool_match = self._find_tool_start(processed_text) if in_reasoning else None
+            if tool_match is not None:
                 # Find the first occurrence of tool_start_token and split there
-                tool_idx = processed_text.find(self.tool_start_token)
+                tool_idx, _ = tool_match
                 reasoning_text = processed_text[:tool_idx].strip()
                 # Preserve tool_start_token in normal text
                 normal_text = processed_text[tool_idx:]
@@ -113,8 +136,7 @@ class BaseReasoningFormatDetector:
 
         # If the current text is a prefix of the think token, keep buffering
         tokens_to_check = [self.think_start_token, self.think_end_token]
-        if self.tool_start_token:
-            tokens_to_check.append(self.tool_start_token)
+        tokens_to_check.extend(self._tool_start_tokens())
         if any(
             token.startswith(current_text) and token != current_text
             for token in tokens_to_check
@@ -144,8 +166,9 @@ class BaseReasoningFormatDetector:
         # Continue with reasoning content
         if self._in_reasoning:
             # Check for tool_start_token interruption
-            if self.tool_start_token and self.tool_start_token in current_text:
-                tool_idx = current_text.find(self.tool_start_token)
+            tool_match = self._find_tool_start(current_text)
+            if tool_match is not None:
+                tool_idx, _ = tool_match
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
                 normal_text = current_text[tool_idx:]
@@ -155,6 +178,13 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             if self.stream_reasoning:
+                partial_tool_prefix_len = self._find_partial_tool_start_suffix_len(
+                    current_text
+                )
+                if partial_tool_prefix_len:
+                    reasoning_text = current_text[:-partial_tool_prefix_len]
+                    self._buffer = current_text[-partial_tool_prefix_len:]
+                    return StreamingParseResult(reasoning_text=reasoning_text)
                 # Stream the content immediately
                 self._buffer = ""
                 return StreamingParseResult(reasoning_text=current_text)
@@ -237,6 +267,36 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
+class DeepSeekV3Detector(BaseReasoningFormatDetector):
+    """
+    Detector for DeepSeek-V3 style reasoning.
+
+    DeepSeek-V3.2 can switch from reasoning mode directly into a DSML function-call
+    block before emitting `</think>`, so the reasoning parser needs to preserve the
+    raw tool-call marker for the downstream function-call parser.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token=(
+                f"<{dsml_token}function_calls>",
+                f"\n\n<{dsml_token}function_calls>",
+            ),
             continue_final_message=continue_final_message,
             previous_content=previous_content,
         )
@@ -490,7 +550,7 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
-        "deepseek-v3": Qwen3Detector,
+        "deepseek-v3": DeepSeekV3Detector,
         "glm45": Glm45Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,

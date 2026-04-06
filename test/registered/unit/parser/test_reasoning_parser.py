@@ -2,9 +2,11 @@
 
 import unittest
 
+from sglang.srt.entrypoints.openai.encoding_dsv32 import dsml_token
 from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
+    DeepSeekV3Detector,
     Glm45Detector,
     KimiDetector,
     KimiK2Detector,
@@ -17,6 +19,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+
+
+DEEPSEEK_V32_TOOL_START = f"<{dsml_token}function_calls>"
+DEEPSEEK_V32_FORMATTED_TOOL_START = f"\n\n<{dsml_token}function_calls>"
 
 
 class TestStreamingParseResult(CustomTestCase):
@@ -221,6 +227,59 @@ class TestQwen3Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
+
+
+class TestDeepSeekV3Detector(CustomTestCase):
+    def setUp(self):
+        self.detector = DeepSeekV3Detector()
+
+    def test_init(self):
+        """Test DeepSeekV3Detector initialization."""
+        self.assertEqual(self.detector.think_start_token, "<think>")
+        self.assertEqual(self.detector.think_end_token, "</think>")
+        self.assertEqual(
+            self.detector.tool_start_token,
+            (DEEPSEEK_V32_TOOL_START, DEEPSEEK_V32_FORMATTED_TOOL_START),
+        )
+        self.assertFalse(self.detector._in_reasoning)
+
+    def test_detect_and_parse_tool_interrupt(self):
+        """Test parsing with DeepSeek-V3.2 DSML tool interruption."""
+        text = f"<think>thinking{DEEPSEEK_V32_TOOL_START}\n<tool payload>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(
+            result.normal_text, f"{DEEPSEEK_V32_TOOL_START}\n<tool payload>"
+        )
+
+    def test_parse_streaming_increment_tool_interrupt(self):
+        """Test streaming parsing preserves the DSML tool-call marker."""
+        self.detector.parse_streaming_increment("<think>")
+        reasoning = self.detector.parse_streaming_increment("thinking")
+        tool_call = self.detector.parse_streaming_increment(DEEPSEEK_V32_TOOL_START)
+        trailing = self.detector.parse_streaming_increment("\n<tool payload>")
+
+        self.assertEqual(reasoning.reasoning_text, "thinking")
+        self.assertEqual(tool_call.reasoning_text, "")
+        self.assertEqual(tool_call.normal_text, DEEPSEEK_V32_TOOL_START)
+        self.assertEqual(trailing.reasoning_text, "")
+        self.assertEqual(trailing.normal_text, "\n<tool payload>")
+
+    def test_parse_streaming_increment_formatted_tool_interrupt(self):
+        """Test streaming parsing buffers a newline-prefixed DSML marker."""
+        self.detector.parse_streaming_increment("<think>")
+        reasoning = self.detector.parse_streaming_increment("thinking\n\n<")
+        tool_call = self.detector.parse_streaming_increment(
+            f"{dsml_token}function_calls>"
+        )
+        trailing = self.detector.parse_streaming_increment("\n<tool payload>")
+
+        self.assertEqual(reasoning.reasoning_text, "thinking")
+        self.assertEqual(reasoning.normal_text, "")
+        self.assertEqual(tool_call.reasoning_text, "")
+        self.assertEqual(tool_call.normal_text, DEEPSEEK_V32_FORMATTED_TOOL_START)
+        self.assertEqual(trailing.reasoning_text, "")
+        self.assertEqual(trailing.normal_text, "\n<tool payload>")
 
 
 class TestQwen3ForcedReasoningDetector(CustomTestCase):
@@ -649,10 +708,12 @@ class TestReasoningParser(CustomTestCase):
         parser1 = ReasoningParser("DeepSeek-R1")
         parser2 = ReasoningParser("QWEN3")
         parser3 = ReasoningParser("Kimi")
+        parser4 = ReasoningParser("DeepSeek-V3")
 
         self.assertIsInstance(parser1.detector, DeepSeekR1Detector)
         self.assertIsInstance(parser2.detector, Qwen3Detector)
         self.assertIsInstance(parser3.detector, KimiDetector)
+        self.assertIsInstance(parser4.detector, DeepSeekV3Detector)
 
     def test_stream_reasoning_parameter(self):
         """Test stream_reasoning parameter is passed correctly."""
@@ -718,6 +779,51 @@ class TestReasoningParser(CustomTestCase):
 
         self.assertEqual(all_reasoning, "reasoning")
         self.assertEqual(all_normal, "<|tool_calls_section_begin|><|tool_call_begin|>")
+
+    def test_deepseek_v3_tool_interruption(self):
+        """Test DeepSeek-V3 tool interruption through ReasoningParser API."""
+        parser = ReasoningParser("deepseek-v3")
+
+        reasoning, normal = parser.parse_non_stream(
+            f"<think>thinking{DEEPSEEK_V32_TOOL_START}\n<invoke>"
+        )
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, f"{DEEPSEEK_V32_TOOL_START}\n<invoke>")
+
+        parser = ReasoningParser("deepseek-v3")
+        chunks = ["<think>", "reasoning", DEEPSEEK_V32_TOOL_START, "\n<invoke>"]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            if reasoning:
+                all_reasoning += reasoning
+            if normal:
+                all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, f"{DEEPSEEK_V32_TOOL_START}\n<invoke>")
+
+    def test_deepseek_v3_formatted_tool_interruption(self):
+        """Test DeepSeek-V3 tool interruption with formatted DSML output."""
+        parser = ReasoningParser("deepseek-v3")
+        chunks = [
+            "<think>",
+            "reasoning\n\n<",
+            f"{dsml_token}function_calls>",
+            "\n<invoke>",
+        ]
+        all_reasoning = ""
+        all_normal = ""
+        for chunk in chunks:
+            reasoning, normal = parser.parse_stream_chunk(chunk)
+            if reasoning:
+                all_reasoning += reasoning
+            if normal:
+                all_normal += normal
+
+        self.assertEqual(all_reasoning, "reasoning")
+        self.assertEqual(all_normal, f"{DEEPSEEK_V32_FORMATTED_TOOL_START}\n<invoke>")
 
 
 class TestIntegrationScenarios(CustomTestCase):
