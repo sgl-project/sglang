@@ -611,7 +611,9 @@ class HiRadixCache(RadixCache):
         # Backup invariant (for write-through mode): backed-up nodes must form a
         # contiguous prefix from root — no gaps.  Skip if parent isn't backed
         # up yet;
-        if not write_back and (node.parent != self.root_node and not node.parent.backuped):
+        if not write_back and (
+            node.parent != self.root_node and not node.parent.backuped
+        ):
             return 0
 
         host_indices = self.cache_controller.write(
