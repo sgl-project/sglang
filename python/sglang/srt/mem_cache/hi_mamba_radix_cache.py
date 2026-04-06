@@ -277,13 +277,10 @@ class HiMambaRadixCache(MambaRadixCache):
         super().reset()
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
-        # Write-through only: skip if parent not yet backed up to avoid
-        # gaps in the backup chain. Write-back ordering is handled by eviction.
-        if (
-            not write_back
-            and node.parent != self.root_node
-            and not node.parent.backuped
-        ):
+        # Backup invariant (for write-through mode): backed-up nodes must form a
+        # contiguous prefix from root — no gaps.  Skip if parent isn't backed
+        # up yet;
+        if not write_back and (node.parent != self.root_node and not node.parent.backuped):
             return 0
 
         # If mamba host slot already exists, refresh its LRU position.
