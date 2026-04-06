@@ -403,7 +403,6 @@ class TokenizerCommunicatorMixin:
                 )
                 token_chunks = []
                 total_tokens = 0
-                truncated = False
                 has_prev = False
                 for doc in obj.documents:
                     if not doc:

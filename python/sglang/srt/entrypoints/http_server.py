@@ -739,7 +739,13 @@ async def add_external_corpus(request: Request):
     """Add an external corpus for ngram speculative decoding."""
     from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
 
-    obj = AddExternalCorpusReqInput(**(await request.json()))
+    try:
+        obj = AddExternalCorpusReqInput(**(await request.json()))
+    except TypeError as e:
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
     result = await _global_state.tokenizer_manager.add_external_corpus(obj)
     return ORJSONResponse(
         {
