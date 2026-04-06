@@ -192,7 +192,7 @@ class TestServerUpdateWeightsFromDiskNVFP4(
                 "--fp4-gemm-backend",
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
-                "flashinfer_trtllm",
+                "flashinfer_trtllm_routed",
             ),
         },
     )
