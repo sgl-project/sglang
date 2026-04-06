@@ -75,11 +75,16 @@ class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
-            cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
+            if getattr(self, "_use_fp4_nsa_kv_cache", False):
+                from sglang.srt.mem_cache.utils import FP4_KV_CACHE_DIM
+
+                cell_size = FP4_KV_CACHE_DIM * num_layers
+            else:
+                cell_size = (
+                        (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
+                        * num_layers
+                        * kv_size
+                    )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
