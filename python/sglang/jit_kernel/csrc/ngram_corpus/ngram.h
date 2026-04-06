@@ -3,6 +3,7 @@
 #include "param.h"
 #include "queue.h"
 #include "result.h"
+#include "suffix_automaton.h"
 #include "trie.h"
 #include <condition_variable>
 #include <cstddef>
@@ -18,6 +19,7 @@ namespace ngram {
 
 class Ngram {
   std::unique_ptr<Trie> trie_;
+  std::unique_ptr<SuffixAutomaton> sam_;
   Param param_;
 
   // NOTE: protects trie_ and pending_count_. Ensures batchMatch never reads
@@ -39,6 +41,14 @@ class Ngram {
   void synchronize() const;
 
   void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
+
+  void startExternalCorpusLoad();
+
+  void appendExternalCorpusTokens(const std::vector<int32_t>& tokens);
+
+  void finishExternalCorpusLoad();
+
+  void clearExternalCorpus();
 
   Result batchMatch(const std::vector<std::vector<int32_t>>& tokens);
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from typing import List, Tuple
 
 import numpy as np
@@ -29,6 +30,7 @@ def get_ngram_corpus_cls():
         cpp_files=[
             "ngram_corpus/result.cpp",
             "ngram_corpus/trie.cpp",
+            "ngram_corpus/suffix_automaton.cpp",
             "ngram_corpus/ngram.cpp",
             "ngram_corpus/ngram_corpus_ffi.cpp",
         ],
@@ -48,6 +50,8 @@ def get_ngram_corpus_cls():
             max_bfs_breadth: int,
             draft_token_num: int,
             match_type: str,
+            external_sam_budget: int = 0,
+            external_corpus_max_tokens: int = 10000000,
         ) -> None:
             mt = _MATCH_TYPE_MAP.get(match_type)
             if mt is None:
@@ -61,6 +65,8 @@ def get_ngram_corpus_cls():
                 max_bfs_breadth,
                 draft_token_num,
                 mt,
+                external_sam_budget,
+                external_corpus_max_tokens,
             )
             self._draft_token_num = draft_token_num
 
@@ -111,5 +117,23 @@ def get_ngram_corpus_cls():
         def erase_states(self, state_ids: List[int]) -> None:
             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
             self.erase_match_state(state_ids_t)  # type: ignore
+
+        def load_external_corpus(
+            self, chunks: Iterable[Sequence[int]]
+        ) -> Tuple[int, int]:
+            self.start_external_corpus_load()  # type: ignore
+            chunk_count = 0
+            loaded_token_count = 0
+            try:
+                for chunk in chunks:
+                    tokens_t = torch.tensor(list(chunk), dtype=torch.int32)
+                    loaded_token_count += len(tokens_t)
+                    self.append_external_corpus_tokens(tokens_t)  # type: ignore
+                    chunk_count += 1
+                self.finish_external_corpus_load()  # type: ignore
+            except Exception:
+                self.clear_external_corpus()  # type: ignore
+                raise
+            return chunk_count, loaded_token_count
 
     return NgramCorpusFFI

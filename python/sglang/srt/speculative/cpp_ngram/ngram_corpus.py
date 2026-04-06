@@ -1,13 +1,42 @@
 # -*- coding: utf-8 -*-
 
 import logging
-from typing import Dict, List, Tuple
+from collections.abc import Iterable, Iterator, Sequence
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from sglang.jit_kernel.ngram_corpus import get_ngram_corpus_cls
+from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
 
 logger = logging.getLogger(__name__)
+
+
+# Convenience path for pre-tokenized in-memory documents. The main serving
+# startup path loads file-backed corpora through `iter_external_corpus_chunks()`.
+def _documents_to_chunks(
+    documents: Iterable[Sequence[int]],
+    max_tokens: Optional[int] = None,
+) -> Iterator[list[int]]:
+    total_tokens = 0
+    has_previous = False
+    for doc in documents:
+        if not doc:
+            continue
+        doc_tokens = list(doc)
+        separator_cost = 1 if has_previous else 0
+        next_total_tokens = total_tokens + separator_cost + len(doc_tokens)
+        if max_tokens is not None and next_total_tokens > max_tokens:
+            raise ValueError(
+                "External ngram corpus exceeds the configured token limit "
+                f"({max_tokens}) after loading {total_tokens} tokens."
+            )
+        total_tokens = next_total_tokens
+        if has_previous:
+            yield [SEPARATOR_TOKEN] + doc_tokens
+        else:
+            yield doc_tokens
+        has_previous = True
 
 
 class NgramCorpus:
@@ -19,6 +48,9 @@ class NgramCorpus:
         draft_token_num=8,
         match_type="BFS",
         capacity=1000000,
+        external_sam_budget=0,
+        external_corpus_max_tokens=10000000,
+        external_corpus_documents: Optional[Iterable[Sequence[int]]] = None,
     ) -> None:
         cls = get_ngram_corpus_cls()
         self._obj = cls(
@@ -28,11 +60,20 @@ class NgramCorpus:
             max_bfs_breadth=max_bfs_breadth,
             draft_token_num=draft_token_num,
             match_type=match_type,
+            external_sam_budget=external_sam_budget,
+            external_corpus_max_tokens=external_corpus_max_tokens,
         )
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
         self._req_id_to_state_id: Dict[str, int] = {}
         self._next_state_id: int = 0
+        self.external_corpus_token_count = 0
+        if external_corpus_documents is not None:
+            self.load_external_corpus(
+                _documents_to_chunks(
+                    external_corpus_documents, external_corpus_max_tokens
+                )
+            )
 
     def _get_state_id(self, req_id: str) -> int:
         sid = self._req_id_to_state_id.get(req_id)
@@ -47,6 +88,18 @@ class NgramCorpus:
 
     def synchronize(self):
         self._obj.synchronize()  # type: ignore
+
+    def load_external_corpus(self, chunks: Iterable[Sequence[int]]) -> int:
+        """Load pre-chunked external corpus tokens.
+
+        Callers passing raw chunk iterables must enforce any token budget before
+        calling this method. Python-side helpers such as
+        `iter_external_corpus_chunks()` and `external_corpus_documents=` handle
+        `external_corpus_max_tokens` validation before handing chunks to C++.
+        """
+        _, loaded_token_count = self._obj.load_external_corpus(chunks)
+        self.external_corpus_token_count = loaded_token_count
+        return loaded_token_count
 
     def reset(self):
         self._obj.reset()  # type: ignore

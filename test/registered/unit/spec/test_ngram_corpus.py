@@ -1,8 +1,14 @@
+import json
+import os
+import tempfile
 import unittest
 import uuid
 
 import numpy as np
 
+from sglang.srt.speculative.cpp_ngram.external_corpus import (
+    iter_external_corpus_chunks,
+)
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -17,6 +23,9 @@ def _make_corpus(match_type="BFS", **kwargs):
         max_bfs_breadth=8,
         draft_token_num=8,
         capacity=100000,
+        external_sam_budget=0,
+        external_corpus_max_tokens=10000000,
+        external_corpus_documents=None,
     )
     defaults.update(kwargs)
     defaults["match_type"] = match_type
@@ -41,6 +50,12 @@ def _batch_get_with_state(
     total_len: int,
 ):
     return corpus.batch_get([req_id], [current_tokens], [total_len])
+
+
+class _IntTokenizer:
+    def encode(self, text: str, add_special_tokens: bool = False):
+        del add_special_tokens
+        return [int(piece) for piece in text.split()]
 
 
 SEED_SEQUENCES = [
@@ -672,6 +687,159 @@ class TestNgramCorpusIncremental(CustomTestCase):
         full_ids, full_masks = _batch_get(corpus, [[5000, 5001, 5002]])
         np.testing.assert_array_equal(inc_ids, full_ids)
         np.testing.assert_array_equal(inc_masks, full_masks)
+
+
+class TestNgramCorpusExternalSam(CustomTestCase):
+    """Verify external SAM loading and fixed-budget composition."""
+
+    def test_external_corpus_iterator_streams_documents(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_max_tokens=8,
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps("1 2 3 4 5"))
+            f.write("\n")
+            f.write(json.dumps("8 9"))
+            f.write("\n")
+            path = f.name
+        self.addCleanup(os.remove, path)
+
+        loaded_token_count = corpus.load_external_corpus(
+            iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=8)
+        )
+        # 5 doc tokens + 1 separator + 2 doc tokens = 8
+        self.assertEqual(loaded_token_count, 8)
+
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
+        ids_list = ids.tolist()
+        self.assertEqual(ids_list[0], 3)
+        self.assertEqual(ids_list[1:3], [4, 5])
+
+    def test_external_corpus_iterator_rejects_oversized_corpus(self):
+        corpus = _make_corpus(
+            "BFS",
+            external_sam_budget=2,
+            external_corpus_max_tokens=4,
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps("1 2 3"))
+            f.write("\n")
+            f.write(json.dumps("4 5"))
+            f.write("\n")
+            path = f.name
+        self.addCleanup(os.remove, path)
+
+        with self.assertRaisesRegex(ValueError, "token limit"):
+            corpus.load_external_corpus(
+                iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=4)
+            )
+
+    def test_external_sam_documents_reject_oversized_corpus(self):
+        with self.assertRaisesRegex(ValueError, "token limit"):
+            _make_corpus(
+                "BFS",
+                external_sam_budget=2,
+                external_corpus_max_tokens=4,
+                external_corpus_documents=[[1, 2, 3], [4, 5]],
+            )
+
+    def test_external_sam_only_chain(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_documents=[[1, 2, 3, 4, 5]],
+        )
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        ids_list = ids.tolist()
+        self.assertEqual(ids_list[0], 3)
+        self.assertEqual(ids_list[1:3], [4, 5])
+
+    def test_external_sam_respects_document_boundaries(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_documents=[[1, 2, 3], [4, 5, 6]],
+        )
+
+        ids, _ = _batch_get(corpus, [[2, 3]])
+        ids_list = ids.tolist()
+        self.assertEqual(ids_list[0], 3)
+        self.assertTrue(all(token == 0 for token in ids_list[1:]), ids_list)
+
+    def test_external_sam_adds_distinct_root_branch(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=6,
+            external_sam_budget=2,
+            external_corpus_documents=[[1, 2, 3, 20, 21]],
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11]])
+        corpus.synchronize()
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(6, 6).tolist()
+        )
+        self.assertIn([3, 10, 11], leaf_paths)
+        self.assertIn([3, 20, 21], leaf_paths)
+
+    def test_shared_prefix_keeps_both_branches(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=5,
+            external_sam_budget=2,
+            external_corpus_documents=[[1, 2, 3, 10, 99]],
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11]])
+        corpus.synchronize()
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(5, 5).tolist()
+        )
+        self.assertIn([3, 10, 11], leaf_paths)
+        self.assertIn([3, 10, 99], leaf_paths)
+
+    def test_shared_prefix_merge_can_underfill_budget(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=6,
+            external_sam_budget=2,
+            external_corpus_documents=[[1, 2, 3, 10, 99]],
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11]])
+        corpus.synchronize()
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        ids_list = ids.tolist()
+        leaf_paths = corpus.leaf_paths_from_mask(ids_list, masks.reshape(6, 6).tolist())
+        self.assertIn([3, 10, 11], leaf_paths)
+        self.assertIn([3, 10, 99], leaf_paths)
+        self.assertEqual(ids_list.count(0), 2, ids_list)
+
+    def test_external_sam_prob_prefers_frequent_continuation(self):
+        corpus = _make_corpus(
+            "PROB",
+            draft_token_num=2,
+            min_bfs_breadth=1,
+            max_bfs_breadth=1,
+            external_sam_budget=1,
+            external_corpus_documents=[
+                [1, 2, 3, 10],
+                [1, 2, 3, 20],
+                [1, 2, 3, 20],
+                [1, 2, 3, 20],
+            ],
+        )
+
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
+        self.assertEqual(ids.tolist(), [3, 20])
 
 
 class TestNgramCorpusMatchBenchmark(CustomTestCase):

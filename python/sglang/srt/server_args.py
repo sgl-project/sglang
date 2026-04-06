@@ -512,6 +512,9 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_max_trie_depth: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_ngram_external_corpus_path: Optional[str] = None
+    speculative_ngram_external_sam_budget: int = 0
+    speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -3110,6 +3113,30 @@ class ServerArgs:
                     "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
                     "You can override this by explicitly setting --speculative-num-draft-tokens."
                 )
+            if self.speculative_ngram_external_corpus_path is not None:
+                if self.speculative_ngram_external_sam_budget <= 0:
+                    raise ValueError(
+                        "--speculative-ngram-external-sam-budget must be positive when "
+                        "--speculative-ngram-external-corpus-path is set."
+                    )
+                if self.speculative_ngram_external_corpus_max_tokens <= 0:
+                    raise ValueError(
+                        "--speculative-ngram-external-corpus-max-tokens must be positive when "
+                        "--speculative-ngram-external-corpus-path is set."
+                    )
+                if (
+                    self.speculative_ngram_external_sam_budget
+                    > self.speculative_num_draft_tokens - 1
+                ):
+                    raise ValueError(
+                        "speculative_ngram_external_sam_budget must be less than or equal to "
+                        f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."
+                    )
+            elif self.speculative_ngram_external_sam_budget != 0:
+                raise ValueError(
+                    "--speculative-ngram-external-sam-budget requires "
+                    "--speculative-ngram-external-corpus-path."
+                )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
                 "using ngram speculative decoding."
@@ -4887,6 +4914,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-corpus-path",
+            type=str,
+            default=ServerArgs.speculative_ngram_external_corpus_path,
+            help="Optional path to an external corpus used to build a read-only SAM for ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-sam-budget",
+            type=int,
+            default=ServerArgs.speculative_ngram_external_sam_budget,
+            help="Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-corpus-max-tokens",
+            type=int,
+            default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
+            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
         )
 
         # Multi-layer Eagle speculative decoding

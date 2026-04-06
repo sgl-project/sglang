@@ -63,6 +63,29 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
   }
 }
 
+void Ngram::startExternalCorpusLoad() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  sam_ = std::make_unique<SuffixAutomaton>();
+}
+
+void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  sam_->appendTokens(tokens);
+}
+
+void Ngram::finishExternalCorpusLoad() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  sam_->finalize();
+  if (sam_->empty()) {
+    sam_.reset();
+  }
+}
+
+void Ngram::clearExternalCorpus() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  sam_.reset();
+}
+
 void Ngram::insertWorker() {
   for (;;) {
     std::vector<int32_t> data;
@@ -116,12 +139,17 @@ Result Ngram::batchMatch(
 
   std::unique_lock<std::mutex> lock(mutex_);
 
-  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
-  BuildFn build_fn;
+  using TrieResultBuildFn =
+      Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
+  using SamResultBuildFn = Result (SuffixAutomaton::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
+  TrieResultBuildFn trie_result_build_fn;
+  SamResultBuildFn sam_result_build_fn;
   if (param_.match_type == "BFS") {
-    build_fn = &Trie::buildRecency;
+    trie_result_build_fn = &Trie::buildRecency;
+    sam_result_build_fn = &SuffixAutomaton::buildRecency;
   } else if (param_.match_type == "PROB") {
-    build_fn = &Trie::buildFrequency;
+    trie_result_build_fn = &Trie::buildFrequency;
+    sam_result_build_fn = &SuffixAutomaton::buildFrequency;
   } else {
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
@@ -134,9 +162,23 @@ Result Ngram::batchMatch(
     }
 
     auto& state = match_state_[state_ids[i]];
-    auto draft_token_num = param_.get_draft_token_num(tokens.size());
-    auto res = (trie_.get()->*build_fn)(
-        suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_, state, total_lens[i]);
+    const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
+    const auto sam_budget =
+        sam_ && !sam_->empty() ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
+    const auto trie_budget = total_draft_token_num - sam_budget;
+
+    if (sam_budget == 0) {
+      auto res = (trie_.get()->*trie_result_build_fn)(
+          suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
+      merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
+      merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
+      continue;
+    }
+
+    auto trie_res = (trie_.get()->*trie_result_build_fn)(
+        suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
+    auto sam_res = (sam_.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), sam_budget, param_);
+    auto res = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), trie_res, sam_res);
     merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
     merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
   }

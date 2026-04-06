@@ -23,7 +23,9 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       int64_t min_bfs_breadth,
       int64_t max_bfs_breadth,
       int64_t draft_token_num,
-      int64_t match_type) {
+      int64_t match_type,
+      int64_t external_sam_budget,
+      int64_t external_corpus_max_tokens) {
     ngram::Param param;
     param.enable = true;
     param.enable_router_mode = false;
@@ -32,6 +34,8 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     param.max_bfs_breadth = static_cast<size_t>(max_bfs_breadth);
     param.draft_token_num = static_cast<size_t>(draft_token_num);
     param.match_type = (match_type == 0) ? "BFS" : "PROB";
+    param.external_sam_budget = static_cast<size_t>(external_sam_budget);
+    param.external_corpus_max_tokens = static_cast<size_t>(external_corpus_max_tokens);
     ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
   }
 
@@ -97,6 +101,25 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_->eraseMatchState(state_ids);
   }
 
+  void start_external_corpus_load() {
+    ngram_->startExternalCorpusLoad();
+  }
+
+  void append_external_corpus_tokens(const tvm::ffi::TensorView tokens_tv) {
+    auto* data = static_cast<const int32_t*>(tokens_tv.data_ptr());
+    int64_t n = tokens_tv.size(0);
+    std::vector<int32_t> tokens(data, data + n);
+    ngram_->appendExternalCorpusTokens(tokens);
+  }
+
+  void finish_external_corpus_load() {
+    ngram_->finishExternalCorpusLoad();
+  }
+
+  void clear_external_corpus() {
+    ngram_->clearExternalCorpus();
+  }
+
   void synchronize() {
     ngram_->synchronize();
   }
@@ -130,11 +153,15 @@ struct NgramCorpusObj : public tvm::ffi::Object {
 void register_ngram_corpus() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<NgramCorpusObj>()
-      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
+      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match", &NgramCorpusObj::batch_match)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
+      .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
+      .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
+      .def("finish_external_corpus_load", &NgramCorpusObj::finish_external_corpus_load)
+      .def("clear_external_corpus", &NgramCorpusObj::clear_external_corpus)
       .def("synchronize", &NgramCorpusObj::synchronize)
       .def("reset", &NgramCorpusObj::reset);
 }
