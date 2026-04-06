@@ -32,6 +32,8 @@ class TestMiniMaxM25Basic(CustomTestCase):
             "8",
             "--mem-fraction-static",
             "0.85",
+            "--reasoning-parser",
+            "minimax-append-think",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
@@ -48,11 +50,11 @@ class TestMiniMaxM25Basic(CustomTestCase):
 
     def test_a_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
+            num_shots=20,
             data_path=None,
-            num_questions=200,
+            num_questions=1400,
+            parallel=1400,
             max_new_tokens=512,
-            parallel=128,
             host="http://127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
@@ -63,7 +65,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
             write_github_step_summary(
                 f"### test_gsm8k (minimax-m25)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
-        self.assertGreater(metrics["accuracy"], 0.80)
+        self.assertGreater(metrics["accuracy"], 0.935)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -75,7 +77,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (minimax-m25)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 30)
+            self.assertGreater(speed, 90)
 
 
 if __name__ == "__main__":
