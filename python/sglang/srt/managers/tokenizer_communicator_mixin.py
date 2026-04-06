@@ -374,6 +374,7 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager, obj: AddExternalCorpusReqInput
     ) -> AddExternalCorpusReqOutput:
         self.auto_create_handle_loop()
+        truncated = False
         try:
             if not obj.corpus_id:
                 import uuid
@@ -397,7 +398,12 @@ class TokenizerCommunicatorMixin:
                     SEPARATOR_TOKEN,
                 )
 
+                max_tokens = (
+                    self.server_args.speculative_ngram_external_corpus_max_tokens
+                )
                 token_chunks = []
+                total_tokens = 0
+                truncated = False
                 has_prev = False
                 for doc in obj.documents:
                     if not doc:
@@ -409,7 +415,11 @@ class TokenizerCommunicatorMixin:
                         continue
                     if has_prev:
                         token_ids = [SEPARATOR_TOKEN] + token_ids
+                    if total_tokens + len(token_ids) > max_tokens:
+                        truncated = True
+                        break
                     token_chunks.append(token_ids)
+                    total_tokens += len(token_ids)
                     has_prev = True
                 obj.token_chunks = token_chunks
             else:
@@ -420,7 +430,10 @@ class TokenizerCommunicatorMixin:
             obj.file_path = None
             obj.documents = None
             results = await self.add_external_corpus_communicator(obj)
-            return results[0]
+            result = results[0]
+            if truncated and result.success:
+                result.message += f" (truncated: exceeded {max_tokens} token limit)"
+            return result
         except Exception as e:
             return AddExternalCorpusReqOutput(success=False, message=str(e))
 
