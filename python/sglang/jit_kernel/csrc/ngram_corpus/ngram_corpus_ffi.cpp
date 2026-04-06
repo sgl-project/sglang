@@ -107,9 +107,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
 
  private:
   void write_result_(
-      const ngram::Result& result,
-      const tvm::ffi::TensorView& out_tokens,
-      const tvm::ffi::TensorView& out_mask) {
+      const ngram::Result& result, const tvm::ffi::TensorView& out_tokens, const tvm::ffi::TensorView& out_mask) {
     auto* out_tok = static_cast<int32_t*>(out_tokens.data_ptr());
     auto* out_msk = static_cast<uint8_t*>(out_mask.data_ptr());
     if (result.token.size() > static_cast<size_t>(out_tokens.size(0))) {

@@ -526,7 +526,6 @@ class TestTruncate(CustomTestCase):
         n = 8
         full_mask = masks.reshape(n, n)
 
-
         trunc_n = 4
         trunc_mask = full_mask[:trunc_n, :trunc_n]
 
