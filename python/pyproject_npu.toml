@@ -21,6 +21,7 @@ dependencies = [
   "blobfile==3.0.0",
   "av",
   "build",
+  "cachetools",
   "compressed-tensors",
   "datasets",
   "einops",

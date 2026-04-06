@@ -210,6 +210,8 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruc
 --port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: xgrammar)
 ```
 
+SGLang also caches compiled grammar objects for constrained decoding. If you need to cap the in-memory cache size, set `SGLANG_GRAMMAR_CACHE_MAX_ENTRIES` to a positive integer to enable LRU eviction. The default value `-1` keeps the existing unbounded cache behavior.
+
 ```python
 import json
 import requests
