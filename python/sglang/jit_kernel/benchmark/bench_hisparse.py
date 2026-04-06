@@ -72,7 +72,9 @@ def _build_inputs(
     host_cache.copy_(torch.randn_like(host_cache))
 
     total_device_tokens = batch_size * padded_buffer_size
-    device_buffer = torch.empty((total_device_tokens, 1, kv_dim), dtype=DTYPE, device=DEVICE)
+    device_buffer = torch.empty(
+        (total_device_tokens, 1, kv_dim), dtype=DTYPE, device=DEVICE
+    )
     device_buffer.normal_()
 
     device_buffer_locs = torch.arange(
@@ -85,9 +87,11 @@ def _build_inputs(
         hot_buffer_size, dtype=torch.int32, device=DEVICE
     )
 
-    lru_slots = torch.arange(hot_buffer_size, dtype=torch.int16, device=DEVICE).view(
-        1, -1
-    ).repeat(batch_size, 1)
+    lru_slots = (
+        torch.arange(hot_buffer_size, dtype=torch.int16, device=DEVICE)
+        .view(1, -1)
+        .repeat(batch_size, 1)
+    )
 
     return {
         "top_k_tokens": top_k_tokens,
@@ -103,7 +107,9 @@ def _build_inputs(
             (batch_size, TOP_K), dtype=torch.int32, device=DEVICE
         ),
         "req_pool_indices": torch.arange(batch_size, dtype=torch.int64, device=DEVICE),
-        "seq_lens": torch.full((batch_size,), seq_len, dtype=torch.int32, device=DEVICE),
+        "seq_lens": torch.full(
+            (batch_size,), seq_len, dtype=torch.int32, device=DEVICE
+        ),
         "lru_slots": lru_slots,
         "initial_lru_slots": lru_slots.clone(),
         "num_real_reqs": torch.tensor([batch_size], dtype=torch.int32, device=DEVICE),
