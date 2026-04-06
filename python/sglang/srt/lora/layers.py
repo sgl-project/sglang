@@ -629,7 +629,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def forward(self, input_: torch.Tensor, skip_all_reduce=False):
-        # duplicate the logic in RowParallelLinear
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
@@ -638,8 +637,14 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 input_, num_partitions=self.base_layer.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
+
+        bias_ = (
+            None
+            if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
+            else self.base_layer.bias
+        )
         output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
+            self.base_layer, input_parallel, bias=bias_
         )
 
         should_reduce = (
@@ -668,17 +673,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             else:
                 output_ = output_parallel
 
-        if not self.base_layer.skip_bias_add:
-            output = (
-                output_ + self.base_layer.bias
-                if self.base_layer.bias is not None
-                else output_
-            )
-            output_bias = None
-        else:
-            output = output_
-            output_bias = self.base_layer.bias
-        return output, output_bias
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output_, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         shard_size = self.base_layer.input_size_per_partition
@@ -719,6 +715,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.intermediate_size_per_partition = getattr(
             base_layer, "intermediate_size_per_partition", None
         )
+        self._uses_interleaved_gate_up = (
+            getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
+        )
 
         # initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
@@ -753,26 +752,26 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_b_weights = down_lora_b_weights
 
     def _get_lora_info(self):
-        """
-        Build LoRAInfo for the current batch.
-
-        Returns None if LoRA is not enabled or weights are not set.
-        """
+        """Build LoRAInfo for the current batch."""
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
 
-        # Get LoRA batch info from backend
         batch_info = self.lora_backend.batch_info
-        lora_ranks = batch_info.lora_ranks  # [num_loras]
+        lora_ranks = batch_info.lora_ranks
 
         max_lora_rank = self.down_lora_a_weights.shape[2]
 
-        # Create adapter_enabled tensor for the current batch
-        # Only enable LoRA adapters that are actually used in this batch
-        # TODO: Jonahbernard: check that this doesn't slow down inference for this batch
-        adapter_enabled = torch.zeros(
-            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
-        )
-        adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
+        cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
+        if cg_buffers is not None and batch_info.use_cuda_graph:
+            adapter_enabled = cg_buffers["adapter_enabled"]
+            adapter_enabled.zero_()
+            idx_buf = cg_buffers["weight_indices_long"]
+            idx_buf[: batch_info.bs] = batch_info.weight_indices[: batch_info.bs]
+            adapter_enabled.index_fill_(0, idx_buf[: batch_info.bs], 1)
+        else:
+            adapter_enabled = torch.zeros(
+                len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
+            )
+            adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
@@ -786,6 +785,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             max_lora_rank=max_lora_rank,
             num_experts=self.base_layer.num_experts,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
+            cg_buffers=cg_buffers,
+            has_active_lora=batch_info.has_active_lora,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
@@ -895,7 +896,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
           gate_up_proj_moe B: [intermediate_size*2, rank] — output matches sharded base w13
           down_proj_moe B:    [hidden_size, rank] — output is all-reduced, no slice
         """
-        if self.tp_size <= 1:
+        needs_processing = (self.tp_size > 1) or (
+            target_module == "gate_up_proj_moe" and self._uses_interleaved_gate_up
+        )
+        if not needs_processing:
             return B
         if target_module != "gate_up_proj_moe":
             return B
@@ -923,6 +927,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             full_inter = B.shape[0] // 2
             gate_b = B[start:end, :]
             up_b = B[full_inter + start : full_inter + end, :]
+            if self._uses_interleaved_gate_up:
+                return torch.stack([gate_b, up_b], dim=1).reshape(-1, B.shape[-1])
             return torch.cat([gate_b, up_b], dim=0).contiguous()
         return B
 

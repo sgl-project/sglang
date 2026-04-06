@@ -890,8 +890,6 @@ jobs:
       (
         inputs.target_stage == 'multimodal-gen-test-1-gpu' ||
         inputs.target_stage == 'multimodal-gen-test-2-gpu' ||
-        inputs.target_stage == 'multimodal-gen-component-accuracy-1-gpu' ||
-        inputs.target_stage == 'multimodal-gen-component-accuracy-2-gpu' ||
         inputs.target_stage == 'multimodal-gen-test-1-b200' ||
         inputs.target_stage == 'multimodal-gen-unit-test' ||
         (

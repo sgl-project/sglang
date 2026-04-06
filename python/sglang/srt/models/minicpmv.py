@@ -993,7 +993,11 @@ class MiniCPMV2_6(MiniCPMBaseModel):
         slice_end_id: int = image_inputs.slice_end_id
 
         media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        # Only increment data_idx on im_start (not slice_start) so all slices
+        # within one image share the same pad_value for per-image caching.
+        pattern = MultiModalityDataPaddingPatternTokenPairs(
+            media_token_pairs, data_start_token_ids=[im_start_id]
+        )
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
@@ -1155,7 +1159,11 @@ class MiniCPMV4_0(MiniCPMBaseModel):
         slice_end_id: int = image_inputs.slice_end_id
 
         media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        # Only increment data_idx on im_start (not slice_start) so all slices
+        # within one image share the same pad_value for per-image caching.
+        pattern = MultiModalityDataPaddingPatternTokenPairs(
+            media_token_pairs, data_start_token_ids=[im_start_id]
+        )
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
@@ -1321,7 +1329,11 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         slice_end_id: int = image_inputs.slice_end_id
 
         media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        # Only increment data_idx on im_start (not slice_start) so all slices
+        # within one image share the same pad_value for per-image caching.
+        pattern = MultiModalityDataPaddingPatternTokenPairs(
+            media_token_pairs, data_start_token_ids=[im_start_id]
+        )
 
         return pattern.pad_input_tokens(input_ids, image_inputs)
 

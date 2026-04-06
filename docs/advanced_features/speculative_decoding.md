@@ -387,7 +387,7 @@ Enable it with:
 
 | Parameter | Description | Default |
 |---|---|---|
-| `--speculative-num-draft-tokens` | Number of draft tokens verified per step. | `12` |
+| `--speculative-num-draft-tokens` | Number of draft tokens verified per step. If omitted, defaults to `min(--speculative-ngram-max-trie-depth, 12)`. | `12` (with default ngram settings) |
 | `--speculative-ngram-min-bfs-breadth` | Minimum BFS breadth. | `1` |
 | `--speculative-ngram-max-bfs-breadth` | Maximum BFS breadth. | `10` |
 | `--speculative-ngram-match-type` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion. | `"BFS"` |
