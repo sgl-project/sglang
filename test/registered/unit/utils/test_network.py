@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
+import os
 import socket
 import unittest
 from unittest.mock import patch
@@ -105,6 +106,9 @@ class TestNetworkAddress(CustomTestCase):
         self.assertEqual(
             NetworkAddress("127.0.0.1", 5000).to_tcp(), "tcp://127.0.0.1:5000"
         )
+        self.assertEqual(
+            NetworkAddress("::1", 5000).to_tcp(), "tcp://[::1]:5000"
+        )
 
     def test_to_host_port_str(self):
         self.assertEqual(
@@ -121,6 +125,7 @@ class TestNetworkAddress(CustomTestCase):
         addr = NetworkAddress("127.0.0.1", 8000)
         self.assertEqual(str(addr), "127.0.0.1:8000")
         self.assertEqual(repr(addr), "NetworkAddress('127.0.0.1', 8000)")
+        self.assertEqual(str(NetworkAddress("::1", 8000)), "[::1]:8000")
 
     def test_frozen(self):
         addr = NetworkAddress("127.0.0.1", 8000)
@@ -233,8 +238,6 @@ class TestPortOperations(CustomTestCase):
     @patch.dict("os.environ", {}, clear=False)
     def test_get_open_port_without_env(self):
         # Ensure SGLANG_PORT is not set so get_open_port uses OS-assigned port
-        import os
-
         os.environ.pop("SGLANG_PORT", None)
         port = get_open_port()
         self.assertGreater(port, 0)
