@@ -11,7 +11,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=15, suite="stage-b-test-1-gpu-small")
 
 # Tolerance table — chosen per dtype to cover known rounding gaps.
 # fp32 ref is tight (kernel also runs in fp32 internally).

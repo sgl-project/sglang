@@ -36,7 +36,7 @@ if is_cuda():
 # Batch size threshold for fused Triton kernel vs PyTorch softmax.
 # Below this threshold, PyTorch's native div+softmax is faster.
 # At and above this threshold, the fused Triton kernel wins.
-_FUSED_SAMPLING_BATCH_THRESHOLD = 128
+_FUSED_SAMPLING_BATCH_THRESHOLD = 32
 if is_npu():
     import torch_npu
 
