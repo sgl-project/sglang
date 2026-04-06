@@ -20,13 +20,15 @@ namespace ngram {
 class Ngram {
   std::unique_ptr<Trie> trie_;
   std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
+  // FIXME: single staging slot — only one corpus can be loaded at a time.
+  // To support concurrent loads, move staging into a per-load local variable.
   std::unique_ptr<SuffixAutomaton> staging_sam_;
   Param param_;
 
-  // NOTE: protects trie_, sams_, staging_sam_, and pending_count_. Ensures
-  // batchMatch never reads while insertWorker or corpus loading is writing.
-  // After synchronize(), no pending inserts remain so mutex_ contention is
-  // effectively zero.
+  // NOTE: protects trie_, sams_, and pending_count_. staging_sam_ is NOT
+  // protected by mutex_ — it is only accessed from the corpus loading thread.
+  // finishExternalCorpusLoad briefly acquires mutex_ to move the completed
+  // SAM into sams_.
   mutable std::mutex mutex_;
   mutable std::condition_variable sync_cv_;
   // NOTE: tracks inserts from enqueue through trie_->insert() completion,
