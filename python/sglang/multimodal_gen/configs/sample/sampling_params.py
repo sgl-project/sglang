@@ -29,11 +29,16 @@ def _json_safe(obj: Any):
     """
     Recursively convert objects to JSON-serializable forms.
     - Enums -> their name
+    - Callables -> stable module-qualified name
     - Sets/Tuples -> lists
     - Dicts/Lists -> recursively processed
     """
     if isinstance(obj, Enum):
         return obj.name
+    if callable(obj):
+        module = getattr(obj, "__module__", None)
+        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
+        return f"{module}.{qualname}" if module else qualname
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
@@ -123,7 +128,7 @@ class SamplingParams:
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 42
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: str | None = None  # None means use the pipeline/model default
 
     # Original dimensions (before VAE scaling)
     num_frames: int = 1  # Default for image models
@@ -680,7 +685,7 @@ class SamplingParams:
             "--generator-device",
             type=str,
             choices=["cuda", "musa", "cpu"],
-            help="Device for random generator (cuda, musa or cpu). Default: cuda",
+            help="Device for random generator (cuda, musa or cpu). Default: use the model-specific setting.",
         )
         add_argument(
             "--num-frames",

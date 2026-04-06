@@ -65,7 +65,7 @@ dependencies = [
   "triton==3.5.0",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
+  "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
 ]
 
@@ -127,4 +127,4 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]

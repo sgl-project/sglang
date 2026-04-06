@@ -92,7 +92,10 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_qk_norm_rope
+    from sglang.jit_kernel.fused_qknorm_rope import (
+        can_use_fused_qk_norm_rope,
+        fused_qk_norm_rope,
+    )
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
@@ -507,12 +510,20 @@ class Qwen3MoeAttention(nn.Module):
         self.compatible_with_fused_kv_buffer = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         )
-        self.compatible_with_fused_qk_norm_rope = (
-            not isinstance(self.rotary_emb, MRotaryEmbedding)
+        self.compatible_with_fused_qk_norm_rope = not isinstance(
+            self.rotary_emb, MRotaryEmbedding
         ) and self.head_dim in (64, 128, 256)
+        _yarn_factor, _, _, _ = compute_yarn_parameters(config)
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
+            and _is_cuda
+            and can_use_fused_qk_norm_rope(
+                self.head_dim,
+                self.rotary_emb.is_neox_style,
+                torch.bfloat16,
+                _yarn_factor != 1.0,
+            )
         )
         self._used_fused_qk_norm_rope_last_call = False
 
