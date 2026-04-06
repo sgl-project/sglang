@@ -608,8 +608,13 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
-        # Backup invariant: parent must be backed up before child.
-        if node.parent != self.root_node and not node.parent.backuped:
+        # Write-through only: skip if parent not yet backed up to avoid
+        # gaps in the backup chain. Write-back ordering is handled by eviction.
+        if (
+            not write_back
+            and node.parent != self.root_node
+            and not node.parent.backuped
+        ):
             return 0
 
         host_indices = self.cache_controller.write(
