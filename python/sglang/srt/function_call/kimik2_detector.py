@@ -61,9 +61,9 @@ class KimiK2Detector(BaseFormatDetector):
             re.DOTALL,
         )
 
+        # Negative lookahead prevents greedy match from crossing into the next tool call
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
-            re.DOTALL,
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>(?:(?!<\|tool_call_begin\|>)[\s\S])*)",
         )
 
         self._last_arguments = ""
@@ -241,6 +241,17 @@ class KimiK2Detector(BaseFormatDetector):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
+
+    def reset_streaming_state(self) -> None:
+        """Reset all streaming state between requests to prevent cross-request state pollution."""
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.prev_tool_call_arr = []
+        self.streamed_args_for_tool = []
+        self._last_arguments = ""
+        self._buffer = ""
+        if hasattr(self, "_tool_indices"):
+            del self._tool_indices
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
