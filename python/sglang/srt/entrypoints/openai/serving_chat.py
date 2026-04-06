@@ -1207,13 +1207,18 @@ class OpenAIServingChat(OpenAIServingBase):
         total_output_logprobs: int,
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
+        output_token_logprobs = content["meta_info"]["output_token_logprobs"]
+        output_top_logprobs = content["meta_info"].get("output_top_logprobs", [])
+        if not self.tokenizer_manager.server_args.incremental_streaming_output:
+            output_token_logprobs = output_token_logprobs[
+                n_prev_token:total_output_logprobs
+            ]
+            output_top_logprobs = output_top_logprobs[
+                n_prev_token:total_output_logprobs
+            ]
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=content["meta_info"]["output_token_logprobs"][
-                n_prev_token:total_output_logprobs
-            ],
-            output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
-                n_prev_token:total_output_logprobs
-            ],
+            output_token_logprobs=output_token_logprobs,
+            output_top_logprobs=output_top_logprobs,
         )
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)

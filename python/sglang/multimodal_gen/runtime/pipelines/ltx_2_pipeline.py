@@ -5,6 +5,9 @@ import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    is_ltx23_native_variant,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
@@ -44,6 +47,8 @@ def _resolve_ltx2_two_stage_component_paths(
     if "spatial_upsampler" not in resolved:
         spatial_candidates = [
             os.path.join(model_path, "latent_upsampler"),
+            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
+            os.path.join(model_path, "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"),
             os.path.join(model_path, "ltx-2-spatial-upscaler-x2-1.0.safetensors"),
         ]
         for candidate in spatial_candidates:
@@ -53,12 +58,15 @@ def _resolve_ltx2_two_stage_component_paths(
                 break
 
     if "distilled_lora" not in resolved:
-        distilled_lora = os.path.join(
-            model_path, "ltx-2-19b-distilled-lora-384.safetensors"
-        )
-        if os.path.exists(distilled_lora):
-            resolved["distilled_lora"] = distilled_lora
-            auto_resolved.append(f"distilled_lora={distilled_lora}")
+        distilled_lora_candidates = [
+            os.path.join(model_path, "ltx-2.3-22b-distilled-lora-384.safetensors"),
+            os.path.join(model_path, "ltx-2-19b-distilled-lora-384.safetensors"),
+        ]
+        for distilled_lora in distilled_lora_candidates:
+            if os.path.exists(distilled_lora):
+                resolved["distilled_lora"] = distilled_lora
+                auto_resolved.append(f"distilled_lora={distilled_lora}")
+                break
 
     if auto_resolved:
         logger.info(
@@ -81,6 +89,8 @@ def calculate_ltx2_shift(
 
 
 def prepare_ltx2_mu(batch: Req, server_args: ServerArgs):
+    if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+        return "mu", None
     latent_num_frames = (int(batch.num_frames) - 1) // int(
         server_args.pipeline_config.vae_temporal_compression
     ) + 1
@@ -92,16 +102,49 @@ def prepare_ltx2_mu(batch: Req, server_args: ServerArgs):
     return "mu", calculate_ltx2_shift(video_sequence_length)
 
 
+def build_official_ltx2_sigmas(
+    steps: int,
+    *,
+    max_shift: float = 2.05,
+    base_shift: float = 0.95,
+    stretch: bool = True,
+    terminal: float = 0.1,
+    default_number_of_tokens: int = MAX_SHIFT_ANCHOR,
+) -> list[float]:
+    sigmas = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float32)
+
+    mm = (max_shift - base_shift) / (MAX_SHIFT_ANCHOR - BASE_SHIFT_ANCHOR)
+    b = base_shift - mm * BASE_SHIFT_ANCHOR
+    sigma_shift = float(default_number_of_tokens) * mm + b
+
+    non_zero_mask = sigmas != 0
+    shifted = torch.where(
+        non_zero_mask,
+        math.exp(sigma_shift) / (math.exp(sigma_shift) + (1.0 / sigmas - 1.0)),
+        torch.zeros_like(sigmas),
+    )
+
+    if stretch:
+        one_minus_z = 1.0 - shifted[non_zero_mask]
+        scale_factor = one_minus_z[-1] / (1.0 - terminal)
+        shifted[non_zero_mask] = 1.0 - (one_minus_z / scale_factor)
+
+    return shifted[:-1].tolist()
+
+
 class LTX2SigmaPreparationStage(PipelineStage):
     """Prepare native LTX-2 sigma schedule before timestep setup."""
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage1"
-        batch.sigmas = np.linspace(
-            1.0,
-            1.0 / int(batch.num_inference_steps),
-            int(batch.num_inference_steps),
-        ).tolist()
+        if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+            batch.sigmas = build_official_ltx2_sigmas(int(batch.num_inference_steps))
+        else:
+            batch.sigmas = np.linspace(
+                1.0,
+                1.0 / int(batch.num_inference_steps),
+                int(batch.num_inference_steps),
+            ).tolist()
         return batch
 
 

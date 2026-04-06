@@ -11,6 +11,9 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.cpp_ngram.external_corpus import (
+    iter_external_corpus_chunks,
+)
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -54,7 +57,21 @@ class NGRAMWorker:
             capacity=server_args.speculative_ngram_capacity,
             max_trie_depth=server_args.speculative_ngram_max_trie_depth,
             draft_token_num=server_args.speculative_num_draft_tokens,
+            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
+            external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
         )
+        if server_args.speculative_ngram_external_corpus_path is not None:
+            loaded_token_count = self.ngram_corpus.load_external_corpus(
+                iter_external_corpus_chunks(
+                    server_args.speculative_ngram_external_corpus_path,
+                    target_worker.tokenizer,
+                    server_args.speculative_ngram_external_corpus_max_tokens,
+                )
+            )
+            logger.info(
+                "Loaded external ngram corpus (%d tokens) for SAM speculative decoding.",
+                loaded_token_count,
+            )
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
@@ -123,13 +140,19 @@ class NGRAMWorker:
         bs = batch.batch_size()
 
         self.ngram_corpus.synchronize()
+        req_ids = []
         batch_tokens = []
+        total_lens = []
         for req in batch.reqs:
             check_token = self._efficient_concat_last_n(
                 req.origin_input_ids, req.output_ids, self.max_trie_depth
             )
+            req_ids.append(req.rid)
             batch_tokens.append(check_token)
-        req_drafts, mask = self.ngram_corpus.batch_get(batch_tokens)
+            total_lens.append(len(req.origin_input_ids) + len(req.output_ids))
+        req_drafts, mask = self.ngram_corpus.batch_get(
+            req_ids, batch_tokens, total_lens
+        )
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -263,6 +286,16 @@ class NGRAMWorker:
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_corpus(batch)
+            # Clean up per-request match state for finished/retracted requests.
+            # State entries are created in _prepare_draft_tokens and cleaned here.
+            # If a request is removed without passing through verify, the entry
+            # persists until reset(); this is acceptable because MatchState is small.
+            finished_req_ids = []
+            for req in batch.reqs:
+                if req.finished() or req.is_retracted:
+                    finished_req_ids.append(req.rid)
+            if finished_req_ids:
+                self.ngram_corpus.erase_match_state(finished_req_ids)
             batch.forward_mode = ForwardMode.DECODE
 
         else:
