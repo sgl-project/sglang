@@ -49,8 +49,9 @@ def _fwd_kernel_stage1(
     sm_scale_withk,
     kv_indptr,
     kv_indices,
-    Att_Out,
-    Att_Lse,
+    softmax_segm_output,
+    softmax_segm_max,
+    softmax_segm_expsum,
     num_kv_splits,
     stride_qbs,
     stride_qh,
@@ -58,9 +59,12 @@ def _fwd_kernel_stage1(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
+    stride_segm_output_b,
+    stride_segm_output_h,
+    stride_segm_output_s,
+    stride_segm_logic_b,
+    stride_segm_logic_h,
+    stride_segm_logic_s,
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -155,27 +159,32 @@ def _fwd_kernel_stage1(
             e_max = n_e_max
 
         offs_mid_o = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
+            cur_batch * stride_segm_output_b
+            + cur_head * stride_segm_output_h
+            + split_kv_id * stride_segm_output_s
             + offs_dv
         )
 
         tl.store(
-            Att_Out + offs_mid_o,
-            acc / e_sum,
+            softmax_segm_output + offs_mid_o,
+            acc,
             mask=(mask_dv),
         )
 
         offs_mid_o_1 = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
-        ) // Lv
+            cur_batch * stride_segm_logic_b
+            + cur_head * stride_segm_logic_h
+            + split_kv_id * stride_segm_logic_s
+        )
 
         tl.store(
-            Att_Lse + offs_mid_o_1,
-            e_max + tl.log(e_sum),
+            softmax_segm_max + offs_mid_o_1,
+            e_max,
+        )
+
+        tl.store(
+            softmax_segm_expsum + offs_mid_o_1,
+            e_sum,
         )
 
 
@@ -183,8 +192,6 @@ def _decode_att_m_fwd(
     q,
     k_buffer,
     v_buffer,
-    att_out,
-    att_lse,
     kv_indptr,
     kv_indices,
     num_kv_splits,
@@ -192,6 +199,9 @@ def _decode_att_m_fwd(
     sm_scale_withk,
     logit_cap,
     xai_temperature_len=-1,
+    softmax_segm_output=None,
+    softmax_segm_max=None,
+    softmax_segm_expsum=None,
 ):
     BLOCK = 64
     # [TODO] work around SGPR limit on MI3xx
@@ -223,8 +233,9 @@ def _decode_att_m_fwd(
         sm_scale_withk,
         kv_indptr,
         kv_indices,
-        att_out,
-        att_lse,
+        softmax_segm_output,
+        softmax_segm_max,
+        softmax_segm_expsum,
         num_kv_splits,
         q.stride(0),
         q.stride(1),
@@ -232,9 +243,12 @@ def _decode_att_m_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
-        att_out.stride(0),
-        att_out.stride(1),
-        att_out.stride(2),
+        softmax_segm_output.stride(0),
+        softmax_segm_output.stride(1),
+        softmax_segm_output.stride(2),
+        softmax_segm_max.stride(0),
+        softmax_segm_max.stride(1),
+        softmax_segm_max.stride(2),
         kv_group_num=kv_group_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
@@ -257,8 +271,9 @@ def _fwd_grouped_kernel_stage1(
     sm_scale_withk,
     kv_indptr,
     kv_indices,
-    Att_Out,
-    Att_Lse,
+    softmax_segm_output,
+    softmax_segm_max,
+    softmax_segm_expsum,
     num_kv_splits,
     stride_qbs,
     stride_qh,
@@ -266,9 +281,12 @@ def _fwd_grouped_kernel_stage1(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
+    stride_segm_output_b,
+    stride_segm_output_h,
+    stride_segm_output_s,
+    stride_segm_logic_b,
+    stride_segm_logic_h,
+    stride_segm_logic_s,
     kv_group_num: tl.constexpr,
     q_head_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -398,27 +416,33 @@ def _fwd_grouped_kernel_stage1(
             e_max = n_e_max
 
         offs_mid_o = (
-            cur_batch * stride_mid_ob
-            + cur_head[:, None] * stride_mid_oh
-            + split_kv_id * stride_mid_os
+            cur_batch * stride_segm_output_b
+            + cur_head[:, None] * stride_segm_output_h
+            + split_kv_id * stride_segm_output_s
             + offs_dv[None, :]
         )
 
         tl.store(
-            Att_Out + offs_mid_o,
-            acc / e_sum[:, None],
+            softmax_segm_output + offs_mid_o,
+            acc,
             mask=(mask_h[:, None]) & (mask_dv[None, :]),
         )
 
         offs_mid_o_1 = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
-        ) // Lv
+            cur_batch * stride_segm_logic_b
+            + cur_head * stride_segm_logic_h
+            + split_kv_id * stride_segm_logic_s
+        )
 
         tl.store(
-            Att_Lse + offs_mid_o_1,
-            e_max + tl.log(e_sum),
+            softmax_segm_max + offs_mid_o_1,
+            e_max,
+            mask=mask_h,
+        )
+
+        tl.store(
+            softmax_segm_expsum + offs_mid_o_1,
+            e_sum,
             mask=mask_h,
         )
 
@@ -427,8 +451,6 @@ def _decode_grouped_att_m_fwd(
     q,
     k_buffer,
     v_buffer,
-    att_out,
-    att_lse,
     kv_indptr,
     kv_indices,
     num_kv_splits,
@@ -436,6 +458,9 @@ def _decode_grouped_att_m_fwd(
     sm_scale_withk,
     logit_cap,
     xai_temperature_len=-1,
+    softmax_segm_output=None,
+    softmax_segm_max=None,
+    softmax_segm_expsum=None,
 ):
     BLOCK = 32
     Lk = k_buffer.shape[-1]
@@ -482,8 +507,9 @@ def _decode_grouped_att_m_fwd(
         sm_scale_withk,
         kv_indptr,
         kv_indices,
-        att_out,
-        att_lse,
+        softmax_segm_output,
+        softmax_segm_max,
+        softmax_segm_expsum,
         num_kv_splits,
         q.stride(0),
         q.stride(1),
@@ -491,9 +517,12 @@ def _decode_grouped_att_m_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
-        att_out.stride(0),
-        att_out.stride(1),
-        att_out.stride(2),
+        softmax_segm_output.stride(0),
+        softmax_segm_output.stride(1),
+        softmax_segm_output.stride(2),
+        softmax_segm_max.stride(0),
+        softmax_segm_max.stride(1),
+        softmax_segm_max.stride(2),
         kv_group_num=kv_group_num,
         q_head_num=head_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
@@ -514,16 +543,20 @@ def _decode_grouped_att_m_fwd(
 
 @triton.jit
 def _fwd_kernel_stage2(
-    Mid_O,
-    Mid_O_1,
+    softmax_segm_output,
+    softmax_segm_max,
+    softmax_segm_expsum,
     O,
     v_scale,
     kv_indptr,
     num_kv_splits,
     sink_ptr,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
+    stride_segm_output_b,
+    stride_segm_output_h,
+    stride_segm_output_s,
+    stride_segm_logic_b,
+    stride_segm_logic_h,
+    stride_segm_logic_s,
     stride_obs,
     stride_oh,
     MAX_KV_SPLITS: tl.constexpr,
@@ -543,49 +576,66 @@ def _fwd_kernel_stage2(
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
 
-    e_sum = 0.0
-    e_max = -float("inf")
-    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
-
-    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
-    offs_logic = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh) // Lv
+    acc_sum = tl.zeros([BLOCK_DV], dtype=tl.float32)
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
+    act_num_splits = tl.where(
+        kv_len_per_split > 0, tl.cdiv(cur_batch_seq_len, kv_len_per_split), 0
+    )
+    offs_split = tl.arange(0, MAX_KV_SPLITS)
+    split_mask = offs_split < act_num_splits
 
-    for split_kv_id in range(0, MAX_KV_SPLITS):
-        split_kv_start = kv_len_per_split * split_kv_id
-        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    segm_logic_offset = (
+        cur_batch * stride_segm_logic_b
+        + cur_head * stride_segm_logic_h
+        + offs_split * stride_segm_logic_s
+    )
 
-        if split_kv_end > split_kv_start:
-            tv = tl.load(
-                Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
-            )
-            tlogic = tl.load(Mid_O_1 + offs_logic + split_kv_id * stride_mid_os // Lv)
-            n_e_max = tl.maximum(tlogic, e_max)
+    segm_max = tl.load(
+        softmax_segm_max + segm_logic_offset,
+        mask=split_mask,
+        other=float("-inf"),
+    )
+    segm_expsum = tl.load(
+        softmax_segm_expsum + segm_logic_offset,
+        mask=split_mask,
+        other=0.0,
+    )
 
-            old_scale = tl.exp(e_max - n_e_max)
-            acc *= old_scale
-            exp_logic = tl.exp(tlogic - n_e_max)
-            acc += exp_logic * tv
+    overall_max = tl.max(segm_max)
+    has_split = act_num_splits > 0
+    overall_max = tl.where(has_split, overall_max, 0.0)
+    segm_scale = tl.exp(segm_max - overall_max)
+    overall_expsum = tl.sum(segm_expsum * segm_scale, axis=0)
 
-            e_sum = e_sum * old_scale + exp_logic
-            e_max = n_e_max
+    segm_output_offset = (
+        cur_batch * stride_segm_output_b
+        + cur_head * stride_segm_output_h
+        + offs_split[:, None] * stride_segm_output_s
+        + offs_d[None, :]
+    )
+    segm_output = tl.load(
+        softmax_segm_output + segm_output_offset,
+        mask=split_mask[:, None] & mask_d[None, :],
+        other=0.0,
+    )
+    acc_sum = tl.sum(segm_output * segm_scale[:, None], axis=0)
 
     if HAS_SINK:
         cur_sink = tl.load(sink_ptr + cur_head)
-        e_sum += tl.exp(cur_sink - e_max)
+        overall_expsum += tl.exp(cur_sink - overall_max)
+
+    acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
 
     tl.store(
         O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum * v_scale,
+        acc * v_scale,
         mask=mask_d,
     )
 
 
 def _decode_softmax_reducev_fwd(
-    logits,
-    lse,
     q,
     o,
     v_scale,
@@ -594,6 +644,9 @@ def _decode_softmax_reducev_fwd(
     num_kv_splits,
     max_kv_splits,
     sinks=None,
+    softmax_segm_output=None,
+    softmax_segm_max=None,
+    softmax_segm_expsum=None,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
@@ -610,16 +663,20 @@ def _decode_softmax_reducev_fwd(
 
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](
-        logits,
-        lse,
+        softmax_segm_output,
+        softmax_segm_max,
+        softmax_segm_expsum,
         o,
         v_scale,
         kv_indptr,
         num_kv_splits,
         sinks,
-        logits.stride(0),
-        logits.stride(1),
-        logits.stride(2),
+        softmax_segm_output.stride(0),
+        softmax_segm_output.stride(1),
+        softmax_segm_output.stride(2),
+        softmax_segm_max.stride(0),
+        softmax_segm_max.stride(1),
+        softmax_segm_max.stride(2),
         o.stride(0),
         o.stride(1),
         MAX_KV_SPLITS=MAX_KV_SPLITS,
@@ -640,8 +697,6 @@ def decode_attention_fwd_normal(
     o,
     kv_indptr,
     kv_indices,
-    attn_logits,
-    attn_lse,
     num_kv_splits,
     max_kv_splits,
     sm_scale_withk,
@@ -649,13 +704,14 @@ def decode_attention_fwd_normal(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    softmax_segm_output=None,
+    softmax_segm_max=None,
+    softmax_segm_expsum=None,
 ):
     _decode_att_m_fwd(
         q,
         k_buffer,
         v_buffer,
-        attn_logits,
-        attn_lse,
         kv_indptr,
         kv_indices,
         num_kv_splits,
@@ -663,10 +719,11 @@ def decode_attention_fwd_normal(
         sm_scale_withk,
         logit_cap,
         xai_temperature_len,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
     )
     _decode_softmax_reducev_fwd(
-        attn_logits,
-        attn_lse,
         q,
         o,
         v_scale,
@@ -675,6 +732,9 @@ def decode_attention_fwd_normal(
         num_kv_splits,
         max_kv_splits,
         sinks,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
     )
 
 
@@ -685,8 +745,6 @@ def decode_attention_fwd_grouped(
     o,
     kv_indptr,
     kv_indices,
-    attn_logits,
-    attn_lse,
     num_kv_splits,
     max_kv_splits,
     sm_scale_withk,
@@ -694,13 +752,14 @@ def decode_attention_fwd_grouped(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    softmax_segm_output=None,
+    softmax_segm_max=None,
+    softmax_segm_expsum=None,
 ):
     _decode_grouped_att_m_fwd(
         q,
         k_buffer,
         v_buffer,
-        attn_logits,
-        attn_lse,
         kv_indptr,
         kv_indices,
         num_kv_splits,
@@ -708,10 +767,11 @@ def decode_attention_fwd_grouped(
         sm_scale_withk,
         logit_cap,
         xai_temperature_len,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
     )
     _decode_softmax_reducev_fwd(
-        attn_logits,
-        attn_lse,
         q,
         o,
         v_scale,
@@ -720,6 +780,9 @@ def decode_attention_fwd_grouped(
         num_kv_splits,
         max_kv_splits,
         sinks,
+        softmax_segm_output=softmax_segm_output,
+        softmax_segm_max=softmax_segm_max,
+        softmax_segm_expsum=softmax_segm_expsum,
     )
 
 
@@ -730,8 +793,6 @@ def decode_attention_fwd(
     o,
     kv_indptr,
     kv_indices,
-    attn_logits,
-    attn_lse,
     num_kv_splits,
     max_kv_splits,
     sm_scale,
@@ -740,10 +801,15 @@ def decode_attention_fwd(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    softmax_segm_output=None,
+    softmax_segm_max=None,
+    softmax_segm_expsum=None,
 ):
-    assert max_kv_splits == attn_logits.shape[2]
+    assert softmax_segm_output is not None
+    assert softmax_segm_max is not None
+    assert softmax_segm_expsum is not None
     assert q.shape[0] <= kv_indptr.shape[0] - 1
-    assert q.shape[0] <= attn_logits.shape[0]
+    assert q.shape[0] <= softmax_segm_output.shape[0]
 
     kv_group_num = q.shape[1] // v_buffer.shape[1]
 
@@ -756,8 +822,6 @@ def decode_attention_fwd(
             o,
             kv_indptr,
             kv_indices,
-            attn_logits,
-            attn_lse,
             num_kv_splits,
             max_kv_splits,
             sm_scale * k_scale,
@@ -765,6 +829,9 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
         )
     else:
         # GQA/MQA/MLA
@@ -775,8 +842,6 @@ def decode_attention_fwd(
             o,
             kv_indptr,
             kv_indices,
-            attn_logits,
-            attn_lse,
             num_kv_splits,
             max_kv_splits,
             sm_scale * k_scale,
@@ -784,4 +849,7 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
             xai_temperature_len=xai_temperature_len,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
         )

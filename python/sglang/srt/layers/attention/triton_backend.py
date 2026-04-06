@@ -82,6 +82,9 @@ class TritonAttnBackend(AttentionBackend):
         # Parse args
         self.skip_prefill = skip_prefill
         max_bs = model_runner.req_to_token_pool.size
+        self.max_buffer_bs = (
+            kv_indptr_buf.shape[0] - 1 if kv_indptr_buf is not None else max_bs
+        )
         self.sliding_window_size = model_runner.sliding_window_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
@@ -135,11 +138,6 @@ class TritonAttnBackend(AttentionBackend):
                 model_runner.server_args.triton_attention_split_tile_size
             )
 
-        if self.split_tile_size is not None:
-            self.max_kv_splits = (
-                self.max_context_len + self.split_tile_size - 1
-            ) // self.split_tile_size
-
         # Check arguments
         assert not (
             model_runner.sliding_window_size is not None
@@ -178,6 +176,59 @@ class TritonAttnBackend(AttentionBackend):
 
         # Initialize forward metadata
         self.forward_metadata: ForwardMetadata = None
+        self.device_core_count = get_device_core_count(model_runner.gpu_id)
+        self.seq_threshold_3D = max(1, 128 // self.num_kv_head)
+        self.max_kv_splits = max(
+            self.max_kv_splits, next_power_of_2(self.device_core_count // 4)
+        )
+        if self.split_tile_size is not None:
+            self.max_kv_splits = (
+                self.max_context_len + self.split_tile_size - 1
+            ) // self.split_tile_size
+        headdim_padded = next_power_of_2(
+            model_runner.token_to_kv_pool.get_key_buffer(0).shape[-1]
+        )
+        split_buffer_bs = max(1, min(self.seq_threshold_3D, self.max_buffer_bs))
+        self.softmax_segm_output = torch.empty(
+            (
+                split_buffer_bs,
+                self.num_head,
+                self.max_kv_splits,
+                headdim_padded,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.softmax_segm_max = torch.empty(
+            (split_buffer_bs, self.num_head, self.max_kv_splits),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.softmax_segm_expsum = torch.empty(
+            (split_buffer_bs, self.num_head, self.max_kv_splits),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.softmax_segm_output_nosplit = torch.empty(
+            (
+                self.max_buffer_bs,
+                self.num_head,
+                1,
+                headdim_padded,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.softmax_segm_max_nosplit = torch.empty(
+            (self.max_buffer_bs, self.num_head, 1),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.softmax_segm_expsum_nosplit = torch.empty(
+            (self.max_buffer_bs, self.num_head, 1),
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         self.cuda_graph_custom_mask = None
 
@@ -191,6 +242,10 @@ class TritonAttnBackend(AttentionBackend):
         # num_kv_splits.shape[0] will be topk * real_num_token.
         # And the real_num_token is num_seq in decoding phase.
         num_group = num_token // num_seq
+
+        if num_token > self.seq_threshold_3D:
+            num_kv_splits.fill_(1)
+            return
 
         assert (
             num_group * num_seq == num_token
@@ -285,22 +340,14 @@ class TritonAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
 
-            attn_logits = torch.empty(
-                (bs, self.num_head, self.max_kv_splits, self.v_head_dim),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            attn_lse = torch.empty(
-                (bs, self.num_head, self.max_kv_splits),
-                dtype=torch.float32,
-                device=self.device,
-            )
             num_kv_splits = torch.empty((bs,), dtype=torch.int32, device=self.device)
             self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
 
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
+            attn_logits = None
+            attn_lse = None
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
@@ -445,17 +492,6 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
         cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
-        self.cuda_graph_attn_logits = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.cuda_graph_attn_lse = torch.zeros(
-            (max_num_tokens, self.num_head, self.max_kv_splits),
-            dtype=torch.float32,
-            device=self.device,
-        )
-
         if cuda_graph_num_kv_splits_buf is None:
             self.cuda_graph_num_kv_splits = torch.full(
                 (max_num_tokens,),
@@ -557,8 +593,8 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
-            attn_logits = self.cuda_graph_attn_logits
-            attn_lse = self.cuda_graph_attn_lse
+            attn_logits = None
+            attn_lse = None
             max_extend_len = None
             num_kv_splits = self.cuda_graph_num_kv_splits
             qo_indptr = None
@@ -1089,6 +1125,20 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        q_bs = q.shape[0]
+        if q_bs > self.seq_threshold_3D:
+            # Large decode batches already have enough parallelism; force no split.
+            runtime_max_kv_splits = 1
+            self.forward_metadata.num_kv_splits[:q_bs].fill_(1)
+            softmax_segm_output = self.softmax_segm_output_nosplit
+            softmax_segm_max = self.softmax_segm_max_nosplit
+            softmax_segm_expsum = self.softmax_segm_expsum_nosplit
+        else:
+            runtime_max_kv_splits = self.max_kv_splits
+            softmax_segm_output = self.softmax_segm_output
+            softmax_segm_max = self.softmax_segm_max
+            softmax_segm_expsum = self.softmax_segm_expsum
+
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
@@ -1096,16 +1146,17 @@ class TritonAttnBackend(AttentionBackend):
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
             kv_indptr,
             kv_indices,
-            self.forward_metadata.attn_logits,
-            self.forward_metadata.attn_lse,
             self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
+            runtime_max_kv_splits,
             layer.scaling,
             k_descale,
             v_descale,
             logit_cap=logits_soft_cap,
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
         )
         return o
 
