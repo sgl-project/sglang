@@ -260,7 +260,7 @@ class ModelRunnerKVCacheMixin:
 
         # On HIP with TileLang backend, keep the default MLA KV cache dimension.
         # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
-        # FP4 uses its own compact layout (416 bytes) managed by NSATokenToKVPoolFP4.
+        # FP4 uses its own compact layout (400 bytes) managed by NSATokenToKVPoolFP4.
         if _is_hip and (
             self.server_args.nsa_prefill_backend == "tilelang"
             or self.server_args.nsa_decode_backend == "tilelang"
