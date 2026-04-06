@@ -95,8 +95,7 @@ def _merge_output_batches(output_batches: List[OutputBatch]) -> OutputBatch:
 
     # Bool check safe for both list and tensor.
     has_outputs = (
-        outputs.numel() > 0 if isinstance(outputs, torch.Tensor)
-        else bool(outputs)
+        outputs.numel() > 0 if isinstance(outputs, torch.Tensor) else bool(outputs)
     )
 
     merged_trajectory_timesteps = None
