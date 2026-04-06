@@ -341,7 +341,6 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager,
             _global_state.template_manager,
             enable_prompt_tokens_details=True,
-            enable_force_include_usage=True,
             tool_server=tool_server,
         )
     except Exception:
