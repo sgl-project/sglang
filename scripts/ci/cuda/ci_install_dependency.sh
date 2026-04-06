@@ -218,9 +218,9 @@ mark_step_done "Uninstall Flashinfer"
 # Install main package
 # ------------------------------------------------------------------------------
 # Install the main package
-EXTRAS="dev,runai"
+EXTRAS="dev,runai,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
-    EXTRAS="dev,runai,${OPTIONAL_DEPS}"
+    EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
 source "$(dirname "$0")/cache_nvidia_wheels.sh"
