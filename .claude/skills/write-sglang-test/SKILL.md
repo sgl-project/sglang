@@ -440,6 +440,5 @@ Before submitting a test:
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)
 - [ ] `tearDownClass` is defensive — uses `hasattr`/null checks before accessing resources that may not have been allocated
-- [ ] **No module-level `sys.modules` mutation** — never inject stubs into `sys.modules` at import time; use `setUpModule` + `patch.dict` if unavoidable (see "Avoiding sys.modules pollution")
 - [ ] Has `if __name__ == "__main__": unittest.main()`
 - [ ] `est_time` is reasonable (measure locally)
