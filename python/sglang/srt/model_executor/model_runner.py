@@ -508,9 +508,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.remote_instance_transfer_engine_weight_info = register_memory_region(
                     self.model, self.remote_instance_transfer_engine
                 )
-            if self.server_args.remote_instance_weight_loader_start_seed_via_transfer_engine:
-                # Register to bootstrap server so external callers for p2p training call
-                self._register_to_engine_info_bootstrap()
+            # Register to bootstrap server so external callers for p2p training call
+            self._register_to_engine_info_bootstrap()
 
         # Register parallelism config with the bootstrap server
         if (
