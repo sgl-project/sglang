@@ -33,6 +33,7 @@ from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    cpu_has_rvv_support,
     is_cpu,
     is_cuda,
     is_hip,
@@ -47,6 +48,7 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_rvv_available = cpu_has_rvv_support()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
@@ -95,7 +97,7 @@ class SiluAndMul(MultiPlatformOp):
         return out
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        if _is_cpu_amx_available:
+        if _is_cpu_amx_available or _is_cpu_rvv_available:
             out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
             return out
         else:
@@ -141,9 +143,13 @@ class GeluAndMul(MultiPlatformOp):
         return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        if _is_cpu_amx_available and self.approximate == "tanh":
+        if (
+            _is_cpu_amx_available or _is_cpu_rvv_available
+        ) and self.approximate == "tanh":
             return torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x)
-        elif _is_cpu_amx_available and self.approximate == "none":
+        elif (
+            _is_cpu_amx_available or _is_cpu_rvv_available
+        ) and self.approximate == "none":
             return torch.ops.sgl_kernel.gelu_and_mul_cpu(x)
         else:
             return self.forward_native(x)
