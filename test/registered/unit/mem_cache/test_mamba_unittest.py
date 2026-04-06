@@ -452,7 +452,148 @@ class TestMamba(unittest.TestCase):
             mock_full_seglen.assert_called_once_with(5)
             mock_mamba_seglen.assert_called_once_with(7)
 
-    def _setup_tree_and_allocator(self, eviction_policy: str = "lru"):
+    def test_seglen_eff_weight_changes_candidate_choice(self):
+        low_weight_tree, _, _, _ = self._setup_tree_and_allocator(
+            eviction_policy="seglen", seglen_eff_weight=0.0
+        )
+        high_weight_tree, _, _, _ = self._setup_tree_and_allocator(
+            eviction_policy="seglen", seglen_eff_weight=2.0
+        )
+
+        older = low_weight_tree.root_node
+        newer = high_weight_tree.root_node
+
+        current_time = older.last_access_time
+        older.last_access_time = current_time - 10
+        newer.last_access_time = current_time - 1
+
+        low_weight_pick = low_weight_tree._pick_best_candidate_with_efficiency(
+            [older, newer],
+            [10.0, 1.0],
+        )
+        self.assertIs(low_weight_pick, older)
+
+        older.last_access_time = current_time - 10
+        newer.last_access_time = current_time - 1
+        high_weight_pick = high_weight_tree._pick_best_candidate_with_efficiency(
+            [older, newer],
+            [10.0, 1.0],
+        )
+        self.assertIs(high_weight_pick, newer)
+
+    def test_full_seglen_weight_can_flip_eviction_choice(self):
+        low_weight_tree, low_allocator, _, low_make_dummy_req = (
+            self._setup_tree_and_allocator(
+                eviction_policy="seglen", seglen_eff_weight=0.0
+            )
+        )
+        high_weight_tree, high_allocator, _, high_make_dummy_req = (
+            self._setup_tree_and_allocator(
+                eviction_policy="seglen", seglen_eff_weight=2.0
+            )
+        )
+
+        for tree, allocator, make_dummy_req in (
+            (low_weight_tree, low_allocator, low_make_dummy_req),
+            (high_weight_tree, high_allocator, high_make_dummy_req),
+        ):
+            anchor_req = make_dummy_req()
+            tree.insert(
+                InsertParams(
+                    key=RadixKey([1, 2, 3]),
+                    value=allocator.alloc(3),
+                    mamba_value=anchor_req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+            short_req = make_dummy_req()
+            tree.insert(
+                InsertParams(
+                    key=RadixKey([1, 2, 3, 4, 5]),
+                    value=allocator.alloc(5),
+                    mamba_value=short_req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+            long_req = make_dummy_req()
+            tree.insert(
+                InsertParams(
+                    key=RadixKey([9, 10, 11, 12]),
+                    value=allocator.alloc(4),
+                    mamba_value=long_req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+            branch_parent = tree.root_node.children[1]
+            short_leaf = branch_parent.children[4]
+            long_leaf = tree.root_node.children[9]
+            current_time = short_leaf.last_access_time
+            short_leaf.last_access_time = current_time - 1
+            long_leaf.last_access_time = current_time - 10
+
+        low_result = low_weight_tree.evict(EvictParams(num_tokens=2))
+        self.assertGreaterEqual(low_result.num_tokens_evicted, 2)
+        self.assertNotIn(9, low_weight_tree.root_node.children)
+        self.assertIn(4, low_weight_tree.root_node.children[1].children)
+
+        high_result = high_weight_tree.evict(EvictParams(num_tokens=2))
+        self.assertGreaterEqual(high_result.num_tokens_evicted, 2)
+        self.assertIn(9, high_weight_tree.root_node.children)
+        self.assertNotIn(4, high_weight_tree.root_node.children[1].children)
+
+    def test_mamba_seglen_skips_branching_internal_candidates(self):
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
+            eviction_policy="seglen"
+        )
+
+        parent_req = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3]),
+                value=allocator.alloc(3),
+                mamba_value=parent_req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        left_req = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=allocator.alloc(4),
+                mamba_value=left_req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        right_req = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 5]),
+                value=allocator.alloc(4),
+                mamba_value=right_req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        other_req = make_dummy_req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([9, 10]),
+                value=allocator.alloc(2),
+                mamba_value=other_req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+
+        branching_parent = tree.root_node.children[1]
+        self.assertEqual(len(branching_parent.children), 2)
+        branching_parent.last_access_time -= 100
+
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        self.assertGreaterEqual(result.mamba_num_evicted, 1)
+        self.assertIsNotNone(branching_parent.mamba_value)
+        self.assertIn(1, tree.root_node.children)
+
+    def _setup_tree_and_allocator(
+        self, eviction_policy: str = "lru", seglen_eff_weight: float = 0.5
+    ):
         """Helper to create a MambaRadixCache with allocator for testing."""
         set_global_server_args_for_scheduler(
             ServerArgs(model_path="dummy", page_size=1)
@@ -521,6 +662,7 @@ class TestMamba(unittest.TestCase):
             page_size=1,
             disable=False,
             eviction_policy=eviction_policy,
+            seglen_eff_weight=seglen_eff_weight,
         )
         tree = MambaRadixCache(params=params)
 
