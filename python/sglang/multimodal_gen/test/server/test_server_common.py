@@ -39,6 +39,7 @@ from sglang.multimodal_gen.test.test_utils import (
     compare_with_gt,
     extract_key_frames_from_video,
     get_consistency_gt_candidates,
+    get_consistency_gt_remote_files,
     get_consistency_thresholds,
     get_dynamic_server_port,
     gt_exists,
@@ -535,6 +536,17 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
 
         if not result.passed:
             failed_frames = []
+            video_gt_info = ""
+            if is_video:
+                gt_remote_files = get_consistency_gt_remote_files(
+                    case.id,
+                    num_gpus,
+                    is_video=True,
+                    output_format=output_format,
+                )
+                video_gt_info = "\n".join(
+                    f"    - {filename}: {url}" for filename, url in gt_remote_files
+                )
             for metric in result.frame_metrics:
                 failed_metrics = []
                 if not metric.clip_passed:
@@ -547,25 +559,30 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
                     failed_metrics.append("mean_abs_diff")
                 if failed_metrics:
                     failed_frames.append(
-                        "  Frame "
-                        f"{metric.frame_index}: "
-                        f"clip={metric.clip_similarity:.4f}, "
-                        f"ssim={metric.ssim:.4f}, "
-                        f"psnr={metric.psnr:.4f}, "
-                        f"mean_abs_diff={metric.mean_abs_diff:.4f}, "
-                        f"failed={', '.join(failed_metrics)}"
+                        f"    - f{metric.frame_index} "
+                        f"[{', '.join(failed_metrics)}] "
+                        f"clip={metric.clip_similarity:.4f} "
+                        f"ssim={metric.ssim:.4f} "
+                        f"psnr={metric.psnr:.4f} "
+                        f"mean_abs_diff={metric.mean_abs_diff:.4f}"
                     )
             pytest.fail(
                 f"Consistency check failed for {case.id}:\n"
-                f"  Min similarity: {result.min_similarity:.4f}\n"
-                f"  Min SSIM: {result.min_ssim:.4f}\n"
-                f"  Min PSNR: {result.min_psnr:.4f}\n"
-                f"  Max mean_abs_diff: {result.max_mean_abs_diff:.4f}\n"
+                f"  Metrics: sim={result.min_similarity:.4f}, "
+                f"ssim={result.min_ssim:.4f}, "
+                f"psnr={result.min_psnr:.4f}, "
+                f"mean_abs_diff={result.max_mean_abs_diff:.4f}\n"
                 f"  Thresholds: clip>={result.thresholds.clip_threshold}, "
                 f"ssim>={result.thresholds.ssim_threshold}, "
                 f"psnr>={result.thresholds.psnr_threshold}, "
                 f"mean_abs_diff<={result.thresholds.mean_abs_diff_threshold}\n"
-                f"  Failed frames:\n" + "\n".join(failed_frames)
+                f"  Failed frames:\n"
+                + "\n".join(failed_frames)
+                + (
+                    f"\n  Compared GT frame files and links:\n{video_gt_info}"
+                    if video_gt_info
+                    else ""
+                )
             )
 
         logger.info(

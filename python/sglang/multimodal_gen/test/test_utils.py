@@ -848,6 +848,17 @@ def get_consistency_gt_candidates(
     return [f"{base}.{e}" for e in exts]
 
 
+def get_consistency_gt_remote_files(
+    case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
+) -> list[tuple[str, str]]:
+    """Return GT filenames with their remote raw URLs."""
+    filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
+    return [
+        (filename, f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{filename}")
+        for filename in filenames
+    ]
+
+
 def _get_consistency_gt_dir() -> Path | None:
     """Return the local GT directory when configured."""
     d = os.environ.get("SGLANG_CONSISTENCY_GT_DIR")
