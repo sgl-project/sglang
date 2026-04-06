@@ -31,7 +31,7 @@ dependencies = [
   "flashinfer_cubin==0.6.7.post2",
   "gguf",
   "interegular",
-  "llguidance>=0.7.11,<0.8.0",
+  "llguidance>=1.4.0",
   "modelscope",
   "msgspec",
   "ninja",
