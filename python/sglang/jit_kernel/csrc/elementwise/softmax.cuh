@@ -159,8 +159,6 @@ SGL_SOFTMAX_KERNEL softmax_split_kernel(const __grid_constant__ SoftmaxParams pa
   using namespace device;
   using vec_t = AlignedVector<DType, kVecN>;
 
-  PDLWaitPrimary<kUsePDL>();
-
   const auto input = static_cast<const DType*>(params.input);
   const auto output = static_cast<DType*>(params.output);
   const auto partial_ms = static_cast<fp32x2_t*>(params.workspace);
@@ -171,15 +169,16 @@ SGL_SOFTMAX_KERNEL softmax_split_kernel(const __grid_constant__ SoftmaxParams pa
   const uint32_t sid = blockIdx.y;
   const DType* row_in = input + static_cast<uint64_t>(row) * vocab_size;
   DType* row_out = output + static_cast<uint64_t>(row) * vocab_size;
-  const float inv_temp = 1.0f / params.get_temperature(row);
 
   // Aligned chunk boundaries for vectorized loads
   const uint32_t chunk_raw = div_ceil(vocab_size, num_splits);
   const uint32_t chunk = div_ceil(chunk_raw, kVecN) * kVecN;
-  const uint32_t c_start = sid * chunk;
+  const uint32_t c_start = min(sid * chunk, vocab_size);
   const uint32_t c_end = min(c_start + chunk, vocab_size);
-  if (c_start >= vocab_size) return;
   const uint32_t c_len = c_end - c_start;
+
+  PDLWaitPrimary<kUsePDL>();
+  const float inv_temp = 1.0f / params.get_temperature(row);
 
   __shared__ fp32x2_t smem_ms[32];
 
@@ -245,9 +244,8 @@ SGL_SOFTMAX_KERNEL softmax_merge_kernel(const __grid_constant__ SoftmaxParams pa
   // Compute this block's chunk range (same formula as split kernel)
   const uint32_t chunk_raw = div_ceil(vocab_size, num_splits);
   const uint32_t chunk = div_ceil(chunk_raw, kVecN) * kVecN;
-  const uint32_t c_start = sid * chunk;
+  const uint32_t c_start = min(sid * chunk, vocab_size);
   const uint32_t c_end = min(c_start + chunk, vocab_size);
-  if (c_start >= vocab_size) return;
   const uint32_t c_len = c_end - c_start;
 
   const uint32_t lane = threadIdx.x % kWarpThreads;
