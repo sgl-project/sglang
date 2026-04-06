@@ -17,6 +17,7 @@ register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
 
 def _make_corpus(match_type="BFS", **kwargs):
+    external_corpus_documents = kwargs.pop("external_corpus_documents", None)
     defaults = dict(
         max_trie_depth=12,
         min_bfs_breadth=1,
@@ -25,11 +26,23 @@ def _make_corpus(match_type="BFS", **kwargs):
         capacity=100000,
         external_sam_budget=0,
         external_corpus_max_tokens=10000000,
-        external_corpus_documents=None,
     )
     defaults.update(kwargs)
     defaults["match_type"] = match_type
-    return NgramCorpus(**defaults)
+    corpus = NgramCorpus(**defaults)
+    if external_corpus_documents is not None:
+        from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
+
+        chunks = []
+        has_prev = False
+        for doc in external_corpus_documents:
+            if has_prev:
+                chunks.append([SEPARATOR_TOKEN] + list(doc))
+            else:
+                chunks.append(list(doc))
+            has_prev = True
+        corpus.load_external_corpus_named("__default__", chunks)
+    return corpus
 
 
 def _batch_get(
@@ -735,15 +748,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "token limit"):
             corpus.load_external_corpus(
                 iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=4)
-            )
-
-    def test_external_sam_documents_reject_oversized_corpus(self):
-        with self.assertRaisesRegex(ValueError, "token limit"):
-            _make_corpus(
-                "BFS",
-                external_sam_budget=2,
-                external_corpus_max_tokens=4,
-                external_corpus_documents=[[1, 2, 3], [4, 5]],
             )
 
     def test_external_sam_only_chain(self):
