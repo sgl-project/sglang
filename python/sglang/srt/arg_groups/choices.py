@@ -98,6 +98,7 @@ ATTENTION_BACKEND_CHOICES = [
     "wave",
     # Other platforms
     "intel_amx",
+    "rvv",
     "ascend",
     "intel_xpu",
 ]
