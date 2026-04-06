@@ -103,9 +103,8 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           grep -E '^=+.*passed' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
           echo "" >> $GITHUB_STEP_SUMMARY
-          # Coverage total with header
-          printf "%-8s %8s %8s %8s\n" "" "Stmts" "Miss" "Cover" >> $GITHUB_STEP_SUMMARY
-          grep -E '^TOTAL ' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
+          # Coverage total, reformatted
+          awk '/^TOTAL / { for(i=1;i<=NF;i++) if($i~/^[0-9]+$/ || $i~/^[0-9]+%$/) a[++n]=$i; if(n>=3) printf "TOTAL   Stmts: %s   Miss: %s   Cover: %s\n", a[1], a[2], a[3] }' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
           # Core modules with coverage < 50%, sorted by uncovered lines (descending)
