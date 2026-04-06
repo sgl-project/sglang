@@ -23,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
@@ -313,18 +314,24 @@ class EagleVerifyInputV2Mixin:
 
         # Apply penalty
         # This is a relaxed version of penalties for speculative decoding.
-        if (
-            sampling_info.acc_linear_penalties is not None
-            or sampling_info.logit_bias is not None
-        ):
-            linear_penalty = torch.zeros(
-                (bs, next_token_logits.shape[1]),
-                dtype=torch.float32,
-                device=device,
-            )
-            sampling_info.apply_logits_bias(linear_penalty)
+        if sampling_info.acc_additive_penalties is not None:
             next_token_logits.add_(
-                torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
+                torch.repeat_interleave(
+                    sampling_info.acc_additive_penalties, self.draft_token_num, dim=0
+                )
+            )
+        if sampling_info.acc_scaling_penalties is not None:
+            apply_scaling_penalties(
+                next_token_logits,
+                torch.repeat_interleave(
+                    sampling_info.acc_scaling_penalties, self.draft_token_num, dim=0
+                ),
+            )
+        if sampling_info.logit_bias is not None:
+            next_token_logits.add_(
+                torch.repeat_interleave(
+                    sampling_info.logit_bias, self.draft_token_num, dim=0
+                )
             )
 
         # Apply grammar mask if provided
