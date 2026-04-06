@@ -169,6 +169,7 @@ def _platform_key() -> str:
     """
     from sglang.srt.utils import (
         cpu_has_amx_support,
+        cpu_has_rvv_support,
         is_cpu,
         is_cuda,
         is_hip,
@@ -181,7 +182,7 @@ def _platform_key() -> str:
         return "cuda"
     if is_hip():
         return "hip"
-    if is_cpu() and cpu_has_amx_support():
+    if is_cpu() and (cpu_has_amx_support() or cpu_has_rvv_support()):
         return "cpu"
     if is_npu():
         return "npu"
