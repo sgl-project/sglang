@@ -28,16 +28,21 @@ _UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
     "Qwen-Image",
 )
 
+
+def _discover_unit_tests() -> list[str]:
+    """Auto-discover all test_*.py files in the unit/ directory."""
+    unit_dir = Path(__file__).resolve().parent / "unit"
+    if not unit_dir.is_dir():
+        return []
+    return sorted(
+        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
+    )
+
+
 SUITES = {
     # no GPU required; safe to run on any CPU-only runner
-    "unit": [
-        "../unit/test_sampling_params.py",
-        "../unit/test_storage.py",
-        "../unit/test_lora_format_adapter.py",
-        "../unit/test_server_args.py",
-        "../unit/test_input_validation.py",
-        # add new unit tests here
-    ],
+    # Auto-discovered from test/unit/test_*.py
+    "unit": _discover_unit_tests(),
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
@@ -50,6 +55,9 @@ SUITES = {
         "test_server_2_gpu_a.py",
         "test_server_2_gpu_b.py",
         # add new 2-gpu test files here
+    ],
+    "1-gpu-b200": [
+        "test_server_c.py",
     ],
 }
 
@@ -79,7 +87,7 @@ def parse_args():
         type=str,
         required=True,
         choices=list(SUITES.keys()),
-        help="The test suite to run (e.g., 1-gpu, 2-gpu)",
+        help="The test suite to run (valid names are defined in SUITES)",
     )
     parser.add_argument(
         "--partition-id",
@@ -234,7 +242,9 @@ def run_pytest(files, filter_expr=None):
         )
 
         is_flaky_ci_assertion = (
-            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+            "SafetensorError" in full_output
+            or "FileNotFoundError" in full_output
+            or "TimeoutError" in full_output
         )
 
         is_oom_error = (

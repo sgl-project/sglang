@@ -437,7 +437,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                 self.eagle_worker.chain_mtp_hidden_states
                 and ret.hidden_states is not None
             ):
-                self.hidden_states[:num_tokens].copy_(ret.hidden_states[:num_tokens])
+                buffers.hidden_states[:num_tokens].copy_(ret.hidden_states[:num_tokens])
 
             select_index = (
                 torch.arange(bs, device=self.model_runner.device)

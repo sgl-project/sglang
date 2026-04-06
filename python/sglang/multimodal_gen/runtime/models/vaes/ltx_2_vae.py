@@ -394,6 +394,18 @@ class LTXVideoUpsampler3d(nn.Module):
         return hidden_states
 
 
+class LTX23PerChannelStatistics(nn.Module):
+    def __init__(self, latent_channels: int) -> None:
+        super().__init__()
+        self.register_buffer("mean_of_means", torch.empty(latent_channels))
+        self.register_buffer("std_of_means", torch.empty(latent_channels))
+
+    def un_normalize(self, x: torch.Tensor) -> torch.Tensor:
+        mean = self.mean_of_means.view(1, -1, 1, 1, 1).to(x)
+        std = self.std_of_means.view(1, -1, 1, 1, 1).to(x)
+        return x * std + mean
+
+
 # Like LTX 1.0 LTXVideo095DownBlock3D, but with the updated LTX2VideoResnetBlock3d
 class LTX2VideoDownBlock3D(nn.Module):
     r"""
@@ -605,6 +617,64 @@ class LTX2VideoMidBlock3d(nn.Module):
                 )
             else:
                 hidden_states = resnet(hidden_states, temb, generator, causal=causal)
+
+        return hidden_states
+
+
+class LTX23VideoMidBlock3d(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        resnet_eps: float = 1e-6,
+        resnet_act_fn: str = "swish",
+        inject_noise: bool = False,
+        timestep_conditioning: bool = False,
+        spatial_padding_mode: str = "zeros",
+    ) -> None:
+        super().__init__()
+
+        self.time_embedder = None
+        if timestep_conditioning:
+            self.time_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(
+                in_channels * 4, 0
+            )
+
+        self.res_blocks = nn.ModuleList(
+            [
+                LTX2VideoResnetBlock3d(
+                    in_channels=in_channels,
+                    out_channels=in_channels,
+                    dropout=dropout,
+                    eps=resnet_eps,
+                    non_linearity=resnet_act_fn,
+                    inject_noise=inject_noise,
+                    timestep_conditioning=timestep_conditioning,
+                    spatial_padding_mode=spatial_padding_mode,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+        causal: bool = True,
+    ) -> torch.Tensor:
+        if self.time_embedder is not None:
+            temb = self.time_embedder(
+                timestep=temb.flatten(),
+                resolution=None,
+                aspect_ratio=None,
+                batch_size=hidden_states.size(0),
+                hidden_dtype=hidden_states.dtype,
+            )
+            temb = temb.view(hidden_states.size(0), -1, 1, 1, 1)
+
+        for res_block in self.res_blocks:
+            hidden_states = res_block(hidden_states, temb, causal=causal)
 
         return hidden_states
 
@@ -1104,6 +1174,192 @@ class LTX2VideoDecoder3d(nn.Module):
         return hidden_states
 
 
+def _make_ltx23_decoder_block(
+    block_name: str,
+    block_config: dict,
+    in_channels: int,
+    resnet_norm_eps: float,
+    timestep_conditioning: bool,
+    spatial_padding_mode: str,
+) -> tuple[nn.Module, int]:
+    out_channels = in_channels
+    if block_name == "res_x":
+        block = LTX23VideoMidBlock3d(
+            in_channels=in_channels,
+            num_layers=int(block_config["num_layers"]),
+            resnet_eps=resnet_norm_eps,
+            timestep_conditioning=timestep_conditioning,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "res_x_y":
+        out_channels = in_channels // int(block_config.get("multiplier", 2))
+        block = LTX2VideoResnetBlock3d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            eps=resnet_norm_eps,
+            timestep_conditioning=False,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "compress_time":
+        out_channels = in_channels // int(block_config.get("multiplier", 1))
+        block = LTXVideoUpsampler3d(
+            in_channels=in_channels,
+            stride=(2, 1, 1),
+            residual=False,
+            upscale_factor=int(block_config.get("multiplier", 1)),
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "compress_space":
+        out_channels = in_channels // int(block_config.get("multiplier", 1))
+        block = LTXVideoUpsampler3d(
+            in_channels=in_channels,
+            stride=(1, 2, 2),
+            residual=False,
+            upscale_factor=int(block_config.get("multiplier", 1)),
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "compress_all":
+        out_channels = in_channels // int(block_config.get("multiplier", 1))
+        block = LTXVideoUpsampler3d(
+            in_channels=in_channels,
+            stride=(2, 2, 2),
+            residual=bool(block_config.get("residual", False)),
+            upscale_factor=int(block_config.get("multiplier", 1)),
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    else:
+        raise ValueError(f"Unsupported LTX-2.3 decoder block: {block_name}")
+
+    return block, out_channels
+
+
+class LTX23VideoDecoder3d(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 128,
+        out_channels: int = 3,
+        decoder_blocks: tuple[tuple[str, dict], ...] = (),
+        patch_size: int = 4,
+        patch_size_t: int = 1,
+        resnet_norm_eps: float = 1e-6,
+        is_causal: bool = False,
+        timestep_conditioning: bool = False,
+        base_channels: int = 128,
+        spatial_padding_mode: str = "zeros",
+    ) -> None:
+        super().__init__()
+
+        self.patch_size = patch_size
+        self.patch_size_t = patch_size_t
+        self.out_channels = out_channels * patch_size**2
+        self.is_causal = is_causal
+        self.per_channel_statistics = LTX23PerChannelStatistics(in_channels)
+
+        feature_channels = base_channels * 8
+        self.conv_in = LTX2VideoCausalConv3d(
+            in_channels=in_channels,
+            out_channels=feature_channels,
+            kernel_size=3,
+            stride=1,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+
+        self.up_blocks = nn.ModuleList([])
+        for block_name, block_params in reversed(tuple(decoder_blocks)):
+            block_config = (
+                {"num_layers": block_params}
+                if isinstance(block_params, int)
+                else dict(block_params)
+            )
+            block, feature_channels = _make_ltx23_decoder_block(
+                block_name=block_name,
+                block_config=block_config,
+                in_channels=feature_channels,
+                resnet_norm_eps=resnet_norm_eps,
+                timestep_conditioning=timestep_conditioning,
+                spatial_padding_mode=spatial_padding_mode,
+            )
+            self.up_blocks.append(block)
+
+        self.norm_out = PerChannelRMSNorm()
+        self.conv_act = nn.SiLU()
+        self.conv_out = LTX2VideoCausalConv3d(
+            in_channels=feature_channels,
+            out_channels=self.out_channels,
+            kernel_size=3,
+            stride=1,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+
+        self.time_embedder = None
+        self.scale_shift_table = None
+        self.timestep_scale_multiplier = None
+        if timestep_conditioning:
+            self.timestep_scale_multiplier = nn.Parameter(
+                torch.tensor(1000.0, dtype=torch.float32)
+            )
+            self.time_embedder = PixArtAlphaCombinedTimestepSizeEmbeddings(
+                feature_channels * 2, 0
+            )
+            self.scale_shift_table = nn.Parameter(
+                torch.randn(2, feature_channels) / feature_channels**0.5
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+        causal: Optional[bool] = None,
+    ) -> torch.Tensor:
+        causal = self.is_causal if causal is None else causal
+
+        hidden_states = self.per_channel_statistics.un_normalize(hidden_states)
+        hidden_states = self.conv_in(hidden_states, causal=causal)
+
+        if self.timestep_scale_multiplier is not None and temb is not None:
+            temb = temb * self.timestep_scale_multiplier
+
+        for up_block in self.up_blocks:
+            if isinstance(up_block, LTX23VideoMidBlock3d):
+                hidden_states = up_block(hidden_states, temb, causal=causal)
+            elif isinstance(up_block, LTX2VideoResnetBlock3d):
+                hidden_states = up_block(hidden_states, None, causal=causal)
+            else:
+                hidden_states = up_block(hidden_states, causal=causal)
+
+        hidden_states = self.norm_out(hidden_states)
+
+        if self.time_embedder is not None and temb is not None:
+            temb = self.time_embedder(
+                timestep=temb.flatten(),
+                resolution=None,
+                aspect_ratio=None,
+                batch_size=hidden_states.size(0),
+                hidden_dtype=hidden_states.dtype,
+            )
+            temb = temb.view(hidden_states.size(0), -1, 1, 1, 1).unflatten(1, (2, -1))
+            temb = temb + self.scale_shift_table[None, ..., None, None, None]
+            shift, scale = temb.unbind(dim=1)
+            hidden_states = hidden_states * (1 + scale) + shift
+
+        hidden_states = self.conv_act(hidden_states)
+        hidden_states = self.conv_out(hidden_states, causal=causal)
+
+        p = self.patch_size
+        p_t = self.patch_size_t
+        batch_size, _, num_frames, height, width = hidden_states.shape
+        hidden_states = hidden_states.reshape(
+            batch_size, -1, p_t, p, p, num_frames, height, width
+        )
+        hidden_states = (
+            hidden_states.permute(0, 1, 5, 2, 6, 4, 7, 3)
+            .flatten(6, 7)
+            .flatten(4, 5)
+            .flatten(2, 3)
+        )
+        return hidden_states
+
+
 class AutoencoderKLLTX2Video(ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding videos into latents and decoding latent representations into videos.
@@ -1135,6 +1391,32 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             config.arch_config.decoder_spatio_temporal_scaling
         )
         decoder_layers_per_block = config.arch_config.decoder_layers_per_block
+        decoder_inject_noise = getattr(
+            config.arch_config, "decoder_inject_noise", (False, False, False, False)
+        )
+        if isinstance(decoder_inject_noise, bool):
+            decoder_inject_noise = (decoder_inject_noise,) * 4
+        else:
+            decoder_inject_noise = tuple(decoder_inject_noise)
+        upsample_residual = getattr(
+            config.arch_config, "upsample_residual", (True, True, True)
+        )
+        if isinstance(upsample_residual, bool):
+            upsample_residual = (upsample_residual,) * 3
+        else:
+            upsample_residual = tuple(upsample_residual)
+        upsample_factor = getattr(config.arch_config, "upsample_factor", (2, 2, 2))
+        if isinstance(upsample_factor, int):
+            upsample_factor = (upsample_factor,) * 3
+        else:
+            upsample_factor = tuple(upsample_factor)
+        timestep_conditioning = getattr(
+            config.arch_config, "timestep_conditioning", False
+        )
+        use_ltx23_video_decoder = (
+            str(getattr(config.arch_config, "video_decoder_variant", "ltx_2"))
+            == "ltx_2_3"
+        )
         decoder_causal = config.arch_config.decoder_causal
         decoder_spatial_padding_mode = config.arch_config.decoder_spatial_padding_mode
 
@@ -1153,18 +1435,53 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             encoder_spatial_padding_mode,
         )
 
-        self.decoder = LTX2VideoDecoder3d(
-            latent_channels,
-            out_channels,
-            decoder_block_out_channels,
-            decoder_spatio_temporal_scaling,
-            decoder_layers_per_block,
-            patch_size,
-            patch_size_t,
-            resnet_norm_eps,
-            decoder_causal,
-            decoder_spatial_padding_mode,
-        )
+        if use_ltx23_video_decoder:
+            video_decoder_config = dict(config.arch_config.video_decoder_config)
+            if not video_decoder_config:
+                raise ValueError(
+                    "LTX-2.3 native video decoder requires video_decoder_config."
+                )
+            self.decoder = LTX23VideoDecoder3d(
+                in_channels=latent_channels,
+                out_channels=out_channels,
+                decoder_blocks=tuple(video_decoder_config["decoder_blocks"]),
+                patch_size=int(video_decoder_config.get("patch_size", patch_size)),
+                patch_size_t=patch_size_t,
+                resnet_norm_eps=resnet_norm_eps,
+                is_causal=bool(
+                    video_decoder_config.get("causal_decoder", decoder_causal)
+                ),
+                timestep_conditioning=bool(
+                    video_decoder_config.get(
+                        "timestep_conditioning", timestep_conditioning
+                    )
+                ),
+                base_channels=int(
+                    video_decoder_config.get("decoder_base_channels", 128)
+                ),
+                spatial_padding_mode=str(
+                    video_decoder_config.get(
+                        "spatial_padding_mode", decoder_spatial_padding_mode
+                    )
+                ),
+            )
+        else:
+            self.decoder = LTX2VideoDecoder3d(
+                in_channels=latent_channels,
+                out_channels=out_channels,
+                block_out_channels=decoder_block_out_channels,
+                spatio_temporal_scaling=decoder_spatio_temporal_scaling,
+                layers_per_block=decoder_layers_per_block,
+                patch_size=patch_size,
+                patch_size_t=patch_size_t,
+                resnet_norm_eps=resnet_norm_eps,
+                is_causal=decoder_causal,
+                inject_noise=decoder_inject_noise,
+                timestep_conditioning=timestep_conditioning,
+                upsample_residual=upsample_residual,
+                upsample_factor=upsample_factor,
+                spatial_padding_mode=decoder_spatial_padding_mode,
+            )
 
         latents_mean = torch.zeros((latent_channels,), requires_grad=False)
         latents_std = torch.ones((latent_channels,), requires_grad=False)

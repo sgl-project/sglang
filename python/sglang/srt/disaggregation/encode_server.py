@@ -673,6 +673,7 @@ class MMEncoder:
         part_idx: int,
         hashes: Optional[List[str]] = None,
     ) -> torch.Tensor:
+        # mm_inputs: dict
         mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
         grid_thw = _get_mm_grid_dim(mm_inputs, modality)
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
@@ -853,7 +854,6 @@ class MMEncoder:
             images = await self._flatten_and_load_images(mm_items)
             image_config = self.vision_config.get("image", {})
             processor_input = self.image_processor(images=images, **image_config)
-            feature = processor_input["pixel_values"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_image_feature
             else:
@@ -867,10 +867,11 @@ class MMEncoder:
             )
             # Get additional video metadata
             if (
-                self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+                self.model_type
+                in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
                 and video_processor_kwargs.get("video_metadata", None) is not None
             ):
-                # For qwen3-vl models, we need to store the video timestamps
+                # For qwen3-vl/qwen3.5 models, we need to store the video timestamps
                 video_metadata = video_processor_kwargs["video_metadata"]
                 try:
                     merge_size = (
@@ -908,7 +909,6 @@ class MMEncoder:
                 )
                 processor_input["second_per_grid_ts"] = second_per_grid_ts_tensor
 
-            feature = processor_input["pixel_values_videos"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_video_feature
             else:
@@ -929,7 +929,6 @@ class MMEncoder:
             processor_input["audio_feature_lens_raw"] = input_lengths
             output_lengths = self._get_feat_extract_output_lengths(input_lengths)
             processor_input["audio_feature_lens"] = output_lengths
-            feature = processor_input["input_features"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_audio_feature
             else:
