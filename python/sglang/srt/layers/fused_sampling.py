@@ -6,8 +6,9 @@ kernel launch overhead and global memory traffic during decode.
 Two kernel variants:
   - Single-pass: vocab fits in one tile (1 read + 1 write). Used when
     next_power_of_2(vocab) <= 32768.
-  - Multi-pass: 3-pass softmax with autotune (3 reads + 1 write).
-    Used for large vocabs (e.g. 128K+).
+  - Multi-pass: online 2-pass softmax with autotune (2 reads + 1 write).
+    Pass 1 fuses max + sum via the Milakov-Gimelshein correction.
+    Pass 2 normalizes and writes.  Used for large vocabs (e.g. 128K+).
 """
 
 import logging
@@ -83,7 +84,10 @@ def _single_pass_temperature_softmax_inplace_kernel(
 
 # ---------------------------------------------------------------------------
 # Multi-pass kernel: vocab too large for one tile.
-# 3-pass softmax with autotune over (BLOCK_SIZE, num_warps).
+# Online 2-pass softmax (Milakov-Gimelshein) with autotune over
+# (BLOCK_SIZE, num_warps).  No num_stages > 1: the online correction
+# term creates a tight loop-carried dependency that conflicts with
+# Triton's software pipelining.
 # ---------------------------------------------------------------------------
 
 _MULTI_PASS_AUTOTUNE_CONFIGS = [
@@ -91,15 +95,11 @@ _MULTI_PASS_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_SIZE": 2048}, num_warps=16),
     triton.Config({"BLOCK_SIZE": 4096}, num_warps=8),
     triton.Config({"BLOCK_SIZE": 4096}, num_warps=16),
-    triton.Config({"BLOCK_SIZE": 4096}, num_warps=16, num_stages=4),
     triton.Config({"BLOCK_SIZE": 8192}, num_warps=16),
     triton.Config({"BLOCK_SIZE": 8192}, num_warps=32),
-    triton.Config({"BLOCK_SIZE": 8192}, num_warps=32, num_stages=4),
     triton.Config({"BLOCK_SIZE": 16384}, num_warps=16),
     triton.Config({"BLOCK_SIZE": 16384}, num_warps=32),
-    triton.Config({"BLOCK_SIZE": 16384}, num_warps=32, num_stages=4),
     triton.Config({"BLOCK_SIZE": 32768}, num_warps=32),
-    triton.Config({"BLOCK_SIZE": 32768}, num_warps=32, num_stages=4),
 ]
 
 
@@ -120,32 +120,28 @@ def _multi_pass_temperature_softmax_kernel(
     logits_row = logits_ptr + row_idx * logits_stride
     output_row = output_ptr + row_idx * output_stride
 
-    # Pass 1: find global max (matches PyTorch's first reduction pass)
-    global_max = tl.full([], value=float("-inf"), dtype=tl.float32)
+    # Pass 1: online max + sum (Milakov-Gimelshein)
+    running_max = tl.full([], value=float("-inf"), dtype=tl.float32)
+    running_sum = tl.full([], value=0.0, dtype=tl.float32)
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
         x = tl.load(logits_row + offsets, mask=mask, other=float("-inf"))
         x = (x / temp).to(tl.float32)
-        global_max = tl.maximum(global_max, tl.max(x, axis=0))
+        tile_max = tl.max(x, axis=0)
+        new_max = tl.maximum(running_max, tile_max)
+        running_sum = running_sum * tl.exp(running_max - new_max) + tl.sum(
+            tl.exp(x - new_max), axis=0
+        )
+        running_max = new_max
 
-    # Pass 2: compute sum of exp(x - max) (matches PyTorch's second pass)
-    sum_exp = tl.full([], value=0.0, dtype=tl.float32)
+    # Pass 2: normalize and write
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
         x = tl.load(logits_row + offsets, mask=mask, other=float("-inf"))
         x = (x / temp).to(tl.float32)
-        sum_exp += tl.sum(tl.exp(x - global_max), axis=0)
-
-    # Pass 3: normalize (matches PyTorch's exp(x-max)/sum)
-    for start in range(0, vocab_size, BLOCK_SIZE):
-        offsets = start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < vocab_size
-        x = tl.load(logits_row + offsets, mask=mask, other=float("-inf"))
-        x = (x / temp).to(tl.float32)
-
-        prob = tl.exp(x - global_max) / sum_exp
+        prob = tl.exp(x - running_max) / running_sum
         tl.store(output_row + offsets, prob, mask=mask)
 
 
@@ -162,32 +158,28 @@ def _multi_pass_temperature_softmax_inplace_kernel(
 
     row_start = logits_ptr + row_idx * stride
 
-    # Pass 1: find global max (matches PyTorch's first reduction pass)
-    global_max = tl.full([], value=float("-inf"), dtype=tl.float32)
+    # Pass 1: online max + sum (Milakov-Gimelshein)
+    running_max = tl.full([], value=float("-inf"), dtype=tl.float32)
+    running_sum = tl.full([], value=0.0, dtype=tl.float32)
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
         x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
         x = (x / temp).to(tl.float32)
-        global_max = tl.maximum(global_max, tl.max(x, axis=0))
+        tile_max = tl.max(x, axis=0)
+        new_max = tl.maximum(running_max, tile_max)
+        running_sum = running_sum * tl.exp(running_max - new_max) + tl.sum(
+            tl.exp(x - new_max), axis=0
+        )
+        running_max = new_max
 
-    # Pass 2: compute sum of exp(x - max) (matches PyTorch's second pass)
-    sum_exp = tl.full([], value=0.0, dtype=tl.float32)
+    # Pass 2: normalize and write in-place
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
         x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
         x = (x / temp).to(tl.float32)
-        sum_exp += tl.sum(tl.exp(x - global_max), axis=0)
-
-    # Pass 3: normalize (matches PyTorch's exp(x-max)/sum)
-    for start in range(0, vocab_size, BLOCK_SIZE):
-        offsets = start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < vocab_size
-        x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
-        x = (x / temp).to(tl.float32)
-
-        prob = tl.exp(x - global_max) / sum_exp
+        prob = tl.exp(x - running_max) / running_sum
         tl.store(row_start + offsets, prob, mask=mask)
 
 
@@ -309,12 +301,17 @@ def warmup_fused_temperature_softmax(
     vocab_size: int,
     device: torch.device | int | None = None,
     logits_dtype: torch.dtype = torch.float32,
+    tp_group=None,
 ) -> None:
     """Pre-compile and autotune kernels at startup so first request has no latency spike.
 
     For multi-pass kernels the out-of-place variant is autotuned (safe — separate
     input/output buffers), and its winning config is reused for the in-place
     variant so that no autotune ever runs on a live logits buffer.
+
+    When running under tensor parallelism, the autotune result is broadcast from
+    rank 0 so that all ranks use the same kernel config, guaranteeing bitwise-equal
+    sampling results across ranks.
 
     ``logits_dtype`` should match ``next_token_logits`` at inference (usually
     ``model_config.dtype``) so Triton specializes the same way as in production.
@@ -348,14 +345,10 @@ def warmup_fused_temperature_softmax(
                 "BLOCK_SIZE": best.kwargs["BLOCK_SIZE"],
                 "num_warps": best.num_warps,
             }
-            if best.num_stages is not None:
-                _multi_pass_inplace_config["num_stages"] = best.num_stages
-            ns = _multi_pass_inplace_config.get("num_stages", "default")
             logger.info(
-                "Multi-pass autotune result: BLOCK_SIZE=%d, num_warps=%d, num_stages=%s",
+                "Multi-pass autotune result: BLOCK_SIZE=%d, num_warps=%d",
                 _multi_pass_inplace_config["BLOCK_SIZE"],
                 _multi_pass_inplace_config["num_warps"],
-                ns,
             )
         else:
             _multi_pass_inplace_config = None
@@ -364,8 +357,32 @@ def warmup_fused_temperature_softmax(
                 "using default launch config for in-place kernel."
             )
 
+        _broadcast_multi_pass_config(tp_group)
+
     # 3. In-place kernel: JIT compile only (uses the config from step 2).
     fused_temperature_softmax_inplace(dummy_logits.clone(), dummy_temps)
     torch.cuda.synchronize(device)
 
     logger.info("fused_temperature_softmax warmup done (vocab_size=%d).", vocab_size)
+
+
+def _broadcast_multi_pass_config(tp_group=None) -> None:
+    """Broadcast the multi-pass autotune config from TP rank 0 to all ranks.
+
+    Ensures every rank uses the identical kernel launch config, which is
+    required for bitwise-equal sampling results under tensor parallelism.
+    """
+    global _multi_pass_inplace_config
+
+    if tp_group is None or tp_group.world_size <= 1:
+        return
+
+    cfg = tp_group.broadcast_object(_multi_pass_inplace_config, src=0)
+    _multi_pass_inplace_config = cfg
+
+    logger.info(
+        "Multi-pass config after TP broadcast: %s (rank %d/%d)",
+        _multi_pass_inplace_config,
+        tp_group.rank_in_group,
+        tp_group.world_size,
+    )

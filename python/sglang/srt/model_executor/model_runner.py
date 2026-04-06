@@ -2074,6 +2074,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         warmup_fused_temperature_softmax(
             self.model_config.vocab_size,
             logits_dtype=logits_warmup_dtype,
+            tp_group=self.tp_group,
         )
 
     def _should_run_flashinfer_autotune(self) -> bool:
