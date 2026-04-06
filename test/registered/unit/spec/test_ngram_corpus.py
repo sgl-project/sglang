@@ -906,5 +906,152 @@ class TestNgramCorpusMatchBenchmark(CustomTestCase):
         )
 
 
+class TestNgramCorpusMultiSam(CustomTestCase):
+    """Verify multi-SAM add/remove/list and budget splitting."""
+
+    def test_add_and_list(self):
+        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
+        corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+        corpus.load_external_corpus_named("b", [[10, 20, 30, 40, 50]])
+        ids = corpus.list_external_corpora()
+        self.assertEqual(sorted(ids), ["a", "b"])
+
+    def test_remove(self):
+        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
+        corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+        corpus.load_external_corpus_named("b", [[10, 20, 30, 40, 50]])
+        corpus.remove_external_corpus("a")
+        self.assertEqual(corpus.list_external_corpora(), ["b"])
+
+    def test_remove_nonexistent_is_noop(self):
+        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
+        corpus.remove_external_corpus("nonexistent")
+        self.assertEqual(corpus.list_external_corpora(), [])
+
+    def test_multi_sam_candidates(self):
+        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
+        corpus.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
+        corpus.load_external_corpus_named("b", [[1, 2, 3, 20, 21]])
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(6, 6).tolist()
+        )
+        # Both SAMs should contribute candidates
+        self.assertIn([3, 10, 11], leaf_paths)
+        self.assertIn([3, 20, 21], leaf_paths)
+
+    def test_remove_reduces_candidates(self):
+        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
+        corpus.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
+        corpus.load_external_corpus_named("b", [[1, 2, 3, 20, 21]])
+
+        corpus.remove_external_corpus("b")
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(6, 6).tolist()
+        )
+        self.assertIn([3, 10, 11], leaf_paths)
+        self.assertNotIn([3, 20, 21], leaf_paths)
+
+    def test_backward_compat_default_corpus(self):
+        """Startup-style load uses __default__ corpus_id."""
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_documents=[[1, 2, 3, 4, 5]],
+        )
+        ids = corpus.list_external_corpora()
+        self.assertIn("__default__", ids)
+
+
+class TestMultiSamSchedulerMock(CustomTestCase):
+    """Test scheduler handler logic with a mock draft worker."""
+
+    def _make_mock_scheduler(self):
+        from unittest.mock import MagicMock
+
+        scheduler = MagicMock()
+        scheduler.spec_algorithm.is_ngram.return_value = True
+        scheduler.draft_worker = MagicMock()
+        return scheduler
+
+    def test_add_corpus_calls_worker(self):
+        from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = self._make_mock_scheduler()
+        scheduler.draft_worker.add_external_corpus.return_value = 100
+
+        req = AddExternalCorpusReqInput(corpus_id="test", token_chunks=[[1, 2, 3]])
+        result = Scheduler.add_external_corpus(scheduler, req)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.corpus_id, "test")
+        self.assertEqual(result.loaded_token_count, 100)
+        scheduler.draft_worker.add_external_corpus.assert_called_once_with(
+            "test", [[1, 2, 3]]
+        )
+
+    def test_remove_corpus_calls_worker(self):
+        from sglang.srt.managers.io_struct import RemoveExternalCorpusReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = self._make_mock_scheduler()
+
+        req = RemoveExternalCorpusReqInput(corpus_id="test")
+        result = Scheduler.remove_external_corpus(scheduler, req)
+
+        self.assertTrue(result.success)
+        scheduler.draft_worker.remove_external_corpus.assert_called_once_with("test")
+
+    def test_list_corpus_calls_worker(self):
+        from sglang.srt.managers.io_struct import ListExternalCorporaReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = self._make_mock_scheduler()
+        scheduler.draft_worker.list_external_corpora.return_value = [
+            "a",
+            "b",
+        ]
+
+        req = ListExternalCorporaReqInput()
+        result = Scheduler.list_external_corpora(scheduler, req)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.corpus_ids, ["a", "b"])
+
+    def test_ngram_not_enabled_returns_error(self):
+        from unittest.mock import MagicMock
+
+        from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = MagicMock()
+        scheduler.spec_algorithm.is_ngram.return_value = False
+        scheduler.draft_worker = None
+
+        req = AddExternalCorpusReqInput(corpus_id="test", token_chunks=[[1, 2, 3]])
+        result = Scheduler.add_external_corpus(scheduler, req)
+
+        self.assertFalse(result.success)
+        self.assertIn("not enabled", result.message)
+
+    def test_worker_exception_returns_error(self):
+        from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = self._make_mock_scheduler()
+        scheduler.draft_worker.add_external_corpus.side_effect = RuntimeError("OOM")
+
+        req = AddExternalCorpusReqInput(corpus_id="test", token_chunks=[[1, 2, 3]])
+        result = Scheduler.add_external_corpus(scheduler, req)
+
+        self.assertFalse(result.success)
+        self.assertIn("OOM", result.message)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=3)
