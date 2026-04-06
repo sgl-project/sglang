@@ -184,7 +184,13 @@ Result Ngram::batchMatch(
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
 
+  // All budget values are loop-invariant (mutex_ held, sams_ won't change).
   const size_t num_sams = sams_.size();
+  const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
+  const size_t total_sam_budget =
+      num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
+  const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};
+  const size_t trie_budget = total_draft_token_num - (per_sam_budget * num_sams);
 
   Result merged;
   for (size_t i = 0; i < state_ids.size(); ++i) {
@@ -194,11 +200,6 @@ Result Ngram::batchMatch(
     }
 
     auto& state = match_state_[state_ids[i]];
-    const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
-    const size_t total_sam_budget =
-        num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
-    const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};
-    const size_t trie_budget = total_draft_token_num - (per_sam_budget * num_sams);
 
     if (total_sam_budget == 0 || per_sam_budget == 0) {
       auto res = (trie_.get()->*trie_result_build_fn)(
