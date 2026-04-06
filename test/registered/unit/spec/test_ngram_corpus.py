@@ -681,7 +681,7 @@ class TestNgramCorpusMatchBenchmark(CustomTestCase):
         """Incremental advance (O(D) per token) should be faster than rebuild (O(D^2))."""
         import time
 
-        max_trie_depth = 12
+        max_trie_depth = 18
         draft_token_num = 8
         corpus = _make_corpus(
             "BFS",
