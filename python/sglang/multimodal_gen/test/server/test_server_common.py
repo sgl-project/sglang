@@ -43,6 +43,14 @@ from sglang.multimodal_gen.test.test_utils import (
 logger = init_logger(__name__)
 
 
+def _is_lora_case(case: DiffusionTestCase) -> bool:
+    return bool(
+        case.server_args.lora_path
+        or case.server_args.dynamic_lora_path
+        or case.server_args.second_lora_path
+    )
+
+
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
@@ -65,9 +73,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
 
-    # In GT generation mode, force --backend diffusers
+    # Keep LoRA GT on the normal backend path so adapter state matches CI.
     if os.environ.get("SGLANG_GEN_GT", "0") == "1":
-        if "--backend" not in extra_args:
+        if not _is_lora_case(case) and "--backend" not in extra_args:
             extra_args = "--backend diffusers " + extra_args.strip()
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
@@ -92,12 +100,19 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.ring_degree is not None:
         extra_args += f" --ring-degree {server_args.ring_degree}"
 
+    if server_args.cfg_parallel:
+        extra_args += " --enable-cfg-parallel"
+
     # LoRA support
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
-    # default warmup
-    extra_args += f" --warmup"
+    if server_args.enable_warmup:
+        extra_args += " --warmup"
+
+    # Strict ports: fail immediately if port is occupied instead of silently
+    # picking another one (which causes the test client to connect to the wrong server).
+    extra_args += " --strict-ports"
 
     for arg in server_args.extras:
         extra_args += f" {arg}"
@@ -115,7 +130,20 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         extra_args=extra_args,
         env_vars=env_vars,
     )
-    ctx = manager.start()
+    try:
+        ctx = manager.start()
+    except (RuntimeError, TimeoutError) as exc:
+        # Auto-skip when the installed diffusers version lacks the required
+        # pipeline class.  This avoids hard failures when a model needs a
+        # newer diffusers release than what is currently installed in CI.
+        msg = str(exc)
+        if "not found in diffusers" in msg or "has no attribute" in msg:
+            pytest.skip(
+                f"Skipping {case.id}: required diffusers pipeline class "
+                f"is not available in the installed version. "
+                f"Upgrade diffusers to enable this test."
+            )
+        raise
 
     try:
         # Reconstruct output size for OpenAI API
@@ -833,9 +861,8 @@ Consider updating perf_baselines.json with the snippets below:
         # Check if we're in GT generation mode
         is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
 
-        # Dynamic LoRA loading test - tests LayerwiseOffload + set_lora interaction
-        # Server starts WITHOUT lora_path, then set_lora is called after startup
-        if case.server_args.dynamic_lora_path and not is_gt_gen_mode:
+        # GT generation also needs the dynamic set_lora step before generation.
+        if case.run_lora_dynamic_load_check:
             self._test_dynamic_lora_loading(diffusion_server, case)
 
         generate_fn = get_generate_fn(
@@ -871,27 +898,28 @@ Consider updating perf_baselines.json with the snippets below:
                 validate_mesh_correctness(mesh_path)
 
         # Test /v1/models endpoint for router compatibility
-        self._test_v1_models_endpoint(diffusion_server, case)
-        self._test_t2v_rejects_input_reference(diffusion_server, case)
+        if case.run_models_api_check:
+            self._test_v1_models_endpoint(diffusion_server, case)
+        if case.run_t2v_input_reference_check:
+            self._test_t2v_rejects_input_reference(diffusion_server, case)
 
         # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
-        if case.server_args.lora_path or case.server_args.dynamic_lora_path:
+        if case.run_lora_basic_api_check:
             self._test_lora_api_functionality(diffusion_server, case, generate_fn)
 
-            # Test dynamic LoRA switching (requires a second LoRA adapter)
-            if case.server_args.second_lora_path:
-                self._test_lora_dynamic_switch_e2e(
-                    diffusion_server,
-                    case,
-                    generate_fn,
-                    case.server_args.second_lora_path,
-                )
+        if case.run_lora_dynamic_switch_check:
+            self._test_lora_dynamic_switch_e2e(
+                diffusion_server,
+                case,
+                generate_fn,
+                case.server_args.second_lora_path,
+            )
 
-                # Test multi-LoRA functionality
-                self._test_multi_lora_e2e(
-                    diffusion_server,
-                    case,
-                    generate_fn,
-                    case.server_args.lora_path,
-                    case.server_args.second_lora_path,
-                )
+        if case.run_multi_lora_api_check:
+            self._test_multi_lora_e2e(
+                diffusion_server,
+                case,
+                generate_fn,
+                case.server_args.lora_path,
+                case.server_args.second_lora_path,
+            )

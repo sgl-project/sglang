@@ -115,7 +115,7 @@ def score_mgsm(target: str, prediction: str) -> bool:
 def get_lang_examples(lang: str) -> list[dict[str, str]]:
     fpath = LANG_TO_FPATH[lang]
     examples = []
-    with urllib.request.urlopen(fpath) as f:
+    with urllib.request.urlopen(fpath, timeout=30) as f:
         for line in f.read().decode("utf-8").splitlines():
             inputs, targets = line.strip().split("\t")
             if "." in targets:

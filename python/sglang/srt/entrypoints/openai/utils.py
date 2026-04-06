@@ -6,6 +6,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     LogProbs,
+    StreamOptions,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,23 @@ def process_hidden_states_from_ret(
     if hidden_states is not None:
         hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
     return hidden_states
+
+
+def should_include_usage(
+    stream_options: StreamOptions | None, stream_response_default_include_usage: bool
+) -> tuple[bool, bool]:
+    # When stream_options are specified in the request
+    if stream_options:
+        include_usage = (
+            stream_options.include_usage or stream_response_default_include_usage
+        )
+        continuous_usage_stats = bool(stream_options.continuous_usage_stats)
+    else:
+        include_usage, continuous_usage_stats = (
+            stream_response_default_include_usage,
+            False,
+        )
+    return include_usage, continuous_usage_stats
 
 
 def process_routed_experts_from_ret(
