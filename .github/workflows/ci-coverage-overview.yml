@@ -103,7 +103,8 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           grep -E '^=+.*passed' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
           echo "" >> $GITHUB_STEP_SUMMARY
-          # Coverage total
+          # Coverage total with header
+          printf "%-8s %8s %8s %8s\n" "" "Stmts" "Miss" "Cover" >> $GITHUB_STEP_SUMMARY
           grep -E '^TOTAL ' coverage_output.txt >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
