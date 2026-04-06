@@ -140,6 +140,8 @@ class KimiK2Detector(BaseFormatDetector):
 
         if not has_tool_call:
             self._buffer = ""
+            if self.eot_token in new_text:
+                self._reset_streaming_state()
             normal_text = _strip_special_tokens(new_text)
             return StreamingParseResult(normal_text=normal_text)
 
