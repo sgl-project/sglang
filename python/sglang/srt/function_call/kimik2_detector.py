@@ -231,9 +231,12 @@ class KimiK2Detector(BaseFormatDetector):
                             self._buffer = ""
 
                         result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
+                        if self.eot_token in self._buffer:
+                            self._reset_streaming_state()
+                        else:
+                            self.current_tool_id += 1
+                            self._last_arguments = ""
+                            self.current_tool_name_sent = False
                         return result
 
             return StreamingParseResult(normal_text="", calls=calls)
@@ -242,8 +245,8 @@ class KimiK2Detector(BaseFormatDetector):
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
 
-    def reset_streaming_state(self) -> None:
-        """Reset all streaming state between requests to prevent cross-request state pollution."""
+    def _reset_streaming_state(self) -> None:
+        """Reset all streaming state to prevent cross-request state pollution."""
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self.prev_tool_call_arr = []
