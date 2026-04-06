@@ -330,7 +330,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
                 num_tokens, hidden_size, dtype=torch.bfloat16, device=x.device
             )
 
-        output = trtllm_mxint4_block_scale_moe(
+        trtllm_mxint4_block_scale_moe(
             routing_logits=router_logits,  # float
             routing_bias=correction_bias,
             hidden_states=x,
@@ -354,4 +354,4 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
             output=symm_output,
         )
 
-        return StandardCombineInput(hidden_states=output)
+        return StandardCombineInput(hidden_states=symm_output)
