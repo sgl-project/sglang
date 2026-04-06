@@ -10,11 +10,13 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 
+AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
+
 _DEFAULT_ASR_PROMPT = (
-    "<|im_start|>user\n"
-    "<|audio_start|><|audio_pad|><|audio_end|>"
-    "<|im_end|>\n"
-    "<|im_start|>assistant\n"
+    f"<|im_start|>user\n"
+    f"{AUDIO_PLACEHOLDER}"
+    f"<|im_end|>\n"
+    f"<|im_start|>assistant\n"
 )
 
 
@@ -23,7 +25,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        self.AUDIO_TOKEN = "<|audio_start|><|audio_pad|><|audio_end|>"
+        self.AUDIO_TOKEN = AUDIO_PLACEHOLDER
         self.AUDIO_TOKEN_REGEX = re.compile(
             r"<\|audio_start\|>(?:<\|audio_pad\|>)+<\|audio_end\|>"
         )
@@ -41,6 +43,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         self.ATTR_NAME_TO_MODALITY.update({"feature_attention_mask": Modality.AUDIO})
 
     def _build_transcription_prompt(self, input_text: Union[str, list]) -> str:
+        # TODO: support `force_language`
         if isinstance(input_text, list):
             input_text = self._tokenizer.decode(input_text)
         if not input_text or not input_text.strip():

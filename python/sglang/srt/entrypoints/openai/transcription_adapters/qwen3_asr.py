@@ -39,7 +39,7 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
         tokenizer,
         usage: TranscriptionUsage,
     ) -> TranscriptionVerboseResponse:
-        # Qwen3-ASR doesn't natively produce timestamp tokens
+        # TODO: Qwen3-ASR needs ForcedAligner to produce timestamps
         return TranscriptionVerboseResponse(
             language=request.language or "auto",
             duration=round(request.audio_duration_s, 2),
