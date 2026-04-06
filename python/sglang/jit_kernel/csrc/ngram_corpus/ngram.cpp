@@ -68,6 +68,9 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
 // staging_sam_ is disjoint from sams_ / trie_. Only finishExternalCorpusLoad
 // briefly acquires mutex_ when moving the completed SAM into sams_.
 void Ngram::startExternalCorpusLoad() {
+  if (staging_sam_) {
+    throw std::runtime_error("startExternalCorpusLoad called while another load is in progress");
+  }
   staging_sam_ = std::make_unique<SuffixAutomaton>();
 }
 
