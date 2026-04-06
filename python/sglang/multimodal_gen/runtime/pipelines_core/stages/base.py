@@ -110,6 +110,11 @@ class PipelineStage(ABC):
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
 
+    @property
+    def requires_per_output_execution(self) -> bool:
+        """Whether this stage must run once per output when num_outputs_per_prompt > 1."""
+        return False
+
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
         Verify the output for the stage.

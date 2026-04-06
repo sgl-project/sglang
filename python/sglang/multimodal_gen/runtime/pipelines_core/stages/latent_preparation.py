@@ -32,6 +32,10 @@ class LatentPreparationStage(PipelineStage):
     denoised during the diffusion process.
     """
 
+    @property
+    def requires_per_output_execution(self) -> bool:
+        return True
+
     def __init__(self, scheduler, transformer) -> None:
         super().__init__()
         self.scheduler = scheduler

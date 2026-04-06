@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
+    _merge_output_batches,
+    _prepare_single_output_batch,
+    _split_stages_by_per_output,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -98,5 +101,35 @@ class ParallelExecutor(PipelineExecutor):
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-        batch = self._execute(stages, batch, server_args)
-        return batch
+        num_outputs = batch.num_outputs_per_prompt
+
+        if num_outputs <= 1:
+            return self._execute(stages, batch, server_args)
+
+        shared_stages, per_output_stages = _split_stages_by_per_output(stages)
+        if not per_output_stages:
+            return self._execute(stages, batch, server_args)
+
+        logger.info("Multi-output mode: %d outputs requested.", num_outputs)
+
+        # Phase 1: shared stages (e.g. text encoding) run once
+        batch = self._execute(shared_stages, batch, server_args)
+
+        # Phase 2: per-output stages loop N times with batch_size=1
+        output_batches: List[OutputBatch] = []
+        for i in range(num_outputs):
+            sub_batch = _prepare_single_output_batch(batch, i)
+            result = self._execute(per_output_stages, sub_batch, server_args)
+
+            if isinstance(result, OutputBatch):
+                output_batches.append(result)
+            else:
+                output_batches.append(
+                    OutputBatch(
+                        output=getattr(result, "output", None),
+                        metrics=getattr(result, "metrics", None),
+                    )
+                )
+
+        # Phase 3: merge
+        return _merge_output_batches(output_batches)
