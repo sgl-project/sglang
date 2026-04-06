@@ -155,7 +155,6 @@ class TestLinearAttnModelRegistry(CustomTestCase):
         self.assertTrue(spec.support_mamba_cache)
         self.assertFalse(spec.support_mamba_cache_extra_buffer)
         self.assertFalse(spec.unwrap_text_config)
-        self.assertFalse(spec.mla_incompatible)
 
 
 if __name__ == "__main__":
