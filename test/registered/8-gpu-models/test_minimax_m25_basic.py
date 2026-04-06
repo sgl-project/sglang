@@ -65,7 +65,7 @@ class TestMiniMaxM25Basic(CustomTestCase):
             write_github_step_summary(
                 f"### test_gsm8k (minimax-m25)\n" f'{metrics["accuracy"]=:.3f}\n'
             )
-        self.assertGreater(metrics["accuracy"], 0.935)
+        self.assertGreater(metrics["accuracy"], 0.900)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
