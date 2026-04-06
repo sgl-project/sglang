@@ -978,9 +978,14 @@ class TestMultiSamHttpMock(CustomTestCase):
     def setUpClass(cls):
         from unittest.mock import AsyncMock, MagicMock
 
-        from starlette.testclient import TestClient
+        try:
+            from starlette.testclient import TestClient
 
-        from sglang.srt.entrypoints.http_server import app, set_global_state
+            from sglang.srt.entrypoints.http_server import app, set_global_state
+        except (ImportError, OSError):
+            raise unittest.SkipTest(
+                "http_server import requires CUDA libraries not available on CPU"
+            )
         from sglang.srt.managers.io_struct import (
             AddExternalCorpusReqOutput,
             ListExternalCorporaReqOutput,
