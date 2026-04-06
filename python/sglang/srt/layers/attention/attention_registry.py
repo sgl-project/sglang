@@ -96,6 +96,11 @@ def create_triton_backend(runner):
         )
 
         return DoubleSparseAttnBackend(runner)
+    elif runner.use_mla_backend:
+        from sglang.srt.layers.attention.triton_mla_backend import TritonMLABackend
+
+        return TritonMLABackend(runner)
+
     else:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 

@@ -126,13 +126,22 @@ class DraftBackendFactory:
             )
 
     def _create_triton_decode_backend(self):
-        from sglang.srt.layers.attention.triton_backend import (
-            TritonMultiStepDraftBackend,
-        )
+        if not get_global_server_args().use_mla_backend:
+            from sglang.srt.layers.attention.triton_backend import (
+                TritonMultiStepDraftBackend,
+            )
 
-        return TritonMultiStepDraftBackend(
-            self.draft_model_runner, self.topk, self.speculative_num_steps
-        )
+            return TritonMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+        else:
+            from sglang.srt.layers.attention.triton_mla_backend import (
+                TritonMLAMultiStepDraftBackend,
+            )
+
+            return TritonMLAMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
 
     def _create_aiter_decode_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterMultiStepDraftBackend
@@ -215,9 +224,14 @@ class DraftBackendFactory:
             return FlashInferMLAAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_triton_prefill_backend(self):
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+        if not get_global_server_args().use_mla_backend:
+            from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
-        return TritonAttnBackend(self.draft_model_runner, skip_prefill=False)
+            return TritonAttnBackend(self.draft_model_runner, skip_prefill=False)
+        else:
+            from sglang.srt.layers.attention.triton_mla_backend import TritonMLABackend
+
+            return TritonMLABackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_aiter_prefill_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend

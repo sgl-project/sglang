@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
     EAGLEDraftNpuGraphRunner,
 )
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.attention.triton_mla_backend import TritonMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
@@ -296,6 +297,7 @@ class EagleDraftWorker(BaseDraftWorker):
         supports_cuda_draft_extend_graph = _is_cuda and (
             isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
             or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
+            or isinstance(self.draft_extend_attn_backend, TritonMLABackend)
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
