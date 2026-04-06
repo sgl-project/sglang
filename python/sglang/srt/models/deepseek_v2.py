@@ -1640,6 +1640,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        self._gfx95_quant_format = self._detect_gfx95_quant_format()
+
         if self.nsa_enable_prefill_cp:
             self.layer_communicator = NSACPLayerCommunicator(
                 layer_scatter_modes=self.layer_scatter_modes,
@@ -1663,6 +1665,20 @@ class DeepseekV2DecoderLayer(nn.Module):
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
+    def _detect_gfx95_quant_format(self) -> str:
+        if not _is_gfx95_supported:
+            return ""
+        weight = getattr(
+            getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None), "weight", None
+        )
+        if weight is None:
+            return ""
+        if weight.dtype == torch.uint8:
+            return "mxfp4"
+        if weight.dtype == getattr(torch, "float8_e4m3fn", None):
+            return "fp8"
+        return ""
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
@@ -1681,38 +1697,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        quant_format = (
-            "mxfp4"
-            if (
-                _is_gfx95_supported
-                and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
-                is not None
-                and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
-                is not None
-                and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
-            )
-            else (
-                "fp8"
-                if (
-                    _is_gfx95_supported
-                    and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
-                    is not None
-                    and getattr(
-                        self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None
-                    )
-                    is not None
-                    and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype
-                    == getattr(torch, "float8_e4m3fn", None)
-                )
-                else ""
-            )
-        )
-
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
-            quant_format,
+            self._gfx95_quant_format,
         )
 
         hidden_states = self.self_attn(
