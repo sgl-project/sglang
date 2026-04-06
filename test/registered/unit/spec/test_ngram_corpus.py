@@ -967,90 +967,88 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         self.assertIn("__default__", ids)
 
 
-class TestMultiSamSchedulerMock(CustomTestCase):
-    """Test scheduler handler logic with a mock draft worker."""
+class TestMultiSamHttpMock(CustomTestCase):
+    """Test HTTP endpoints for multi-SAM management with a mocked backend."""
 
-    def _make_mock_scheduler(self):
-        from unittest.mock import MagicMock
+    @classmethod
+    def setUpClass(cls):
+        from unittest.mock import AsyncMock, MagicMock
 
-        scheduler = MagicMock()
-        scheduler.spec_algorithm.is_ngram.return_value = True
-        scheduler.draft_worker = MagicMock()
-        return scheduler
+        from starlette.testclient import TestClient
 
-    def test_add_corpus_calls_worker(self):
-        from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
-        from sglang.srt.managers.scheduler import Scheduler
-
-        scheduler = self._make_mock_scheduler()
-        scheduler.draft_worker.add_external_corpus.return_value = 100
-
-        req = AddExternalCorpusReqInput(corpus_id="test", token_chunks=[[1, 2, 3]])
-        result = Scheduler.add_external_corpus(scheduler, req)
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.corpus_id, "test")
-        self.assertEqual(result.loaded_token_count, 100)
-        scheduler.draft_worker.add_external_corpus.assert_called_once_with(
-            "test", [[1, 2, 3]]
+        from sglang.srt.entrypoints.http_server import app, set_global_state
+        from sglang.srt.managers.io_struct import (
+            AddExternalCorpusReqOutput,
+            ListExternalCorporaReqOutput,
+            RemoveExternalCorpusReqOutput,
         )
 
-    def test_remove_corpus_calls_worker(self):
-        from sglang.srt.managers.io_struct import RemoveExternalCorpusReqInput
-        from sglang.srt.managers.scheduler import Scheduler
+        mock_state = MagicMock()
+        tm = mock_state.tokenizer_manager
 
-        scheduler = self._make_mock_scheduler()
+        # Wire up async methods that the HTTP handlers call
+        tm.add_external_corpus = AsyncMock(
+            return_value=AddExternalCorpusReqOutput(
+                success=True,
+                corpus_id="test-id",
+                message="Loaded corpus 'test-id' with 100 tokens.",
+                loaded_token_count=100,
+            )
+        )
+        tm.remove_external_corpus = AsyncMock(
+            return_value=RemoveExternalCorpusReqOutput(
+                success=True, message="Removed corpus 'test-id'."
+            )
+        )
+        tm.list_external_corpora = AsyncMock(
+            return_value=ListExternalCorporaReqOutput(
+                success=True, corpus_ids=["a", "b"]
+            )
+        )
+        set_global_state(mock_state)
+        cls.client = TestClient(app)
+        cls.mock_tm = tm
 
-        req = RemoveExternalCorpusReqInput(corpus_id="test")
-        result = Scheduler.remove_external_corpus(scheduler, req)
+    def test_add_corpus(self):
+        resp = self.client.post(
+            "/add_external_corpus",
+            json={"corpus_id": "my-corpus", "documents": ["hello world"]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["corpus_id"], "test-id")
+        self.assertEqual(data["loaded_token_count"], 100)
 
-        self.assertTrue(result.success)
-        scheduler.draft_worker.remove_external_corpus.assert_called_once_with("test")
+    def test_add_corpus_auto_id(self):
+        resp = self.client.post(
+            "/add_external_corpus",
+            json={"documents": ["hello world"]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
 
-    def test_list_corpus_calls_worker(self):
-        from sglang.srt.managers.io_struct import ListExternalCorporaReqInput
-        from sglang.srt.managers.scheduler import Scheduler
+    def test_remove_corpus(self):
+        resp = self.client.post(
+            "/remove_external_corpus",
+            json={"corpus_id": "test-id"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
 
-        scheduler = self._make_mock_scheduler()
-        scheduler.draft_worker.list_external_corpora.return_value = [
-            "a",
-            "b",
-        ]
+    def test_remove_corpus_missing_id(self):
+        resp = self.client.post(
+            "/remove_external_corpus",
+            json={},
+        )
+        self.assertEqual(resp.status_code, 400)
 
-        req = ListExternalCorporaReqInput()
-        result = Scheduler.list_external_corpora(scheduler, req)
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.corpus_ids, ["a", "b"])
-
-    def test_ngram_not_enabled_returns_error(self):
-        from unittest.mock import MagicMock
-
-        from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
-        from sglang.srt.managers.scheduler import Scheduler
-
-        scheduler = MagicMock()
-        scheduler.spec_algorithm.is_ngram.return_value = False
-        scheduler.draft_worker = None
-
-        req = AddExternalCorpusReqInput(corpus_id="test", token_chunks=[[1, 2, 3]])
-        result = Scheduler.add_external_corpus(scheduler, req)
-
-        self.assertFalse(result.success)
-        self.assertIn("not enabled", result.message)
-
-    def test_worker_exception_returns_error(self):
-        from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
-        from sglang.srt.managers.scheduler import Scheduler
-
-        scheduler = self._make_mock_scheduler()
-        scheduler.draft_worker.add_external_corpus.side_effect = RuntimeError("OOM")
-
-        req = AddExternalCorpusReqInput(corpus_id="test", token_chunks=[[1, 2, 3]])
-        result = Scheduler.add_external_corpus(scheduler, req)
-
-        self.assertFalse(result.success)
-        self.assertIn("OOM", result.message)
+    def test_list_corpora(self):
+        resp = self.client.get("/list_external_corpora")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["success"])
+        self.assertEqual(sorted(data["corpus_ids"]), ["a", "b"])
 
 
 if __name__ == "__main__":
