@@ -99,12 +99,16 @@ def _make_state(
     device_buffer_tokens = torch.tensor(
         device_buffer_tokens_rows, dtype=torch.int32, device=DEVICE
     )
-    lru_slots = torch.arange(HOT_BUFFER_SIZE, dtype=torch.int16, device=DEVICE).view(
-        1, -1
-    ).repeat(device_buffer_locs.shape[0], 1)
-    host_cache_locs = torch.arange(
-        HOST_CACHE_SIZE, dtype=torch.int64, device=DEVICE
-    ).view(1, -1).repeat(device_buffer_locs.shape[0], 1)
+    lru_slots = (
+        torch.arange(HOT_BUFFER_SIZE, dtype=torch.int16, device=DEVICE)
+        .view(1, -1)
+        .repeat(device_buffer_locs.shape[0], 1)
+    )
+    host_cache_locs = (
+        torch.arange(HOST_CACHE_SIZE, dtype=torch.int64, device=DEVICE)
+        .view(1, -1)
+        .repeat(device_buffer_locs.shape[0], 1)
+    )
 
     # Slots 0..3 participate in LRU; slot 4 is the reserved newest slot.
     for rid, newest_token in enumerate(newest_tokens):
@@ -212,6 +216,7 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
     # Step 1: touch tokens [4, 2], so LRU becomes [0, 3, 1, 2].
     # Step 2: query token 6, which is a miss.
     # The kernel should reuse the new LRU head slot0, whose physical loc is 9.
+    # This round has no regular hits, so the freshly loaded miss slot ends up at the tail.
     _run_kernel(
         top_k_tokens=torch.tensor([[4, 2]], dtype=torch.int32, device=DEVICE),
         seq_len=8,
@@ -229,7 +234,7 @@ def test_load_cache_to_device_buffer_miss_uses_updated_lru_slot() -> None:
         torch.tensor([[6, 4, 2, 5, -1]], dtype=torch.int32),
     )
     assert torch.equal(
-        state["lru_slots"].cpu(), torch.tensor([[0, 3, 1, 2]], dtype=torch.int16)
+        state["lru_slots"].cpu(), torch.tensor([[3, 1, 2, 0]], dtype=torch.int16)
     )
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
 
@@ -254,7 +259,8 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     # req 0: long path
     #   cached tokens/locs : 1@9, 4@7, 2@3, 5@5, newest 7@11
     #   query [4, 6, 7]    : hit loc 7, miss into slot0/loc 9, newest loc 11
-    #   LRU update         : [0, 1, 2, 3] -> [0, 2, 3, 1]
+    #   LRU update         : remaining evictables [2, 3], then miss [0], then hit [1]
+    #                      : [0, 1, 2, 3] -> [2, 3, 0, 1]
     #
     # req 1: fast path
     #   seq_len = 3 <= HOT_BUFFER_SIZE, so [2, 1, 0] maps directly to locs [8, 10, 12]
@@ -271,7 +277,8 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     )
 
     assert torch.equal(
-        out.cpu(), torch.tensor([[7, 9, 11], [8, 10, 12], [-1, -1, -1]], dtype=torch.int32)
+        out.cpu(),
+        torch.tensor([[7, 9, 11], [8, 10, 12], [-1, -1, -1]], dtype=torch.int32),
     )
     assert torch.equal(
         state["device_buffer_tokens"][:2].cpu(),
@@ -279,9 +286,11 @@ def test_load_cache_to_device_buffer_batched_with_padding() -> None:
     )
     assert torch.equal(
         state["lru_slots"][:2].cpu(),
-        torch.tensor([[0, 2, 3, 1], [0, 1, 2, 3]], dtype=torch.int16),
+        torch.tensor([[2, 3, 0, 1], [0, 1, 2, 3]], dtype=torch.int16),
     )
-    assert torch.equal(state["device_buffer_tokens"][2].cpu(), padded_tokens_before.cpu())
+    assert torch.equal(
+        state["device_buffer_tokens"][2].cpu(), padded_tokens_before.cpu()
+    )
     assert torch.equal(state["lru_slots"][2].cpu(), padded_lru_before.cpu())
     assert torch.equal(state["device_buffer"][9].cpu(), state["host_cache"][6])
 
