@@ -3113,6 +3113,25 @@ class ServerArgs:
                     "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
                     "You can override this by explicitly setting --speculative-num-draft-tokens."
                 )
+            if self.speculative_ngram_external_corpus_path is not None:
+                if self.speculative_ngram_external_sam_budget <= 0:
+                    raise ValueError(
+                        "--speculative-ngram-external-sam-budget must be positive when "
+                        "--speculative-ngram-external-corpus-path is set."
+                    )
+                if self.speculative_ngram_external_corpus_max_tokens <= 0:
+                    raise ValueError(
+                        "--speculative-ngram-external-corpus-max-tokens must be positive when "
+                        "--speculative-ngram-external-corpus-path is set."
+                    )
+                if (
+                    self.speculative_ngram_external_sam_budget
+                    > self.speculative_num_draft_tokens - 1
+                ):
+                    raise ValueError(
+                        "speculative_ngram_external_sam_budget must be less than or equal to "
+                        f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."
+                    )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
                 "using ngram speculative decoding."
