@@ -41,9 +41,6 @@ class NGRAMWorker:
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
-        self.max_match_window_size: int = (
-            server_args.speculative_ngram_max_match_window_size
-        )
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
@@ -51,8 +48,6 @@ class NGRAMWorker:
         self._init_preallocated_tensors()
 
         self.ngram_corpus = NgramCorpus(
-            min_match_window_size=server_args.speculative_ngram_min_match_window_size,
-            max_match_window_size=server_args.speculative_ngram_max_match_window_size,
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
             match_type=server_args.speculative_ngram_match_type,
@@ -128,13 +123,19 @@ class NGRAMWorker:
         bs = batch.batch_size()
 
         self.ngram_corpus.synchronize()
+        req_ids = []
         batch_tokens = []
+        total_lens = []
         for req in batch.reqs:
             check_token = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids, self.max_match_window_size
+                req.origin_input_ids, req.output_ids, self.max_trie_depth
             )
+            req_ids.append(req.rid)
             batch_tokens.append(check_token)
-        req_drafts, mask = self.ngram_corpus.batch_get(batch_tokens)
+            total_lens.append(len(req.origin_input_ids) + len(req.output_ids))
+        req_drafts, mask = self.ngram_corpus.batch_get(
+            req_ids, batch_tokens, total_lens
+        )
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -220,6 +221,7 @@ class NGRAMWorker:
         spec_info = model_worker_batch.spec_info
         num_accepted_tokens = 0
         accept_lens = None
+        accept_length_per_req_cpu = None
 
         if model_worker_batch.forward_mode.is_target_verify():
             if batch.has_grammar:
@@ -261,11 +263,22 @@ class NGRAMWorker:
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
                 batch, logits_output, self.page_size, vocab_mask
             )
+            accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_corpus(batch)
+            # Clean up per-request match state for finished/retracted requests.
+            # State entries are created in _prepare_draft_tokens and cleaned here.
+            # If a request is removed without passing through verify, the entry
+            # persists until reset(); this is acceptable because MatchState is small.
+            finished_req_ids = []
+            for req in batch.reqs:
+                if req.finished() or req.is_retracted:
+                    finished_req_ids.append(req.rid)
+            if finished_req_ids:
+                self.ngram_corpus.erase_match_state(finished_req_ids)
             batch.forward_mode = ForwardMode.DECODE
 
         else:
@@ -282,6 +295,7 @@ class NGRAMWorker:
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
         )

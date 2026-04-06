@@ -98,6 +98,7 @@ srt_hip = [
 
 diffusion_hip = [
   "sglang[diffusion_common]",
+  "peft>=0.18.0",
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
@@ -113,7 +114,7 @@ srt_musa = [
     "sglang[runtime_common]",
     "torch",
     "torch_musa",
-    "torchada>=0.1.25",
+    "torchada>=0.1.45",
     "mthreads-ml-py",
     "numpy<2.0",
 ]
@@ -208,4 +209,4 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]

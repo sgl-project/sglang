@@ -3,7 +3,6 @@ from typing import Optional
 
 import requests
 
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_gsm8k
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_summary
 
@@ -19,17 +18,20 @@ def _check_accept_length(test_case, base_url, threshold):
 
 
 class GSM8KMixin:
-    """Mixin for few-shot GSM8K evaluation.
+    """Mixin for GSM8K evaluation via OpenAI Chat API.
 
     Required attributes on the test class:
         base_url: str
         gsm8k_accuracy_thres: float
+
+    Optional attributes:
+        model: str (if not set, auto-detected from server)
     """
 
     gsm8k_accuracy_thres: float = _THRESHOLD_NOT_SET
     gsm8k_accept_length_thres: Optional[float] = None
     gsm8k_num_questions: int = 200
-    gsm8k_parallel: int = 128
+    gsm8k_num_threads: int = 128
 
     def test_gsm8k(self):
         assert (
@@ -39,17 +41,21 @@ class GSM8KMixin:
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=self.gsm8k_num_questions,
-            max_new_tokens=512,
-            parallel=self.gsm8k_parallel,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=self.gsm8k_num_questions,
+            num_threads=self.gsm8k_num_threads,
         )
-        metrics = run_eval_gsm8k(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreaterEqual(metrics["accuracy"], self.gsm8k_accuracy_thres)
+
+        if is_in_ci():
+            write_github_step_summary(f"### test_gsm8k\n{metrics['score']=:.4f}\n")
+
+        self.assertGreaterEqual(metrics["score"], self.gsm8k_accuracy_thres)
 
         if self.gsm8k_accept_length_thres is not None:
             _check_accept_length(self, self.base_url, self.gsm8k_accept_length_thres)

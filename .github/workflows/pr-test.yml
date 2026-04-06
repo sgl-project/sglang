@@ -88,6 +88,8 @@ jobs:
       jit_kernel: ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       max_parallel: ${{ steps.set-parallel.outputs.max_parallel }}
+      max_parallel_small: ${{ steps.set-parallel.outputs.max_parallel_small }}
+      max_parallel_2gpu: ${{ steps.set-parallel.outputs.max_parallel_2gpu }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
@@ -125,10 +127,10 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
-              - "python/sglang/!(multimodal_gen)/**"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
-              - "test/**"
+              - "test/**/!(*.md)"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
@@ -145,7 +147,7 @@ jobs:
               - "python/sglang/jit_kernel/**"
             sgl_kernel:
               - ".github/workflows/pr-test-sgl-kernel.yml"
-              - "sgl-kernel/**"
+              - "sgl-kernel/**/*.!(md|txt)"
 
       # For /rerun-stage (workflow_dispatch with target_stage), dorny/paths-filter doesn't work
       # correctly because it falls back to "last commit" detection which breaks for merge commits.
@@ -216,13 +218,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Scheduled runs and high-priority PRs get full parallelism
+          # Determine if this run gets full parallelism (scheduled / high priority)
+          FULL=false
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            echo "max_parallel=14" >> $GITHUB_OUTPUT
-            echo "Scheduled run detected, setting max_parallel to 14"
+            FULL=true
+            echo "Scheduled run detected, using full parallelism"
           elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
-            echo "max_parallel=14" >> $GITHUB_OUTPUT
-            echo "High priority PR detected, setting max_parallel to 14"
+            FULL=true
+            echo "High priority PR detected, using full parallelism"
           elif [[ -n "${{ inputs.target_stage }}" ]]; then
             # /rerun-stage (workflow_dispatch): query PR labels via GitHub API
             # Try SHA lookup first (fork PRs), fallback to branch name (non-fork PRs)
@@ -238,16 +241,26 @@ jobs:
             fi
             echo "PR labels: ${LABELS:-"(none)"}"
             if echo "$LABELS" | grep -Fxq "high priority"; then
-              echo "max_parallel=14" >> $GITHUB_OUTPUT
-              echo "High priority PR detected via API (/rerun-stage), setting max_parallel to 14"
-            else
-              echo "max_parallel=3" >> $GITHUB_OUTPUT
-              echo "Using default max_parallel of 3 (/rerun-stage, no high priority label)"
+              FULL=true
+              echo "High priority PR detected via API (/rerun-stage), using full parallelism"
             fi
-          else
-            echo "max_parallel=3" >> $GITHUB_OUTPUT
-            echo "Using default max_parallel of 3"
           fi
+
+          # Set max-parallel for each runner type
+          #   1-gpu-h100: 14 partitions, 1-gpu-5090: 8 partitions, 2-gpu-h100: 4 partitions
+          if [[ "$FULL" == "true" ]]; then
+            LEVEL=full
+            echo "max_parallel=14" >> $GITHUB_OUTPUT
+            echo "max_parallel_small=8" >> $GITHUB_OUTPUT
+            echo "max_parallel_2gpu=4" >> $GITHUB_OUTPUT
+          else
+            LEVEL=low
+            echo "max_parallel=3" >> $GITHUB_OUTPUT
+            echo "max_parallel_small=3" >> $GITHUB_OUTPUT
+            echo "max_parallel_2gpu=2" >> $GITHUB_OUTPUT
+          fi
+          echo "parallel_level=$LEVEL" >> $GITHUB_OUTPUT
+          echo "Parallelism level: $LEVEL"
 
       - name: Set B200 runner tag
         id: set-runner
@@ -314,7 +327,7 @@ jobs:
             echo "| multimodal_gen    | ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
             echo "| target_stage      | ${{ inputs.target_stage || '(none)' }} |"
             echo "| detection_method  | ${{ inputs.target_stage && 'GitHub API' || 'dorny/paths-filter' }} |"
-            echo "| max_parallel      | ${{ steps.set-parallel.outputs.max_parallel }} |"
+            echo "| max_parallel      | ${{ steps.set-parallel.outputs.parallel_level }} (h100=${{ steps.set-parallel.outputs.max_parallel }}, 5090=${{ steps.set-parallel.outputs.max_parallel_small }}, 2gpu=${{ steps.set-parallel.outputs.max_parallel_2gpu }}) |"
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
             echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
             echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
@@ -661,7 +674,7 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: 8
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_small) }}
       matrix:
         partition: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
@@ -687,9 +700,6 @@ jobs:
         run: |
           source /etc/profile.d/sglang-ci.sh
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
@@ -777,6 +787,7 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
+      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_2gpu) }}
       matrix:
         partition: [0, 1, 2, 3]
     steps:
@@ -801,9 +812,6 @@ jobs:
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-          git clone https://github.com/merrymercy/human-eval.git
-          cd human-eval
-          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
@@ -882,6 +890,7 @@ jobs:
       (
         inputs.target_stage == 'multimodal-gen-test-1-gpu' ||
         inputs.target_stage == 'multimodal-gen-test-2-gpu' ||
+        inputs.target_stage == 'multimodal-gen-test-1-b200' ||
         inputs.target_stage == 'multimodal-gen-unit-test' ||
         (
           !inputs.target_stage &&
@@ -893,6 +902,7 @@ jobs:
     with:
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
+      b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
