@@ -19,13 +19,19 @@ namespace ngram {
 
 class Ngram {
   std::unique_ptr<Trie> trie_;
-  std::unordered_map<std::string, std::shared_ptr<SuffixAutomaton>> sams_;
+  std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
   std::string staging_corpus_id_;
-  std::shared_ptr<SuffixAutomaton> staging_sam_;
+  std::unique_ptr<SuffixAutomaton> staging_sam_;
   Param param_;
 
+  // NOTE: protects trie_, sams_, staging_sam_, and pending_count_. Ensures
+  // batchMatch never reads while insertWorker or corpus loading is writing.
+  // After synchronize(), no pending inserts remain so mutex_ contention is
+  // effectively zero.
   mutable std::mutex mutex_;
   mutable std::condition_variable sync_cv_;
+  // NOTE: tracks inserts from enqueue through trie_->insert() completion,
+  // not just queue occupancy. A dequeued item may still be mid-insert.
   size_t pending_count_ = 0;
   utils::Queue<std::vector<int32_t>> insert_queue_;
   std::thread insert_worker_;

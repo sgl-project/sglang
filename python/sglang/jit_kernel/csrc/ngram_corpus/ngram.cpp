@@ -66,7 +66,7 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
 void Ngram::startExternalCorpusLoad(const std::string& corpus_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   staging_corpus_id_ = corpus_id;
-  staging_sam_ = std::make_shared<SuffixAutomaton>();
+  staging_sam_ = std::make_unique<SuffixAutomaton>();
 }
 
 void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
@@ -180,11 +180,11 @@ Result Ngram::batchMatch(
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
 
-  // Collect active SAMs
-  std::vector<std::shared_ptr<SuffixAutomaton>> active_sams;
+  // Collect active SAMs (snapshot taken once per batch under mutex)
+  std::vector<const SuffixAutomaton*> active_sams;
   for (const auto& [_, sam] : sams_) {
     if (sam && !sam->empty()) {
-      active_sams.push_back(sam);
+      active_sams.push_back(sam.get());
     }
   }
 
@@ -214,9 +214,8 @@ Result Ngram::batchMatch(
     auto combined = (trie_.get()->*trie_result_build_fn)(
         suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
 
-    for (const auto& sam : active_sams) {
-      auto sam_res =
-          (sam.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
+    for (const auto* sam : active_sams) {
+      auto sam_res = (sam->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
       combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
     }
 
