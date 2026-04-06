@@ -2230,14 +2230,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif require_attn_tp_gather(self.server_args):
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
-                    [num_tokens],
+                    [num_tokens] * self.server_args.dp_size,
                     dtype=torch.int32,
                     device=self.device,
                 )
             )
             buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [num_tokens],
+                    [num_tokens] * self.server_args.dp_size,
                     dtype=torch.int32,
                     device=self.device,
                 )

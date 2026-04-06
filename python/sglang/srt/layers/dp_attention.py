@@ -328,6 +328,10 @@ def get_attention_tp_size() -> int:
     return get_attn_tensor_model_parallel_world_size()
 
 
+def get_attention_tp_world_size() -> int:
+    return get_attn_tensor_model_parallel_world_size()
+
+
 def get_attention_cp_group() -> GroupCoordinator:
     return get_attn_cp_group()
 

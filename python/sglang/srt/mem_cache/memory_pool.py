@@ -100,9 +100,10 @@ def _set_kv_buffer_impl(
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
     if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
+        num_tokens = indices.numel()
         return store_cache(
-            k.view(-1, row_dim),
-            v.view(-1, row_dim),
+            k.view(num_tokens, row_dim),
+            v.view(num_tokens, row_dim),
             k_cache.view(-1, row_dim),
             v_cache.view(-1, row_dim),
             indices,
