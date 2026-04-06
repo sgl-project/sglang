@@ -426,5 +426,29 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.decode_attention_backend, "triton")
 
 
+class TestNgramExternalSamArgs(CustomTestCase):
+    def test_prepare_server_args_parses_external_sam_args(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--speculative-algorithm",
+                "NGRAM",
+                "--speculative-ngram-external-corpus-path",
+                "/tmp/ngram-corpus.jsonl",
+                "--speculative-ngram-external-sam-budget",
+                "4",
+                "--speculative-ngram-external-corpus-max-tokens",
+                "128",
+            ]
+        )
+        self.assertEqual(
+            server_args.speculative_ngram_external_corpus_path,
+            "/tmp/ngram-corpus.jsonl",
+        )
+        self.assertEqual(server_args.speculative_ngram_external_sam_budget, 4)
+        self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
+
+
 if __name__ == "__main__":
     unittest.main()

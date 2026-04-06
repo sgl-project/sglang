@@ -57,6 +57,25 @@ class NGRAMWorker:
             external_sam_budget=server_args.speculative_ngram_external_sam_budget,
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
         )
+        if server_args.speculative_ngram_external_corpus_path is not None:
+            from sglang.srt.speculative.cpp_ngram.external_corpus import (
+                iter_external_corpus_chunks,
+            )
+
+            corpus_path = server_args.speculative_ngram_external_corpus_path
+            chunks = list(
+                iter_external_corpus_chunks(
+                    corpus_path,
+                    target_worker.tokenizer,
+                    server_args.speculative_ngram_external_corpus_max_tokens,
+                )
+            )
+            loaded = self.add_external_corpus(corpus_path, chunks)
+            logger.info(
+                "Loaded external ngram corpus '%s' (%d tokens).",
+                corpus_path,
+                loaded,
+            )
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
