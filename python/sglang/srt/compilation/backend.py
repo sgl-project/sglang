@@ -21,6 +21,7 @@ from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdap
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
 from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
+from sglang.srt.compilation.piecewise_context_manager import is_in_pcg_torch_compile
 from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
@@ -358,6 +359,7 @@ class SGLangBackend:
 
     graph_pool: Any
     _called: bool = False
+    _guards_skipped: bool = False
     # the graph we compiled
     graph: fx.GraphModule
     # the stiching graph module for all the piecewise graphs
@@ -465,4 +467,39 @@ class SGLangBackend:
                     f.write(src)
 
         self._called = True
-        return self.split_gm
+
+        # Wrap split_gm to disable Dynamo guard evaluation after all
+        # CUDA graphs are captured. During replay, the PCG infrastructure
+        # handles dispatch by shape, so Dynamo guards are redundant.
+        original_split_gm = self.split_gm
+        backend_self = self
+
+        def split_gm_with_guard_bypass(*args):
+            result = original_split_gm(*args)
+            if (
+                not backend_self._guards_skipped
+                and not is_in_pcg_torch_compile()
+                and backend_self._all_captured()
+            ):
+                import torch._C._dynamo.eval_frame
+
+                torch._C._dynamo.eval_frame.set_skip_guard_eval_unsafe(True)
+                backend_self._guards_skipped = True
+            return result
+
+        return split_gm_with_guard_bypass
+
+    def _all_captured(self) -> bool:
+        """Check if all CUDA graphs have been captured."""
+        has_any = False
+        for item in self.piecewise_graphs:
+            if item.is_splitting_graph:
+                continue
+            backend = self.split_gm.__dict__.get(item.submod_name)
+            if isinstance(backend, CUDAPiecewiseBackend):
+                for entry in backend.concrete_size_entries.values():
+                    if entry.use_cudagraph:
+                        has_any = True
+                        if entry.cudagraph is None:
+                            return False
+        return has_any

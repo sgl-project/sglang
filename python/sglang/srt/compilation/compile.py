@@ -132,7 +132,7 @@ def install_torch_compiled(
         )
 
     compiled_codes: list[type(original_code)] = []
-    state = {"compiled": False, "compiled_callable": None}
+    state = {"compiled": False, "compiled_callable": None, "direct_fn": None}
 
     def bytecode_hook(old_code, new_code):
         if old_code is not original_code:
@@ -184,12 +184,44 @@ def install_torch_compiled(
 
         state["compiled"] = True
         state["compiled_callable"] = compiled_callable
+        # Enable direct bytecode call immediately to bypass
+        # Dynamo's eval_frame C hook
+        enable_direct_call()
+
+    def _build_direct_fn():
+        """Build a function from the compiled bytecode that calls split_gm
+        directly, bypassing Dynamo's eval_frame C hook"""
+        if not compiled_codes:
+            return None
+        code = compiled_codes[0]
+        # Get the closure from the original forward if it has one
+        closure = unbound_fwd.__closure__
+        fn = types.FunctionType(
+            code,
+            unbound_fwd.__globals__,
+            "compiled_forward_no_dynamo",
+            unbound_fwd.__defaults__,
+            closure,
+        )
+        if unbound_fwd.__kwdefaults__:
+            fn.__kwdefaults__ = unbound_fwd.__kwdefaults__
+        return fn
+
+    def enable_direct_call():
+        """Enable direct bytecode call, bypassing Dynamo's eval_frame hook.
+        Should be called after PCG capture is complete."""
+        if state["direct_fn"] is None and compiled_codes:
+            state["direct_fn"] = _build_direct_fn()
 
     def trampoline(self, *args, **kwargs):
         use_compiled = is_in_piecewise_cuda_graph()
         if use_compiled:
             if not state["compiled"]:
                 _ensure_compiled(self, *args, **kwargs)
+
+            direct_fn = state["direct_fn"]
+            if direct_fn is not None:
+                return direct_fn(self, *args, **kwargs)
 
             compiled_callable = state["compiled_callable"]
             return compiled_callable(*args, **kwargs)
