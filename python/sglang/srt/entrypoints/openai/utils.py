@@ -1,6 +1,8 @@
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+import torch
+
 from sglang.srt.entrypoints.openai.protocol import (
     CachedTokensDetails,
     ChatCompletionRequest,
@@ -132,3 +134,29 @@ def process_cached_tokens_details_from_ret(
             device=details.get("device", 0),
             host=details.get("host", 0),
         )
+
+
+def convert_embeds_to_tensors(
+    embeds: Optional[Union[List[List[List[float]]], List[List[float]]]],
+) -> Optional[List[List[torch.Tensor]]]:
+    """Convert nested float lists from the HTTP API to lists of tensors.
+
+    Accepts either:
+      - None -> returns None
+      - List[List[float]] (single input) -> [[tensor, ...]]
+      - List[List[List[float]]] (batch) -> [[tensor, ...], ...]
+    Each innermost List[float] becomes a 1-D torch.Tensor.
+    """
+    if embeds is None:
+        return None
+    if len(embeds) == 0:
+        return []
+    # Detect nesting depth: if first element is empty or its first element is a float,
+    # it's a single input [num_replacements][hidden_size]
+    if not embeds[0] or isinstance(embeds[0][0], (int, float)):
+        return [[torch.tensor(vec, dtype=torch.float32) for vec in embeds]]
+    # Otherwise it's batch: [num_inputs][num_replacements][hidden_size]
+    return [
+        [torch.tensor(vec, dtype=torch.float32) for vec in per_input]
+        for per_input in embeds
+    ]

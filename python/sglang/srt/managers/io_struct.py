@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
@@ -137,6 +138,12 @@ class GenerateReqInput(BaseReq):
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # Embedding overrides to place at specific token positions.
+    # - Single example: PositionalEmbeds
+    # - Batch: List[Optional[PositionalEmbeds]]
+    embed_override_injection: Optional[
+        Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
+    ] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -600,6 +607,14 @@ class GenerateReqInput(BaseReq):
             ):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
+    def _get_embed_override_injection_item(self, i: int) -> Optional[PositionalEmbeds]:
+        """Extract the i-th item from embed_override_injection."""
+        if self.embed_override_injection is None:
+            return None
+        if isinstance(self.embed_override_injection, PositionalEmbeds):
+            return self.embed_override_injection
+        return self.embed_override_injection[i]
+
     def __getitem__(self, i):
         # Cache sub-objects so that repeated obj[i] calls return the same instance.
         # This avoids subtle bugs where different call sites get divergent objects.
@@ -612,6 +627,7 @@ class GenerateReqInput(BaseReq):
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
+            embed_override_injection=self._get_embed_override_injection_item(i),
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
@@ -706,6 +722,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
+    # Embedding overrides to place at specific token positions.
+    embed_override_injection: Optional[PositionalEmbeds] = None
+
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
 
@@ -791,6 +810,16 @@ class EmbeddingReqInput(BaseReq):
     audio_data: Optional[MultimodalDataInputFormat] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # Placeholder token ID used to locate embedding override positions in input token IDs.
+    embed_override_token_id: Optional[int] = None
+    # Unresolved embedding overrides: per-input list of tensors.
+    # Position resolution happens in the tokenizer manager after tokenization.
+    # Shape: [num_inputs][num_replacements] where each entry is a torch.Tensor of [hidden_size].
+    embed_overrides: Optional[List[List[torch.Tensor]]] = None
+    # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
+    embed_override_injection: Optional[
+        Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
+    ] = None
     # Dummy sampling params for compatibility
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Dummy input embeds for compatibility
@@ -896,6 +925,14 @@ class EmbeddingReqInput(BaseReq):
             or has_valid_data(self.audio_data)
         )
 
+    def _get_embed_override_injection_item(self, i: int) -> Optional[PositionalEmbeds]:
+        """Extract the i-th item from embed_override_injection."""
+        if self.embed_override_injection is None:
+            return None
+        if isinstance(self.embed_override_injection, PositionalEmbeds):
+            return self.embed_override_injection
+        return self.embed_override_injection[i]
+
     def __getitem__(self, i):
         # Cache sub-objects so that repeated obj[i] calls return the same instance.
         cache = self.__dict__.setdefault("_sub_obj_cache", {})
@@ -905,6 +942,7 @@ class EmbeddingReqInput(BaseReq):
         if self.is_cross_encoder_request:
             sub = EmbeddingReqInput(
                 text=[self.text[i]] if self.text is not None else None,
+                embed_override_injection=self._get_embed_override_injection_item(i),
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -916,6 +954,11 @@ class EmbeddingReqInput(BaseReq):
             sub = EmbeddingReqInput(
                 text=self.text[i] if self.text is not None else None,
                 input_ids=self.input_ids[i] if self.input_ids is not None else None,
+                embed_override_token_id=self.embed_override_token_id,
+                embed_overrides=(
+                    self.embed_overrides[i] if self.embed_overrides is not None else None
+                ),
+                embed_override_injection=self._get_embed_override_injection_item(i),
                 image_data=self.image_data[i] if self.image_data is not None else None,
                 audio_data=self.audio_data[i] if self.audio_data is not None else None,
                 video_data=self.video_data[i] if self.video_data is not None else None,
@@ -944,12 +987,15 @@ class TokenizedEmbeddingReqInput(BaseReq):
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # Embedding overrides to place at specific token positions.
+    embed_override_injection: Optional[PositionalEmbeds] = None
     # For DP routing
     routed_dp_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
     # For observability

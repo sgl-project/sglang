@@ -14,6 +14,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.parser.conversation import generate_embedding_convs
 
@@ -129,6 +130,26 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
 
+        # Validate pairing: both or neither must be provided
+        if (
+            request.embed_overrides is not None
+            and request.embed_override_token_id is None
+        ):
+            raise ValueError(
+                "embed_override_token_id is required when embed_overrides is provided"
+            )
+        if (
+            request.embed_override_token_id is not None
+            and request.embed_overrides is None
+        ):
+            raise ValueError(
+                "embed_override_token_id requires embed_overrides to be provided"
+            )
+
+        # Convert float lists to tensors; position resolution is deferred
+        # to the tokenizer manager (after tokenization for text inputs).
+        embed_overrides = convert_embeds_to_tensors(request.embed_overrides)
+
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
             rid=request.rid,
@@ -136,6 +157,8 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             routing_key=self.extract_routing_key(raw_request),
             dimensions=request.dimensions,
             lora_path=lora_path,
+            embed_override_token_id=request.embed_override_token_id,
+            embed_overrides=embed_overrides,
         )
 
         return adapted_request, request
