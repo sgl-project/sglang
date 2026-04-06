@@ -466,8 +466,8 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
     api_server_dispatch_time: float = 0.0
 
     # new timestamp, get by time.perf_counter()
-    dc_dispatch_time: float = 0.0
-    dc_dispatch_finish_time: float = 0.0
+    dpc_dispatch_time: float = 0.0
+    dpc_dispatch_finish_time: float = 0.0
 
     def __getstate__(self) -> object:
         state = {}
@@ -476,14 +476,14 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
         # state = {
         #     "created_time": self.created_time,
         #     "api_server_dispatch_time": self.api_server_dispatch_time,
-        #     "dc_dispatch_time": self.dc_dispatch_time,
+        #     "dpc_dispatch_time": self.dpc_dispatch_time,
         # }
         state.update(super().__getstate__())
         return state
 
     def set_dp_dispatch_time(self, ts=None):
         ts = ts or time.perf_counter()
-        self.dc_dispatch_time = ts
+        self.dpc_dispatch_time = ts
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_slice_start(
@@ -494,7 +494,7 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
 
     def set_dp_dispatch_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
-        self.dc_dispatch_finish_time = ts
+        self.dpc_dispatch_finish_time = ts
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_slice_end(
@@ -519,7 +519,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # propagated from tokenizer/grpc_server or dp controller
     created_time: float = 0.0
     api_server_dispatch_time: float = 0.0
-    dc_dispatch_time: float = 0.0
+    dpc_dispatch_time: float = 0.0
 
     # common, get by time.perf_counter()
     wait_queue_entry_time: float = 0.0
