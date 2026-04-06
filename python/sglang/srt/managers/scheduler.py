@@ -605,6 +605,7 @@ class Scheduler(
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
             self.draft_worker = None
+            self.external_corpus_manager = None
             return
 
         # Launch a draft worker for speculative decoding
