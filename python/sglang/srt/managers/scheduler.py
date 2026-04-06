@@ -714,7 +714,7 @@ class Scheduler(
         if server_args.radix_eviction_policy == "seglen" and not self.is_hybrid_ssm:
             raise ValueError(
                 "--radix-eviction-policy=seglen is only supported when using "
-                "MambaRadixCache for hybrid SSM models."
+                "MambaRadixCache for hybrid models."
             )
 
         self.sliding_window_size = None

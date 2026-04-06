@@ -63,6 +63,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+_NORMALIZE_EPSILON = 1e-9
+
+
 class TreeNode:
 
     counter = 0
@@ -888,9 +891,10 @@ class MambaRadixCache(BasePrefixCache):
         def _normalize(values):
             min_v = min(values)
             max_v = max(values)
-            if max_v - min_v < 1e-12:
+            span = max_v - min_v
+            if span <= _NORMALIZE_EPSILON:
                 return [0.5] * len(values)
-            return [(v - min_v) / (max_v - min_v) for v in values]
+            return [(v - min_v) / span for v in values]
 
         current_time = TreeNode.last_access_time_counter_float
         recencies = [
