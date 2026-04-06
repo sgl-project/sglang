@@ -296,9 +296,17 @@ class LocalAttention(nn.Module):
         ctx_attn_metadata = forward_context.attn_metadata
 
         if attn_mask is not None:
-            q_ = q.transpose(1, 2)
-            k_ = k.transpose(1, 2)
+            q_ = q.transpose(1, 2)  # [B, num_heads, seq, head_dim]
+            k_ = k.transpose(1, 2)  # [B, num_kv_heads, seq, head_dim]
             v_ = v.transpose(1, 2)
+
+            # GQA: repeat k/v to match q's num_heads
+            num_heads = q_.shape[1]
+            num_kv_heads = k_.shape[1]
+            if num_heads != num_kv_heads:
+                n_rep = num_heads // num_kv_heads
+                k_ = k_.repeat_interleave(n_rep, dim=1)
+                v_ = v_.repeat_interleave(n_rep, dim=1)
 
             if torch.is_floating_point(attn_mask):
                 mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
