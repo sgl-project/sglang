@@ -102,11 +102,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
   }
 
   void start_external_corpus_load() {
-    ngram_->startExternalCorpusLoad("__default__");
-  }
-
-  void start_external_corpus_load_named(const std::string& corpus_id) {
-    ngram_->startExternalCorpusLoad(corpus_id);
+    ngram_->startExternalCorpusLoad();
   }
 
   void append_external_corpus_tokens(const tvm::ffi::TensorView tokens_tv) {
@@ -116,8 +112,8 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_->appendExternalCorpusTokens(tokens);
   }
 
-  void finish_external_corpus_load() {
-    ngram_->finishExternalCorpusLoad();
+  void finish_external_corpus_load(const std::string& corpus_id) {
+    ngram_->finishExternalCorpusLoad(corpus_id);
   }
 
   void remove_external_corpus(const std::string& corpus_id) {
@@ -177,7 +173,6 @@ void register_ngram_corpus() {
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
-      .def("start_external_corpus_load_named", &NgramCorpusObj::start_external_corpus_load_named)
       .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
       .def("finish_external_corpus_load", &NgramCorpusObj::finish_external_corpus_load)
       .def("remove_external_corpus", &NgramCorpusObj::remove_external_corpus)

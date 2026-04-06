@@ -20,7 +20,6 @@ namespace ngram {
 class Ngram {
   std::unique_ptr<Trie> trie_;
   std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
-  std::string staging_corpus_id_;
   std::unique_ptr<SuffixAutomaton> staging_sam_;
   Param param_;
 
@@ -45,11 +44,11 @@ class Ngram {
 
   void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
 
-  void startExternalCorpusLoad(const std::string& corpus_id);
+  void startExternalCorpusLoad();
 
   void appendExternalCorpusTokens(const std::vector<int32_t>& tokens);
 
-  void finishExternalCorpusLoad();
+  void finishExternalCorpusLoad(const std::string& corpus_id);
 
   void removeExternalCorpus(const std::string& corpus_id);
 

@@ -67,8 +67,7 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
 // thread during async corpus loading. They do NOT hold mutex_ because
 // staging_sam_ is disjoint from sams_ / trie_. Only finishExternalCorpusLoad
 // briefly acquires mutex_ when moving the completed SAM into sams_.
-void Ngram::startExternalCorpusLoad(const std::string& corpus_id) {
-  staging_corpus_id_ = corpus_id;
+void Ngram::startExternalCorpusLoad() {
   staging_sam_ = std::make_unique<SuffixAutomaton>();
 }
 
@@ -79,22 +78,20 @@ void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
   staging_sam_->appendTokens(tokens);
 }
 
-void Ngram::finishExternalCorpusLoad() {
+void Ngram::finishExternalCorpusLoad(const std::string& corpus_id) {
   if (!staging_sam_) {
     throw std::runtime_error("finishExternalCorpusLoad called without startExternalCorpusLoad");
   }
   staging_sam_->finalize();
   if (staging_sam_->empty()) {
     staging_sam_.reset();
-    staging_corpus_id_.clear();
     throw std::runtime_error("External corpus is empty — no tokens were loaded.");
   }
   // Only lock briefly to install the completed SAM.
   std::unique_lock<std::mutex> lock(mutex_);
-  sams_[staging_corpus_id_] = std::move(staging_sam_);
+  sams_[corpus_id] = std::move(staging_sam_);
   lock.unlock();
   staging_sam_.reset();
-  staging_corpus_id_.clear();
 }
 
 void Ngram::removeExternalCorpus(const std::string& corpus_id) {
@@ -106,7 +103,6 @@ void Ngram::clearExternalCorpus() {
   std::unique_lock<std::mutex> lock(mutex_);
   sams_.clear();
   staging_sam_.reset();
-  staging_corpus_id_.clear();
 }
 
 std::vector<std::string> Ngram::listExternalCorpora() const {
