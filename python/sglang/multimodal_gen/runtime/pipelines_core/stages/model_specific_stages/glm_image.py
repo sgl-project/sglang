@@ -127,6 +127,10 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             A scheduler to be used in combination with `transformer` to denoise the encoded image latents.
     """
 
+    @property
+    def requires_per_output_execution(self) -> bool:
+        return True
+
     def __init__(
         self,
         tokenizer,
