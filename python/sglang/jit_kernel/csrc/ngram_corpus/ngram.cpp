@@ -63,27 +63,53 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
   }
 }
 
-void Ngram::startExternalCorpusLoad() {
+void Ngram::startExternalCorpusLoad(const std::string& corpus_id) {
   std::unique_lock<std::mutex> lock(mutex_);
-  sam_ = std::make_unique<SuffixAutomaton>();
+  staging_corpus_id_ = corpus_id;
+  staging_sam_ = std::make_shared<SuffixAutomaton>();
 }
 
 void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
   std::unique_lock<std::mutex> lock(mutex_);
-  sam_->appendTokens(tokens);
+  if (!staging_sam_) {
+    throw std::runtime_error("appendExternalCorpusTokens called without startExternalCorpusLoad");
+  }
+  staging_sam_->appendTokens(tokens);
 }
 
 void Ngram::finishExternalCorpusLoad() {
   std::unique_lock<std::mutex> lock(mutex_);
-  sam_->finalize();
-  if (sam_->empty()) {
-    sam_.reset();
+  if (!staging_sam_) {
+    throw std::runtime_error("finishExternalCorpusLoad called without startExternalCorpusLoad");
   }
+  staging_sam_->finalize();
+  if (!staging_sam_->empty()) {
+    sams_[staging_corpus_id_] = std::move(staging_sam_);
+  }
+  staging_sam_.reset();
+  staging_corpus_id_.clear();
+}
+
+void Ngram::removeExternalCorpus(const std::string& corpus_id) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  sams_.erase(corpus_id);
 }
 
 void Ngram::clearExternalCorpus() {
   std::unique_lock<std::mutex> lock(mutex_);
-  sam_.reset();
+  sams_.clear();
+  staging_sam_.reset();
+  staging_corpus_id_.clear();
+}
+
+std::vector<std::string> Ngram::listExternalCorpora() const {
+  std::unique_lock<std::mutex> lock(mutex_);
+  std::vector<std::string> ids;
+  ids.reserve(sams_.size());
+  for (const auto& [id, _] : sams_) {
+    ids.push_back(id);
+  }
+  return ids;
 }
 
 void Ngram::insertWorker() {
@@ -154,6 +180,14 @@ Result Ngram::batchMatch(
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
 
+  // Collect active SAMs
+  std::vector<std::shared_ptr<SuffixAutomaton>> active_sams;
+  for (const auto& [_, sam] : sams_) {
+    if (sam && !sam->empty()) {
+      active_sams.push_back(sam);
+    }
+  }
+
   Result merged;
   for (size_t i = 0; i < state_ids.size(); ++i) {
     const auto& suffix = tokens[i];
@@ -163,11 +197,13 @@ Result Ngram::batchMatch(
 
     auto& state = match_state_[state_ids[i]];
     const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
-    const auto sam_budget =
-        sam_ && !sam_->empty() ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
-    const auto trie_budget = total_draft_token_num - sam_budget;
+    const size_t num_sams = active_sams.size();
+    const size_t total_sam_budget =
+        num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
+    const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};
+    const size_t trie_budget = total_draft_token_num - (per_sam_budget * num_sams);
 
-    if (sam_budget == 0) {
+    if (total_sam_budget == 0 || per_sam_budget == 0) {
       auto res = (trie_.get()->*trie_result_build_fn)(
           suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
@@ -175,12 +211,17 @@ Result Ngram::batchMatch(
       continue;
     }
 
-    auto trie_res = (trie_.get()->*trie_result_build_fn)(
+    auto combined = (trie_.get()->*trie_result_build_fn)(
         suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
-    auto sam_res = (sam_.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), sam_budget, param_);
-    auto res = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), trie_res, sam_res);
-    merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
-    merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
+
+    for (const auto& sam : active_sams) {
+      auto sam_res =
+          (sam.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
+      combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
+    }
+
+    merged.token.insert(merged.token.end(), combined.token.begin(), combined.token.end());
+    merged.mask.insert(merged.mask.end(), combined.mask.begin(), combined.mask.end());
   }
   return merged;
 }

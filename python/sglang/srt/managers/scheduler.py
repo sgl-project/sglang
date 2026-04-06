@@ -83,6 +83,8 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    AddExternalCorpusReqInput,
+    AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BaseBatchReq,
@@ -114,6 +116,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    ListExternalCorporaReqInput,
+    ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -122,6 +126,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    RemoveExternalCorpusReqInput,
+    RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -1251,6 +1257,15 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (AddExternalCorpusReqInput, self.add_external_corpus),
+                (
+                    RemoveExternalCorpusReqInput,
+                    self.remove_external_corpus,
+                ),
+                (
+                    ListExternalCorporaReqInput,
+                    self.list_external_corpora,
+                ),
             ]
         )
 
@@ -2864,6 +2879,57 @@ class Scheduler(
                 ),
                 pending_req,
             )
+
+    def add_external_corpus(
+        self, recv_req: AddExternalCorpusReqInput
+    ) -> AddExternalCorpusReqOutput:
+        if self.draft_worker is None or not self.spec_algorithm.is_ngram():
+            return AddExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        try:
+            loaded = self.draft_worker.add_external_corpus(
+                recv_req.corpus_id, recv_req.token_chunks
+            )
+            return AddExternalCorpusReqOutput(
+                success=True,
+                message=f"Loaded corpus '{recv_req.corpus_id}' with {loaded} tokens.",
+                loaded_token_count=loaded,
+            )
+        except Exception as e:
+            return AddExternalCorpusReqOutput(success=False, message=str(e))
+
+    def remove_external_corpus(
+        self, recv_req: RemoveExternalCorpusReqInput
+    ) -> RemoveExternalCorpusReqOutput:
+        if self.draft_worker is None or not self.spec_algorithm.is_ngram():
+            return RemoveExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        try:
+            self.draft_worker.remove_external_corpus(recv_req.corpus_id)
+            return RemoveExternalCorpusReqOutput(
+                success=True,
+                message=f"Removed corpus '{recv_req.corpus_id}'.",
+            )
+        except Exception as e:
+            return RemoveExternalCorpusReqOutput(success=False, message=str(e))
+
+    def list_external_corpora(
+        self, recv_req: ListExternalCorporaReqInput
+    ) -> ListExternalCorporaReqOutput:
+        if self.draft_worker is None or not self.spec_algorithm.is_ngram():
+            return ListExternalCorporaReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        try:
+            ids = self.draft_worker.list_external_corpora()
+            return ListExternalCorporaReqOutput(success=True, corpus_ids=ids)
+        except Exception as e:
+            return ListExternalCorporaReqOutput(success=False, message=str(e))
 
     def flush_cache_wrapped(
         self, recv_req: FlushCacheReqInput

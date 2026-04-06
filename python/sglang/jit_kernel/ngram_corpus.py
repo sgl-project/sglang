@@ -136,4 +136,31 @@ def get_ngram_corpus_cls():
                 raise
             return chunk_count, loaded_token_count
 
+        def load_external_corpus_named(
+            self, corpus_id: str, chunks: Iterable[Sequence[int]]
+        ) -> Tuple[int, int]:
+            self.start_external_corpus_load_named(corpus_id)  # type: ignore
+            chunk_count = 0
+            loaded_token_count = 0
+            try:
+                for chunk in chunks:
+                    tokens_t = torch.tensor(list(chunk), dtype=torch.int32)
+                    loaded_token_count += len(tokens_t)
+                    self.append_external_corpus_tokens(tokens_t)  # type: ignore
+                    chunk_count += 1
+                self.finish_external_corpus_load()  # type: ignore
+            except Exception:
+                self.clear_external_corpus()  # type: ignore
+                raise
+            return chunk_count, loaded_token_count
+
+        def remove_corpus(self, corpus_id: str) -> None:
+            self.remove_external_corpus(corpus_id)  # type: ignore
+
+        def list_corpora(self) -> List[str]:
+            result = self.list_external_corpora()  # type: ignore
+            if not result:
+                return []
+            return result.split(",")
+
     return NgramCorpusFFI

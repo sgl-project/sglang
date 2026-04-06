@@ -101,6 +101,18 @@ class NgramCorpus:
         self.external_corpus_token_count = loaded_token_count
         return loaded_token_count
 
+    def load_external_corpus_named(
+        self, corpus_id: str, chunks: Iterable[Sequence[int]]
+    ) -> int:
+        _, loaded_token_count = self._obj.load_external_corpus_named(corpus_id, chunks)
+        return loaded_token_count
+
+    def remove_external_corpus(self, corpus_id: str) -> None:
+        self._obj.remove_corpus(corpus_id)
+
+    def list_external_corpora(self) -> List[str]:
+        return self._obj.list_corpora()
+
     def reset(self):
         self._obj.reset()  # type: ignore
         self._req_id_to_state_id.clear()
