@@ -88,6 +88,10 @@ class KimiK2Detector(BaseFormatDetector):
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
         try:
+            # there are two possible captures - between tags, or between a
+            # tag and end-of-string so the result of
+            # findall is an array of tuples where one is a function call and
+            # the other is None
             function_call_tuples = self.tool_call_regex.findall(text)
 
             logger.debug("function_call_tuples: %s", function_call_tuples)
@@ -217,10 +221,12 @@ class KimiK2Detector(BaseFormatDetector):
                         except json.JSONDecodeError:
                             pass
 
+                        # Find the end of the current tool call and remove only that part from buffer
+                        tool_call_end_pattern = (
+                            r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
+                        )
                         end_match = re.search(
-                            r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>",
-                            current_text,
-                            re.DOTALL,
+                            tool_call_end_pattern, current_text, re.DOTALL
                         )
                         if end_match:
                             self._buffer = current_text[end_match.end() :]
