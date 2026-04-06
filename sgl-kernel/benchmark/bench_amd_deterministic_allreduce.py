@@ -29,20 +29,18 @@ python_dir = os.path.join(script_dir, "python")
 sys.path.insert(0, python_dir)
 
 # Try to import custom all-reduce if available
+from sglang.srt.environ import envs
+
 try:
     import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as custom_ar_ops
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
-    )
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
-        is_weak_contiguous,
     )
 
     CUSTOM_AR_AVAILABLE = custom_ar_ops.IS_CUSTOM_AR_AVAILABLE
 except (ImportError, AttributeError):
     CUSTOM_AR_AVAILABLE = False
     CustomAllreduce = None
-    is_weak_contiguous = None
 
 # Note: sglang's optimized all-reduce requires full runtime initialization
 # and won't work in standalone benchmarks, so we skip it
@@ -110,6 +108,7 @@ def reduce_scatter_then_all_gather(tensor, rank, world_size, custom_ar=None):
 
 
 def worker(world_size, rank, port, results_queue):
+    envs.SGLANG_USE_1STAGE_ALLREDUCE.set("1")
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
@@ -240,7 +239,7 @@ def worker(world_size, rank, port, results_queue):
         results_deterministic_kernel = []
         latencies_deterministic_kernel = []
         deterministic_kernel_available = False
-        if custom_ar is not None and hasattr(custom_ar, "deterministic_all_reduce"):
+        if custom_ar is not None:
             # Check if input size fits in buffer
             input_size_bytes = base_input.numel() * base_input.element_size()
             if input_size_bytes > custom_ar.max_size:
@@ -259,9 +258,7 @@ def worker(world_size, rank, port, results_queue):
                         # Measure latency
                         torch.cuda.synchronize()
                         start = time.perf_counter()
-                        result_kernel = custom_ar.deterministic_all_reduce(
-                            inp_kernel, registered=False
-                        )
+                        result_kernel = custom_ar.custom_all_reduce(inp_kernel)
                         torch.cuda.synchronize()
                         end = time.perf_counter()
                         latencies_deterministic_kernel.append(end - start)

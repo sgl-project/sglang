@@ -204,6 +204,7 @@ def create_grammar_backend(
     tokenizer,
     vocab_size: int,
     eos_token_ids: Optional[set] = None,
+    think_end_id: Optional[int] = None,
 ) -> Optional[BaseGrammarBackend]:
     name = server_args.grammar_backend
 
@@ -258,13 +259,11 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+    if server_args.reasoning_parser and think_end_id is not None:
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
 
-        grammar_backend = ReasonerGrammarBackend(
-            grammar_backend, tokenizer.think_end_id
-        )
+        grammar_backend = ReasonerGrammarBackend(grammar_backend, think_end_id)
 
     return grammar_backend

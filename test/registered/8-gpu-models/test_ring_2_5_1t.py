@@ -23,6 +23,8 @@ class TestRing2_5_1T(unittest.TestCase):
             "--trust-remote-code",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
+            "--watchdog-timeout",
+            "1800",
         ]
 
         variants = [
@@ -31,6 +33,7 @@ class TestRing2_5_1T(unittest.TestCase):
                 tp_size=8,
                 extra_args=base_args,
                 variant="TP8",
+                launch_timeout=1800,
             ),
         ]
 

@@ -489,15 +489,16 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
 
     from huggingface_hub.errors import EntryNotFoundError
 
-    # If it's a local path, verify it directly
+    overlay_config = maybe_load_overlay_model_index(
+        model_name_or_path,
+        snapshot_download_fn=snapshot_download,
+        hf_hub_download_fn=hf_hub_download,
+    )
+    if overlay_config is not None:
+        return overlay_config
+
+    # If it's a local path, verify it directly.
     if os.path.exists(model_name_or_path):
-        overlay_config = maybe_load_overlay_model_index(
-            model_name_or_path,
-            snapshot_download_fn=snapshot_download,
-            hf_hub_download_fn=hf_hub_download,
-        )
-        if overlay_config is not None:
-            return overlay_config
         try:
             return verify_model_config_and_directory(model_name_or_path)
         except ValueError:
@@ -508,15 +509,6 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
                     config = json.load(f)
                 return config
             raise
-
-    # return resolved overlay config if applicable
-    overlay_config = maybe_load_overlay_model_index(
-        model_name_or_path,
-        snapshot_download_fn=snapshot_download,
-        hf_hub_download_fn=hf_hub_download,
-    )
-    if overlay_config is not None:
-        return overlay_config
 
     # For remote models, download just the model_index.json
     try:
@@ -553,7 +545,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             )
             return config
     except EntryNotFoundError:
-        logger.warning(
+        logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )

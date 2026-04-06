@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -94,23 +94,22 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=1400,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=1400,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
 
 class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
     LOAD_BALANCE_METHOD = "round_robin"
-    # TODO: add test for other load balance methods
     # TODO: add a balancedness metric
 
     def test_bench_serving(self):
@@ -128,6 +127,48 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
 
         self.assertLess(result["mean_tpot_ms"], 20)
         self.assertEqual(result["completed"], 1000)
+
+
+class TestDisaggregationDPAttentionTotalRequests(TestDisaggregationDPAttention):
+    LOAD_BALANCE_METHOD = "total_requests"
+    test_gsm8k = unittest.skip(
+        "Covered by base class; this class targets total_requests path."
+    )(TestDisaggregationDPAttention.test_gsm8k)
+
+    def test_bench_serving(self):
+        args = get_benchmark_args(
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            dataset_name="random",
+            tokenizer=self.model,
+            num_prompts=256,
+            random_input_len=2048,
+            random_output_len=512,
+            request_rate=float("inf"),
+            max_concurrency=128,
+        )
+        result = run_benchmark(args)
+        self.assertEqual(result["completed"], 256)
+
+
+class TestDisaggregationDPAttentionTotalTokens(TestDisaggregationDPAttention):
+    LOAD_BALANCE_METHOD = "total_tokens"
+    test_gsm8k = unittest.skip(
+        "Covered by base class; this class targets total_tokens path."
+    )(TestDisaggregationDPAttention.test_gsm8k)
+
+    def test_bench_serving(self):
+        args = get_benchmark_args(
+            base_url=f"http://{self.base_host}:{self.lb_port}",
+            dataset_name="random",
+            tokenizer=self.model,
+            num_prompts=256,
+            random_input_len=2048,
+            random_output_len=512,
+            request_rate=float("inf"),
+            max_concurrency=128,
+        )
+        result = run_benchmark(args)
+        self.assertEqual(result["completed"], 256)
 
 
 @unittest.skip(

@@ -78,8 +78,10 @@ class LoRAManager:
             server_args.enable_lora_overlap_loading
         )
 
-        # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
+        self._experts_shared_outer_override: Optional[bool] = (
+            server_args.experts_shared_outer_loras
+        )
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -100,10 +102,30 @@ class LoRAManager:
     def init_cuda_graph_batch_info(
         self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
     ):
+        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
+
+        Called during CudaGraphRunner.__init__(), after init_memory_pool().
+        Phase 1 (MoE buffers) is handled earlier via init_cuda_graph_moe_buffers().
+        """
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
         self.lora_backend.init_cuda_graph_batch_info(
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_bs=num_tokens_per_bs,
+        )
+
+    def init_cuda_graph_moe_buffers(
+        self, max_bs: int, max_loras: int, compute_dtype, moe_layer
+    ):
+        """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
+
+        Called before init_memory_pool() so memory profiling accounts for them.
+        Phase 2 (dense batch metadata) is handled later via init_cuda_graph_batch_info().
+        """
+        self.lora_backend.init_cuda_graph_moe_buffers(
+            max_bs=max_bs,
+            max_loras=max_loras,
+            compute_dtype=compute_dtype,
+            moe_layer=moe_layer,
         )
 
     def create_lora_update_result(
@@ -134,7 +156,10 @@ class LoRAManager:
 
         try:
             # load configs
-            new_adapter = LoRAConfig(lora_ref.lora_path)
+            new_adapter = LoRAConfig(
+                lora_ref.lora_path,
+                base_vocab_size=self.base_hf_config.vocab_size,
+            )
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -292,6 +317,9 @@ class LoRAManager:
             scalings=scalings,
             use_cuda_graph=use_cuda_graph,
         )
+        self.lora_backend.batch_info.has_active_lora = any(
+            lora_ranks[wi] > 0 for wi in weight_indices
+        )
 
     def update_lora_info(self):
         """
@@ -303,23 +331,33 @@ class LoRAManager:
                 if isinstance(module, FusedMoEWithLoRA) and all(
                     x in self.target_modules for x in ["gate_up_proj", "down_proj"]
                 ):
+                    gate_up_key = (
+                        "gate_up_proj_moe"
+                        if "gate_up_proj_moe" in self.memory_pool.A_buffer
+                        else "gate_up_proj"
+                    )
+                    down_key = (
+                        "down_proj_moe"
+                        if "down_proj_moe" in self.memory_pool.A_buffer
+                        else "down_proj"
+                    )
                     gate_up_a = self.memory_pool.get_tensor(
-                        target_module="gate_up_proj_moe",
+                        target_module=gate_up_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_A,
                     )
                     gate_up_b = self.memory_pool.get_tensor(
-                        target_module="gate_up_proj_moe",
+                        target_module=gate_up_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_B,
                     )
                     down_a = self.memory_pool.get_tensor(
-                        target_module="down_proj_moe",
+                        target_module=down_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_A,
                     )
                     down_b = self.memory_pool.get_tensor(
-                        target_module="down_proj_moe",
+                        target_module=down_key,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_B,
                     )
@@ -387,6 +425,16 @@ class LoRAManager:
             target_modules=target_modules,
         )
 
+        if self._experts_shared_outer_override is not None:
+            self.experts_shared_outer_loras = self._experts_shared_outer_override
+        else:
+            self.experts_shared_outer_loras = self._detect_shared_outer_loras()
+        if self.experts_shared_outer_loras:
+            logger.info(
+                "Shared outer LoRA mode enabled: gate_up lora_A and "
+                "down lora_B will be shared across experts (expert_dim=1)."
+            )
+
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
@@ -411,6 +459,43 @@ class LoRAManager:
                     raise RuntimeError(
                         f"Failed to load LoRA adapter {lora_ref.lora_name}: {result.error_message}"
                     )
+
+    def _detect_shared_outer_loras(self) -> bool:
+        """Auto-detect shared outer LoRA format from loaded adapter weights.
+
+        MoE adapters with shared outer experts store 3D tensors where
+        dim[0]=1 indicates weights shared across all experts, while
+        dim[0]=num_experts indicates per-expert weights.
+        Returns True if gate_up lora_A has expert_dim=1 (shared).
+
+        All loaded adapters that expose a 3D gate_up lora_A must agree;
+        mixed formats raise RuntimeError.
+        """
+        shared_outer: Optional[bool] = None
+        for adapter_id, adapter in self.loras.items():
+            found = False
+            for layer in adapter.layers:
+                for name, weight in layer.weights.items():
+                    if (
+                        "gate_up_proj" in name
+                        and "lora_A" in name
+                        and weight.dim() == 3
+                    ):
+                        is_shared = weight.shape[0] == 1
+                        if shared_outer is None:
+                            shared_outer = is_shared
+                        elif shared_outer != is_shared:
+                            raise RuntimeError(
+                                "Mixed shared-outer LoRA formats detected across "
+                                f"loaded adapters (conflict in adapter '{adapter_id}'). "
+                                "All MoE adapters must either all use shared outer "
+                                "experts (expert_dim=1) or all use per-expert weights."
+                            )
+                        found = True
+                        break
+                if found:
+                    break
+        return bool(shared_outer) if shared_outer is not None else False
 
     def init_lora_shapes(
         self,
@@ -560,7 +645,11 @@ class LoRAManager:
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
-            new_adapter = LoRAConfig.from_dict(config_dict, added_tokens_config)
+            new_adapter = LoRAConfig.from_dict(
+                config_dict,
+                added_tokens_config,
+                base_vocab_size=self.base_hf_config.vocab_size,
+            )
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -589,6 +678,7 @@ class LoRAManager:
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
             lora_added_tokens_size=self.lora_added_tokens_size,
+            experts_shared_outer_loras=self.experts_shared_outer_loras,
         )
 
         # Initializing memory pool with base model
@@ -683,11 +773,10 @@ class LoRAManager:
                 )
                 continue
 
-            # Temporarily workaround for FusedMoE layer
             if isinstance(module, FusedMoE) and all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
                 layer_id = get_layer_id(module_name)
-                self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                    module_name, module
-                )
+                lora_module = self.set_lora_module(module_name, module)
+                lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
+                self.lora_modules[layer_id][module_name] = lora_module

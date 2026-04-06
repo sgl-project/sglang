@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+    from sglang.srt.models.utils import WeightsMapper
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -240,6 +241,12 @@ class Fp8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+        if self.ignored_layers:
+            self.ignored_layers = list(
+                dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
+            )
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -495,19 +502,43 @@ class Fp8LinearMethod(LinearMethodBase):
             return
 
         if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+            from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
+
+            weight = layer.weight.data
+            scale_u8 = layer.weight_scale_inv.data
+            n, k = weight.shape
+            epilogue_tile_m = 128
+
+            copy_or_rebind_param(
+                layer,
+                "weight",
+                shuffle_matrix_a(
+                    weight.contiguous().view(torch.uint8), epilogue_tile_m
+                ).view(torch.float8_e4m3fn),
+            )
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv",
+                shuffle_matrix_sf_a(
+                    scale_u8.contiguous().view(torch.uint8).reshape(n, k // 32),
+                    epilogue_tile_m,
+                    num_elts_per_sf=32,
+                )
+                .reshape_as(scale_u8)
+                .contiguous(),
+            )
+        elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
             from flashinfer import block_scale_interleave
 
             scale_u8 = layer.weight_scale_inv.data
-            new_swizzled = block_scale_interleave(scale_u8.contiguous()).contiguous()
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv",
+                block_scale_interleave(scale_u8.contiguous()).contiguous(),
+            )
         else:
             # Triton path consumes canonical 2D UE8M0 scales directly.
             return
-
-        copy_or_rebind_param(layer, "weight_scale_inv_swizzled", new_swizzled)
-        layer._weight_scale_inv_swizzled_src_version = layer.weight_scale_inv._version
-        layer._weight_scale_inv_swizzled_src_data_ptr = (
-            layer.weight_scale_inv.data_ptr()
-        )
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
@@ -657,22 +688,18 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
-                weight_scale = layer.weight_scale_inv_swizzled
-            else:
-                weight_scale = layer.weight_scale_inv
             if isinstance(x, tuple):
                 return self.w8a8_mxfp8_linear(
                     input=x[0],
                     weight=layer.weight,
-                    weight_scale=weight_scale,
+                    weight_scale=layer.weight_scale_inv,
                     input_scale=x[1],
                     bias=bias,
                 )
             return self.w8a8_mxfp8_linear(
                 input=x,
                 weight=layer.weight,
-                weight_scale=weight_scale,
+                weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,
             )
@@ -1349,7 +1376,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 self.process_weights_hip_scale_padding(layer)
 
             # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            ):
                 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                     align_fp8_moe_weights_for_flashinfer_trtllm,
                 )
@@ -1599,7 +1629,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 local_num_experts=num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
                 routing_method_type=int(
-                    getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
+                    getattr(layer, "routing_method_type", None)
+                    or RoutingMethodType.DeepSeekV3
                 ),
                 block_quant=self.block_quant,
                 use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
