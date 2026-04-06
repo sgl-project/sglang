@@ -88,10 +88,7 @@ def _merge_output_batches(output_batches: List[OutputBatch]) -> OutputBatch:
 
     # Cat into (N, ...) tensor so enumerate() yields per-sample slices.
     if outputs and all(isinstance(o, torch.Tensor) for o in outputs):
-        try:
-            outputs = torch.cat(outputs, dim=0)
-        except Exception:
-            pass
+        outputs = torch.cat(outputs, dim=0)
 
     # Bool check safe for both list and tensor.
     has_outputs = (
