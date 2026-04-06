@@ -3,7 +3,7 @@
 DeepSeek-V3.2 model family equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
 
 
-Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser. [GLM-5](https://huggingface.co/zai-org/GLM-5) model also applies DSA(Deepseek sparse attention) structure, so can share most of the usage here, except for reasoning parser and tool call parser.
+Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser. [GLM-5](https://huggingface.co/zai-org/GLM-5) model also applies DSA (DeepSeek Sparse Attention) structure, so it can share most of the usage here, except for the reasoning parser and tool call parser.
 
 
 ## Installation
@@ -56,13 +56,13 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
 ```
 
-To server GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
+To serve GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
 
 ### Configuration Tips
 - **DP Attention**: To enable [DP Attention](../advanced_features/dp_dpa_smg_guide.md), please include `--enable-dp-attention --dp <dp-size>` in command. DP Attention is better for large concurrency scenarios.
 - **TP Attention**: Launching with TP attention is also supported. TP attention is better for low latency scenarios.
 - **Short-sequence MHA prefill (adaptive)**: For short prefill sequences (default threshold: **2048 tokens**), the NSA backend uses standard MHA automatically (no extra flags). On H200 (SM90) this path uses the FlashAttention variable-length kernel; on B200 (SM100) it uses TRT-LLM ragged MHA. MHA uses `MHA_ONE_SHOT` for best performance, which computes multi-head attention over all tokens (both cached prefix and newly extended tokens) in a single kernel invocation, avoiding the overhead of chunked KV cache processing. This achieves optimal throughput for short sequences where total sequence length fits within the chunk capacity limit.
-- **MHA prefill threshold relax** To apply MHA attention to requests longer than 2048 tokens, please set flag `SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` to a value larger than 2048. As threshold grows larger, the prefill performance can be improved, but at the cost of potential accuracy drop.
+- **MHA prefill threshold relaxation**: To apply MHA attention to requests longer than 2048 tokens, please set the flag `SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD` to a value larger than 2048. As threshold grows larger, the prefill performance can be improved, but at the cost of potential accuracy drop.
 - **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill-backend` and `--nsa-decode-backend` server arguments. The choices of nsa prefill/decode attention kernels include:
   - `flashmla_sparse`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, kv inputs.
   - `flashmla_kv`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, fp8 k_cache inputs.
@@ -73,9 +73,8 @@ To server GLM-5, just replace the `--model` argument with `zai-org/GLM-5-FP8`.
   - `trtllm`: `trtllm-mla` sparse kernel from flashinfer library. Only run on blackwell GPUs. It requires q,k,v to be uniformly bf16 or fp8_e4m3 format.
   - On the basis of performance benchmarks, the default configuration of DSA kernels on Hopper and Blackwell are set as follows :
     - Bfloat 16 kv cache: On Hopper, `flashmla_sparse` prefill attention, `fa3` decode attention; On Blackwell, `flashmla_sparse` prefill attention, `trtllm` decode attention
-    - Float8_e3m4 kv cachew: On Hopper, `flashmla_auto` prefill attention, `flashmla_kv` decode attention; On Blackwell, `trtllm` prefill attention and `trtllm` decode attention.
-- **Skip Softmax Attention**: Introduced in [BLAAST](https://arxiv.org/abs/2512.12087), skip-softmax attention can improve speed by dynamically pruning attention matrices. Use `SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR` for controlling prefill kernel sparsity, and use `SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR` for controlling decode kernel sparsity. Setting a higher sparsity can gain more speedup, but at the risk of lower accuracy. Skip-softmax attention can only be applied to trtllm-gem kernels on Blackwell.
-- **Index Cache**: Introduce in [this paper](https://arxiv.org/abs/2603.12201), IndexCache improves speed by reusing the result of indexer across different layers, only at cost of negligible accuracy loss.  We recommend appending `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to command for better tradeoff between speedup and performance.
+    - Float8_e4m3fn KV cache: On Hopper, `flashmla_auto` prefill attention, `flashmla_kv` decode attention; On Blackwell, `trtllm` prefill attention and `trtllm` decode attention.
+- **Index Cache**: Introduce in [this paper](https://arxiv.org/abs/2603.12201), IndexCache improves speed by reusing the result of indexer across different layers, only at cost of negligible accuracy loss.  For **GLM-5** model, we recommend appending `--json-model-override-args '{"index_topk_pattern": "FFSFSSSFSSFFFSSSFFFSFSSSSSSFFSFFSFFSSFFFFFFSFFFFFSFFSSSSSSFSFFFSFSSSFSFFSFFSSS"}'` to command for better tradeoff between speedup and performance.
 
 ## Multi-token Prediction
 SGLang implements Multi-Token Prediction (MTP) for DeepSeek V3.2 based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved significantly on small batch sizes. Please look at [this PR](https://github.com/sgl-project/sglang/pull/11652) for more information.
@@ -123,7 +122,7 @@ python3 -m sglang.launch_server \
   --reasoning-parser deepseek-v3
 ```
 
-`DeepSeek-V3.2-Speciale` doesn't support tool calling, so can only be launched with reasoning parser:
+`DeepSeek-V3.2-Speciale` does not support tool calling, so it can only be launched with the reasoning parser:
 ```bash
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V3.2-Speciale \
@@ -233,7 +232,7 @@ Repeat: 8, mean: 0.797
 Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
 
-For Deepseek V3.2, Deepseek recommends setting the sampling parameters to temperature = 1.0, top_p = 0.95:
+For DeepSeek V3.2, DeepSeek recommends setting the sampling parameters to temperature = 1.0, top_p = 0.95:
 
 ```bash
 python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 128000 --repeat 8 --top-p 0.95 --temperature 1.0 --thinking-mode deepseek-v3
@@ -241,7 +240,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198
 Repeat: 8, mean: 0.840
 Scores: ['0.848', '0.808', '0.848', '0.838', '0.879', '0.813', '0.838', '0.848']
 ```
-which matches the official score, 0.824, as reported in the [Deepseek-V3.2 technical report](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/assets/paper.pdf).
+which matches the official score, 0.824, as reported in the [DeepSeek-V3.2 technical report](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/assets/paper.pdf).
 
 ### Accuracy Test with `aime 2025`
 
@@ -290,7 +289,7 @@ ns eval \
 
 Test results (8*B200):
 
-DeepSeek-V3.2-Exp：
+DeepSeek-V3.2-Exp:
 
 | evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
 |--------------------|-------------|------------|-------------|-----------------------|-----------|
@@ -326,7 +325,7 @@ For context parallel in DeepSeek V3.2 model, we provide two different modes of s
 
 The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator. Add `attn_cp_size` for communication group for context parallel.
 
-Note that in sequence splitting mode has the following restrictions:
+Note that the in-sequence splitting mode has the following restrictions:
 - The batch size is restricted to 1 for prefill batches
 - `moe_dense_tp_size=1`, `moe_a2a_backend = "deepep"`
 - To ensure `cp_size > 1`, the passed in `tp_size` must be larger than `dp_size`
@@ -343,7 +342,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --e
 
 This mode can be enabled by specifying the parameter `--nsa-prefill-cp-mode round-robin-split`, which distributes tokens across ranks based on `token_idx % cp_size`.
 
-In this scenario, compared with the aforementioned method, it additionally supports the fused MoE backend (the fused MoE backend may deliver better performance than DeepEP in single-machine scenarios), FP8 KV-cache, and multi-batch prefill inference. But it cannot be enabled with dp attention together.
+In this scenario, compared to the in-sequence splitting method, it additionally supports the fused MoE backend (the fused MoE backend may deliver better performance than DeepEP in single-machine scenarios), FP8 KV-cache, and multi-batch prefill inference. However, it cannot be enabled with DP attention together.
 
 For more details, please refer to PR https://github.com/sgl-project/sglang/pull/13959.
 
