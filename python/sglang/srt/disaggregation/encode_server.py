@@ -867,10 +867,11 @@ class MMEncoder:
             )
             # Get additional video metadata
             if (
-                self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+                self.model_type
+                in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
                 and video_processor_kwargs.get("video_metadata", None) is not None
             ):
-                # For qwen3-vl models, we need to store the video timestamps
+                # For qwen3-vl/qwen3.5 models, we need to store the video timestamps
                 video_metadata = video_processor_kwargs["video_metadata"]
                 try:
                     merge_size = (
