@@ -1,4 +1,5 @@
 import unittest
+import uuid
 
 import numpy as np
 
@@ -20,6 +21,26 @@ def _make_corpus(match_type="BFS", **kwargs):
     defaults.update(kwargs)
     defaults["match_type"] = match_type
     return NgramCorpus(**defaults)
+
+
+def _batch_get(
+    corpus: NgramCorpus,
+    batch_tokens: list[list[int]],
+):
+    return corpus.batch_get(
+        req_ids=[uuid.uuid4().hex for _ in range(len(batch_tokens))],
+        batch_tokens=batch_tokens,
+        total_lens=[len(tokens) for tokens in batch_tokens],
+    )
+
+
+def _batch_get_with_state(
+    corpus: NgramCorpus,
+    req_id: str,
+    current_tokens: list[int],
+    total_len: int,
+):
+    return corpus.batch_get([req_id], [current_tokens], [total_len])
 
 
 SEED_SEQUENCES = [
@@ -116,7 +137,7 @@ class TestNgramCorpusBFS(CustomTestCase):
         cls.corpus = _make_corpus("BFS")
         cls.corpus.batch_put(SEED_SEQUENCES)
         cls.corpus.synchronize()
-        ids, masks = cls.corpus.batch_get(QUERY_SEQUENCES)
+        ids, masks = _batch_get(cls.corpus, QUERY_SEQUENCES)
         draft = 8
         cls.ids = ids.reshape(-1, draft)
         cls.masks = masks.reshape(-1, draft, draft)
@@ -142,7 +163,7 @@ class TestNgramCorpusProb(CustomTestCase):
         cls.corpus = _make_corpus("PROB")
         cls.corpus.batch_put(SEED_SEQUENCES)
         cls.corpus.synchronize()
-        ids, masks = cls.corpus.batch_get(QUERY_SEQUENCES)
+        ids, masks = _batch_get(cls.corpus, QUERY_SEQUENCES)
         cls.ids = ids.reshape(-1, 8)
         cls.masks = masks.reshape(-1, 8, 8)
 
@@ -166,7 +187,7 @@ class TestNgramCorpusReset(CustomTestCase):
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        ids_before, _ = corpus.batch_get([[1, 2, 3]])
+        ids_before, _ = _batch_get(corpus, [[1, 2, 3]])
         self.assertTrue(
             any(t != 0 for t in ids_before.tolist()[1:]),
             "Expected non-trivial draft tokens before reset",
@@ -174,7 +195,7 @@ class TestNgramCorpusReset(CustomTestCase):
 
         corpus.reset()
 
-        ids_after, _ = corpus.batch_get([[1, 2, 3]])
+        ids_after, _ = _batch_get(corpus, [[1, 2, 3]])
         self.assertEqual(
             ids_after.tolist(),
             [3, 0, 0, 0, 0, 0, 0, 0],
@@ -190,7 +211,7 @@ class TestNgramCorpusNoMatch(CustomTestCase):
         corpus.batch_put([[10, 20, 30, 40, 50]])
         corpus.synchronize()
 
-        ids, masks = corpus.batch_get([[999, 888, 777]])
+        ids, masks = _batch_get(corpus, [[999, 888, 777]])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 777, "First token should be last context token")
         self.assertTrue(
@@ -200,7 +221,7 @@ class TestNgramCorpusNoMatch(CustomTestCase):
 
     def test_empty_corpus(self):
         corpus = _make_corpus("BFS")
-        ids, masks = corpus.batch_get([[1, 2, 3]])
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 3)
         self.assertTrue(all(t == 0 for t in ids_list[1:]))
@@ -217,7 +238,7 @@ class TestNgramCorpusMultipleInserts(CustomTestCase):
         corpus.batch_put([[1, 2, 3, 44, 55]])
         corpus.synchronize()
 
-        ids, _ = corpus.batch_get([[1, 2, 3]])
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
         ids_list = ids.tolist()
 
         self.assertIn(4, ids_list, "Token 4 from first insert should still match")
@@ -233,7 +254,7 @@ class TestNgramCorpusSqueeze(CustomTestCase):
         corpus.batch_put([long_seq])
         corpus.synchronize()
 
-        ids, masks = corpus.batch_get([[50, 51, 52]])
+        ids, masks = _batch_get(corpus, [[50, 51, 52]])
         self.assertEqual(len(ids), 8, "Should still produce draft_token_num outputs")
 
     def test_eviction_preserves_recent(self):
@@ -247,7 +268,7 @@ class TestNgramCorpusSqueeze(CustomTestCase):
         corpus.batch_put([recent_seq])
         corpus.synchronize()
 
-        ids, _ = corpus.batch_get([[2000, 2001, 2002]])
+        ids, _ = _batch_get(corpus, [[2000, 2001, 2002]])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 2002, "Last context token should be first")
         self.assertIn(2003, ids_list, "Recent sequence should still be matchable")
@@ -294,13 +315,13 @@ class TestNgramCorpusBatchConsistency(CustomTestCase):
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        batch_ids, batch_masks = corpus.batch_get(QUERY_SEQUENCES)
+        batch_ids, batch_masks = _batch_get(corpus, QUERY_SEQUENCES)
         draft = 8
         batch_ids = batch_ids.reshape(-1, draft)
         batch_masks = batch_masks.reshape(-1, draft, draft)
 
         for i, query in enumerate(QUERY_SEQUENCES):
-            single_ids, single_masks = corpus.batch_get([query])
+            single_ids, single_masks = _batch_get(corpus, [query])
             single_ids = single_ids.reshape(-1, draft)
             single_masks = single_masks.reshape(-1, draft, draft)
 
@@ -329,7 +350,7 @@ class TestMaskValidity(CustomTestCase):
         corpus = _make_corpus("BFS")
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
-        _, masks = corpus.batch_get(QUERY_SEQUENCES)
+        _, masks = _batch_get(corpus, QUERY_SEQUENCES)
         masks = masks.reshape(-1, 8, 8)
         for i in range(masks.shape[0]):
             self._check_mask(masks[i].tolist())
@@ -338,7 +359,7 @@ class TestMaskValidity(CustomTestCase):
         corpus = _make_corpus("PROB")
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
-        _, masks = corpus.batch_get(QUERY_SEQUENCES)
+        _, masks = _batch_get(corpus, QUERY_SEQUENCES)
         masks = masks.reshape(-1, 8, 8)
         for i in range(masks.shape[0]):
             self._check_mask(masks[i].tolist())
@@ -362,7 +383,7 @@ class TestFrequencyBoosting(CustomTestCase):
             corpus.batch_put([[1, 2, 3, 20, 21]])
         corpus.synchronize()
 
-        ids, _ = corpus.batch_get([[1, 2, 3]])
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
         ids_list = ids.tolist()
 
         self.assertEqual(
@@ -388,7 +409,7 @@ class TestRecencyOrdering(CustomTestCase):
         corpus.batch_put([[1, 2, 3, 20, 21]])
         corpus.synchronize()
 
-        ids, _ = corpus.batch_get([[1, 2, 3]])
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
         ids_list = ids.tolist()
         self.assertEqual(
             ids_list[1],
@@ -406,7 +427,7 @@ class TestOverlappingSuffixes(CustomTestCase):
         corpus.batch_put([[300, 400, 7, 8, 9, 60, 61]])
         corpus.synchronize()
 
-        ids, _ = corpus.batch_get([[7, 8, 9]])
+        ids, _ = _batch_get(corpus, [[7, 8, 9]])
         ids_list = ids.tolist()
         self.assertIn(50, ids_list, "Continuation from first sequence missing")
         self.assertIn(60, ids_list, "Continuation from second sequence missing")
@@ -420,7 +441,7 @@ class TestSingleTokenContext(CustomTestCase):
         corpus.batch_put([[5, 10, 20, 30]])
         corpus.synchronize()
 
-        ids, masks = corpus.batch_get([[5]])
+        ids, masks = _batch_get(corpus, [[5]])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 5, "First token should be last context token")
         self.assertIn(10, ids_list, "Should match continuation after single token 5")
@@ -436,7 +457,7 @@ class TestLongContext(CustomTestCase):
         corpus.synchronize()
 
         long_query = list(range(1, 16))
-        ids, masks = corpus.batch_get([long_query])
+        ids, masks = _batch_get(corpus, [long_query])
         ids_list = ids.tolist()
         self.assertEqual(ids_list[0], 15, "First token should be last context token")
         self.assertIn(16, ids_list, "Should match via suffix despite long context")
@@ -447,7 +468,7 @@ class TestLongContext(CustomTestCase):
         corpus.batch_put([[99, 3, 4, 5, 6, 8]])
         corpus.synchronize()
 
-        ids, _ = corpus.batch_get([[2, 3, 4, 5, 6]])
+        ids, _ = _batch_get(corpus, [[2, 3, 4, 5, 6]])
         ids_list = ids.tolist()
         self.assertIn(
             7, ids_list, "Longest stored suffix should contribute a continuation"
@@ -468,7 +489,7 @@ class TestDraftBudgetSaturation(CustomTestCase):
         corpus.batch_put([seq])
         corpus.synchronize()
 
-        ids, _ = corpus.batch_get([[1, 2, 3]])
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
         ids_list = ids.tolist()
         self.assertEqual(len(ids_list), 8)
         non_zero = [t for t in ids_list[1:] if t != 0]
@@ -487,7 +508,7 @@ class TestTruncate(CustomTestCase):
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        ids, masks = corpus.batch_get([[1, 2, 3]])
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
         ids = ids.reshape(8)
         self.assertEqual(len(ids), 8)
 
@@ -501,7 +522,7 @@ class TestTruncate(CustomTestCase):
         corpus.batch_put(SEED_SEQUENCES)
         corpus.synchronize()
 
-        ids, masks = corpus.batch_get([[1, 2, 3]])
+        _, masks = _batch_get(corpus, [[1, 2, 3]])
         n = 8
         full_mask = masks.reshape(n, n)
 
@@ -530,14 +551,14 @@ class TestResetAndReinsert(CustomTestCase):
         corpus.batch_put([[10, 20, 30, 40, 50]])
         corpus.synchronize()
 
-        ids_old, _ = corpus.batch_get([[1, 2, 3]])
+        ids_old, _ = _batch_get(corpus, [[1, 2, 3]])
         ids_old_list = ids_old.tolist()
         self.assertTrue(
             all(t == 0 for t in ids_old_list[1:]),
             f"Old data should not match after reset+reinsert, got {ids_old_list}",
         )
 
-        ids_new, _ = corpus.batch_get([[10, 20, 30]])
+        ids_new, _ = _batch_get(corpus, [[10, 20, 30]])
         ids_new_list = ids_new.tolist()
         self.assertEqual(ids_new_list[0], 30)
         self.assertIn(40, ids_new_list, "New data should match after reset+reinsert")
@@ -553,7 +574,7 @@ class TestSqueezeEvictsOld(CustomTestCase):
         corpus.batch_put([old_seq])
         corpus.synchronize()
 
-        ids_before, _ = corpus.batch_get([[5000, 5001, 5002]])
+        ids_before, _ = _batch_get(corpus, [[5000, 5001, 5002]])
         self.assertIn(
             5003,
             ids_before.tolist(),
@@ -565,13 +586,92 @@ class TestSqueezeEvictsOld(CustomTestCase):
             corpus.batch_put([new_seq])
             corpus.synchronize()
 
-        ids_after, _ = corpus.batch_get([[5000, 5001, 5002]])
+        ids_after, _ = _batch_get(corpus, [[5000, 5001, 5002]])
         ids_after_list = ids_after.tolist()
         self.assertNotIn(
             5003,
             ids_after_list,
             f"Old data should be evicted after pressure, got {ids_after_list}",
         )
+
+
+class TestNgramCorpusIncremental(CustomTestCase):
+    """Verify the incremental matching path matches the stateless path."""
+
+    def _assert_incremental_matches_stateless(self, match_type: str):
+        corpus = _make_corpus(match_type, max_trie_depth=4, draft_token_num=4)
+        corpus.batch_put([[1, 2, 3, 4, 5, 6], [9, 3, 4, 7, 8]])
+        corpus.synchronize()
+
+        req_id = f"req-{match_type.lower()}"
+
+        steps = [
+            [1, 2, 3],
+            [1, 2, 3, 4],
+            [1, 2, 3, 4, 5, 6],
+        ]
+        for full_sequence in steps:
+            current_tail = full_sequence[-4:]
+            inc_ids, inc_masks = _batch_get_with_state(
+                corpus,
+                req_id,
+                current_tail,
+                len(full_sequence),
+            )
+            full_ids, full_masks = _batch_get(corpus, [current_tail])
+            np.testing.assert_array_equal(inc_ids, full_ids)
+            np.testing.assert_array_equal(inc_masks, full_masks)
+
+    def test_incremental_matches_stateless_bfs(self):
+        self._assert_incremental_matches_stateless("BFS")
+
+    def test_incremental_matches_stateless_prob(self):
+        self._assert_incremental_matches_stateless("PROB")
+
+    def test_leaf_anchor_becomes_expandable(self):
+        corpus = _make_corpus("BFS", max_trie_depth=4, draft_token_num=4)
+        corpus.batch_put([[1, 2, 3]])
+        corpus.synchronize()
+
+        req_id = "leaf-anchor"
+        ids_before, _ = _batch_get_with_state(corpus, req_id, [2, 3], 2)
+        self.assertTrue(
+            all(t == 0 for t in ids_before.tolist()[1:]),
+            f"Expected only the last token before extension, got {ids_before.tolist()}",
+        )
+
+        corpus.batch_put([[9, 2, 3, 4]])
+        corpus.synchronize()
+
+        inc_ids, inc_masks = _batch_get_with_state(corpus, req_id, [2, 3], 2)
+        full_ids, full_masks = _batch_get(corpus, [[2, 3]])
+        np.testing.assert_array_equal(inc_ids, full_ids)
+        np.testing.assert_array_equal(inc_masks, full_masks)
+        self.assertIn(
+            4,
+            inc_ids.tolist(),
+            f"Expected token 4 after extension, got {inc_ids.tolist()}",
+        )
+
+    def test_stale_state_rebuilds_after_eviction(self):
+        corpus = _make_corpus("BFS", capacity=150, max_trie_depth=6, draft_token_num=4)
+        corpus.batch_put([list(range(5000, 5030))])
+        corpus.synchronize()
+
+        req_id = "evicted"
+        _batch_get_with_state(corpus, req_id, [5000, 5001, 5002], 3)
+
+        for i in range(5):
+            new_seq = list(range(6000 + i * 30, 6000 + i * 30 + 30))
+            corpus.batch_put([new_seq])
+            corpus.synchronize()
+
+        inc_ids, inc_masks = _batch_get_with_state(
+            corpus, req_id, [5000, 5001, 5002], 3
+        )
+        full_ids, full_masks = _batch_get(corpus, [[5000, 5001, 5002]])
+        np.testing.assert_array_equal(inc_ids, full_ids)
+        np.testing.assert_array_equal(inc_masks, full_masks)
 
 
 if __name__ == "__main__":

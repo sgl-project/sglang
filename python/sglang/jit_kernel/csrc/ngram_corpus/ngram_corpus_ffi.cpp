@@ -62,7 +62,52 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     }
 
     auto result = ngram_->batchMatch(tokens);
+    write_result_(result, out_tokens, out_mask);
+  }
 
+  void batch_match_stateful(
+      const tvm::ffi::TensorView state_ids_tv,
+      const tvm::ffi::TensorView tokens_flat,
+      const tvm::ffi::TensorView offsets,
+      const tvm::ffi::TensorView total_lens_tv,
+      const tvm::ffi::TensorView out_tokens,
+      const tvm::ffi::TensorView out_mask) {
+    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
+    auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
+    auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
+    auto* tlens = static_cast<const int64_t*>(total_lens_tv.data_ptr());
+    int64_t batch_size = offsets.size(0) - 1;
+
+    std::vector<int64_t> state_ids(sid, sid + batch_size);
+    std::vector<std::vector<int32_t>> tokens(batch_size);
+    std::vector<size_t> total_lens(batch_size);
+    for (int64_t i = 0; i < batch_size; ++i) {
+      tokens[i].assign(data + offs[i], data + offs[i + 1]);
+      total_lens[i] = static_cast<size_t>(tlens[i]);
+    }
+
+    auto result = ngram_->batchMatch(state_ids, tokens, total_lens);
+    write_result_(result, out_tokens, out_mask);
+  }
+
+  void erase_match_state(const tvm::ffi::TensorView state_ids_tv) {
+    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
+    int64_t n = state_ids_tv.size(0);
+    std::vector<int64_t> state_ids(sid, sid + n);
+    ngram_->eraseMatchState(state_ids);
+  }
+
+  void synchronize() {
+    ngram_->synchronize();
+  }
+
+  void reset() {
+    ngram_->reset();
+  }
+
+ private:
+  void write_result_(
+      const ngram::Result& result, const tvm::ffi::TensorView& out_tokens, const tvm::ffi::TensorView& out_mask) {
     auto* out_tok = static_cast<int32_t*>(out_tokens.data_ptr());
     auto* out_msk = static_cast<uint8_t*>(out_mask.data_ptr());
     if (result.token.size() > static_cast<size_t>(out_tokens.size(0))) {
@@ -79,15 +124,6 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     std::memcpy(out_msk, result.mask.data(), result.mask.size() * sizeof(uint8_t));
   }
 
-  void synchronize() {
-    ngram_->synchronize();
-  }
-
-  void reset() {
-    ngram_->reset();
-  }
-
- private:
   std::unique_ptr<ngram::Ngram> ngram_;
 };
 
@@ -97,6 +133,8 @@ void register_ngram_corpus() {
       .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match", &NgramCorpusObj::batch_match)
+      .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
+      .def("erase_match_state", &NgramCorpusObj::erase_match_state)
       .def("synchronize", &NgramCorpusObj::synchronize)
       .def("reset", &NgramCorpusObj::reset);
 }

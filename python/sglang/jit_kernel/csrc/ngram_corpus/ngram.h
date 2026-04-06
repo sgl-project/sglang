@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace ngram {
@@ -28,6 +30,7 @@ class Ngram {
   size_t pending_count_ = 0;
   utils::Queue<std::vector<int32_t>> insert_queue_;
   std::thread insert_worker_;
+  std::unordered_map<int64_t, MatchState> match_state_;
 
  public:
   Ngram(size_t capacity, const Param& param);
@@ -37,13 +40,21 @@ class Ngram {
 
   void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
 
-  Result batchMatch(const std::vector<std::vector<int32_t>>& tokens) const;
+  Result batchMatch(const std::vector<std::vector<int32_t>>& tokens);
+
+  Result batchMatch(
+      const std::vector<int64_t>& state_ids,
+      const std::vector<std::vector<int32_t>>& tokens,
+      const std::vector<size_t>& total_lens);
+
+  void eraseMatchState(const std::vector<int64_t>& state_ids);
 
   void reset() {
     std::unique_lock<std::mutex> lock(mutex_);
     if (trie_) {
       trie_->reset();
     }
+    match_state_.clear();
   }
 
   const Param& param() const {

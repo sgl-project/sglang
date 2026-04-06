@@ -77,10 +77,10 @@ void Ngram::insertWorker() {
   }
 }
 
-Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const {
+Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) {
   std::unique_lock<std::mutex> lock(mutex_);
 
-  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
+  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
   BuildFn build_fn;
   if (param_.match_type == "BFS") {
     build_fn = &Trie::buildRecency;
@@ -91,13 +91,63 @@ Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const 
   }
 
   Result merged;
-  for (const auto& suffix : tokens) {
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    const auto& suffix = tokens[i];
+    if (suffix.empty()) {
+      throw std::runtime_error("batchMatch received an empty token tail");
+    }
+    MatchState temp_state;
     auto draft_token_num = param_.get_draft_token_num(tokens.size());
-    auto res = (trie_.get()->*build_fn)(suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_);
+    auto res = (trie_.get()->*build_fn)(
+        suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_, temp_state, suffix.size());
     merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
     merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
   }
   return merged;
+}
+
+Result Ngram::batchMatch(
+    const std::vector<int64_t>& state_ids,
+    const std::vector<std::vector<int32_t>>& tokens,
+    const std::vector<size_t>& total_lens) {
+  if (state_ids.size() != tokens.size() || state_ids.size() != total_lens.size()) {
+    throw std::runtime_error("batchMatch expects state_ids, tokens, and total_lens to match in size");
+  }
+
+  std::unique_lock<std::mutex> lock(mutex_);
+
+  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
+  BuildFn build_fn;
+  if (param_.match_type == "BFS") {
+    build_fn = &Trie::buildRecency;
+  } else if (param_.match_type == "PROB") {
+    build_fn = &Trie::buildFrequency;
+  } else {
+    throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
+  }
+
+  Result merged;
+  for (size_t i = 0; i < state_ids.size(); ++i) {
+    const auto& suffix = tokens[i];
+    if (suffix.empty()) {
+      throw std::runtime_error("batchMatch received an empty token tail");
+    }
+
+    auto& state = match_state_[state_ids[i]];
+    auto draft_token_num = param_.get_draft_token_num(tokens.size());
+    auto res = (trie_.get()->*build_fn)(
+        suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_, state, total_lens[i]);
+    merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
+    merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
+  }
+  return merged;
+}
+
+void Ngram::eraseMatchState(const std::vector<int64_t>& state_ids) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (const auto& sid : state_ids) {
+    match_state_.erase(sid);
+  }
 }
 
 }  // namespace ngram

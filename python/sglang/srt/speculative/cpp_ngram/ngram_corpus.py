@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -31,6 +31,16 @@ class NgramCorpus:
         )
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
+        self._req_id_to_state_id: Dict[str, int] = {}
+        self._next_state_id: int = 0
+
+    def _get_state_id(self, req_id: str) -> int:
+        sid = self._req_id_to_state_id.get(req_id)
+        if sid is None:
+            sid = self._next_state_id
+            self._next_state_id += 1
+            self._req_id_to_state_id[req_id] = sid
+        return sid
 
     def batch_put(self, batch_tokens: List[List[int]]):
         self._obj.insert(batch_tokens)
@@ -40,9 +50,26 @@ class NgramCorpus:
 
     def reset(self):
         self._obj.reset()  # type: ignore
+        self._req_id_to_state_id.clear()
+        self._next_state_id = 0
 
-    def batch_get(self, batch_tokens: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
-        return self._obj.match(batch_tokens)
+    def batch_get(
+        self,
+        req_ids: List[str],
+        batch_tokens: List[List[int]],
+        total_lens: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
+
+    def erase_match_state(self, req_ids: List[str]):
+        state_ids = []
+        for rid in req_ids:
+            sid = self._req_id_to_state_id.pop(rid, None)
+            if sid is not None:
+                state_ids.append(sid)
+        if state_ids:
+            self._obj.erase_states(state_ids)
 
     def leaf_paths_from_mask(
         self, tokens: List[int], tree_mask: List[List[int]]
@@ -119,6 +146,11 @@ if __name__ == "__main__":
     corpus.batch_put(token_ids)
 
     corpus.synchronize()
-    decoding_ids, decoding_masks = corpus.batch_get([[1, 2, 3], [3, 44], [3, 6, 999]])
+    queries = [[1, 2, 3], [3, 44], [3, 6, 999]]
+    decoding_ids, decoding_masks = corpus.batch_get(
+        req_ids=[f"query-{i}" for i in range(len(queries))],
+        batch_tokens=queries,
+        total_lens=[len(q) for q in queries],
+    )
 
     corpus.debug_result(decoding_ids, decoding_masks)

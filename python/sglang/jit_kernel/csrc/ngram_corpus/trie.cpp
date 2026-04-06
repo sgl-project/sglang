@@ -84,12 +84,14 @@ void Trie::squeeze(size_t count) {
     last->parent->lru.erase(last->parent_lru_pos);
     last->parent->sorted_children.erase(last);
     last->parent->child.erase(last->token);
+    retireNode(last);
 
     node_pool_[free_node_count_++] = last;
   }
 }
 
 void Trie::reset() {
+  ++trie_epoch_;
   global_lru_.clear();
   path_.clear();
   node_pool_.clear();
@@ -100,11 +102,31 @@ void Trie::reset() {
   root_ = getNode();
 }
 
-std::vector<std::pair<TrieNode*, int32_t>> Trie::match(const int32_t* context, size_t len) const {
-  std::vector<std::pair<TrieNode*, int32_t>> result;
+const TrieNode* Trie::resolve(const MatchState& state, const NodeRef& ref) const {
+  if (ref.ptr == nullptr || state.trie_epoch != trie_epoch_ || ref.ptr->version != ref.version) {
+    return nullptr;
+  }
+  return ref.ptr;
+}
+
+bool Trie::validateMatchState_(const MatchState& state) const {
+  if (state.trie_epoch != trie_epoch_) {
+    return false;
+  }
+  for (const auto& ref : state.anchors) {
+    if (ref.ptr && !resolve(state, ref)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void Trie::rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
   const auto max_match_depth = std::min(len, param_.max_trie_depth);
-  result.reserve(max_match_depth);
-  for (size_t match_depth = max_match_depth; match_depth > 0; --match_depth) {
+  state.trie_epoch = trie_epoch_;
+  state.processed_total_len = total_len;
+  state.anchors.assign(max_match_depth, {});
+  for (size_t match_depth = 1; match_depth <= max_match_depth; ++match_depth) {
     auto start = context + len - match_depth;
     auto end = start + match_depth;
     auto cursor = root_;
@@ -117,17 +139,88 @@ std::vector<std::pair<TrieNode*, int32_t>> Trie::match(const int32_t* context, s
       ++start;
       cursor = iter->second;
     }
-    if (cursor != nullptr && !cursor->child.empty()) {
-      result.emplace_back(cursor, static_cast<int32_t>(match_depth));
+    if (cursor != nullptr) {
+      state.anchors[match_depth - 1] = capture(cursor);
+    }
+  }
+}
+
+bool Trie::advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const {
+  if (!validateMatchState_(state)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < len; ++i) {
+    const auto next_depth = std::min(state.anchors.size() + 1, param_.max_trie_depth);
+    std::vector<NodeRef> next(next_depth);
+
+    const auto root_ref = rootRef();
+    const auto root = resolve(state, root_ref);
+    if (root == nullptr) {
+      return false;
+    }
+    if (auto iter = root->child.find(tokens[i]); iter != root->child.end()) {
+      next[0] = capture(iter->second);
+    }
+
+    for (size_t depth = 1; depth < next_depth; ++depth) {
+      const auto& prev_ref = state.anchors[depth - 1];
+      if (prev_ref.ptr == nullptr) {
+        continue;
+      }
+      const auto prev_node = resolve(state, prev_ref);
+      if (prev_node == nullptr) {
+        return false;
+      }
+      if (auto iter = prev_node->child.find(tokens[i]); iter != prev_node->child.end()) {
+        next[depth] = capture(iter->second);
+      }
+    }
+
+    state.anchors.swap(next);
+  }
+
+  state.processed_total_len = total_len;
+  return true;
+}
+
+std::vector<std::pair<const TrieNode*, int32_t>> Trie::getExpandableAnchors_(const MatchState& state) const {
+  std::vector<std::pair<const TrieNode*, int32_t>> result;
+  result.reserve(state.anchors.size());
+  for (size_t depth = state.anchors.size(); depth > 0; --depth) {
+    const auto node = resolve(state, state.anchors[depth - 1]);
+    if (node != nullptr && !node->child.empty()) {
+      result.emplace_back(node, static_cast<int32_t>(depth));
     }
   }
   return result;
 }
 
-Result Trie::buildRecency(
-    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
-  auto anchors = match(context, len);
+std::vector<std::pair<const TrieNode*, int32_t>>
+Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
+  const bool has_forward_progress = total_len >= state.processed_total_len;
+  const auto appended_len = has_forward_progress ? total_len - state.processed_total_len : 0;
+  const auto expected_prev_depth = std::min(state.processed_total_len, param_.max_trie_depth);
+  const bool can_advance = state.trie_epoch == trie_epoch_ && has_forward_progress && appended_len <= len &&
+                           state.anchors.size() == expected_prev_depth;
 
+  if (can_advance && advanceMatchState_(state, context + len - appended_len, appended_len, total_len)) {
+    return getExpandableAnchors_(state);
+  }
+
+  rebuildMatchState_(context, len, state, total_len);
+  return getExpandableAnchors_(state);
+}
+
+Result Trie::buildRecency(
+    const int32_t* context,
+    size_t len,
+    int32_t last_token,
+    size_t draft_token_num,
+    const Param& param,
+    MatchState& state,
+    size_t total_len) const {
+  auto anchors = match(context, len, state, total_len);
   const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
   double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
 
@@ -166,9 +259,14 @@ Result Trie::buildRecency(
 }
 
 Result Trie::buildFrequency(
-    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
-  auto anchors = match(context, len);
-
+    const int32_t* context,
+    size_t len,
+    int32_t last_token,
+    size_t draft_token_num,
+    const Param& param,
+    MatchState& state,
+    size_t total_len) const {
+  auto anchors = match(context, len, state, total_len);
   struct CompareByLastDouble {
     bool operator()(
         const std::tuple<double, const TrieNode*, double>& a,

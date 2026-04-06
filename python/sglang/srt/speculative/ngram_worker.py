@@ -123,13 +123,19 @@ class NGRAMWorker:
         bs = batch.batch_size()
 
         self.ngram_corpus.synchronize()
+        req_ids = []
         batch_tokens = []
+        total_lens = []
         for req in batch.reqs:
             check_token = self._efficient_concat_last_n(
                 req.origin_input_ids, req.output_ids, self.max_trie_depth
             )
+            req_ids.append(req.rid)
             batch_tokens.append(check_token)
-        req_drafts, mask = self.ngram_corpus.batch_get(batch_tokens)
+            total_lens.append(len(req.origin_input_ids) + len(req.output_ids))
+        req_drafts, mask = self.ngram_corpus.batch_get(
+            req_ids, batch_tokens, total_lens
+        )
         total_draft_token_num = len(req_drafts)
 
         # Check if speculative decoding is needed; here we always enforce it
@@ -263,6 +269,12 @@ class NGRAMWorker:
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_corpus(batch)
+            finished_req_ids = []
+            for req in batch.reqs:
+                if req.finished() or req.is_retracted:
+                    finished_req_ids.append(req.rid)
+            if finished_req_ids:
+                self.ngram_corpus.erase_match_state(finished_req_ids)
             batch.forward_mode = ForwardMode.DECODE
 
         else:
