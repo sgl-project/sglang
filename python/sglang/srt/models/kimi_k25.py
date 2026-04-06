@@ -25,7 +25,11 @@ except ImportError:
     activations.PytorchGELUTanh = GELUTanh
     PytorchGELUTanh = GELUTanh
 
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.managers.schedule_batch import (
@@ -151,6 +155,7 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
@@ -159,6 +164,7 @@ class MoonViTEncoderLayer(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
+            forward_metadata=forward_metadata,
         )
 
         hidden_states = residual + hidden_states
@@ -481,9 +487,17 @@ class MoonViT3dEncoder(nn.Module):
         max_seqlen = lengths.max()
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=hidden_states.device
+        )
+
         for block in self.blocks:
             hidden_states = block(
-                hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis=rope_freqs_cis
+                hidden_states,
+                cu_seqlens,
+                max_seqlen,
+                rope_freqs_cis=rope_freqs_cis,
+                forward_metadata=forward_metadata,
             )
 
         hidden_states = self.final_layernorm(hidden_states)

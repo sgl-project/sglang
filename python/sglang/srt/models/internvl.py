@@ -13,10 +13,14 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
-from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    _get_cu_seqlens_for_shape,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -38,9 +42,6 @@ from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
-from sglang.srt.multimodal.internvl_vit_cuda_graph_runner import (
-    InternViTCudaGraphRunner,
-)
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_vision_model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda
@@ -87,9 +88,13 @@ class InternAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        output_ws: Optional[torch.Tensor] = None,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
-        out = self.attn(hidden_states, cu_seqlens=cu_seqlens, output_ws=output_ws)
+        out = self.attn(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            forward_metadata=forward_metadata,
+        )
         outs = self.proj_drop(out)
         return outs
 
@@ -262,12 +267,8 @@ class InternVisionEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        output_ws: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.FloatTensor,
-        Optional[torch.FloatTensor],
-        Optional[Tuple[torch.FloatTensor]],
-    ]:
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
+    ) -> torch.FloatTensor:
         """
         Args:
             hidden_states (`Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]`): input to the layer of shape `(batch, seq_len, embed_dim)`
@@ -277,7 +278,7 @@ class InternVisionEncoderLayer(nn.Module):
             self.attn(
                 self.norm1(hidden_states).to(hidden_states.dtype),
                 cu_seqlens=cu_seqlens,
-                output_ws=output_ws,
+                forward_metadata=forward_metadata,
             )
             * self.ls1
         )
@@ -313,10 +314,7 @@ class InternVisionEncoder(nn.Module):
             for x in torch.linspace(0, config.drop_path_rate, config.num_hidden_layers)
         ]
 
-        self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
-        aux_stream = (
-            None if self.enable_cg else (torch.cuda.Stream() if _is_cuda else None)
-        )
+        aux_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
             [
                 InternVisionEncoderLayer(
@@ -325,10 +323,6 @@ class InternVisionEncoder(nn.Module):
                 for idx in range(config.num_hidden_layers)
             ]
         )
-
-        self.cuda_graph_runner: Optional[InternViTCudaGraphRunner] = None
-        if self.enable_cg:
-            self.cuda_graph_runner = InternViTCudaGraphRunner(self)
 
     def forward(
         self,
@@ -346,14 +340,6 @@ class InternVisionEncoder(nn.Module):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        if self.enable_cg and (not output_hidden_states):
-            # graph path only returns last_hidden_state
-            hidden_states = inputs_embeds.to(device=inputs_embeds.device).contiguous()
-            hidden_states = self.cuda_graph_runner.run(hidden_states)
-            if not return_dict:
-                return (hidden_states,)
-            return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=None)
-
         output_hidden_states = (
             output_hidden_states
             if output_hidden_states is not None
@@ -366,12 +352,23 @@ class InternVisionEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
 
-        cu_seqlens = SingletonCache()
+        # pre-compute attention metadata once for all layers
+        bsz, seq_len, _ = inputs_embeds.shape
+        cu_seqlens = _get_cu_seqlens_for_shape(
+            bsz, seq_len, device=inputs_embeds.device
+        )
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=inputs_embeds.device
+        )
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
-            layer_outputs = encoder_layer(hidden_states, cu_seqlens=cu_seqlens)
+            layer_outputs = encoder_layer(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                forward_metadata=forward_metadata,
+            )
             hidden_states = layer_outputs
 
         if output_hidden_states:
