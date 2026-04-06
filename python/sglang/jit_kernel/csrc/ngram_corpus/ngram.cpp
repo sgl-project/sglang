@@ -93,8 +93,6 @@ void Ngram::finishExternalCorpusLoad(const std::string& corpus_id) {
   // Only lock briefly to install the completed SAM.
   std::unique_lock<std::mutex> lock(mutex_);
   sams_[corpus_id] = std::move(staging_sam_);
-  lock.unlock();
-  staging_sam_.reset();
 }
 
 void Ngram::removeExternalCorpus(const std::string& corpus_id) {
