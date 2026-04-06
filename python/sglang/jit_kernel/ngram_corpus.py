@@ -143,6 +143,6 @@ def get_ngram_corpus_cls():
             result = self.list_external_corpora()  # type: ignore
             if not result:
                 return []
-            return result.split(",")
+            return result.split("\n")
 
     return NgramCorpusFFI

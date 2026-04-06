@@ -128,7 +128,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     auto ids = ngram_->listExternalCorpora();
     std::string result;
     for (size_t i = 0; i < ids.size(); ++i) {
-      if (i > 0) result += ",";
+      if (i > 0) result += "\n";
       result += ids[i];
     }
     return result;
