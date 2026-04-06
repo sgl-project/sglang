@@ -634,8 +634,12 @@ class Req(ReqDllmMixin):
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
-        # Require reasoning for the request (hybrid reasoning model only)
+        # Require reasoning for the request
         self.require_reasoning = require_reasoning
+
+        # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
+        self._is_reasoning_over = False
+        self.reasoning_tokens = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1276,6 +1280,20 @@ class Req(ReqDllmMixin):
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
+    def update_reasoning_tokens(self, token_id, think_end_id):
+        if self._is_reasoning_over:
+            return
+
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        try:
+            end_pos = token_id.index(think_end_id)
+            self.reasoning_tokens += end_pos + 1
+            self._is_reasoning_over = True
+        except ValueError:
+            self.reasoning_tokens += len(token_id)
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
@@ -1730,21 +1748,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
-        for mm_input in multimodal_inputs:
-            if mm_input is None:
-                continue
-            for mm_item in mm_input.mm_items:
-                pixel_values = getattr(mm_item, "feature", None)
-                if isinstance(pixel_values, torch.Tensor):
-                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
-                if get_global_server_args().language_only:
-                    precomputed_embeddings = getattr(
-                        mm_item, "precomputed_embeddings", None
-                    )
-                    if isinstance(precomputed_embeddings, torch.Tensor):
-                        mm_item.precomputed_embeddings = precomputed_embeddings.to(
-                            self.device, non_blocking=True
-                        )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -2017,6 +2020,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.retract_req(req)
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
