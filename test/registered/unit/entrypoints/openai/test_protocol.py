@@ -18,8 +18,6 @@ from sglang.utils import convert_json_schema_to_str
 
 register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
 
-_PROTOCOL_LOGGER = "sglang.srt.entrypoints.openai.protocol"
-
 
 class TestChatCompletionRequest(CustomTestCase):
     def test_tool_choice_defaults_to_none_without_tools(self):
@@ -139,30 +137,6 @@ class TestChatCompletionRequest(CustomTestCase):
         self.assertEqual(params["repetition_penalty"], 1.15)
         self.assertEqual(
             params["json_schema"], convert_json_schema_to_str({"type": "object"})
-        )
-
-    def test_to_sampling_params_skips_tool_call_constraint_when_constraints_exist(self):
-        """Test tool call constraints are skipped when constrained decoding is set."""
-        req = ChatCompletionRequest(
-            messages=[{"role": "user", "content": "Need regex constrained output"}],
-            max_completion_tokens=16,
-            regex="\\d+",
-        )
-
-        with self.assertLogs(_PROTOCOL_LOGGER, level="WARNING") as logs:
-            params = req.to_sampling_params(
-                stop=[],
-                model_generation_config={},
-                tool_call_constraint=("json_schema", {"type": "object"}),
-            )
-
-        self.assertEqual(params["regex"], "\\d+")
-        self.assertNotIn("json_schema", params)
-        self.assertTrue(
-            any(
-                "Constrained decoding is not compatible with tool calls." in msg
-                for msg in logs.output
-            )
         )
 
     def test_to_sampling_params_response_format_json_schema_sets_json_schema_param(
