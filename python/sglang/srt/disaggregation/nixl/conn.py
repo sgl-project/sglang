@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Set
 
 import numpy as np
 import numpy.typing as npt
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -44,6 +45,7 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     dst_state_indices: List[int]
+    staging: Optional[object] = None
 
     def is_dummy(self):
         return self.dst_kv_indices.size == 0
@@ -86,6 +88,8 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: list[int] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: list[int] = dataclasses.field(default_factory=list)
+    staging_base_ptr: int = 0
+    staging_total_size: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -104,6 +108,13 @@ class KVArgsRegisterInfo:
                 struct.unpack(f"{len(msg[13]) // 4}I", msg[13])
             )
 
+        staging_base_ptr = 0
+        staging_total_size = 0
+        if len(msg) > 14 and msg[14] != b"":
+            staging_base_ptr = struct.unpack("Q", msg[14])[0]
+        if len(msg) > 15 and msg[15] != b"":
+            staging_total_size = int(msg[15].decode("ascii"))
+
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -119,6 +130,8 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=int(msg[11].decode("ascii")),
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
+            staging_base_ptr=staging_base_ptr,
+            staging_total_size=staging_total_size,
         )
 
 
@@ -202,17 +215,138 @@ class NixlKVManager(CommonKVManager):
 
         self.register_buffer_to_engine()
 
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.kv_buffer_tensors = None
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.enable_staging:
+                self._init_staging_prefill_ctx()
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
             )
+            if self.enable_staging:
+                self._init_staging_decode_ctx()
+                self._staging_handler = None
+                self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
+                self._start_decode_staging_thread()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
+
+    def _start_decode_staging_thread(self):
+        """Start a thread on the decode side to recv STAGING_REQ from prefill via ZMQ."""
+
+        def decode_staging_thread():
+            while True:
+                msg = self.server_socket.recv_multipart()
+                if msg[0] == b"STAGING_REQ":
+                    self._handle_staging_req(msg)
+                    continue
+                logger.warning(
+                    "decode_staging_thread: unexpected message tag %s",
+                    msg[0][:20],
+                )
+
+        threading.Thread(target=decode_staging_thread, daemon=True).start()
+
+    def _handle_staging_req(self, msg):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            handle_staging_req,
+        )
+
+        room = int(msg[1].decode("ascii"))
+        session_id = msg[4].decode("ascii")
+        handler = self._staging_handler
+        assert (
+            handler is not None
+        ), "STAGING_REQ received before staging handler initialized"
+        decode_req = handler._room_to_decode_req.get(room)
+        if decode_req is None:
+            logger.warning(
+                "STAGING_REQ received for unregistered room=%s, skipping",
+                room,
+            )
+            return
+        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+        handle_staging_req(
+            msg,
+            self._staging_ctx.allocator,
+            self.kv_args,
+            self.attn_tp_size,
+            prefill_tp,
+            getattr(self, "kv_buffer_tensors", None),
+            self._staging_ctx.room_receivers,
+            self._staging_ctx.room_bootstrap,
+        )
+
+        receiver = self._staging_ctx.room_receivers.get(room)
+        if receiver is not None:
+            handler.register_wm_subscriber(receiver, session_id)
+
+    def _prefetch_staging_reqs(self, room: int):
+        """Send STAGING_REQ for all chunks before the prefill forward starts."""
+        if not self.enable_staging or self.kv_buffer_tensors is None:
+            return
+
+        import zmq
+
+        from sglang.srt.utils.network import NetworkAddress
+
+        room_infos = self.transfer_infos.get(room, {})
+        needs_staging = any(
+            not tinfo.is_dummy()
+            and tinfo.agent_name in self.decode_kv_args_table
+            and self.decode_kv_args_table[tinfo.agent_name].decode_tp_size
+            != self.attn_tp_size
+            for tinfo in room_infos.values()
+        )
+        if not needs_staging:
+            return
+
+        page_size = self.kv_buffer_tensors["page_size"]
+        cps = self.server_args.chunked_prefill_size or 8192
+        full_chunk_pages = max(1, cps // page_size)
+
+        for agent_name, tinfo in room_infos.items():
+            if tinfo.is_dummy():
+                continue
+            total_pages = len(tinfo.dst_kv_indices)
+            if total_pages == 0:
+                continue
+            num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
+
+            for chunk_idx in range(num_chunks):
+                stg_key = (room, chunk_idx, agent_name)
+                if stg_key in self._staging_ctx.prefetch_requested:
+                    continue
+                self._staging_ctx.prefetch_requested.add(stg_key)
+
+                remaining = total_pages - chunk_idx * full_chunk_pages
+                chunk_pages = min(full_chunk_pages, remaining)
+                try:
+                    na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
+                    ep = na.to_tcp()
+                    if ep not in self._staging_ctx.prefetch_sockets:
+                        sock = zmq.Context().socket(zmq.PUSH)
+                        if na.is_ipv6:
+                            sock.setsockopt(zmq.IPV6, 1)
+                        sock.connect(ep)
+                        self._staging_ctx.prefetch_sockets[ep] = sock
+                    self._staging_ctx.prefetch_sockets[ep].send_multipart(
+                        [
+                            b"STAGING_REQ",
+                            str(room).encode("ascii"),
+                            str(chunk_idx).encode("ascii"),
+                            str(chunk_pages).encode("ascii"),
+                            agent_name.encode("ascii"),
+                        ]
+                    )
+                except Exception:
+                    self._staging_ctx.prefetch_requested.discard(stg_key)
 
     def _start_heartbeat_checker_thread(self):
         """
@@ -335,6 +469,100 @@ class NixlKVManager(CommonKVManager):
             )
             if not self.state_descs:
                 raise Exception("NIXL memory registration failed for state tensors")
+
+    # ------------------------------------------------------------------
+    # Staging buffer methods
+    # ------------------------------------------------------------------
+
+    def _init_staging_prefill_ctx(self):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            PrefillStagingContext,
+        )
+
+        self._staging_ctx = PrefillStagingContext()
+
+    def _init_staging_decode_ctx(self):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            DecodeStagingContext,
+        )
+
+        self._staging_ctx = DecodeStagingContext()
+        self._init_staging_allocator()
+
+    def _init_staging_buffers(self, count: int):
+        from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+
+        size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
+        size_bytes = size_mb * 1024 * 1024
+        gpu_id = self.kv_args.gpu_id
+        device = f"cuda:{gpu_id}"
+
+        buffers = []
+        for _ in range(count):
+            buf = StagingBuffer(size_bytes, device, gpu_id)
+            self._register_staging_memory(buf.get_ptr(), buf.get_size(), gpu_id)
+            buffers.append(buf)
+        self._staging_ctx.buffers = buffers
+        return buffers
+
+    def _init_staging_allocator(self):
+        from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
+
+        pool_size_mb = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get()
+        pool_size_bytes = pool_size_mb * 1024 * 1024
+        gpu_id = self.kv_args.gpu_id
+        device = f"cuda:{gpu_id}"
+
+        allocator = StagingAllocator(pool_size_bytes, device, gpu_id)
+        self._register_staging_memory(
+            allocator.get_base_ptr(), allocator.get_total_size(), gpu_id
+        )
+        self._staging_ctx.allocator = allocator
+
+    def _register_staging_memory(self, ptr: int, size: int, gpu_id: int):
+        """Register a staging buffer with the NIXL agent."""
+        addrs = [(ptr, size, gpu_id, "")]
+        descs = self.agent.register_memory(addrs, "VRAM")
+        if not descs:
+            raise RuntimeError(
+                f"NIXL memory registration failed for staging buffer "
+                f"(ptr=0x{ptr:x}, size={size})"
+            )
+
+    def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
+        self.kv_buffer_tensors = {
+            "k_buffers": k_buffers,
+            "v_buffers": v_buffers,
+            "page_size": page_size,
+        }
+        if (
+            self.enable_staging
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and not self._staging_ctx.buffers
+        ):
+            self._init_staging_buffers(len(getattr(self, "transfer_queues", [1])))
+
+    def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
+        self._staging_ctx.room_bootstrap[room] = bootstrap_infos
+        self._staging_ctx.room_receivers[room] = receiver
+
+    def _is_watermark_ready(
+        self, agent_name: str, alloc_round: int, alloc_end: int
+    ) -> bool:
+        from sglang.srt.disaggregation.common.staging_handler import (
+            is_watermark_ready,
+        )
+
+        return is_watermark_ready(self._staging_ctx, agent_name, alloc_round, alloc_end)
+
+    def _try_create_staging_strategy(self, staging_buffer):
+        if not self.enable_staging or self.kv_buffer_tensors is None:
+            return None
+        from sglang.srt.disaggregation.common.staging_handler import (
+            PrefillStagingStrategy,
+        )
+
+        return PrefillStagingStrategy(self, staging_buffer)
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
@@ -609,6 +837,114 @@ class NixlKVManager(CommonKVManager):
 
         return xfer_handle
 
+    def send_kvcache_staged(
+        self,
+        peer_name: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_staging_ptr: int,
+        dst_staging_size: int,
+        dst_gpu_id: int,
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        dst_kv_item_len: int,
+        notif: str,
+        staging_buffer=None,
+    ):
+        """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_head_slice_params,
+            compute_staging_layout,
+            gather_all_layers_to_staging,
+            resolve_total_kv_heads,
+        )
+
+        if self.kv_buffer_tensors is None or staging_buffer is None:
+            return None
+
+        k_buffers = self.kv_buffer_tensors["k_buffers"]
+        v_buffers = self.kv_buffer_tensors["v_buffers"]
+        page_size = self.kv_buffer_tensors["page_size"]
+        num_layers = len(k_buffers)
+        head_dim = k_buffers[0].shape[-1]
+        dtype_size = k_buffers[0].element_size()
+
+        total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
+
+        local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+        src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
+            self.attn_tp_size,
+            dst_attn_tp_size,
+            local_tp_rank,
+            dst_tp_rank,
+            total_kv_heads,
+        )
+
+        num_tokens = len(prefill_kv_indices) * page_size
+        per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
+        per_rank_bytes = per_layer_bytes * num_layers * 2
+
+        num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
+            self.attn_tp_size,
+            dst_attn_tp_size,
+            dst_tp_rank,
+            total_kv_heads,
+            num_tokens,
+            head_dim * dtype_size,
+            num_layers,
+        )
+        writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
+        rank_offset = sum(writer_rank_bytes[:writer_idx])
+
+        if not staging_buffer.fits(per_rank_bytes):
+            logger.warning(
+                f"Prefill staging too small for {per_rank_bytes} bytes, falling back"
+            )
+            return None
+        if dst_staging_size < total_staging_needed:
+            logger.warning(
+                f"Decode staging too small: need {total_staging_needed} bytes, "
+                f"have {dst_staging_size}, falling back"
+            )
+            return None
+
+        gather_all_layers_to_staging(
+            k_buffers,
+            v_buffers,
+            prefill_kv_indices,
+            staging_buffer,
+            src_head_start,
+            num_heads_to_send,
+            page_size,
+            self.kv_args.gpu_id,
+        )
+        torch.cuda.current_stream().synchronize()
+
+        dst_write_ptr = dst_staging_ptr + rank_offset
+        src_reqs = np.array(
+            [[staging_buffer.get_ptr(), per_rank_bytes, self.kv_args.gpu_id]],
+            dtype=np.int64,
+        )
+        dst_reqs = np.array(
+            [[dst_write_ptr, per_rank_bytes, dst_gpu_id]], dtype=np.int64
+        )
+
+        src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
+
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
+        )
+        if not xfer_handle:
+            raise RuntimeError(
+                f"[Staging] Failed to create NIXL bulk transfer "
+                f"(src=0x{staging_buffer.get_ptr():x}, dst=0x{dst_write_ptr:x}, "
+                f"size={per_rank_bytes})"
+            )
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
+        return xfer_handle
+
     def send_aux(
         self,
         peer_name: str,
@@ -872,6 +1208,9 @@ class NixlKVManager(CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
 
+        if self.enable_staging and chunk_id == 0:
+            self._prefetch_staging_reqs(bootstrap_room)
+
         reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
         handles = []
         for req in reqs_to_be_processed:
@@ -883,54 +1222,144 @@ class NixlKVManager(CommonKVManager):
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
 
-            notif = (
-                f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
-            )
-            decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
+            decode_info = self.decode_kv_args_table[req.agent_name]
+            decode_tp_size = decode_info.decode_tp_size
 
-            if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
+            # Staging path: heterogeneous TP with staging buffer enabled
+            use_staging = (
+                self.enable_staging
+                and not self.is_mla_backend
+                and decode_tp_size != self.attn_tp_size
+                and decode_info.staging_base_ptr != 0
+                and decode_info.staging_total_size > 0
+                and self.kv_buffer_tensors is not None
+                and self._staging_ctx is not None
+                and self._staging_ctx.buffers
+            )
+
+            if use_staging:
+                staging_buffer = self._staging_ctx.buffers[0]
+                stg = getattr(req, "staging", None)
+
+                page_start = index_slice.start
+                num_pages = len(kv_indices)
+
+                # Determine chunk_idx for staging offset lookup
+                page_size = self.kv_buffer_tensors["page_size"]
+                cps = self.server_args.chunked_prefill_size or 8192
+                full_chunk_pages = max(1, cps // page_size)
+                chunk_idx = (
+                    page_start // full_chunk_pages if full_chunk_pages > 0 else 0
+                )
+
+                # Check if staging offset is ready
+                stg_offset = -1
+                stg_round = 0
+                stg_end = -1
+                if stg is not None and chunk_idx < len(stg.offsets):
+                    stg_offset = stg.offsets[chunk_idx]
+                    stg_round = stg.rounds[chunk_idx]
+                    stg_end = stg.ends[chunk_idx]
+
+                if stg_offset >= 0 and self._is_watermark_ready(
+                    req.agent_name, stg_round, stg_end
+                ):
+                    notif_tag = (
+                        f"{req.room}_stg_{chunk_id}_{int(is_last)}"
+                        f"_{self.kv_args.engine_rank}_{chunk_idx}"
+                        f"_{page_start}_{num_pages}_{req.agent_name}"
+                    )
+                    kv_xfer_handle = self.send_kvcache_staged(
+                        req.agent_name,
+                        kv_indices,
+                        decode_info.staging_base_ptr + stg_offset,
+                        decode_info.staging_total_size - stg_offset,
+                        decode_info.gpu_id,
+                        decode_info.decode_tp_rank,
+                        decode_tp_size,
+                        decode_info.dst_kv_item_len,
+                        notif_tag,
+                        staging_buffer=staging_buffer,
+                    )
+                    if kv_xfer_handle is not None:
+                        handles.append(kv_xfer_handle)
+                    else:
+                        # Fallback to slice path
+                        notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
+                        kv_xfer_handle = self.send_kvcache_slice(
+                            req.agent_name,
+                            kv_indices,
+                            decode_info.dst_kv_ptrs,
+                            chunked_dst_kv_indice,
+                            decode_info.gpu_id,
+                            notif,
+                            prefill_tp_size=self.attn_tp_size,
+                            decode_tp_size=decode_tp_size,
+                            decode_tp_rank=decode_info.decode_tp_rank,
+                            dst_kv_item_len=decode_info.dst_kv_item_len,
+                        )
+                        handles.append(kv_xfer_handle)
+                else:
+                    # Staging offset not ready, fall back to slice path
+                    notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
+                    kv_xfer_handle = self.send_kvcache_slice(
+                        req.agent_name,
+                        kv_indices,
+                        decode_info.dst_kv_ptrs,
+                        chunked_dst_kv_indice,
+                        decode_info.gpu_id,
+                        notif,
+                        prefill_tp_size=self.attn_tp_size,
+                        decode_tp_size=decode_tp_size,
+                        decode_tp_rank=decode_info.decode_tp_rank,
+                        dst_kv_item_len=decode_info.dst_kv_item_len,
+                    )
+                    handles.append(kv_xfer_handle)
+            elif self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
+                notif = (
+                    f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
+                )
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
                     kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                    decode_info.dst_kv_ptrs,
                     chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
+                    decode_info.gpu_id,
                     notif,
                 )
+                handles.append(kv_xfer_handle)
             else:
+                notif = (
+                    f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
+                )
                 kv_xfer_handle = self.send_kvcache_slice(
                     req.agent_name,
                     kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                    decode_info.dst_kv_ptrs,
                     chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
+                    decode_info.gpu_id,
                     notif,
                     prefill_tp_size=self.attn_tp_size,
                     decode_tp_size=decode_tp_size,
-                    decode_tp_rank=self.decode_kv_args_table[
-                        req.agent_name
-                    ].decode_tp_rank,
-                    dst_kv_item_len=self.decode_kv_args_table[
-                        req.agent_name
-                    ].dst_kv_item_len,
+                    decode_tp_rank=decode_info.decode_tp_rank,
+                    dst_kv_item_len=decode_info.dst_kv_item_len,
                 )
+                handles.append(kv_xfer_handle)
 
-            handles.append(kv_xfer_handle)
             # Only the last chunk we need to send the aux data.
             if is_last:
                 if state_indices is not None:
-                    dst_info = self.decode_kv_args_table[req.agent_name]
                     state_xfer_handle = self.maybe_send_extra(
                         req.agent_name,
                         state_indices,
-                        dst_info.dst_state_data_ptrs,
+                        decode_info.dst_state_data_ptrs,
                         req.dst_state_indices,
-                        dst_info.gpu_id,
+                        decode_info.gpu_id,
                         f"{req.room}_state_{self.kv_args.engine_rank}",
                         decode_tp_size,
-                        decode_tp_rank=dst_info.decode_tp_rank,
-                        dst_state_item_lens=dst_info.dst_state_item_lens,
-                        dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
+                        decode_tp_rank=decode_info.decode_tp_rank,
+                        dst_state_item_lens=decode_info.dst_state_item_lens,
+                        dst_state_dim_per_tensor=decode_info.dst_state_dim_per_tensor,
                     )
                     if state_xfer_handle is not None:
                         handles.append(state_xfer_handle)
@@ -939,7 +1368,7 @@ class NixlKVManager(CommonKVManager):
                 aux_xfer_handle = self.send_aux(
                     req.agent_name,
                     aux_index,
-                    self.decode_kv_args_table[req.agent_name].dst_aux_ptrs,
+                    decode_info.dst_aux_ptrs,
                     req.dst_aux_index,
                     f"{req.room}_aux",
                 )
@@ -952,35 +1381,106 @@ class NixlKVManager(CommonKVManager):
         # Process notifications from received transfers.
         notif_map = self.agent.get_new_notifs()
         for peer_name, messages in notif_map.items():
-            # We could also check that self.bootstrap_info['agent_name'] matches
-            # the message sender. But the bootstrap room alone should be
-            # sufficient to map the status.
             for msg in messages:
-                components = msg.decode("ascii").split("_", 4)
+                decoded = msg.decode("ascii")
+                components = decoded.split("_")
                 room = int(components[0])
-                if components[1] == "kv":
+                tag = components[1]
+                if tag == "kv":
                     chunk_id = int(components[2])
                     is_last = bool(int(components[3]))
                     pp_rank = int(components[4]) if len(components) > 4 else 0
-                    # Track received chunks per pp_rank
-                    self.transfer_statuses[room].received_kvs_per_pp[pp_rank].add(
-                        chunk_id
+                    self._track_kv_arrival(room, chunk_id, is_last, pp_rank)
+                elif tag == "stg":
+                    # Format: {room}_stg_{chunk_id}_{is_last}_{pp_rank}_{chunk_idx}_{page_start}_{num_pages}_{agent_name}
+                    chunk_id = int(components[2])
+                    is_last = bool(int(components[3]))
+                    pp_rank = int(components[4])
+                    chunk_idx = int(components[5])
+                    page_start = int(components[6])
+                    num_pages = int(components[7])
+                    agent_name = components[8] if len(components) > 8 else ""
+                    # Track as kv for TransferStatus.is_done()
+                    self._track_kv_arrival(room, chunk_id, is_last, pp_rank)
+                    # Handle staging scatter
+                    self._handle_staging_chunk_arrived(
+                        room, chunk_idx, page_start, num_pages, agent_name
                     )
-                    if is_last:
-                        # Record expected chunk count for this pp_rank
-                        self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = (
-                            chunk_id + 1
-                        )
-                        # Set num_pp_ranks_expected from table (or default to 1)
-                        if self.transfer_statuses[room].num_pp_ranks_expected is None:
-                            self.transfer_statuses[room].num_pp_ranks_expected = (
-                                self.required_prefill_response_num_table.get(room, 1)
-                            )
-                elif components[1] == "aux":
+                elif tag == "aux":
                     self.transfer_statuses[room].received_aux = True
-                elif components[1] == "state":
+                    if (
+                        self.enable_staging
+                        and self._staging_handler is not None
+                        and self._staging_handler.is_staging_room(room)
+                    ):
+                        self._maybe_submit_last_scatter(room)
+                elif tag == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+
+    def _track_kv_arrival(self, room: int, chunk_id: int, is_last: bool, pp_rank: int):
+        """Update transfer status tracking for a kv chunk arrival."""
+        self.transfer_statuses[room].received_kvs_per_pp[pp_rank].add(chunk_id)
+        if is_last:
+            self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = chunk_id + 1
+            if self.transfer_statuses[room].num_pp_ranks_expected is None:
+                self.transfer_statuses[room].num_pp_ranks_expected = (
+                    self.required_prefill_response_num_table.get(room, 1)
+                )
+            if (
+                self.enable_staging
+                and self._staging_handler is not None
+                and self._staging_handler.is_staging_room(room)
+            ):
+                self._maybe_submit_last_scatter(room)
+
+    def _handle_staging_chunk_arrived(
+        self,
+        room: int,
+        chunk_idx: int,
+        page_start: int,
+        num_pages: int,
+        agent_name: str,
+    ):
+        """Process a staging chunk arrival via RDMA notification."""
+        self._chunk_writer_counts[room][chunk_idx].append(
+            (page_start, num_pages, agent_name)
+        )
+        handler = self._staging_handler
+        if handler is None:
+            return
+        decode_req = handler._room_to_decode_req.get(room)
+        if decode_req is None:
+            logger.warning(
+                "stg notification for unregistered room=%s chunk=%d, skipping",
+                room,
+                chunk_idx,
+            )
+            return
+        writers_arrived = len(self._chunk_writer_counts[room][chunk_idx])
+        num_writers = handler.num_writers_for(decode_req)
+        if writers_arrived >= num_writers:
+            handler.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            del self._chunk_writer_counts[room][chunk_idx]
+
+    def _maybe_submit_last_scatter(self, room: int):
+        """Check if all kv+aux transfers are done and submit last scatter if so."""
+        status = self.transfer_statuses.get(room)
+        if status is None:
+            return
+        if not status.received_aux:
+            return
+        if status.num_pp_ranks_expected is None:
+            return
+        if len(status.expected_kvs_per_pp) < status.num_pp_ranks_expected:
+            return
+        for pp_rank, expected in status.expected_kvs_per_pp.items():
+            if len(status.received_kvs_per_pp[pp_rank]) != expected:
+                return
+        handler = self._staging_handler
+        if handler is not None and handler.is_staging_room(room):
+            handler.submit_last_scatter_async(room)
+            self._chunk_writer_counts.pop(room, None)
 
     def check_transfer_done(self, room: int):
         if room not in self.transfer_statuses:
@@ -995,6 +1495,59 @@ class NixlKVManager(CommonKVManager):
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
+
+                # Staging: decode reports consumption watermark back to prefill
+                if waiting_req_bytes[0] == b"WATERMARK":
+                    if self.enable_staging and self._staging_ctx is not None:
+                        wm_round = int(waiting_req_bytes[1].decode("ascii"))
+                        wm_tail = int(waiting_req_bytes[2].decode("ascii"))
+                        wm_session = (
+                            waiting_req_bytes[3].decode("ascii")
+                            if len(waiting_req_bytes) > 3
+                            else ""
+                        )
+                        with self._staging_ctx.watermark_cv:
+                            prev = self._staging_ctx.remote_watermarks.get(
+                                wm_session, (0, 0)
+                            )
+                            if (wm_round, wm_tail) > prev:
+                                self._staging_ctx.remote_watermarks[wm_session] = (
+                                    wm_round,
+                                    wm_tail,
+                                )
+                            self._staging_ctx.watermark_cv.notify_all()
+                    continue
+
+                # Staging: decode replies with allocated staging offset
+                if waiting_req_bytes[0] == b"STAGING_RSP":
+                    if self.enable_staging and self._staging_ctx is not None:
+                        from sglang.srt.disaggregation.common.staging_handler import (
+                            StagingTransferInfo,
+                        )
+
+                        stg_room = int(waiting_req_bytes[1].decode("ascii"))
+                        stg_chunk_idx = int(waiting_req_bytes[2].decode("ascii"))
+                        stg_offset = int(waiting_req_bytes[3].decode("ascii"))
+                        stg_round = int(waiting_req_bytes[4].decode("ascii"))
+                        stg_end = int(waiting_req_bytes[5].decode("ascii"))
+                        stg_session = waiting_req_bytes[6].decode("ascii")
+                        room_infos = self.transfer_infos.get(stg_room, {})
+                        tinfo = room_infos.get(stg_session)
+                        if tinfo is not None:
+                            if not hasattr(tinfo, "staging") or tinfo.staging is None:
+                                tinfo.staging = StagingTransferInfo()
+                            tinfo.staging.set_chunk(
+                                stg_chunk_idx, stg_offset, stg_round, stg_end
+                            )
+                        else:
+                            logger.warning(
+                                "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
+                                stg_room,
+                                stg_chunk_idx,
+                                stg_session,
+                            )
+                    continue
+
                 assert (
                     waiting_req_bytes[0] == GUARD
                 ), f"First message should be {GUARD}. Foreign traffic?"
@@ -1121,6 +1674,18 @@ class NixlKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
+        # Register staging room bootstrap info for staging handler
+        if (
+            self.kv_mgr.enable_staging
+            and hasattr(self.kv_mgr, "_staging_ctx")
+            and self.kv_mgr._staging_ctx is not None
+            and self.kv_mgr._staging_ctx.allocator is not None
+        ):
+            self.chunk_staging_infos = []
+            self.kv_mgr.register_staging_room_bootstrap(
+                self.bootstrap_room, self.bootstrap_infos, self
+            )
+
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
                 f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
@@ -1219,6 +1784,20 @@ class NixlKVReceiver(CommonKVReceiver):
                 struct.pack("I", dim) for dim in state_dim_per_tensor
             )
 
+            # Include staging allocator metadata if available
+            if (
+                self.kv_mgr.enable_staging
+                and hasattr(self.kv_mgr, "_staging_ctx")
+                and self.kv_mgr._staging_ctx is not None
+                and self.kv_mgr._staging_ctx.allocator is not None
+            ):
+                _alloc = self.kv_mgr._staging_ctx.allocator
+                packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
+                staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
+            else:
+                packed_staging_base_ptr = b""
+                staging_total_size_str = b""
+
             with lock:
                 sock.send_multipart(
                     [
@@ -1237,6 +1816,8 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
+                        packed_staging_base_ptr,
+                        staging_total_size_str,
                     ]
                 )
 
