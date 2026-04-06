@@ -110,9 +110,24 @@ class TestGemmaRMSNorm(CustomTestCase):
 
 
 class TestGemma3RMSNorm(CustomTestCase):
-    DTYPES = [torch.half, torch.bfloat16]
-    NUM_TOKENS = [7, 83, 4096]
-    HIDDEN_SIZES = [128, 768, 5120, 8192]
+    DTYPES = [torch.float32, torch.half, torch.bfloat16]
+    NUM_TOKENS = [1, 7, 83, 4096]
+    HIDDEN_SIZES = [
+        128,
+        256,
+        768,
+        769,
+        770,
+        771,
+        3072,
+        5120,
+        5124,
+        5125,
+        5126,
+        8192,
+        8199,
+    ]
+    EPS_VALUES = [1e-6, 1e-5]
     SEEDS = [0]
 
     @classmethod
@@ -121,12 +136,24 @@ class TestGemma3RMSNorm(CustomTestCase):
             raise unittest.SkipTest("CUDA is not available")
         torch.set_default_device("cuda")
 
-    def _run_gemma3_rms_norm_2d(self, num_tokens, hidden_size, dtype, seed):
+    def _run_gemma3_rms_norm_2d(self, num_tokens, hidden_size, dtype, eps, seed):
         torch.manual_seed(seed)
-        layer = Gemma3RMSNorm(hidden_size).to(dtype=dtype)
+        layer = Gemma3RMSNorm(hidden_size, eps=eps).to(dtype=dtype)
         layer.weight.data.normal_(mean=0.0, std=0.1)
         scale = 1 / (2 * hidden_size)
         x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+
+        with torch.inference_mode():
+            ref_out = layer.forward_native(x)
+            out = layer(x)
+
+        self.assertTrue(torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2))
+
+    def _run_gemma3_rms_norm_3d(self, num_tokens, num_heads, head_dim, dtype, seed):
+        torch.manual_seed(seed)
+        layer = Gemma3RMSNorm(head_dim).to(dtype=dtype)
+        layer.weight.data.normal_(mean=0.0, std=0.1)
+        x = torch.randn(num_tokens, num_heads, head_dim, dtype=dtype) * 0.01
 
         with torch.inference_mode():
             ref_out = layer.forward_native(x)
@@ -147,20 +174,35 @@ class TestGemma3RMSNorm(CustomTestCase):
         self.assertTrue(torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2))
 
     def test_gemma3_rms_norm_2d(self):
-        for params in itertools.product(
-            self.NUM_TOKENS, self.HIDDEN_SIZES, self.DTYPES, self.SEEDS
+        for num_tokens, hidden_size, dtype, eps, seed in itertools.product(
+            self.NUM_TOKENS, self.HIDDEN_SIZES, self.DTYPES, self.EPS_VALUES, self.SEEDS
         ):
             with self.subTest(
-                num_tokens=params[0],
-                hidden_size=params[1],
-                dtype=params[2],
-                seed=params[3],
+                num_tokens=num_tokens,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                eps=eps,
+                seed=seed,
             ):
-                self._run_gemma3_rms_norm_2d(*params)
+                self._run_gemma3_rms_norm_2d(num_tokens, hidden_size, dtype, eps, seed)
+
+    def test_gemma3_rms_norm_3d(self):
+        for num_tokens, num_heads, head_dim, dtype in itertools.product(
+            [1, 7, 64], [8, 16], [128, 256], self.DTYPES
+        ):
+            with self.subTest(
+                num_tokens=num_tokens,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+            ):
+                self._run_gemma3_rms_norm_3d(
+                    num_tokens, num_heads, head_dim, dtype, seed=0
+                )
 
     def test_gemma3_rms_norm_4d(self):
         for batch, num_heads, seq_len, head_dim, dtype in itertools.product(
-            [1, 2], [8, 16], [7, 64], [128], self.DTYPES
+            [1, 2], [8, 16], [1, 7, 64], [128, 256], self.DTYPES
         ):
             with self.subTest(
                 batch=batch,
