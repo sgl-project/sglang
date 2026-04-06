@@ -1900,6 +1900,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def configure_kv_cache_dtype(self):
+        self.turboquant_kv_cache = False
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
@@ -1940,12 +1941,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype == "turboquant":
+            # TurboQuant encode→decode round-trip: the cache stores dequantized
+            # values in the model's native dtype while the round-trip introduces
+            # controlled quantization noise.  The actual compression metadata
+            # (codebooks, rotation matrix, outlier mask) lives on each attention
+            # layer and is managed by TurboQuantKVCacheMethod.
+            self.kv_cache_dtype = self.dtype
+            self.turboquant_kv_cache = True
+            self._apply_turboquant_to_layers()
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
+
+    def _apply_turboquant_to_layers(self):
+        """Apply TurboQuantConfig to all RadixAttention layers.
+
+        Called when ``--kv-cache-dtype turboquant`` is specified so that the
+        encode→decode hooks are activated even when the model checkpoint does
+        not embed a TurboQuant quantization config.
+        """
+        from sglang.srt.layers.quantization.turboquant import (
+            TurboQuantConfig,
+            TurboQuantKVCacheMethod,
+        )
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        tq_config = TurboQuantConfig()
+        applied = 0
+        for module in self.model.modules():
+            if isinstance(module, RadixAttention):
+                # Skip layers that already have TurboQuant configured
+                if getattr(module, "tq_config", None) is not None:
+                    continue
+                method = TurboQuantKVCacheMethod(tq_config)
+                method.create_weights(module)
+                applied += 1
+        log_info_on_rank0(
+            logger,
+            f"TurboQuant KV cache enabled on {applied} attention layers",
+        )
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
