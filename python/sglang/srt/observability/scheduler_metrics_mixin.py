@@ -5,7 +5,7 @@ import logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -114,6 +114,7 @@ class SchedulerMetricsMixin:
         self.stats = SchedulerStats()
 
         # Metrics
+        self.enable_mfu_metrics = False
         self.enable_metrics = self.server_args.enable_metrics
         self.is_stats_logging_rank = self.attn_tp_rank == 0
         self.current_scheduler_metrics_enabled = self.enable_metrics and (
@@ -148,6 +149,12 @@ class SchedulerMetricsMixin:
                 enable_hierarchical_cache=self.enable_hierarchical_cache,
                 server_args=self.server_args,
             )
+            self.enable_mfu_metrics = bool(self.server_args.enable_mfu_metrics)
+            if self.enable_mfu_metrics:
+                self._init_estimated_perf_constants()
+                self._mfu_log_flops = 0.0
+                self._mfu_log_read_bytes = 0.0
+                self._mfu_log_write_bytes = 0.0
 
             if ENABLE_METRICS_DEVICE_TIMER:
                 self.forward_pass_device_timer = DeviceTimer(
@@ -174,6 +181,139 @@ class SchedulerMetricsMixin:
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
+
+    def _init_estimated_perf_constants(self: Scheduler) -> None:
+        model_config = self.model_config
+        hf_text_config = model_config.hf_text_config
+
+        hidden_size = float(model_config.hidden_size)
+        num_layers = float(getattr(model_config, "num_attention_layers", 0))
+        head_dim = float(getattr(model_config, "head_dim", 0))
+        num_attn_heads = float(model_config.get_num_attention_heads(self.tp_size))
+        num_kv_heads = float(model_config.get_num_kv_heads(self.tp_size))
+        intermediate_size = getattr(hf_text_config, "intermediate_size", None)
+        if intermediate_size is None:
+            intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
+        intermediate_size = float(intermediate_size)
+
+        dtype_num_bytes = getattr(model_config.dtype, "itemsize", None)
+        if dtype_num_bytes is None:
+            dtype_num_bytes = 2
+        # Keep this estimator lightweight and consistent with current server dtype.
+        # KV cache quantization-aware bytes can be added in a follow-up.
+        act_bytes = float(dtype_num_bytes)
+        w_bytes = float(dtype_num_bytes)
+        cache_bytes = float(dtype_num_bytes)
+
+        # Linear-layer FLOPs per token on one GPU.
+        attn_linear_flops = (
+            2.0 * hidden_size * head_dim * (num_attn_heads + 2.0 * num_kv_heads)
+            + 2.0 * hidden_size * head_dim * num_attn_heads
+        )
+        mlp_flops = (
+            6.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
+        )
+        self._linear_flops_per_token = max(
+            0.0, (attn_linear_flops + mlp_flops) * num_layers
+        )
+
+        # Attention dot-product FLOPs coefficient to multiply token-context product.
+        # attn_qk + attn_av = 4 * q * TC * d * L
+        self._attn_dot_flops_coeff = 4.0 * num_attn_heads * head_dim * num_layers
+
+        # KV cache bytes (write one K and one V vector per generated token).
+        self._kv_cache_bytes_per_token = (
+            2.0 * num_layers * num_kv_heads * head_dim * cache_bytes
+        )
+
+        # Weight read bytes per token.
+        self._weight_read_bytes_per_token = (
+            hidden_size
+            * head_dim
+            * (num_attn_heads + 2.0 * num_kv_heads)
+            * w_bytes
+            * num_layers
+            + hidden_size * head_dim * num_attn_heads * w_bytes * num_layers
+            + (
+                3.0 * hidden_size * intermediate_size * w_bytes * num_layers
+                if intermediate_size > 0
+                else 0.0
+            )
+        )
+
+        # Activation movement bytes per token (coarse approximation).
+        self._qkv_act_bytes_per_token = (
+            hidden_size * act_bytes * num_layers
+            + (num_attn_heads + 2.0 * num_kv_heads) * head_dim * act_bytes * num_layers
+            + head_dim * num_attn_heads * act_bytes * num_layers
+            + hidden_size * act_bytes * num_layers
+        )
+        self._ffn_act_bytes_per_token = (
+            3.0 * intermediate_size * act_bytes * num_layers
+            if intermediate_size > 0
+            else 0.0
+        )
+
+        # Prefill reads Q/K/V activations from on-device memory.
+        self._prefill_attn_act_read_per_token = (
+            (num_attn_heads + 2.0 * num_kv_heads) * head_dim * act_bytes * num_layers
+        )
+
+        # Decode reads Q from activation memory; K/V reads are from KV cache.
+        self._decode_q_read_bytes_per_token = (
+            num_attn_heads * head_dim * act_bytes * num_layers
+        )
+
+    def _estimate_prefill_perf(
+        self: Scheduler, num_tokens: int
+    ) -> Tuple[float, float, float]:
+        tokens = max(0, int(num_tokens))
+        if tokens == 0:
+            return 0.0, 0.0, 0.0
+
+        # Causal prefill token-context product.
+        context_product = tokens * (tokens + 1) / 2.0
+        flops = (
+            tokens * self._linear_flops_per_token
+            + self._attn_dot_flops_coeff * context_product
+        )
+
+        read_bytes = (
+            tokens * self._weight_read_bytes_per_token
+            + tokens * self._qkv_act_bytes_per_token
+            + tokens * self._prefill_attn_act_read_per_token
+        )
+        write_bytes = (
+            tokens * self._kv_cache_bytes_per_token
+            + tokens * self._qkv_act_bytes_per_token
+            + tokens * self._ffn_act_bytes_per_token
+        )
+        return flops, read_bytes, write_bytes
+
+    def _estimate_decode_perf(
+        self: Scheduler, batch: ScheduleBatch, num_tokens: int
+    ) -> Tuple[float, float, float]:
+        tokens = max(0, int(num_tokens))
+        if tokens == 0:
+            return 0.0, 0.0, 0.0
+
+        total_context = float(batch.seq_lens_cpu.sum().item())
+        flops = (
+            tokens * self._linear_flops_per_token
+            + self._attn_dot_flops_coeff * total_context
+        )
+        read_bytes = (
+            tokens * self._weight_read_bytes_per_token
+            + tokens * self._qkv_act_bytes_per_token
+            + tokens * self._decode_q_read_bytes_per_token
+            + total_context * self._kv_cache_bytes_per_token
+        )
+        write_bytes = (
+            tokens * self._kv_cache_bytes_per_token
+            + tokens * self._qkv_act_bytes_per_token
+            + tokens * self._ffn_act_bytes_per_token
+        )
+        return flops, read_bytes, write_bytes
 
     def reset_metrics(self: Scheduler):
         self.forward_ct_decode = 0
@@ -275,6 +415,11 @@ class SchedulerMetricsMixin:
         msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
+        if self.enable_mfu_metrics and gap_latency > 0:
+            flops, _, _ = self._estimate_prefill_perf(prefill_stats.log_input_tokens)
+            tflops_per_s = flops / gap_latency / 1e12
+            msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
+
         if self.is_stats_logging_rank:
             logger.info(msg)
 
@@ -287,6 +432,15 @@ class SchedulerMetricsMixin:
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
                 dp_cooperation_info=dp_cooperation_info,
             )
+            if self.enable_mfu_metrics:
+                flops, read_bytes, write_bytes = self._estimate_prefill_perf(
+                    prefill_stats.log_input_tokens
+                )
+                self.metrics_collector.increment_estimated_perf(
+                    num_flops_per_gpu=flops,
+                    num_read_bytes_per_gpu=read_bytes,
+                    num_write_bytes_per_gpu=write_bytes,
+                )
 
             # Basics
             total_tokens = prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
@@ -354,11 +508,24 @@ class SchedulerMetricsMixin:
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
+            decode_tokens = batch.batch_size() + num_accepted_tokens
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
-                decode_tokens=batch.batch_size() + num_accepted_tokens,
+                decode_tokens=decode_tokens,
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
+            if self.enable_mfu_metrics:
+                flops, read_bytes, write_bytes = self._estimate_decode_perf(
+                    batch, decode_tokens
+                )
+                self.metrics_collector.increment_estimated_perf(
+                    num_flops_per_gpu=flops,
+                    num_read_bytes_per_gpu=read_bytes,
+                    num_write_bytes_per_gpu=write_bytes,
+                )
+                self._mfu_log_flops += flops
+                self._mfu_log_read_bytes += read_bytes
+                self._mfu_log_write_bytes += write_bytes
 
             if x := self.scheduler_status_logger:
                 x.maybe_dump(batch, self.waiting_queue)
@@ -489,6 +656,22 @@ class SchedulerMetricsMixin:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
+
+        if self.enable_mfu_metrics and gap_latency > 0:
+            flops_per_s = self._mfu_log_flops / gap_latency
+            read_bytes_per_s = self._mfu_log_read_bytes / gap_latency
+            write_bytes_per_s = self._mfu_log_write_bytes / gap_latency
+            tflops_per_s = flops_per_s / 1e12
+            read_gb_per_s = read_bytes_per_s / 1e9
+            write_gb_per_s = write_bytes_per_s / 1e9
+            msg += (
+                f", est. decode TFLOPS/s (per GPU): {tflops_per_s:.2f}, "
+                f"est. read BW (GB/s per GPU): {read_gb_per_s:.2f}, "
+                f"est. write BW (GB/s per GPU): {write_gb_per_s:.2f}"
+            )
+            self._mfu_log_flops = 0.0
+            self._mfu_log_read_bytes = 0.0
+            self._mfu_log_write_bytes = 0.0
 
         if self.is_stats_logging_rank:
             logger.info(msg)

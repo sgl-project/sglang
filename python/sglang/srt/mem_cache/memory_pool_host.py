@@ -1,10 +1,17 @@
+from __future__ import annotations
+
 import abc
 import logging
 import threading
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import wraps
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+
+import numpy as np
 import psutil
 import torch
 
@@ -15,10 +22,17 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
 from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer_mla as jit_transfer_hicache_all_layer_mla,
+)
+from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
+)
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
+    MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
@@ -301,8 +315,16 @@ class MHATokenToKVPoolHost(HostKVCache):
             element_size=self.element_dim * self.dtype.itemsize
         )
 
-        self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
-        self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        if self.layout == "page_first":
+            # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
+            # This swaps strides without copying data
+            k_transposed = self.k_buffer.transpose(0, 1)
+            v_transposed = self.v_buffer.transpose(0, 1)
+            self.k_data_refs = [k_transposed[i] for i in range(self.layer_num)]
+            self.v_data_refs = [v_transposed[i] for i in range(self.layer_num)]
+        else:
+            self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
+            self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_data_refs],
             dtype=torch.uint64,
@@ -401,17 +423,31 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                     )
             elif self.layout == "page_first":
-                transfer_kv_per_layer_pf_lf(
-                    src_k=self.k_buffer,
-                    dst_k=device_pool.k_buffer[layer_id],
-                    src_v=self.v_buffer,
-                    dst_v=device_pool.v_buffer[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    item_size=self.token_stride_size,
-                    src_layout_dim=self.layout_dim,
-                )
+                if self.can_use_jit:
+                    # Transpose [page, layer, ...] -> [layer, page, ...] then
+                    # index by layer_id to get a per-layer view with strided layout.
+                    # The kernel handles different src/dst strides automatically.
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=device_pool.k_buffer[layer_id],
+                        v_cache_dst=device_pool.v_buffer[layer_id],
+                        k_cache_src=self.k_data_refs[layer_id],
+                        v_cache_src=self.v_data_refs[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_pf_lf(
+                        src_k=self.k_buffer,
+                        dst_k=device_pool.k_buffer[layer_id],
+                        src_v=self.v_buffer,
+                        dst_v=device_pool.v_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                    )
             elif self.layout == "page_head":
                 transfer_kv_per_layer_ph_lf(
                     src_k=self.k_buffer,
@@ -502,17 +538,32 @@ class MHATokenToKVPoolHost(HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_first":
-                transfer_kv_all_layer_lf_pf(
-                    src_k_layers=device_pool.k_data_ptrs,
-                    dst_k=self.k_buffer,
-                    src_v_layers=device_pool.v_data_ptrs,
-                    dst_v=self.v_buffer,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    dst_layout_dim=self.layout_dim,
-                    num_layers=self.layer_num,
-                )
+                if self.can_use_jit:
+                    # Use transposed data ptrs so the kernel writes to
+                    # [layer, page, item] view with stride layout_dim per token.
+                    jit_transfer_hicache_all_layer(
+                        k_ptr_dst=self.k_data_ptrs,
+                        v_ptr_dst=self.v_data_ptrs,
+                        indices_dst=host_indices,
+                        k_ptr_src=device_pool.k_data_ptrs,
+                        v_ptr_src=device_pool.v_data_ptrs,
+                        indices_src=device_indices,
+                        kv_cache_src_stride_bytes=self.token_stride_size,
+                        kv_cache_dst_stride_bytes=self.layout_dim,
+                        element_size=self.element_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer_lf_pf(
+                        src_k_layers=device_pool.k_data_ptrs,
+                        dst_k=self.k_buffer,
+                        src_v_layers=device_pool.v_data_ptrs,
+                        dst_v=self.v_buffer,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
+                        num_layers=self.layer_num,
+                    )
             elif self.layout == "page_head":
                 transfer_kv_all_layer_lf_ph(
                     src_k_layers=device_pool.k_data_ptrs,
@@ -758,12 +809,30 @@ class MLATokenToKVPoolHost(HostKVCache):
             device,
             allocator_type,
         )
-        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.kv_cache_dim * self.dtype.itemsize
+        )
+
+        if self.layout == "page_first" and self.can_use_jit:
+            # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
+            # This swaps strides without copying data
+            transposed = self.kv_buffer.transpose(0, 1)
+            self.data_refs = [transposed[i] for i in range(self.layer_num)]
+        else:
+            self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.data_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+
+    def get_contiguous_buf_infos(self):
+        """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
+        for registering host memory with the disaggregation transfer engine."""
+        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [self.token_stride_size] * self.layer_num
+        return data_ptrs, data_lens, item_lens
 
     def get_size_per_token(self):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
@@ -856,23 +925,41 @@ class MLATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                transfer_kv_per_layer_mla(
-                    src=self.kv_buffer[layer_id],
-                    dst=device_pool.kv_buffer[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    item_size=self.token_stride_size,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=device_pool.kv_buffer[layer_id],
+                        cache_src=self.kv_buffer[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_mla(
+                        src=self.kv_buffer[layer_id],
+                        dst=device_pool.kv_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        item_size=self.token_stride_size,
+                    )
             elif self.layout == "page_first":
-                transfer_kv_per_layer_mla_pf_lf(
-                    src=self.kv_buffer,
-                    dst=device_pool.kv_buffer[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    item_size=self.token_stride_size,
-                    src_layout_dim=self.layout_dim,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer_mla(
+                        cache_dst=device_pool.kv_buffer[layer_id],
+                        cache_src=self.data_refs[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.kv_cache_dim,
+                    )
+                else:
+                    transfer_kv_per_layer_mla_pf_lf(
+                        src=self.kv_buffer,
+                        dst=device_pool.kv_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -921,24 +1008,46 @@ class MLATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                transfer_kv_all_layer_mla(
-                    src_layers=device_pool.data_ptrs,
-                    dst_layers=self.data_ptrs,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    num_layers=self.layer_num,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_all_layer_mla(
+                        ptr_dst=self.data_ptrs,
+                        indices_dst=host_indices,
+                        ptr_src=device_pool.data_ptrs,
+                        indices_src=device_indices,
+                        cache_dst_stride_bytes=self.token_stride_size,
+                        cache_src_stride_bytes=self.token_stride_size,
+                        element_size=self.kv_cache_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer_mla(
+                        src_layers=device_pool.data_ptrs,
+                        dst_layers=self.data_ptrs,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        num_layers=self.layer_num,
+                    )
             elif self.layout == "page_first":
-                transfer_kv_all_layer_mla_lf_pf(
-                    src_layers=device_pool.data_ptrs,
-                    dst=self.kv_buffer,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    dst_layout_dim=self.layout_dim,
-                    num_layers=self.layer_num,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_all_layer_mla(
+                        ptr_dst=self.data_ptrs,
+                        indices_dst=host_indices,
+                        ptr_src=device_pool.data_ptrs,
+                        indices_src=device_indices,
+                        cache_src_stride_bytes=self.token_stride_size,
+                        cache_dst_stride_bytes=self.layout_dim,
+                        element_size=self.kv_cache_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer_mla_lf_pf(
+                        src_layers=device_pool.data_ptrs,
+                        dst=self.kv_buffer,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        dst_layout_dim=self.layout_dim,
+                        num_layers=self.layer_num,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -1072,6 +1181,526 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class MambaPoolHost(HostKVCache):
+
+    def __init__(
+        self,
+        device_pool: MambaPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+        layout: str = "layer_first",
+    ):
+        self.device_pool = device_pool
+        self.page_size = 1
+        assert layout in [
+            "page_first",
+            "page_first_direct",
+            "layer_first",
+        ], f"Unsupported layout: {layout}"
+
+        self.layout = layout
+        self.pin_memory = pin_memory
+        self.device = device
+        self.allocator = get_allocator_from_storage(allocator_type)
+        self.num_mamba_layers = device_pool.num_mamba_layers
+
+        self.conv_state_shapes = [
+            conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
+        ]
+        self.temporal_state_shape = device_pool.mamba_cache.temporal.shape[2:]
+        self.conv_dtype = device_pool.mamba_cache.conv[0].dtype
+        self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
+        self.dtype = self.conv_dtype
+        self.size_per_token = self.get_size_per_token()
+
+        if host_size > 0:
+            self.size = int(host_size * 1e9 // self.size_per_token)
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
+
+        self.page_num = self.size // self.page_size + 1
+        self.size = self.page_num * self.page_size
+
+        assert (
+            self.size > device_pool.size
+        ), "The host memory should be larger than the device memory with the current protocol"
+
+        host_mem = psutil.virtual_memory()
+        requested_bytes = self.size * self.size_per_token
+        ten_gb = 10 * (1024**3)
+        available_bytes = host_mem.available - ten_gb
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory available. Requesting "
+                f"{requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                f"size of the hierarchical cache."
+            )
+        logger.info(
+            "Allocating %.2f GB host memory for hierarchical Mamba cache (layout=%s).",
+            requested_bytes / 1e9,
+            self.layout,
+        )
+
+        self.init_kv_buffer()
+        self.lock = threading.RLock()
+        self.clear()
+
+    def init_kv_buffer(self):
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+
+        if self.layout in ["page_first", "page_first_direct"]:
+            # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
+            temporal_dims = (
+                self.size,
+                self.num_mamba_layers,
+                1,
+            ) + self.temporal_state_shape
+            self.temporal_buffer = alloc_func(
+                temporal_dims,
+                dtype=self.temporal_dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            self.conv_buffer = []
+            for conv_shape in self.conv_state_shapes:
+                conv_dims = (self.size, self.num_mamba_layers, 1) + conv_shape
+                self.conv_buffer.append(
+                    alloc_func(
+                        conv_dims,
+                        dtype=self.conv_dtype,
+                        device=self.device,
+                        pin_memory=self.pin_memory,
+                        allocator=self.allocator,
+                    )
+                )
+        else:
+            # layer-first: (num_layers, size, *shape)
+            temporal_dims = (
+                self.num_mamba_layers,
+                self.size,
+            ) + self.temporal_state_shape
+            self.temporal_buffer = alloc_func(
+                temporal_dims,
+                dtype=self.temporal_dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            self.conv_buffer = []
+            for conv_shape in self.conv_state_shapes:
+                conv_dims = (self.num_mamba_layers, self.size) + conv_shape
+                self.conv_buffer.append(
+                    alloc_func(
+                        conv_dims,
+                        dtype=self.conv_dtype,
+                        device=self.device,
+                        pin_memory=self.pin_memory,
+                        allocator=self.allocator,
+                    )
+                )
+
+    def _iter_page_tensors(self, index: int):
+        if self.layout in ["page_first", "page_first_direct"]:
+            yield self.temporal_buffer[index]
+            for conv_buf in self.conv_buffer:
+                yield conv_buf[index]
+        else:
+            yield self.temporal_buffer[:, index : index + self.page_size]
+            for conv_buf in self.conv_buffer:
+                yield conv_buf[:, index : index + self.page_size]
+
+    @staticmethod
+    def _flatten_tensor_bytes(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.contiguous().view(torch.uint8).reshape(-1)
+
+    @synchronized
+    def clear(self):
+        self.mem_state = torch.zeros(
+            (self.size,), dtype=torch.uint8, device=self.device
+        )
+        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    @synchronized
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        assert (
+            need_size % self.page_size == 0
+        ), "The requested size should be a multiple of the page size."
+        if need_size > self.available_size():
+            return None
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        return select_index
+
+    @synchronized
+    def free(self, indices: torch.Tensor) -> int:
+        self.free_slots = torch.cat([self.free_slots, indices])
+        return len(indices)
+
+    def get_size_per_token(self):
+        conv_total_size = 0
+        for conv_shape in self.conv_state_shapes:
+            conv_total_size += int(np.prod(conv_shape)) * self.conv_dtype.itemsize
+        temporal_size = (
+            int(np.prod(self.temporal_state_shape)) * self.temporal_dtype.itemsize
+        )
+        return (conv_total_size + temporal_size) * self.num_mamba_layers
+
+    def get_ksize_per_token(self):
+        return self.get_size_per_token()
+
+    @staticmethod
+    def _item_size_per_index(tensor: torch.Tensor) -> int:
+        if tensor.shape[0] == 0:
+            return 0
+        return int(tensor[0].numel() * tensor.element_size())
+
+    @staticmethod
+    def _copy_tensor(
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        io_backend: str,
+    ) -> None:
+        if src_indices.numel() == 0:
+            return
+        if io_backend == "kernel":
+            # TODO: Rename the interface for clarity.
+            # Here, transfer_kv_per_layer_mla is reused to transfer the Mamba state.
+            # This has nothing to do with MLA; it's only reused because this interface happens to transfer a single Pool.
+            transfer_kv_per_layer_mla(
+                src=src,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                item_size=MambaPoolHost._item_size_per_index(src),
+            )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=[src],
+                dst_layers=[dst],
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                page_size=1,
+            )
+        else:
+            raise ValueError(f"Unsupported io_backend: {io_backend}")
+
+    @staticmethod
+    def _copy_tensor_pf_lf(
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        layer_id: int,
+        num_layers: int,
+        io_backend: str,
+    ) -> None:
+        if src_indices.numel() == 0:
+            return
+        if io_backend == "kernel":
+            item_size = MambaPoolHost._item_size_per_index(dst)
+            transfer_kv_per_layer_mla_pf_lf(
+                src=src,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                layer_id=layer_id,
+                item_size=item_size,
+                src_layout_dim=item_size * num_layers,
+            )
+        elif io_backend == "direct":
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[src],
+                dst_ptrs=[dst],
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                layer_id=layer_id,
+                page_size=1,
+            )
+        else:
+            raise ValueError(f"Unsupported io_backend: {io_backend}")
+
+    @staticmethod
+    def _copy_tensor_all_layers_lf_pf(
+        src_layers: torch.Tensor,
+        dst: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        num_layers: int,
+        device: str,
+        io_backend: str,
+    ) -> None:
+        if src_indices.numel() == 0:
+            return
+        if io_backend == "kernel":
+            item_size = MambaPoolHost._item_size_per_index(src_layers[0])
+            src_ptrs = torch.tensor(
+                [src_layers[i].data_ptr() for i in range(num_layers)],
+                dtype=torch.uint64,
+                device=device,
+            )
+            transfer_kv_all_layer_mla_lf_pf(
+                src_layers=src_ptrs,
+                dst=dst,
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                item_size=item_size,
+                dst_layout_dim=item_size * num_layers,
+                num_layers=num_layers,
+            )
+        elif io_backend == "direct":
+            src_ptrs = [src_layers[i] for i in range(num_layers)]
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=src_ptrs,
+                dst_ptrs=[dst],
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                page_size=1,
+            )
+        else:
+            raise ValueError(f"Unsupported io_backend: {io_backend}")
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend="kernel",
+    ):
+        if self.layout in ["page_first", "page_first_direct"]:
+            self._copy_tensor_pf_lf(
+                src=self.temporal_buffer,
+                dst=device_pool.mamba_cache.temporal[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                layer_id=layer_id,
+                num_layers=self.num_mamba_layers,
+                io_backend=io_backend,
+            )
+            for conv_idx in range(len(self.conv_state_shapes)):
+                self._copy_tensor_pf_lf(
+                    src=self.conv_buffer[conv_idx],
+                    dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    num_layers=self.num_mamba_layers,
+                    io_backend=io_backend,
+                )
+        else:
+            self._copy_tensor(
+                self.temporal_buffer[layer_id],
+                device_pool.mamba_cache.temporal[layer_id],
+                host_indices,
+                device_indices,
+                io_backend,
+            )
+            for conv_idx in range(len(self.conv_state_shapes)):
+                self._copy_tensor(
+                    self.conv_buffer[conv_idx][layer_id],
+                    device_pool.mamba_cache.conv[conv_idx][layer_id],
+                    host_indices,
+                    device_indices,
+                    io_backend,
+                )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend="kernel"
+    ):
+        if self.layout in ["page_first", "page_first_direct"]:
+            self._copy_tensor_all_layers_lf_pf(
+                src_layers=device_pool.mamba_cache.temporal,
+                dst=self.temporal_buffer,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                num_layers=self.num_mamba_layers,
+                device=self.device_pool.device,
+                io_backend=io_backend,
+            )
+            for conv_idx in range(len(self.conv_state_shapes)):
+                self._copy_tensor_all_layers_lf_pf(
+                    src_layers=device_pool.mamba_cache.conv[conv_idx],
+                    dst=self.conv_buffer[conv_idx],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    num_layers=self.num_mamba_layers,
+                    device=self.device_pool.device,
+                    io_backend=io_backend,
+                )
+        else:
+            for layer_id in range(self.num_mamba_layers):
+                self._copy_tensor(
+                    device_pool.mamba_cache.temporal[layer_id],
+                    self.temporal_buffer[layer_id],
+                    device_indices,
+                    host_indices,
+                    io_backend,
+                )
+                for conv_idx in range(len(self.conv_state_shapes)):
+                    self._copy_tensor(
+                        device_pool.mamba_cache.conv[conv_idx][layer_id],
+                        self.conv_buffer[conv_idx][layer_id],
+                        device_indices,
+                        host_indices,
+                        io_backend,
+                    )
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        data_page = torch.cat(
+            [
+                self._flatten_tensor_bytes(tensor)
+                for tensor in self._iter_page_tensors(index)
+            ]
+        )
+        return data_page.flatten() if flat else data_page
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(
+            self.page_size * self.size_per_token,
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    def set_from_flat_data_page(
+        self,
+        index: int,
+        data_page: torch.Tensor,
+    ) -> None:
+        flat_bytes = data_page.contiguous().view(torch.uint8).reshape(-1)
+        start = 0
+        for tensor in self._iter_page_tensors(index):
+            num_bytes = tensor.numel() * tensor.element_size()
+            tensor_bytes = flat_bytes[start : start + num_bytes]
+            start += num_bytes
+            restored = tensor_bytes.view(dtype=tensor.dtype).reshape(tensor.shape)
+            tensor.copy_(restored)
+
+
+@dataclass
+class PoolEntry:
+    name: PoolName
+    host_pool: Any
+    device_pool: Any
+    layer_mapper: Callable[[int], Optional[int]]
+    is_primary_index_anchor: bool = False
+    # Optional eviction callbacks for auto-alloc in HybridCacheController.
+    # host_evict_fn(n): evict n slots from the host pool (used by write()).
+    # device_evict_fn(n): evict n slots from the device pool (used by load()).
+    host_evict_fn: Optional[Callable] = None
+    device_evict_fn: Optional[Callable] = None
+
+
+class HostPoolGroup:
+    def __init__(self, entries: list[PoolEntry]):
+        if not entries:
+            raise ValueError("HostPoolGroup requires at least one pool entry.")
+        self.entries = entries
+        self.entry_map = {entry.name: entry for entry in entries}
+        self.anchor_entry = next(
+            (entry for entry in entries if entry.is_primary_index_anchor),
+            entries[0],
+        )
+
+        self.layout = self.anchor_entry.host_pool.layout
+        self.page_size = self.anchor_entry.host_pool.page_size
+        self.device = self.anchor_entry.host_pool.device
+        self.size = self.anchor_entry.host_pool.size
+
+    def clear(self) -> None:
+        for entry in self.entries:
+            entry.host_pool.clear()
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        return self.anchor_entry.host_pool.alloc(need_size)
+
+    def free(self, indices: torch.Tensor) -> int:
+        return self.anchor_entry.host_pool.free(indices)
+
+    def get_data_page(self, index, flat: bool = True):
+        return self.anchor_entry.host_pool.get_data_page(index, flat)
+
+    def get_dummy_flat_data_page(self):
+        return self.anchor_entry.host_pool.get_dummy_flat_data_page()
+
+    def set_from_flat_data_page(self, index: int, data_page) -> None:
+        return self.anchor_entry.host_pool.set_from_flat_data_page(index, data_page)
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        pool_transfers: Optional[list] = None,
+    ) -> None:
+        # 1. Anchor (KV) transfer
+        anchor = self.anchor_entry
+        local_layer_id = anchor.layer_mapper(layer_id)
+        if local_layer_id is not None and host_indices.numel() > 0:
+            anchor.host_pool.load_to_device_per_layer(
+                anchor.device_pool,
+                host_indices,
+                device_indices,
+                local_layer_id,
+                io_backend,
+            )
+
+        # 2. Extra pool transfers
+        for transfer in pool_transfers or []:
+            entry = self.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
+                continue
+            local_layer_id = entry.layer_mapper(layer_id)
+            if local_layer_id is None:
+                continue
+            entry.host_pool.load_to_device_per_layer(
+                entry.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                local_layer_id,
+                io_backend,
+            )
+
+    def backup_from_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        pool_transfers: Optional[list] = None,
+    ) -> None:
+        # 1. Anchor (KV) backup
+        self.anchor_entry.host_pool.backup_from_device_all_layer(
+            self.anchor_entry.device_pool,
+            host_indices,
+            device_indices,
+            io_backend,
+        )
+        # 2. Extra pool backup
+        for transfer in pool_transfers or []:
+            entry = self.entry_map.get(transfer.name)
+            if entry is None or transfer.host_indices is None:
+                continue
+            entry.host_pool.backup_from_device_all_layer(
+                entry.device_pool,
+                transfer.host_indices,
+                transfer.device_indices,
+                io_backend,
+            )
 
 
 class NSATokenToKVPoolHost(MLATokenToKVPoolHost):

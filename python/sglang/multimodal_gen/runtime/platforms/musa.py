@@ -72,6 +72,11 @@ class MusaPlatformBase(Platform):
     device_control_env_var: str = "MUSA_VISIBLE_DEVICES"
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return False
+
+    @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device(f"musa:{envs.LOCAL_RANK}")
 
@@ -150,10 +155,61 @@ class MusaPlatformBase(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
-        logger.info("Using Torch SDPA backend.")
-        return (
-            "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-        )
+        target_backend: AttentionBackendEnum | None = None
+
+        if selected_backend == AttentionBackendEnum.TORCH_SDPA:
+            logger.info("Using Torch SDPA backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+        elif selected_backend in [
+            AttentionBackendEnum.FA,
+        ]:
+            target_backend = AttentionBackendEnum.FA
+        elif selected_backend:
+            raise ValueError(f"Invalid attention backend for {cls.device_name}")
+        else:
+            target_backend = AttentionBackendEnum.FA
+
+        # Ensure we have a target backend selected before validation/fallback.
+        if target_backend is None:
+            target_backend = AttentionBackendEnum.FA
+
+        if dtype not in (torch.float16, torch.bfloat16):
+            logger.info(
+                "Cannot use FlashAttention backend for dtype other than "
+                "torch.float16 or torch.bfloat16."
+            )
+            target_backend = AttentionBackendEnum.TORCH_SDPA
+
+        # FlashAttn is valid for the model, checking if the package is
+        # installed.
+        if target_backend == AttentionBackendEnum.FA:
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
+                    FlashAttentionBackend,
+                )
+
+                supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
+                if head_size not in supported_sizes:
+                    logger.info(
+                        "Cannot use FlashAttention backend for head size %d.",
+                        head_size,
+                    )
+                    target_backend = AttentionBackendEnum.TORCH_SDPA
+            except ImportError:
+                logger.info(
+                    "Cannot use FlashAttention backend because the "
+                    "flash_attn package is not found. "
+                    "Make sure that flash_attn was built and installed "
+                    "(on by default)."
+                )
+                target_backend = AttentionBackendEnum.TORCH_SDPA
+
+        if target_backend == AttentionBackendEnum.TORCH_SDPA:
+            logger.info("Using Torch SDPA backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+
+        logger.info("Using FlashAttention (FA3) backend on MUSA")
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

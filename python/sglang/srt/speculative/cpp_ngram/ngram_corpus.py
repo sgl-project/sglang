@@ -1,29 +1,15 @@
 # -*- coding: utf-8 -*-
 
 import logging
-import os
 from collections.abc import Iterable, Iterator, Sequence
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from torch.utils.cpp_extension import load
 
+from sglang.jit_kernel.ngram_corpus import get_ngram_corpus_cls
 from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
 
 logger = logging.getLogger(__name__)
-
-_abs_path = os.path.dirname(os.path.abspath(__file__))
-ngram_corpus_cpp = load(
-    name="ngram_corpus_cpp",
-    sources=[
-        f"{_abs_path}/ngram_corpus_binding.cpp",
-        f"{_abs_path}/ngram.cpp",
-        f"{_abs_path}/trie.cpp",
-        f"{_abs_path}/suffix_automaton.cpp",
-        f"{_abs_path}/result.cpp",
-    ],
-    extra_cflags=["-O3", "-std=c++20"],
-)
 
 
 # Convenience path for pre-tokenized in-memory documents. The main serving
@@ -65,16 +51,22 @@ class NgramCorpus:
         external_sam_budget=0,
         external_corpus_max_tokens=10000000,
         external_corpus_documents: Optional[Iterable[Sequence[int]]] = None,
-    ):
-        param = ngram_corpus_cpp.Param()
-        param.max_trie_depth = max_trie_depth
-        param.min_bfs_breadth = min_bfs_breadth
-        param.max_bfs_breadth = max_bfs_breadth
-        param.draft_token_num = draft_token_num
-        param.external_sam_budget = external_sam_budget
-        param.external_corpus_max_tokens = external_corpus_max_tokens
-        param.match_type = match_type
-        self._ngram = ngram_corpus_cpp.Ngram(capacity, param)
+    ) -> None:
+        cls = get_ngram_corpus_cls()
+        self._obj = cls(
+            capacity=capacity,
+            max_trie_depth=max_trie_depth,
+            min_bfs_breadth=min_bfs_breadth,
+            max_bfs_breadth=max_bfs_breadth,
+            draft_token_num=draft_token_num,
+            match_type=match_type,
+            external_sam_budget=external_sam_budget,
+            external_corpus_max_tokens=external_corpus_max_tokens,
+        )
+        self.default_mask = np.ones((1, 1), dtype=np.int64)
+        self.draft_token_num = draft_token_num
+        self._req_id_to_state_id: Dict[str, int] = {}
+        self._next_state_id: int = 0
         self.external_corpus_token_count = 0
         if external_corpus_documents is not None:
             self.load_external_corpus(
@@ -83,14 +75,19 @@ class NgramCorpus:
                 )
             )
 
-        self.default_mask = np.ones((1, 1), dtype=np.int64)
-        self.draft_token_num = draft_token_num
+    def _get_state_id(self, req_id: str) -> int:
+        sid = self._req_id_to_state_id.get(req_id)
+        if sid is None:
+            sid = self._next_state_id
+            self._next_state_id += 1
+            self._req_id_to_state_id[req_id] = sid
+        return sid
 
     def batch_put(self, batch_tokens: List[List[int]]):
-        self._ngram.asyncInsert(batch_tokens)
+        self._obj.insert(batch_tokens)
 
     def synchronize(self):
-        self._ngram.synchronize()
+        self._obj.synchronize()  # type: ignore
 
     def load_external_corpus(self, chunks: Iterable[Sequence[int]]) -> int:
         """Load pre-chunked external corpus tokens.
@@ -100,12 +97,14 @@ class NgramCorpus:
         `iter_external_corpus_chunks()` and `external_corpus_documents=` handle
         `external_corpus_max_tokens` validation before handing chunks to C++.
         """
-        _, loaded_token_count = self._ngram.loadExternalCorpus(chunks)
+        _, loaded_token_count = self._obj.load_external_corpus(chunks)
         self.external_corpus_token_count = loaded_token_count
         return loaded_token_count
 
     def reset(self):
-        self._ngram.reset()
+        self._obj.reset()  # type: ignore
+        self._req_id_to_state_id.clear()
+        self._next_state_id = 0
 
     def batch_get(
         self,
@@ -113,11 +112,17 @@ class NgramCorpus:
         batch_tokens: List[List[int]],
         total_lens: List[int],
     ) -> Tuple[np.ndarray, np.ndarray]:
-        result = self._ngram.batchMatch(req_ids, batch_tokens, total_lens)
-        return np.array(result.token), np.array(result.mask)
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
 
     def erase_match_state(self, req_ids: List[str]):
-        self._ngram.eraseMatchState(req_ids)
+        state_ids = []
+        for rid in req_ids:
+            sid = self._req_id_to_state_id.pop(rid, None)
+            if sid is not None:
+                state_ids.append(sid)
+        if state_ids:
+            self._obj.erase_states(state_ids)
 
     def leaf_paths_from_mask(
         self, tokens: List[int], tree_mask: List[List[int]]

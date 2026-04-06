@@ -610,6 +610,8 @@ pub fn build_app(
         .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
+        .route("/server_info", get(get_server_info))
+        // TODO: Remove `/get_server_info` alias after one release-cycle deprecation window.
         .route("/get_server_info", get(get_server_info));
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
