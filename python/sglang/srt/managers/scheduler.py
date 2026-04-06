@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -856,6 +857,10 @@ class Scheduler(
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self._pending_flush: Optional[Tuple[FlushCacheReqInput, float]] = None
+        self._pending_corpus_load: Optional[
+            Tuple[AddExternalCorpusReqInput, threading.Thread]
+        ] = None
+        self._corpus_load_result: Optional[AddExternalCorpusReqOutput] = None
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
@@ -1620,6 +1625,7 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
 
         self._check_pending_flush()
+        self._check_pending_corpus_load()
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -2880,26 +2886,51 @@ class Scheduler(
                 pending_req,
             )
 
+    def _check_pending_corpus_load(self):
+        if self._pending_corpus_load is None:
+            return
+        recv_req, thread = self._pending_corpus_load
+        if thread.is_alive():
+            return
+        self._pending_corpus_load = None
+        result = self._corpus_load_result
+        self._corpus_load_result = None
+        self.send_to_tokenizer.send_output(result, recv_req)
+
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
-    ) -> AddExternalCorpusReqOutput:
+    ) -> Optional[AddExternalCorpusReqOutput]:
         if self.draft_worker is None or not self.spec_algorithm.is_ngram():
             return AddExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
             )
-        try:
-            loaded = self.draft_worker.add_external_corpus(
-                recv_req.corpus_id, recv_req.token_chunks
-            )
+        if self._pending_corpus_load is not None:
             return AddExternalCorpusReqOutput(
-                success=True,
-                corpus_id=recv_req.corpus_id,
-                message=f"Loaded corpus '{recv_req.corpus_id}' with {loaded} tokens.",
-                loaded_token_count=loaded,
+                success=False,
+                message="Another corpus load is already in progress.",
             )
-        except Exception as e:
-            return AddExternalCorpusReqOutput(success=False, message=str(e))
+
+        def _build():
+            try:
+                loaded = self.draft_worker.add_external_corpus(
+                    recv_req.corpus_id, recv_req.token_chunks
+                )
+                self._corpus_load_result = AddExternalCorpusReqOutput(
+                    success=True,
+                    corpus_id=recv_req.corpus_id,
+                    message=f"Loaded corpus '{recv_req.corpus_id}' with {loaded} tokens.",
+                    loaded_token_count=loaded,
+                )
+            except Exception as e:
+                self._corpus_load_result = AddExternalCorpusReqOutput(
+                    success=False, message=str(e)
+                )
+
+        thread = threading.Thread(target=_build, daemon=True)
+        self._pending_corpus_load = (recv_req, thread)
+        thread.start()
+        return None  # response sent later by _check_pending_corpus_load
 
     def remove_external_corpus(
         self, recv_req: RemoveExternalCorpusReqInput

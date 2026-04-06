@@ -63,14 +63,16 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
   }
 }
 
+// NOTE: staging operations (start/append/finish) are called from a background
+// thread during async corpus loading. They do NOT hold mutex_ because
+// staging_sam_ is disjoint from sams_ / trie_. Only finishExternalCorpusLoad
+// briefly acquires mutex_ when moving the completed SAM into sams_.
 void Ngram::startExternalCorpusLoad(const std::string& corpus_id) {
-  std::unique_lock<std::mutex> lock(mutex_);
   staging_corpus_id_ = corpus_id;
   staging_sam_ = std::make_unique<SuffixAutomaton>();
 }
 
 void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
-  std::unique_lock<std::mutex> lock(mutex_);
   if (!staging_sam_) {
     throw std::runtime_error("appendExternalCorpusTokens called without startExternalCorpusLoad");
   }
@@ -78,7 +80,6 @@ void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
 }
 
 void Ngram::finishExternalCorpusLoad() {
-  std::unique_lock<std::mutex> lock(mutex_);
   if (!staging_sam_) {
     throw std::runtime_error("finishExternalCorpusLoad called without startExternalCorpusLoad");
   }
@@ -88,7 +89,10 @@ void Ngram::finishExternalCorpusLoad() {
     staging_corpus_id_.clear();
     throw std::runtime_error("External corpus is empty — no tokens were loaded.");
   }
+  // Only lock briefly to install the completed SAM.
+  std::unique_lock<std::mutex> lock(mutex_);
   sams_[staging_corpus_id_] = std::move(staging_sam_);
+  lock.unlock();
   staging_sam_.reset();
   staging_corpus_id_.clear();
 }
