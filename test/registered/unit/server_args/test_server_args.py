@@ -449,6 +449,33 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertEqual(server_args.speculative_ngram_external_sam_budget, 4)
         self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
 
+    def _make_dummy_ngram_args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "NGRAM"
+        args.speculative_num_draft_tokens = 12
+        args.device = "cuda"
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_external_sam_budget_must_fit_draft_budget(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_num_draft_tokens=4,
+                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+                speculative_ngram_external_sam_budget=4,
+            )._handle_speculative_decoding()
+        self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
+
+    def test_external_corpus_max_tokens_must_be_positive(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+                speculative_ngram_external_sam_budget=2,
+                speculative_ngram_external_corpus_max_tokens=0,
+            )._handle_speculative_decoding()
+        self.assertIn("external-corpus-max-tokens", str(context.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
