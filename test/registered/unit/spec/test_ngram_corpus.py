@@ -721,7 +721,7 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         self.addCleanup(os.remove, path)
 
         loaded_token_count = corpus.load_external_corpus_named(
-            "__default__",
+            path,
             iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=8),
         )
         # 5 doc tokens + 1 separator + 2 doc tokens = 8
@@ -748,7 +748,7 @@ class TestNgramCorpusExternalSam(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "token limit"):
             corpus.load_external_corpus_named(
-                "__default__",
+                path,
                 iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=4),
             )
 
