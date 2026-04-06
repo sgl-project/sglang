@@ -344,26 +344,20 @@ inline float reduce_sum_f32m1(vfloat32m1_t v_acc, size_t vl_max) {
 }
 
 // Widening Multiply-Accumulate Support
+// These helpers require the Zvfh extension (vfloat16m2_t type is zvfh-only).
+
+#if defined(__riscv_zvfh)
 
 // FP16 Vector-Vector -> FP32 Accumulator
 inline vfloat32m4_t vfwmacc_f16_to_f32m4(vfloat32m4_t vd, vfloat16m2_t vs1, vfloat16m2_t vs2, size_t vl) {
-#if defined(__riscv_zvfh)
   return __riscv_vfwmacc_vv_f32m4_tu(vd, vs1, vs2, vl);
-#else
-  vfloat32m4_t vs1_f32 = __riscv_vfwcvt_f_f_v_f32m4(vs1, vl);
-  vfloat32m4_t vs2_f32 = __riscv_vfwcvt_f_f_v_f32m4(vs2, vl);
-  return __riscv_vfmacc_vv_f32m4_tu(vd, vs1_f32, vs2_f32, vl);
-#endif
 }
 
 // FP16 Scalar-Vector -> FP32 Accumulator
 inline vfloat32m4_t vfwmacc_f16_scalar_to_f32m4(vfloat32m4_t vd, _Float16 scalar, vfloat16m2_t vs2, size_t vl) {
-#if defined(__riscv_zvfh)
   return __riscv_vfwmacc_vf_f32m4_tu(vd, scalar, vs2, vl);
-#else
-  vfloat32m4_t vs2_f32 = __riscv_vfwcvt_f_f_v_f32m4(vs2, vl);
-  return __riscv_vfmacc_vf_f32m4_tu(vd, (float)scalar, vs2_f32, vl);
-#endif
 }
+
+#endif  // __riscv_zvfh
 
 #endif  // CPU_CAPABILITY_RVV

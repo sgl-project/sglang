@@ -18,7 +18,6 @@
 namespace {
 
 // Generic scalar fallback for tinygemm_kernel_nt: computes Q(M,K) @ B(N,K) → C(M,N).
-// Index gathering is handled by the caller; this struct is type-agnostic GEMM.
 template <typename scalar_t, typename kv_t, typename index_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nt {
   static inline void apply(
@@ -115,6 +114,7 @@ struct tinygemm_kernel_nt<at::BFloat16, at::BFloat16, index_t, BLOCK_M, BLOCK_N>
   }
 };
 
+#if defined(__riscv_zvfh)
 template <typename index_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nt<at::Half, at::Half, index_t, BLOCK_M, BLOCK_N> {
   static inline void apply(
@@ -184,6 +184,7 @@ struct tinygemm_kernel_nt<at::Half, at::Half, index_t, BLOCK_M, BLOCK_N> {
     Unroll<ROWS * COLS>{}(storec);
   }
 };
+#endif  // __riscv_zvfh
 
 #define LAUNCH_TINYGEMM_KERNEL_NT(MB_SIZE, NB_SIZE)                        \
   tinygemm_kernel_nt<scalar_t, kv_type, index_t, MB_SIZE, NB_SIZE>::apply( \
