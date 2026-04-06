@@ -249,6 +249,11 @@ class BaseMultimodalProcessor(ABC):
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
         if SGL_USE_CUDA_IPC and not skip_mm_pool:
+            logger.info(
+                "CUDA IPC transport for multimodal data is enabled by default. "
+                "If you encounter OOM issues, try disabling it by setting "
+                "SGLANG_USE_CUDA_IPC_TRANSPORT=0 and restarting the server."
+            )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
                 MM_FEATURE_CACHE_SIZE,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
