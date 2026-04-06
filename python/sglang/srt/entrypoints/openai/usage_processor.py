@@ -23,10 +23,14 @@ class UsageProcessor:
         completion_tokens = sum(
             r["meta_info"].get("completion_tokens", 0) for r in responses
         )
-
         prompt_tokens = sum(
             responses[i]["meta_info"].get("prompt_tokens", 0)
             for i in range(0, len(responses), n_choices)
+        )
+
+        # some API don't have reasoning_tokens semantics
+        reasoning_tokens = sum(
+            r["meta_info"].get("reasoning_tokens", 0) for r in responses
         )
 
         cached_details = None
@@ -39,6 +43,7 @@ class UsageProcessor:
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
+            reasoning_tokens=reasoning_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_details,
         )
@@ -46,6 +51,7 @@ class UsageProcessor:
     @staticmethod
     def calculate_streaming_usage(
         prompt_tokens: Mapping[int, int],
+        reasoning_tokens: Mapping[int, int],
         completion_tokens: Mapping[int, int],
         cached_tokens: Mapping[int, int],
         n_choices: int,
@@ -55,6 +61,7 @@ class UsageProcessor:
         total_prompt_tokens = sum(
             tok for idx, tok in prompt_tokens.items() if idx % n_choices == 0
         )
+        total_reasoning_tokens = sum(reasoning_tokens.values())
         total_completion_tokens = sum(completion_tokens.values())
 
         cached_details = (
@@ -67,6 +74,7 @@ class UsageProcessor:
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,
+            reasoning_tokens=total_reasoning_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
         )
@@ -75,6 +83,7 @@ class UsageProcessor:
     def calculate_token_usage(
         prompt_tokens: int,
         completion_tokens: int,
+        reasoning_tokens: Optional[int] = 0,
         cached_tokens: Optional[PromptTokensDetails] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
@@ -83,4 +92,5 @@ class UsageProcessor:
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
         )

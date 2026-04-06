@@ -552,13 +552,15 @@ class DiffGenerator:
         self.shutdown()
 
     def __del__(self):
-        if self.owns_scheduler_client:
+        owns_scheduler_client = bool(getattr(self, "owns_scheduler_client", False))
+        local_scheduler_process = getattr(self, "local_scheduler_process", None)
+        if owns_scheduler_client:
             logger.warning(
                 "Generator was garbage collected without being shut down. "
                 "Attempting to shut down the local server and client."
             )
             self.shutdown()
-        elif self.local_scheduler_process:
+        elif local_scheduler_process:
             logger.warning(
                 "Generator was garbage collected without being shut down. "
                 "Attempting to shut down the local server."

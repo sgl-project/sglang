@@ -8,6 +8,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
+    dump_metric,
     popen_launch_server,
     write_github_step_summary,
 )
@@ -98,7 +99,7 @@ def _run_simple_eval(
             model.model_path,
             base_url,
             other_args=model.extra_args,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env=model.env,
         )
 
@@ -275,7 +276,7 @@ def _run_nemo_skills_eval(
             model.model_path,
             base_url,
             other_args=model.extra_args,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env=model.env,
         )
 
@@ -420,6 +421,12 @@ def _run_nemo_skills_eval(
 
         if score is None:
             return False, "Could not parse accuracy from ns eval output", None
+
+        dump_metric(
+            f"{dataset}_score",
+            score,
+            labels={"model": model.model_path, "eval": dataset, "api": "nemo-skills"},
+        )
 
         return True, None, {"score": score}
 

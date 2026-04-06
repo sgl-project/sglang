@@ -531,6 +531,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
+        forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_runner.forward(forward_batch).logits_output
