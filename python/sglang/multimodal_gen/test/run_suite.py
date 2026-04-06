@@ -28,17 +28,21 @@ _UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
     "Qwen-Image",
 )
 
+
+def _discover_unit_tests() -> list[str]:
+    """Auto-discover all test_*.py files in the unit/ directory."""
+    unit_dir = Path(__file__).resolve().parent / "unit"
+    if not unit_dir.is_dir():
+        return []
+    return sorted(
+        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
+    )
+
+
 SUITES = {
     # no GPU required; safe to run on any CPU-only runner
-    "unit": [
-        "../unit/test_sampling_params.py",
-        "../unit/test_storage.py",
-        "../unit/test_lora_format_adapter.py",
-        "../unit/test_server_args.py",
-        "../unit/test_input_validation.py",
-        "../unit/test_resolve_prompts.py",
-        # add new unit tests here
-    ],
+    # Auto-discovered from test/unit/test_*.py
+    "unit": _discover_unit_tests(),
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",

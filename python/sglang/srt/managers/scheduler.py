@@ -549,7 +549,7 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            self.tokenizer.think_end_id = self.tokenizer.encode(
+            self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
@@ -2201,6 +2201,8 @@ class Scheduler(
                 else:
                     self.running_batch.merge_batch(new_batch)
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
+            # Reset batch_is_full so the scheduler can schedule more prefills.
+            self.running_batch.batch_is_full = False
 
         if (
             not self.enable_hisparse
@@ -2603,8 +2605,6 @@ class Scheduler(
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.retract_req(req)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -3278,7 +3278,14 @@ class Scheduler(
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
-            if not self.last_batch.is_empty():
+            # Skip merge for disagg prefill: completed prefill requests are
+            # already in disagg_prefill_inflight_queue. Merging them into
+            # running_batch leaks them, since the prefill event loop never
+            # calls update_running_batch to clean them up.
+            if (
+                not self.last_batch.is_empty()
+                and self.disaggregation_mode != DisaggregationMode.PREFILL
+            ):
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
@@ -3287,7 +3294,7 @@ class Scheduler(
         self.last_batch = None
         self.cur_batch = None
 
-        if recv_req.mode == "retract":
+        if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
