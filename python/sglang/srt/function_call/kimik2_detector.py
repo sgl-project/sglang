@@ -63,7 +63,7 @@ class KimiK2Detector(BaseFormatDetector):
 
         # Negative lookahead prevents greedy match from crossing into the next tool call
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>(?:(?!<\|tool_call_begin\|>)[\s\S])*)",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{(?:(?!<\|tool_call_begin\|>)[\s\S])*)",
         )
 
         self._last_arguments = ""
