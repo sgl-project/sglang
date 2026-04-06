@@ -23,6 +23,7 @@ constexpr float kInvSqrt2 = 0.7071067811865476f;
 template <typename scalar_t>
 void act_silu_inner(
     scalar_t* __restrict__ out_ptr, const scalar_t* __restrict__ x_ptr, const scalar_t* __restrict__ y_ptr, int64_t d) {
+  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
   const size_t max_vl = __riscv_vsetvlmax_e32m4();
   const int64_t max_vl_i = static_cast<int64_t>(max_vl);
   int64_t j = 0;
@@ -30,34 +31,34 @@ void act_silu_inner(
   // 2-way unrolled main loop (both chunks are full-width, no tail logic needed here)
   for (; j + 2 * max_vl_i <= d; j += 2 * max_vl_i) {
     // ---- chunk A: load + issue exp ----
-    vfloat32m4_t vxA = load_as_float_m4(x_ptr + j, max_vl, nullptr);
-    vfloat32m4_t vyA = load_as_float_m4(y_ptr + j, max_vl, nullptr);
+    vfloat32m4_t vxA = load_as_float_m4(x_ptr + j, max_vl, scratch);
+    vfloat32m4_t vyA = load_as_float_m4(y_ptr + j, max_vl, scratch);
     vfloat32m4_t vexpA = vfexp_f32m4(__riscv_vfneg_v_f32m4(vxA, max_vl), max_vl);
     // ---- chunk B: load while expA computes ----
-    vfloat32m4_t vxB = load_as_float_m4(x_ptr + j + max_vl_i, max_vl, nullptr);
-    vfloat32m4_t vyB = load_as_float_m4(y_ptr + j + max_vl_i, max_vl, nullptr);
+    vfloat32m4_t vxB = load_as_float_m4(x_ptr + j + max_vl_i, max_vl, scratch);
+    vfloat32m4_t vyB = load_as_float_m4(y_ptr + j + max_vl_i, max_vl, scratch);
     vfloat32m4_t vexpB = vfexp_f32m4(__riscv_vfneg_v_f32m4(vxB, max_vl), max_vl);
 
     vfloat32m4_t vdA = __riscv_vfadd_vf_f32m4(vexpA, 1.0f, max_vl);
     vfloat32m4_t voutA =
         __riscv_vfmul_vv_f32m4(__riscv_vfmul_vv_f32m4(vxA, vrec_f32m4(vdA, max_vl), max_vl), vyA, max_vl);
-    store_from_float_m4(out_ptr + j, voutA, max_vl, nullptr);
+    store_from_float_m4(out_ptr + j, voutA, max_vl, scratch);
 
     vfloat32m4_t vdB = __riscv_vfadd_vf_f32m4(vexpB, 1.0f, max_vl);
     vfloat32m4_t voutB =
         __riscv_vfmul_vv_f32m4(__riscv_vfmul_vv_f32m4(vxB, vrec_f32m4(vdB, max_vl), max_vl), vyB, max_vl);
-    store_from_float_m4(out_ptr + j + max_vl_i, voutB, max_vl, nullptr);
+    store_from_float_m4(out_ptr + j + max_vl_i, voutB, max_vl, scratch);
   }
 
   // tail: handles remainder (including d < 2*max_vl entirely)
   size_t vl;
   for (; j < d; j += vl) {
     vl = __riscv_vsetvl_e32m4(d - j);
-    vfloat32m4_t vx = load_as_float_m4(x_ptr + j, vl, nullptr);
-    vfloat32m4_t vy = load_as_float_m4(y_ptr + j, vl, nullptr);
+    vfloat32m4_t vx = load_as_float_m4(x_ptr + j, vl, scratch);
+    vfloat32m4_t vy = load_as_float_m4(y_ptr + j, vl, scratch);
     vfloat32m4_t vd = __riscv_vfadd_vf_f32m4(vfexp_f32m4(__riscv_vfneg_v_f32m4(vx, vl), vl), 1.0f, vl);
     store_from_float_m4(
-        out_ptr + j, __riscv_vfmul_vv_f32m4(__riscv_vfmul_vv_f32m4(vx, vrec_f32m4(vd, vl), vl), vy, vl), vl, nullptr);
+        out_ptr + j, __riscv_vfmul_vv_f32m4(__riscv_vfmul_vv_f32m4(vx, vrec_f32m4(vd, vl), vl), vy, vl), vl, scratch);
   }
 }
 
@@ -67,20 +68,21 @@ void act_silu_inner(
 template <typename scalar_t>
 void act_gelu_tanh_inner(
     scalar_t* __restrict__ out_ptr, const scalar_t* __restrict__ x_ptr, const scalar_t* __restrict__ y_ptr, int64_t d) {
+  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
   size_t vl;
   for (int64_t j = 0; j < d; j += vl) {
     vl = __riscv_vsetvl_e32m4(d - j);
-    vfloat32m4_t vx = load_as_float_m4(x_ptr + j, vl, nullptr);
+    vfloat32m4_t vx = load_as_float_m4(x_ptr + j, vl, scratch);
     vfloat32m4_t vx2 = __riscv_vfmul_vv_f32m4(vx, vx, vl);
     vfloat32m4_t vx3 = __riscv_vfmul_vv_f32m4(vx2, vx, vl);
     vfloat32m4_t vinner = __riscv_vfmacc_vf_f32m4(vx, 0.044715f, vx3, vl);
     vfloat32m4_t vtanh_arg = __riscv_vfmul_vf_f32m4(vinner, kSqrt2DivPi, vl);
-    vfloat32m4_t vy = load_as_float_m4(y_ptr + j, vl, nullptr);
+    vfloat32m4_t vy = load_as_float_m4(y_ptr + j, vl, scratch);
     vfloat32m4_t vtanh = vftanh_f32m4(vtanh_arg, vl);
     // gelu = 0.5 * x * (1 + tanh) * vy
     vfloat32m4_t vgelu =
         __riscv_vfmul_vf_f32m4(__riscv_vfmul_vv_f32m4(vx, __riscv_vfadd_vf_f32m4(vtanh, 1.0f, vl), vl), 0.5f, vl);
-    store_from_float_m4(out_ptr + j, __riscv_vfmul_vv_f32m4(vgelu, vy, vl), vl, nullptr);
+    store_from_float_m4(out_ptr + j, __riscv_vfmul_vv_f32m4(vgelu, vy, vl), vl, scratch);
   }
 }
 
@@ -90,16 +92,17 @@ void act_gelu_tanh_inner(
 template <typename scalar_t>
 void act_gelu_inner(
     scalar_t* __restrict__ out_ptr, const scalar_t* __restrict__ x_ptr, const scalar_t* __restrict__ y_ptr, int64_t d) {
+  alignas(64) float scratch[rvv_constants::MAX_VL_ELEMENTS_M4];
   size_t vl;
   for (int64_t j = 0; j < d; j += vl) {
     vl = __riscv_vsetvl_e32m4(d - j);
-    vfloat32m4_t vx = load_as_float_m4(x_ptr + j, vl, nullptr);
+    vfloat32m4_t vx = load_as_float_m4(x_ptr + j, vl, scratch);
     vfloat32m4_t verf = vferf_f32m4(__riscv_vfmul_vf_f32m4(vx, kInvSqrt2, vl), vl);
-    vfloat32m4_t vy = load_as_float_m4(y_ptr + j, vl, nullptr);
+    vfloat32m4_t vy = load_as_float_m4(y_ptr + j, vl, scratch);
     // gelu = 0.5 * x * (1 + erf) * vy
     vfloat32m4_t vgelu =
         __riscv_vfmul_vf_f32m4(__riscv_vfmul_vv_f32m4(vx, __riscv_vfadd_vf_f32m4(verf, 1.0f, vl), vl), 0.5f, vl);
-    store_from_float_m4(out_ptr + j, __riscv_vfmul_vv_f32m4(vgelu, vy, vl), vl, nullptr);
+    store_from_float_m4(out_ptr + j, __riscv_vfmul_vv_f32m4(vgelu, vy, vl), vl, scratch);
   }
 }
 
@@ -107,7 +110,7 @@ void act_gelu_inner(
 
 // input   : {num_tokens, 2 * d}
 // output  : {num_tokens, d}
-at::Tensor silu_and_mul_cpu(at::Tensor& input) {
+at::Tensor silu_and_mul_cpu(const at::Tensor& input) {
   RECORD_FUNCTION("sgl-kernel::silu_and_mul_cpu", std::vector<c10::IValue>({input}));
   auto input_contig = input.contiguous();
   auto sizes = input.sizes().vec();
