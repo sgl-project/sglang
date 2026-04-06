@@ -44,11 +44,9 @@ def _single_pass_temperature_softmax_kernel(
     mask = offsets < vocab_size
 
     x = tl.load(
-        logits_ptr + row_idx * logits_stride + offsets,
-        mask=mask,
-        other=float("-inf"),
-    )
-    x = (x / temp).to(tl.float32)
+        logits_ptr + row_idx * logits_stride + offsets, mask=mask, other=float("-inf")
+    ).to(tl.float32)
+    x = x / temp
 
     x_max = tl.max(x, axis=0)
     exp_x = tl.exp(x - x_max)
@@ -72,8 +70,8 @@ def _single_pass_temperature_softmax_inplace_kernel(
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < vocab_size
 
-    x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
-    x = (x / temp).to(tl.float32)
+    x = tl.load(row_start + offsets, mask=mask, other=float("-inf")).to(tl.float32)
+    x = x / temp
 
     x_max = tl.max(x, axis=0)
     exp_x = tl.exp(x - x_max)
@@ -121,13 +119,13 @@ def _multi_pass_temperature_softmax_kernel(
     output_row = output_ptr + row_idx * output_stride
 
     # Pass 1: online max + sum (Milakov-Gimelshein)
-    running_max = tl.full([], value=float("-inf"), dtype=tl.float32)
-    running_sum = tl.full([], value=0.0, dtype=tl.float32)
+    running_max = tl.full([], float("-inf"), dtype=tl.float32)
+    running_sum = tl.full([], 0.0, dtype=tl.float32)
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
-        x = tl.load(logits_row + offsets, mask=mask, other=float("-inf"))
-        x = (x / temp).to(tl.float32)
+        x = tl.load(logits_row + offsets, mask=mask, other=float("-inf")).to(tl.float32)
+        x = x / temp
         tile_max = tl.max(x, axis=0)
         new_max = tl.maximum(running_max, tile_max)
         running_sum = running_sum * tl.exp(running_max - new_max) + tl.sum(
@@ -139,8 +137,8 @@ def _multi_pass_temperature_softmax_kernel(
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
-        x = tl.load(logits_row + offsets, mask=mask, other=float("-inf"))
-        x = (x / temp).to(tl.float32)
+        x = tl.load(logits_row + offsets, mask=mask, other=float("-inf")).to(tl.float32)
+        x = x / temp
         prob = tl.exp(x - running_max) / running_sum
         tl.store(output_row + offsets, prob, mask=mask)
 
@@ -159,13 +157,13 @@ def _multi_pass_temperature_softmax_inplace_kernel(
     row_start = logits_ptr + row_idx * stride
 
     # Pass 1: online max + sum (Milakov-Gimelshein)
-    running_max = tl.full([], value=float("-inf"), dtype=tl.float32)
-    running_sum = tl.full([], value=0.0, dtype=tl.float32)
+    running_max = tl.full([], float("-inf"), dtype=tl.float32)
+    running_sum = tl.full([], 0.0, dtype=tl.float32)
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
-        x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
-        x = (x / temp).to(tl.float32)
+        x = tl.load(row_start + offsets, mask=mask, other=float("-inf")).to(tl.float32)
+        x = x / temp
         tile_max = tl.max(x, axis=0)
         new_max = tl.maximum(running_max, tile_max)
         running_sum = running_sum * tl.exp(running_max - new_max) + tl.sum(
@@ -177,8 +175,8 @@ def _multi_pass_temperature_softmax_inplace_kernel(
     for start in range(0, vocab_size, BLOCK_SIZE):
         offsets = start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < vocab_size
-        x = tl.load(row_start + offsets, mask=mask, other=float("-inf"))
-        x = (x / temp).to(tl.float32)
+        x = tl.load(row_start + offsets, mask=mask, other=float("-inf")).to(tl.float32)
+        x = x / temp
         prob = tl.exp(x - running_max) / running_sum
         tl.store(row_start + offsets, prob, mask=mask)
 
