@@ -438,7 +438,10 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        # Fused attention output projection + MLP output projection
+        # Fused attention output + MLP output projection.
+        # Input is [attn_shard | mlp_shard] (independently sharded by
+        # MergedColumnParallelLinear), so patch weight loader to pick the
+        # correct non-contiguous columns per rank.
         self.to_out = RowParallelLinear(
             self.inner_dim + self.mlp_hidden_dim,
             self.out_dim,
@@ -447,6 +450,8 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             quant_config=quant_config,
             prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
+        if self.tp_size > 1:
+            self._patch_to_out_weight_loader()
 
         self.attn = USPAttention(
             num_heads=self.local_heads,
@@ -455,6 +460,24 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             softmax_scale=None,
             causal=False,
         )
+
+    def _patch_to_out_weight_loader(self) -> None:
+        inner_dim, mlp_dim = self.inner_dim, self.mlp_hidden_dim
+        tp_size, tp_rank = self.tp_size, self.to_out.tp_rank
+
+        def _loader(param, loaded_weight):
+            input_dim = getattr(param, "input_dim", None)
+            if input_dim is not None:
+                a = inner_dim // tp_size
+                m = mlp_dim // tp_size
+                attn_cols = loaded_weight.narrow(input_dim, tp_rank * a, a)
+                mlp_cols = loaded_weight.narrow(input_dim, inner_dim + tp_rank * m, m)
+                param.data.copy_(torch.cat([attn_cols, mlp_cols], dim=input_dim))
+            else:
+                param.data.copy_(loaded_weight)
+
+        self.to_out.weight_loader = _loader
+        self.to_out.weight.weight_loader = _loader
 
     def forward(
         self,
@@ -792,9 +815,9 @@ class Flux2PosEmbed(nn.Module):
             use_real=False,
             repeat_interleave_real=False,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
         )
 
@@ -987,7 +1010,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype)
         if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype)
+            guidance = guidance.to(hidden_states.dtype) * 1000
 
         temb = self.time_guidance_embed(timestep, guidance)
 
