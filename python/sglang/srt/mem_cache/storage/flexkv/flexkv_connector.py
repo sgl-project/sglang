@@ -261,6 +261,7 @@ class FlexKVConnector(BaseKVConnector):
 
         self.tp_size = server_args.tp_size
         self.rank = tp_rank
+        self.tp_cpu_group = getattr(tp_group, "cpu_group", tp_group) if tp_group is not None else None
 
         self.k_pool = getattr(kvcache, "k_buffer", None)
         self.v_pool = getattr(kvcache, "v_buffer", None)
@@ -338,11 +339,11 @@ class FlexKVConnector(BaseKVConnector):
             if not update_state_for_load:
                 self.kv_manager.cancel([flexkv_task_id])
 
-        if self.tp_group is not None and self.tp_size > 1:
+        if self.tp_cpu_group is not None and self.tp_size > 1:
             data = broadcast_pyobj(
                 [{"hit_length": hit_length, "task_id": flexkv_task_id}],
                 self.rank,
-                self.tp_group,
+                self.tp_cpu_group,
                 src=0,
             )[0]
             hit_length = data["hit_length"]
@@ -409,8 +410,8 @@ class FlexKVConnector(BaseKVConnector):
                         "[FlexKV] Some tasks failed in non-layerwise transfer"
                     )
 
-            if self.tp_group is not None and self.tp_size > 1:
-                torch.distributed.barrier(self.tp_group)
+            if self.tp_cpu_group is not None and self.tp_size > 1:
+                torch.distributed.barrier(self.tp_cpu_group)
 
             self._completed_loads.append(task_id)
 
@@ -468,11 +469,11 @@ class FlexKVConnector(BaseKVConnector):
                 completed_ext_ids.append(ext_tid)
                 del self._ongoing_stores[ext_tid]
 
-        if self.tp_group is not None and self.tp_size > 1:
+        if self.tp_cpu_group is not None and self.tp_size > 1:
             completed_ext_ids = broadcast_pyobj(
                 [completed_ext_ids] if self.rank == 0 else [None],
                 self.rank,
-                self.tp_group,
+                self.tp_cpu_group,
                 src=0,
             )[0]
 
