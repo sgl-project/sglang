@@ -136,10 +136,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
             self.last_loc = last_loc
 
+        alloc = batch.token_to_kv_pool_allocator
         maybe_detect_oob(
             batch.out_cache_loc,
             0,
-            batch.token_to_kv_pool_allocator.size,
+            alloc.size + alloc.page_size,
             "prepare_for_verify: out_cache_loc OOB",
         )
 

@@ -533,12 +533,13 @@ class EAGLEWorker(TpModelWorker):
             pos_upper,
             f"draft_preprocess: positions OOB vs {pos_upper}",
         )
-        kv_pool_size = self.token_to_kv_pool_allocator.size
+        alloc = self.token_to_kv_pool_allocator
+        kv_buf_size = alloc.size + alloc.page_size
         maybe_detect_oob(
             out_cache_loc,
             0,
-            kv_pool_size,
-            f"draft_preprocess: out_cache_loc OOB vs kv_pool_size={kv_pool_size}",
+            kv_buf_size,
+            f"draft_preprocess: out_cache_loc OOB vs kv_buf_size={kv_buf_size}",
         )
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
