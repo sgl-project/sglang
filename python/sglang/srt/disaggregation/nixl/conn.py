@@ -1187,26 +1187,47 @@ class NixlKVManager(CommonKVManager):
             staging_buffer=staging_buffer,
         )
 
-    def _send_kv_slice_fallback(
+    def _send_kv_for_req(
         self,
         req,
         kv_indices: npt.NDArray[np.int32],
         chunked_dst_kv_indice: npt.NDArray[np.int32],
+        index_slice: slice,
         chunk_id: int,
         is_last: bool,
         dst_info: KVArgsRegisterInfo,
     ):
-        """Fallback: send KV via per-head slice path."""
+        """Dispatch a single KV transfer via the best available path."""
+        decode_tp_size = dst_info.decode_tp_size
         notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
+
+        if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
+            return self.send_kvcache(
+                req.agent_name, kv_indices,
+                dst_info.dst_kv_ptrs, chunked_dst_kv_indice,
+                dst_info.gpu_id, notif,
+            )
+
+        use_staging = (
+            self.enable_staging
+            and dst_info.staging is not None
+            and self.kv_buffer_tensors is not None
+            and self._staging_ctx.buffers
+        )
+        if use_staging:
+            xfer_handle = self._do_staging_transfer(
+                req, kv_indices, index_slice, chunk_id, is_last,
+                dst_info, self._staging_ctx.buffers[0],
+            )
+            if xfer_handle is not None:
+                return xfer_handle
+
         return self.send_kvcache_slice(
-            req.agent_name,
-            kv_indices,
-            dst_info.dst_kv_ptrs,
-            chunked_dst_kv_indice,
-            dst_info.gpu_id,
-            notif,
+            req.agent_name, kv_indices,
+            dst_info.dst_kv_ptrs, chunked_dst_kv_indice,
+            dst_info.gpu_id, notif,
             prefill_tp_size=self.attn_tp_size,
-            decode_tp_size=dst_info.decode_tp_size,
+            decode_tp_size=decode_tp_size,
             decode_tp_rank=dst_info.decode_tp_rank,
             dst_kv_item_len=dst_info.dst_kv_item_len,
         )
@@ -1239,56 +1260,13 @@ class NixlKVManager(CommonKVManager):
             assert req.agent_name in self.decode_kv_args_table
 
             dst_info = self.decode_kv_args_table[req.agent_name]
-            decode_tp_size = dst_info.decode_tp_size
 
-            # Staging path: heterogeneous TP with staging buffer enabled
-            use_staging = (
-                self.enable_staging
-                and not self.is_mla_backend
-                and decode_tp_size != self.attn_tp_size
-                and dst_info.staging is not None
-                and self.kv_buffer_tensors is not None
-                and self._staging_ctx.buffers
+            handles.append(
+                self._send_kv_for_req(
+                    req, kv_indices, chunked_dst_kv_indice,
+                    index_slice, chunk_id, is_last, dst_info,
+                )
             )
-
-            if use_staging:
-                xfer_handle = self._do_staging_transfer(
-                    req,
-                    kv_indices,
-                    index_slice,
-                    chunk_id,
-                    is_last,
-                    dst_info,
-                    self._staging_ctx.buffers[0],
-                )
-                if xfer_handle is not None:
-                    handles.append(xfer_handle)
-                else:
-                    handles.append(
-                        self._send_kv_slice_fallback(
-                            req, kv_indices, chunked_dst_kv_indice,
-                            chunk_id, is_last, dst_info,
-                        )
-                    )
-            elif self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
-                notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
-                handles.append(
-                    self.send_kvcache(
-                        req.agent_name,
-                        kv_indices,
-                        dst_info.dst_kv_ptrs,
-                        chunked_dst_kv_indice,
-                        dst_info.gpu_id,
-                        notif,
-                    )
-                )
-            else:
-                handles.append(
-                    self._send_kv_slice_fallback(
-                        req, kv_indices, chunked_dst_kv_indice,
-                        chunk_id, is_last, dst_info,
-                    )
-                )
 
             # Only the last chunk we need to send the aux data.
             if is_last:
@@ -1300,7 +1278,7 @@ class NixlKVManager(CommonKVManager):
                         req.dst_state_indices,
                         dst_info.gpu_id,
                         f"{req.room}_state_{self.kv_args.engine_rank}",
-                        decode_tp_size,
+                        dst_info.decode_tp_size,
                         decode_tp_rank=dst_info.decode_tp_rank,
                         dst_state_item_lens=dst_info.dst_state_item_lens,
                         dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
