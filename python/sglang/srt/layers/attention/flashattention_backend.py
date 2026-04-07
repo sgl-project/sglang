@@ -239,6 +239,15 @@ class FlashAttentionBackend(AttentionBackend):
             causal=True,
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
+
+        # In embedding mode with no chunked prefill and radix cache disabled,
+        # skip KV cache write and use flash_attn_varlen_func with raw K/V
+        # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
+        server_args = model_runner.server_args
+        self.fa_skip_kv_cache = (
+            server_args.is_embedding
+            and server_args.chunked_prefill_size == -1
+            and server_args.disable_radix_cache
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -606,7 +615,7 @@ class FlashAttentionBackend(AttentionBackend):
                 and self.attn_cp_size > 1
             )
 
-            if save_kv_cache and not is_cp_mode:
+            if save_kv_cache and not is_cp_mode and not self.fa_skip_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -764,10 +773,12 @@ class FlashAttentionBackend(AttentionBackend):
                     self.device,
                     _fa_cp_attn,
                 )
-            elif layer.skip_kv_cache:
-                # Skip KV cache read — use raw K/V tensors via varlen func.
-                # In this mode K length == Q length (no prefix cache).
-                assert k is not None, "skip_kv_cache requires k to be provided"
+            elif self.fa_skip_kv_cache:
+                # Embedding mode: skip KV cache read and use raw K/V tensors
+                # directly via flash_attn_varlen_func. The KV cache write is
+                # also skipped (guarded above). This eliminates store_kvcache
+                # and prepare_varlen_num_blocks overhead per layer.
+                assert k is not None, "fa_skip_kv_cache requires k to be provided"
                 result = flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
