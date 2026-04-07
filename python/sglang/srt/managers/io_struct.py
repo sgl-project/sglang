@@ -956,7 +956,9 @@ class EmbeddingReqInput(BaseReq):
                 input_ids=self.input_ids[i] if self.input_ids is not None else None,
                 embed_override_token_id=self.embed_override_token_id,
                 embed_overrides=(
-                    self.embed_overrides[i] if self.embed_overrides is not None else None
+                    self.embed_overrides[i]
+                    if self.embed_overrides is not None
+                    else None
                 ),
                 embed_override_injection=self._get_embed_override_injection_item(i),
                 image_data=self.image_data[i] if self.image_data is not None else None,
