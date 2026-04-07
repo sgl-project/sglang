@@ -50,7 +50,7 @@ class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
             "--tp",
             str(TP_SIZE),
             "--attention-backend",
-            "triton",
+            "aiter",
             "--trust-remote-code",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
