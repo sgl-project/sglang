@@ -156,7 +156,7 @@ class Sampler(nn.Module):
                 if is_cuda() and can_use_softmax_sampling(logits):
                     softmax_sampling(
                         logits,
-                        sampling_info.temperatures,
+                        sampling_info.temperatures.view(-1),
                         out=logits,
                     )
                 else:

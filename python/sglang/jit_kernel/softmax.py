@@ -38,11 +38,17 @@ def _jit_softmax_module(dtype: torch.dtype) -> Module:
 
 def can_use_softmax_sampling(logits: torch.Tensor) -> bool:
     dtype = logits.dtype
-    return (
+    if not (
         logits.is_cuda
         and dtype in (torch.float16, torch.bfloat16, torch.float32)
         and (logits.shape[-1] * dtype.itemsize) % 16 == 0
-    )
+    ):
+        return False
+    try:
+        _jit_softmax_module(dtype)
+        return True
+    except RuntimeError:
+        return False
 
 
 def softmax_sampling(
