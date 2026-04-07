@@ -150,9 +150,6 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.speculative.dflash_utils import (
-    parse_dflash_draft_config,
-)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -377,6 +374,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.eagle_aux_hidden_state_layer_ids = None
 
         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+            from sglang.srt.speculative.dflash_utils import (
+                parse_dflash_draft_config,
+            )
+
             # Select target layers to capture for building DFlash context features.
             draft_model_config = ModelConfig.from_server_args(
                 server_args,
