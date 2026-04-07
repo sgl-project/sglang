@@ -30,17 +30,13 @@ causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
 
 
-class AscendGDNKernelDispatcher(GDNKernelDispatcher):
-    pass
-
-
 class AscendGDNAttnBackend(GDNAttnBackend):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
-        self.kernel_dispatcher = AscendGDNKernelDispatcher(
+        self.kernel_dispatcher = GDNKernelDispatcher(
             decode_backend, prefill_backend
         )
 
@@ -220,7 +216,6 @@ class AscendGDNAttnBackend(GDNAttnBackend):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
         if is_target_verify:
-            batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             num_token_padding = mixed_qkv.shape[0]
             batch_size = cache_indices.shape[0]

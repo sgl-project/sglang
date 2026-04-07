@@ -32,7 +32,7 @@ if not is_cpu():
 if is_npu():
     from sgl_kernel_npu.mamba.mamba_state_update_triton import (
         conv_state_rollback,
-        move_intermediate_cache_dynamic_h_block,
+        move_intermediate_cache,
     )
 
 logger = logging.getLogger(__name__)
@@ -1004,7 +1004,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             valid_state_indices = state_indices_tensor.to(torch.int64)  # [N]
             last_steps = accepted_steps.to(torch.int64)  # [N]
 
-            move_intermediate_cache_dynamic_h_block(
+            move_intermediate_cache(
                 ssm_states, intermediate_state_cache, valid_state_indices, last_steps
             )
 
