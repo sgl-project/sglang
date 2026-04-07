@@ -1,23 +1,31 @@
 """Unit tests for request_metrics_exporter.py — no server, no model loading."""
 
-# ── Lightweight stubs for heavy transitive deps ──
-import sys
-import types
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from sglang.test.ci.ci_register import register_cpu_ci
 
-def _ensure_module(name):
-    if name not in sys.modules:
-        sys.modules[name] = types.ModuleType(name)
-    return sys.modules[name]
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+
+import asyncio
+import json
+import os
+import shutil
+import tempfile
+import types
+import unittest
+from unittest.mock import MagicMock, patch
+
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+
+# ── Test helper classes (local only, never injected into sys.modules) ──
 
 
 @dataclass
 class _GenerateReqInput:
     rid: Optional[str] = None
     text: Optional[str] = None
-    image_data: Optional[Any] = None  # in ALWAYS_EXCLUDE_FIELDS
+    image_data: Optional[Any] = None
     sampling_params: Optional[Dict] = None
 
 
@@ -35,36 +43,74 @@ class _ServerArgs:
             setattr(self, k, v)
 
 
-# Pre-populate modules before importing the module under test.
-_ensure_module("sglang.srt.managers")
-_io = _ensure_module("sglang.srt.managers.io_struct")
-_io.GenerateReqInput = _GenerateReqInput
-_io.EmbeddingReqInput = _EmbeddingReqInput
+# ── Deferred import of the module-under-test ──
+# request_metrics_exporter.py imports io_struct and server_args at module level.
+# We use patch.dict to temporarily provide lightweight stubs so the import
+# succeeds without pulling in heavy transitive deps (torch, triton, …).
+# The patch is started in setUpModule and stopped in tearDownModule,
+# so sys.modules is never modified during pytest collection.
 
-_sa = _ensure_module("sglang.srt.server_args")
-_sa.ServerArgs = _ServerArgs
+_patcher = None
 
-# ── End stubs ──
+# Module-under-test symbols, populated by setUpModule
+FileRequestMetricsExporter = None
+RequestMetricsExporter = None
+RequestMetricsExporterManager = None
+create_request_metrics_exporters = None
+_ConcreteExporter = None
 
-from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
+def setUpModule():
+    global _patcher
+    global FileRequestMetricsExporter, RequestMetricsExporter
+    global RequestMetricsExporterManager, create_request_metrics_exporters
+    global _ConcreteExporter
 
-import asyncio
-import json
-import os
-import shutil
-import tempfile
-import unittest
-from unittest.mock import MagicMock, patch
+    stub_modules = {}
+    for name in (
+        "sglang.srt.managers",
+        "sglang.srt.managers.io_struct",
+        "sglang.srt.server_args",
+    ):
+        if name not in __import__("sys").modules:
+            stub_modules[name] = types.ModuleType(name)
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.observability.request_metrics_exporter import (
-    FileRequestMetricsExporter,
-    RequestMetricsExporter,
-    RequestMetricsExporterManager,
-    create_request_metrics_exporters,
-)
+    if stub_modules:
+        if "sglang.srt.managers.io_struct" in stub_modules:
+            stub_modules["sglang.srt.managers.io_struct"].GenerateReqInput = (
+                _GenerateReqInput
+            )
+            stub_modules["sglang.srt.managers.io_struct"].EmbeddingReqInput = (
+                _EmbeddingReqInput
+            )
+        if "sglang.srt.server_args" in stub_modules:
+            stub_modules["sglang.srt.server_args"].ServerArgs = _ServerArgs
+
+        _patcher = patch.dict("sys.modules", stub_modules)
+        _patcher.start()
+
+    import sglang.srt.observability.request_metrics_exporter as _mod
+
+    FileRequestMetricsExporter = _mod.FileRequestMetricsExporter
+    RequestMetricsExporter = _mod.RequestMetricsExporter
+    RequestMetricsExporterManager = _mod.RequestMetricsExporterManager
+    create_request_metrics_exporters = _mod.create_request_metrics_exporters
+
+    class ConcreteExporter(RequestMetricsExporter):
+        """Minimal concrete subclass for testing base class methods."""
+
+        async def write_record(self, obj, out_dict):
+            pass
+
+    _ConcreteExporter = ConcreteExporter
+
+
+def tearDownModule():
+    if _patcher is not None:
+        _patcher.stop()
+
+
+# ── Helpers ──
 
 
 def _make_server_args(tmp_dir, enabled=True):
@@ -72,13 +118,6 @@ def _make_server_args(tmp_dir, enabled=True):
         export_metrics_to_file=enabled,
         export_metrics_to_file_dir=tmp_dir,
     )
-
-
-class _ConcreteExporter(RequestMetricsExporter):
-    """Minimal concrete subclass for testing base class methods."""
-
-    async def write_record(self, obj, out_dict):
-        pass
 
 
 class TestFormatOutputData(unittest.TestCase):
