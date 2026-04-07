@@ -1155,7 +1155,7 @@ class NixlKVManager(CommonKVManager):
         index_slice: slice,
         chunk_id: int,
         is_last: bool,
-        decode_info: KVArgsRegisterInfo,
+        dst_info: KVArgsRegisterInfo,
         staging_buffer,
     ):
         """Attempt staging transfer for one request. Returns xfer_handle or None on fallback."""
@@ -1177,12 +1177,12 @@ class NixlKVManager(CommonKVManager):
         return self.send_kvcache_staged(
             req.agent_name,
             kv_indices,
-            decode_info.staging.base_ptr + c_offset,
-            decode_info.staging.total_size - c_offset,
-            decode_info.gpu_id,
-            decode_info.decode_tp_rank,
-            decode_info.decode_tp_size,
-            decode_info.dst_kv_item_len,
+            dst_info.staging.base_ptr + c_offset,
+            dst_info.staging.total_size - c_offset,
+            dst_info.gpu_id,
+            dst_info.decode_tp_rank,
+            dst_info.decode_tp_size,
+            dst_info.dst_kv_item_len,
             notif_tag,
             staging_buffer=staging_buffer,
         )
@@ -1194,21 +1194,21 @@ class NixlKVManager(CommonKVManager):
         chunked_dst_kv_indice: npt.NDArray[np.int32],
         chunk_id: int,
         is_last: bool,
-        decode_info: KVArgsRegisterInfo,
+        dst_info: KVArgsRegisterInfo,
     ):
         """Fallback: send KV via per-head slice path."""
         notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
         return self.send_kvcache_slice(
             req.agent_name,
             kv_indices,
-            decode_info.dst_kv_ptrs,
+            dst_info.dst_kv_ptrs,
             chunked_dst_kv_indice,
-            decode_info.gpu_id,
+            dst_info.gpu_id,
             notif,
             prefill_tp_size=self.attn_tp_size,
-            decode_tp_size=decode_info.decode_tp_size,
-            decode_tp_rank=decode_info.decode_tp_rank,
-            dst_kv_item_len=decode_info.dst_kv_item_len,
+            decode_tp_size=dst_info.decode_tp_size,
+            decode_tp_rank=dst_info.decode_tp_rank,
+            dst_kv_item_len=dst_info.dst_kv_item_len,
         )
 
     def add_transfer_request(
@@ -1238,15 +1238,15 @@ class NixlKVManager(CommonKVManager):
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
 
-            decode_info = self.decode_kv_args_table[req.agent_name]
-            decode_tp_size = decode_info.decode_tp_size
+            dst_info = self.decode_kv_args_table[req.agent_name]
+            decode_tp_size = dst_info.decode_tp_size
 
             # Staging path: heterogeneous TP with staging buffer enabled
             use_staging = (
                 self.enable_staging
                 and not self.is_mla_backend
                 and decode_tp_size != self.attn_tp_size
-                and decode_info.staging is not None
+                and dst_info.staging is not None
                 and self.kv_buffer_tensors is not None
                 and self._staging_ctx.buffers
             )
@@ -1258,7 +1258,7 @@ class NixlKVManager(CommonKVManager):
                     index_slice,
                     chunk_id,
                     is_last,
-                    decode_info,
+                    dst_info,
                     self._staging_ctx.buffers[0],
                 )
                 if xfer_handle is not None:
@@ -1267,7 +1267,7 @@ class NixlKVManager(CommonKVManager):
                     handles.append(
                         self._send_kv_slice_fallback(
                             req, kv_indices, chunked_dst_kv_indice,
-                            chunk_id, is_last, decode_info,
+                            chunk_id, is_last, dst_info,
                         )
                     )
             elif self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
@@ -1276,9 +1276,9 @@ class NixlKVManager(CommonKVManager):
                     self.send_kvcache(
                         req.agent_name,
                         kv_indices,
-                        decode_info.dst_kv_ptrs,
+                        dst_info.dst_kv_ptrs,
                         chunked_dst_kv_indice,
-                        decode_info.gpu_id,
+                        dst_info.gpu_id,
                         notif,
                     )
                 )
@@ -1286,7 +1286,7 @@ class NixlKVManager(CommonKVManager):
                 handles.append(
                     self._send_kv_slice_fallback(
                         req, kv_indices, chunked_dst_kv_indice,
-                        chunk_id, is_last, decode_info,
+                        chunk_id, is_last, dst_info,
                     )
                 )
 
@@ -1296,14 +1296,14 @@ class NixlKVManager(CommonKVManager):
                     state_xfer_handle = self.maybe_send_extra(
                         req.agent_name,
                         state_indices,
-                        decode_info.dst_state_data_ptrs,
+                        dst_info.dst_state_data_ptrs,
                         req.dst_state_indices,
-                        decode_info.gpu_id,
+                        dst_info.gpu_id,
                         f"{req.room}_state_{self.kv_args.engine_rank}",
                         decode_tp_size,
-                        decode_tp_rank=decode_info.decode_tp_rank,
-                        dst_state_item_lens=decode_info.dst_state_item_lens,
-                        dst_state_dim_per_tensor=decode_info.dst_state_dim_per_tensor,
+                        decode_tp_rank=dst_info.decode_tp_rank,
+                        dst_state_item_lens=dst_info.dst_state_item_lens,
+                        dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                     )
                     if state_xfer_handle is not None:
                         handles.append(state_xfer_handle)
@@ -1312,7 +1312,7 @@ class NixlKVManager(CommonKVManager):
                 aux_xfer_handle = self.send_aux(
                     req.agent_name,
                     aux_index,
-                    decode_info.dst_aux_ptrs,
+                    dst_info.dst_aux_ptrs,
                     req.dst_aux_index,
                     f"{req.room}_aux",
                 )
