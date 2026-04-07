@@ -277,6 +277,10 @@ class HiMambaRadixCache(MambaRadixCache):
         super().reset()
 
     def write_backup(self, node: TreeNode, write_back=False):
+        # Backup invariant: parent must be backed up before child.
+        if node.parent != self.root_node and not node.parent.backuped:
+            return
+
         # If mamba host slot already exists, refresh its LRU position.
         if node.mamba_value is not None and node.mamba_host_value is not None:
             if self.mamba_host_lru_list.in_list(node):
