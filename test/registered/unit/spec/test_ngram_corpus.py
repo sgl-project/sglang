@@ -41,7 +41,7 @@ def _make_corpus(match_type="BFS", **kwargs):
             else:
                 chunks.append(list(doc))
             has_prev = True
-        corpus.load_external_corpus_named("__default__", chunks)
+        corpus.load_external_corpus_named("test_corpus", chunks)
     return corpus
 
 
@@ -961,8 +961,8 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         self.assertIn([3, 10, 11], leaf_paths)
         self.assertNotIn([3, 20, 21], leaf_paths)
 
-    def test_backward_compat_default_corpus(self):
-        """Startup-style load uses __default__ corpus_id."""
+    def test_make_corpus_with_documents(self):
+        """_make_corpus helper loads documents as a named corpus."""
         corpus = _make_corpus(
             "BFS",
             draft_token_num=4,
@@ -970,7 +970,7 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             external_corpus_documents=[[1, 2, 3, 4, 5]],
         )
         ids = corpus.list_external_corpora()
-        self.assertIn("__default__", ids)
+        self.assertIn("test_corpus", ids)
 
 
 class TestMultiSamHttpMock(CustomTestCase):
