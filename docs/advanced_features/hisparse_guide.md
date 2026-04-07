@@ -2,7 +2,7 @@
 
 HiSparse reduces per-request GPU memory consumption during the decode phase by maintaining only a small "hot" KV buffer on GPU while keeping complete KV data in CPU pinned memory. Combined with PD disaggregation, it enables significantly higher decode concurrency.
 
-> **Prerequisites**: HiSparse only works with models that use **DeepSeek Sparse Attention (DSA)**  architectures (e.g., DeepSeek-V3/R1, GLM-5). These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss.  Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
+> **Prerequisites**: HiSparse only works with models that use **DeepSeek Sparse Attention (DSA)**  architectures (e.g., DeepSeek-V3.2, GLM-5). These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss.  Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
 
 ## Why HiSparse?
 
