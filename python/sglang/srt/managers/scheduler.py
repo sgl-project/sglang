@@ -668,9 +668,8 @@ class Scheduler(
 
     def _init_auto_spec(self):
         """Initialize the auto-spec engine and pass it to the model worker."""
-        from sglang.srt.speculative.auto_spec_engine import AutoSpecEngine
-
         from sglang.srt.environ import envs
+        from sglang.srt.speculative.auto_spec_engine import AutoSpecEngine
 
         self.auto_spec_engine = AutoSpecEngine(self.server_args)
         is_spec_v2 = envs.SGLANG_ENABLE_SPEC_V2.get()

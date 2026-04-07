@@ -103,7 +103,9 @@ class SchedulerMetricsMixin:
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
         self.spec_num_forward_ct = 0
-        self.spec_num_draft_tokens = 0  # Total draft tokens (for accurate accept_rate with auto-spec)
+        self.spec_num_draft_tokens = (
+            0  # Total draft tokens (for accurate accept_rate with auto-spec)
+        )
         # The total number of accepted tokens and forward ct for the whole server lifetime
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
@@ -629,9 +631,12 @@ class SchedulerMetricsMixin:
             if self.spec_num_draft_tokens > 0:
                 total_draft_tokens = self.spec_num_draft_tokens
             else:
-                draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
+                draft_tokens_fallback = (
+                    self.server_args.speculative_num_steps or 0
+                ) + 1
                 num_draft_tokens = (
-                    self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
+                    self.server_args.speculative_num_draft_tokens
+                    or draft_tokens_fallback
                 )
                 total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
 

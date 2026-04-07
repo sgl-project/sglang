@@ -363,7 +363,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 saved_worker_draft = self.speculative_num_draft_tokens
                 saved_draft_attn = self.draft_attn_backend
                 self.draft_runner.server_args.speculative_num_steps = num_steps
-                self.draft_runner.server_args.speculative_num_draft_tokens = num_steps + 1
+                self.draft_runner.server_args.speculative_num_draft_tokens = (
+                    num_steps + 1
+                )
                 self.speculative_num_steps = num_steps
                 self.speculative_num_draft_tokens = num_steps + 1
 

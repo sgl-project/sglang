@@ -313,16 +313,22 @@ class EAGLEWorker(TpModelWorker):
                 if num_steps == default_step:
                     continue
 
-                logger.info(f"AutoSpec: capturing draft graphs for num_steps={num_steps}")
+                logger.info(
+                    f"AutoSpec: capturing draft graphs for num_steps={num_steps}"
+                )
 
                 # Save and update server_args + worker attrs for this step
                 saved_steps = self.draft_model_runner.server_args.speculative_num_steps
-                saved_draft = self.draft_model_runner.server_args.speculative_num_draft_tokens
+                saved_draft = (
+                    self.draft_model_runner.server_args.speculative_num_draft_tokens
+                )
                 saved_worker_steps = self.speculative_num_steps
                 saved_worker_draft = self.speculative_num_draft_tokens
                 saved_draft_attn = self.draft_attn_backend
                 self.draft_model_runner.server_args.speculative_num_steps = num_steps
-                self.draft_model_runner.server_args.speculative_num_draft_tokens = num_steps + 1
+                self.draft_model_runner.server_args.speculative_num_draft_tokens = (
+                    num_steps + 1
+                )
                 self.speculative_num_steps = num_steps
                 self.speculative_num_draft_tokens = num_steps + 1
 
@@ -368,7 +374,9 @@ class EAGLEWorker(TpModelWorker):
 
                 # Restore
                 self.draft_model_runner.server_args.speculative_num_steps = saved_steps
-                self.draft_model_runner.server_args.speculative_num_draft_tokens = saved_draft
+                self.draft_model_runner.server_args.speculative_num_draft_tokens = (
+                    saved_draft
+                )
                 self.speculative_num_steps = saved_worker_steps
                 self.speculative_num_draft_tokens = saved_worker_draft
                 self.draft_attn_backend = saved_draft_attn
@@ -381,7 +389,9 @@ class EAGLEWorker(TpModelWorker):
 
         # Restore current backends to the default step
         self.draft_attn_backend = self.draft_attn_backend_for_steps[default_step]
-        self.draft_extend_attn_backend = self.draft_extend_attn_backend_for_steps[default_step]
+        self.draft_extend_attn_backend = self.draft_extend_attn_backend_for_steps[
+            default_step
+        ]
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
         self.cuda_graph_runner = self.cuda_graph_runner_for_steps[default_step]
         self.cuda_graph_runner_for_draft_extend = (
@@ -407,7 +417,9 @@ class EAGLEWorker(TpModelWorker):
 
         # Switch draft-side
         self.draft_attn_backend = self.draft_attn_backend_for_steps[num_steps]
-        self.draft_extend_attn_backend = self.draft_extend_attn_backend_for_steps.get(num_steps)
+        self.draft_extend_attn_backend = self.draft_extend_attn_backend_for_steps.get(
+            num_steps
+        )
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
         self.cuda_graph_runner = self.cuda_graph_runner_for_steps.get(num_steps)
         self.cuda_graph_runner_for_draft_extend = (

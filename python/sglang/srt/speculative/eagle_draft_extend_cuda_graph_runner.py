@@ -618,11 +618,11 @@ class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
-            out_cache_loc = torch.ones((self.max_num_token,), dtype=self._cache_loc_dtype())
-            positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            mrope_positions = torch.zeros(
-                (3, self.max_num_token), dtype=torch.int64
+            out_cache_loc = torch.ones(
+                (self.max_num_token,), dtype=self._cache_loc_dtype()
             )
+            positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
             if (
                 self.eagle_worker.speculative_algorithm.is_eagle3()
@@ -674,13 +674,9 @@ class EAGLEDraftExtendCudaGraphRunnerAuto(EAGLEDraftExtendCudaGraphRunner):
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
 
-            if hasattr(
-                self.model_runner.model_config.hf_config, "draft_vocab_size"
-            ):
+            if hasattr(self.model_runner.model_config.hf_config, "draft_vocab_size"):
                 vocab_size = self.model_runner.model_config.hf_config.draft_vocab_size
-            elif hasattr(
-                self.model_runner.model_config.hf_config, "hot_vocab_size"
-            ):
+            elif hasattr(self.model_runner.model_config.hf_config, "hot_vocab_size"):
                 vocab_size = self.model_runner.model_config.hf_config.hot_vocab_size
             else:
                 vocab_size = self.model_runner.model_config.vocab_size
