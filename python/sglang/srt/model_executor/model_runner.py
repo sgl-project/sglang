@@ -120,9 +120,6 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.breakable_piecewise_cuda_graph_runner import (
-    BreakablePiecewiseCudaGraphRunner,
-)
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
@@ -2528,11 +2525,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        if self.server_args.enable_breakable_cuda_graph:
-            # Experimental feature
-            self.piecewise_cuda_graph_runner = BreakablePiecewiseCudaGraphRunner(self)
-        else:
-            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        # Experimental: use_breakable skips torch.compile and uses @non_graph decorators
+        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(
+            self, use_breakable=self.server_args.enable_breakable_cuda_graph
+        )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
