@@ -1376,6 +1376,11 @@ class DeepseekV2AttentionMLA(
             llama_4_scaling=llama_4_scaling,
             prev_topk_indices=prev_topk_indices,
         )
+        if get_global_server_args().enable_longcat_double_stream and self.layer_id % 2 == 1 and not forward_batch.forward_mode.is_prefill():
+            from sglang.srt.utils.multi_stream_utils import MultiStreamUtils
+            MultiStreamUtils().mlp_attn0_finished.record()
+            MultiStreamUtils().forward_moe_func()
+            MultiStreamUtils().moe_gemm_finished.wait()
         return self.forward_core(s)
 
     def forward_prepare(

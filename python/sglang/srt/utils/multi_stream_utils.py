@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 
 import torch
 
+from sglang.srt.server_args import get_global_server_args
 
 class do_multi_stream_local(threading.local):
 
@@ -73,3 +74,25 @@ def maybe_execute_in_parallel(
         result0 = fn0()
         result1 = fn1()
     return (result0, result1)
+
+class Singleton(type):
+    def __call__(cls, *args, **kwargs):
+        if not hasattr(cls, "_instance"):
+            cls._instance = super().__call__(*args, **kwargs)
+        return cls._instance
+
+
+class MultiStreamUtils(metaclass=Singleton):
+    def __init__(self):
+        if get_global_server_args().enable_longcat_double_stream:
+            self.stream_8 = torch.npu.Stream()
+            self.stream_16 = torch.npu.Stream()
+            torch.npu.set_stream_limit(self.stream_8, 8, 16)
+            torch.npu.set_stream_limit(self.stream_16, 16, 32)
+            self.main_stream = None
+            self.forward_moe_func = None
+
+            self.first_attn_finished = torch.npu.Event()
+            self.mlp_attn0_finished = torch.npu.Event()
+            self.moe_dispatch_finished = torch.npu.Event()
+            self.moe_gemm_finished = torch.npu.Event()

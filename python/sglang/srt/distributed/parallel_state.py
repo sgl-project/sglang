@@ -1429,6 +1429,7 @@ def init_model_parallel_group(
 
 
 _TP: Optional[GroupCoordinator] = None
+_DOUBLE_STREAM_EP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 
@@ -1452,6 +1453,9 @@ def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
+def get_double_stream_ep_group() -> GroupCoordinator:
+    assert _DOUBLE_STREAM_EP is not None, "double stream parallel group is not initialized"
+    return _DOUBLE_STREAM_EP
 
 def get_attn_tp_group() -> GroupCoordinator:
     assert (
@@ -1796,6 +1800,17 @@ def initialize_model_parallel(
         ),
         group_name="tp",
     )
+
+    from sglang.srt.server_args import get_global_server_args
+    if get_global_server_args().enable_longcat_double_stream:
+        global _DOUBLE_STREAM_EP
+        assert _DOUBLE_STREAM_EP is None, "double stream expert parallel group is already initialized"
+        _DOUBLE_STREAM_EP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="double_stream_ep",
+        )
 
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP

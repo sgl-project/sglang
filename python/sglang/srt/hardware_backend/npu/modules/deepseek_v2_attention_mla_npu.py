@@ -10,6 +10,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
     is_mla_preprocess_enabled,
+    is_longcat_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.nsa.utils import (
@@ -157,31 +158,31 @@ def forward_mla_prepare_npu(
 ):
     if is_mla_preprocess_enabled():
         if not hasattr(m, "mla_preprocess"):
-            m.mla_preprocess = NPUFusedMLAPreprocess(
-                m.fused_qkv_a_proj_with_mqa,
-                m.q_a_layernorm,
-                m.kv_a_layernorm,
-                m.q_b_proj,
-                m.w_kc,
-                m.rotary_emb,
-                m.layer_id,
-                m.num_local_heads,
-                m.qk_nope_head_dim,
-                m.qk_rope_head_dim,
-                m.quant_config,
-            )
-        (
-            q_pe,
-            k_pe,
-            q_nope_out,
-            k_nope,
-            forward_batch,
-            zero_allocator,
-            positions,
-        ) = m.mla_preprocess.forward(
-            positions, hidden_states, forward_batch, zero_allocator
-        )
-        topk_indices = None
+            if is_longcat_mla_preprocess_enabled():
+                (
+                    q_pe,
+                    k_pe,
+                    q_nope_out,
+                    k_nope,
+                    q_lora,
+                    forward_batch,
+                    positions,
+                ) = m.mla_preprocess.forward(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
+            else:
+                (
+                    q_pe,
+                    k_pe,
+                    q_nope_out,
+                    k_nope,
+                    forward_batch,
+                    zero_allocator,
+                    positions,
+                ) = m.mla_preprocess.forward(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
+            topk_indices = None
     else:
         q_lora = None
         if m.q_lora_rank is not None:

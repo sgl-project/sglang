@@ -568,7 +568,7 @@ class Scheduler(
             self.model_config.hf_config, "text_config", self.model_config.hf_config
         )
 
-        if hasattr(config_to_check, "num_experts_per_tok"):
+        if hasattr(self.model_config.hf_config, "num_experts_per_tok") or hasattr(self.model_config.hf_config, "moe_topk"):
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
