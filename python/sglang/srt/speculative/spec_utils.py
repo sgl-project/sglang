@@ -46,7 +46,7 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+TREE_SPEC_KERNEL_AVAILABLE = _is_cuda or _is_hip
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:

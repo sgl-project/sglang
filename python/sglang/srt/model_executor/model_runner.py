@@ -364,19 +364,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.eagle_use_aux_hidden_state = True
 
             try:
-                # get the aux layer from draft model config
                 eagle_config = getattr(
                     draft_model_config.hf_config, "eagle_config", None
                 )
+                if eagle_config is None:
+                    raise ValueError("eagle_config not found in draft model config")
                 self.eagle_use_aux_hidden_state = eagle_config.get(
                     "use_aux_hidden_state", True
                 )
                 self.eagle_aux_hidden_state_layer_ids = eagle_config[
                     "eagle_aux_hidden_state_layer_ids"
                 ]
-            except:
-                # if there is no aux layer, set to None
+            except Exception:
                 self.eagle_aux_hidden_state_layer_ids = None
+                if self.eagle_use_aux_hidden_state:
+                    logger.info(
+                        "Draft model has no eagle_config with explicit "
+                        "layer IDs. Using default aux hidden state layers."
+                    )
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
