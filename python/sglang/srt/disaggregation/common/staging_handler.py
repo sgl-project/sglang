@@ -370,7 +370,7 @@ def is_watermark_ready(
 
 
 # ======================================================================
-# Mooncake-specific staging protocol and utilities
+# Staging data structures and protocol utilities
 # ======================================================================
 
 
@@ -436,8 +436,16 @@ class PrefillStagingStrategy:
         req,
         kv_chunk_index_start: int,
         num_chunk_pages: int,
+        session_id: Optional[str] = None,
     ) -> Tuple[bool, int, int, int, int]:
         """Check if staging offset and watermark are ready for this chunk.
+
+        Args:
+            req: transfer request with a ``.staging`` attribute.
+            kv_chunk_index_start: page-level start index for this chunk.
+            num_chunk_pages: number of pages in this chunk.
+            session_id: identifier used for watermark lookup. Falls back to
+                ``req.mooncake_session_id`` when *None* (mooncake compat).
 
         Returns (ready, chunk_idx, offset, round, end).
         offset == ALLOC_OVERSIZED means permanent failure (fall back to slice).
@@ -451,7 +459,7 @@ class PrefillStagingStrategy:
             else 0
         )
 
-        stg = req.staging
+        stg = getattr(req, "staging", None)
         if stg is None or chunk_idx >= len(stg.offsets):
             return (False, chunk_idx, -1, 0, -1)
 
@@ -464,9 +472,9 @@ class PrefillStagingStrategy:
         c_round = stg.rounds[chunk_idx]
         c_end = stg.ends[chunk_idx]
 
-        if not self.kv_manager._is_watermark_ready(
-            req.mooncake_session_id, c_round, c_end
-        ):
+        if session_id is None:
+            session_id = req.mooncake_session_id
+        if not self.kv_manager._is_watermark_ready(session_id, c_round, c_end):
             return (False, chunk_idx, c_offset, c_round, c_end)
 
         return (True, chunk_idx, c_offset, c_round, c_end)
@@ -717,7 +725,8 @@ def prefetch_staging_reqs(
     full_chunk_pages = max(1, cps // page_size)
 
     for session_id, tinfo in transfer_infos[room].items():
-        if tinfo.is_dummy:
+        _is_dummy = tinfo.is_dummy() if callable(tinfo.is_dummy) else tinfo.is_dummy
+        if _is_dummy:
             continue
         total_pages = len(tinfo.dst_kv_indices)
         if total_pages == 0:

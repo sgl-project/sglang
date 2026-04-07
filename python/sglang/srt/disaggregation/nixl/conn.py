@@ -88,11 +88,14 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: list[int] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: list[int] = dataclasses.field(default_factory=list)
-    staging_base_ptr: int = 0
-    staging_total_size: int = 0
+    staging: Optional[object] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            StagingRegisterInfo,
+        )
+
         # Parse state_data_ptrs from msg[7] if present
         if len(msg) > 7 and msg[7] != b"":
             dst_state_data_ptrs = list(struct.unpack(f"{len(msg[7]) // 8}Q", msg[7]))
@@ -107,13 +110,6 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor = list(
                 struct.unpack(f"{len(msg[13]) // 4}I", msg[13])
             )
-
-        staging_base_ptr = 0
-        staging_total_size = 0
-        if len(msg) > 14 and msg[14] != b"":
-            staging_base_ptr = struct.unpack("Q", msg[14])[0]
-        if len(msg) > 15 and msg[15] != b"":
-            staging_total_size = int(msg[15].decode("ascii"))
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -130,8 +126,7 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=int(msg[11].decode("ascii")),
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
-            staging_base_ptr=staging_base_ptr,
-            staging_total_size=staging_total_size,
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
 
@@ -1175,6 +1170,16 @@ class NixlKVManager(CommonKVManager):
     # Staging transfer helper
     # ------------------------------------------------------------------
 
+    def _get_staging_strategy(self, staging_buffer):
+        """Lazily create or return cached PrefillStagingStrategy."""
+        if not hasattr(self, "_staging_strategy") or self._staging_strategy is None:
+            from sglang.srt.disaggregation.common.staging_handler import (
+                PrefillStagingStrategy,
+            )
+
+            self._staging_strategy = PrefillStagingStrategy(self, staging_buffer)
+        return self._staging_strategy
+
     def _do_staging_transfer(
         self,
         req,
@@ -1186,29 +1191,14 @@ class NixlKVManager(CommonKVManager):
         staging_buffer,
     ):
         """Attempt staging transfer for one request. Returns xfer_handle or None on fallback."""
-        page_size = self.kv_buffer_tensors["page_size"]
-        from sglang.srt.disaggregation.common.staging_handler import (
-            DEFAULT_CHUNKED_PREFILL_SIZE,
-        )
-
-        cps = self.server_args.chunked_prefill_size or DEFAULT_CHUNKED_PREFILL_SIZE
-        full_chunk_pages = max(1, cps // page_size)
-
+        strategy = self._get_staging_strategy(staging_buffer)
         page_start = index_slice.start
         num_pages = len(kv_indices)
-        chunk_idx = page_start // full_chunk_pages if full_chunk_pages > 0 else 0
 
-        stg = getattr(req, "staging", None)
-        if stg is None or chunk_idx >= len(stg.offsets):
-            return None
-
-        c_offset = stg.offsets[chunk_idx]
-        if c_offset < 0:
-            return None
-
-        c_round = stg.rounds[chunk_idx]
-        c_end = stg.ends[chunk_idx]
-        if not self._is_watermark_ready(req.agent_name, c_round, c_end):
+        ready, chunk_idx, c_offset, _, _ = strategy.check_ready(
+            req, page_start, num_pages, session_id=req.agent_name
+        )
+        if not ready:
             return None
 
         notif_tag = (
@@ -1219,8 +1209,8 @@ class NixlKVManager(CommonKVManager):
         return self.send_kvcache_staged(
             req.agent_name,
             kv_indices,
-            decode_info.staging_base_ptr + c_offset,
-            decode_info.staging_total_size - c_offset,
+            decode_info.staging.base_ptr + c_offset,
+            decode_info.staging.total_size - c_offset,
             decode_info.gpu_id,
             decode_info.decode_tp_rank,
             decode_info.decode_tp_size,
@@ -1292,8 +1282,7 @@ class NixlKVManager(CommonKVManager):
                 self.enable_staging
                 and not self.is_mla_backend
                 and decode_tp_size != self.attn_tp_size
-                and decode_info.staging_base_ptr != 0
-                and decode_info.staging_total_size > 0
+                and decode_info.staging is not None
                 and self.kv_buffer_tensors is not None
                 and self._staging_ctx.buffers
             )
