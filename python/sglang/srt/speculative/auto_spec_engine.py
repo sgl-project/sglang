@@ -85,7 +85,6 @@ class AutoSpecEngine:
 
         # EMA smoothing factor for acceptance rate tracking
         self.ema_alpha = 0.3
-        # self.ema_alpha = 1.0
 
         # Load or build bs -> steps mapping
         self._init_bs_steps_mapping()
@@ -159,20 +158,23 @@ class AutoSpecEngine:
             try:
                 with open(self.speculative_config_file, "r") as f:
                     config = json.load(f)
-                if self.model_name and self.model_name in config:
+                if not isinstance(config, dict):
+                    logger.warning(
+                        "AutoSpecEngine: config file is not a JSON object, using defaults."
+                    )
+                elif self.model_name and self.model_name in config:
                     model_config = config[self.model_name]
                     self.bs_steps_mapping = {}
                     for bs_str, steps in model_config.items():
                         try:
-                            self.bs_steps_mapping[int(bs_str)] = sorted(steps)
-                            logger.info(
-                                "AutoSpecEngine: speculative config loaded from file."
-                            )
+                            bs = int(bs_str)
+                            if not isinstance(steps, list) or not steps:
+                                continue
+                            self.bs_steps_mapping[bs] = sorted(steps)
                         except ValueError:
-                            logger.info(
-                                "AutoSpecEngine: speculative config failed to load from file."
+                            logger.warning(
+                                f"AutoSpecEngine: invalid batch size key '{bs_str}' in config file."
                             )
-                            pass
                     if self.bs_steps_mapping:
                         logger.info(
                             f"AutoSpecEngine: loaded config for '{self.model_name}'"
@@ -220,7 +222,7 @@ class AutoSpecEngine:
                 if i < len(neg_threshold):
                     self.decrease_thresholds[bs] = neg_threshold[i]
         logger.info(
-            f"AutoSpecEngine: initialised increase_thresholds={self.increase_thresholds}, decrease_thresholds={self.decrease_thresholds}"
+            f"AutoSpecEngine: initialized increase_thresholds={self.increase_thresholds}, decrease_thresholds={self.decrease_thresholds}"
         )
 
     def _trim_steps_by_memory(self, max_num_graphs: int):
@@ -263,7 +265,7 @@ class AutoSpecEngine:
         for step in self.steps_bs_mapping:
             self.steps_bs_mapping[step].sort()
         logger.info(
-            f"AutoSpecEngine: initialised steps_bs_mapping={self.steps_bs_mapping}"
+            f"AutoSpecEngine: initialized steps_bs_mapping={self.steps_bs_mapping}"
         )
 
     def _init_current_params(self):
@@ -278,7 +280,7 @@ class AutoSpecEngine:
                 initial_steps = min(available, key=lambda s: abs(s - initial_steps))
             self.current_params[bs] = SpecParams(num_steps=initial_steps)
         logger.info(
-            f"AutoSpecEngine: initialised current_params={self._format_params()}"
+            f"AutoSpecEngine: initialized current_params={self._format_params()}"
         )
 
         # EMA acceptance rate tracker per batch size
@@ -358,7 +360,6 @@ class AutoSpecEngine:
 
         bs = self._find_closest_bs(batch_size)
         available_steps = self.bs_steps_mapping[bs]
-        # logger.info(f"AutoSpecEngine: batch size {bs}, available_steps: {available_steps}")
 
         # Compute acceptance rate for this step
         avg_accept_length = (num_accepted_tokens + batch_size) / batch_size
@@ -376,7 +377,6 @@ class AutoSpecEngine:
 
         current_rate = self.ema_accept_rate[bs]
         current_steps = self.current_params[bs].num_steps
-        # logger.info(f"AutoSpecEngine: batch size {bs}, accept_rate: {accept_rate}, current_rate: {current_rate}, current_steps: {current_steps}")
 
         inc_threshold = self.increase_thresholds.get(bs, 0.55)
         dec_threshold = self.decrease_thresholds.get(bs, 0.50)
@@ -384,20 +384,16 @@ class AutoSpecEngine:
         new_steps = current_steps
         if current_rate >= inc_threshold:
             # Try to increase steps
-            # logger.info(f"AutoSpecEngine: current_rate({current_rate}) >= inc_threshold({inc_threshold})")
             higher = [s for s in available_steps if s > current_steps]
             if higher:
                 new_steps = higher[0]  # smallest step larger than current
                 self.current_params[bs] = SpecParams(num_steps=new_steps)
-                # logger.info(f"AutoSpecEngine: new_steps: {new_steps}")
         elif current_rate < dec_threshold:
             # Try to decrease steps
-            # logger.info(f"AutoSpecEngine: current_rate({current_rate}) < inc_threshold({inc_threshold})")
             lower = [s for s in available_steps if s < current_steps]
             if lower:
                 new_steps = lower[-1]  # largest step smaller than current
                 self.current_params[bs] = SpecParams(num_steps=new_steps)
-                # logger.info(f"AutoSpecEngine: new_steps: {new_steps}")
 
         if new_steps != current_steps:
             logger.info(
