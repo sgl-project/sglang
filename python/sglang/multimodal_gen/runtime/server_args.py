@@ -149,6 +149,7 @@ class ServerArgs:
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
@@ -848,6 +849,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
+        parser.add_argument(
+            "--lora-weight-name",
+            type=str,
+            default=ServerArgs.lora_weight_name,
+            help="Specific safetensors filename to load from a multi-file LoRA repo",
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
