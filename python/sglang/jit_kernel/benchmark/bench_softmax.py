@@ -15,7 +15,7 @@ from sglang.jit_kernel.benchmark.utils import (
 from sglang.jit_kernel.softmax import softmax_sampling
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=20, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 DTYPE = torch.bfloat16
 
@@ -25,13 +25,14 @@ VOCAB_SIZES = get_benchmark_range(
 )
 BATCH_SIZES = get_benchmark_range(
     full_range=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-    ci_range=[1, 64],
+    ci_range=[1, 64, 512],
 )
 NUM_REPEAT = 4
 
 configs = list(itertools.product(VOCAB_SIZES, BATCH_SIZES))
 
 
+@torch.compile
 def _torch_softmax(logits: torch.Tensor, temperatures: torch.Tensor) -> torch.Tensor:
     scaled = logits / temperatures.unsqueeze(1)
     return torch.softmax(scaled, dim=-1)

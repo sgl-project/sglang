@@ -32,6 +32,7 @@ def _jit_softmax_module(dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["elementwise/softmax.cuh"],
         cuda_wrappers=[("softmax", f"SoftmaxKernel<{args}>::run")],
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
 

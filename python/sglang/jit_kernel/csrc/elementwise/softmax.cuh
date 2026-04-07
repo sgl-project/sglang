@@ -57,7 +57,7 @@ struct SoftmaxParams {
 /// Warp-level online softmax merge across all 32 lanes.
 SGL_DEVICE fp32x2_t warp_online_softmax_merge(fp32x2_t ms) {
   using namespace device;
-  auto [m, s] = ms;
+  const auto [m, s] = ms;
   const auto warp_max = warp::reduce_max(m);
   const auto warp_sum = warp::reduce_sum(s * math::exp(m - warp_max));
   return {warp_max, warp_sum};
