@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -456,6 +456,26 @@ class TestMamba(unittest.TestCase):
         assert allocator.available_size() == avail_after_step3 - 9
 
         tree.sanity_check()
+
+    def test_get_mamba_recompute_length_skips_tombstoned_parent(self):
+        tree, _, _, _ = self._setup_tree_and_allocator()
+
+        live_ancestor = TreeNode()
+        live_ancestor.parent = tree.root_node
+        live_ancestor.key = RadixKey([1, 2, 3])
+        live_ancestor.mamba_value = torch.tensor([1], device=tree.device)
+
+        tombstoned_parent = TreeNode()
+        tombstoned_parent.parent = live_ancestor
+        tombstoned_parent.key = RadixKey([4, 5])
+        tombstoned_parent.mamba_value = None
+
+        leaf = TreeNode()
+        leaf.parent = tombstoned_parent
+        leaf.key = RadixKey([6, 7, 8, 9])
+        leaf.mamba_value = torch.tensor([2], device=tree.device)
+
+        self.assertEqual(tree._get_mamba_recompute_length(leaf), 6)
 
 
 if __name__ == "__main__":

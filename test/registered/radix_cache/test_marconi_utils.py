@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 
 from sglang.srt.mem_cache.marconi_utils import (
     compute_flop_efficiency,
+    compute_flop_efficiency_with_parent,
     compute_flops_saved,
     compute_memory_bytes,
     get_dense_mlp_flops,
@@ -20,6 +21,7 @@ from sglang.srt.mem_cache.marconi_utils import (
     get_linear_attn_flops,
     get_moe_flops,
 )
+
 
 def _make_dense_config(
     num_layers=8,
@@ -117,8 +119,8 @@ class TestGetFullAttnFlops(unittest.TestCase):
 
     def test_gqa_uses_num_kv_heads(self):
         # With GQA (fewer KV heads), proj_flops should be smaller than MHA
-        mha = get_full_attn_flops(10, 512, 8, 8, 64)   # num_kv_heads == num_heads
-        gqa = get_full_attn_flops(10, 512, 8, 2, 64)   # num_kv_heads < num_heads
+        mha = get_full_attn_flops(10, 512, 8, 8, 64)  # num_kv_heads == num_heads
+        gqa = get_full_attn_flops(10, 512, 8, 2, 64)  # num_kv_heads < num_heads
         self.assertGreater(mha, gqa)
 
     def test_scales_quadratically_with_seqlen(self):
@@ -160,8 +162,7 @@ class TestGetMoeFlops(unittest.TestCase):
         seqlen, hidden, k, expert_int, shared_int = 10, 512, 2, 256, 128
         # SwiGLU: up + gate + down = 3 matmuls × 2 = 6, same as dense MLP
         expected = (
-            6 * seqlen * hidden * expert_int * k
-            + 6 * seqlen * hidden * shared_int
+            6 * seqlen * hidden * expert_int * k + 6 * seqlen * hidden * shared_int
         )
         self.assertEqual(
             get_moe_flops(seqlen, hidden, k, expert_int, shared_int), expected
@@ -191,6 +192,7 @@ class TestGetDenseMlpFlops(unittest.TestCase):
         f2 = get_dense_mlp_flops(100, 512, 1024)
         self.assertAlmostEqual(f2 / f1, 2.0, places=9)
 
+
 class TestComputeFlopsSaved(unittest.TestCase):
     def setUp(self):
         # 8-layer model: attention at layers 3,7; linear at 0,1,2,4,5,6
@@ -218,8 +220,8 @@ class TestComputeFlopsSaved(unittest.TestCase):
         self.assertGreater(moe, dense)
 
     def test_deeper_prefix_saves_more_attn_flops(self):
-        shallow = compute_flops_saved(10, 20, self.dense_cfg)   # parent_len=10
-        deep = compute_flops_saved(10, 100, self.dense_cfg)     # parent_len=90
+        shallow = compute_flops_saved(10, 20, self.dense_cfg)  # parent_len=10
+        deep = compute_flops_saved(10, 100, self.dense_cfg)  # parent_len=90
         self.assertGreater(deep, shallow)
 
     def test_prefix_equals_total_len(self):
@@ -227,6 +229,18 @@ class TestComputeFlopsSaved(unittest.TestCase):
         full = compute_flops_saved(20, 20, self.dense_cfg)
         partial = compute_flops_saved(10, 20, self.dense_cfg)
         self.assertGreater(full, partial)
+
+    def test_explicit_live_ancestor_above_parent_saves_more(self):
+        immediate_parent = compute_flops_saved(10, 30, self.dense_cfg)
+        live_ancestor = compute_flops_saved(
+            seqlen_child=10,
+            seqlen_total=30,
+            config=self.dense_cfg,
+            seqlen_parent=10,
+        )
+        equivalent_replay = compute_flops_saved(20, 30, self.dense_cfg)
+        self.assertGreater(live_ancestor, immediate_parent)
+        self.assertEqual(live_ancestor, equivalent_replay)
 
     def test_dense_config_does_not_use_moe_flops(self):
         prefix_len = 5
@@ -247,8 +261,65 @@ class TestComputeFlopsSaved(unittest.TestCase):
         moe_result = compute_flops_saved(prefix_len, 2 * prefix_len, cfg_moe_same)
         self.assertGreater(moe_result, dense_result)
 
+
 class TestComputeMemoryBytes(unittest.TestCase):
-    def _bytes(self, prefix_len, mamba_bytes, total_kv_heads, tp, head_dim, num_attn_layers, kv_dtype_bytes=2):
+    def _bytes(
+        self,
+        prefix_len,
+        mamba_bytes,
+        total_kv_heads,
+        tp,
+        head_dim,
+        num_attn_layers,
+        kv_dtype_bytes=2,
+    ):
+        cache_params = _make_cache_params(mamba_bytes)
+        model_config = _make_model_config(total_kv_heads, tp)
+        config = MagicMock()
+        config.head_dim = head_dim
+        config.full_attention_layer_ids = list(range(num_attn_layers))
+        return compute_memory_bytes(
+            prefix_len, cache_params, config, model_config, tp, kv_dtype_bytes
+        )
+
+
+class TestComputeFlopEfficiencyWithParent(unittest.TestCase):
+    def test_farther_live_ancestor_increases_efficiency(self):
+        cfg = _make_dense_config(num_layers=8, full_attention_interval=4)
+        cache_params = _make_cache_params(4096)
+        model_config = _make_model_config(total_kv_heads=8, tp_world_size=1)
+
+        immediate_parent = compute_flop_efficiency(
+            seqlen_child=10,
+            seqlen_total=30,
+            cache_params=cache_params,
+            config=cfg,
+            model_config=model_config,
+            tp_world_size=1,
+        )
+        live_ancestor = compute_flop_efficiency_with_parent(
+            seqlen_total=30,
+            seqlen_parent=10,
+            cache_params=cache_params,
+            config=cfg,
+            model_config=model_config,
+            tp_world_size=1,
+        )
+
+        self.assertGreater(live_ancestor, immediate_parent)
+
+
+class TestComputeMemoryBytes(unittest.TestCase):
+    def _bytes(
+        self,
+        prefix_len,
+        mamba_bytes,
+        total_kv_heads,
+        tp,
+        head_dim,
+        num_attn_layers,
+        kv_dtype_bytes=2,
+    ):
         cache_params = _make_cache_params(mamba_bytes)
         model_config = _make_model_config(total_kv_heads, tp)
         config = MagicMock()
@@ -260,7 +331,9 @@ class TestComputeMemoryBytes(unittest.TestCase):
 
     def test_zero_prefix_len_returns_ssm_only(self):
         # KV bytes = 0 when prefix_len = 0
-        result = self._bytes(0, mamba_bytes=4096, total_kv_heads=8, tp=1, head_dim=64, num_attn_layers=2)
+        result = self._bytes(
+            0, mamba_bytes=4096, total_kv_heads=8, tp=1, head_dim=64, num_attn_layers=2
+        )
         self.assertEqual(result, 4096)
 
     def test_kv_scales_linearly_with_prefix_len(self):
@@ -275,8 +348,12 @@ class TestComputeMemoryBytes(unittest.TestCase):
 
     def test_tp_sharding_does_not_affect_ssm_bytes(self):
         # mamba_cache_per_req already carries TP-sharded values; it must not be divided again
-        tp1 = self._bytes(0, mamba_bytes=8192, total_kv_heads=8, tp=1, head_dim=64, num_attn_layers=2)
-        tp4 = self._bytes(0, mamba_bytes=8192, total_kv_heads=8, tp=4, head_dim=64, num_attn_layers=2)
+        tp1 = self._bytes(
+            0, mamba_bytes=8192, total_kv_heads=8, tp=1, head_dim=64, num_attn_layers=2
+        )
+        tp4 = self._bytes(
+            0, mamba_bytes=8192, total_kv_heads=8, tp=4, head_dim=64, num_attn_layers=2
+        )
         self.assertEqual(tp1, tp4)
 
     def test_kv_dtype_bytes_scales_result(self):
@@ -288,13 +365,24 @@ class TestComputeMemoryBytes(unittest.TestCase):
         prefix_len, total_kv_heads, tp, head_dim, num_attn_layers = 10, 8, 2, 64, 3
         kv_dtype_bytes = 2
         kv_heads_per_gpu = max(1, total_kv_heads // tp)
-        expected_kv = prefix_len * kv_heads_per_gpu * head_dim * 2 * kv_dtype_bytes * num_attn_layers
-        result = self._bytes(prefix_len, 0, total_kv_heads, tp, head_dim, num_attn_layers, kv_dtype_bytes)
+        expected_kv = (
+            prefix_len
+            * kv_heads_per_gpu
+            * head_dim
+            * 2
+            * kv_dtype_bytes
+            * num_attn_layers
+        )
+        result = self._bytes(
+            prefix_len, 0, total_kv_heads, tp, head_dim, num_attn_layers, kv_dtype_bytes
+        )
         self.assertEqual(result, expected_kv)
 
     def test_tp_head_replication_min_one(self):
         # When num_kv_heads < tp_world_size, heads are replicated: min 1 head per GPU
-        result = self._bytes(10, 0, total_kv_heads=2, tp=8, head_dim=64, num_attn_layers=1)
+        result = self._bytes(
+            10, 0, total_kv_heads=2, tp=8, head_dim=64, num_attn_layers=1
+        )
         expected_kv = 10 * 1 * 64 * 2 * 2 * 1  # max(1, 2//8)=1
         self.assertEqual(result, expected_kv)
 

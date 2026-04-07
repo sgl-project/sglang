@@ -693,10 +693,14 @@ class Scheduler(
             ),
             eviction_policy=server_args.radix_eviction_policy,
             marconi_eff_weight=server_args.marconi_eff_weight,
-            model_config=self.model_config if server_args.radix_eviction_policy == "marconi" else None,
+            model_config=(
+                self.model_config
+                if server_args.radix_eviction_policy in ("marconi", "marconi-fixed")
+                else None
+            ),
             mamba_cache_params=(
                 self.model_config.hf_text_config.mamba2_cache_params
-                if server_args.radix_eviction_policy == "marconi"
+                if server_args.radix_eviction_policy in ("marconi", "marconi-fixed")
                 and hasattr(self.model_config.hf_text_config, "mamba2_cache_params")
                 else None
             ),
