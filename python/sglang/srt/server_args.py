@@ -3002,8 +3002,13 @@ class ServerArgs:
                 logger.warning(
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
-
-            if (
+            
+            if self.speculative_algorithm == "SSD_V1":
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "SSD_V1 is enabled for speculative decoding and overlap schedule is turned off."
+                )
+            elif (
                 self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
                 and envs.SGLANG_ENABLE_SPEC_V2.get()
             ):
@@ -4787,7 +4792,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SSD_V1"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

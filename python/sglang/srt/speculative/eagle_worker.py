@@ -61,6 +61,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     empty_context,
+    get_bool_env_var,
     get_available_gpu_memory,
     is_cuda,
     is_npu,
@@ -693,9 +694,38 @@ class EAGLEWorker(TpModelWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
 
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
-        )
+        score_full = torch.cat(score_list, dim=1).flatten(1)
+        ss_token_list = torch.cat(token_list, dim=1)
+        if get_bool_env_var("SGLANG_SSD_SUBTREE_REUSE", "false"):
+            setattr(forward_batch, "_ssd_candidate_scores", score_full)
+            setattr(forward_batch, "_ssd_candidate_tokens", ss_token_list)
+
+        k = int(self.speculative_num_draft_tokens) - 1
+        n = int(score_full.shape[1])
+        if k <= 0:
+            raise RuntimeError(
+                f"Invalid num_draft_token={self.speculative_num_draft_tokens}. Expected >= 2."
+            )
+        if k > n:
+            raise RuntimeError(
+                "Invalid speculative config: "
+                f"num_draft_token-1={k} exceeds available candidates={n}. "
+                "Check speculative_num_steps, topk, and speculative_num_draft_tokens."
+            )
+        if k == n:
+            top_scores_index = torch.arange(
+                n, device=score_full.device, dtype=torch.int64
+            ).expand(score_full.shape[0], n)
+        else:
+            top_scores_index = torch.topk(score_full, k, dim=-1).indices
+            top_scores_index = torch.sort(top_scores_index).values
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+        if len(parents_list) > 1:
+            parent_list = torch.cat(parents_list[:-1], dim=1)
+        else:
+            batch_size = parents_list[0].shape[0]
+            parent_list = torch.empty(batch_size, 0, device=parents_list[0].device)
 
         return parent_list, top_scores_index, draft_tokens
 

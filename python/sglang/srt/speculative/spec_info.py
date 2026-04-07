@@ -18,6 +18,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
+    SSD_V1 = auto()
     NGRAM = auto()
     NONE = auto()
 
@@ -42,6 +43,9 @@ class SpeculativeAlgorithm(Enum):
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
+    
+    def is_ssd(self) -> bool:
+        return self == SpeculativeAlgorithm.SSD_V1
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
@@ -92,6 +96,14 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.standalone_worker import StandaloneWorker
 
             return StandaloneWorker
+        elif self.is_ssd():
+            if enable_overlap:
+                raise ValueError(
+                    "Speculative algorithm SSD_V1 does not support overlap (spec v2). "
+                    "Set env SGLANG_ENABLE_SPEC_V2=False."
+                )
+            from sglang.srt.speculative.ssd_worker import SSDWorkerV1
+            return SSDWorkerV1
         elif self.is_ngram():
             if enable_overlap:
                 raise ValueError(

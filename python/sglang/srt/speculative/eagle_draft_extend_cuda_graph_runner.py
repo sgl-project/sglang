@@ -227,6 +227,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_ssd()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:

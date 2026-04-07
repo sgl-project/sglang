@@ -48,6 +48,10 @@ class GenerationBatchResult:
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+    ssd_cache_hits_sum: int = 0
+    ssd_cache_hits_count: int = 0
+    ssd_subtree_reuse_attempts: int = 0
+    ssd_subtree_reuse_fallbacks: int = 0
 
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.

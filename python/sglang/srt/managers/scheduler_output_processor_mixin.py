@@ -411,7 +411,14 @@ class SchedulerOutputProcessorMixin:
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            self.update_spec_metrics(
+                batch.batch_size(),
+                result.num_accepted_tokens,
+                getattr(result, "ssd_cache_hits_sum", 0),
+                getattr(result, "ssd_cache_hits_count", 0),
+                getattr(result, "ssd_subtree_reuse_attempts", 0),
+                getattr(result, "ssd_subtree_reuse_fallbacks", 0),
+            )
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
