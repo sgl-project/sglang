@@ -134,6 +134,10 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         hidden_size = getattr(config, "moe_latent_size", None) or hidden_size
+    elif architecture == "Gemma4ForConditionalGeneration":
+        E = config.num_experts // ep_size
+        topk = config.top_k_experts
+        intermediate_size = config.moe_intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
