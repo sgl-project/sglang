@@ -22,7 +22,7 @@ register_cuda_ci(est_time=360, suite="stage-b-test-1-gpu-small")
 
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
-    max_running_requests = 64
+    max_running_requests = 128
     attention_backend = "flashinfer"
     page_size = 1
     other_launch_args = []
