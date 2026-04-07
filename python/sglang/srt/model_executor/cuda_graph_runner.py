@@ -601,6 +601,9 @@ class CudaGraphRunner:
             set_torch_compile_config()
 
         if self.model_runner.server_args.enable_lora:
+            # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
+            # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
+            # lora_manager.init_cuda_graph_moe_buffers().
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_bs=self.num_tokens_per_bs,
