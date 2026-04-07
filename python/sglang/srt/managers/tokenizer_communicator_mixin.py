@@ -374,6 +374,11 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager, obj: AddExternalCorpusReqInput
     ) -> AddExternalCorpusReqOutput:
         self.auto_create_handle_loop()
+        if self.server_args.speculative_algorithm != "NGRAM":
+            return AddExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
         truncated = False
         try:
             if not obj.corpus_id:
@@ -447,6 +452,11 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager, corpus_id: str
     ) -> RemoveExternalCorpusReqOutput:
         self.auto_create_handle_loop()
+        if self.server_args.speculative_algorithm != "NGRAM":
+            return RemoveExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
         results = await self.remove_external_corpus_communicator(
             RemoveExternalCorpusReqInput(corpus_id=corpus_id)
         )
@@ -459,6 +469,11 @@ class TokenizerCommunicatorMixin:
         self: TokenizerManager,
     ) -> ListExternalCorporaReqOutput:
         self.auto_create_handle_loop()
+        if self.server_args.speculative_algorithm != "NGRAM":
+            return ListExternalCorporaReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
         results = await self.list_external_corpora_communicator(
             ListExternalCorporaReqInput()
         )
