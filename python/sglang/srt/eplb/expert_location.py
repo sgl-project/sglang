@@ -522,7 +522,10 @@ class ModelConfigForExpertLocation:
 
     @staticmethod
     def from_model_config(model_config: ModelConfig):
-        model_class, _ = get_model_architecture(model_config)
+        try:
+            model_class, _ = get_model_architecture(model_config)
+        except (ValueError, AttributeError, TypeError):
+            return None
         if hasattr(model_class, "get_model_config_for_expert_location"):
             return model_class.get_model_config_for_expert_location(
                 model_config.hf_config
