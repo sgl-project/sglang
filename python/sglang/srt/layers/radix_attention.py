@@ -24,6 +24,7 @@ from torch import nn
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.environ import envs
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -116,7 +117,7 @@ class RadixAttention(nn.Module):
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+            if get_global_server_args().enable_breakable_cuda_graph:
                 from sglang.srt.model_executor.breakable_piecewise_cuda_graph_runner import (
                     get_bridge_buffers,
                 )

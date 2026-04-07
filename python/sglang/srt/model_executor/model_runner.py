@@ -2525,7 +2525,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+        if self.server_args.enable_breakable_cuda_graph:
             from sglang.srt.model_executor.breakable_piecewise_cuda_graph_runner import (
                 BreakablePiecewiseCudaGraphRunner,
             )

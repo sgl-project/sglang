@@ -610,7 +610,6 @@ class ServerArgs:
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
-    debug_cuda_graph: bool = False
     enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
@@ -3398,13 +3397,8 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        if self.enable_breakable_cuda_graph or self.debug_cuda_graph:
-            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
-        if self.debug_cuda_graph:
-            logger.warning(
-                "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
-                "All operations will run eagerly through the graph capture/replay path."
-            )
+        if self.enable_breakable_cuda_graph:
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.set("0")
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
