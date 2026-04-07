@@ -183,7 +183,7 @@ class AutoBenchmarkTestCase(CustomTestCase):
             "benchmark_cfg": benchmark_cfg,
             "dataset_summary": {"num_requests": 1},
             "backend": "sglang-oai",
-            "dataset_path": "/tmp/fake.jsonl",
+            "dataset_path": str(self.tmpdir_path / "fake.jsonl"),
             "tokenizer_path": str(self.tokenizer_dir),
             "server_flags": {"model_path": "/model"},
             "output_dir": str(self.tmpdir_path),
