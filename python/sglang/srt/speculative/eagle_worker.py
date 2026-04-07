@@ -348,8 +348,8 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_attn_backend = draft_attn
 
                 # Capture draft CUDA graph for this step
+                bs_for_step = auto_spec_engine.steps_bs_mapping.get(num_steps)
                 if num_steps > 1:
-                    bs_for_step = auto_spec_engine.steps_bs_mapping.get(num_steps)
                     self.cuda_graph_runner_for_steps[num_steps] = (
                         EAGLEDraftCudaGraphRunnerAuto(
                             self,
