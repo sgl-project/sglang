@@ -725,9 +725,14 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
+        _spec = self.tp_worker.model_runner.linear_attn_model_spec
+        _registry_needs_mamba = (
+            _spec.uses_mamba_radix_cache if _spec is not None else False
+        )
         self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
+            or _registry_needs_mamba
         )
 
         self.sliding_window_size = None
