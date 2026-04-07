@@ -972,6 +972,64 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         ids = corpus.list_external_corpora()
         self.assertIn("test_corpus", ids)
 
+    def test_remove_frees_token_budget(self):
+        """Removing a corpus should free its tokens from the total budget."""
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_max_tokens=10,
+        )
+        corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+        corpus.load_external_corpus_named("b", [[10, 20, 30, 40, 50]])
+        self.assertEqual(corpus.remaining_token_budget, 0)
+
+        corpus.remove_external_corpus("a")
+        self.assertEqual(corpus.remaining_token_budget, 5)
+
+        # Now there's room for a new corpus.
+        corpus.load_external_corpus_named("c", [[100, 200, 300]])
+        self.assertEqual(sorted(corpus.list_external_corpora()), ["b", "c"])
+
+    def test_replace_corpus_respects_budget(self):
+        """Replacing an existing corpus_id should account for the old token count."""
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_max_tokens=10,
+        )
+        corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+        # Replace "a" with a larger corpus that still fits.
+        corpus.load_external_corpus_named("a", [[10, 20, 30, 40, 50, 60, 70, 80]])
+        self.assertEqual(corpus.remaining_token_budget, 2)
+        self.assertEqual(corpus.list_external_corpora(), ["a"])
+
+    def test_error_on_load_preserves_existing_corpora(self):
+        """A failed load must not wipe previously loaded corpora (staging-only cleanup)."""
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_max_tokens=10,
+        )
+        corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+
+        # Force an error by exceeding the budget.
+        with self.assertRaises(ValueError):
+            corpus.load_external_corpus_named("b", [[10, 20, 30, 40, 50, 60]])
+
+        # "a" must still be usable for matching.
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(4, 4).tolist()
+        )
+        # Should still find continuations from corpus "a".
+        self.assertTrue(
+            any(4 in path or 5 in path for path in leaf_paths),
+            f"Expected tokens from corpus 'a' in {leaf_paths}",
+        )
+
 
 class TestMultiSamHttpMock(CustomTestCase):
     """Test HTTP endpoints for multi-SAM management with a mocked backend."""

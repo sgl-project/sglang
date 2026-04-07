@@ -80,6 +80,10 @@ class NGRAMWorker:
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
 
+    @property
+    def remaining_corpus_token_budget(self) -> int:
+        return self.ngram_corpus.remaining_token_budget
+
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
 

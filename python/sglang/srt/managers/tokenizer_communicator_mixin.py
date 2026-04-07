@@ -441,9 +441,7 @@ class TokenizerCommunicatorMixin:
                 success=all_success,
                 corpus_id=results[0].corpus_id if all_success else "",
                 message=all_message,
-                loaded_token_count=results[0].loaded_token_count
-                if all_success
-                else 0,
+                loaded_token_count=results[0].loaded_token_count if all_success else 0,
             )
         except Exception as e:
             return AddExternalCorpusReqOutput(success=False, message=str(e))
@@ -461,9 +459,7 @@ class TokenizerCommunicatorMixin:
             RemoveExternalCorpusReqInput(corpus_id=corpus_id)
         )
         all_success, all_message = _Communicator.merge_results(results)
-        return RemoveExternalCorpusReqOutput(
-            success=all_success, message=all_message
-        )
+        return RemoveExternalCorpusReqOutput(success=all_success, message=all_message)
 
     async def list_external_corpora(
         self: TokenizerManager,

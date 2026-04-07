@@ -36,8 +36,11 @@ class NgramCorpus:
         )
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
+        self.external_corpus_max_tokens = external_corpus_max_tokens
         self._req_id_to_state_id: Dict[str, int] = {}
         self._next_state_id: int = 0
+        self._corpus_token_counts: Dict[str, int] = {}
+        self._total_loaded_tokens: int = 0
 
     def _get_state_id(self, req_id: str) -> int:
         sid = self._req_id_to_state_id.get(req_id)
@@ -53,14 +56,36 @@ class NgramCorpus:
     def synchronize(self):
         self._obj.synchronize()  # type: ignore
 
+    @property
+    def remaining_token_budget(self) -> int:
+        return self.external_corpus_max_tokens - self._total_loaded_tokens
+
     def load_external_corpus_named(
         self, corpus_id: str, chunks: Iterable[Sequence[int]]
     ) -> int:
         _, loaded_token_count = self._obj.load_external_corpus_named(corpus_id, chunks)
+        # If replacing an existing corpus, subtract the old count first.
+        old_count = self._corpus_token_counts.pop(corpus_id, 0)
+        self._total_loaded_tokens -= old_count
+        if (
+            self._total_loaded_tokens + loaded_token_count
+            > self.external_corpus_max_tokens
+        ):
+            # Rollback: remove the just-loaded corpus from C++.
+            self._obj.remove_corpus(corpus_id)
+            raise ValueError(
+                f"Total external corpus tokens would exceed the configured limit "
+                f"({self.external_corpus_max_tokens}). Currently loaded: "
+                f"{self._total_loaded_tokens}, attempted to add: {loaded_token_count}."
+            )
+        self._corpus_token_counts[corpus_id] = loaded_token_count
+        self._total_loaded_tokens += loaded_token_count
         return loaded_token_count
 
     def remove_external_corpus(self, corpus_id: str) -> None:
         self._obj.remove_corpus(corpus_id)
+        old_count = self._corpus_token_counts.pop(corpus_id, 0)
+        self._total_loaded_tokens -= old_count
 
     def list_external_corpora(self) -> List[str]:
         return self._obj.list_corpora()
