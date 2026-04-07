@@ -1534,7 +1534,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
         self.enable_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self._cache_permute_indices = {}
 
@@ -1789,10 +1788,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ("w2", layer.w2_weight_scale),
         ]:
             # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
-            if (
-                get_moe_runner_backend().is_flashinfer_trtllm()
-                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            ):
+            if get_moe_runner_backend().is_flashinfer_trtllm():
                 expected_blocks = {
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
@@ -1904,17 +1900,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        ):
+        if get_moe_runner_backend().is_flashinfer_trtllm():
             self.runner = MoeRunner(
-                (
-                    MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
-                    if get_moe_runner_backend().is_flashinfer_trtllm_routed()
-                    else MoeRunnerBackend.FLASHINFER_TRTLLM
-                ),
-                moe_runner_config,
+                MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
             )
 
     def apply(
