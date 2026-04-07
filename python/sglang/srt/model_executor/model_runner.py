@@ -140,6 +140,9 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
+from sglang.srt.model_executor.breakable_piecewise_cuda_graph_runner import (
+    BreakablePiecewiseCudaGraphRunner,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -2526,10 +2529,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if self.server_args.enable_breakable_cuda_graph:
-            from sglang.srt.model_executor.breakable_piecewise_cuda_graph_runner import (
-                BreakablePiecewiseCudaGraphRunner,
-            )
-
+            # Experimental feature
             self.piecewise_cuda_graph_runner = BreakablePiecewiseCudaGraphRunner(self)
         else:
             self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
