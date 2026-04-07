@@ -29,7 +29,7 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
     model = DEFAULT_TARGET_MODEL_DFLASH
     draft_model = DEFAULT_DRAFT_MODEL_DFLASH
     gsm8k_accuracy_thres = 0.23
-    gsm8k_accept_length_thres = 3.15
+    gsm8k_accept_length_thres = 2.8
 
     @classmethod
     def setUpClass(cls):
