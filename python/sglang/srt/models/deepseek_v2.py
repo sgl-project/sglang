@@ -2179,23 +2179,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if server_args.disable_shared_experts_fusion:
             return
 
-        # SBO/TBO overlap shared expert with A2A dispatch/combine, which is
-        # incompatible with fusing shared expert into the MoE kernel.
-        if is_sbo_enabled() or is_tbo_enabled():
-            server_args.disable_shared_experts_fusion = True
-            log_info_on_rank0(
-                logger,
-                "SBO/TBO enabled: shared experts fusion is disabled to allow overlap.",
-            )
-            return
-
-        # For DeepEP/Mori/Mooncake: fusion is off by default because shared expert
-        # computation can overlap with A2A dispatch/combine. Users can opt-in via
-        # --enforce-shared-experts-fusion.
-        if is_deepep_class_backend():
-            if not server_args.enforce_shared_experts_fusion:
-                server_args.disable_shared_experts_fusion = True
-                return
+        # DeepEP + enforce: the only path that enables fusion under DeepEP.
+        if is_deepep_class_backend() and server_args.enforce_shared_experts_fusion:
             log_info_on_rank0(
                 logger,
                 "DeepEP shared expert fusion: fusing shared expert into MoE kernel "
@@ -2204,9 +2189,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.num_fused_shared_experts = self.config.n_shared_experts
             return
 
-        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
+        # Check all conditions that disable fusion.
         disable_reason = None
-        if (
+        if is_sbo_enabled() or is_tbo_enabled():
+            disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."
+        elif is_deepep_class_backend():
+            disable_reason = "DeepEP: fusion off by default (use --enforce-shared-experts-fusion to enable)."
+        elif (
             self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
