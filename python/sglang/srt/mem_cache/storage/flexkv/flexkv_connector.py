@@ -284,6 +284,10 @@ class FlexKVConnector(BaseKVConnector):
         self.layerwise_eventfd_socket = os.getenv(
             "FLEXKV_LAYERWISE_EVENTFD_SOCKET", "/tmp/flexkv_layerwise_eventfd.sock"
         )
+        self.layerwise_eventfd_connect_max_retries = max(
+            360,
+            int(os.getenv("FLEXKV_LAYERWISE_EVENTFD_CONNECT_MAX_RETRIES", "0")),
+        )
         self._layer_done_counter: Optional[FlexKVLayerDoneCounter] = None
         self._worker_connected = False
 
@@ -564,9 +568,10 @@ class FlexKVConnector(BaseKVConnector):
         logger.info("[FlexKV] Rank %d: Initialized layerwise transfer", self.rank)
 
     def _send_eventfds_to_worker(
-        self, max_retries: int = 180, retry_interval: float = 1.0
+        self, retry_interval: float = 1.0
     ):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        max_retries =self.layerwise_eventfd_connect_max_retries
 
         for attempt in range(max_retries):
             try:
