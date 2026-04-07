@@ -50,12 +50,22 @@ logger = logging.getLogger(__name__)
 TIMESTAMP_BASE_TOKEN_ID = 50365  # <|0.00|>
 TIMESTAMP_BASE_OFFSET = 0.02  # Each token step = 0.02 seconds
 
+_QWEN3_ASR_TEXT_TAG = "<asr_text>"
+
+
+def _detect_model_family(model_config) -> str:
+    archs = getattr(getattr(model_config, "hf_config", None), "architectures", []) or []
+    if "Qwen3ASRForConditionalGeneration" in archs:
+        return "qwen3_asr"
+    return "whisper"
+
 
 class OpenAIServingTranscription(OpenAIServingBase):
     """Handler for /v1/audio/transcriptions requests"""
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         super().__init__(tokenizer_manager)
+        self._model_family = _detect_model_family(tokenizer_manager.model_config)
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
@@ -71,6 +81,27 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, TranscriptionRequest]:
         """Convert transcription request to internal format."""
+        if self._model_family == "qwen3_asr":
+            prompt = (
+                "<|im_start|>user\n"
+                "<|audio_start|><|audio_pad|><|audio_end|>"
+                "<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
+            sampling_params = {
+                "temperature": request.temperature,
+                "max_new_tokens": 1024,
+            }
+            adapted_request = GenerateReqInput(
+                text=prompt,
+                audio_data=request.audio_data,
+                sampling_params=sampling_params,
+                stream=request.stream,
+                modalities=["audio"],
+                routing_key=self.extract_routing_key(raw_request),
+            )
+            return adapted_request, request
+
         # Build sampling params - include language for WhisperProcessor
         sampling_params = {
             "temperature": request.temperature,
@@ -232,6 +263,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         text = ret.get("text", "")
+        if self._model_family == "qwen3_asr":
+            text = _postprocess_qwen3_asr(text)
         usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
         # Build response based on format
@@ -239,15 +272,22 @@ class OpenAIServingTranscription(OpenAIServingBase):
             return Response(content=text, media_type="text/plain")
 
         if request.response_format == "verbose_json":
-            output_ids = ret.get("output_ids", [])
-            tokenizer = self.tokenizer_manager.tokenizer
-            parsed_text, segments = self._parse_segments(output_ids, tokenizer)
-
+            if self._model_family == "whisper":
+                output_ids = ret.get("output_ids", [])
+                tokenizer = self.tokenizer_manager.tokenizer
+                parsed_text, segments = self._parse_segments(output_ids, tokenizer)
+                return TranscriptionVerboseResponse(
+                    language=request.language or "en",
+                    duration=round(request.audio_duration_s, 2),
+                    text=parsed_text or text,
+                    segments=segments,
+                    usage=usage,
+                )
             return TranscriptionVerboseResponse(
-                language=request.language or "en",
+                language=request.language,
                 duration=round(request.audio_duration_s, 2),
-                text=parsed_text or text,
-                segments=segments,
+                text=text,
+                segments=[],
                 usage=usage,
             )
 
@@ -324,3 +364,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
             yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"
+
+
+# TODO (adityavaid): refactor model-specific postprocessing into a plugin/adapter mechanism.
+def _postprocess_qwen3_asr(text: str) -> str:
+    if not text:
+        return ""
+    if _QWEN3_ASR_TEXT_TAG in text:
+        _, text_part = text.rsplit(_QWEN3_ASR_TEXT_TAG, 1)
+        return text_part.strip()
+    return text.strip()
