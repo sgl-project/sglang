@@ -13,6 +13,7 @@
 # ==============================================================================
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
+import logging
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -26,6 +27,8 @@ from .base_grammar_backend import (
     BaseGrammarObject,
     InvalidGrammarObject,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
@@ -41,7 +44,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def maybe_init_reasoning(self, reasoning: bool):
         self.tokens_after_think_end = -1 if reasoning else 0
 
-    def transfer_state(self, token: int) -> int:
+    def transfer_state(self, token: int) -> None:
         if self.tokens_after_think_end == -1 and token == self.think_end_id:
             self.tokens_after_think_end = 0
         elif self.tokens_after_think_end >= 0:
@@ -132,6 +135,15 @@ class StrictReasonerGrammarObject(ReasonerGrammarObject):
             and think_excluded_token_ids
             and getattr(grammar_backend, "is_support_token_filter", False)
         )
+        if (
+            strict_reasoning_format
+            and think_excluded_token_ids
+            and not getattr(grammar_backend, "is_support_token_filter", False)
+        ):
+            logger.warning(
+                "Strict reasoning format requested but the grammar backend does not "
+                "support token filtering. Think-phase token filter will be disabled."
+            )
         self.is_init_reasoning = False
         self.max_think_tokens = envs.SGLANG_MAX_THINK_TOKENS.get()
         # -1    means thinking has not began yet
@@ -144,8 +156,14 @@ class StrictReasonerGrammarObject(ReasonerGrammarObject):
         self.tokens_after_think_end = -1
 
     def maybe_init_reasoning(self, reasoning: bool):
-        self.tokens_in_think = 0 if reasoning else -1  # Enforce thinking begin
-        self.is_init_reasoning = reasoning
+        if reasoning:
+            self.tokens_in_think = 0  # Enforce thinking begin
+            self.is_init_reasoning = True
+        else:
+            # Skip directly to post-think state so grammar constraints apply
+            self.tokens_in_think = -1
+            self.tokens_after_think_end = 0
+            self.is_init_reasoning = False
 
     def _is_initial_state(self):
         return (self.tokens_in_think == -1) and (self.tokens_after_think_end == -1)
@@ -156,7 +174,7 @@ class StrictReasonerGrammarObject(ReasonerGrammarObject):
     def _is_reasoning_ended(self):
         return self.tokens_after_think_end >= 0
 
-    def transfer_state(self, token: int) -> int:
+    def transfer_state(self, token: int) -> None:
         if self._is_initial_state() and token == self.think_start_id:
             self.tokens_in_think = 0
             return
@@ -188,6 +206,14 @@ class StrictReasonerGrammarObject(ReasonerGrammarObject):
             elif self.tokens_after_think_end > 0:
                 self.tokens_after_think_end -= 1
             return
+
+    def rollback(self, k):
+        # Only rollback grammar for steps that occurred after think ended
+        steps_after_think = min(k, max(0, self.tokens_after_think_end))
+        if steps_after_think > 0:
+            self.grammar.rollback(steps_after_think)
+        for _ in range(k):
+            self.rollback_state()
 
     def accept_token(self, token: int):
         if self._is_reasoning_ended():
@@ -256,12 +282,24 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
-        self.think_start_id = tokenizer.encode(
-            reasoning_parser.detector.think_start_token
-        )[0]
-        self.think_end_id = tokenizer.encode(reasoning_parser.detector.think_end_token)[
-            0
-        ]
+        think_start_ids = tokenizer.encode(
+            reasoning_parser.detector.think_start_token, add_special_tokens=False
+        )
+        think_end_ids = tokenizer.encode(
+            reasoning_parser.detector.think_end_token, add_special_tokens=False
+        )
+        if not think_start_ids:
+            raise ValueError(
+                f"think_start_token '{reasoning_parser.detector.think_start_token}' "
+                f"could not be encoded by the tokenizer."
+            )
+        if not think_end_ids:
+            raise ValueError(
+                f"think_end_token '{reasoning_parser.detector.think_end_token}' "
+                f"could not be encoded by the tokenizer."
+            )
+        self.think_start_id = think_start_ids[0]
+        self.think_end_id = think_end_ids[0]
         self.strict_reasoning_format = reasoning_parser.detector.strict_reasoning_format
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
@@ -278,7 +316,12 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         ):
             return None
         for token in reasoning_parser.detector.think_excluded_tokens:
-            new_ids = tokenizer.encode(token)
+            new_ids = tokenizer.encode(token, add_special_tokens=False)
+            if not new_ids:
+                logger.warning(
+                    f"think_excluded_token '{token}' could not be encoded; skipping."
+                )
+                continue
             excluded_ids += new_ids
         return excluded_ids
 

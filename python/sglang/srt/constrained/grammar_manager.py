@@ -38,6 +38,19 @@ class GrammarManager:
         else:
             self.grammar_backend = None
 
+        self._strict_reasoning_format = False
+        if self.server_args.reasoning_parser:
+            try:
+                rp = ReasoningParser(
+                    model_type=self.server_args.reasoning_parser,
+                    stream_reasoning=False,
+                )
+                self._strict_reasoning_format = (
+                    rp.detector.strict_reasoning_format
+                )
+            except ValueError:
+                pass
+
         self.grammar_sync_group = scheduler.dp_tp_cpu_group
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
@@ -104,27 +117,27 @@ class GrammarManager:
                             f"Failed to compile {key[0]} grammar: {value.error_message}"
                         )
                         req.set_finish_with_abort(error_msg)
-        elif self.server_args.reasoning_parser:
-            reasoning_parser = ReasoningParser(
-                model_type=self.server_args.reasoning_parser, stream_reasoning=False
+        elif self._strict_reasoning_format:
+            key = ("regex", ".*")
+            logger.debug(
+                f"strict reasoning enabled: {self.server_args.reasoning_parser}, config reasoner grammar with fake grammar."
             )
-            if reasoning_parser.detector.strict_reasoning_format:
-                key = ("regex", ".*")
-                logger.debug(
-                    f"strict reasoning enabled: {self.server_args.reasoning_parser}, config reasoner grammar with fake grammar."
-                )
-                value, cache_hit = self.grammar_backend.get_cached_or_future_value(
-                    key, req.require_reasoning
-                )
-                req.grammar = value
+            value, cache_hit = self.grammar_backend.get_cached_or_future_value(
+                key, req.require_reasoning
+            )
+            req.grammar = value
 
-                if not cache_hit:
-                    req.grammar_key = key
-                    add_to_grammar_queue = True
-                else:
-                    if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
-                        error_msg = f"Invalid grammar request with cache hit: {key=}"
-                        req.set_finish_with_abort(error_msg)
+            if not cache_hit:
+                req.grammar_key = key
+                add_to_grammar_queue = True
+            else:
+                if isinstance(
+                    value, InvalidGrammarObject
+                ):  # We hit a cached invalid grammar.
+                    error_msg = (
+                        f"Failed to compile {key[0]} grammar: {value.error_message}"
+                    )
+                    req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
             self.grammar_queue.append(req)

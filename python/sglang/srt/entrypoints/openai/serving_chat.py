@@ -577,6 +577,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 "qwen3-thinking",
                 "qwen3-thinking-strict",
                 "glm4",
+                "glm45-strict",
             ]:
                 # qwen3 and glm4 think internally without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
