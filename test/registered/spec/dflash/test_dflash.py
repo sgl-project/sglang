@@ -18,11 +18,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=360, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=300, suite="stage-b-test-1-gpu-small")
 
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
-    max_running_requests = 128
+    max_running_requests = 64
     attention_backend = "flashinfer"
     page_size = 1
     other_launch_args = []
@@ -46,8 +46,6 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
             str(cls.page_size),
             "--max-running-requests",
             str(cls.max_running_requests),
-            "--mem-fraction-static",
-            "0.65",
             "--cuda-graph-bs",
             *[str(i) for i in range(1, cls.max_running_requests + 1)],
         ]
