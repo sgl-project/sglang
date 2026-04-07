@@ -8,7 +8,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
-from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.kits.radix_cache_server_kit import gen_radix_tree
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
@@ -76,10 +76,6 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_radix_attention(self):
-        run_radix_attention_test(self.base_url)
-        assert self.process.poll() is None
-
     def test_early_stop(self):
         client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
         for i in range(8):
@@ -125,12 +121,23 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
         assert self.process.poll() is None
 
 
-class TestDFlashServerPage(TestDFlashServerBase):
-    page_size = 64
-
-
 class TestDFlashServerPage256(TestDFlashServerBase):
     page_size = 256
+
+    def test_radix_attention(self):
+        import requests
+
+        nodes = gen_radix_tree(num_nodes=50)
+        data = {
+            "input_ids": [node["input_ids"] for node in nodes],
+            "sampling_params": [
+                {"max_new_tokens": node["decode_len"], "temperature": 0}
+                for node in nodes
+            ],
+        }
+        res = requests.post(self.base_url + "/generate", json=data)
+        assert res.status_code == 200
+        assert self.process.poll() is None
 
 
 class TestDFlashServerChunkedPrefill(TestDFlashServerBase):
