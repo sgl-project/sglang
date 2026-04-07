@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     NixlEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -838,9 +839,15 @@ def model_forward_maybe_tbo(
         residual=residual,
         zero_allocator=zero_allocator,
     )
-    layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
+    # Filter out PPMissingLayer for Pipeline Parallelism
+    real_layers = [layer for layer in layers if not isinstance(layer, PPMissingLayer)]
+    if len(real_layers) == 0:
+        # All layers are PPMissingLayer, just return inputs
+        return hidden_states, residual
+    
+    layer_input_scatter_mode = real_layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
-        layers, forward_batch.global_forward_mode
+        real_layers, forward_batch.global_forward_mode
     )
     if enable_tbo:
         return _model_forward_tbo(
@@ -978,7 +985,7 @@ def _model_forward_filter_inputs(
     token_slice = slice(*output_forward_batch.tbo_parent_token_range)
     hidden_states = hidden_states[token_slice]
     residual = None if residual is None else residual[token_slice]
-    positions = positions[token_slice]
+    positions = None if positions is None else positions[token_slice]
 
     assert output_forward_batch.tbo_padded_len is not None
     padded_len = output_forward_batch.tbo_padded_len
