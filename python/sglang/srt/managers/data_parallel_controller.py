@@ -351,6 +351,24 @@ class DataParallelController:
             return worker_ports
         finally:
             rep_socket.close()
+            if self.server_args.elastic_ep_backend is not None:
+                threading.Thread(
+                    target=self._reply_ports_as_server, args=(endpoint, worker_ports)
+                ).start()
+
+    def _reply_ports_as_server(self, endpoint: str, worker_ports: List[int]):
+        """
+        Runs as a background thread to broadcast worker ports for recovered EP ranks
+        """
+        rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+        while True:
+            # Wait for client handshake
+            client_rank = rep_socket.recv().decode()
+            logger.debug(f"Received handshake from node {client_rank}")
+
+            # Send worker ports to client
+            rep_socket.send_pyobj(worker_ports)
+            logger.debug(f"Sent worker ports to node {client_rank}")
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
         """Receive worker ports from the server node."""
