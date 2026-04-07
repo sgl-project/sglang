@@ -534,11 +534,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 should_deepgemm_weight_requant_ue8m0,
             )
 
+            # Only requantize to UE8M0 if DeepGEMM can actually run
+            # this layer. If the dtype or shape is unsupported, the GEMM
+            # falls back to triton at runtime, which needs float32 scales.
             if (
                 should_deepgemm_weight_requant_ue8m0(
                     weight_block_size=getattr(
                         self.quant_config, "weight_block_size", None
                     ),
+                    output_dtype=getattr(layer, "orig_dtype", None),
+                    weight_shape=layer.weight.shape,
                 )
                 and (
                     self.w8a8_block_fp8_linear
