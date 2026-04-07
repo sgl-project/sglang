@@ -491,15 +491,17 @@ class NixlKVManager(CommonKVManager):
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+        from sglang.srt.disaggregation.mooncake.utils import init_mooncake_custom_mem_pool
 
         size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
         size_bytes = size_mb * 1024 * 1024
         gpu_id = self.kv_args.gpu_id
         device = f"cuda:{gpu_id}"
+        _, custom_mem_pool, _ = init_mooncake_custom_mem_pool(device)
 
         buffers = []
         for _ in range(count):
-            buf = StagingBuffer(size_bytes, device, gpu_id)
+            buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
             self._register_staging_memory(buf.get_ptr(), buf.get_size(), gpu_id)
             buffers.append(buf)
         self._staging_ctx.buffers = buffers
@@ -507,13 +509,15 @@ class NixlKVManager(CommonKVManager):
 
     def _init_staging_allocator(self):
         from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
+        from sglang.srt.disaggregation.mooncake.utils import init_mooncake_custom_mem_pool
 
         pool_size_mb = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get()
         pool_size_bytes = pool_size_mb * 1024 * 1024
         gpu_id = self.kv_args.gpu_id
         device = f"cuda:{gpu_id}"
+        _, custom_mem_pool, _ = init_mooncake_custom_mem_pool(device)
 
-        allocator = StagingAllocator(pool_size_bytes, device, gpu_id)
+        allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)
         self._register_staging_memory(
             allocator.get_base_ptr(), allocator.get_total_size(), gpu_id
         )
