@@ -47,7 +47,6 @@ class TransferInfo:
     dst_state_indices: List[int]
     staging: Optional[object] = None
 
-    @property
     def is_dummy(self):
         return self.dst_kv_indices.size == 0
 
@@ -105,7 +104,9 @@ class KVArgsRegisterInfo:
         if len(msg) > 12 and len(msg[12]) > 0:
             dst_state_item_lens = list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
         if len(msg) > 13 and len(msg[13]) > 0:
-            dst_state_dim_per_tensor = list(struct.unpack(f"{len(msg[13]) // 4}I", msg[13]))
+            dst_state_dim_per_tensor = list(
+                struct.unpack(f"{len(msg[13]) // 4}I", msg[13])
+            )
 
         staging_base_ptr = 0
         staging_total_size = 0
@@ -359,7 +360,7 @@ class NixlKVManager(CommonKVManager):
             self.kv_args,
             self.attn_tp_size,
             prefill_tp,
-            self.kv_buffer_tensors,
+            getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
         )
@@ -379,7 +380,7 @@ class NixlKVManager(CommonKVManager):
 
         room_infos = self.transfer_infos.get(room, {})
         needs_staging = any(
-            not tinfo.is_dummy
+            not tinfo.is_dummy()
             and tinfo.agent_name in self.decode_kv_args_table
             and self.decode_kv_args_table[tinfo.agent_name].decode_tp_size
             != self.attn_tp_size
@@ -644,7 +645,7 @@ class NixlKVManager(CommonKVManager):
             src_descs,
             dst_descs,
             peer_name,
-            notif.encode("ascii"),
+            notif.encode("ascii"),  # type: ignore
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
@@ -949,7 +950,7 @@ class NixlKVManager(CommonKVManager):
             src_descs,
             dst_descs,
             peer_name,
-            notif.encode("ascii"),
+            notif.encode("ascii"),  # type: ignore
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
@@ -1033,7 +1034,7 @@ class NixlKVManager(CommonKVManager):
 
         prefill_state_data_ptrs = self.kv_args.state_data_ptrs
         prefill_state_item_lens = self.kv_args.state_item_lens
-        src_state_dim_per_tensor = self.kv_args.state_dim_per_tensor
+        src_state_dim_per_tensor = getattr(self.kv_args, "state_dim_per_tensor", [])
 
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(
@@ -1119,7 +1120,7 @@ class NixlKVManager(CommonKVManager):
         dst_state_dim_per_tensor: list[int] | None = None,
     ):
         """Send state or extra pool data with type-specific handling."""
-        state_type = self.kv_args.state_type
+        state_type = getattr(self.kv_args, "state_type", "none")
 
         if state_type == "mamba":
             if self.attn_tp_size != decode_tp_size:
@@ -1197,7 +1198,7 @@ class NixlKVManager(CommonKVManager):
         num_pages = len(kv_indices)
         chunk_idx = page_start // full_chunk_pages if full_chunk_pages > 0 else 0
 
-        stg = req.staging
+        stg = getattr(req, "staging", None)
         if stg is None or chunk_idx >= len(stg.offsets):
             return None
 
@@ -1276,7 +1277,7 @@ class NixlKVManager(CommonKVManager):
         handles = []
         for req in reqs_to_be_processed:
             assert bootstrap_room == req.room
-            if req.is_dummy:
+            if req.is_dummy():
                 continue
 
             chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
@@ -1633,10 +1634,10 @@ class NixlKVSender(CommonKVSender):
             return self.kv_mgr.check_status(self.bootstrap_room)
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
         if all([x == "DONE" for x in states]):
-            return KVPoll.Success
+            return KVPoll.Success  # type: ignore
         if any([x == "ERR" for x in states]):
             raise Exception("KVSender transfer encountered an error.")
-        return KVPoll.WaitingForInput
+        return KVPoll.WaitingForInput  # type: ignore
 
     def failure_exception(self):
         raise RuntimeError("NIXL KVSender Exception")
@@ -1737,7 +1738,7 @@ class NixlKVReceiver(CommonKVReceiver):
             return KVPoll.Failed
 
         self.kv_mgr.update_transfer_status()
-        if self.kv_mgr.check_transfer_done(self.bootstrap_room):
+        if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
             )
@@ -1750,8 +1751,8 @@ class NixlKVReceiver(CommonKVReceiver):
             else:
                 self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
-            return self.conclude_state
-        return KVPoll.WaitingForInput
+            return self.conclude_state  # type: ignore
+        return KVPoll.WaitingForInput  # type: ignore
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
@@ -1770,8 +1771,11 @@ class NixlKVReceiver(CommonKVReceiver):
                 struct.pack("I", item_len)
                 for item_len in self.kv_mgr.kv_args.state_item_lens
             )
+            state_dim_per_tensor = getattr(
+                self.kv_mgr.kv_args, "state_dim_per_tensor", []
+            )
             packed_state_dim_per_tensor = b"".join(
-                struct.pack("I", dim) for dim in self.kv_mgr.kv_args.state_dim_per_tensor
+                struct.pack("I", dim) for dim in state_dim_per_tensor
             )
 
             # Include staging allocator metadata if available
