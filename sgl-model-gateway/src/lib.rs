@@ -1,5 +1,7 @@
 pub mod app_context;
 pub use smg_auth as auth;
+#[doc(hidden)]
+pub mod bench_support;
 pub mod config;
 pub mod core;
 pub mod middleware;

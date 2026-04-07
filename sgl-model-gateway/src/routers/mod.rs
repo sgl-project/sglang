@@ -5,10 +5,11 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{ws::WebSocket, Request},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::SinkExt;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
@@ -31,8 +32,10 @@ pub mod mesh;
 pub mod openai;
 pub mod parse;
 pub mod persistence_utils;
+pub mod responses_validation;
 pub mod router_manager;
 pub mod tokenize;
+pub mod ws_responses;
 
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
@@ -123,6 +126,16 @@ pub trait RouterTrait: Send + Sync + Debug {
             "Responses endpoint not implemented",
         )
             .into_response()
+    }
+
+    /// Whether this router supports the WebSocket Responses surface.
+    fn supports_responses_ws(&self) -> bool {
+        false
+    }
+
+    /// Handle a WebSocket-upgraded `/v1/responses` connection.
+    async fn route_responses_ws(&self, _headers: HeaderMap, mut socket: WebSocket) {
+        let _ = socket.close().await;
     }
 
     /// Retrieve a stored/background response by id

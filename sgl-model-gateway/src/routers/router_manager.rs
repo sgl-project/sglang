@@ -10,11 +10,12 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{ws::WebSocket, Request},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
+use futures_util::SinkExt;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -396,6 +397,20 @@ impl RouterManager {
 
         best_router
     }
+
+    fn select_router_for_ws(&self, headers: &HeaderMap) -> Option<Arc<dyn RouterTrait>> {
+        if let Some(router) = self.select_router_for_request(Some(headers), None) {
+            if router.supports_responses_ws() {
+                return Some(router);
+            }
+        }
+
+        let routers_snapshot = self.routers_snapshot.load();
+        routers_snapshot
+            .iter()
+            .find(|router| router.supports_responses_ws())
+            .cloned()
+    }
 }
 
 #[async_trait]
@@ -611,6 +626,21 @@ impl RouterTrait for RouterManager {
                 "No router available to handle responses request",
             )
                 .into_response()
+        }
+    }
+
+    fn supports_responses_ws(&self) -> bool {
+        let routers_snapshot = self.routers_snapshot.load();
+        routers_snapshot
+            .iter()
+            .any(|router| router.supports_responses_ws())
+    }
+
+    async fn route_responses_ws(&self, headers: HeaderMap, mut socket: WebSocket) {
+        if let Some(router) = self.select_router_for_ws(&headers) {
+            router.route_responses_ws(headers, socket).await;
+        } else {
+            let _ = socket.close().await;
         }
     }
 

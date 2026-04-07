@@ -7,12 +7,13 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{ws::WebSocketUpgrade, FromRequestParts, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+use axum_server::accept::NoDelayAcceptor;
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -47,19 +48,20 @@ use crate::{
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::V1RerankReqInput,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        responses::ResponsesGetParams,
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
-        conversations,
+        conversations, error as router_error,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
             get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
         },
         parse,
+        responses_validation::ValidatedResponsesJson,
         router_manager::RouterManager,
         tokenize, RouterTrait,
     },
@@ -218,12 +220,37 @@ async fn v1_rerank(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+    ValidatedResponsesJson(body): ValidatedResponsesJson,
 ) -> Response {
     state
         .router
         .route_responses(Some(&headers), &body, Some(&body.model))
         .await
+}
+
+async fn v1_responses_ws(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if !state.router.supports_responses_ws() {
+        return router_error::not_implemented(
+            "responses_ws_not_supported",
+            "WebSocket Responses are not supported for this router.",
+        );
+    }
+
+    let (mut parts, _body) = req.into_parts();
+    let headers = parts.headers.clone();
+
+    let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &()).await else {
+        return router_error::bad_request(
+            "websocket_upgrade_required",
+            "GET /v1/responses requires a WebSocket upgrade request.",
+        );
+    };
+
+    let router = state.router.clone();
+    ws.on_upgrade(move |socket| async move {
+        router.route_responses_ws(headers, socket).await;
+    })
+    .into_response()
 }
 
 async fn v1_embeddings(
@@ -546,7 +573,7 @@ pub fn build_app(
         .route("/v1/chat/completions", post(v1_chat_completions))
         .route("/v1/completions", post(v1_completions))
         .route("/v1/rerank", post(v1_rerank))
-        .route("/v1/responses", post(v1_responses))
+        .route("/v1/responses", get(v1_responses_ws).post(v1_responses))
         .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/classify", post(v1_classify))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
@@ -1078,12 +1105,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .map_err(|e| format!("Failed to create TLS config: {}", e))?;
 
         axum_server::bind_rustls(addr, tls_config)
+            .acceptor(NoDelayAcceptor::new())
             .handle(handle)
             .serve(app.into_make_service())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     } else {
         axum_server::bind(addr)
+            .acceptor(NoDelayAcceptor::new())
             .handle(handle)
             .serve(app.into_make_service())
             .await

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{
+    extract::ws::WebSocket,
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
@@ -30,7 +31,7 @@ use crate::{
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{ws_responses::serve_responses_ws, RouterTrait},
 };
 
 /// gRPC router implementation for SGLang
@@ -399,6 +400,18 @@ impl RouterTrait for GrpcRouter {
         model_id: Option<&str>,
     ) -> Response {
         self.route_responses_impl(headers, body, model_id).await
+    }
+
+    fn supports_responses_ws(&self) -> bool {
+        true
+    }
+
+    async fn route_responses_ws(&self, headers: HeaderMap, socket: WebSocket) {
+        let executor = Arc::new(responses::GrpcWsResponsesExecutor::new(
+            self.worker_registry.clone(),
+            self.responses_context.clone(),
+        ));
+        serve_responses_ws(socket, headers, executor).await;
     }
 
     async fn get_response(
