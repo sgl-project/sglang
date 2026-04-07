@@ -52,6 +52,8 @@ def pad_to_alignment(
     pad = (-size) % alignment
     if pad == 0:
         return tensor
+    # F.pad takes padding in reverse-dim order, two values per dim (left, right).
+    # Index 2*(ndim-1-dim)+1 selects the right-side padding for `dim`.
     pad_arg = [0] * (2 * tensor.ndim)
     pad_arg[2 * (tensor.ndim - 1 - dim) + 1] = pad
     return F.pad(tensor, pad_arg)
@@ -63,15 +65,18 @@ def _pad_weight_to_alignment(
     """Pad weight (N, K) so both dims are multiples of FP8_ALIGNMENT.
 
     Returns (weight_t, weight_scale, orig_N) where weight_t is transposed.
-    weight_scale is padded along dim-0 when it is per-channel (shape [N, 1]).
+    weight_scale is padded along dim-0 when it is per-channel (shape [N, 1]
+    or [N,]).
     """
     orig_n = weight.shape[0]
     weight = pad_to_alignment(weight, dim=0)
     weight = pad_to_alignment(weight, dim=1)
     if weight_scale is not None and weight.shape[0] > orig_n:
+        if weight_scale.shape == (orig_n,):
+            weight_scale = weight_scale.unsqueeze(1)
         if weight_scale.shape != (orig_n, 1):
             raise ValueError(
-                f"Expected per-channel scale shape ({orig_n}, 1), "
+                f"Expected per-channel scale shape ({orig_n}, 1) or ({orig_n},), "
                 f"got {tuple(weight_scale.shape)}"
             )
         weight_scale = pad_to_alignment(weight_scale, dim=0)
@@ -287,6 +292,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             )
 
         # weight is stored transposed as (K_padded, N_padded); pad x to match.
+        # TODO: consider padding input activation at graph-capture time instead of per-forward.
         orig_out = layer._orig_output_dim
         pad_k = layer.weight.shape[0] - x.shape[-1]
         if pad_k > 0:
