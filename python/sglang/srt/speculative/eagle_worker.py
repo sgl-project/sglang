@@ -526,6 +526,20 @@ class EAGLEWorker(TpModelWorker):
         batch.return_hidden_states = False
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+        pos_upper = batch.seq_lens_sum + self.speculative_num_steps
+        maybe_detect_oob(
+            spec_info.positions,
+            0,
+            pos_upper,
+            f"draft_preprocess: positions OOB vs {pos_upper}",
+        )
+        pool_size = batch.req_to_token_pool.req_to_token.shape[1]
+        maybe_detect_oob(
+            out_cache_loc,
+            0,
+            pool_size,
+            f"draft_preprocess: out_cache_loc OOB vs pool_size={pool_size}",
+        )
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
@@ -682,7 +696,11 @@ class EAGLEWorker(TpModelWorker):
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            maybe_detect_nan(probs, f"draft_forward step {i}: NaN in probs after softmax")
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            maybe_detect_nan(
+                topk_p, f"draft_forward step {i}: NaN in topk_p after fast_topk"
+            )
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -695,6 +713,17 @@ class EAGLEWorker(TpModelWorker):
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        )
+        maybe_detect_nan(
+            top_scores_index.float(),
+            "draft_forward: NaN in top_scores_index after organize_draft_results",
+        )
+        total_candidates = self.topk + (self.speculative_num_steps - 1) * self.topk
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            total_candidates,
+            f"draft_forward: top_scores_index OOB vs total_candidates={total_candidates}",
         )
 
         return parent_list, top_scores_index, draft_tokens
@@ -757,6 +786,10 @@ class EAGLEWorker(TpModelWorker):
                 batch.sampling_info.vocab_mask = None
 
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        maybe_detect_nan(
+            logits_output.hidden_states,
+            "verify: hidden_states before spec_info.verify",
+        )
 
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(

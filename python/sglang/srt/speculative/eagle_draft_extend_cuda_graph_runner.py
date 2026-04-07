@@ -25,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.environ import envs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
@@ -250,10 +251,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         return torch.int64
 
     def _capture_init(self, run_once_fn):
-        for _ in range(2):
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once_fn()
+        with envs.SGLANG_SPEC_NAN_DETECTION.override(
+            False
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(False):
+            for _ in range(2):
+                torch.cuda.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once_fn()
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         with torch.cuda.graph(graph, pool=pool, stream=stream):

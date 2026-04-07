@@ -28,6 +28,7 @@ from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
+    maybe_detect_oob,
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
 
@@ -167,6 +168,12 @@ class EagleDraftInputV2Mixin:
                 topk,
                 num_steps,
             )
+            maybe_detect_oob(
+                batch.out_cache_loc,
+                0,
+                req_to_token_pool.req_to_token.shape[1],
+                "prepare_for_v2_draft: out_cache_loc OOB",
+            )
 
         # Get a forward batch
         self.num_tokens_per_req = topk
@@ -230,6 +237,12 @@ class EagleVerifyInputV2Mixin:
                 batch_size=bs,
                 draft_token_num=self.draft_token_num,
                 device=device,
+            )
+            maybe_detect_oob(
+                batch.out_cache_loc,
+                0,
+                req_to_token_pool.req_to_token.shape[1],
+                "prepare_for_v2_verify: out_cache_loc OOB",
             )
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
@@ -379,6 +392,15 @@ class EagleVerifyInputV2Mixin:
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
                 spec_steps=self.spec_steps,
+            )
+
+        valid_accept = accept_index[accept_index != -1]
+        if valid_accept.numel() > 0:
+            maybe_detect_oob(
+                valid_accept,
+                0,
+                len(predict),
+                f"sample: accept_index OOB vs predict len={len(predict)}",
             )
 
         # Include the bonus token

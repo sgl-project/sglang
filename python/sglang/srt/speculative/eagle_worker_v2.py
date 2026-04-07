@@ -450,7 +450,11 @@ class EagleDraftWorker(BaseDraftWorker):
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            maybe_detect_nan(probs, f"draft_forward step {i}: NaN in probs after softmax")
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            maybe_detect_nan(
+                topk_p, f"draft_forward step {i}: NaN in topk_p after fast_topk"
+            )
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -473,6 +477,10 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
+        maybe_detect_nan(
+            top_scores_index.float(),
+            "draft_forward: NaN in top_scores_index after organize",
+        )
         maybe_detect_oob(
             top_scores_index,
             0,
@@ -559,6 +567,12 @@ class EagleDraftWorker(BaseDraftWorker):
             * self.speculative_num_draft_tokens
             + batch_result.accept_lens
             - 1
+        )
+        maybe_detect_oob(
+            select_index,
+            0,
+            len(batch_result.next_token_ids),
+            "draft_extend_for_decode: select_index OOB vs predict",
         )
 
         # Prepare for draft extend in a separate stream
@@ -840,6 +854,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
+            maybe_detect_nan(
+                logits_output.hidden_states,
+                "verify: hidden_states before accept indexing",
+            )
             all_verified_id = predict[accept_index]
             verified_id = torch.empty_like(accept_length, dtype=torch.int32)
             fill_new_verified_id[(bs,)](

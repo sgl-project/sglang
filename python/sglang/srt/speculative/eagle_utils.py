@@ -4,6 +4,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.speculative.spec_utils import maybe_detect_oob
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
@@ -148,6 +149,19 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    pos_upper = seq_lens_sum + num_verify_tokens
+    maybe_detect_oob(
+        positions, 0, pos_upper, f"build_tree: positions OOB vs {pos_upper}"
+    )
+    valid_retrive = retrive_index[retrive_index != -1]
+    if valid_retrive.numel() > 0:
+        maybe_detect_oob(
+            valid_retrive,
+            0,
+            bs * num_verify_tokens,
+            f"build_tree: retrive_index OOB vs {bs * num_verify_tokens}",
+        )
+
     return (
         tree_mask,
         positions,

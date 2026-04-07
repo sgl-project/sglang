@@ -38,6 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    maybe_detect_oob,
 )
 from sglang.srt.utils import is_cuda, next_power_of_2
 
@@ -135,6 +136,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
             self.last_loc = last_loc
 
+        maybe_detect_oob(
+            batch.out_cache_loc,
+            0,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            "prepare_for_verify: out_cache_loc OOB",
+        )
+
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
@@ -193,6 +201,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             None,
             kv_indices,
             req_to_token.size(1),
+        )
+        maybe_detect_oob(
+            kv_indices,
+            0,
+            req_to_token.shape[1],
+            f"generate_attn_arg_prefill: kv_indices OOB vs pool_size={req_to_token.shape[1]}",
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -441,6 +455,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
+        if accept_index.numel() > 0:
+            predict_len = predict.shape[0] if predict.dim() == 1 else predict.numel()
+            maybe_detect_oob(
+                accept_index,
+                0,
+                predict_len,
+                f"verify: accept_index OOB vs predict len={predict_len}",
+            )
         verified_id = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
