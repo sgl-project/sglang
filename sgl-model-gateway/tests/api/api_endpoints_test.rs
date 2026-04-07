@@ -648,6 +648,17 @@ mod responses_endpoint_tests {
 
     use super::*;
 
+    fn response_output_text(response: &serde_json::Value) -> Option<&str> {
+        response["output"]
+            .as_array()?
+            .first()?
+            .get("content")?
+            .as_array()?
+            .first()?
+            .get("text")?
+            .as_str()
+    }
+
     #[tokio::test]
     async fn test_v1_responses_non_streaming() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -725,6 +736,147 @@ mod responses_endpoint_tests {
         assert!(ct.contains("text/event-stream"));
 
         // We don't fully consume the stream in this test harness.
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_accepts_function_call_output_only_continuation() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18955,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let seed_payload = json!({
+            "input": "Seed a stored response for continuation.",
+            "model": "mock-model",
+            "store": true,
+            "stream": false
+        });
+
+        let seed_req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&seed_payload).unwrap()))
+            .unwrap();
+
+        let seed_resp = app.clone().oneshot(seed_req).await.unwrap();
+        assert_eq!(seed_resp.status(), StatusCode::OK);
+        let seed_body = axum::body::to_bytes(seed_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let seed_json: serde_json::Value = serde_json::from_slice(&seed_body).unwrap();
+        let response_id = seed_json["id"].as_str().expect("response id missing");
+
+        let continuation_payload = json!({
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "{\"result\":345}"
+                }
+            ],
+            "model": "mock-model",
+            "previous_response_id": response_id,
+            "store": false,
+            "stream": false
+        });
+
+        let continuation_req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&continuation_payload).unwrap(),
+            ))
+            .unwrap();
+
+        let continuation_resp = app.clone().oneshot(continuation_req).await.unwrap();
+        assert_eq!(continuation_resp.status(), StatusCode::OK);
+
+        let continuation_body = axum::body::to_bytes(continuation_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let continuation_json: serde_json::Value =
+            serde_json::from_slice(&continuation_body).unwrap();
+        assert_eq!(continuation_json["object"], "response");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_v1_responses_non_streaming_previous_response_continuation_returns_text() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18956,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+
+        let seed_payload = json!({
+            "input": "Seed a stored response for text continuation.",
+            "model": "mock-model",
+            "store": true,
+            "stream": false
+        });
+
+        let seed_req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&seed_payload).unwrap()))
+            .unwrap();
+
+        let seed_resp = app.clone().oneshot(seed_req).await.unwrap();
+        assert_eq!(seed_resp.status(), StatusCode::OK);
+        let seed_body = axum::body::to_bytes(seed_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let seed_json: serde_json::Value = serde_json::from_slice(&seed_body).unwrap();
+        let response_id = seed_json["id"].as_str().expect("response id missing");
+
+        let continuation_payload = json!({
+            "input": "Continue this response chain with a second turn.",
+            "model": "mock-model",
+            "previous_response_id": response_id,
+            "store": true,
+            "stream": false
+        });
+
+        let continuation_req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_string(&continuation_payload).unwrap(),
+            ))
+            .unwrap();
+
+        let continuation_resp = app.clone().oneshot(continuation_req).await.unwrap();
+        assert_eq!(continuation_resp.status(), StatusCode::OK);
+
+        let continuation_body = axum::body::to_bytes(continuation_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let continuation_json: serde_json::Value =
+            serde_json::from_slice(&continuation_body).unwrap();
+        assert_eq!(continuation_json["object"], "response");
+        assert_eq!(continuation_json["status"], "completed");
+        assert_eq!(
+            response_output_text(&continuation_json),
+            Some("This is a mock responses output.")
+        );
+
         ctx.shutdown().await;
     }
 
