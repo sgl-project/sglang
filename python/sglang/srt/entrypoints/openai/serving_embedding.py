@@ -60,14 +60,14 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 # List of strings
                 for i, item in enumerate(input):
                     if not isinstance(item, str):
-                        return f"All items in input list must be strings"
+                        return "All items in input list must be strings"
                     if not item.strip():
                         return f"Input at index {i} cannot be empty or whitespace only"
             elif isinstance(first_item, int):
                 # List of integers (token IDs)
                 for i, item in enumerate(input):
                     if not isinstance(item, int):
-                        return f"All items in input list must be integers"
+                        return "All items in input list must be integers"
                     if item < 0:
                         return f"Token ID at index {i} must be non-negative"
         return None
