@@ -27,6 +27,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 # Compatibility shim: flash-attn-4 registers a bare ``flash_attn`` namespace
 # that makes ``is_flash_attn_2_available()`` return True, but lacks the v2 API
@@ -488,6 +489,9 @@ def get_config(
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
+    if is_runai_obj_uri(model):
+        model = ObjectStorageModel.get_path(model)
+
     if is_remote_url(model):
         # BaseConnector implements __del__() to clean up the local dir.
         # Since config files need to exist all the time, so we DO NOT use
@@ -617,6 +621,32 @@ def get_config(
 
     if config.model_type == "multi_modality":
         config.update({"architectures": ["MultiModalityCausalLM"]})
+
+    if config.model_type == "gemma4":
+        # Gemma4 configs use base attributes for SWA layers and `global_*`
+        # variants for full-attention layers.  SGLang expects the opposite:
+        # base = full-attention, `swa_*` = sliding-window overrides.
+        # Remap here so the rest of the stack sees a uniform convention.
+        text_config = config.text_config
+        global_head_dim = getattr(text_config, "global_head_dim", None)
+        global_kv_heads = getattr(text_config, "num_global_key_value_heads", None)
+
+        swa_head_dim = text_config.head_dim
+        swa_kv_heads = text_config.num_key_value_heads
+
+        text_config.swa_head_dim = swa_head_dim
+        text_config.swa_v_head_dim = swa_head_dim
+        text_config.swa_num_key_value_heads = swa_kv_heads
+
+        if global_head_dim is not None:
+            text_config.head_dim = global_head_dim
+        if global_kv_heads is not None:
+            text_config.num_key_value_heads = global_kv_heads
+
+        if not hasattr(text_config, "v_head_dim"):
+            text_config.v_head_dim = text_config.head_dim
+        if not hasattr(text_config, "swa_v_head_dim"):
+            text_config.swa_v_head_dim = text_config.swa_head_dim
 
     if config.model_type == "longcat_flash":
         config.update({"architectures": ["LongcatFlashForCausalLM"]})
@@ -798,6 +828,9 @@ def get_tokenizer(
         kwargs["gguf_file"] = tokenizer_name
         tokenizer_name = Path(tokenizer_name).parent
 
+    if is_runai_obj_uri(tokenizer_name):
+        tokenizer_name = ObjectStorageModel.get_path(tokenizer_name)
+
     if is_remote_url(tokenizer_name):
         # BaseConnector implements __del__() to clean up the local dir.
         # Since config files need to exist all the time, so we DO NOT use
@@ -830,9 +863,25 @@ def get_tokenizer(
         )
         raise RuntimeError(err_msg) from e
     except ValueError as e:
+        # MistralCommon tokenizers reject standard HF kwargs like
+        # trust_remote_code, use_fast etc. Retry without them.
+        if "are not supported by" in str(e) and "MistralCommon" in str(e):
+            for k in (
+                "trust_remote_code",
+                "tokenizer_revision",
+                "use_fast",
+                "_from_auto",
+                "clean_up_tokenization_spaces",
+            ):
+                kwargs.pop(k, None)
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                *args,
+                **kwargs,
+            )
         # If the error pertains to the tokenizer class not existing or not
         # currently being imported, suggest using the --trust-remote-code flag.
-        if not trust_remote_code and (
+        elif not trust_remote_code and (
             "does not exist or is not currently imported." in str(e)
             or "requires you to execute the tokenizer file" in str(e)
         ):
@@ -868,6 +917,7 @@ def get_tokenizer(
             "slowdown. Consider using a fast tokenizer instead."
         )
 
+    _patch_mistral_common_tokenizer(tokenizer)
     _fix_special_tokens_pattern(tokenizer)
     attach_additional_stop_token_ids(tokenizer)
     tokenizer = patch_tokenizer(tokenizer)
@@ -1001,6 +1051,15 @@ def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):
         if config_val is None:
             # Key missing or null → use v4 default for this tokenizer class
             config_val = _V4_DEFAULTS.get(attr, False)
+        # Fast tokenizers in v4 used tokenizer.json post-processor for EOS —
+        # the add_eos_token Python attribute was set but the post-processor
+        # came from tokenizer.json, not from the attribute. In v5, the flag is
+        # stripped and both sglang and HF reference end up with add_eos_token=False.
+        # Restoring add_eos_token for fast tokenizers makes sglang diverge from
+        # the HF reference (which doesn't restore it), breaking embedding models
+        # like intfloat/e5-mistral-7b-instruct (cosine similarity drops to ~0.33).
+        if attr == "add_eos_token" and isinstance(tokenizer, PreTrainedTokenizerFast):
+            config_val = _V4_DEFAULTS["add_eos_token"]  # False
         current_val = getattr(tokenizer, attr, None)
         if current_val != config_val:
             logger.info(
@@ -1251,6 +1310,22 @@ def get_processor(
                 revision=revision,
                 **kwargs,
             )
+        elif (
+            "are not supported by" in error_message and "MistralCommon" in error_message
+        ):
+            logger.info(
+                "AutoProcessor for %s rejected standard kwargs, "
+                "retrying without trust_remote_code/use_fast",
+                tokenizer_name,
+            )
+            kwargs.pop("use_fast", None)
+            kwargs.pop("_from_auto", None)
+            processor = AutoProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                revision=revision,
+                **kwargs,
+            )
         elif "Unrecognized feature extractor" in error_message:
             logger.info(
                 "AutoProcessor failed on feature extractor for %s, "
@@ -1299,6 +1374,7 @@ def get_processor(
         )
 
     tokenizer = get_tokenizer_from_processor(processor)
+    _patch_mistral_common_tokenizer(tokenizer)
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(
@@ -1323,6 +1399,86 @@ def attach_additional_stop_token_ids(tokenizer):
         )
     else:
         tokenizer.additional_stop_token_ids = None
+
+
+def _patch_mistral_common_tokenizer(tokenizer):
+    """Patch MistralCommonTokenizer/Backend to be compatible with HF tokenizer API.
+
+    MistralCommon tokenizers (used by Voxtral, Pixtral, etc.) reject several
+    standard kwargs and lack some attributes that sglang expects.  We wrap the
+    offending methods once at load time so that the rest of the codebase does
+    not need any special-casing.
+    """
+    cls_name = type(tokenizer).__name__
+    if "MistralCommon" not in cls_name:
+        return tokenizer
+    if getattr(tokenizer, "_mistral_common_patched", False):
+        return tokenizer
+    tokenizer._mistral_common_patched = True
+
+    # Missing attributes
+    if not hasattr(tokenizer, "get_added_vocab"):
+        tokenizer.get_added_vocab = lambda: {}
+
+    # Set a chat_template containing "audio" so that sglang's content format
+    # detector returns "openai" (which preserves audio_url extraction).
+    # The actual template rendering is done by MistralCommon's apply_chat_template.
+    if not hasattr(tokenizer, "chat_template") or tokenizer.chat_template is None:
+        tokenizer.chat_template = "<!-- audio/image multimodal -->"
+
+    # convert_tokens_to_ids asserts on multi-token strings
+    _orig_convert = tokenizer.convert_tokens_to_ids
+
+    def _safe_convert(val):
+        try:
+            return _orig_convert(val)
+        except AssertionError:
+            return getattr(tokenizer, "unk_token_id", None)
+
+    tokenizer.convert_tokens_to_ids = _safe_convert
+
+    # Wrap methods that reject certain kwargs
+    def _drop_kwargs(fn, keys):
+        def wrapper(*args, **kwargs):
+            for k in keys:
+                kwargs.pop(k, None)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    tokenizer.decode = _drop_kwargs(tokenizer.decode, ["spaces_between_special_tokens"])
+    tokenizer.batch_decode = _drop_kwargs(
+        tokenizer.batch_decode, ["spaces_between_special_tokens"]
+    )
+
+    # Save original apply_chat_template for processors that need it (e.g. Voxtral)
+    tokenizer._orig_apply_chat_template = tokenizer.apply_chat_template
+
+    def _safe_apply_chat_template(messages, **kwargs):
+        """Wrapper that strips unsupported kwargs and non-text content parts.
+
+        When sglang extracts audio/image URLs, it replaces content blocks with
+        {"type": "audio"} or {"type": "image"} (no URL).  MistralCommon fails
+        on these stripped blocks.  We convert them to text-only messages.
+        """
+        kwargs.pop("add_generation_prompt", None)
+        cleaned = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    text_parts = [
+                        p.get("text", "")
+                        for p in content
+                        if isinstance(p, dict) and p.get("type") == "text"
+                    ]
+                    msg = {**msg, "content": " ".join(text_parts) if text_parts else ""}
+                cleaned.append(msg)
+            else:
+                cleaned.append(msg)
+        return tokenizer._orig_apply_chat_template(cleaned, **kwargs)
+
+    tokenizer.apply_chat_template = _safe_apply_chat_template
 
 
 def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
