@@ -2230,6 +2230,30 @@ class ServerArgs:
                 "flashinfer" if is_flashinfer_available() else "pytorch"
             )
 
+    def _get_default_draft_attn_backend(self) -> str:
+        """
+        Pick the best MHA attention backend for the draft model on current hardware.
+        1. We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
+        2. Use trtllm_mha for SM100/SM103 (Blackwell B200/GB200/B300) excluding spec with topk > 1.
+            Note: trtllm_mha does not support SM120, which will fall back to flashinfer.
+        3. In other cases, we will use flashinfer if available, otherwise use triton.
+        """
+        topk = self.speculative_eagle_topk
+        page_size = self.page_size
+
+        assert topk is not None and page_size is not None
+
+        if is_hopper_with_cuda_12_3() and topk == 1 and page_size == 1:
+            return "fa3"
+        elif is_sm100_supported() and topk == 1:
+            return "trtllm_mha"
+        elif is_hip():
+            return "aiter"
+        elif is_mps():
+            return "torch_native"
+        else:
+            return "flashinfer" if is_flashinfer_available() else "triton"
+
     def _get_default_attn_backend(self, use_mla_backend: bool, model_config):
         """
         Auto select the fastest attention backend.
@@ -2999,6 +3023,7 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
+        is_mtp = False
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -3054,6 +3079,7 @@ class ServerArgs:
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
             ]:
+                is_mtp = True
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
                     self.speculative_draft_model_revision = self.revision
@@ -3165,6 +3191,30 @@ class ServerArgs:
                 # TODO: support dp attention for ngram speculative decoding
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
+                )
+
+        # Set draft attention backend automatically when base model uses MLA-only backends.
+        # Draft models (e.g. EAGLE) always use MHA, so MLA-only backends are incompatible.
+        if (
+            self.speculative_algorithm is not None
+            and self.speculative_draft_attention_backend is None
+            and not is_mtp
+        ):
+            MLA_ONLY_BACKENDS = {"flashmla", "cutlass_mla", "trtllm_mla"}
+            effective_backends = {
+                self.attention_backend,
+                self.prefill_attention_backend,
+                self.decode_attention_backend,
+            } - {None}
+
+            if effective_backends & MLA_ONLY_BACKENDS:
+                fallback = self._get_default_draft_attn_backend()
+                self.speculative_draft_attention_backend = fallback
+                logger.warning(
+                    f"Base model uses MLA-only attention backend(s) "
+                    f"{effective_backends & MLA_ONLY_BACKENDS}, which are incompatible "
+                    f"with MHA draft models. Auto-setting "
+                    f"speculative_draft_attention_backend to '{fallback}'."
                 )
 
     def _handle_load_format(self):
