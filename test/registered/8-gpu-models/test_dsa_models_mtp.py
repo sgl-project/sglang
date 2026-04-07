@@ -215,7 +215,7 @@ class TestGLM5DPMTP(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
             "--mem-frac",
-            "0.7",
+            "0.8",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
@@ -299,7 +299,7 @@ class TestGLM5TPMTP(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
             "--mem-frac",
-            "0.7",
+            "0.8",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
