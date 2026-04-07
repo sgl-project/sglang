@@ -51,14 +51,6 @@ from sglang.multimodal_gen.test.test_utils import (
 logger = init_logger(__name__)
 
 
-def _is_lora_case(case: DiffusionTestCase) -> bool:
-    return bool(
-        case.server_args.lora_path
-        or case.server_args.dynamic_lora_path
-        or case.server_args.second_lora_path
-    )
-
-
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
@@ -80,11 +72,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-
-    # Keep LoRA GT on the normal backend path so adapter state matches CI.
-    if os.environ.get("SGLANG_GEN_GT", "0") == "1":
-        if not _is_lora_case(case) and "--backend" not in extra_args:
-            extra_args = "--backend diffusers " + extra_args.strip()
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
@@ -235,18 +222,21 @@ Consider updating perf_baselines.json with the snippets below:
         ctx: ServerContext,
         case_id: str,
         generate_fn: Callable[[str, openai.Client], tuple[str, bytes]],
-    ) -> tuple[RequestPerfRecord, bytes]:
-        """Run generation and collect performance records.
+        collect_perf: bool = True,
+    ) -> tuple[RequestPerfRecord | None, bytes]:
+        """Run generation and optionally collect performance records.
 
         Returns:
             Tuple of (performance_record, content_bytes)
         """
-        log_path = ctx.perf_log_path
-        log_wait_timeout = 30
-
         client = self._client(ctx)
         rid, content = generate_fn(case_id, client)
 
+        if not collect_perf:
+            return None, content
+
+        log_path = ctx.perf_log_path
+        log_wait_timeout = 30
         req_perf_record = wait_for_req_perf_record(
             rid,
             log_path,
@@ -1024,6 +1014,7 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
             diffusion_server,
             case.id,
             generate_fn,
+            collect_perf=not is_gt_gen_mode,
         )
 
         if is_gt_gen_mode:
