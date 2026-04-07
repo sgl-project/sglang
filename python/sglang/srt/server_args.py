@@ -5362,14 +5362,6 @@ class ServerArgs:
             "the rest of the model is captured in CUDA graphs.",
         )
         parser.add_argument(
-            "--debug-cuda-graph",
-            action="store_true",
-            help="Enable debug/eager mode for CUDA graph using breakable CUDA graph. "
-            "When enabled, graph breaks are inserted so every operation runs eagerly "
-            "while still going through the CUDA graph capture / replay path. "
-            "Useful for debugging CUDA graph capture / replay issues.",
-        )
-        parser.add_argument(
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
