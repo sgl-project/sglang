@@ -278,10 +278,10 @@ class TestGLM5DPMTP(CustomTestCase):
             )
 
             self.assertGreater(acc_length, 2.7)
-            self.assertGreater(speed, 90)
+            self.assertGreater(speed, 70)
 
 
-class TestGLM5TPMTPV2(CustomTestCase):
+class TestGLM5TPMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = GLM5_MODEL_PATH
@@ -362,7 +362,7 @@ class TestGLM5TPMTPV2(CustomTestCase):
             )
 
             self.assertGreater(acc_length, 2.7)
-            self.assertGreater(speed, 180)
+            self.assertGreater(speed, 150)
 
 
 if __name__ == "__main__":

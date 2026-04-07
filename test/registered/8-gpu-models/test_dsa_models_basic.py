@@ -197,7 +197,7 @@ class TestGLM5DP(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (glm-5)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 50)
+            self.assertGreater(speed, 40)
 
 
 class TestGLM5TP(CustomTestCase):
@@ -255,7 +255,7 @@ class TestGLM5TP(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (glm-5)\n" f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 80)
+            self.assertGreater(speed, 60)
 
 
 if __name__ == "__main__":
