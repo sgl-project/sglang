@@ -78,7 +78,7 @@ class TestQwen35Fp8PerfMI35x(unittest.TestCase):
                 "--tp",
                 "8",
                 "--attention-backend",
-                "triton",
+                "aiter",
                 "--mem-fraction-static",
                 "0.8",
                 "--model-loader-extra-config",
