@@ -51,14 +51,6 @@ from sglang.multimodal_gen.test.test_utils import (
 logger = init_logger(__name__)
 
 
-def _is_lora_case(case: DiffusionTestCase) -> bool:
-    return bool(
-        case.server_args.lora_path
-        or case.server_args.dynamic_lora_path
-        or case.server_args.second_lora_path
-    )
-
-
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
@@ -80,11 +72,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-
-    # Keep LoRA GT on the normal backend path so adapter state matches CI.
-    if os.environ.get("SGLANG_GEN_GT", "0") == "1":
-        if not _is_lora_case(case) and "--backend" not in extra_args:
-            extra_args = "--backend diffusers " + extra_args.strip()
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
