@@ -26,6 +26,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -1501,6 +1502,14 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
+        _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
+        if _hybrid_spec is not None:
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=_hybrid_spec.support_mamba_cache,
+                support_mamba_cache_extra_buffer=_hybrid_spec.support_mamba_cache_extra_buffer,
+            )
+
         if model_arch in [
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
@@ -1878,6 +1887,10 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch == "Gemma4ForConditionalGeneration":
+            if self.is_attention_backend_not_set():
+                self.attention_backend = "triton"
+                logger.info("Use triton as default attention backend for Gemma4")
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
                 logger.warning(
@@ -3132,11 +3145,6 @@ class ServerArgs:
                         "speculative_ngram_external_sam_budget must be less than or equal to "
                         f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."
                     )
-            elif self.speculative_ngram_external_sam_budget != 0:
-                raise ValueError(
-                    "--speculative-ngram-external-sam-budget requires "
-                    "--speculative-ngram-external-corpus-path."
-                )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
                 "using ngram speculative decoding."
@@ -3326,6 +3334,8 @@ class ServerArgs:
             "Qwen3VLForConditionalGeneration",
             "Qwen2_5_VLForConditionalGeneration",
             "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
@@ -4919,7 +4929,7 @@ class ServerArgs:
             "--speculative-ngram-external-corpus-path",
             type=str,
             default=ServerArgs.speculative_ngram_external_corpus_path,
-            help="Optional path to an external corpus used to build a read-only SAM for ngram speculative decoding.",
+            help="Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
         )
         parser.add_argument(
             "--speculative-ngram-external-sam-budget",
