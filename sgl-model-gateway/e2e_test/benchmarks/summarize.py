@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -57,6 +58,10 @@ def generate_summary(base_dir: Path) -> str:
 
     for result_path, label in benchmarks:
         try:
+            with result_path.open() as f:
+                raw = json.load(f)
+            if "aggregated_metrics" not in raw:
+                continue  # Skip non-genai-bench results (e.g. WS benchmark JSON)
             result = BenchmarkResult.from_json(result_path)
         except Exception as e:
             print(f"Warning: Failed to parse {result_path}: {e}", file=sys.stderr)

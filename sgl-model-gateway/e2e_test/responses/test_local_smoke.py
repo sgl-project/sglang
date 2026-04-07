@@ -170,7 +170,9 @@ async def _collect_ws_events(ws_url: str, model: str) -> list[dict]:
     """Send one `response.create` request and collect events until terminal state."""
     import websockets
 
-    async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
+    async with websockets.connect(
+        ws_url, open_timeout=30, close_timeout=5
+    ) as websocket:
         return await _send_ws_request_and_collect(
             websocket,
             _ws_request(
@@ -268,7 +270,9 @@ class TestResponsesLocalSmoke:
         """WebSocket Responses should complete end-to-end on the local smoke model."""
         _, model, _, gateway = setup_backend
 
-        events = asyncio.run(_collect_ws_events(_gateway_ws_url(gateway.base_url), model))
+        events = asyncio.run(
+            _collect_ws_events(_gateway_ws_url(gateway.base_url), model)
+        )
 
         event_types = [event["type"] for event in events]
         completed = events[-1]
@@ -293,7 +297,9 @@ class TestResponsesLocalSmoke:
 
         assert ws_event_types == http_event_types
 
-    def test_websocket_store_false_continuation_is_connection_local(self, setup_backend):
+    def test_websocket_store_false_continuation_is_connection_local(
+        self, setup_backend
+    ):
         """`store=false` should continue on the same socket and fail after reconnect."""
         _, model, _, gateway = setup_backend
 
@@ -564,7 +570,9 @@ class TestResponsesLocalSmoke:
         assert retrieved.store is True
         assert len(retrieved.output) > 0
 
-    def test_websocket_generate_false_returns_chainable_response_id(self, setup_backend):
+    def test_websocket_generate_false_returns_chainable_response_id(
+        self, setup_backend
+    ):
         """`generate=false` should return a response id that the same socket can chain from."""
         _, model, _, gateway = setup_backend
 
@@ -807,14 +815,18 @@ class TestResponsesLocalToolSmoke:
         assert "response.function_call_arguments.delta" in event_types
         assert "response.function_call_arguments.done" in event_types
 
-        completed_events = [event for event in events if event.type == "response.completed"]
+        completed_events = [
+            event for event in events if event.type == "response.completed"
+        ]
         assert len(completed_events) == 1
 
         completed = completed_events[0]
         assert completed.response.status == "in_progress"
 
         function_calls = _response_function_calls(completed.response.output)
-        assert function_calls, "expected a function call in the completed response payload"
+        assert (
+            function_calls
+        ), "expected a function call in the completed response payload"
         assert function_calls[0].name == "calculate"
         assert function_calls[0].call_id
         assert function_calls[0].arguments
@@ -834,7 +846,9 @@ class TestResponsesLocalToolSmoke:
         )
 
         function_calls = _response_function_calls(first.output)
-        assert function_calls, "expected a completed function call in the first HTTP turn"
+        assert (
+            function_calls
+        ), "expected a completed function call in the first HTTP turn"
         assert first.status == "in_progress"
         assert function_calls[0].name == "calculate"
         assert function_calls[0].arguments

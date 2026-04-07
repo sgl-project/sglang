@@ -622,9 +622,11 @@ class ModelPool:
                 env=env,
                 stdout=stdout_target,
                 stderr=stderr_target,
-                preexec_fn=_set_parent_death_signal
-                if sys.platform.startswith("linux")
-                else None,
+                preexec_fn=(
+                    _set_parent_death_signal
+                    if sys.platform.startswith("linux")
+                    else None
+                ),
                 start_new_session=True,
             )
         finally:

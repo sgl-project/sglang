@@ -51,7 +51,10 @@ def test_benchmark_contract_carries_router_axes():
 def test_prepare_turn_input_modes():
     conversation = [bench._user_message("first"), bench._assistant_message("reply")]
 
-    assert bench._prepare_turn_input("previous_response_id", conversation, "next") == "next"
+    assert (
+        bench._prepare_turn_input("previous_response_id", conversation, "next")
+        == "next"
+    )
     assert bench._prepare_turn_input("full_replay", conversation, "next") == [
         *conversation,
         bench._user_message("next"),
@@ -95,7 +98,11 @@ def test_response_timing_tracker_records_phase_gaps_and_trace():
     assert metrics["event_count"] == 3
     assert metrics["output_text_delta_count"] == 1
     assert metrics["event_trace"] == [
-        {"event_type": "response.created", "t_ms": pytest.approx(10.0), "delta_chars": 0},
+        {
+            "event_type": "response.created",
+            "t_ms": pytest.approx(10.0),
+            "delta_chars": 0,
+        },
         {
             "event_type": "response.output_text.delta",
             "t_ms": pytest.approx(40.0),

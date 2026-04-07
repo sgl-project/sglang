@@ -7,7 +7,6 @@ logic without requiring GPU or model access.
 from __future__ import annotations
 
 import pytest
-
 from benchmarks.test_ws_microbench import (
     _benchmark_context,
     _benchmark_contract,

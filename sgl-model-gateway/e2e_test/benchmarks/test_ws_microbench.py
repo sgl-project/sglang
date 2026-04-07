@@ -24,9 +24,7 @@ logger = logging.getLogger(__name__)
 # Allow CI and local CI-equivalent runs to swap this test model without editing code.
 # Default remains the original 1B model for parity with the plan, but this can be
 # overridden to any model id from MODEL_SPECS for environments without access.
-_WS_BENCHMARK_MODEL = os.environ.get(
-    "SGLANG_WS_BENCHMARK_MODEL", "llama-1b"
-)
+_WS_BENCHMARK_MODEL = os.environ.get("SGLANG_WS_BENCHMARK_MODEL", "llama-1b")
 
 # WebSocket benchmark coverage is scoped to grpc worker backends in the current
 # router configuration (responses WS is not supported over HTTP-backend worker links).
@@ -67,10 +65,7 @@ def _ws_request(**request_fields) -> dict:
 
 
 def _chain_turn_input(turn_index: int) -> str:
-    return (
-        f"Continuation turn {turn_index}. "
-        "Reply with the single word: hello."
-    )
+    return f"Continuation turn {turn_index}. " "Reply with the single word: hello."
 
 
 def _tool_output_chain_turn_input(turn_index: int) -> list[dict]:
@@ -122,9 +117,7 @@ def _response_output_text_from_response(response: dict) -> str:
 
 def _usage_token_totals(response: dict) -> tuple[int, int]:
     usage = response.get("usage", {})
-    input_tokens = int(
-        usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
-    )
+    input_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
     output_tokens = int(usage.get("output_tokens", 0) or 0)
     return input_tokens, output_tokens
 
@@ -204,7 +197,9 @@ def _collect_http_response_metrics(
     event_count = 0
     output_text_delta_count = 0
 
-    for event in _http_stream_events(base_url, "/v1/responses", request_payload, timeout_secs):
+    for event in _http_stream_events(
+        base_url, "/v1/responses", request_payload, timeout_secs
+    ):
         now = time.perf_counter()
         event_type = event.get("type")
         event_count += 1
@@ -302,7 +297,9 @@ async def _collect_ws_response_metrics(
             output_text_delta_count += 1
 
         if event_type == "error":
-            raise AssertionError(f"Unexpected websocket transcript benchmark error: {event}")
+            raise AssertionError(
+                f"Unexpected websocket transcript benchmark error: {event}"
+            )
 
         if event_type == "response.completed":
             completed_ms = (now - request_started_at) * 1000
@@ -396,7 +393,9 @@ async def _run_single_ws_sample(ws_url: str, model: str) -> dict[str, float | in
     request = _ws_request(**_benchmark_request_body(model))
 
     connect_started_at = time.perf_counter()
-    async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
+    async with websockets.connect(
+        ws_url, open_timeout=30, close_timeout=5
+    ) as websocket:
         connected_at = time.perf_counter()
         await websocket.send(json.dumps(request))
         request_sent_at = time.perf_counter()
@@ -550,7 +549,9 @@ async def _run_ws_sample_batch(
 
 
 async def _collect_ws_terminal_event(websocket, request: dict) -> tuple[dict, float]:
-    return await _collect_ws_terminal_event_with_timeout(websocket, request, timeout_secs=90)
+    return await _collect_ws_terminal_event_with_timeout(
+        websocket, request, timeout_secs=90
+    )
 
 
 async def _collect_ws_terminal_event_with_timeout(
@@ -577,7 +578,9 @@ async def _run_ws_continuation_chain_sample(
     import websockets
 
     connect_started_at = time.perf_counter()
-    async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
+    async with websockets.connect(
+        ws_url, open_timeout=30, close_timeout=5
+    ) as websocket:
         connected_at = time.perf_counter()
 
         per_turn_ms: list[float] = []
@@ -634,7 +637,9 @@ async def _run_ws_tool_output_chain_sample(
     import websockets
 
     connect_started_at = time.perf_counter()
-    async with websockets.connect(ws_url, open_timeout=30, close_timeout=5) as websocket:
+    async with websockets.connect(
+        ws_url, open_timeout=30, close_timeout=5
+    ) as websocket:
         connected_at = time.perf_counter()
 
         per_turn_ms: list[float] = []
@@ -995,7 +1000,8 @@ def _chain_transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, f
         return numerator / denominator
 
     total_ratio = ratio(
-        float(ws_summary["total_chain_ms_p50"]), float(http_summary["total_chain_ms_p50"])
+        float(ws_summary["total_chain_ms_p50"]),
+        float(http_summary["total_chain_ms_p50"]),
     )
     continuation_ratio = ratio(
         float(ws_summary["continuation_only_total_ms_p50"]),
@@ -1006,8 +1012,7 @@ def _chain_transport_ratios(http_summary: dict, ws_summary: dict) -> dict[str, f
         "ws_over_http_total_chain": total_ratio,
         "ws_over_http_continuation_only": continuation_ratio,
         "ws_vs_http_total_chain_delta_pct": (1.0 - total_ratio) * 100.0,
-        "ws_vs_http_continuation_only_delta_pct": (1.0 - continuation_ratio)
-            * 100.0,
+        "ws_vs_http_continuation_only_delta_pct": (1.0 - continuation_ratio) * 100.0,
     }
 
 
@@ -1025,7 +1030,9 @@ class TestWsMicrobench:
 
         concurrency_levels = [
             int(value)
-            for value in os.environ.get("SGLANG_WS_BENCH_CONCURRENCY", "1,2,4").split(",")
+            for value in os.environ.get("SGLANG_WS_BENCH_CONCURRENCY", "1,2,4").split(
+                ","
+            )
             if value.strip()
         ]
         samples_per_concurrency = int(
@@ -1174,9 +1181,7 @@ class TestResponsesContinuationChainCompare:
             workload_kind="incremental_text_continuation",
         )
 
-        timeout_secs = float(
-            os.environ.get("SGLANG_HTTP_WS_CHAIN_TIMEOUT_SECS", "90")
-        )
+        timeout_secs = float(os.environ.get("SGLANG_HTTP_WS_CHAIN_TIMEOUT_SECS", "90"))
         http_samples = [
             _run_http_continuation_chain_sample(
                 gateway.base_url, model, turns, timeout_secs

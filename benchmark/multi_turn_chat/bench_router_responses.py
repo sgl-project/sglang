@@ -89,7 +89,9 @@ class ResponseTimingTracker:
             "request_to_first_event_ms": first_event_ms,
             "request_to_first_content_ms": first_content_ms,
             "request_to_completed_ms": completed_ms,
-            "first_event_to_first_content_ms": max(first_content_ms - first_event_ms, 0.0),
+            "first_event_to_first_content_ms": max(
+                first_content_ms - first_event_ms, 0.0
+            ),
             "first_content_to_completed_ms": max(completed_ms - first_content_ms, 0.0),
             "event_count": self.event_count,
             "output_text_delta_count": self.output_text_delta_count,
@@ -120,7 +122,9 @@ def _topology_overlay(router_topology: str) -> str:
     return "none"
 
 
-def _benchmark_contract(args: argparse.Namespace, client_transport: str) -> dict[str, str]:
+def _benchmark_contract(
+    args: argparse.Namespace, client_transport: str
+) -> dict[str, str]:
     return {
         "benchmark_family": "long_context_multiturn_qos",
         "run_class": "router_multiturn_adapter",
@@ -215,7 +219,9 @@ def _event_type(event: dict[str, Any]) -> str:
 
 def _parse_sse_event(lines: list[str]) -> dict[str, Any] | None:
     data_lines = [
-        line.removeprefix("data:").lstrip() for line in lines if line.startswith("data:")
+        line.removeprefix("data:").lstrip()
+        for line in lines
+        if line.startswith("data:")
     ]
     if not data_lines:
         return None
@@ -378,10 +384,15 @@ def _run_http_chain(
             "max_output_tokens": int(qa["new_tokens"]),
             "store": config.store,
         }
-        if config.chain_mode == "previous_response_id" and previous_response_id is not None:
+        if (
+            config.chain_mode == "previous_response_id"
+            and previous_response_id is not None
+        ):
             request["previous_response_id"] = previous_response_id
 
-        request_payload_bytes = len(json.dumps({**request, "stream": True}).encode("utf-8"))
+        request_payload_bytes = len(
+            json.dumps({**request, "stream": True}).encode("utf-8")
+        )
         response, metrics = _collect_http_response(config, request)
         assistant_text = _response_output_text_from_http_response(response)
         if config.chain_mode == "full_replay":
@@ -459,7 +470,9 @@ async def _run_ws_chain_async(
             )
             assistant_text = _response_output_text_from_ws_response(response)
             if config.chain_mode == "full_replay":
-                _append_full_replay_turn(conversation, str(qa["prompt"]), assistant_text)
+                _append_full_replay_turn(
+                    conversation, str(qa["prompt"]), assistant_text
+                )
             previous_response_id = response.get("id")
             total_request_payload_bytes += request_payload_bytes
 
@@ -525,7 +538,9 @@ def _summarize_transport(
         for turn in result["per_turn"]
     ]
     event_counts = [
-        float(turn["event_count"]) for result in chain_results for turn in result["per_turn"]
+        float(turn["event_count"])
+        for result in chain_results
+        for turn in result["per_turn"]
     ]
     output_text_delta_counts = [
         float(turn["output_text_delta_count"])
@@ -719,7 +734,12 @@ def parse_args() -> argparse.Namespace:
         "--router-topology",
         type=str,
         default="unknown",
-        choices=["unknown", "regular_http_worker", "regular_grpc_worker", "pd_http_workers"],
+        choices=[
+            "unknown",
+            "regular_http_worker",
+            "regular_grpc_worker",
+            "pd_http_workers",
+        ],
         help="Metadata label for the router topology.",
     )
     parser.add_argument("--parallel", type=int, default=1)
