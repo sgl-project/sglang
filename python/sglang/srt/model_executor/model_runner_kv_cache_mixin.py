@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
-from sglang.srt.speculative.dflash_utils import scale_kv_cell_size_per_token_for_dflash
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -141,6 +140,10 @@ class ModelRunnerKVCacheMixin:
 
         cell_size = self.get_cell_size_per_token(num_layers)
         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+            from sglang.srt.speculative.dflash_utils import (
+                scale_kv_cell_size_per_token_for_dflash,
+            )
+
             draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
             if (
                 draft_num_layers is not None
