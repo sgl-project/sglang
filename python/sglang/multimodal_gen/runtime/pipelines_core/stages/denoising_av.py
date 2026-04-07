@@ -1270,11 +1270,44 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             dtype=reference_tensor.dtype,
         )
 
+    @staticmethod
+    def _reset_stage2_generators(batch: Req) -> None:
+        generator = getattr(batch, "generator", None)
+        if isinstance(generator, list) and generator:
+            generator_device = str(generator[0].device)
+        elif isinstance(generator, torch.Generator):
+            generator_device = str(generator.device)
+        else:
+            generator_device = "cpu"
+
+        seeds = getattr(batch, "seeds", None)
+        if not seeds:
+            seed = getattr(batch, "seed", None)
+            if seed is None:
+                return
+            seeds = [int(seed)]
+
+        batch.generator = [
+            torch.Generator(device=generator_device).manual_seed(int(seed))
+            for seed in seeds
+        ]
+
+    @staticmethod
+    def _should_reset_stage2_generators(server_args: ServerArgs) -> bool:
+        # Official LTX-2.3 two-stage refinement continues from the generator state
+        # after stage 1. Resetting back to the request seed changes the distilled
+        # noise injection immediately at stage 2 step 0.
+        arch_config = getattr(
+            server_args.pipeline_config.vae_config, "arch_config", None
+        )
+        if arch_config is not None and is_ltx23_native_variant(arch_config):
+            return False
+        return "LTX-2.3" not in str(getattr(server_args, "model_path", ""))
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage2"
-        # Official LTX-2.3 two-stage refinement reuses the same generator/noiser
-        # instance from stage 1, so stage 2 must continue the RNG stream instead
-        # of rewinding it back to the request seed.
+        if self._should_reset_stage2_generators(server_args):
+            self._reset_stage2_generators(batch)
         noise_scale = self.distilled_sigmas[0].to(batch.latents.device)
         video_noise = self._randn_like_with_batch_generators(batch.latents, batch)
         batch.latents = video_noise * noise_scale + batch.latents * (1 - noise_scale)

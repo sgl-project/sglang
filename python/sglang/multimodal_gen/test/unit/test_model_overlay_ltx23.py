@@ -231,6 +231,41 @@ def test_ltx23_velocity_to_x0_supports_tokenwise_sigma():
     assert torch.allclose(denoised, expected)
 
 
+def test_ltx23_stage2_keeps_generator_state_while_ltx2_resets():
+    ltx23_server_args = SimpleNamespace(
+        model_path="Lightricks/LTX-2.3",
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(ltx_variant="ltx_2_3")
+            )
+        ),
+    )
+    legacy_server_args = SimpleNamespace(
+        model_path="Lightricks/LTX-2",
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2"))
+        ),
+    )
+
+    assert (
+        LTX2RefinementStage._should_reset_stage2_generators(ltx23_server_args) is False
+    )
+    assert (
+        LTX2RefinementStage._should_reset_stage2_generators(legacy_server_args) is True
+    )
+
+
+def test_ltx23_stage2_generator_reset_falls_back_to_model_path():
+    server_args = SimpleNamespace(
+        model_path="Lightricks/LTX-2.3",
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(arch_config=SimpleNamespace())
+        ),
+    )
+
+    assert LTX2RefinementStage._should_reset_stage2_generators(server_args) is False
+
+
 def test_ltx23_connector_repack_renames_qk_norm_keys():
     assert (
         _rename_connector_key(
