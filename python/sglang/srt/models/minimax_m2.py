@@ -37,7 +37,6 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -49,6 +48,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -343,9 +343,8 @@ class MiniMaxM2QKRMSNorm:
         assert q_norm.variance_epsilon == k_norm.variance_epsilon
         self._q_norm = q_norm
         self._k_norm = k_norm
-        self._world_size = get_tensor_model_parallel_world_size()
+        self._world_size = self._q_norm.attn_tp_size
         self._eps = q_norm.variance_epsilon
-        self._cpu_group = get_tp_group().cpu_group
         use_fused_norm = get_bool_env_var("SGLANG_USE_FUSED_PARALLEL_QKNORM")
 
         self._forward_impl = self._forward_naive
@@ -381,7 +380,7 @@ class MiniMaxM2QKRMSNorm:
         # typically, this should not exceed 1M, since max_tokens is usually less than 16384
         max_size = ((8 * max_tokens + ALIGN - 1) // ALIGN) * ALIGN
         comm = CustomAllReduceV2(
-            group=get_tp_group().cpu_group,
+            group=get_attention_tp_group().cpu_group,
             device=device,
             max_pull_size=0,
             max_pull_blocks=0,
@@ -399,8 +398,8 @@ class MiniMaxM2QKRMSNorm:
     def _forward_naive(self, q: torch.Tensor, k: torch.Tensor):
         q, k = q.contiguous(), k.contiguous()
         sum_sq = rms_sumsq_serial(q, k)
-        if self._q_norm.tp_world > 1:
-            sum_sq = tensor_model_parallel_all_reduce(sum_sq)
+        if self._world_size > 1:
+            sum_sq = attn_tp_all_reduce(sum_sq)
         return rms_apply_serial(
             q,
             k,
