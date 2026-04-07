@@ -16,7 +16,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
-from sglang.srt.layers.quantization.modelopt_quant import (
+from sglang.srt.layers.quantization.modelopt import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
     fp4_quantize,
