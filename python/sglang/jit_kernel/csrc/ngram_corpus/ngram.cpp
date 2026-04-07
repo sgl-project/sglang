@@ -100,6 +100,11 @@ void Ngram::removeExternalCorpus(const std::string& corpus_id) {
   sams_.erase(corpus_id);
 }
 
+void Ngram::resetStagingSam() {
+  // staging_sam_ is only accessed from the loading thread — no lock needed.
+  staging_sam_.reset();
+}
+
 void Ngram::clearExternalCorpus() {
   std::unique_lock<std::mutex> lock(mutex_);
   sams_.clear();

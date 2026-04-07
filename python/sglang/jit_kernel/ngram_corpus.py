@@ -132,7 +132,7 @@ def get_ngram_corpus_cls():
                     chunk_count += 1
                 self.finish_external_corpus_load(corpus_id)  # type: ignore
             except Exception:
-                self.clear_external_corpus()  # type: ignore
+                self.cancel_external_corpus_load()  # type: ignore
                 raise
             return chunk_count, loaded_token_count
 

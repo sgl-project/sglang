@@ -54,6 +54,8 @@ class Ngram {
 
   void removeExternalCorpus(const std::string& corpus_id);
 
+  void resetStagingSam();
+
   void clearExternalCorpus();
 
   std::vector<std::string> listExternalCorpora() const;

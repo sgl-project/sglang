@@ -120,6 +120,10 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_->removeExternalCorpus(corpus_id);
   }
 
+  void cancel_external_corpus_load() {
+    ngram_->resetStagingSam();
+  }
+
   void clear_external_corpus() {
     ngram_->clearExternalCorpus();
   }
@@ -176,6 +180,7 @@ void register_ngram_corpus() {
       .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
       .def("finish_external_corpus_load", &NgramCorpusObj::finish_external_corpus_load)
       .def("remove_external_corpus", &NgramCorpusObj::remove_external_corpus)
+      .def("cancel_external_corpus_load", &NgramCorpusObj::cancel_external_corpus_load)
       .def("clear_external_corpus", &NgramCorpusObj::clear_external_corpus)
       .def("list_external_corpora", &NgramCorpusObj::list_external_corpora)
       .def("synchronize", &NgramCorpusObj::synchronize)
