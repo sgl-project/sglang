@@ -84,7 +84,13 @@ class SGLangServingRunner:
 
 def test_benchmark():
     runner = SGLangServingRunner(
-        server_args={"model_path": "Qwen/Qwen3-8B", "device": "cpu"}
+        server_args={
+            "model_path": "Qwen/Qwen3-8B",
+            "device": "cpu",
+            "enable_hierarchical_cache": True,
+            "hicache_storage_backend": "file",
+            "page_size": 16,
+        }
     )
 
     metrics = runner.benchmark()
