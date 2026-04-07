@@ -1948,16 +1948,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.enable_flashinfer_cutedsl_moe:
+        moe_runner_backend = get_moe_runner_backend()
+
+        if moe_runner_backend.is_auto():
+            # TRTLLM is currently the most performant and tested FP4 MoE
+            # backend, so use it as the default.
+            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+
+        if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
-            self.runner = MoeRunner(
-                MoeRunnerBackend.FLASHINFER_CUTEDSL, moe_runner_config
-            )
-        if get_moe_runner_backend().is_flashinfer_trtllm():
-            self.runner = MoeRunner(
-                MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
-            )
+        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply(
         self,
