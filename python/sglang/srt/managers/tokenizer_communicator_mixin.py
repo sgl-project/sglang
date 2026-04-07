@@ -429,10 +429,17 @@ class TokenizerCommunicatorMixin:
             obj.file_path = None
             obj.documents = None
             results = await self.add_external_corpus_communicator(obj)
-            result = results[0]
-            if truncated and result.success:
-                result.message += f" (truncated: exceeded {max_tokens} token limit)"
-            return result
+            all_success, all_message = _Communicator.merge_results(results)
+            if truncated and all_success:
+                all_message += f" (truncated: exceeded {max_tokens} token limit)"
+            return AddExternalCorpusReqOutput(
+                success=all_success,
+                corpus_id=results[0].corpus_id if all_success else "",
+                message=all_message,
+                loaded_token_count=results[0].loaded_token_count
+                if all_success
+                else 0,
+            )
         except Exception as e:
             return AddExternalCorpusReqOutput(success=False, message=str(e))
 
@@ -443,7 +450,10 @@ class TokenizerCommunicatorMixin:
         results = await self.remove_external_corpus_communicator(
             RemoveExternalCorpusReqInput(corpus_id=corpus_id)
         )
-        return results[0]
+        all_success, all_message = _Communicator.merge_results(results)
+        return RemoveExternalCorpusReqOutput(
+            success=all_success, message=all_message
+        )
 
     async def list_external_corpora(
         self: TokenizerManager,
@@ -452,7 +462,12 @@ class TokenizerCommunicatorMixin:
         results = await self.list_external_corpora_communicator(
             ListExternalCorporaReqInput()
         )
-        return results[0]
+        all_success, all_message = _Communicator.merge_results(results)
+        # Merge corpus IDs from all DP ranks (each rank loads the same set).
+        corpus_ids = results[0].corpus_ids if all_success else []
+        return ListExternalCorporaReqOutput(
+            success=all_success, corpus_ids=corpus_ids, message=all_message
+        )
 
     async def flush_cache(
         self: TokenizerManager, timeout_s: Optional[float] = None
