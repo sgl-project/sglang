@@ -74,6 +74,7 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         verify_done: Optional[torch.cuda.Event] = None,
         verified_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
+        accept_index: Optional[torch.Tensor] = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
@@ -96,6 +97,7 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         self.verify_done = verify_done
         self.verified_tokens = verified_tokens
         self.accept_lens = accept_lens
+        self.accept_index = accept_index
 
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device
@@ -507,14 +509,41 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         ]
         self.verified_tokens = self.verified_tokens.flatten()
         self.accept_lens = self.accept_lens[new_indices]
+        if self.accept_index is not None:
+            d = self.draft_token_num
+            accept_2d = self.accept_index.reshape(-1, d)[new_indices]  # (new_bs, d)
+            # Remap global indices: old row i had offset old_i*d, new row j needs offset j*d
+            if not isinstance(new_indices, torch.Tensor):
+                old_indices = torch.tensor(
+                    new_indices, device=accept_2d.device, dtype=torch.int64
+                )
+            else:
+                old_indices = new_indices.to(device=accept_2d.device, dtype=torch.int64)
+            new_i = torch.arange(len(old_indices), device=accept_2d.device)
+            shift = (
+                ((new_i - old_indices) * d).to(accept_2d.dtype).unsqueeze(1)
+            )  # (new_bs, 1)
+            self.accept_index = torch.where(
+                accept_2d != -1, accept_2d + shift, accept_2d
+            ).flatten()
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
 
     def merge_batch(self, spec_info: NgramVerifyInput):
+        self_bs = self.accept_lens.shape[0]
+        d = self.draft_token_num
         self.verified_tokens = torch.cat(
             (self.verified_tokens, spec_info.verified_tokens), dim=0
         )
         self.accept_lens = torch.cat((self.accept_lens, spec_info.accept_lens), dim=0)
+        if self.accept_index is not None and spec_info.accept_index is not None:
+            # Shift incoming accept_index by self_bs * d for non-(-1) values
+            other_index = torch.where(
+                spec_info.accept_index != -1,
+                spec_info.accept_index + self_bs * d,
+                spec_info.accept_index,
+            )
+            self.accept_index = torch.cat((self.accept_index, other_index), dim=0)
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = FutureIndices(

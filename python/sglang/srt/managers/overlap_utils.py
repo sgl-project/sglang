@@ -136,7 +136,7 @@ class FutureMap:
                 return
             indices = draft_input.future_indices.indices
             indices.record_stream(torch.get_device_module(self.device).current_stream())
-            model_worker_batch.new_seq_lens = self.new_seq_lens_buf[indices]
+            model_worker_batch.seq_lens = self.new_seq_lens_buf[indices]
             return
 
         if self.spec_algo.is_none():
@@ -180,7 +180,12 @@ class FutureMap:
                 # idle indices in dp attention do not need store info
                 return
             if not self.buf_initialized:
-                self._lazy_init_buf(draft_input)
+                new_seq_lens0 = draft_input.new_seq_lens[0]
+                self.new_seq_lens_buf = torch.empty(
+                    (self.future_buffer_len, *new_seq_lens0.shape),
+                    dtype=new_seq_lens0.dtype,
+                    device=self.device,
+                )
             self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
             return
 
