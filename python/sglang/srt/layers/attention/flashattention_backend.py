@@ -692,6 +692,12 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        _fa_out = (
+            output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if output is not None
+            else None
+        )
+
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -801,11 +807,6 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                _fa_out = (
-                    output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                    if output is not None
-                    else None
-                )
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -881,11 +882,6 @@ class FlashAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
-                    _fa_out = (
-                        output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                        if output is not None
-                        else None
-                    )
                     output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
@@ -912,11 +908,6 @@ class FlashAttentionBackend(AttentionBackend):
                         metadata.max_seq_len_q
                         if not forward_batch.mha_one_shot
                         else metadata.max_seq_len_k
-                    )
-                    _fa_out = (
-                        output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                        if output is not None
-                        else None
                     )
                     output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1083,6 +1074,12 @@ class FlashAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+
+        _fa_out = (
+            output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if output is not None
+            else None
+        )
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
