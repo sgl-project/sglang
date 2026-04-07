@@ -282,5 +282,18 @@ class TestMooncakeBackendAccuracy(
         run_eval_accuracy_test(self)
 
 
+class TestMooncakeBackendSmallHostMemory(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
+    """Test HiCache-Mooncake backend when host (L2) memory is smaller than device (L1) memory"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args["--hicache-ratio"] = 0.5
+        server_args["--hicache-mem-layout"] = "page_first"
+        return server_args, env_vars
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

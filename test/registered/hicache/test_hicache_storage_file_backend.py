@@ -330,5 +330,14 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     )
 
 
+class TestHiCacheStorageSmallHostMemory(HiCacheStorageBaseMixin, CustomTestCase):
+    """Test HiCache file backend when host (L2) memory is smaller than device (L1) memory"""
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args = {"--hicache-ratio": 0.5}
+        return server_args, {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.temp_dir}
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
