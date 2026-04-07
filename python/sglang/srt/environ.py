@@ -374,6 +374,9 @@ class Envs:
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
 
+    # Unified JIT cache root
+    SGLANG_JIT_CACHE_ROOT = EnvStr(os.path.expanduser("~/.cache/sglang"))
+
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
@@ -536,6 +539,26 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
+def get_jit_cache_subdir(name: str, *, override_env: str = None) -> str:
+    """Return <SGLANG_JIT_CACHE_ROOT>/<name>, or the value of *override_env* if set."""
+    if override_env is not None:
+        override_value = os.environ.get(override_env)
+        if override_value is not None:
+            return os.path.expanduser(override_value)
+    return os.path.join(envs.SGLANG_JIT_CACHE_ROOT.get(), name)
+
+
+def configure_jit_cache_env_vars():
+    """Set TRITON_CACHE_DIR / TORCHINDUCTOR_CACHE_DIR under SGLANG_JIT_CACHE_ROOT if not already set."""
+    root = envs.SGLANG_JIT_CACHE_ROOT.get()
+
+    if "TRITON_CACHE_DIR" not in os.environ:
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(root, "triton")
+
+    if "TORCHINDUCTOR_CACHE_DIR" not in os.environ:
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(root, "inductor")
+
+
 def _print_deprecated_env(new_name: str, old_name: str):
     if old_name in os.environ:
         warnings.warn(
@@ -554,6 +577,7 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
 
 
 def _convert_SGL_to_SGLANG():
+    _print_deprecated_env("SGLANG_JIT_CACHE_ROOT", "SGLANG_CACHE_DIR")
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
     _print_deprecated_env(
         "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"

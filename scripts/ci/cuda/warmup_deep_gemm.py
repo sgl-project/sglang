@@ -22,11 +22,17 @@ import time
 from math import ceil
 from pathlib import Path
 
-# Configure DeepGEMM cache before importing deep_gemm
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR",
-    os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm"),
-)
+# Configure DeepGEMM cache before importing deep_gemm.
+_dg_cache_override = os.getenv("SGLANG_DG_CACHE_DIR")
+if _dg_cache_override is not None:
+    os.environ["DG_JIT_CACHE_DIR"] = os.path.expanduser(_dg_cache_override)
+else:
+    _jit_cache_root = os.path.expanduser(
+        os.getenv("SGLANG_JIT_CACHE_ROOT")
+        or os.getenv("SGLANG_CACHE_DIR")
+        or "~/.cache/sglang"
+    )
+    os.environ["DG_JIT_CACHE_DIR"] = os.path.join(_jit_cache_root, "deep_gemm")
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
 
 BLOCK_SIZE = 128
