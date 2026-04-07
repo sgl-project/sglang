@@ -271,6 +271,16 @@ class SchedulerRuntimeCheckerMixin:
             )
 
     def check_memory(self: Scheduler):
+        if self.server_args.spectre_role == "draft":
+            has_active_draft_reqs = (
+                len(getattr(self, "paused_reqs", [])) > 0
+                or len(getattr(self, "draft_paused_reqs", [])) > 0
+                or len(getattr(getattr(self, "draft_batch", None), "reqs", [])) > 0
+                or len(getattr(self, "draft_waiting_queue", [])) > 0
+            )
+            if has_active_draft_reqs:
+                return
+
         if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():

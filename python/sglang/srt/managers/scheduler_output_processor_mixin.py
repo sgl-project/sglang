@@ -21,6 +21,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spectre.spectre_protocol import (
+    SpectreAction,
+    SpecType,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -190,6 +194,13 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        if (
+                            self.spec_algorithm.is_spectre()
+                            and self.server_args.spectre_role == "target"
+                        ):
+                            self.notify_draft_request_finished_or_aborted(
+                                req, SpectreAction.FINISH
+                            )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
@@ -325,11 +336,12 @@ class SchedulerOutputProcessorMixin:
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
-            prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=can_run_cuda_graph,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
+        if batch.prefill_stats is not None:
+            self.report_prefill_stats(
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
 
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
@@ -411,7 +423,11 @@ class SchedulerOutputProcessorMixin:
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            self.update_spec_metrics(
+                batch.batch_size(),
+                result.num_accepted_tokens,
+                draft_num_tokens=batch.draft_num_tokens,
+            )
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -517,6 +533,11 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
+            if self.server_args.spectre_role == "draft" and hasattr(
+                self, "_check_and_pause_draft_req"
+            ):
+                self._check_and_pause_draft_req(req)
+
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -552,6 +573,11 @@ class SchedulerOutputProcessorMixin:
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
+            if (
+                self.spec_algorithm.is_spectre()
+                and self.server_args.spectre_role == "target"
+            ):
+                self.notify_draft_request_finished_or_aborted(req, SpectreAction.FINISH)
 
         self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -984,6 +1010,9 @@ class SchedulerOutputProcessorMixin:
 
         for req in reqs:
             if req is skip_req:
+                continue
+
+            if hasattr(req, "spec_type") and req.spec_type == SpecType.DRAFT_REQUEST:
                 continue
 
             if req.finished():

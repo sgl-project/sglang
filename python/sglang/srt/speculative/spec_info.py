@@ -10,6 +10,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    from sglang.srt.speculative.spectre.verifier.spectre_worker import (
+        SpectreWorker,
+    )
 
 
 class SpeculativeAlgorithm(Enum):
@@ -19,6 +22,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    SPECTRE = auto()
     NONE = auto()
 
     @classmethod
@@ -46,12 +50,20 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_spectre(self) -> bool:
+        return self == SpeculativeAlgorithm.SPECTRE
+
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
-    def create_worker(
-        self, server_args: ServerArgs
-    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+    def create_worker(self, server_args: ServerArgs) -> Optional[
+        Union[
+            Type[BaseSpecWorker],
+            Type[TpModelWorker],
+            Type[NGRAMWorker],
+            Type[SpectreWorker],
+        ]
+    ]:
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
@@ -101,6 +113,17 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_spectre():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.spectre.verifier.spectre_worker import (
+                SpectreWorker,
+            )
+
+            return SpectreWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 

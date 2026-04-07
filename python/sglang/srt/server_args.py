@@ -518,6 +518,18 @@ class ServerArgs:
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
 
+    # Spectre speculative decoding
+    spectre_role: Optional[Literal["target", "draft"]] = None
+    spectre_max_batch_size: int = 32
+    spectre_reject_interval: int = 500
+    spectre_no_draft_ratio: float = 0.5
+    spectre_retry_fail_ratio: float = 0.5
+    spectre_retry_min_count: int = 4
+    spectre_zmq_addr: str = "127.0.0.1"
+    spectre_zmq_port: str = "30009"
+    spectre_draft_priority: bool = False
+    spectre_max_draft_priority_steps: int = 0
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
@@ -4796,7 +4808,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SPECTRE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4949,6 +4961,81 @@ class ServerArgs:
             "--enable-multi-layer-eagle",
             action="store_true",
             help="Enable multi-layer Eagle speculative decoding.",
+        )
+
+        # Spectre speculative decoding
+        parser.add_argument(
+            "--spectre-role",
+            type=str,
+            choices=["target", "draft"],
+            help="The role of the Spectre speculative decoding. Can be one of 'target' or 'draft'.",
+            default=ServerArgs.spectre_role,
+        )
+        parser.add_argument(
+            "--spectre-max-batch-size",
+            type=int,
+            default=ServerArgs.spectre_max_batch_size,
+            help="The maximum batch size for Spectre speculative decoding. If the batch size is larger than this value, the server will be considered as high overhead.",
+        )
+        parser.add_argument(
+            "--spectre-reject-interval",
+            type=int,
+            default=ServerArgs.spectre_reject_interval,
+            help="The interval to resend draft requests to Drafter server.",
+        )
+        parser.add_argument(
+            "--spectre-no-draft-ratio",
+            type=float,
+            default=ServerArgs.spectre_no_draft_ratio,
+            help="The ratio of requests with no draft tokens to the total batch size. If the ratio is larger than this value, the server will only decode one token.",
+        )
+        parser.add_argument(
+            "--spectre-retry-fail-ratio",
+            type=float,
+            default=ServerArgs.spectre_retry_fail_ratio,
+            help="Minimum ratio of failed requests to batch size required to trigger a retry. "
+            "E.g. 0.5 means retry only when more than 50%% of requests have no valid draft.",
+        )
+        parser.add_argument(
+            "--spectre-zmq-addr",
+            type=str,
+            default=ServerArgs.spectre_zmq_addr,
+            help="ZMQ address for Spectre speculative decoding.",
+        )
+        parser.add_argument(
+            "--spectre-zmq-port",
+            type=str,
+            default=ServerArgs.spectre_zmq_port,
+            help="ZMQ port for Spectre speculative decoding.",
+        )
+        parser.add_argument(
+            "--spectre-retry-min-count",
+            type=int,
+            default=ServerArgs.spectre_retry_min_count,
+            help="Minimum number of failed requests required to trigger a retry.",
+        )
+        parser.add_argument(
+            "--spectre-draft-priority",
+            action="store_true",
+            default=ServerArgs.spectre_draft_priority,
+            help=(
+                "Enable Draft-Priority mode. "
+                "When set, the Drafter server decodes draft requests in a dedicated batch "
+                "for N steps before processing normal requests, preventing Normal-request "
+                "starvation of draft tokens."
+            ),
+        )
+        parser.add_argument(
+            "--spectre-max-draft-priority-steps",
+            type=int,
+            default=ServerArgs.spectre_max_draft_priority_steps,
+            help=(
+                "Maximum number of decode steps to run in Draft-Priority mode per iteration. "
+                "0 means auto-compute from the maximum remaining steps across "
+                "all active draft requests. Positive values cap the steps to prevent Normal-"
+                "request starvation. Only effective when --spectre-draft-priority "
+                "is set."
+            ),
         )
 
         # Expert parallelism

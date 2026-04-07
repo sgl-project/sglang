@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -208,6 +209,12 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin import (
+    SpectreDraftSchedulerMixin as SchedulerSpectreDraftMixin,
+)
+from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import (
+    SchedulerSpectreTargetMixin,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -288,6 +295,8 @@ class Scheduler(
     SchedulerPPMixin,
     SchedulerDPAttnMixin,
     SchedulerDllmMixin,
+    SchedulerSpectreDraftMixin,
+    SchedulerSpectreTargetMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -429,6 +438,8 @@ class Scheduler(
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        self.init_spectre_communication()
+
         # Init LoRA overlap loader
         if self.enable_lora_overlap_loading:
             self.lora_overlap_loader = LoRAOverlapLoader(
@@ -439,6 +450,39 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
         self.is_initializing = False
+
+    def init_spectre_communication(self):
+        """Initialize Spectre communication."""
+        role = self.server_args.spectre_role
+        if role in ["target", "draft"]:
+            from sglang.srt.speculative.spectre.spectre_communication import (
+                SpectreConfig,
+                SpectreZMQCommunicator,
+            )
+
+            spectre_config = SpectreConfig.from_server_args(self.server_args)
+            if self.tp_size == 1 or self.tp_rank == 0:
+                self.zmq_communicator = SpectreZMQCommunicator(config=spectre_config)
+                self.zmq_communicator.start()
+                logger.debug(
+                    "\033[33m ================ ZMQ Communicator Started ================\033[0m"
+                )
+                logger.debug(
+                    f"\033[33m Endpoint: {self.zmq_communicator.get_endpoint()}\033[0m"
+                )
+                logger.debug(
+                    "\033[33m ================================================================ \033[0m"
+                )
+            else:
+                self.zmq_communicator = None
+
+            if role == "draft":
+                self.paused_reqs: List[Req] = []
+                self.paused_reqs_lock = threading.RLock()
+        elif role is not None:
+            raise ValueError(f"Invalid Spectre role: {role}")
+
+        self.spec_forward_cycle = 0
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1014,6 +1058,8 @@ class Scheduler(
                 draft_runner = self.draft_worker.draft_worker.draft_runner
             draft_token_to_kv_pool = draft_runner.token_to_kv_pool
             model_config = draft_runner.model_config
+        elif self.spec_algorithm.is_spectre():
+            draft_token_to_kv_pool = None
         else:
             # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
@@ -2316,7 +2362,16 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_global_server_args().pp_max_micro_batch_size - running_bs
+        paused_count = 0
+        if self.server_args.spectre_role == "draft":
+            with self.paused_reqs_lock:
+                if hasattr(self, "paused_reqs"):
+                    paused_count = len(self.paused_reqs)
+
+        # Total occupied slots = running + paused
+        total_occupied = running_bs + paused_count
+
+        res = get_global_server_args().pp_max_micro_batch_size - total_occupied
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res
@@ -3112,7 +3167,12 @@ class Scheduler(
             self.reset_metrics()
 
             if self.draft_worker:
-                self.draft_worker.clear_cache_pool()
+                clear_cache_pool = getattr(self.draft_worker, "clear_cache_pool", None)
+                if clear_cache_pool is not None:
+                    clear_cache_pool()
+
+            if self.spec_algorithm.is_spectre():
+                self.reset_spectre_target_state()
 
             # TODO: allow optional empty cache
             torch.cuda.empty_cache()
@@ -3553,6 +3613,13 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
+        elif server_args.spectre_role == "draft":
+            scheduler.event_loop_normal_spectre_draft()
+        elif (
+            scheduler.spec_algorithm.is_spectre()
+            and scheduler.server_args.spectre_role == "target"
+        ):
+            scheduler.event_loop_normal_spectre_target()
         elif server_args.pp_size > 1:
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap:

@@ -765,26 +765,46 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
+
+        has_topk_fields = (
+            self.topk_p is not None
+            and len(self.topk_p) > 0
+            and self.topk_index is not None
+            and len(self.topk_index) > 0
+        )
+        has_hidden_states = (
+            self.hidden_states is not None and len(self.hidden_states) > 0
+        )
+
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
-            error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-            if len(new_indices) != len(self.topk_p):
-                if strict_check:
-                    raise ValueError(error_msg)
-                else:
-                    logger.warning(error_msg)
+            if has_topk_fields:
+                error_msg = f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
+                if len(new_indices) != len(self.topk_p):
+                    if strict_check:
+                        raise ValueError(error_msg)
+                    else:
+                        logger.warning(error_msg)
+                self.topk_p = self.topk_p[: len(new_indices)]
+                self.topk_index = self.topk_index[: len(new_indices)]
 
-            self.topk_p = self.topk_p[: len(new_indices)]
-            self.topk_index = self.topk_index[: len(new_indices)]
-            self.hidden_states = self.hidden_states[: len(new_indices)]
-            self.verified_id = self.verified_id[: len(new_indices)]
+            if has_hidden_states:
+                self.hidden_states = self.hidden_states[: len(new_indices)]
+
+            if self.verified_id is not None and len(self.verified_id) > 0:
+                self.verified_id = self.verified_id[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
-            self.topk_p = self.topk_p[new_indices]
-            self.topk_index = self.topk_index[new_indices]
-            self.hidden_states = self.hidden_states[new_indices]
-            self.verified_id = self.verified_id[new_indices]
+            if has_topk_fields:
+                self.topk_p = self.topk_p[new_indices]
+                self.topk_index = self.topk_index[new_indices]
+
+            if has_hidden_states:
+                self.hidden_states = self.hidden_states[new_indices]
+
+            if self.verified_id is not None and len(self.verified_id) > 0:
+                self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -796,20 +816,32 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             return
 
+        if spec_info is None:
+            return
+
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
+        elif spec_info.hidden_states is not None:
+            self.hidden_states = torch.cat(
+                [self.hidden_states, spec_info.hidden_states], axis=0
+            )
+
+        if self.verified_id is None:
             self.verified_id = spec_info.verified_id
+        elif spec_info.verified_id is not None:
+            self.verified_id = torch.cat(
+                [self.verified_id, spec_info.verified_id], axis=0
+            )
+
+        if self.topk_p is None:
             self.topk_p = spec_info.topk_p
+        elif spec_info.topk_p is not None:
+            self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
+
+        if self.topk_index is None:
             self.topk_index = spec_info.topk_index
-            return
-        if spec_info.hidden_states is None:
-            return
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
-        )
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
-        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        elif spec_info.topk_index is not None:
+            self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
 
 
 @dataclass

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.speculative.spectre.spectre_protocol import SpecType
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 # Copyright 2023-2024 SGLang Team
@@ -44,7 +45,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -764,6 +765,25 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val: Optional[List[float]] = None
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
+        # for Spectre speculative decoding
+        self.draft_tokens: Optional[Dict[str, List[int]]] = None
+        self.len_output_ids: Optional[int] = None
+        self.spec_cnt: Optional[int] = 0
+        self.spec_type: Optional[SpecType] = None
+        self.cur_drafts: Optional[List[int]] = []
+        self.target_send_time: Optional[float] = None
+        self.draft_recv_time: Optional[float] = None
+        self.draft_send_time: Optional[float] = None
+        self.target_recv_time: Optional[float] = None
+        self.draft_cnt: Optional[int] = 0
+        self.accept_cnt: Optional[int] = 0
+        self.promote_interval: int = 10
+        self.last_promote_time: float = 0.0
+        self.draft_tokens_target: int = 0
+        self.draft_generation_start_len: int = 0
+        self.draft_is_paused: bool = False
+        self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
+
         if return_logprob:
             # shape: (bs, 1)
             self.output_token_logprobs_val = []
@@ -935,6 +955,10 @@ class Req(ReqDllmMixin):
 
     def finished(self) -> bool:
         # Whether request reached finished condition
+        if self.spec_type in {SpecType.DRAFT_REQUEST, SpecType.DRAFT_REQUEST.value}:
+            if self.sampling_params.max_new_tokens == 0:
+                return self.finished_reason is not None
+            return False
         return self.finished_reason is not None
 
     def init_next_round_input(
@@ -1433,6 +1457,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    draft_num_tokens: Optional[int] = None
+    is_high_overhead: bool = False
+    recv_draft_fn: Optional[Callable] = None
+    retry_fn: Optional[Callable] = None
+    retry_fail_ratio: Optional[float] = None
+    retry_min_count: Optional[int] = None
 
     @classmethod
     def init_new(
@@ -2202,6 +2233,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
                 and self.reqs[i] not in chunked_req_to_exclude
+                and not getattr(self.reqs[i], "draft_is_paused", False)
             ]
 
         if keep_indices is None or len(keep_indices) == 0:

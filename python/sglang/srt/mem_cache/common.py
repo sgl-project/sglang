@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spectre.spectre_protocol import SpecType
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
 
@@ -347,10 +348,27 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate req slots
-    req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
-    )
+    # Allocate req slots.
+    reqs_need_alloc: list[Req] = []
+    req_pool_indices: list[int] = []
+    reqs_need_alloc_pos: list[int] = []
+    for i, req in enumerate(batch.reqs):
+        if (
+            req.req_pool_idx is not None
+            and getattr(req, "spec_type", None) == SpecType.DRAFT_REQUEST
+        ):
+            req_pool_indices.append(req.req_pool_idx)
+        else:
+            reqs_need_alloc.append(req)
+            req_pool_indices.append(None)
+            reqs_need_alloc_pos.append(i)
+
+    if reqs_need_alloc:
+        new_indices = alloc_req_slots(
+            batch.req_to_token_pool, reqs_need_alloc, batch.tree_cache
+        )
+        for pos, req_pool_idx in zip(reqs_need_alloc_pos, new_indices):
+            req_pool_indices[pos] = req_pool_idx
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
