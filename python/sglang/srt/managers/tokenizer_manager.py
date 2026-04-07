@@ -1002,7 +1002,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 bootstrap_room=obj.bootstrap_room,
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
-                embed_override_injection=obj.embed_override_injection,
+                positional_embed_overrides=obj.positional_embed_overrides,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
@@ -1019,13 +1019,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
-            embed_override_injection = obj.embed_override_injection
+            positional_embed_overrides = obj.positional_embed_overrides
             if (
-                embed_override_injection is None
+                positional_embed_overrides is None
                 and obj.embed_overrides is not None
                 and obj.embed_override_token_id is not None
             ):
-                embed_override_injection = self._resolve_embed_overrides(
+                positional_embed_overrides = self._resolve_embed_overrides(
                     input_ids, obj.embed_override_token_id, obj.embed_overrides
                 )
 
@@ -1035,7 +1035,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
-                embed_override_injection=embed_override_injection,
+                positional_embed_overrides=positional_embed_overrides,
                 rid=obj.rid,
                 priority=obj.priority,
                 dimensions=obj.dimensions,

@@ -572,7 +572,7 @@ class Req(ReqDllmMixin):
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_id: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
-        embed_override_injection: Optional[PositionalEmbeds] = None,
+        positional_embed_overrides: Optional[PositionalEmbeds] = None,
         token_type_ids: List[int] = None,
         session: Optional[Session] = None,
         custom_logit_processor: Optional[str] = None,
@@ -612,7 +612,7 @@ class Req(ReqDllmMixin):
         self.fill_ids = []
         self.session = session
         self.input_embeds = input_embeds
-        self.embed_override_injection = embed_override_injection
+        self.positional_embed_overrides = positional_embed_overrides
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -978,7 +978,7 @@ class Req(ReqDllmMixin):
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
-        if self.embed_override_injection is not None:
+        if self.positional_embed_overrides is not None:
             max_prefix_len = 0
             token_ids = []
 
@@ -1659,12 +1659,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]
                 )
 
-            if req.embed_override_injection is not None:
+            if req.positional_embed_overrides is not None:
                 # Override positions are absolute in the full sequence.
                 # Convert to extend-tensor coordinates by subtracting pre_len,
                 # then skip any that fall within the cached prefix.
                 embeds_to_add = []
-                for embed_idx, pos in enumerate(req.embed_override_injection.positions):
+                for embed_idx, pos in enumerate(req.positional_embed_overrides.positions):
                     extend_pos = pos - pre_len
                     if extend_pos < 0 or extend_pos >= req.extend_input_len:
                         continue  # Outside current extend chunk, skip
@@ -1673,7 +1673,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     has_replace_embeds = True
                     indices, positions = zip(*embeds_to_add)
                     all_replace_embeds.append(
-                        req.embed_override_injection.embeds[list(indices)]
+                        req.positional_embed_overrides.embeds[list(indices)]
                     )
                     all_replace_positions.extend(positions)
             input_id_pointer += input_id_lens[i]

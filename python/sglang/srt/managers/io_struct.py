@@ -141,7 +141,7 @@ class GenerateReqInput(BaseReq):
     # Embedding overrides to place at specific token positions.
     # - Single example: PositionalEmbeds
     # - Batch: List[Optional[PositionalEmbeds]]
-    embed_override_injection: Optional[
+    positional_embed_overrides: Optional[
         Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
     ] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -607,13 +607,13 @@ class GenerateReqInput(BaseReq):
             ):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
-    def _get_embed_override_injection_item(self, i: int) -> Optional[PositionalEmbeds]:
-        """Extract the i-th item from embed_override_injection."""
-        if self.embed_override_injection is None:
+    def _get_positional_embed_overrides_item(self, i: int) -> Optional[PositionalEmbeds]:
+        """Extract the i-th item from positional_embed_overrides."""
+        if self.positional_embed_overrides is None:
             return None
-        if isinstance(self.embed_override_injection, PositionalEmbeds):
-            return self.embed_override_injection
-        return self.embed_override_injection[i]
+        if isinstance(self.positional_embed_overrides, PositionalEmbeds):
+            return self.positional_embed_overrides
+        return self.positional_embed_overrides[i]
 
     def __getitem__(self, i):
         # Cache sub-objects so that repeated obj[i] calls return the same instance.
@@ -627,7 +627,7 @@ class GenerateReqInput(BaseReq):
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
-            embed_override_injection=self._get_embed_override_injection_item(i),
+            positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
@@ -723,7 +723,7 @@ class TokenizedGenerateReqInput(BaseReq):
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
     # Embedding overrides to place at specific token positions.
-    embed_override_injection: Optional[PositionalEmbeds] = None
+    positional_embed_overrides: Optional[PositionalEmbeds] = None
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
@@ -817,7 +817,7 @@ class EmbeddingReqInput(BaseReq):
     # Shape: [num_inputs][num_replacements] where each entry is a torch.Tensor of [hidden_size].
     embed_overrides: Optional[List[List[torch.Tensor]]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
-    embed_override_injection: Optional[
+    positional_embed_overrides: Optional[
         Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
     ] = None
     # Dummy sampling params for compatibility
@@ -925,13 +925,13 @@ class EmbeddingReqInput(BaseReq):
             or has_valid_data(self.audio_data)
         )
 
-    def _get_embed_override_injection_item(self, i: int) -> Optional[PositionalEmbeds]:
-        """Extract the i-th item from embed_override_injection."""
-        if self.embed_override_injection is None:
+    def _get_positional_embed_overrides_item(self, i: int) -> Optional[PositionalEmbeds]:
+        """Extract the i-th item from positional_embed_overrides."""
+        if self.positional_embed_overrides is None:
             return None
-        if isinstance(self.embed_override_injection, PositionalEmbeds):
-            return self.embed_override_injection
-        return self.embed_override_injection[i]
+        if isinstance(self.positional_embed_overrides, PositionalEmbeds):
+            return self.positional_embed_overrides
+        return self.positional_embed_overrides[i]
 
     def __getitem__(self, i):
         # Cache sub-objects so that repeated obj[i] calls return the same instance.
@@ -942,7 +942,7 @@ class EmbeddingReqInput(BaseReq):
         if self.is_cross_encoder_request:
             sub = EmbeddingReqInput(
                 text=[self.text[i]] if self.text is not None else None,
-                embed_override_injection=self._get_embed_override_injection_item(i),
+                positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -960,7 +960,7 @@ class EmbeddingReqInput(BaseReq):
                     if self.embed_overrides is not None
                     else None
                 ),
-                embed_override_injection=self._get_embed_override_injection_item(i),
+                positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 image_data=self.image_data[i] if self.image_data is not None else None,
                 audio_data=self.audio_data[i] if self.audio_data is not None else None,
                 video_data=self.video_data[i] if self.video_data is not None else None,
@@ -990,7 +990,7 @@ class TokenizedEmbeddingReqInput(BaseReq):
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
     # Embedding overrides to place at specific token positions.
-    embed_override_injection: Optional[PositionalEmbeds] = None
+    positional_embed_overrides: Optional[PositionalEmbeds] = None
     # For DP routing
     routed_dp_rank: Optional[int] = None
     # Priority for the request

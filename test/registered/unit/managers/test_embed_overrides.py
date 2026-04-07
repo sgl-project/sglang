@@ -4,7 +4,7 @@ Covers:
 - PositionalEmbeds dataclass (embed_types.py)
 - convert_embeds_to_tensors (utils.py)
 - TokenizerManager._resolve_embed_overrides (tokenizer_manager.py)
-- embed_override_injection on GenerateReqInput/EmbeddingReqInput (io_struct.py)
+- positional_embed_overrides on GenerateReqInput/EmbeddingReqInput (io_struct.py)
 - Score mixin override resolution (tokenizer_manager_score_mixin.py)
 """
 
@@ -135,7 +135,7 @@ class TestResolveEmbedOverrides(CustomTestCase):
 
 
 # ========================================================================
-# io_struct: embed_override_injection on GenerateReqInput
+# io_struct: positional_embed_overrides on GenerateReqInput
 # ========================================================================
 
 
@@ -146,11 +146,11 @@ class TestGenerateReqInputEmbedOverride(CustomTestCase):
         req = GenerateReqInput(
             input_ids=[[1, 2], [3, 4]],
             sampling_params=[{}, {}],
-            embed_override_injection=pe,
+            positional_embed_overrides=pe,
         )
         req.normalize_batch_and_arguments()
         item = req[0]
-        self.assertIs(item.embed_override_injection, pe)
+        self.assertIs(item.positional_embed_overrides, pe)
 
     def test_batch_override_in_getitem(self):
         """List[Optional[PositionalEmbeds]] is indexed per-item."""
@@ -159,11 +159,11 @@ class TestGenerateReqInputEmbedOverride(CustomTestCase):
         req = GenerateReqInput(
             input_ids=[[1, 2], [3, 4]],
             sampling_params=[{}, {}],
-            embed_override_injection=[pe0, pe1],
+            positional_embed_overrides=[pe0, pe1],
         )
         req.normalize_batch_and_arguments()
-        self.assertEqual(req[0].embed_override_injection, pe0)
-        self.assertIsNone(req[1].embed_override_injection)
+        self.assertEqual(req[0].positional_embed_overrides, pe0)
+        self.assertIsNone(req[1].positional_embed_overrides)
 
 
 # ========================================================================
@@ -173,7 +173,7 @@ class TestGenerateReqInputEmbedOverride(CustomTestCase):
 
 class TestEmbeddingReqInputEmbedOverride(CustomTestCase):
     def test_override_fields_in_getitem(self):
-        """embed_override_token_id, embed_overrides, and embed_override_injection
+        """embed_override_token_id, embed_overrides, and positional_embed_overrides
         are correctly sliced in __getitem__."""
         pe0 = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
         pe1 = PositionalEmbeds(embeds=[_vec(2)], positions=[1])
@@ -182,15 +182,15 @@ class TestEmbeddingReqInputEmbedOverride(CustomTestCase):
             sampling_params=[{}, {}],
             embed_override_token_id=50,
             embed_overrides=[[_vec(1)], [_vec(2)]],
-            embed_override_injection=[pe0, pe1],
+            positional_embed_overrides=[pe0, pe1],
         )
         req.normalize_batch_and_arguments()
         item0 = req[0]
         item1 = req[1]
         self.assertEqual(item0.embed_override_token_id, 50)
         self.assertEqual(len(item0.embed_overrides), 1)
-        self.assertEqual(item0.embed_override_injection, pe0)
-        self.assertEqual(item1.embed_override_injection, pe1)
+        self.assertEqual(item0.positional_embed_overrides, pe0)
+        self.assertEqual(item1.positional_embed_overrides, pe1)
 
 
 # ========================================================================

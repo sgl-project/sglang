@@ -559,7 +559,7 @@ class TokenizerManagerScoreMixin:
 
         input_ids = None
         text_prompts = None
-        embed_override_injection = None
+        positional_embed_overrides = None
 
         use_text_prompts = isinstance(query, str) and not has_embeds
 
@@ -593,7 +593,7 @@ class TokenizerManagerScoreMixin:
         ):
             # Both query and items are token IDs — tokenize text inputs if needed for embed overrides
             query_ids, items_ids = query, items
-            _, input_ids, embed_override_injection = self._build_token_id_inputs(
+            _, input_ids, positional_embed_overrides = self._build_token_id_inputs(
                 query_ids,
                 items_ids,
                 item_first,
@@ -605,7 +605,7 @@ class TokenizerManagerScoreMixin:
         elif has_embeds:
             # Text inputs with embed overrides — need to tokenize first to resolve positions
             query_ids, items_ids = self._batch_tokenize_query_and_items(query, items)
-            _, input_ids, embed_override_injection = self._build_token_id_inputs(
+            _, input_ids, positional_embed_overrides = self._build_token_id_inputs(
                 query_ids,
                 items_ids,
                 item_first,
@@ -630,7 +630,7 @@ class TokenizerManagerScoreMixin:
                 logprob_start_len=0 if use_multi_item_scoring else -1,
                 stream=False,
                 sampling_params={"max_new_tokens": 0},
-                embed_override_injection=embed_override_injection,
+                positional_embed_overrides=positional_embed_overrides,
             )
         else:
             batch_request = EmbeddingReqInput(
