@@ -866,3 +866,66 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+
+class Gemma4RotaryEmbedding(RotaryEmbedding):
+    """Gemma4-specific RoPE with cross-mixing.
+
+    Instead of rotating the first `rotary_dim` dimensions contiguously,
+    splits the head into two halves and applies rotation across both.
+
+    For a head_dim of D and rotary_dim of R:
+    - Standard RoPE rotates: [0, R)
+    - Gemma4 RoPE rotates: [0, R/2) cross-mixed with [D/2, D/2 + R/2)
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        # Store angles before calling super().__init__
+        # rotary_dim is already scaled by partial_rotary_factor in get_rope
+        # For Gemma4: head_size=512, partial_rotary_factor=0.25 -> rotary_dim=128
+        self.rope_angles = rotary_dim // 2  # Number of rotation angles per half
+        self.nope_angles = (head_size // 2) - self.rope_angles  # Non-rotated per half
+
+        super().__init__(
+            head_size,
+            head_size,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+        )
+
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
+        """Compute frequencies only for the rotated dimensions.
+
+        Non-rotated dims are padded with 0.0 to produce identity rotation.
+        """
+        freq_exponents = (
+            torch.arange(0, 2 * self.rope_angles, 2, dtype=torch.float) / self.head_size
+        )
+        inv_freq = 1.0 / (base**freq_exponents)
+
+        # Zero-pad for non-rotated dims (identity rotation: cos=1, sin=0)
+        if self.nope_angles > 0:
+            inv_freq = torch.cat(
+                [
+                    inv_freq,
+                    torch.zeros(self.nope_angles, dtype=torch.float),
+                ]
+            )
+        return inv_freq
+
+    def extra_repr(self) -> str:
+        s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
+        s += f", rope_angles={self.rope_angles}, nope_angles={self.nope_angles}"
+        s += f", max_position_embeddings={self.max_position_embeddings}"
+        s += f", base={self.base}, is_neox_style={self.is_neox_style}"
+        return s

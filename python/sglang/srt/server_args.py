@@ -1878,6 +1878,10 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch == "Gemma4ForConditionalGeneration":
+            if self.is_attention_backend_not_set():
+                self.attention_backend = "triton"
+                logger.info("Use triton as default attention backend for Gemma4")
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
                 logger.warning(
