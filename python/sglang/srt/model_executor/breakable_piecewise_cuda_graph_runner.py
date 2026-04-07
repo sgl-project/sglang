@@ -28,16 +28,13 @@ from typing import TYPE_CHECKING, Union
 import torch
 import tqdm
 
-from sglang.srt.compilation.piecewise_context_manager import (
-    set_forward_context,
-)
+from sglang.srt.compilation.piecewise_context_manager import set_forward_context
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -52,15 +49,19 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     set_global_graph_memory_pool,
 )
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
-    PrefillInputBuffers,
+    PiecewiseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 # Bridge buffers for reducing graph-owned persistent memory at break points.
 # Pre-allocated OUTSIDE graph capture so they're not graph-owned.
@@ -97,15 +98,7 @@ class BridgeBuffers:
         self.output = torch.empty((max_tokens, out_dim), dtype=dtype, device=device)
 
 
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
-
-logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
-
-
-class BreakablePiecewiseCudaGraphRunner:
+class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
     """Piecewise CUDA graph runner using breakable CUDA graph.
 
     Captures the model forward as a breakable CUDA graph with graph breaks
@@ -113,15 +106,14 @@ class BreakablePiecewiseCudaGraphRunner:
     """
 
     def __init__(self, model_runner: ModelRunner):
+        # Skip parent __init__ (which does torch.compile) — set up shared state directly
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
+        self.graphs = {}
+        self.output_buffers = {}
 
-        self.attention_layers = model_runner.attention_layers
-        self.moe_layers = model_runner.moe_layers
-        self.moe_fusions = model_runner.moe_fusions
         self.quant_config = getattr(model_runner.model, "quant_config", None)
-
         self.is_multimodal = model_runner.is_multimodal
 
         # Capture sizes
@@ -138,7 +130,58 @@ class BreakablePiecewiseCudaGraphRunner:
             f"[Breakable PCG] Capture num tokens: {self.capture_num_tokens}",
         )
 
-        # Pre-allocate static input buffers
+        # Reuse parent's buffer setup
+        self._init_buffers(model_runner)
+
+        self.attention_layers = model_runner.attention_layers
+        self.moe_layers = model_runner.moe_layers
+        self.moe_fusions = model_runner.moe_fusions
+
+        # Bridge buffers — one set, reused across all layers and token sizes.
+        attn_layer_0 = self.attention_layers[0]
+        set_bridge_buffers(
+            BridgeBuffers(
+                self.max_num_tokens, attn_layer_0, self.device, model_runner.dtype
+            )
+        )
+
+        # Static buffers for forward_batch GPU tensors read inside graph segments
+        # (especially by the logits processor in the last segment).
+        # These MUST persist so the graph reads from stable addresses.
+        with torch.device(self.device):
+            self.static_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.static_extend_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.static_extend_prefix_lens = torch.zeros(
+                (self.max_bs,), dtype=torch.int64
+            )
+            self.static_extend_start_loc = torch.zeros(
+                (self.max_bs,), dtype=torch.int64
+            )
+            self.static_req_pool_indices = torch.zeros(
+                (self.max_bs,), dtype=torch.int64
+            )
+            self.static_orig_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
+
+        # Memory pool
+        if get_global_graph_memory_pool() is None:
+            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+        set_graph_pool_id(get_global_graph_memory_pool())
+
+        # Warmup then capture
+        self._warmup()
+        self.device_module.synchronize()
+        self.model_runner.tp_group.barrier()
+        self._capture_all()
+
+        self.raw_num_tokens = 0
+
+    def _init_buffers(self, model_runner):
+        """Initialize input buffers (shared logic with parent)."""
+        from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+            PrefillInputBuffers,
+        )
+        from sglang.srt.utils import is_npu
+
         with torch.device(self.device):
             input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             out_cache_loc = torch.zeros(
@@ -151,7 +194,6 @@ class BreakablePiecewiseCudaGraphRunner:
                 else None
             )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-
             if self.is_multimodal:
                 input_embeds = torch.zeros(
                     (self.max_num_tokens, model_runner.model_config.hidden_size),
@@ -177,58 +219,37 @@ class BreakablePiecewiseCudaGraphRunner:
         )
         self.buffers.share_buffers()
 
-        # Bridge buffers — one set, reused across all layers and token sizes.
-        # Allocated before capture so they're NOT graph-owned.
-        attn_layer_0 = self.attention_layers[0]
-        set_bridge_buffers(
-            BridgeBuffers(
-                self.max_num_tokens, attn_layer_0, self.device, model_runner.dtype
+    def _run_forward(self, forward_batch, num_tokens):
+        """Run model forward with proper context."""
+        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
+        set_is_extend_in_batch(False)
+
+        with set_forward_context(
+            forward_batch,
+            self.attention_layers,
+            self.quant_config,
+            self.moe_layers,
+            self.moe_fusions,
+        ):
+            output = self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
             )
+        return output
+
+    def _build_capture_forward_batch(self, num_tokens):
+        """Build a ForwardBatch for capture using static buffers for stable addresses."""
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
         )
 
-        # Static buffers for forward_batch tensors read inside graph segments
-        # (especially by the logits processor in the last segment).
-        # These MUST persist so the graph reads from stable addresses.
-        with torch.device(self.device):
-            self.static_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
-            self.static_extend_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
-            self.static_extend_prefix_lens = torch.zeros(
-                (self.max_bs,), dtype=torch.int64
-            )
-            self.static_extend_start_loc = torch.zeros(
-                (self.max_bs,), dtype=torch.int64
-            )
-            self.static_req_pool_indices = torch.zeros(
-                (self.max_bs,), dtype=torch.int64
-            )
-            self.static_orig_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
-
-        # Graph storage
-        self.graphs = {}
-        self.output_buffers = {}
-
-        # Memory pool
-        if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-        set_graph_pool_id(get_global_graph_memory_pool())
-
-        # Warmup then capture
-        self._warmup()
-        self.device_module.synchronize()
-        self.model_runner.tp_group.barrier()
-        self._capture_all()
-
-        self.raw_num_tokens = 0
-
-    def _build_forward_batch(self, num_tokens: int) -> ForwardBatch:
-        """Build a ForwardBatch for capture/warmup.
-
-        Uses static buffers for GPU tensors that may be read inside graph
-        segments (e.g., by the logits processor) so addresses are stable.
-        """
         buffers = self.buffers
         bs = 1
-        # Set values in static buffers (persistent addresses for graph capture)
         self.static_seq_lens[:bs].fill_(num_tokens)
         self.static_extend_seq_lens[:bs].fill_(num_tokens)
         self.static_extend_prefix_lens[:bs].zero_()
@@ -286,30 +307,10 @@ class BreakablePiecewiseCudaGraphRunner:
             lora_ids=None,
         )
 
-    def _run_forward(self, forward_batch: ForwardBatch, num_tokens: int):
-        """Run model forward with proper context."""
-        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
-        set_is_extend_in_batch(False)
-
-        with set_forward_context(
-            forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
-        ):
-            output = self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
-        return output
-
     def _warmup(self):
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
-        forward_batch = self._build_forward_batch(num_tokens)
+        forward_batch = self._build_capture_forward_batch(num_tokens)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         self._run_forward(forward_batch, num_tokens)
 
@@ -321,7 +322,6 @@ class BreakablePiecewiseCudaGraphRunner:
             stream = graph_capture_context.stream
             pool = get_global_graph_memory_pool()
 
-            # Capture largest first for better memory sharing
             capture_range = (
                 tqdm.tqdm(list(reversed(self.capture_num_tokens)))
                 if get_tensor_model_parallel_rank() == 0
@@ -351,39 +351,24 @@ class BreakablePiecewiseCudaGraphRunner:
                     f"mem_total={mem_after:.3f} GB"
                 )
 
-    def _capture_one(self, num_tokens: int, pool, stream):
+    def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
-        forward_batch = self._build_forward_batch(num_tokens)
+        forward_batch = self._build_capture_forward_batch(num_tokens)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
             return self._run_forward(forward_batch, num_tokens)
 
-        # Warmup runs (2x to stabilize)
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
 
-        # Capture
         graph = BreakableCUDAGraph()
         with BreakableCUDAGraphContext(cuda_graph=graph, pool=pool, stream=stream):
             output = run_once()
 
         return graph, output
-
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
-        if forward_batch.input_embeds is not None:
-            return False
-        num_tokens = len(forward_batch.input_ids)
-        if forward_batch.return_logprob:
-            for start_len, seq_len in zip(
-                forward_batch.extend_logprob_start_lens_cpu,
-                forward_batch.extend_seq_lens_cpu,
-            ):
-                if start_len is not None and start_len < seq_len:
-                    return False
-        return num_tokens <= self.max_num_tokens
 
     def replay(
         self,
@@ -394,111 +379,12 @@ class BreakablePiecewiseCudaGraphRunner:
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
 
-        self.raw_num_tokens = num_tokens
-
-        # Prepare static buffers
-        buffers = self.buffers
-        if static_num_tokens != num_tokens:
-            buffers.out_cache_loc.zero_()
-            if buffers.out_cache_loc_swa is not None:
-                buffers.out_cache_loc_swa.zero_()
-            buffers.input_ids[num_tokens:static_num_tokens].zero_()
-            buffers.positions[num_tokens:static_num_tokens].zero_()
-            if forward_batch.mrope_positions is not None:
-                buffers.mrope_positions[:, num_tokens:static_num_tokens].zero_()
-
-        buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        buffers.positions[:num_tokens].copy_(forward_batch.positions)
-        buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        if buffers.out_cache_loc_swa is not None:
-            buffers.out_cache_loc_swa[:num_tokens].copy_(
-                self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
-            )
-        if forward_batch.mrope_positions is not None:
-            buffers.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
-
-        # Build static forward batch for context
+        # Reuse parent's buffer preparation and static forward batch construction
+        static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
         bs = forward_batch.batch_size
-        pcg_forward_mode = (
-            ForwardMode.EXTEND
-            if forward_batch.forward_mode == ForwardMode.MIXED
-            else forward_batch.forward_mode
-        )
-        pcg_global_forward_mode = (
-            ForwardMode.EXTEND
-            if forward_batch.global_forward_mode == ForwardMode.MIXED
-            else forward_batch.global_forward_mode
-        )
-
-        static_forward_batch = ForwardBatch(
-            forward_mode=pcg_forward_mode,
-            batch_size=bs,
-            input_ids=buffers.input_ids[:static_num_tokens],
-            input_embeds=(
-                buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
-            ),
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            next_token_logits_buffer=None,
-            orig_seq_lens=forward_batch.orig_seq_lens,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
-            out_cache_loc=buffers.out_cache_loc[:static_num_tokens],
-            out_cache_loc_swa=(
-                buffers.out_cache_loc_swa[:static_num_tokens]
-                if buffers.out_cache_loc_swa is not None
-                else None
-            ),
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            mamba_track_indices=None,
-            mamba_track_mask=None,
-            mamba_track_seqlens=None,
-            encoder_lens=forward_batch.encoder_lens,
-            return_logprob=False,
-            extend_seq_lens=forward_batch.extend_seq_lens,
-            extend_prefix_lens=forward_batch.extend_prefix_lens,
-            extend_start_loc=forward_batch.extend_start_loc,
-            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
-            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
-            extend_num_tokens=forward_batch.extend_num_tokens,
-            extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
-            positions=buffers.positions[:static_num_tokens],
-            global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=forward_batch.dp_padding_mode,
-            global_dp_buffer_len=forward_batch.global_dp_buffer_len,
-            mrope_positions=(
-                buffers.mrope_positions[:, :static_num_tokens]
-                if forward_batch.mrope_positions is not None
-                else None
-            ),
-            spec_algorithm=forward_batch.spec_algorithm,
-            spec_info=forward_batch.spec_info,
-            capture_hidden_mode=forward_batch.capture_hidden_mode,
-            num_token_non_padded=forward_batch.num_token_non_padded,
-            global_forward_mode=pcg_global_forward_mode,
-            lora_ids=forward_batch.lora_ids,
-            sampling_info=forward_batch.sampling_info,
-            mm_inputs=forward_batch.mm_inputs,
-            temp_scaled_logprobs=forward_batch.temp_scaled_logprobs,
-            temperature=forward_batch.temperature,
-            top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
-            top_p=forward_batch.top_p,
-            dimensions=forward_batch.dimensions,
-        )
-
-        if buffers.out_cache_loc_swa is not None:
-            self.model_runner.token_to_kv_pool.set_swa_loc(
-                buffers.out_cache_loc_swa[:static_num_tokens]
-            )
 
         # Update static buffers used by graph segments (esp. logits processor).
-        # The graph reads from these addresses — they must have the serving-time values.
+        # The graph reads from these addresses — they must have serving-time values.
         self.static_seq_lens[:bs].copy_(forward_batch.seq_lens)
         self.static_extend_seq_lens[:bs].copy_(forward_batch.extend_seq_lens)
         self.static_extend_prefix_lens[:bs].copy_(forward_batch.extend_prefix_lens)
