@@ -110,6 +110,7 @@ if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
 else
   docker exec ci_sglang pip uninstall sgl-kernel -y || true
+  docker exec ci_sglang pip uninstall sglang-kernel -y || true
   docker exec ci_sglang pip uninstall sglang -y || true
   # Clear Python cache to ensure latest code is used
   docker exec ci_sglang find /opt/venv -name "*.pyc" -delete || true
@@ -199,15 +200,15 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 if [[ "${GPU_ARCH}" == "mi35x" ]]; then
     echo "[CI-AITER-CHECK] Using gfx950 block from Dockerfile..."
     REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_950 AS gfx950' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
+                        | grep 'AITER_COMMIT_DEFAULT=' \
                         | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
 else
     echo "[CI-AITER-CHECK] Using gfx942 block from Dockerfile..."
     REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
+                        | grep 'AITER_COMMIT_DEFAULT=' \
                         | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
+                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
 fi
 
 
