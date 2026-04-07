@@ -860,7 +860,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        if is_mla_preprocess_enabled():
+        if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO and MLAPROLOG do save kv_cache
             save_kv_cache = False
         if self.is_dllm_model:
@@ -1773,7 +1773,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        if is_mla_preprocess_enabled():
+        if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO does saving kv_cache
             save_kv_cache = False
         if topk_indices is not None:
