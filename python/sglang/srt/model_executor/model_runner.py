@@ -42,6 +42,7 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     Lfm2Config,
     Lfm2MoeConfig,
+    Lfm2VlConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3_5Config,
@@ -49,6 +50,7 @@ from sglang.srt.configs import (
     Qwen3NextConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
@@ -593,6 +595,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
+            if not server_args.disable_cuda_graph:
+                # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
+                # intermediate buffers before init_memory_pool() so memory
+                # profiling accounts for them.  Phase 2 (dense LoRA batch
+                # metadata) is handled in CudaGraphRunner.__init__() via
+                # lora_manager.init_cuda_graph_batch_info().
+                self._init_lora_cuda_graph_moe_buffers()
 
         # Init Double Sparsity
         if server_args.enable_double_sparsity:
@@ -1734,6 +1743,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             lora_paths=self.server_args.lora_paths,
         )
 
+    def _init_lora_cuda_graph_moe_buffers(self):
+        """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
+
+        Must be called before init_memory_pool() so that profile_max_num_token()
+        sees the reduced available memory and sizes KV cache correctly.
+        All MoE LoRA layers share one set of buffers (managed by the
+        lora_backend) since they execute sequentially during forward.
+
+        Phase 2 (dense LoRA batch metadata) is handled later in
+        CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
+        because it needs capture-time parameters (max_bs, num_tokens_per_bs)
+        that are only available at that stage.
+        """
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        max_bs = self.server_args.cuda_graph_max_bs
+        max_loras = self.server_args.max_loras_per_batch
+        for module in self.model.modules():
+            if isinstance(module, FusedMoEWithLoRA):
+                self.lora_manager.init_cuda_graph_moe_buffers(
+                    max_bs, max_loras, self.dtype, module
+                )
+                logger.info(
+                    f"Pre-allocated shared MoE LoRA CUDA graph buffers "
+                    f"(max_bs={max_bs}, max_loras={max_loras})"
+                )
+                break
+
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
 
@@ -1816,7 +1853,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if pattern is not None and "M" not in pattern:
                 return None
         if isinstance(
-            config, FalconH1Config | NemotronHConfig | Lfm2Config | Lfm2MoeConfig
+            config,
+            FalconH1Config
+            | NemotronHConfig
+            | Lfm2Config
+            | Lfm2MoeConfig
+            | Lfm2VlConfig,
         ):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
@@ -1849,14 +1891,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return config
         return None
 
+    def _get_linear_attn_registry_result(self):
+        if not hasattr(self, "_linear_attn_registry_cache"):
+            self._linear_attn_registry_cache = get_linear_attn_config(
+                self.model_config.hf_config
+            )
+        return self._linear_attn_registry_cache
+
+    @property
+    def linear_attn_model_spec(self):
+        result = self._get_linear_attn_registry_result()
+        return result[0] if result else None
+
     @property
     def mambaish_config(self):
-        return (
+        existing = (
             self.mamba2_config
             or self.hybrid_gdn_config
             or self.kimi_linear_config
             or self.hybrid_lightning_config
         )
+        if existing:
+            return existing
+        result = self._get_linear_attn_registry_result()
+        return result[1] if result else None
 
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
@@ -2030,6 +2088,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if backend_str not in [
             "flashinfer_trtllm",
+            # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
+            # "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
@@ -2100,6 +2160,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.enable_torch_compile:
             set_torch_compile_config()
+            should_disable_torch_compile = not getattr(
+                self.model, "_can_torch_compile", True
+            )
+            if should_disable_torch_compile:
+                log_info_on_rank0(
+                    logger,
+                    "Transformers backend model reports it is not torch.compile "
+                    "compatible (e.g. dynamic rope scaling). Disabling torch.compile.",
+                )
+                self.server_args.enable_torch_compile = False
 
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture()

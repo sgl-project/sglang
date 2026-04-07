@@ -506,6 +506,15 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     dim=-1,
                 )
                 ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                # Chain-style: use this step's output hidden_states as next step's input
+                if (
+                    self.chain_mtp_hidden_states
+                    and step < self.speculative_num_steps - 1
+                    and draft_logits_output.logits_output.hidden_states is not None
+                ):
+                    forward_batch.spec_info.hidden_states = (
+                        draft_logits_output.logits_output.hidden_states
+                    )
                 if forward_batch.extend_seq_lens is not None:
                     rotate_input_ids_triton(
                         forward_batch.input_ids,

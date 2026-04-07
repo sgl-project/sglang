@@ -25,6 +25,7 @@ on:
           - 'nightly-test-multimodal-server-2-gpu'
           - 'nightly-test-perf-4-gpu-b200'
           - 'nightly-test-perf-8-gpu-b200'
+          - 'nightly-test-specialized-8-gpu-b200'
           - 'nightly-test-kernel-1-gpu-h100'
           - 'nightly-test-diffusion-comparison'
           - 'nightly-test-kernel-8-gpu-h200'
@@ -510,7 +511,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GPU_CONFIG: "1-gpu-h100"
 
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
@@ -568,7 +569,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GPU_CONFIG: "2-gpu-h100"
 
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
@@ -626,7 +627,7 @@ jobs:
 
   # Specialized B200 tests - 8 GPU, for specific backends and configs
   nightly-test-specialized-8-gpu-b200:
-    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-8-gpu-b200')
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-8-gpu-b200' || inputs.job_filter == 'nightly-test-specialized-8-gpu-b200')
     runs-on: 8-gpu-b200
     env:
       RUNNER_LABELS: 8-gpu-b200
@@ -682,6 +683,7 @@ jobs:
         if: always()
         env:
           GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/ci/utils/diffusion/generate_diffusion_dashboard.py \
             --results comparison-results.json \
