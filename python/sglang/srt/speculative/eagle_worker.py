@@ -696,7 +696,9 @@ class EAGLEWorker(TpModelWorker):
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            maybe_detect_nan(probs, f"draft_forward step {i}: NaN in probs after softmax")
+            maybe_detect_nan(
+                probs, f"draft_forward step {i}: NaN in probs after softmax"
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_nan(
                 topk_p, f"draft_forward step {i}: NaN in topk_p after fast_topk"
