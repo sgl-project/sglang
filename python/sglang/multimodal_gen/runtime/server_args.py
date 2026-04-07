@@ -780,9 +780,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.quantization,
             help=(
-                "Quantization method for online quantization. "
+                "Quantization method for the transformer. If omitted, the method is "
+                "auto-detected from the checkpoint config or safetensors metadata when "
+                "possible. Applies to both pre-quantized checkpoints and online "
+                "quantization. Use this flag to override auto-detection. "
                 "Options: 'fp8', 'mxfp4'. "
-                "Apply online weight and activation quantization to unquantized models. "
+                "Nunchaku SVDQuant is configured separately via --enable-svdquant and "
+                "related flags. "
                 "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
             ),
         )

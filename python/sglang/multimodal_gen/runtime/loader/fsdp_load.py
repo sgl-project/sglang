@@ -458,8 +458,8 @@ def load_model_from_full_model_state_dict(
         "gate_compress",
         "wcscales",
         "wtscale",
-        "input_scale",  # quantization scales
-        "weight_scale",  # quantization scales
+        "input_scale",
+        "weight_scale",
         "bias",
         "norm_q",
         "norm_k",
@@ -490,7 +490,14 @@ def load_model_from_full_model_state_dict(
 
         if missing_param_init == "ones" or any(
             p in new_param_name
-            for p in ("wcscales", "wtscale", "input_scale", "norm_q", "norm_k")
+            for p in (
+                "wcscales",
+                "wtscale",
+                "input_scale",
+                "weight_scale",
+                "norm_q",
+                "norm_k",
+            )
         ):
             init_like = torch.ones_like
         elif missing_param_init == "zeros" or missing_param_init is None:

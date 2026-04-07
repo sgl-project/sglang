@@ -10,8 +10,9 @@ Use these paths:
 - `--model-path`: the base or original model
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
 - `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
+- `--quantization {fp8,mxfp4}`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
 
-Recommended example:
+Recommended example for pre-quantized checkpoints:
 
 ```bash
 sglang generate \
@@ -42,10 +43,39 @@ backend.
 
 | quant_family     | checkpoint form                                                                            | canonical CLI                                        | supported models                                             | extra dependency                      | platform / notes                                                                                                      |
 |------------------|--------------------------------------------------------------------------------------------|------------------------------------------------------|--------------------------------------------------------------|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------|
-| `fp8`            | Quantized transformer component folder, or safetensors with `quantization_config` metadata | `--transformer-path` or `--transformer-weights-path` | ALL                                                          | None                                  | Component-folder and single-file flows are both supported                                                             |
+| `fp8` / `mxfp4`  | Unquantized checkpoint (online quantization only, offline via AMD Quark coming soon) | `--quantization {fp8,mxfp4}` | Z-Image-Turbo (validated), others likely work. More support coming soon. | MXFP4: `aiter` on ROCm | MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to `fp8` / `mxfp4` dynamically. |
 | `nvfp4-modelopt` | NVFP4 safetensors file, sharded directory, or repo providing transformer weights           | `--transformer-weights-path`                         | FLUX.2                                                       | `comfy-kitchen` optional on Blackwell | Blackwell can use a best-performance kit when available; otherwise SGLang falls back to the generic ModelOpt FP4 path |
 | `nunchaku-svdq`  | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`   | `--transformer-weights-path`                         | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                            |
 | `msmodelslim`    | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                       | Wan2.2 family                                                | None                                  | Currently only compatible with the Ascend NPU family and supports both `w8a8` and `w4a4`                              |
+
+## Online Quantization
+
+Online quantization applies quantization to unquantized models at load time. This is useful for when pre-quantized checkpoints are not available.
+
+### FP8 Online Quantization
+
+Apply FP8 quantization to any unquantized model:
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization fp8 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+### MXFP4 Online Quantization
+
+MXFP4 provides aggressive 4-bit compression with online quantization. **Note: Requires ROCm and MI350+ (gfx95x) GPU.**
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --quantization mxfp4 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+**Note:** Requires `aiter` package with MXFP4 kernel support
 
 ## NVFP4
 

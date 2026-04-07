@@ -15,6 +15,7 @@ from typing import Callable, Optional
 import torch
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.quantization import get_quantization_config
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -265,8 +266,12 @@ def _resolve_quant_config(
 ) -> Optional[QuantizationConfig]:
     """
     resolve quant config from checkpoints' metadata
-    priority: model config.json -> safetensors metadata -> format-specific fallback
+    priority: CLI flag -> model config.json -> safetensors metadata -> format-specific fallback
     """
+    if server_args.quantization:
+        quant_config_cls = get_quantization_config(server_args.quantization)
+        return quant_config_cls()
+
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:
         for safetensors_file in safetensors_list:

@@ -96,6 +96,7 @@ For quantized transformer checkpoints, prefer:
 - `--model-path` for the base pipeline
 - `--transformer-path` for a quantized `transformers` transformer component folder
 - `--transformer-weights-path` for a quantized safetensors file, directory, or repo
+- `--quantization {fp8,mxfp4}` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
 
 See [Quantization](../quantization.md) for supported quantization families and examples.
 
