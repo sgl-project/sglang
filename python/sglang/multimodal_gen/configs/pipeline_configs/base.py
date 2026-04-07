@@ -308,7 +308,7 @@ class PipelineConfig:
     # tokenize the prompt
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
-    
+
     def is_flux_v1(self) -> bool:
         """True if this pipeline is FLUX v1 (dual CLIP + T5 text encoders).
 
