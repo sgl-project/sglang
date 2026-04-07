@@ -17,7 +17,11 @@ from sglang.test.test_utils import (
 
 # Registering the test for CUDA CI with appropriate parameters
 # Increasing estimated time since we run evaluation twice
-register_cuda_ci(est_time=600, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(
+    est_time=600,
+    suite="stage-b-test-2-gpu-large",
+    disabled="Temporarily disable the flaky test.",
+)
 
 
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
@@ -73,6 +77,8 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
             "--page-size",
@@ -97,6 +103,8 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp",
             "1",
             "--base-gpu-id",

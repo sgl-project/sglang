@@ -407,6 +407,9 @@ class TpModelWorker(BaseTpWorker):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
+    def register_hisparse_coordinator(self, coordinator):
+        self.model_runner.hisparse_coordinator = coordinator
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
@@ -436,12 +439,6 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
-        )
-
-    def get_remote_instance_transfer_engine_info(self):
-        return (
-            self.model_runner.remote_instance_transfer_engine_session_id,
-            self.model_runner.remote_instance_transfer_engine_weight_info,
         )
 
     def forward_batch_generation(

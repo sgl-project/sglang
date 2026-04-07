@@ -118,8 +118,6 @@ def quantize_weights(
 
 
 def torch_moe(a, w1, w2, score, topk):
-    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -159,6 +157,7 @@ def test_fused_moe_wn16(
     has_zp: bool,
     weight_bits: int,
 ):
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
     print(m, n, k, e, topk, dtype, group_size, has_zp, weight_bits)
     a = torch.randn((m, k), device=get_device(), dtype=dtype) / 10
     w1 = torch.randn((e, 2 * n, k), device=get_device(), dtype=dtype) / 10

@@ -10,6 +10,7 @@ from transformers import activations
 
 from sglang.srt.configs.kimi_k25 import KimiK25Config, KimiK25VisionConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -401,7 +402,7 @@ class MoonVision3dPatchEmbed(nn.Module):
         ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
         self.patch_size = patch_size
 
-        self.proj = nn.Conv2d(
+        self.proj = Conv2dLayer(
             in_dim, out_dim, kernel_size=patch_size, stride=patch_size
         )
 
@@ -715,6 +716,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
             ),
         )
 
+        self.model = self.language_model.model
+
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
         if hasattr(self.language_model, "dtype"):
@@ -763,6 +766,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
     @property
     def end_layer(self) -> int:
         return self.language_model.end_layer
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.language_model._routed_experts_weights_of_layer.value
 
     def forward(
         self,
