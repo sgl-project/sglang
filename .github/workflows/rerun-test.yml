@@ -84,11 +84,31 @@ jobs:
             source /etc/profile.d/sglang-ci.sh
           fi
           cd test/
-          echo "${{ inputs.test_command }}" | while IFS= read -r cmd; do
+          # Collect non-empty commands into an array for counting.
+          cmds=()
+          while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
-            echo ">>> Running: python3 $cmd"
-            python3 $cmd || exit 1
+            cmds+=("$cmd")
+          done <<< "${{ inputs.test_command }}"
+          total=${#cmds[@]}
+          suite_start=$SECONDS
+          for idx in "${!cmds[@]}"; do
+            i=$((idx + 1))
+            cmd="${cmds[$idx]}"
+            echo ""
+            echo "."
+            echo "Begin ($i/$total): python3 $cmd"
+            echo "."
+            file_start=$SECONDS
+            python3 $cmd -f || exit 1
+            elapsed=$(( SECONDS - file_start ))
+            echo "."
+            echo "End ($i/$total): elapsed=${elapsed}s"
+            echo "."
+            echo ""
           done
+          total_elapsed=$(( SECONDS - suite_start ))
+          echo "All $total test(s) passed in ${total_elapsed}s"
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
@@ -129,8 +149,28 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test/
-          echo "${{ inputs.test_command }}" | while IFS= read -r cmd; do
+          # Collect non-empty commands into an array for counting.
+          cmds=()
+          while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
-            echo ">>> Running: python3 $cmd"
-            python3 $cmd || exit 1
+            cmds+=("$cmd")
+          done <<< "${{ inputs.test_command }}"
+          total=${#cmds[@]}
+          suite_start=$SECONDS
+          for idx in "${!cmds[@]}"; do
+            i=$((idx + 1))
+            cmd="${cmds[$idx]}"
+            echo ""
+            echo "."
+            echo "Begin ($i/$total): python3 $cmd"
+            echo "."
+            file_start=$SECONDS
+            python3 $cmd -f || exit 1
+            elapsed=$(( SECONDS - file_start ))
+            echo "."
+            echo "End ($i/$total): elapsed=${elapsed}s"
+            echo "."
+            echo ""
           done
+          total_elapsed=$(( SECONDS - suite_start ))
+          echo "All $total test(s) passed in ${total_elapsed}s"

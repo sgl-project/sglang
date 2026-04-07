@@ -518,8 +518,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         # Move kernel call outside context manager to avoid graph breaks
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
+
+        # The DeepSeekV3 routing method requires float32 router logits.
+        if routing_method_type == RoutingMethodType.DeepSeekV3:
+            router_logits = router_logits.to(torch.float32)
+        else:
+            router_logits = router_logits.to(torch.bfloat16)
+
         output = trtllm_fp8_per_tensor_scale_moe_wrapper(
-            routing_logits=router_logits.to(torch.bfloat16),
+            routing_logits=router_logits,
             routing_bias=routing_bias_cast,
             hidden_states=a_q,
             gemm1_weights=quant_info.w13_weight,

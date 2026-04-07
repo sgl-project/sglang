@@ -34,7 +34,7 @@ REPO = "sgl-project/sglang"
 GITHUB_API = "https://api.github.com"
 
 # Claude model to use
-CLAUDE_MODEL = "claude-sonnet-4-5-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # Path to the bisect skill definition (relative to repo root)
 BISECT_SKILL_PATH = ".claude/skills/sglang-bisect-ci-regression/SKILL.md"
@@ -274,7 +274,7 @@ def _find_last_running_test(logs: str) -> Optional[Dict]:
 
 
 def analyze_scheduled_failures(
-    token: str, min_streak: int = 2, max_failures: int = 10
+    token: str, min_streak: int = 1, max_failures: int = 10
 ) -> Tuple[List[FailureTarget], Dict[int, str]]:
     """
     Fetch Nvidia scheduled runs, analyze job/test failure streaks, return targets.
@@ -1072,7 +1072,7 @@ def run_bisection_analysis(
     github_token: str,
     api_key: str,
     max_failures: int = 10,
-    min_streak: int = 2,
+    min_streak: int = 1,
     output_file: Optional[str] = None,
     dry_run: bool = False,
 ) -> dict:
@@ -1255,8 +1255,8 @@ def main():
     parser.add_argument(
         "--min-streak",
         type=int,
-        default=2,
-        help="Minimum consecutive failure streak to trigger bisection (default: 2)",
+        default=1,
+        help="Minimum consecutive failure streak to trigger bisection (default: 1)",
     )
     parser.add_argument(
         "--dry-run",

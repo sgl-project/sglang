@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, List
 
 from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
 
@@ -51,6 +51,12 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
     decoder_layers_per_block: List[int] = field(default_factory=lambda: [5, 5, 5, 5])
     decoder_causal: bool = False
     decoder_spatial_padding_mode: str = "reflect"
+
+    # Native LTX variant metadata.
+    ltx_variant: str = "ltx_2"
+    condition_encoder_subdir: str = ""
+    video_decoder_variant: str = "ltx_2"
+    video_decoder_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
