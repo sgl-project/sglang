@@ -69,6 +69,9 @@ class Ngram {
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 
+  // Resets the online trie and match state but preserves external corpora
+  // (sams_). External corpora are user-managed via add/remove APIs and
+  // should not be affected by cache flushes.
   void reset() {
     std::unique_lock<std::mutex> lock(mutex_);
     if (trie_) {
