@@ -154,7 +154,7 @@ class NGRAMWorker:
         2. The precomputed path (path_cols stored in cache) must match the
            actual accepted path from verification (accept_index local nodes).
         """
-        if self._precomputed_cache is None:
+        if self._precomputed_cache is None or batch.has_grammar:
             return None
 
         bs = len(batch.reqs)
@@ -480,7 +480,8 @@ class NGRAMWorker:
         6. At next _prepare_for_speculative_decoding, check if predicted_bonus matches
            the actual bonus token from verification.
         """
-        if batch.forward_mode.is_extend():
+        if batch.forward_mode.is_extend() or batch.has_grammar:
+            # spec v2 currently doesn't support grammar, so directly return.
             self._precomputed_cache = None
             return
 
@@ -501,11 +502,8 @@ class NGRAMWorker:
         cur_draft_tokens_2d = cur_draft_tokens.reshape(bs, d)
         cur_tree_mask_3d = cur_tree_mask.reshape(bs, d, d)
 
-        self.ngram_corpus.synchronize()
-
         bonus_check_tokens = []
         path_metadata = []  # [(req_idx, node_j, path_cols_tuple), ...]
-
         stride = d
         for req_idx in range(bs):
             req = batch.reqs[req_idx]
@@ -533,19 +531,11 @@ class NGRAMWorker:
                 path_cols_tuple = tuple(sorted(path_cols.tolist()))
                 path_draft_tokens = req_draft[path_cols].tolist()
 
-                if not batch.has_grammar:
-                    check_token = self._efficient_concat_last_n(
-                        req.origin_input_ids,
-                        base_output + path_draft_tokens,
-                        self.max_trie_depth,
-                    )
-                else:
-                    check_token = self._efficient_concat_last_n(
-                        req.origin_input_ids,
-                        base_output,
-                        self.max_trie_depth,
-                    )
-
+                check_token = self._efficient_concat_last_n(
+                    req.origin_input_ids,
+                    base_output + path_draft_tokens,
+                    self.max_trie_depth,
+                )
                 bonus_check_tokens.append(check_token)
                 path_metadata.append((req_idx, node_j, path_cols_tuple))
 
@@ -553,6 +543,7 @@ class NGRAMWorker:
             self._precomputed_cache = None
             return
 
+        self.ngram_corpus.synchronize()
         # Phase 1: predict bonus tokens via ngram lookup.
         # draft[0] of the returned tree echoes the last token of check_token.
         # The direct children of root (nodes with path length == 2) are the
@@ -567,7 +558,6 @@ class NGRAMWorker:
         draft_check_tokens = []
         # (path_idx, predicted_bonus) for each Phase 2 entry
         phase2_metadata = []
-
         for idx in range(n_paths):
             bonus_mask = bonus_masks_3d[idx]  # (d, d)
             bonus_draft = bonus_drafts_2d[idx]  # (d,)
@@ -579,14 +569,17 @@ class NGRAMWorker:
             # Direct children of root: nodes j where mask[j][0]==1 and
             # path length (sum of mask row) == 2 (attend to self + root only)
             for j in range(1, d):
-                if bonus_mask[j, 0] == 1 and bonus_mask[j, j] == 1:
-                    if int(np.sum(bonus_mask[j])) == 2:
-                        predicted_bonus = int(bonus_draft[j])
-                        check_token_with_bonus = (
-                            bonus_check_tokens[idx] + [predicted_bonus]
-                        )[-self.max_trie_depth :]
-                        draft_check_tokens.append(check_token_with_bonus)
-                        phase2_metadata.append((idx, predicted_bonus))
+                if (
+                    bonus_mask[j, 0] == 1
+                    and bonus_mask[j, j] == 1
+                    and int(np.sum(bonus_mask[j])) == 2
+                ):
+                    predicted_bonus = int(bonus_draft[j])
+                    check_token_with_bonus = (
+                        bonus_check_tokens[idx] + [predicted_bonus]
+                    )[-self.max_trie_depth :]
+                    draft_check_tokens.append(check_token_with_bonus)
+                    phase2_metadata.append((idx, predicted_bonus))
 
         if not draft_check_tokens:
             self._precomputed_cache = None
