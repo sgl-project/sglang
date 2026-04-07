@@ -27,8 +27,8 @@ from sglang.test.test_utils import (
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=127, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=130, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=127, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=130, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestSRTEndpoint(CustomTestCase):
@@ -500,7 +500,7 @@ class TestSRTEndpoint(CustomTestCase):
         self.assertEqual(send_and_check_cached_tokens(range(0, 11000)), 10000)
 
     def test_get_server_info(self):
-        response = requests.get(self.base_url + "/get_server_info")
+        response = requests.get(self.base_url + "/server_info")
         response_json = response.json()
 
         max_total_num_tokens = response_json["max_total_num_tokens"]
@@ -630,7 +630,7 @@ class TestSRTEndpoint(CustomTestCase):
         tp = ThreadPoolExecutor(max_workers=30)
 
         def s():
-            server_info = requests.get(self.base_url + "/get_server_info")
+            server_info = requests.get(self.base_url + "/server_info")
             server_info.json()
 
         futures = []

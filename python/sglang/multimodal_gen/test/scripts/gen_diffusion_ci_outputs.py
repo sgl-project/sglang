@@ -8,6 +8,7 @@ ensuring that GT generation uses exactly the same code path as CI tests.
 Usage:
     python gen_diffusion_ci_outputs.py --suite 1-gpu --partition-id 0 --total-partitions 2 --out-dir ./output
     python gen_diffusion_ci_outputs.py --suite 1-gpu --case-ids qwen_image_t2i flux_image_t2i --out-dir ./output
+    python gen_diffusion_ci_outputs.py --suite 1-gpu-b200 --out-dir ./output
 """
 
 import argparse
@@ -27,9 +28,9 @@ def main():
     parser.add_argument(
         "--suite",
         type=str,
-        choices=["1-gpu", "2-gpu"],
+        choices=list(SUITES.keys()),
         required=True,
-        help="Test suite to run (1-gpu or 2-gpu)",
+        help="Test suite to run (choices: " + ", ".join(list(SUITES.keys())) + ")",
     )
     parser.add_argument(
         "--partition-id",

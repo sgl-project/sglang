@@ -49,7 +49,12 @@ from sglang.srt.utils import (
     load_video,
     random_uuid,
 )
-from sglang.srt.utils.network import config_socket, get_local_ip_auto, get_zmq_socket
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    config_socket,
+    get_local_ip_auto,
+    get_zmq_socket,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -430,8 +435,13 @@ class MMEncoder:
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
+                img, _ = load_image(data, False)
+                if (
+                    discard_alpha_channel
+                    and not isinstance(img, torch.Tensor)
+                    and img.mode != "RGB"
+                ):
+                    # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
@@ -663,6 +673,7 @@ class MMEncoder:
         part_idx: int,
         hashes: Optional[List[str]] = None,
     ) -> torch.Tensor:
+        # mm_inputs: dict
         mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
         grid_thw = _get_mm_grid_dim(mm_inputs, modality)
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
@@ -843,7 +854,6 @@ class MMEncoder:
             images = await self._flatten_and_load_images(mm_items)
             image_config = self.vision_config.get("image", {})
             processor_input = self.image_processor(images=images, **image_config)
-            feature = processor_input["pixel_values"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_image_feature
             else:
@@ -857,10 +867,11 @@ class MMEncoder:
             )
             # Get additional video metadata
             if (
-                self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+                self.model_type
+                in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
                 and video_processor_kwargs.get("video_metadata", None) is not None
             ):
-                # For qwen3-vl models, we need to store the video timestamps
+                # For qwen3-vl/qwen3.5 models, we need to store the video timestamps
                 video_metadata = video_processor_kwargs["video_metadata"]
                 try:
                     merge_size = (
@@ -898,7 +909,6 @@ class MMEncoder:
                 )
                 processor_input["second_per_grid_ts"] = second_per_grid_ts_tensor
 
-            feature = processor_input["pixel_values_videos"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_video_feature
             else:
@@ -919,7 +929,6 @@ class MMEncoder:
             processor_input["audio_feature_lens_raw"] = input_lengths
             output_lengths = self._get_feat_extract_output_lengths(input_lengths)
             processor_input["audio_feature_lens"] = output_lengths
-            feature = processor_input["input_features"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_audio_feature
             else:
@@ -1002,11 +1011,10 @@ class MMEncoder:
             mm_data.embedding = None
 
         # Send ack/data
-        endpoint = (
-            f"tcp://{url}"
-            if url is not None
-            else f"tcp://{prefill_host}:{embedding_port}"
-        )
+        if url is not None:
+            endpoint = NetworkAddress.parse(url).to_tcp()
+        else:
+            endpoint = NetworkAddress(prefill_host, embedding_port).to_tcp()
         logger.info(f"{endpoint = }")
 
         # Serialize data
@@ -1303,9 +1311,12 @@ def launch_server(server_args: ServerArgs):
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
     if server_args.dist_init_addr:
-        dist_init_method = f"tcp://{server_args.dist_init_addr}"
+        na = NetworkAddress.parse(server_args.dist_init_addr)
+        dist_init_method = na.to_tcp()
     else:
-        dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
+        dist_init_method = NetworkAddress(
+            server_args.host or "127.0.0.1", port_args.nccl_port
+        ).to_tcp()
     for rank in range(1, server_args.tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(

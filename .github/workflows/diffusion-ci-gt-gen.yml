@@ -25,7 +25,7 @@ permissions:
 jobs:
   multimodal-diffusion-gen-1gpu:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 1-gpu-runner
+    runs-on: 1-gpu-h100
     strategy:
       matrix:
         part: [0, 1]
@@ -40,8 +40,6 @@ jobs:
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
-        env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
@@ -49,7 +47,6 @@ jobs:
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
             --out-dir ./diffusion-ci-outputs \
-            --continue-on-error \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
@@ -61,7 +58,7 @@ jobs:
 
   multimodal-diffusion-gen-2gpu:
     if: github.repository == 'sgl-project/sglang'
-    runs-on: 2-gpu-runner
+    runs-on: 2-gpu-h100
     strategy:
       matrix:
         part: [0, 1]
@@ -76,8 +73,6 @@ jobs:
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Generate outputs
-        env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
@@ -85,7 +80,6 @@ jobs:
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
             --out-dir ./diffusion-ci-outputs \
-            --continue-on-error \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
@@ -118,4 +112,4 @@ jobs:
       - name: Publish GT images to sglang-bot/sglang-ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-        run: python scripts/ci/utils/publish_diffusion_gt.py --source-dir gt_images
+        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir gt_images
