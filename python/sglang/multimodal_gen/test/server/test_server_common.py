@@ -222,18 +222,21 @@ Consider updating perf_baselines.json with the snippets below:
         ctx: ServerContext,
         case_id: str,
         generate_fn: Callable[[str, openai.Client], tuple[str, bytes]],
-    ) -> tuple[RequestPerfRecord, bytes]:
-        """Run generation and collect performance records.
+        collect_perf: bool = True,
+    ) -> tuple[RequestPerfRecord | None, bytes]:
+        """Run generation and optionally collect performance records.
 
         Returns:
             Tuple of (performance_record, content_bytes)
         """
-        log_path = ctx.perf_log_path
-        log_wait_timeout = 30
-
         client = self._client(ctx)
         rid, content = generate_fn(case_id, client)
 
+        if not collect_perf:
+            return None, content
+
+        log_path = ctx.perf_log_path
+        log_wait_timeout = 30
         req_perf_record = wait_for_req_perf_record(
             rid,
             log_path,
@@ -1011,6 +1014,7 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
             diffusion_server,
             case.id,
             generate_fn,
+            collect_perf=not is_gt_gen_mode,
         )
 
         if is_gt_gen_mode:
