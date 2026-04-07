@@ -129,6 +129,10 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+http2 = [
+  "granian>=2.6.0",
+]
+
 test = [
   "accelerate",
   "addict",
@@ -146,6 +150,7 @@ test = [
   "diff-cover",
   "sentence_transformers",
   "tabulate",
+  "granian>=2.6.0",
 ]
 
 dev = ["sglang[test]"]
@@ -153,6 +158,7 @@ dev = ["sglang[test]"]
 all = [
   "sglang[diffusion]",
   "sglang[tracing]",
+  "sglang[http2]",
 ]
 
 [tool.uv.extra-build-dependencies]
