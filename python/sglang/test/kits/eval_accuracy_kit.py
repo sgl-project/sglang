@@ -9,12 +9,28 @@ from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_sum
 _THRESHOLD_NOT_SET = float("nan")
 
 
+def _get_accept_length(base_url):
+    """Fetch avg speculative decoding accept length, or None if unavailable."""
+    try:
+        server_info = requests.get(base_url + "/server_info").json()
+        return server_info["internal_states"][0]["avg_spec_accept_length"]
+    except (KeyError, IndexError, requests.RequestException):
+        return None
+
+
+def _print_accept_length(base_url):
+    """Print accept length if the server supports speculative decoding."""
+    val = _get_accept_length(base_url)
+    if val is not None:
+        print(f"avg_spec_accept_length={val:.4f}")
+
+
 def _check_accept_length(test_case, base_url, threshold):
     """Check speculative decoding accept length from server info."""
-    server_info = requests.get(base_url + "/server_info").json()
-    avg_spec_accept_length = server_info["internal_states"][0]["avg_spec_accept_length"]
-    print(f"{avg_spec_accept_length=}")
-    test_case.assertGreater(avg_spec_accept_length, threshold)
+    val = _get_accept_length(base_url)
+    assert val is not None, "avg_spec_accept_length not found in server_info"
+    print(f"avg_spec_accept_length={val:.4f}")
+    test_case.assertGreater(val, threshold)
 
 
 class GSM8KMixin:
@@ -57,6 +73,7 @@ class GSM8KMixin:
 
         self.assertGreaterEqual(metrics["score"], self.gsm8k_accuracy_thres)
 
+        _print_accept_length(self.base_url)
         if self.gsm8k_accept_length_thres is not None:
             _check_accept_length(self, self.base_url, self.gsm8k_accept_length_thres)
 
@@ -95,6 +112,7 @@ class MMLUMixin:
 
         self.assertGreaterEqual(metrics["score"], self.mmlu_score_threshold)
 
+        _print_accept_length(self.base_url)
         if self.mmlu_accept_length_thres is not None:
             _check_accept_length(self, self.base_url, self.mmlu_accept_length_thres)
 
@@ -136,6 +154,8 @@ class HumanEvalMixin:
 
         self.assertGreaterEqual(metrics["score"], threshold)
 
+        _print_accept_length(self.base_url)
+
 
 class MGSMEnMixin:
     """Mixin for MGSM English evaluation.
@@ -169,3 +189,5 @@ class MGSMEnMixin:
             write_github_step_summary(f"### test_mgsm_en\n{metrics['score']=:.4f}\n")
 
         self.assertGreaterEqual(metrics["score"], self.mgsm_en_score_threshold)
+
+        _print_accept_length(self.base_url)
