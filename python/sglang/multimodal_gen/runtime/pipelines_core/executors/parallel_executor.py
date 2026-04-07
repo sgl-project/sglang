@@ -126,15 +126,12 @@ class ParallelExecutor(PipelineExecutor):
             else:
                 output_batches.append(
                     OutputBatch(
-                        output=getattr(result, "output", None)
-                        or getattr(result, "latents", None),
-                        trajectory_timesteps=getattr(
-                            result, "trajectory_timesteps", None
-                        ),
-                        trajectory_latents=getattr(result, "trajectory_latents", None),
-                        trajectory_decoded=getattr(result, "trajectory_decoded", None),
-                        metrics=getattr(result, "metrics", None),
-                        noise_pred=getattr(result, "noise_pred", None),
+                        output=result.output or result.latents,
+                        trajectory_timesteps=result.trajectory_timesteps,
+                        trajectory_latents=result.trajectory_latents,
+                        trajectory_decoded=None,
+                        metrics=result.metrics,
+                        noise_pred=result.noise_pred,
                     )
                 )
 
