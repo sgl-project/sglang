@@ -124,10 +124,6 @@ class RadixAttention(nn.Module):
                 bridges = get_bridge_buffers()
                 if bridges is not None:
                     n = q.shape[0]
-                    # Copy to pre-allocated bridge buffers (inside graph segment).
-                    # These copies are captured in the graph. The originals become
-                    # graph-private after del → freed → memory reusable by next segment.
-                    # Reshape bridges to match tensor shapes (may be 2D or 3D).
                     bq = bridges.q[:n].view(q.shape)
                     bk = bridges.k[:n].view(k.shape) if k is not None else None
                     bv = bridges.v[:n].view(v.shape) if v is not None else None

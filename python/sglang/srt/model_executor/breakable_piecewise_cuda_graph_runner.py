@@ -148,9 +148,6 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
             )
         )
 
-        # Static buffers for forward_batch GPU tensors read inside graph segments
-        # (especially by the logits processor in the last segment).
-        # These MUST persist so the graph reads from stable addresses.
         with torch.device(self.device):
             self.static_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
             self.static_extend_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
