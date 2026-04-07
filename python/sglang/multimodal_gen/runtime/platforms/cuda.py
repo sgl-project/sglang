@@ -104,6 +104,58 @@ class CudaPlatformBase(Platform):
         return True
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        try:
+            from flashinfer import fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            pass
+
+        try:
+            from sgl_kernel import scaled_fp4_quant as fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            return None
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
+        if backend is None:
+            return "cudnn" if cls.is_blackwell() else "auto"
+
+        backend = backend.lower()
+        if backend not in {"auto", "cudnn"}:
+            logger.warning(
+                "Unsupported SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r. "
+                "Falling back to %r.",
+                backend,
+                "cudnn" if cls.is_blackwell() else "auto",
+            )
+            return "cudnn" if cls.is_blackwell() else "auto"
+        return backend
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+
+            return cutlass_fp4_gemm, None
+        except ImportError:
+            pass
+
+        try:
+            from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+            return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+        except ImportError:
+            return None, None
+
+    @classmethod
     def is_full_nvlink(cls, device_ids: list[int]) -> bool:
         raise NotImplementedError
 

@@ -22,11 +22,27 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
     LTX2AVDenoisingStage,
+    LTX2RefinementStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_dmd import (
     DmdDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encoding import EncodingStage
+
+# Hunyuan3D paint stages
+from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_paint import (
+    Hunyuan3DPaintPostprocessStage,
+    Hunyuan3DPaintPreprocessStage,
+    Hunyuan3DPaintTexGenStage,
+)
+
+# Hunyuan3D shape stages
+from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_shape import (
+    Hunyuan3DShapeBeforeDenoisingStage,
+    Hunyuan3DShapeDenoisingStage,
+    Hunyuan3DShapeExportStage,
+    Hunyuan3DShapeSaveStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageEncodingStage,
     ImageVAEEncodingStage,
@@ -49,6 +65,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.upsampling import (
+    LTX2HalveResolutionStage,
+    LTX2LoRASwitchStage,
+    LTX2UpsampleStage,
+)
 
 __all__ = [
     "PipelineStage",
@@ -68,4 +89,18 @@ __all__ = [
     "ImageVAEEncodingStage",
     "TextEncodingStage",
     "LTX2TextConnectorStage",
+    # Hunyuan3D shape stages
+    "Hunyuan3DShapeBeforeDenoisingStage",
+    "Hunyuan3DShapeDenoisingStage",
+    "Hunyuan3DShapeExportStage",
+    "Hunyuan3DShapeSaveStage",
+    # Hunyuan3D paint stages
+    "Hunyuan3DPaintPreprocessStage",
+    "Hunyuan3DPaintTexGenStage",
+    "Hunyuan3DPaintPostprocessStage",
+    # LTX-2 two-stage
+    "LTX2RefinementStage",
+    "LTX2HalveResolutionStage",
+    "LTX2LoRASwitchStage",
+    "LTX2UpsampleStage",
 ]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
@@ -29,9 +29,14 @@ def _jit_hadamard_module(dtype: torch.dtype) -> Module:
     )
 
 
-def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+def _hadamard_transform_impl(
+    x: torch.Tensor,
+    scale: float,
+    pad_multiple: int,
+    kernel_fn: Callable,
+) -> torch.Tensor:
     if not x.is_cuda:
-        raise RuntimeError("hadamard_transform only supports CUDA tensors")
+        raise RuntimeError(f"{kernel_fn.__name__} only supports CUDA tensors")
 
     shapes_og = x.size()
     dim_og = x.size(-1)
@@ -39,106 +44,38 @@ def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     if x.stride(-1) != 1:
         x = x.contiguous()
 
-    if dim_og % 8 != 0:
-        x = torch.nn.functional.pad(x, (0, 8 - dim_og % 8))
-    dim = x.size(1)
+    needs_pad = dim_og % pad_multiple != 0
+    if needs_pad:
+        x = torch.nn.functional.pad(x, (0, pad_multiple - dim_og % pad_multiple))
 
     out = torch.empty_like(x)
-    module = _jit_hadamard_module(x.dtype)
-    module.hadamard_transform(x, out, scale)
+    kernel_fn(x, out, scale)
 
-    if dim_og % 8 != 0:
+    if needs_pad:
         out = out[:, :dim_og]
     return out.reshape(shapes_og)
+
+
+def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    module = _jit_hadamard_module(x.dtype)
+    return _hadamard_transform_impl(x, scale, 8, module.hadamard_transform)
 
 
 def hadamard_transform_12n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    if not x.is_cuda:
-        raise RuntimeError("hadamard_transform_12n only supports CUDA tensors")
-
-    shapes_og = x.size()
-    dim_og = x.size(-1)
-    x = x.reshape(-1, dim_og)
-    if x.stride(-1) != 1:
-        x = x.contiguous()
-
-    pad_multiple = 4 * 12
-    if dim_og % pad_multiple != 0:
-        x = torch.nn.functional.pad(x, (0, pad_multiple - dim_og % pad_multiple))
-
-    out = torch.empty_like(x)
     module = _jit_hadamard_module(x.dtype)
-    module.hadamard_transform_12n(x, out, scale)
-
-    if dim_og % pad_multiple != 0:
-        out = out[:, :dim_og]
-    return out.reshape(shapes_og)
+    return _hadamard_transform_impl(x, scale, 4 * 12, module.hadamard_transform_12n)
 
 
 def hadamard_transform_20n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    if not x.is_cuda:
-        raise RuntimeError("hadamard_transform_20n only supports CUDA tensors")
-
-    shapes_og = x.size()
-    dim_og = x.size(-1)
-    x = x.reshape(-1, dim_og)
-    if x.stride(-1) != 1:
-        x = x.contiguous()
-
-    pad_multiple = 4 * 20
-    if dim_og % pad_multiple != 0:
-        x = torch.nn.functional.pad(x, (0, pad_multiple - dim_og % pad_multiple))
-
-    out = torch.empty_like(x)
     module = _jit_hadamard_module(x.dtype)
-    module.hadamard_transform_20n(x, out, scale)
-
-    if dim_og % pad_multiple != 0:
-        out = out[:, :dim_og]
-    return out.reshape(shapes_og)
+    return _hadamard_transform_impl(x, scale, 4 * 20, module.hadamard_transform_20n)
 
 
 def hadamard_transform_28n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    if not x.is_cuda:
-        raise RuntimeError("hadamard_transform_28n only supports CUDA tensors")
-
-    shapes_og = x.size()
-    dim_og = x.size(-1)
-    x = x.reshape(-1, dim_og)
-    if x.stride(-1) != 1:
-        x = x.contiguous()
-
-    pad_multiple = 4 * 28
-    if dim_og % pad_multiple != 0:
-        x = torch.nn.functional.pad(x, (0, pad_multiple - dim_og % pad_multiple))
-
-    out = torch.empty_like(x)
     module = _jit_hadamard_module(x.dtype)
-    module.hadamard_transform_28n(x, out, scale)
-
-    if dim_og % pad_multiple != 0:
-        out = out[:, :dim_og]
-    return out.reshape(shapes_og)
+    return _hadamard_transform_impl(x, scale, 4 * 28, module.hadamard_transform_28n)
 
 
 def hadamard_transform_40n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    if not x.is_cuda:
-        raise RuntimeError("hadamard_transform_40n only supports CUDA tensors")
-
-    shapes_og = x.size()
-    dim_og = x.size(-1)
-    x = x.reshape(-1, dim_og)
-    if x.stride(-1) != 1:
-        x = x.contiguous()
-
-    pad_multiple = 4 * 40
-    if dim_og % pad_multiple != 0:
-        x = torch.nn.functional.pad(x, (0, pad_multiple - dim_og % pad_multiple))
-
-    out = torch.empty_like(x)
     module = _jit_hadamard_module(x.dtype)
-    module.hadamard_transform_40n(x, out, scale)
-
-    if dim_og % pad_multiple != 0:
-        out = out[:, :dim_og]
-    return out.reshape(shapes_og)
+    return _hadamard_transform_impl(x, scale, 4 * 40, module.hadamard_transform_40n)

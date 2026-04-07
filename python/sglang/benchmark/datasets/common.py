@@ -1,4 +1,6 @@
 import random
+from abc import ABC, abstractmethod
+from argparse import Namespace
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -37,7 +39,24 @@ class DatasetRow:
             self.extra_request_body = {}
 
 
+@dataclass
+class BaseDataset(ABC):
+    @classmethod
+    @abstractmethod
+    def from_args(cls, args: Namespace) -> "BaseDataset": ...
+
+    @abstractmethod
+    def load(
+        self,
+        tokenizer: Any,
+        model_id: Optional[str] = None,
+    ) -> List[DatasetRow]: ...
+
+
 def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:
+    # full_len=0 is valid for embedding benchmarks where no output tokens are generated
+    if full_len <= 0:
+        return [0] * num
     return np.random.randint(
         max(int(full_len * range_ratio), 1),
         full_len + 1,

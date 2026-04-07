@@ -28,6 +28,8 @@ class EngineBase(ABC):
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
+        routed_dp_rank: Optional[int] = None,
+        disagg_prefill_dp_rank: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
         priority: Optional[int] = None,

@@ -22,9 +22,9 @@ from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
 from .base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
+    InvalidGrammarObject,
 )
 
 
@@ -287,7 +287,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ) -> Optional[BaseGrammarObject]:
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         # avoid wrapping invalid grammar, so that the scheduler can detect it
-        if ret is None or ret is INVALID_GRAMMAR_OBJ:
+        if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         if not self.strict_reasoning_format:
             obj = ReasonerGrammarObject(ret, self.think_end_id)

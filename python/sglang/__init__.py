@@ -1,5 +1,29 @@
 # SGLang public APIs
 
+# Install stubs early for platforms where certain dependencies are unavailable
+# (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
+# get_device_properties).  This must run before any downstream imports.
+import sys as _sys
+
+if _sys.platform == "darwin":
+    try:
+        import torch as _torch
+
+        if _torch.backends.mps.is_available():
+            from sglang._triton_stub import install as _install_triton_stub
+
+            _install_triton_stub()
+            del _install_triton_stub
+
+            from sglang._mps_stub import install as _install_mps_stub
+
+            _install_mps_stub()
+            del _install_mps_stub
+        del _torch
+    except ImportError:
+        pass
+del _sys
+
 # Frontend Language APIs
 from sglang.global_config import global_config
 from sglang.lang.api import (

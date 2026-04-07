@@ -23,7 +23,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from sglang.benchmark.datasets import DatasetRow, get_dataset, sample_random_requests
+from sglang.benchmark.datasets import DatasetRow, get_dataset
+from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.utils import get_tokenizer, set_ulimit
 from sglang.lang.backend.runtime_endpoint import Runtime
 from sglang.srt.entrypoints.engine import Engine
@@ -322,12 +323,83 @@ def monitor_trace_file(known_files, directory, interval=1):
             break
 
 
+def _create_ray_engine_backend(server_args: ServerArgs):
+    """Create a RayEngine inside a Ray actor on a placement group.
+
+    RayEngine requires a placement group, so we launch it inside a Ray actor
+    and return a lightweight proxy that forwards calls via ray.get().
+    """
+    import ray
+    from ray.runtime_env import RuntimeEnv
+    from ray.util.placement_group import placement_group
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+    env_vars = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+    if os.environ.get("HF_TOKEN"):
+        env_vars["HF_TOKEN"] = os.environ["HF_TOKEN"]
+    if not ray.is_initialized():
+        ray.init(runtime_env=RuntimeEnv(env_vars=env_vars))
+
+    total_gpus = server_args.tp_size * server_args.pp_size
+    pg = placement_group([{"CPU": 1, "GPU": total_gpus}], strategy="STRICT_PACK")
+    ray.get(pg.ready())
+
+    @ray.remote
+    class _EngineActor:
+        def __init__(self, **kwargs):
+            from sglang.srt.ray.engine import RayEngine
+
+            self.engine = RayEngine(**kwargs)
+
+        def call(self, method, **kwargs):
+            return getattr(self.engine, method)(**kwargs)
+
+    actor = _EngineActor.options(
+        num_cpus=1,
+        num_gpus=0,
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_bundle_index=0,
+        ),
+    ).remote(**dataclasses.asdict(server_args))
+
+    class _Proxy:
+        """Forwards method calls to the remote RayEngine actor."""
+
+        def generate(self, **kwargs):
+            return ray.get(actor.call.remote("generate", **kwargs))
+
+        def get_server_info(self, **kwargs):
+            return ray.get(actor.call.remote("get_server_info", **kwargs))
+
+        def start_profile(self, **kwargs):
+            return ray.get(actor.call.remote("start_profile", **kwargs))
+
+        def stop_profile(self, **kwargs):
+            return ray.get(actor.call.remote("stop_profile", **kwargs))
+
+        def shutdown(self):
+            try:
+                ray.get(actor.call.remote("shutdown"), timeout=60)
+            except Exception:
+                pass
+            try:
+                ray.util.remove_placement_group(pg)
+            except Exception:
+                pass
+
+    return _Proxy()
+
+
 def throughput_test(
     server_args: ServerArgs,
     bench_args: BenchArgs,
 ):
     if bench_args.backend == "engine":
-        backend = Engine(**dataclasses.asdict(server_args))
+        if server_args.use_ray:
+            backend = _create_ray_engine_backend(server_args)
+        else:
+            backend = Engine(**dataclasses.asdict(server_args))
         if not backend:
             raise ValueError("Please provide valid engine arguments")
     elif bench_args.backend == "runtime":

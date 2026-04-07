@@ -35,6 +35,7 @@ from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -203,7 +204,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
         self.in_channels = in_channels
 
         kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv3d(
+        self.proj = Conv3dLayer(
             in_channels,
             hidden_size,
             kernel_size=kernel_size,
@@ -212,6 +213,8 @@ class Glm4vVisionPatchEmbed(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input x is 2-D: (num_patches, C * T * P * P)
+        # Reshape to 5-D for Conv3dLayer, then flatten back.
         x = x.view(
             -1,
             self.in_channels,
@@ -219,8 +222,7 @@ class Glm4vVisionPatchEmbed(nn.Module):
             self.patch_size,
             self.patch_size,
         )
-        x = self.proj(x).view(-1, self.hidden_size)
-        return x
+        return self.proj(x).view(-1, self.hidden_size)
 
 
 class Glm4vPatchMerger(nn.Module):
@@ -412,6 +414,7 @@ class Glm4vVisionModel(nn.Module):
                     num_heads=self.num_heads,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                    num_dummy_heads=vision_config.num_dummy_heads,
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
                     use_data_parallel=use_data_parallel,
@@ -551,14 +554,13 @@ class Glm4vForConditionalGeneration(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.visual = Glm4vVisionModel(
             config.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
-
-        vision_utils.update_vit_attn_dummy_heads_config(self.config)
 
         self.model = Glm4Model(
             config,

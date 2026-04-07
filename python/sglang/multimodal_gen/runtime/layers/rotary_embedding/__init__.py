@@ -26,10 +26,10 @@
 # limitations under the License.
 """Rotary Positional Embeddings — unified public API (drop-in replacement)."""
 
-from ._base import RotaryEmbedding
-from ._factory import get_rope, get_rotary_pos_embed
-from ._mrope import NDRotaryEmbedding
-from ._utils import (
+from .base import RotaryEmbedding
+from .factory import get_rope, get_rotary_pos_embed
+from .mrope import NDRotaryEmbedding
+from .utils import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )

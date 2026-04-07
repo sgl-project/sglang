@@ -9,8 +9,8 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.metrics.collector import DPCooperationInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
@@ -94,8 +94,10 @@ class MLPSyncBatchInfo:
 
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
-        self.global_num_tokens = tp0_info[:, 0].tolist()
-        self.global_num_tokens_for_logprob = tp0_info[:, 1].tolist()
+        # Perform only one Device-to-Host (D2H) memory copy
+        cpu_data = tp0_info[:, :2].cpu()
+        self.global_num_tokens = cpu_data[:, 0].tolist()
+        self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         if _ENABLE_METRICS_DP_ATTENTION:

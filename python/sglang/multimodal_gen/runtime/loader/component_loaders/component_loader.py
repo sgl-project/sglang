@@ -15,10 +15,12 @@ from torch import nn
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
 from sglang.multimodal_gen.configs.models import ModelConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
+    get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -124,11 +126,13 @@ class ComponentLoader(ABC):
             if isinstance(component, nn.Module):
                 component = component.eval()
             current_gpu_mem = current_platform.get_available_gpu_memory()
+            model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). consumed: %.2f GB, avail mem: %.2f GB",
+                f"Loaded %s: %s ({source} version). model size: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
                 component_name,
                 component.__class__.__name__,
+                model_size,
                 consumed,
                 current_gpu_mem,
             )
@@ -291,9 +295,15 @@ class TokenizerLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
+        # Flux.2 aligns to the tokenizer defaults from the original baseline.
+        # TODO: abstract this
+        if isinstance(server_args.pipeline_config, Flux2PipelineConfig):
+            return AutoProcessor.from_pretrained(component_model_path)
+
         return AutoTokenizer.from_pretrained(
             component_model_path,
-            padding_size="right",
+            padding_side="right",
+            use_fast=True,
         )
 
 
