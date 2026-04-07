@@ -11,7 +11,7 @@ _THRESHOLD_NOT_SET = float("nan")
 
 def _check_accept_length(test_case, base_url, threshold):
     """Check speculative decoding accept length from server info."""
-    server_info = requests.get(base_url + "/get_server_info").json()
+    server_info = requests.get(base_url + "/server_info").json()
     avg_spec_accept_length = server_info["internal_states"][0]["avg_spec_accept_length"]
     print(f"{avg_spec_accept_length=}")
     test_case.assertGreater(avg_spec_accept_length, threshold)
