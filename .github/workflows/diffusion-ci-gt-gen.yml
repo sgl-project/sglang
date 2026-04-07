@@ -62,6 +62,11 @@ jobs:
           path: python/diffusion-ci-outputs
           retention-days: 7
 
+      - name: Publish GT images to sglang-bot/sglang-ci-data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir python/diffusion-ci-outputs
+
   multimodal-diffusion-gen-2gpu:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 2-gpu-h100
@@ -97,6 +102,11 @@ jobs:
           path: python/diffusion-ci-outputs
           retention-days: 7
 
+      - name: Publish GT images to sglang-bot/sglang-ci-data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir python/diffusion-ci-outputs
+
   multimodal-diffusion-gen-b200:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 4-gpu-b200
@@ -127,27 +137,7 @@ jobs:
           path: python/diffusion-ci-outputs
           retention-days: 7
 
-  diffusion-ci-push:
-    needs: [multimodal-diffusion-gen-1gpu, multimodal-diffusion-gen-2gpu, multimodal-diffusion-gen-b200]
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: diffusion-gen-*
-          path: combined
-          merge-multiple: true
-
-      - name: Collect image files
-        run: |
-          mkdir -p gt_images
-          find combined \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" \) -type f -exec cp -f {} gt_images/ \;
-
       - name: Publish GT images to sglang-bot/sglang-ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir gt_images
+        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir python/diffusion-ci-outputs
