@@ -360,56 +360,29 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _is_deepep_backend = is_deepep_class_backend()
         _fusion_disabled = get_global_server_args().disable_shared_experts_fusion
-
-        # DeepEP shared expert fusion: shared expert is fused into the same MoE kernel
-        # as a local expert at the home EP rank (analogous to Standard dispatcher's
-        # local_expert_mapping[256] = num_local_routed_experts).
-        #
-        # Expert layout expanded: 256 routed → 256+EP_size (e.g. 272 for EP=16).
-        # Each rank has 17 local experts: slots 0-15 = routed, slot 16 = shared expert.
-        # Before dispatch, topk_ids are remapped: routed expert e → e + e//16 (shifts
-        # IDs to make room for shared slots), and shared expert → ep_rank*17+16 (routes
-        # back to home rank). Shared expert weights are loaded onto all ranks at slot 16.
-        _deepep_fusion_enabled = (
-            _is_deepep_backend and not _fusion_disabled and n_shared_experts > 0
-        )
-        self._deepep_fusion_enabled = _deepep_fusion_enabled
 
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
         self.num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
 
-        # FusedMoE kernel impl: for DeepEP fusion, pass 0 so all 17 local experts are
-        # treated uniformly (no scaling factor, no TopK special-casing for expert 256).
-        # For Standard/AMD EP: pass n_shared_experts for inline kernel fusion.
-        num_fused_shared_experts_in_moe_impl = (
-            0 if _deepep_fusion_enabled else self.num_fused_shared_experts
+        # DeepEP shared expert fusion: shared expert is fused into the same MoE kernel
+        # as a local expert at the home EP rank. Expert layout is expanded from 256
+        # routed to 256+EP_size (e.g. 272 for EP=16). TopK handles interleaving.
+        _is_deepep_fusion = (
+            is_deepep_class_backend() and self.num_fused_shared_experts > 0
         )
 
-        if _deepep_fusion_enabled:
+        if _is_deepep_fusion:
             # 256 routed + EP_size shared slots = 272 experts total (for EP=16)
             num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
             top_k_for_moe = config.num_experts_per_tok + 1  # 8 routed + 1 shared
-            _num_local_routed = config.n_routed_experts // self.moe_ep_size  # 16
-            _num_local_experts = _num_local_routed + 1  # 17
-            # After MoE, output *= routed_scaling_factor. Shared expert weight must
-            # compensate so its net contribution is 1.0: weight = 1/routed_scaling_factor
-            self._deepep_shared_weight = (
-                1.0 / self.routed_scaling_factor
-                if self.routed_scaling_factor != 0
-                else 1.0
-            )
-            self._deepep_num_local_routed = _num_local_routed
-            self._deepep_num_local_experts = _num_local_experts
+            # Interleaving for DeepEP dispatch is handled by TopK internally.
         else:
             num_experts_for_moe = (
-                config.n_routed_experts + num_fused_shared_experts_in_moe_impl
+                config.n_routed_experts + self.num_fused_shared_experts
             )
-            top_k_for_moe = (
-                config.num_experts_per_tok + num_fused_shared_experts_in_moe_impl
-            )
+            top_k_for_moe = config.num_experts_per_tok + self.num_fused_shared_experts
 
         self.config = config
         self.layer_id = layer_id
@@ -436,8 +409,14 @@ class DeepseekV2MoE(nn.Module):
         )
 
         # scaling factor for fused shared experts on AMD-platform.
+        # DeepEP doesn't need this: shared expert is only computed on home rank
+        # (not all-reduced), so no 1/ep_size correction is needed.
         fused_shared_experts_scaling_factor = None
-        if self.moe_ep_size > 1 and num_fused_shared_experts_in_moe_impl > 0:
+        if (
+            self.moe_ep_size > 1
+            and self.num_fused_shared_experts > 0
+            and not _is_deepep_fusion
+        ):
             # if enable_ep_moe tp_szie == ep_size, every gpu get shared experts gemm output
             # so we scale with 1 / self.moe_ep_size in ep mode which will make it equalation as in tp mode
             # with fused_shared_experts
@@ -446,7 +425,7 @@ class DeepseekV2MoE(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=num_experts_for_moe
             + get_global_server_args().ep_num_redundant_experts,
-            num_fused_shared_experts=num_fused_shared_experts_in_moe_impl,
+            num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -457,7 +436,6 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             prefix=add_prefix("experts", prefix),
-            is_deepep_shared_expert_fusion=_deepep_fusion_enabled,
         )
 
         self.topk = TopK(
@@ -486,13 +464,13 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
-        # Shared experts: skip when fused into MoE kernel (num_fused_shared_experts_in_moe_impl > 0)
+        # Shared experts: skip when fused into MoE kernel (self.num_fused_shared_experts > 0)
         # or when DeepEP fusion is enabled (shared expert is local slot 16 in FusedMoE, no separate MLP).
         if (
             config.n_shared_experts is not None
             and config.n_shared_experts > 0
-            and num_fused_shared_experts_in_moe_impl == 0
-            and not _deepep_fusion_enabled
+            and self.num_fused_shared_experts == 0
+            and not _is_deepep_fusion
         ):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
@@ -843,8 +821,16 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-        if self._deepep_fusion_enabled:
-            topk_output = self._remap_topk_ids_for_deepep_fusion(topk_output)
+            if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
+                n = self.num_fused_shared_experts
+                topk_output = topk_output._replace(
+                    topk_ids=topk_output.topk_ids.new_empty(
+                        (0, topk_output.topk_ids.shape[-1] + n)
+                    ),
+                    topk_weights=topk_output.topk_weights.new_empty(
+                        (0, topk_output.topk_weights.shape[-1] + n)
+                    ),
+                )
 
         if sbo_overlap_dispatch_flag:
             shared_output = None
@@ -1023,21 +1009,6 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
-
-    def _remap_topk_ids_for_deepep_fusion(self, topk_output):
-        topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
-        if topk_ids.shape[0] == 0:  # empty_topk_output returns [0, 8]; expand to [0, 9]
-            return topk_output._replace(
-                topk_ids=topk_ids.new_empty((0, topk_ids.shape[-1] + 1)),
-                topk_weights=topk_weights.new_empty((0, topk_weights.shape[-1] + 1)),
-            )
-        topk_ids[:, :-1] += topk_ids[:, :-1] // self._deepep_num_local_routed
-        topk_ids[:, -1] = (
-            self.experts.moe_ep_rank * self._deepep_num_local_experts
-            + self._deepep_num_local_routed
-        )
-        topk_weights[:, -1] = self._deepep_shared_weight
-        return topk_output
 
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
@@ -1957,12 +1928,7 @@ class DeepseekV2Model(nn.Module):
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     # tp_size = get_tensor_model_parallel_world_size()
-                    a2a_backend = get_moe_a2a_backend()
-                    is_a2a_moe = (
-                        a2a_backend.is_deepep()
-                        or a2a_backend.is_mori()
-                        or a2a_backend.is_mooncake()
-                    )
+                    is_a2a_moe = is_deepep_class_backend()
                     tp_size = (
                         1 if is_a2a_moe else get_tensor_model_parallel_world_size()
                     )

@@ -48,7 +48,7 @@ from sglang.srt.layers.moe.topk import (
     TopKOutput,
     TopKOutputChecker,
 )
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import RoutingMethodType, is_deepep_class_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -179,7 +179,6 @@ class FusedMoE(torch.nn.Module):
         with_bias=False,
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
-        is_deepep_shared_expert_fusion: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -198,20 +197,20 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
-        assert (num_experts - num_fused_shared_experts) % self.moe_ep_size == 0
-        self.num_local_experts = (
-            num_experts - num_fused_shared_experts
-        ) // self.moe_ep_size + num_fused_shared_experts
 
-        if is_deepep_shared_expert_fusion:
-            self._num_global_routed = num_experts - self.moe_ep_size
-            self._num_local_routed = self._num_global_routed // self.moe_ep_size
+        # DeepEP: each rank has its own shared expert slot, so total shared
+        # weight slots = num_fused_shared_experts * ep_size.
+        # AMD/Standard: shared experts are global, slots = num_fused_shared_experts.
+        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+            num_shared_slots = num_fused_shared_experts * self.moe_ep_size
         else:
-            self._num_global_routed = num_experts - num_fused_shared_experts
-            self._num_local_routed = self.num_local_experts - num_fused_shared_experts
-        self._has_fused_shared = (
-            num_fused_shared_experts > 0 or is_deepep_shared_expert_fusion
-        )
+            num_shared_slots = num_fused_shared_experts
+
+        assert (num_experts - num_shared_slots) % self.moe_ep_size == 0
+        self._num_global_routed = num_experts - num_shared_slots
+        self._num_local_routed = self._num_global_routed // self.moe_ep_size
+        self.num_local_experts = self._num_local_routed + num_fused_shared_experts
+        self._has_fused_shared = num_fused_shared_experts > 0
 
         self.expert_mask_gpu = None
 
