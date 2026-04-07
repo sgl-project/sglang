@@ -160,7 +160,6 @@ SGL_SOFTMAX_KERNEL softmax_split_kernel(const __grid_constant__ SoftmaxParams pa
   using vec_t = AlignedVector<DType, kVecN>;
 
   const auto input = static_cast<const DType*>(params.input);
-  const auto output = static_cast<DType*>(params.output);
   const auto partial_ms = static_cast<fp32x2_t*>(params.workspace);
   const auto vocab_size = params.vocab_size;
   const auto num_splits = params.num_splits;
@@ -168,7 +167,6 @@ SGL_SOFTMAX_KERNEL softmax_split_kernel(const __grid_constant__ SoftmaxParams pa
   const uint32_t row = blockIdx.x;
   const uint32_t sid = blockIdx.y;
   const DType* row_in = input + static_cast<uint64_t>(row) * vocab_size;
-  DType* row_out = output + static_cast<uint64_t>(row) * vocab_size;
 
   // Aligned chunk boundaries for vectorized loads
   const uint32_t chunk_raw = div_ceil(vocab_size, num_splits);
