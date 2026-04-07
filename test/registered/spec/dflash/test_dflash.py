@@ -1,13 +1,12 @@
 import os
 import unittest
-from types import SimpleNamespace
 
 import openai
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
@@ -22,13 +21,14 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=360, suite="stage-b-test-small-1-gpu")
 
 
-class TestDFlashServerBase(CustomTestCase, MatchedStopMixin):
+class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
     max_running_requests = 64
     attention_backend = "flashinfer"
     page_size = 1
     other_launch_args = []
     model = DEFAULT_TARGET_MODEL_DFLASH
     draft_model = DEFAULT_DRAFT_MODEL_DFLASH
+    gsm8k_accuracy_thres = 0.23
 
     @classmethod
     def setUpClass(cls):
@@ -77,21 +77,6 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin):
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)
-        assert self.process.poll() is None
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=1000,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval(args)
-        print(f"TestDFlashServerBase -- {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.23)
         assert self.process.poll() is None
 
     def test_early_stop(self):
