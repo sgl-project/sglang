@@ -36,9 +36,7 @@ class AscendGDNAttnBackend(GDNAttnBackend):
         super().__init__(model_runner)
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
-        self.kernel_dispatcher = GDNKernelDispatcher(
-            decode_backend, prefill_backend
-        )
+        self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
 
     def prepare_gdn_inputs(
         self,
