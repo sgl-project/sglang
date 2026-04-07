@@ -874,11 +874,12 @@ def _register_configs():
     register_configs(
         sampling_param_cls=ErnieImageSamplingParams,
         pipeline_config_cls=ErnieImagePipelineConfig,
-        hf_model_paths = [
-            "baidu/ERNIE-Image-Turbo"
+        hf_model_paths=[
+            "baidu/ERNIE-Image",
+            "baidu/ERNIE-Image-Turbo",
         ],
         model_detectors=[
-            lambda hf_id: "ernie-image-turbo" in hf_id.lower(),
+            lambda hf_id: "ernie-image" in hf_id.lower(),
         ],
     )
 
