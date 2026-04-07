@@ -42,6 +42,7 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     Lfm2Config,
     Lfm2MoeConfig,
+    Lfm2VlConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3_5Config,
@@ -520,9 +521,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.remote_instance_transfer_engine is not None
             and self.remote_instance_transfer_engine_weight_info is None
         ):
+            # Register memory and upstream the transfer engine info to the bootstrap server
             self.remote_instance_transfer_engine_weight_info = register_memory_region(
                 self.model, self.remote_instance_transfer_engine
             )
+            self._register_to_engine_info_bootstrap()
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -591,6 +594,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init lora
         if server_args.enable_lora:
             self.init_lora_manager()
+            if not server_args.disable_cuda_graph:
+                # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
+                # intermediate buffers before init_memory_pool() so memory
+                # profiling accounts for them.  Phase 2 (dense LoRA batch
+                # metadata) is handled in CudaGraphRunner.__init__() via
+                # lora_manager.init_cuda_graph_batch_info().
+                self._init_lora_cuda_graph_moe_buffers()
 
         # Init Double Sparsity
         if server_args.enable_double_sparsity:
@@ -699,6 +709,52 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine_session_id = NetworkAddress(
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
         ).to_host_port_str()
+
+    def _register_to_engine_info_bootstrap(self):
+        """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
+
+        The bootstrap server runs on node_rank==0. For multi-node setups, the
+        host is derived from dist_init_addr. For single-node, use 127.0.0.1.
+        """
+        import requests as http_requests
+
+        if self.server_args.dist_init_addr:
+            # Multi-node: bootstrap server is on the head node (node_rank==0).
+            # Derive host from dist_init_addr (shared across all nodes).
+            bootstrap_host = (
+                NetworkAddress.parse(self.server_args.dist_init_addr).resolved().host
+            )
+        else:
+            bootstrap_host = "127.0.0.1"
+
+        bootstrap_port = self.server_args.engine_info_bootstrap_port
+        bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
+        url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
+
+        payload = {
+            "tp_rank": self.tp_rank,
+            "transfer_engine_info": {
+                "session_id": self.remote_instance_transfer_engine_session_id,
+                "weights_info_dict": self.remote_instance_transfer_engine_weight_info,
+            },
+        }
+
+        try:
+            resp = http_requests.put(url, json=payload, timeout=5)
+            if resp.status_code == 200:
+                logger.info(
+                    f"Registered transfer engine info for tp_rank={self.tp_rank} "
+                    f"with bootstrap server at {bootstrap_na}"
+                )
+            else:
+                logger.error(
+                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}: "
+                    f"{resp.status_code}, {resp.text}"
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
+            )
 
     def _publish_modelexpress_metadata(self):
         """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
@@ -1108,6 +1164,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
+        # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
+        # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
+        if _is_npu:
+            torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
 
         # Publish metadata to ModelExpress if running as seed source
@@ -1682,6 +1742,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             lora_paths=self.server_args.lora_paths,
         )
 
+    def _init_lora_cuda_graph_moe_buffers(self):
+        """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
+
+        Must be called before init_memory_pool() so that profile_max_num_token()
+        sees the reduced available memory and sizes KV cache correctly.
+        All MoE LoRA layers share one set of buffers (managed by the
+        lora_backend) since they execute sequentially during forward.
+
+        Phase 2 (dense LoRA batch metadata) is handled later in
+        CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
+        because it needs capture-time parameters (max_bs, num_tokens_per_bs)
+        that are only available at that stage.
+        """
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        max_bs = self.server_args.cuda_graph_max_bs
+        max_loras = self.server_args.max_loras_per_batch
+        for module in self.model.modules():
+            if isinstance(module, FusedMoEWithLoRA):
+                self.lora_manager.init_cuda_graph_moe_buffers(
+                    max_bs, max_loras, self.dtype, module
+                )
+                logger.info(
+                    f"Pre-allocated shared MoE LoRA CUDA graph buffers "
+                    f"(max_bs={max_bs}, max_loras={max_loras})"
+                )
+                break
+
     def load_lora_adapter(self, lora_ref: LoRARef):
         """Load a new lora adapter from disk or huggingface."""
 
@@ -1764,7 +1852,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if pattern is not None and "M" not in pattern:
                 return None
         if isinstance(
-            config, FalconH1Config | NemotronHConfig | Lfm2Config | Lfm2MoeConfig
+            config,
+            FalconH1Config
+            | NemotronHConfig
+            | Lfm2Config
+            | Lfm2MoeConfig
+            | Lfm2VlConfig,
         ):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
@@ -1978,6 +2071,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if backend_str not in [
             "flashinfer_trtllm",
+            # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
+            # "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
@@ -2048,6 +2143,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.enable_torch_compile:
             set_torch_compile_config()
+            should_disable_torch_compile = not getattr(
+                self.model, "_can_torch_compile", True
+            )
+            if should_disable_torch_compile:
+                log_info_on_rank0(
+                    logger,
+                    "Transformers backend model reports it is not torch.compile "
+                    "compatible (e.g. dynamic rope scaling). Disabling torch.compile.",
+                )
+                self.server_args.enable_torch_compile = False
 
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture()
@@ -2068,7 +2173,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             is_encoder_decoder=self.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather_,
             seq_len_fill_value=seq_len_fill_value,
-            encoder_len_fill_value=0,
+            encoder_len_fill_value=(
+                getattr(self.model_config.hf_config, "max_source_positions", 0)
+                if self.model_config.is_encoder_decoder
+                else 0
+            ),
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
@@ -2379,6 +2488,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
+
+        # Some draft models (e.g. eagle3) don't have a standard 'layers' attribute
+        if not hasattr(language_model.model, "layers"):
+            logger.warning(
+                "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
+            )
+            return
+
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
@@ -2412,6 +2529,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if attn_layer is not None:
                 self.attention_layers.append(attn_layer)
+            elif hasattr(layer, "mixer"):
+                self.attention_layers.append(None)
 
             moe_block = None
             moe_fusion = None

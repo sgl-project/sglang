@@ -54,6 +54,8 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQLinearMethod",
     "FBGEMMFp8LinearMethod",
     "ModelOptFp8LinearMethod",
+    "ModelOptFp4LinearMethod",
+    "ComfyUIFp4LinearMethod",
     "IPEXAWQLinearMethod",
     "IPEXGPTQLinearMethod",
     "HQQMarlinMethod",
@@ -156,7 +158,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             F.linear(x, layer.weight, bias)
             if current_platform.is_amp_supported() or bias is None
             else F.linear(x, layer.weight, bias.to(x.dtype))
-        )  # NOTE: this line assumes that we are using amp when using cuda and is needed to account for the fact that amp isn't supported in mps
+        )  # NOTE: explicit dtype cast for bias is needed on platforms where amp isn't supported
         return output
 
 
