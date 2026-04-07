@@ -412,7 +412,7 @@ install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
 
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
-# Now FA3 support sm80/sm86/sm90
+# Now FA3 support sm80/sm86/sm90/sm100
 if (SGL_KERNEL_ENABLE_FA3)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
@@ -436,6 +436,18 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-Xcompiler=-Wconversion"
         "-Xcompiler=-fno-strict-aliasing"
     )
+
+    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+        list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_100a,code=sm_100a"
+            "-gencode=arch=compute_120a,code=sm_120a"
+        )
+        if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+            list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
+                "-gencode=arch=compute_103a,code=sm_103a"
+            )
+        endif()
+    endif()
 
     if (ENABLE_BELOW_SM90)
         list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
