@@ -168,12 +168,6 @@ class EagleDraftInputV2Mixin:
                 topk,
                 num_steps,
             )
-            maybe_detect_oob(
-                batch.out_cache_loc,
-                0,
-                req_to_token_pool.req_to_token.shape[1],
-                "prepare_for_v2_draft: out_cache_loc OOB",
-            )
 
         # Get a forward batch
         self.num_tokens_per_req = topk
@@ -237,12 +231,6 @@ class EagleVerifyInputV2Mixin:
                 batch_size=bs,
                 draft_token_num=self.draft_token_num,
                 device=device,
-            )
-            maybe_detect_oob(
-                batch.out_cache_loc,
-                0,
-                req_to_token_pool.req_to_token.shape[1],
-                "prepare_for_v2_verify: out_cache_loc OOB",
             )
 
             # Set mamba_track_indices for mamba prefix-cache state tracking

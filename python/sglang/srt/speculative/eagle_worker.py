@@ -533,12 +533,12 @@ class EAGLEWorker(TpModelWorker):
             pos_upper,
             f"draft_preprocess: positions OOB vs {pos_upper}",
         )
-        pool_size = batch.req_to_token_pool.req_to_token.shape[1]
+        kv_pool_size = self.token_to_kv_pool_allocator.size
         maybe_detect_oob(
             out_cache_loc,
             0,
-            pool_size,
-            f"draft_preprocess: out_cache_loc OOB vs pool_size={pool_size}",
+            kv_pool_size,
+            f"draft_preprocess: out_cache_loc OOB vs kv_pool_size={kv_pool_size}",
         )
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):

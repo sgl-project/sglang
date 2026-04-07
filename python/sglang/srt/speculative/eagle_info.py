@@ -139,7 +139,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         maybe_detect_oob(
             batch.out_cache_loc,
             0,
-            batch.req_to_token_pool.req_to_token.shape[1],
+            batch.token_to_kv_pool_allocator.size,
             "prepare_for_verify: out_cache_loc OOB",
         )
 
@@ -201,12 +201,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             None,
             kv_indices,
             req_to_token.size(1),
-        )
-        maybe_detect_oob(
-            kv_indices,
-            0,
-            req_to_token.shape[1],
-            f"generate_attn_arg_prefill: kv_indices OOB vs pool_size={req_to_token.shape[1]}",
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
