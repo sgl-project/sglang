@@ -1562,11 +1562,16 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        # When LoRA adapters wrap the projection, the fused GEMM path reads
+        # .weight directly and would bypass the LoRA delta.  Detect this by
+        # checking for the ``base_layer`` attribute that all LoRA wrappers add.
+        is_lora_wrapped = hasattr(self.fused_qkv_a_proj_with_mqa, "base_layer")
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
             and self.use_min_latency_fused_a_gemm
+            and not is_lora_wrapped
         ):
             qkv_latent = dsv3_fused_a_gemm(
                 hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
