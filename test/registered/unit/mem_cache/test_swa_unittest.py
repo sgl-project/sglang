@@ -17,8 +17,8 @@ from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestSWA(unittest.TestCase):

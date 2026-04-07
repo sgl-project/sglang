@@ -716,6 +716,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
             ),
         )
 
+        self.model = self.language_model.model
+
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
         # This solves the dtype mismatch issue when using device_map="auto" and torch_dtype.
         if hasattr(self.language_model, "dtype"):
@@ -764,6 +766,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
     @property
     def end_layer(self) -> int:
         return self.language_model.end_layer
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self.language_model._routed_experts_weights_of_layer.value
 
     def forward(
         self,

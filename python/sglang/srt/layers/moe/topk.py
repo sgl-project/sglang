@@ -129,6 +129,7 @@ if _is_cuda or _is_hip or _is_xpu:
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
+        from aiter.fused_moe import fused_topk as aiter_fused_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
@@ -511,12 +512,24 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
-        topk_softmax(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-        )
+        if _use_aiter:
+
+            # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
+            topk_weights, topk_ids = aiter_fused_topk(
+                hidden_states,
+                gating_output,
+                topk,
+                renormalize,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
+        else:
+            topk_softmax(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+            )
     elif scoring_func == "sigmoid":
         topk_sigmoid(
             topk_weights,
@@ -943,8 +956,9 @@ def _post_process_topk_ids(
         topk_ids=topk_ids,
     )
     if _is_cuda:
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        topk_ids = _biased_grouped_topk_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape

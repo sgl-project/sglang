@@ -29,11 +29,16 @@ def _json_safe(obj: Any):
     """
     Recursively convert objects to JSON-serializable forms.
     - Enums -> their name
+    - Callables -> stable module-qualified name
     - Sets/Tuples -> lists
     - Dicts/Lists -> recursively processed
     """
     if isinstance(obj, Enum):
         return obj.name
+    if callable(obj):
+        module = getattr(obj, "__module__", None)
+        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
+        return f"{module}.{qualname}" if module else qualname
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
@@ -123,7 +128,7 @@ class SamplingParams:
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 42
-    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: str | None = None  # None means use the pipeline/model default
 
     # Original dimensions (before VAE scaling)
     num_frames: int = 1  # Default for image models
@@ -247,6 +252,18 @@ class SamplingParams:
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+    def build_request_extra(self) -> dict[str, Any]:
+        """Return optional request-scoped extras for downstream pipeline stages."""
+        extra = {}
+        diffusers_kwargs = getattr(self, "diffusers_kwargs", None)
+        if diffusers_kwargs:
+            extra["diffusers_kwargs"] = diffusers_kwargs
+        return extra
+
+    def apply_request_extra(self, req: Any) -> None:
+        """Merge request extras (model specific, e.g., LTX2.3) into an already-created pipeline request."""
+        req.extra.update(self.build_request_extra())
 
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
@@ -649,7 +666,7 @@ class SamplingParams:
         add_argument(
             "--prompt-path",
             type=str,
-            help="Path to a text file containing the prompt",
+            help="Path to a text file containing prompts (one per line)",
         )
         add_argument(
             "--output-file-name",
@@ -680,7 +697,7 @@ class SamplingParams:
             "--generator-device",
             type=str,
             choices=["cuda", "musa", "cpu"],
-            help="Device for random generator (cuda, musa or cpu). Default: cuda",
+            help="Device for random generator (cuda, musa or cpu). Default: use the model-specific setting.",
         )
         add_argument(
             "--num-frames",
@@ -743,6 +760,12 @@ class SamplingParams:
             type=float,
             dest="guidance_scale_2",
             help="Secondary guidance scale for dual-guidance models (e.g., Wan low-noise expert)",
+        )
+        add_argument(
+            "--true-cfg-scale",
+            type=float,
+            dest="true_cfg_scale",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
         )
         add_argument(
             "--guidance-rescale",

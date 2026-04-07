@@ -9,7 +9,7 @@ SGLang diffusion features an end-to-end unified pipeline for accelerating diffus
 ## Key Features
 
 SGLang Diffusion has the following features:
-  - Broad model support: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image
+  - Broad model support: Wan series, FastWan series, Hunyuan, LTX-2, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image
   - Fast inference speed: enpowered by highly optimized kernel from sgl-kernel and efficient scheduler loop
   - Ease of use: OpenAI-compatible api, CLI, and python sdk support
   - Multi-platform support:
@@ -89,7 +89,7 @@ sglang generate \
   --save-output
 ```
 
-For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/cli.md).
+For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/api/cli.md).
 
 ## Contributing
 

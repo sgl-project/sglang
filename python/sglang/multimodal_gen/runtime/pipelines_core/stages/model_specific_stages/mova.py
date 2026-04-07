@@ -67,7 +67,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.utils.common import get_compiler_backend
 
+_is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
 
 
@@ -208,16 +210,31 @@ class MOVADenoisingStage(PipelineStage):
         """
         if not server_args.enable_torch_compile or not isinstance(module, nn.Module):
             return
-        try:
-            import torch._inductor.config as _inductor_cfg
+        compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
 
-            _inductor_cfg.reorder_for_compute_comm_overlap = True
-        except ImportError:
-            pass
-        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
-        logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
+        if current_platform.is_npu():
+            backend = get_compiler_backend()
+            compile_kwargs["backend"] = backend
+            compile_kwargs["dynamic"] = False
+            logger.info(
+                "Compiling %s with torchair backend on NPU",
+                module.__class__.__name__,
+            )
+        else:
+            try:
+                import torch._inductor.config as _inductor_cfg
+
+                _inductor_cfg.reorder_for_compute_comm_overlap = True
+            except ImportError:
+                pass
+            mode = os.environ.get(
+                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            )
+            compile_kwargs["mode"] = mode
+            logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
+
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(mode=mode, fullgraph=False, dynamic=None)
+        module.compile(**compile_kwargs)
 
     def _maybe_compile_dits(self, server_args: ServerArgs):
         if self._torch_compiled or not server_args.enable_torch_compile:
@@ -414,6 +431,7 @@ class MOVADenoisingStage(PipelineStage):
                     logger=logger,
                     metrics=metrics,
                     perf_dump_path_provided=perf_dump_path_provided,
+                    record_as_step=True,
                 ):
                     pair_t = paired_timesteps[idx_step]
                     if getattr(pair_t, "shape", None) == (2,):
@@ -698,7 +716,14 @@ class MOVADenoisingStage(PipelineStage):
 
         # Build visual freqs for full sequence
         visual_dit._init_freqs()
-        visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            visual_freqs = tuple(
+                freq.to(device=visual_x.device, dtype=torch.complex64)
+                for freq in visual_dit.freqs
+            )
+        else:
+            visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
         visual_freqs = (
             torch.cat(
                 [
@@ -718,18 +743,24 @@ class MOVADenoisingStage(PipelineStage):
 
         # Build audio freqs for full sequence
         self.audio_dit._init_freqs()
-        audio_freqs = (
-            torch.cat(
-                [
-                    self.audio_dit.freqs[0][:f].view(f, -1).expand(f, -1),
-                    self.audio_dit.freqs[1][:f].view(f, -1).expand(f, -1),
-                    self.audio_dit.freqs[2][:f].view(f, -1).expand(f, -1),
-                ],
-                dim=-1,
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            audio_freqs = tuple(
+                freq.to(device=audio_x.device, dtype=torch.complex64)
+                for freq in self.audio_dit.freqs
             )
-            .reshape(full_audio_seq_len, 1, -1)
-            .to(audio_x.device)
-        )
+        else:
+            audio_freqs = tuple(
+                freq.to(audio_x.device) for freq in self.audio_dit.freqs
+            )
+        audio_freqs = torch.cat(
+            [
+                audio_freqs[0][:f].view(f, -1).expand(f, -1),
+                audio_freqs[1][:f].view(f, -1).expand(f, -1),
+                audio_freqs[2][:f].view(f, -1).expand(f, -1),
+            ],
+            dim=-1,
+        ).reshape(full_audio_seq_len, 1, -1)
 
         # Shard sequences for SP
         visual_x, visual_pad_len = self._shard_sequence_for_sp(visual_x, dim=1)
