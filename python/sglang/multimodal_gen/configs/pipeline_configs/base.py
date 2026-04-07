@@ -97,10 +97,6 @@ class STA_Mode(str, Enum):
     NONE = None
 
 
-def preprocess_text(prompt: str) -> str:
-    return prompt
-
-
 def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
     raise NotImplementedError
 
@@ -173,6 +169,7 @@ class PipelineConfig:
     # controls the timestep embedding generation
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0
+    generator_device: str | None = None
     flow_shift: float | None = None
     disable_autocast: bool = False
 
@@ -206,8 +203,8 @@ class PipelineConfig:
     def postprocess_image(self, image):
         return image.last_hidden_state
 
-    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,)
+    preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
+        default_factory=lambda: (None,)
     )
 
     # get prompt_embeds from encoder output
@@ -359,7 +356,7 @@ class PipelineConfig:
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
         latents = sequence_model_parallel_all_gather(latents, dim=2)
         return latents
@@ -423,6 +420,9 @@ class PipelineConfig:
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
+
+    def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
+        raise NotImplementedError("not yet implemented")
 
     @staticmethod
     def add_cli_args(
@@ -808,7 +808,7 @@ class ImagePipelineConfig(PipelineConfig):
         sharded_tensor = sharded_tensor[:, rank_in_sp_group, :, :]
         return sharded_tensor, True
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         # For image latents [B, S_local, D], gather along sequence dim=1
         latents = sequence_model_parallel_all_gather(latents, dim=1)
         return latents
@@ -862,11 +862,11 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
         sharded = latents[:, :, h0:h1, :].contiguous()
         return sharded, True
 
-    def gather_latents_for_sp(self, latents):
+    def gather_latents_for_sp(self, latents, batch=None):
         if get_sp_world_size() <= 1:
             return latents
         if latents.dim() != 4:
-            return super().gather_latents_for_sp(latents)
+            return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
         return sequence_model_parallel_all_gather(latents, dim=2)
 

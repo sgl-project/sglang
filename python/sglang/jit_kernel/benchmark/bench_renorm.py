@@ -6,7 +6,10 @@ import triton
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 
 def torch_top_k_renorm_probs(probs, top_k):
@@ -79,31 +82,6 @@ def torch_top_p_renorm_probs(probs, top_p, eps=1e-5):
         return renorm_probs
 
 
-def torch_top_k_mask_logits(logits, top_k):
-    """Vectorized PyTorch implementation of top-k logits masking."""
-    batch_size, vocab_size = logits.shape
-
-    # Handle scalar or tensor k
-    if isinstance(top_k, int):
-        k_val = min(max(top_k, 1), vocab_size)
-        # Get top-k indices for all batches at once
-        _, topk_indices = torch.topk(logits, k_val, dim=1, largest=True)
-
-        # Create masked logits: start with -inf everywhere
-        masked_logits = torch.full_like(logits, float("-inf"))
-        # Scatter the top-k values back
-        masked_logits.scatter_(1, topk_indices, logits.gather(1, topk_indices))
-    else:
-        # Variable k per batch - need to handle separately
-        masked_logits = torch.full_like(logits, float("-inf"))
-        for i in range(batch_size):
-            k_val = min(max(top_k[i].item(), 1), vocab_size)
-            _, topk_indices = torch.topk(logits[i], k_val, largest=True)
-            masked_logits[i, topk_indices] = logits[i, topk_indices]
-
-    return masked_logits
-
-
 def calculate_diff_top_k_renorm(batch_size, vocab_size, k):
     """Compare Torch reference and SGLang kernel for top-k renorm correctness."""
     torch.manual_seed(42)
@@ -132,20 +110,6 @@ def calculate_diff_top_p_renorm(batch_size, vocab_size, p):
 
     torch_output = torch_top_p_renorm_probs(probs, top_p_tensor)
     sglang_output = sgl_kernel.top_p_renorm_prob(probs, top_p_tensor)
-
-    torch.testing.assert_close(torch_output, sglang_output, rtol=1e-3, atol=1e-3)
-
-
-def calculate_diff_top_k_mask(batch_size, vocab_size, k):
-    """Compare Torch reference and SGLang kernel for top-k mask correctness."""
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-
-    logits = torch.randn(batch_size, vocab_size, device=device) * 5
-    top_k_tensor = torch.full((batch_size,), k, device=device, dtype=torch.int32)
-
-    torch_output = torch_top_k_mask_logits(logits, top_k_tensor)
-    sglang_output = sgl_kernel.top_k_mask_logits(logits, top_k_tensor)
 
     torch.testing.assert_close(torch_output, sglang_output, rtol=1e-3, atol=1e-3)
 
@@ -228,38 +192,6 @@ def benchmark_top_p_renorm(batch_size, vocab_size, p, provider):
     return run_benchmark_no_cudagraph(fn)
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size", "vocab_size", "k"],
-        x_vals=configs_k,
-        line_arg="provider",
-        line_vals=["torch", "sglang"],
-        line_names=["Torch Reference", "SGL Kernel"],
-        styles=[("red", "-"), ("orange", "-")],
-        ylabel="us",
-        plot_name="top-k-mask-logits-performance",
-        args={},
-    )
-)
-def benchmark_top_k_mask(batch_size, vocab_size, k, provider):
-    # Skip invalid configurations
-    if k >= vocab_size:
-        return float("nan"), float("nan"), float("nan")
-
-    torch.manual_seed(42)
-    device = torch.device("cuda")
-
-    logits = torch.randn(batch_size, vocab_size, device=device) * 5
-    top_k_tensor = torch.full((batch_size,), k, device=device, dtype=torch.int32)
-
-    if provider == "torch":
-        fn = lambda: torch_top_k_mask_logits(logits.clone(), top_k_tensor)
-    elif provider == "sglang":
-        fn = lambda: sgl_kernel.top_k_mask_logits(logits.clone(), top_k_tensor)
-
-    return run_benchmark_no_cudagraph(fn)
-
-
 if __name__ == "__main__":
     print("=" * 60)
     print("Running correctness checks...")
@@ -288,15 +220,6 @@ if __name__ == "__main__":
         batch_size, vocab_size, p = cfg
         print(f"  ✓ Passed: batch_size={batch_size}, vocab_size={vocab_size}, p={p}")
 
-    print("\n3. Testing top_k_mask_logits...")
-    for cfg in test_configs_k:
-        batch_size, vocab_size, k = cfg
-        if k < vocab_size:  # Skip invalid configs
-            calculate_diff_top_k_mask(batch_size, vocab_size, k)
-            print(
-                f"  ✓ Passed: batch_size={batch_size}, vocab_size={vocab_size}, k={k}"
-            )
-
     print("\n" + "=" * 60)
     print("All correctness checks passed!")
     print("=" * 60)
@@ -310,9 +233,6 @@ if __name__ == "__main__":
 
     print("\n2. Benchmarking top_p_renorm_probs...")
     benchmark_top_p_renorm.run(print_data=True)
-
-    print("\n3. Benchmarking top_k_mask_logits...")
-    benchmark_top_k_mask.run(print_data=True)
 
     print("\n" + "=" * 60)
     print("Benchmarking complete!")

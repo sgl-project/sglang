@@ -27,7 +27,7 @@ pip install --upgrade pip
 export RUNNER_ALLOW_RUNASROOT=1
 ```
 
-Then follow https://github.com/sgl-project/sglang/settings/actions/runners/new?arch=x64&os=linux to run `config.sh`
+Then follow https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners to run `config.sh`
 
 **Notes**
 - Do not need to specify the runner group

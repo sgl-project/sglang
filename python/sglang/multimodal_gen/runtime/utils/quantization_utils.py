@@ -167,3 +167,134 @@ def get_metadata_from_safetensors_file(file_path: str):
             return metadata
     except Exception as e:
         logger.warning(e)
+
+
+def _build_nvfp4_config_from_safetensors_files(
+    file_paths: list[str],
+    param_names_mapping_dict: Optional[dict] = None,
+) -> Optional[QuantizationConfig]:
+    """Build a single NVFP4 config by aggregating metadata across multiple files.
+
+    Some checkpoints split BF16 fallback layers and NVFP4 layers across multiple
+    safetensors. Building the config from only the first matching file can
+    incorrectly exclude layers that are quantized in a later shard.
+    """
+    import torch
+
+    group_size = None
+    quantized_bfl_modules: set[str] = set()
+    non_quantized_bfl_modules: set[str] = set()
+    files_with_nvfp4_metadata: list[str] = []
+
+    for file_path in file_paths:
+        metadata = get_metadata_from_safetensors_file(file_path)
+        if not metadata:
+            continue
+
+        quant_config_str = metadata.get("_quantization_metadata")
+        if not quant_config_str:
+            continue
+
+        quant_config_dict = json.loads(quant_config_str)
+        if (
+            "format_version" not in quant_config_dict
+            or "layers" not in quant_config_dict
+        ):
+            continue
+
+        layers = quant_config_dict.get("layers", {})
+        file_quantized_modules = {
+            layer_name
+            for layer_name, layer_cfg in layers.items()
+            if isinstance(layer_cfg, dict) and layer_cfg.get("format") == "nvfp4"
+        }
+        if not file_quantized_modules:
+            continue
+
+        files_with_nvfp4_metadata.append(file_path)
+        quantized_bfl_modules.update(file_quantized_modules)
+
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            all_keys = set(f.keys())
+
+            if group_size is None:
+                for layer_name in file_quantized_modules:
+                    weight_key = f"{layer_name}.weight"
+                    scale_key = f"{layer_name}.weight_scale"
+                    if weight_key in all_keys and scale_key in all_keys:
+                        w = f.get_tensor(weight_key)
+                        s = f.get_tensor(scale_key)
+                        input_size = w.shape[1] * 2
+                        group_size = input_size // s.shape[1]
+                        break
+
+            for k in sorted(all_keys):
+                if not k.endswith(".weight"):
+                    continue
+                t = f.get_tensor(k)
+                if t.dtype != torch.uint8:
+                    non_quantized_bfl_modules.add(k[: -len(".weight")])
+
+    if not files_with_nvfp4_metadata:
+        return None
+
+    if group_size is None:
+        logger.warning(
+            "Could not infer group_size from NVFP4 safetensors: %s",
+            ", ".join(files_with_nvfp4_metadata),
+        )
+        return None
+
+    exclude_bfl_modules = sorted(non_quantized_bfl_modules - quantized_bfl_modules)
+
+    exclude_modules = []
+    if param_names_mapping_dict:
+        from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
+        mapping_fn = get_param_names_mapping(param_names_mapping_dict)
+        for module_bfl in exclude_bfl_modules:
+            mapped, _, _ = mapping_fn(f"{module_bfl}.weight")
+            exclude_modules.append(
+                mapped[: -len(".weight")] if mapped.endswith(".weight") else mapped
+            )
+    else:
+        exclude_modules = exclude_bfl_modules
+
+    try:
+        quant_cls = get_quantization_config("modelopt_fp4")
+        result = quant_cls.from_config(
+            {"quant_algo": "NVFP4", "group_size": group_size, "ignore": exclude_modules}
+        )
+        logger.info(
+            "Built NVFP4 quant config from %d safetensors: group_size=%d, %d excluded modules",
+            len(files_with_nvfp4_metadata),
+            group_size,
+            len(exclude_modules),
+        )
+        return result
+    except Exception as e:
+        logger.warning(
+            "Failed to build NVFP4 config from %s: %s",
+            ", ".join(files_with_nvfp4_metadata),
+            e,
+        )
+        return None
+
+
+def build_nvfp4_config_from_safetensors(
+    file_path: str,
+    param_names_mapping_dict: Optional[dict] = None,
+) -> Optional[QuantizationConfig]:
+    """Backward-compatible wrapper for a single safetensors file."""
+    return _build_nvfp4_config_from_safetensors_files(
+        [file_path], param_names_mapping_dict
+    )
+
+
+def build_nvfp4_config_from_safetensors_list(
+    file_paths: list[str],
+    param_names_mapping_dict: Optional[dict] = None,
+) -> Optional[QuantizationConfig]:
+    return _build_nvfp4_config_from_safetensors_files(
+        file_paths, param_names_mapping_dict
+    )
