@@ -774,26 +774,26 @@ class FlashInferAttnBackend(AttentionBackend):
 
         logits_soft_cap = layer.logit_cap
 
+        pool = forward_batch.token_to_kv_pool
+        _has_rotate = hasattr(pool, "rotate_q") and hasattr(pool, "_rotated_domain") and pool._rotated_domain
+
         q = q.contiguous()
+        q_3d = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        q_rot = pool.rotate_q(q_3d, layer.layer_id) if _has_rotate else q_3d
+
         if not self.forward_metadata.use_ragged:
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
             o = prefill_wrapper_paged.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                q_rot,
+                pool.get_kv_buffer(layer.layer_id),
                 causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
                 window_left=(
                     layer.sliding_window_size
                     if not (
@@ -807,14 +807,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            if _has_rotate:
+                o = pool.rotate_output(o, layer.layer_id)
         else:
-            # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
-            # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
-            # previously cached context without re-materializing KV tensors (e.g., the
-            # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
+            # If k/v are not explicitly provided, fall back to the KV cache stored in
+            # forward_batch.token_to_kv_pool for this layer.
             if k is None and v is None:
-                k = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
-                v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
+                k = pool.get_kv_buffer(layer.layer_id)[0]
+                v = pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
             if (
                 layer.is_cross_attention
@@ -825,11 +825,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 save_kv_cache = False
 
             if self.forward_metadata.extend_no_prefix:
-                # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
-                # The FlashInfer head_dim limitation itself is tracked here:
-                # https://github.com/flashinfer-ai/flashinfer/issues/1048
                 o = self.prefill_wrapper_ragged.forward(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q_3d,
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
@@ -839,30 +836,32 @@ class FlashInferAttnBackend(AttentionBackend):
 
             else:
                 if not self.is_dllm_model:
-                    # TODO: design a better interface
-                    # For other models, use causal attention for the ragged part as previously
                     causal = True
 
+                # Ragged part: new tokens, raw K/V — no rotation
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q_3d,
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
+                # Paged part: cached KV from pool — rotate Q, de-rotate output
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    q_rot,
+                    pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
+                if _has_rotate:
+                    o2 = pool.rotate_output(o2, layer.layer_id)
 
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
@@ -894,16 +893,25 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Call the wrapped function
+        pool = forward_batch.token_to_kv_pool
+        _has_rotate = hasattr(pool, "_rotated_domain") and pool._rotated_domain
+
+        q_attn = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if _has_rotate:
+            q_attn = pool.rotate_q(q_attn, layer.layer_id)
+
+        # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
         o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            q_attn,
+            pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
+
+        if _has_rotate:
+            o = pool.rotate_output(o, layer.layer_id)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -1124,6 +1132,12 @@ class FlashInferIndicesUpdaterDecode:
                     kv_indices[:kv_last_index]
                 )
             )
+
+        # Notify the KV pool which positions will be read (for selective dequant).
+        kv_last_index = kv_indptr[-1]
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if hasattr(kv_pool, "set_active_kv_indices"):
+            kv_pool.set_active_kv_indices(kv_indices[:kv_last_index])
 
         global global_override_indptr_cpu
         locally_override = False
@@ -1509,6 +1523,12 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_len=token_pos_in_items_len,
             max_item_len_ptr=max_item_len_ptr,
         )
+
+        # Notify the KV pool which positions will be read (for selective dequant).
+        kv_last_index = kv_indptr[-1]
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if hasattr(kv_pool, "set_active_kv_indices"):
+            kv_pool.set_active_kv_indices(kv_indices[:kv_last_index])
 
 
 class FlashInferMultiStepDraftBackend:

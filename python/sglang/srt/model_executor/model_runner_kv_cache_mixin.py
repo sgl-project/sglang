@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.turboquant_memory_pool import MHATokenToKVPoolTurboQuant
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -73,6 +74,40 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
+        # TurboQuant: bit-packed indices + float32 norm per K and V head,
+        # plus a pair of shared workspace buffers (one K, one V) that are
+        # reused across layers for dequantized data.
+        if getattr(self, "_turboquant_enabled", False):
+            from sglang.srt.layers.quantization.turboquant_kernels import (
+                _next_power_of_2,
+                compute_packed_dim,
+                compute_packed_dim_mixed,
+                parse_bits,
+            )
+
+            head_dim = self.model_config.head_dim
+            v_head_dim = getattr(self.model_config, "v_head_dim", head_dim) or head_dim
+            num_kv_heads = self.model_config.get_num_kv_heads(
+                get_attention_tp_size()
+            )
+            bits = getattr(self, "_turboquant_bits", 4.0)
+            mode = getattr(self, "_turboquant_mode", "mse")
+            is_mixed, bits_hi, _ = parse_bits(bits)
+            # packed indices + norms (2 norms per head for mixed, 1 for uniform)
+            norm_bytes = 8 if is_mixed else 4  # float32 per norm
+            per_head_compressed = compute_packed_dim_mixed(head_dim, bits) + norm_bytes
+            # QJL buffers for prod mode (1-bit signs + float32 residual norm)
+            if mode == "prod" and not is_mixed:
+                padded_dim = _next_power_of_2(head_dim)
+                per_head_compressed += compute_packed_dim(padded_dim, 1) + 4
+            # Compressed storage is per-layer (K + V)
+            cell_size = num_kv_heads * per_head_compressed * 2 * num_layers
+            # Shared workspace buffers (one K + one V, NOT per-layer)
+            dtype_size = torch._utils._element_size(self.dtype)
+            cell_size += num_kv_heads * head_dim * dtype_size  # K workspace
+            cell_size += num_kv_heads * v_head_dim * dtype_size  # V workspace
+            return cell_size
+
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             cell_size = (
@@ -678,7 +713,28 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                if getattr(self, "_turboquant_enabled", False):
+                    self.token_to_kv_pool = MHATokenToKVPoolTurboQuant(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.dtype,  # working dtype, not storage dtype
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        bits=getattr(self, "_turboquant_bits", 4.0),
+                        mode=getattr(self, "_turboquant_mode", "mse"),
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
+                elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,

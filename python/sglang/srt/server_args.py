@@ -333,6 +333,8 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    turboquant_bits: float = 4.0
+    turboquant_mode: str = "mse"
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -3930,8 +3932,21 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1", "turboquant"],
+            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+. "turboquant" for TurboQuant 3-4 bit KV cache compression (Google, ICLR 2026).',
+        )
+        parser.add_argument(
+            "--turboquant-bits",
+            type=float,
+            default=ServerArgs.turboquant_bits,
+            help="TurboQuant bit-width: 1, 2, 3, 4 (uniform) or 2.5, 3.5 (mixed-precision). Default 4.",
+        )
+        parser.add_argument(
+            "--turboquant-mode",
+            type=str,
+            default=ServerArgs.turboquant_mode,
+            choices=["mse", "prod"],
+            help='TurboQuant mode: "mse" for MSE-optimal, "prod" for QJL inner-product. Default "mse".',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
