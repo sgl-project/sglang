@@ -28,7 +28,7 @@ MEMORY_THRESHOLD_PCT = 10
 
 # Patterns matching SGLang process command lines (equivalent to pgrep -f in killall_sglang.sh)
 _SGLANG_PROCESS_PATTERNS = re.compile(
-    r"sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::"
+    r"sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::|sglang serve"
 )
 
 # Boxed output helpers

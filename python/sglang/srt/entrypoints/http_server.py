@@ -127,7 +127,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
-    PinPrefixReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -342,7 +341,6 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager,
             _global_state.template_manager,
             enable_prompt_tokens_details=True,
-            enable_force_include_usage=True,
             tool_server=tool_server,
         )
     except Exception:
@@ -735,6 +733,64 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     )
 
 
+@app.post("/add_external_corpus")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def add_external_corpus(request: Request):
+    """Add an external corpus for ngram speculative decoding."""
+    from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
+
+    try:
+        obj = AddExternalCorpusReqInput(**(await request.json()))
+    except TypeError as e:
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    result = await _global_state.tokenizer_manager.add_external_corpus(obj)
+    return ORJSONResponse(
+        {
+            "success": result.success,
+            "corpus_id": result.corpus_id,
+            "message": result.message,
+            "loaded_token_count": result.loaded_token_count,
+        },
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/remove_external_corpus")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def remove_external_corpus(request: Request):
+    """Remove an external corpus by ID."""
+    body = await request.json()
+    corpus_id = body.get("corpus_id")
+    if not corpus_id:
+        return ORJSONResponse(
+            {"success": False, "message": "corpus_id is required."},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    result = await _global_state.tokenizer_manager.remove_external_corpus(corpus_id)
+    return ORJSONResponse(
+        {"success": result.success, "message": result.message},
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.get("/list_external_corpora")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_external_corpora():
+    """List all active external corpora."""
+    result = await _global_state.tokenizer_manager.list_external_corpora()
+    return ORJSONResponse(
+        {
+            "success": result.success,
+            "corpus_ids": result.corpus_ids,
+            "message": result.message,
+        },
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend_deprecated():
@@ -843,25 +899,6 @@ async def hicache_storage_backend_status():
         "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
         "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
     }
-
-
-@app.api_route("/hicache/pin_prefix", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pin_prefix(obj: PinPrefixReqInput):
-    """Pin a prefix by token_ids to resist eviction."""
-    if not _global_state.tokenizer_manager.server_args.admin_api_key:
-        return _admin_api_key_missing_response()
-    ret = await _global_state.tokenizer_manager.pin_prefix(
-        obj.token_ids, obj.ttl_seconds
-    )
-    return ORJSONResponse(
-        content={
-            "status": "ok" if ret.success else "error",
-            "nodes_pinned": ret.nodes_pinned,
-            "message": ret.message,
-        },
-        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
-    )
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])

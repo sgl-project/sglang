@@ -1283,7 +1283,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                         output_dim, start_idx, shard_size
                     )
 
-        # Special case for for AQLM codebooks.
+        # Special case for AQLM codebooks.
         elif is_metadata:
             # metadata indicates fixed size concatenated along dim 0
             shard_size = loaded_weight.shape[0]
