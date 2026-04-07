@@ -17,7 +17,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -183,6 +186,20 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner.server_args.enable_flashinfer_pod_attention
             and model_runner.server_args.enable_mixed_chunk
         )
+
+        # POD attention does not support logits_soft_cap (flashinfer hardcodes it
+        # to 0.0 in the POD wrapper). Disable POD for models that use it.
+        if self.enable_pod_attention:
+            hf_config = model_runner.model_config.hf_config
+            if getattr(
+                hf_config, "attn_logit_softcapping", None
+            ) is not None or getattr(hf_config, "logits_soft_cap", None):
+                logger.warning(
+                    "Disabling POD attention: model uses logits_soft_cap which is "
+                    "not supported by flashinfer's BatchPODWithPagedKVCacheWrapper."
+                )
+                self.enable_pod_attention = False
+        self.page_size = model_runner.page_size
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -488,6 +505,8 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata_pod_attention = None
+        self._pod_plan_done = False
+
         if (
             self.enable_pod_attention
             and not self.skip_prefill
@@ -500,22 +519,12 @@ class FlashInferAttnBackend(AttentionBackend):
             num_prefill_reqs = bs - num_decode_reqs
 
             if num_prefill_reqs > 0 and num_decode_reqs > 0:
-                self.indices_updater_pod_attention.update(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_cpu,
-                    forward_batch.seq_lens_sum,
-                    prefix_lens,
-                    pod_attention_wrappers=self.pod_attention_wrappers,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=None,
-                    num_decode_reqs=num_decode_reqs,
-                )
-
                 self.forward_metadata_pod_attention = PodAttentionMetadata(
                     self.pod_attention_wrappers
                 )
-                return
+                # Do NOT return here — fall through to set self.forward_metadata
+                # as fallback for backends that use forward_extend instead of
+                # forward_mixed (e.g. hybrid_linear_attn_backend).
 
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -1005,26 +1014,13 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        # If PodAttentionMetadata is not available, fallback to extend path
         if self.forward_metadata_pod_attention is None:
             return self.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache=save_kv_cache
             )
 
-        pod_attention_wrapper = (
-            self.forward_metadata_pod_attention.pod_attention_wrappers[
-                self._get_wrapper_idx(layer)
-            ]
-        )
-
         if not q.is_contiguous():
             q = q.contiguous()
-
-        num_decoding_reqs = forward_batch.num_decoding_reqs or 0
-        num_prefill_tokens = forward_batch.extend_num_tokens - num_decoding_reqs
-
-        q_p = q[:num_prefill_tokens].view(-1, layer.tp_q_head_num, layer.head_dim)
-        q_d = q[num_prefill_tokens:].view(-1, layer.tp_q_head_num, layer.head_dim)
 
         paged_kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -1033,31 +1029,75 @@ class FlashInferAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
             )
 
-        o_p, o_d = pod_attention_wrapper.run(
+        # First layer of batch: plan + cache all per-batch constants.
+        # Subsequent layers skip everything inside this block.
+        if not self._pod_plan_done:
+            num_decoding_reqs = forward_batch.num_decoding_reqs or 0
+            num_prefill_tokens = forward_batch.extend_num_tokens - num_decoding_reqs
+            k_scale = layer.k_scale_float
+
+            updater = self.indices_updater_pod_attention
+            sm_scale = updater._sm_scale
+            if sm_scale is None:
+                sm_scale = layer.scaling
+                if k_scale != 1.0:
+                    sm_scale = sm_scale * k_scale
+
+            updater.update(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                forward_batch.extend_prefix_lens,
+                pod_attention_wrappers=self.pod_attention_wrappers,
+                encoder_lens=forward_batch.encoder_lens,
+                spec_info=None,
+                num_decode_reqs=num_decoding_reqs,
+                sm_scale=sm_scale,
+            )
+
+            # Cache per-batch constants for layers 2..N
+            hidden_size = layer.tp_q_head_num * layer.head_dim
+            q_shape = (-1, layer.tp_q_head_num, layer.head_dim)
+            total_tokens = num_prefill_tokens + num_decoding_reqs
+
+            self._pod_wrapper = (
+                self.forward_metadata_pod_attention.pod_attention_wrappers[
+                    self._get_wrapper_idx(layer)
+                ]
+            )
+            self._pod_n_p = num_prefill_tokens
+            self._pod_q_shape = q_shape
+            self._pod_hidden = hidden_size
+            self._pod_v_scale = layer.v_scale_float
+
+            o = _get_pod_attention_output_buffer(
+                total_tokens * hidden_size, q.dtype, q.device
+            )
+            self._pod_out = o.view(total_tokens, hidden_size)
+            self._pod_out_p = self._pod_out[:num_prefill_tokens].view(q_shape)
+            self._pod_out_d = self._pod_out[num_prefill_tokens:].view(q_shape)
+
+            self._pod_plan_done = True
+
+        # Hot path: minimal per-layer work
+        q_p = q[: self._pod_n_p].view(self._pod_q_shape)
+        q_d = q[self._pod_n_p :].view(self._pod_q_shape)
+
+        self._pod_wrapper.run(
             q_p,
             paged_kv_cache,
             q_d,
             paged_kv_cache,
             causal_p=True,
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
+            out_p=self._pod_out_p,
+            out_d=self._pod_out_d,
         )
 
-        num_tokens_p = o_p.size(0)
-        num_tokens_d = o_d.size(0)
-        hidden_size = layer.tp_q_head_num * layer.head_dim
+        if self._pod_v_scale != 1.0:
+            self._pod_out.mul_(self._pod_v_scale)
 
-        o = _get_pod_attention_output_buffer(
-            (num_tokens_p + num_tokens_d) * hidden_size, o_p.dtype, o_p.device
-        )
-        o = o.view(num_tokens_p + num_tokens_d, hidden_size)
-
-        if num_tokens_p > 0:
-            o[:num_tokens_p] = o_p.reshape(num_tokens_p, hidden_size)
-        if num_tokens_d > 0:
-            o[num_tokens_p:] = o_d.reshape(num_tokens_d, hidden_size)
-
-        return o.view(-1, hidden_size)
+        return self._pod_out.view(-1, self._pod_hidden)
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
@@ -1204,16 +1244,19 @@ class FlashInferIndicesUpdaterDecode:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
+        # Cache encoder_lens on CPU to avoid GPU→CPU transfer per call
+        encoder_lens_cpu = encoder_lens.cpu() if encoder_lens is not None else None
         for wrapper_id in range(2):
             if wrapper_id == 0:
-                # Normal attention
                 paged_kernel_lens = seq_lens
                 kv_start_idx = encoder_lens
+                kv_lens_cpu = seq_lens_cpu
             else:
-                # Cross attention
+                # Cross-attention: attend to encoder tokens only
                 paged_kernel_lens = encoder_lens
                 kv_start_idx = torch.zeros_like(encoder_lens)
                 seq_lens_sum = encoder_lens.sum().item()
+                kv_lens_cpu = encoder_lens_cpu
 
             self.call_begin_forward(
                 decode_wrappers[wrapper_id],
@@ -1223,7 +1266,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.kv_indptr[wrapper_id],
                 kv_start_idx,
                 spec_info,
-                seq_lens_cpu=seq_lens_cpu,
+                seq_lens_cpu=kv_lens_cpu,
             )
 
     def call_begin_forward(
@@ -1345,6 +1388,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.q_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
+        self.page_size = attn_backend.page_size
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1534,8 +1578,13 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
+            # Reserve extra space in kv_indices for a potential piecewise CUDA graph
+            # dummy request (see below). Worst case: static_num_tokens extra pages.
+            fwd_ctx = get_forward_context()
+            pcg_num_tokens = fwd_ctx.num_tokens if fwd_ctx is not None else None
+            extra_kv = pcg_num_tokens if pcg_num_tokens is not None else 0
             kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
+                paged_kernel_lens_sum + extra_kv + 256,
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
@@ -1550,6 +1599,40 @@ class FlashInferIndicesUpdaterPrefill:
             )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
+
+            # Piecewise CUDA graph padding: input_ids are padded to static_num_tokens,
+            # so q.shape[0] == static_num_tokens but qo_indptr[-1] == actual tokens.
+            # Append a dummy request for the padding tokens so that
+            # qo_indptr[-1] == static_num_tokens, satisfying flashinfer's shape check
+            # without corrupting the causal masks of real requests.
+            # The dummy request's KV indices all point to slot 0 (a scratch location);
+            # its attention output is discarded via the [:raw_num_tokens] slice in replay.
+            bs_eff = bs
+            # extend_num_tokens is a Python int (== sum of seq_lens - prefix_lens),
+            # and paged_kernel_lens_sum is also a Python int (== kv_indptr[-1]),
+            # so this block requires no CPU-GPU synchronisation.
+            actual_qo_tokens = (
+                fwd_ctx.forward_batch.extend_num_tokens if fwd_ctx is not None else None
+            )
+            if (
+                pcg_num_tokens is not None
+                and actual_qo_tokens is not None
+                and pcg_num_tokens > actual_qo_tokens
+            ):
+                pad_tokens = pcg_num_tokens - actual_qo_tokens
+                num_dummy_pages = (pad_tokens + self.page_size - 1) // self.page_size
+                kv_start = (
+                    paged_kernel_lens_sum  # equals kv_indptr[-1], no .item() needed
+                )
+                kv_indices[kv_start : kv_start + num_dummy_pages] = 0
+                qo_indptr = torch.cat(
+                    [qo_indptr, qo_indptr.new_tensor([pcg_num_tokens])]
+                )
+                kv_indptr = torch.cat(
+                    [kv_indptr, kv_indptr.new_tensor([kv_start + num_dummy_pages])]
+                )
+                bs_eff = bs + 1
+
             custom_mask = None
         else:
             assert isinstance(spec_info, SpecInput)
@@ -1561,6 +1644,7 @@ class FlashInferIndicesUpdaterPrefill:
                     self.req_to_token,
                 )
             )
+            bs_eff = bs
 
         # extend part
         if use_ragged:
@@ -1602,7 +1686,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr,
             kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            self.kv_last_page_len[:bs_eff],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
@@ -1632,6 +1716,8 @@ class FlashInferIndicesUpdaterPodAttention:
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.attn_backend = attn_backend
+        # sm_scale will be set from layer.scaling on first forward_mixed call
+        self._sm_scale = None
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -1699,6 +1785,7 @@ class FlashInferIndicesUpdaterPodAttention:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         num_decode_reqs: int = 0,
+        sm_scale: Optional[float] = None,
     ):
         pod_attention_wrappers = pod_attention_wrappers or self.pod_attention_wrappers
         self.call_begin_forward(
@@ -1708,6 +1795,7 @@ class FlashInferIndicesUpdaterPodAttention:
             prefix_lens,
             num_decode_reqs,
             spec_info,
+            sm_scale=sm_scale,
         )
 
     def call_begin_forward(
@@ -1718,7 +1806,11 @@ class FlashInferIndicesUpdaterPodAttention:
         prefix_lens: torch.Tensor,
         num_decode_reqs: int,
         spec_info: Optional[SpecInput],
+        sm_scale: Optional[float] = None,
     ):
+        if sm_scale is not None:
+            self._sm_scale = sm_scale
+
         if spec_info is None:
             bs = len(seq_lens)
             bs_p = bs - num_decode_reqs
@@ -1741,12 +1833,18 @@ class FlashInferIndicesUpdaterPodAttention:
             kv_indptr_p = self.kv_indptr[0]
             kv_indptr_d = self.kv_indptr[1]
 
+            # Single cumsum on full seq_lens, then narrow for prefill/decode.
+            # Decode indptr needs offset correction since full_cumsum includes
+            # the prefix sum of prefill seq_lens.
+            if bs_p > 0 or bs_d > 0:
+                full_cumsum = torch.cumsum(seq_lens, dim=0)
             if bs_p > 0:
-                cumsum_p = torch.cumsum(seq_lens_p, dim=0)
-                kv_indptr_p[1 : bs_p + 1] = cumsum_p
+                kv_indptr_p[1 : bs_p + 1] = full_cumsum.narrow(0, 0, bs_p)
             if bs_d > 0:
-                cumsum_d = torch.cumsum(seq_lens_d, dim=0)
-                kv_indptr_d[1 : bs_d + 1] = cumsum_d
+                decode_offset = full_cumsum[bs_p - 1] if bs_p > 0 else 0
+                kv_indptr_d[1 : bs_d + 1] = (
+                    full_cumsum.narrow(0, bs_p, bs_d) - decode_offset
+                )
 
             if bs_p > 0:
                 kv_indptr_p_buf = kv_indptr_p[: bs_p + 1]
@@ -1818,6 +1916,7 @@ class FlashInferIndicesUpdaterPodAttention:
             1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
+            sm_scale=self._sm_scale,
         )
 
 

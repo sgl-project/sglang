@@ -148,15 +148,18 @@ def create_mm_data_row(
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
 
-    use_raw_prompt = backend in [
-        "sglang",
-        "sglang-oai",
-        "sglang-oai-chat",
-        "vllm",
-        "vllm-chat",
-        "lmdeploy",
-        "lmdeploy-chat",
-    ]
+    supported_backends = ["sglang", "sglang-native", "sglang-oai-chat"]
+    if backend not in supported_backends:
+        raise ValueError(
+            f"Image dataset only supports backends: {supported_backends}, "
+            f"got '{backend}'."
+        )
+
+    # sglang-oai-chat: server's chat handler applies chat template, so send raw text.
+    # sglang/sglang-native: /generate does not apply chat template, so send prompt_str
+    #         which contains image placeholder tokens needed by the multimodal processor.
+    use_raw_prompt = backend == "sglang-oai-chat"
+
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,

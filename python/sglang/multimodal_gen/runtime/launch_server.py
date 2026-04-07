@@ -88,7 +88,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         result_pipes_from_slaves_w.append(w)
 
     # Launch all worker processes
-    master_port = server_args.master_port or (server_args.master_port + 100)
+    master_port = server_args.master_port
     scheduler_pipe_readers = []
     scheduler_pipe_writers = []
 

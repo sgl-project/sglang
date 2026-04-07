@@ -18,6 +18,17 @@ if current_platform.is_npu():
 logger = init_logger(__name__)
 
 
+def _resolve_profiler_log_dir(log_dir: str | None) -> str:
+    if log_dir is not None:
+        return log_dir
+
+    diffusion_profiler_dir = os.getenv("SGLANG_DIFFUSION_TORCH_PROFILER_DIR")
+    if diffusion_profiler_dir:
+        return diffusion_profiler_dir
+
+    return os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+
+
 class SGLDiffusionProfiler:
     """
     A wrapper around torch.profiler to simplify usage in pipelines.
@@ -43,11 +54,7 @@ class SGLDiffusionProfiler:
         self.rank = rank
         self.full_profile = full_profile
 
-        self.log_dir = (
-            log_dir
-            if log_dir is not None
-            else os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
-        )
+        self.log_dir = _resolve_profiler_log_dir(log_dir)
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)

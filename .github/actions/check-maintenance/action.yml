@@ -1,10 +1,11 @@
 name: Check Maintenance Mode
-description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label, or env SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only).
+description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label, or env SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only). Merging non-CI-fix PRs is prohibited during maintenance mode; in severe cases, merge permissions may be revoked.
 
 inputs:
   github-token:
     description: GitHub token for API access
-    required: true
+    required: false
+    default: ${{ github.token }}
 
 runs:
   using: composite
@@ -45,10 +46,12 @@ runs:
           "## ⚠️ CI Maintenance Mode is Active" \
           "The CI infrastructure is currently under maintenance." \
           "All PR CI runs are paused until maintenance is complete." \
+          "**Merging non-CI-fix PRs is prohibited during maintenance mode.** In severe cases, merge permissions may be revoked." \
           "You might also experience unexpected failures during this period." \
           "The team is working on the issue and will update the status as soon as possible." \
           "" \
           "What should you do?" \
+          "- **Do NOT merge non-CI-fix PRs** until maintenance mode is lifted" \
           "- Check back later (~12 hours)" \
           "- Follow CI Maintenance Mode issue: https://github.com/$REPO/issues/$MAINTENANCE_ISSUE for status updates")
 

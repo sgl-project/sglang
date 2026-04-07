@@ -14,6 +14,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
@@ -69,6 +70,7 @@ class FunctionCallParser:
         "interns1": InternlmDetector,
         "hermes": HermesDetector,
         "gigachat3": GigaChat3Detector,
+        "gemma4": Gemma4Detector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):
@@ -184,7 +186,9 @@ class FunctionCallParser:
         )
 
     def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
+        self,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+        parallel_tool_calls: bool = True,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -210,5 +214,7 @@ class FunctionCallParser:
             tag = self.get_structure_tag()
             return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            json_schema = get_json_schema_constraint(
+                self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
+            )
             return ("json_schema", json_schema)

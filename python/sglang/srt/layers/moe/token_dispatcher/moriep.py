@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
@@ -170,22 +171,9 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
     }
 
 
-@lru_cache(maxsize=2)
-def _get_mori_dispatch_quant_flags():
-    fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
-    fp4_dispatch = get_bool_env_var("SGLANG_MORI_FP4_DISP", "False")
-    if fp8_dispatch and fp4_dispatch:
-        logger.warning(
-            "Both SGLANG_MORI_FP8_DISP and SGLANG_MORI_FP4_DISP are set to True. "
-            "Using SGLANG_MORI_FP4_DISP and ignoring SGLANG_MORI_FP8_DISP."
-        )
-        fp8_dispatch = False
-    return fp8_dispatch, fp4_dispatch
-
-
 # init_mori_op only needs do once in model initial stage
 # use lru_cache to reuse the same mori_op instance to avoid the init overhead for mori
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def init_mori_op(
     group,
     router_topk,
@@ -196,6 +184,8 @@ def init_mori_op(
     num_max_dispatch_tokens_per_rank,
     deepep_mode,
     instance_id=0,
+    fp8_dispatch=False,
+    fp4_dispatch=False,
 ):
 
     import mori
@@ -228,12 +218,6 @@ def init_mori_op(
     if async_mode:
         mode = EpMode.LOW_LATENCY
 
-    logger.info(
-        f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
-        f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
-        f"{router_topk=} {mode=}"
-    )
-
     cfg = get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank)[mode]
 
     kernel_type = cfg.kernel_type
@@ -245,8 +229,6 @@ def init_mori_op(
     scale_dim = 1
     data_type = fp8_dtype
     scale_type_size = torch.float32.itemsize
-
-    fp8_dispatch, fp4_dispatch = _get_mori_dispatch_quant_flags()
 
     if fp8_dispatch:
         scale_dim = hidden_size // 128
@@ -271,6 +253,13 @@ def init_mori_op(
     combine_quant_type = "none"
     if get_bool_env_var("SGLANG_MORI_FP8_COMB", "False"):
         combine_quant_type = "fp8_direct_cast"
+
+    logger.info(
+        f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
+        f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
+        f"{router_topk=} {mode=} {fp8_dispatch=} {fp4_dispatch=} "
+        f"{combine_quant_type=}"
+    )
 
     mori_config = mori.ops.EpDispatchCombineConfig(
         rank=rank,
@@ -348,22 +337,54 @@ class _MoriEPDispatcherImplBase:
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
 
-        self.mori_op = init_mori_op(
-            self.group,
-            self.router_topk,
-            self.num_experts,
-            self.num_local_experts,
-            self.hidden_size,
-            self.params_dtype,
-            self.num_max_dispatch_tokens_per_rank,
-            self.deepep_mode,
-            self.instance_id,
-        )
+        self._mori_op = None
+        self.fp8_dispatch = False
+        self.fp4_dispatch = False
 
         self.quant_config: Optional[dict] = None
 
         self.overlap_args: Optional[CombineOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
+
+    @property
+    def mori_op(self):
+        if self._mori_op is None:
+            # If set_quant_config was never called, apply env var override now
+            if self.quant_config is None:
+                self._apply_dispatch_dtype_override()
+            self._mori_op = init_mori_op(
+                self.group,
+                self.router_topk,
+                self.num_experts,
+                self.num_local_experts,
+                self.hidden_size,
+                self.params_dtype,
+                self.num_max_dispatch_tokens_per_rank,
+                self.deepep_mode,
+                self.instance_id,
+                self.fp8_dispatch,
+                self.fp4_dispatch,
+            )
+        return self._mori_op
+
+    def _apply_dispatch_dtype_override(self):
+        """Apply env var override to fp8_dispatch/fp4_dispatch flags."""
+        if "SGLANG_MORI_DISPATCH_DTYPE" in os.environ:
+            dispatch_dtype = os.environ["SGLANG_MORI_DISPATCH_DTYPE"].lower()
+            if dispatch_dtype != "auto":
+                self.fp8_dispatch = dispatch_dtype == "fp8"
+                self.fp4_dispatch = dispatch_dtype == "fp4"
+        elif (
+            "SGLANG_MORI_FP8_DISP" in os.environ or "SGLANG_MORI_FP4_DISP" in os.environ
+        ):
+            # Deprecated: will be removed in a future release
+            logger.warning_once(
+                "SGLANG_MORI_FP8_DISP and SGLANG_MORI_FP4_DISP are deprecated "
+                "and will be removed in a future release. "
+                "Use SGLANG_MORI_DISPATCH_DTYPE=auto|bf16|fp8|fp4 instead."
+            )
+            self.fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
+            self.fp4_dispatch = get_bool_env_var("SGLANG_MORI_FP4_DISP", "False")
 
     def dispatch_a(
         self,
@@ -388,6 +409,19 @@ class _MoriEPDispatcherImplBase:
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
+        # Auto-detect dispatch quantization from weight dtype
+        weight_dtype = quant_config.get("weight_dtype", None)
+        if weight_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            self.fp8_dispatch = True
+            self.fp4_dispatch = False
+        elif weight_dtype == torch.float4_e2m1fn_x2:
+            self.fp8_dispatch = False
+            self.fp4_dispatch = True
+        else:
+            self.fp8_dispatch = False
+            self.fp4_dispatch = False
+        # Apply env var override immediately so dispatch_a sees correct flags
+        self._apply_dispatch_dtype_override()
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
@@ -432,7 +466,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        fp8_dispatch, fp4_dispatch = _get_mori_dispatch_quant_flags()
+        fp8_dispatch, fp4_dispatch = self.fp8_dispatch, self.fp4_dispatch
 
         if fp8_dispatch:
             # FP8 quant
@@ -652,7 +686,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         return combined_hidden_states, done_event
 
     def set_quant_config(self, quant_config: dict):
-        self.quant_config = quant_config
+        super().set_quant_config(quant_config)
 
 
 class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
@@ -678,7 +712,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        fp8_dispatch, fp4_dispatch = _get_mori_dispatch_quant_flags()
+        fp8_dispatch, fp4_dispatch = self.fp8_dispatch, self.fp4_dispatch
 
         if fp8_dispatch:
             # FP8 quant
@@ -828,7 +862,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         return combined_hidden_states
 
     def set_quant_config(self, quant_config: dict):
-        self.quant_config = quant_config
+        super().set_quant_config(quant_config)
 
 
 @dataclass

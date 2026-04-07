@@ -451,7 +451,7 @@ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
     sys.settrace(partial(_trace_calls, log_file_path, root_dir))
 
 
-def set_uvicorn_logging_configs():
+def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
     LOGGING_CONFIG["formatters"]["default"][
@@ -462,6 +462,59 @@ def set_uvicorn_logging_configs():
         "fmt"
     ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+    # Install access log path filter into LOGGING_CONFIG so it survives
+    # uvicorn's internal dictConfig() call during startup.
+    prefixes = getattr(server_args, "uvicorn_access_log_exclude_prefixes", None)
+    if prefixes:
+        _install_access_log_filter(LOGGING_CONFIG, prefixes)
+
+
+def _install_access_log_filter(config: dict, prefixes: list[str]):
+    """Register a path-based access log filter into uvicorn's LOGGING_CONFIG dict.
+
+    Only attaches to the ``access`` handler (not the ``uvicorn.access`` logger)
+    to avoid filtering the same record twice.
+    """
+    # Sanitize: drop empty strings (would match all paths) and deduplicate.
+    prefixes = [str(p) for p in prefixes if p]
+    prefixes = list(dict.fromkeys(prefixes))
+    if not prefixes:
+        return
+
+    name = "sglang_diffusion_path_filter"
+    config.setdefault("filters", {})[name] = {
+        "()": "sglang.multimodal_gen.runtime.utils.logging_utils._UvicornAccessLogFilter",
+        "prefixes": prefixes,
+    }
+
+    handler_cfg = config.get("handlers", {}).get("access")
+    if handler_cfg is not None:
+        fl = handler_cfg.setdefault("filters", [])
+        if name not in fl:
+            fl.append(name)
+
+
+class _UvicornAccessLogFilter(logging.Filter):
+    """Suppress uvicorn access logs whose path starts with an excluded prefix.
+
+    uvicorn's ``AccessFormatter`` injects ``request_line`` during ``format()``,
+    which runs *after* filters.  We therefore extract the path from
+    ``record.args`` which uvicorn populates as::
+
+        (client_addr, method, full_path, http_version, status_code)
+    """
+
+    def __init__(self, prefixes: list[str] | None = None):
+        super().__init__()
+        self.prefixes = tuple(str(p) for p in (prefixes or ()) if p)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            path = str(args[2]).split("?", 1)[0]
+            return not path.startswith(self.prefixes)
+        return True
 
 
 def configure_logger(server_args, prefix: str = ""):
@@ -477,7 +530,7 @@ def configure_logger(server_args, prefix: str = ""):
     root.addHandler(handler)
     root.setLevel(getattr(logging, server_args.log_level.upper()))
 
-    set_uvicorn_logging_configs()
+    set_uvicorn_logging_configs(server_args)
 
 
 @lru_cache(maxsize=1)

@@ -12,13 +12,15 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-Lite model compatible with HuggingFace weights"""
+"""Inference-only GLM-4.7-Flash model compatible with HuggingFace weights"""
 
 import logging
+import re
 from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from sgl_kernel import dsv3_router_gemm
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -29,12 +31,14 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
@@ -72,6 +76,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _device_sm = get_device_sm()
@@ -183,7 +188,6 @@ class Glm4MoeLiteGate(nn.Module):
             and self.weight.shape[0] == 256
             and _device_sm >= 90
         ):
-            from sgl_kernel import dsv3_router_gemm
 
             logits = dsv3_router_gemm(hidden_states, self.weight).to(
                 hidden_states.dtype
@@ -335,12 +339,8 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.config = config
-
-        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        rope_theta = 1000000
-        rope_scaling = None
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 202752)
         self.layer_id = layer_id
 
@@ -429,8 +429,6 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         self.pp_group = get_pp_group()
 
         # DeepseekV2Model.forward expects these attributes to exist.
-        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         self.cp_size = get_attention_tp_size() if self.nsa_enable_prefill_cp else None
         self.gemm_output_zero_allocator_size = 0
@@ -501,15 +499,8 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         )
         self.capture_aux_hidden_states = False
 
-        from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            from sglang.srt.layers.dp_attention import (
-                get_attention_tp_rank,
-                get_attention_tp_size,
-            )
-
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()
         else:
@@ -549,7 +540,6 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         weights: Iterable[Tuple[str, torch.Tensor]],
         is_nextn=False,
         params_dict=None,
-        is_eagle=False,
     ):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -579,7 +569,6 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             def iter_weights_with_fused_shared_experts(
                 weights: Iterable[Tuple[str, torch.Tensor]],
             ) -> Iterable[Tuple[str, torch.Tensor]]:
-                import re
 
                 pattern = re.compile(
                     r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
@@ -621,13 +610,6 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
             nextn_layer_prefix = None
             nextn_spec_weight_names = []
 
-        eagle_ignore_weight_names = []
-        if is_eagle:
-            eagle_ignore_weight_names = [
-                "eagle_draft_tokens_map",
-                "eagle_lm_head.weight",
-            ]
-
         if params_dict is None:
             params_dict = dict(self.named_parameters())
 
@@ -635,7 +617,7 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         for name, loaded_weight in weights:
             weight_names.append(name)
 
-            if not is_nextn and not is_eagle:
+            if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
                     if num_nextn_layers > 0 and name.startswith("model.layers"):
@@ -725,8 +707,6 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    if name in eagle_ignore_weight_names:
-                        continue
 
                     # GLM NOTE: for MLA
                     if fuse_qkv_a_proj and (
@@ -797,7 +777,7 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
 
         # DeepseekV2AttentionMLA.forward_* expects post_load_weights() to populate
         # per-layer packed weights like `w_kc`/`w_vc` (used during CUDA graph capture).
-        # GLM-Lite configs may not set `config.mla`, but this model always uses
+        # GLM-4.7-Flash configs not set `config.mla`, but this model always uses
         # DeepseekV2AttentionMLA, so we must run the post-load processing.
         # Use weight_names=None to ensure we always process all layers. Some checkpoints /
         # naming schemes may not include "kv_b_proj" in `weight_names`, but `w_kc`/`w_vc`

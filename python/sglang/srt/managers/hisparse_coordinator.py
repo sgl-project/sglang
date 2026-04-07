@@ -56,7 +56,7 @@ class HiSparseCoordinator:
             override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
         )
 
-        max_num_reqs = req_to_token_pool.size
+        max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
 
         # to have an extra page for new tokens
@@ -123,7 +123,7 @@ class HiSparseCoordinator:
         self.decode_producer_stream = stream
 
     def admit_request_into_staging(self, req: Req) -> None:
-        req.staging = True
+        req.hisparse_staging = True
         logical_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
@@ -160,6 +160,53 @@ class HiSparseCoordinator:
                 device_indices.record_stream(self.write_staging_stream)
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
+
+    def admit_request_direct(self, req: Req) -> None:
+        """Direct-to-host path: KV data already resides in host pool via RDMA.
+
+        Skips staging DMA entirely. Only allocates a small device buffer
+        (4KB) for decode-time swap-in, then marks the request as ready.
+        Host indices were already written to req_to_host_pool.
+
+        Metadata fixups after alloc_device_buffer():
+        - alloc_device_buffer() sets device_buffer_tokens = [0, 1, ..., buf_size-1],
+          which tells the swap-in kernel that those tokens are cached in the device
+          buffer.  In the staging path this is correct (prefill filled the buffer),
+          but here the buffer is empty.
+        """
+        self.alloc_device_buffer(req)
+
+        if req.kv_allocated_len <= self.device_buffer_size:
+            # Short sequences (seq_len <= device_buffer_size): the kernel fast path
+            # returns device_buffer_locs directly without any host loading, so we
+            # must preload all tokens from host pool into the device buffer
+            # TODO(hzh0425): Optimize this.
+            self._preload_to_device_buffer(req)
+        else:
+            # Long sequence: reset device_buffer_tokens to -1 so the kernel
+            # sees all slots as empty → every top-k lookup is a miss → host load.
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, : self.device_buffer_size
+            ] = -1
+
+        req.staging = False
+        self._skip_first_backup[req.req_pool_idx] = True
+        logger.debug("HiSparse: admitting request %s directly", req.rid)
+
+    def _preload_to_device_buffer(self, req: Req) -> None:
+        """Preload all tokens from host pool into the device buffer."""
+        n = req.kv_allocated_len
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
+        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_locs,
+                layer_id,
+                io_backend="kernel",
+            )
 
     def alloc_device_buffer(self, req: Req) -> None:
         allocated_indices = self.req_to_token_pool.req_to_token[
@@ -224,7 +271,7 @@ class HiSparseCoordinator:
             _, _, req = self.ack_staging_queue.pop(0)
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
-            req.staging = False
+            req.hisparse_staging = False
             self._skip_first_backup[req.req_pool_idx] = True
             finish_count -= 1
             ready_reqs.append(req)
@@ -494,7 +541,7 @@ class HiSparseCoordinator:
         """Remove a request from the staging queue and free its host resources.
 
         Must be called when aborting a request that has been admitted into staging
-        but has not yet completed (i.e. req.staging is True).
+        but has not yet completed (i.e. req.hisparse_staging is True).
         """
         # Remove from staging queue
         self.ack_staging_queue = [
@@ -510,10 +557,10 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
-        req.staging = False
+        req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
-        if req.staging:
+        if req.hisparse_staging:
             self.abort_staging_request(req)
         else:
             self.request_finished(req)
@@ -556,14 +603,14 @@ class HiSparseCoordinator:
         layer_id: int,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
-        # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32.
+        # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32 or int64.
         if req_pool_indices.dtype != torch.int64:
             raise ValueError(
                 f"req_pool_indices dtype {req_pool_indices.dtype} is not int64 as expected"
             )
-        if seq_lens.dtype != torch.int32:
+        if seq_lens.dtype not in (torch.int32, torch.int64):
             raise ValueError(
-                f"seq_lens dtype {seq_lens.dtype} is not int32 as expected"
+                f"seq_lens dtype {seq_lens.dtype} is not int32 or int64 as expected"
             )
         if top_k_result.dtype != torch.int32:
             raise ValueError(

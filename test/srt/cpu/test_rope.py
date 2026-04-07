@@ -9,6 +9,7 @@ from sglang.srt.layers.rotary_embedding import (
 )
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
+    apply_rotary_pos_emb_native,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
@@ -18,6 +19,7 @@ torch.manual_seed(1234)
 
 class TestROPE(CustomTestCase):
     def test_mrope(self):
+        torch.manual_seed(100)
         head_size = 128
         seq_len = 512
         num_heads = 16
@@ -253,6 +255,27 @@ class TestROPE(CustomTestCase):
                     num_q_heads,
                     num_kv_heads,
                 )
+
+    def test_apply_rotary_pos_emb(self):
+        num_tokens = 1024
+        num_heads = 8
+        head_size = 72
+        qkv = torch.randn(num_tokens, num_heads * head_size * 3).to(torch.bfloat16)
+        query, key, _ = qkv.split(
+            [num_heads * head_size, num_heads * head_size, num_heads * head_size],
+            dim=-1,
+        )
+        query = query.view(num_tokens, num_heads, head_size)
+        key = key.view(num_tokens, num_heads, head_size)
+        for sincos_dtype in [torch.float32, torch.bfloat16]:
+            cos = torch.rand(num_tokens, head_size).to(sincos_dtype)
+            sin = torch.rand(num_tokens, head_size).to(sincos_dtype)
+            q_out_ref, k_out_ref = apply_rotary_pos_emb_native(query, key, cos, sin)
+            q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
+                query, key, cos, sin
+            )
+            torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":

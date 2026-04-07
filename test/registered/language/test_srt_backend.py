@@ -15,6 +15,7 @@ from sglang.test.test_programs import (
     test_regex,
     test_select,
     test_stream,
+    test_stream_logprobs,
     test_tool_use,
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
@@ -32,6 +33,8 @@ class TestSRTBackend(CustomTestCase):
             model_path=DEFAULT_MODEL_NAME_FOR_TEST,
             cuda_graph_max_bs=4,
             mem_fraction_static=0.7,
+            incremental_streaming_output=True,
+            log_level="info",
         )
         sgl.set_default_backend(cls.backend)
 
@@ -66,6 +69,9 @@ class TestSRTBackend(CustomTestCase):
 
     def test_stream(self):
         test_stream()
+
+    def test_stream_logprobs(self):
+        test_stream_logprobs()
 
     def test_regex(self):
         test_regex()

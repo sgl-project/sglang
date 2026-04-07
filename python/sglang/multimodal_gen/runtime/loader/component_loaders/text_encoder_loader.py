@@ -156,7 +156,9 @@ class TextEncoderLoader(ComponentLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source", to_cpu: bool
+        self,
+        source: "Source",
+        to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
@@ -166,7 +168,8 @@ class TextEncoderLoader(ComponentLoader):
         )
         if use_safetensors:
             weights_iterator = safetensors_weights_iterator(
-                hf_weights_files, to_cpu=to_cpu
+                hf_weights_files,
+                to_cpu=to_cpu,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
@@ -186,17 +189,27 @@ class TextEncoderLoader(ComponentLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights, to_cpu)
+        yield from self._get_weights_iterator(
+            primary_weights,
+            to_cpu,
+        )
 
         secondary_weights = cast(
             Iterable[TextEncoderLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source, to_cpu)
+            yield from self._get_weights_iterator(
+                source,
+                to_cpu,
+            )
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        cpu_offload_flag: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
         diffusers_pretrained_config = get_config(
@@ -227,6 +240,7 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config,
             server_args,
             encoder_dtype,
+            cpu_offload_flag=cpu_offload_flag,
         )
 
     def load_model(
@@ -240,7 +254,10 @@ class TextEncoderLoader(ComponentLoader):
         # Determine CPU offload behavior and target device
 
         local_torch_device = get_local_torch_device()
-        should_offload = self.should_offload(server_args, model_config)
+        fsdp_cpu_offload = self.should_offload(server_args, model_config)
+        should_offload = (
+            cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
+        )
 
         if should_offload and not current_platform.is_mps():
             model_device = torch.device("cpu")
@@ -263,12 +280,12 @@ class TextEncoderLoader(ComponentLoader):
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
-                self._get_all_weights(model, model_path, to_cpu=should_offload)
+                self._get_all_weights(
+                    model,
+                    model_path,
+                    to_cpu=should_offload,
+                )
             )
-
-            # Explicitly move model to target device after loading weights
-            if not should_offload:
-                model = model.to(local_torch_device)
 
             if should_offload:
                 # Disable FSDP for MPS as it's not compatible
@@ -277,7 +294,7 @@ class TextEncoderLoader(ComponentLoader):
                         "Disabling FSDP sharding for MPS platform as it's not compatible"
                     )
                     model = model.to(local_torch_device)
-                else:
+                elif fsdp_cpu_offload:
                     mesh = init_device_mesh(
                         current_platform.device_type,
                         mesh_shape=(1, dist.get_world_size()),
@@ -292,6 +309,8 @@ class TextEncoderLoader(ComponentLoader):
                         or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
+                else:
+                    model = model.to("cpu")
             else:
                 model = model.to(local_torch_device)
             # We only enable strict check for non-quantized models

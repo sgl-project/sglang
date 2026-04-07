@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch_npu
+from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
@@ -323,45 +324,74 @@ def forward_dsa_prepare_npu(
         )
     else:
         fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-        q, latent_cache = fused_qkv_a_proj_out.split(
-            [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
-        )
+        if m.rotary_emb.is_neox_style:
+            q, latent_cache = fused_qkv_a_proj_out.split(
+                [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+            )
+            # overlap qk norm
+            q = m.q_a_layernorm(q)
+            if (
+                _use_ag_after_qlora
+                and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+            ):
+                q = scattered_to_tp_attn_full(q, forward_batch)
+                latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
+            q_lora = q.clone()  # required for topk_indices
 
-        # overlap qk norm
-        q = m.q_a_layernorm(q)
-        if (
-            _use_ag_after_qlora
-            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
-            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
-        ):
-            q = scattered_to_tp_attn_full(q, forward_batch)
-            latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
-        q_lora = q.clone()  # required for topk_indices
-
-        q_event = None
-        if m.alt_stream is not None:
-            m.alt_stream.wait_stream(torch.npu.current_stream())
-            with torch.npu.stream(m.alt_stream):
+            q_event = None
+            if m.alt_stream is not None:
+                m.alt_stream.wait_stream(torch.npu.current_stream())
+                with torch.npu.stream(m.alt_stream):
+                    q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+                    # record q to ensure memory space will not be released
+                    q.record_stream(m.alt_stream)
+                    q_event = m.alt_stream.record_event()
+            else:
                 q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
-                # record q to ensure memory space will not be released
-                q.record_stream(m.alt_stream)
-                q_event = m.alt_stream.record_event()
-        else:
-            q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
-        k_nope, k_pe = latent_cache.unsqueeze(1).split(
-            [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
-        )
-        k_nope = m.kv_a_layernorm(k_nope)
-        # main stream waits for the completion of the event on the alt stream to ensure data dependency is complete
-        if q_event is not None:
-            torch.npu.current_stream().wait_event(q_event)
+            k_nope, k_pe = latent_cache.unsqueeze(1).split(
+                [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+            )
+            k_nope = m.kv_a_layernorm(k_nope)
+            # main stream waits for the completion of the event on the alt stream to ensure data dependency is complete
+            if q_event is not None:
+                torch.npu.current_stream().wait_event(q_event)
+        else:
+            if fused_qkv_a_proj_out.shape[0] < 65535:
+                q_lora, k_nope, k_pe = fused_split_qk_norm(
+                    fused_qkv_a_proj_out,
+                    m.q_a_layernorm,
+                    m.kv_a_layernorm,
+                    m.q_lora_rank,
+                    m.kv_lora_rank,
+                    m.qk_rope_head_dim,
+                    eps=m.q_a_layernorm.variance_epsilon,
+                )
+            else:
+                q, latent_cache = fused_qkv_a_proj_out.split(
+                    [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+                )
+                # overlap qk norm
+                q = m.q_a_layernorm(q)
+
+                q_lora = q.clone()  # required for topk_indices
+                k_nope, k_pe = latent_cache.unsqueeze(1).split(
+                    [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+                )
+                k_nope = m.kv_a_layernorm(k_nope)
+            q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
+
+        if m.layer_id == 0:
+            m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
+                0, positions
+            )
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 

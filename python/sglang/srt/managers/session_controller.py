@@ -164,6 +164,19 @@ class Session:
                 and req.input_ids[0] == tokenizer.bos_token_id
             ):
                 req.input_ids = req.input_ids[1:]
+                # Adjust mm_item offsets since they were computed on
+                # the pre-strip sequence (with BOS at position 0)
+                if req.mm_inputs:
+                    for item in req.mm_inputs.mm_items:
+                        if item.offsets:
+                            if any(s == 0 for s, _ in item.offsets):
+                                logging.warning(
+                                    "mm_item offset starts at 0 (BOS position), "
+                                    "clamping to 0 after BOS strip"
+                                )
+                            item.offsets = [
+                                (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
+                            ]
 
             input_ids = (
                 last_req.origin_input_ids
@@ -278,6 +291,18 @@ class SessionController:
             req = next(iter(session.req_nodes.values())).req
             if not req.finished():
                 req.session = None
+
+        # Release multimodal features held by session requests.
+        # Session reqs skip the normal mm cleanup path (scheduler and
+        # output_processor) so features stay alive until the session closes.
+        seen_mm = set()
+        for node in session.req_nodes.values():
+            mm = node.req.multimodal_inputs
+            if mm is not None and id(mm) not in seen_mm:
+                seen_mm.add(id(mm))
+                mm.release_features()
+            node.req.multimodal_inputs = None
+
         if isinstance(self.tree_cache, SessionAwareCache):
             self.tree_cache.release_session(session_id)
         del self.sessions[session_id]

@@ -26,6 +26,10 @@ class TestLlavaServer(ImageOpenAITestMixin):
     model = "lmms-lab/llava-onevision-qwen2-0.5b-ov"
 
 
+class TestLfm2VlServer(ImageOpenAITestMixin):
+    model = "LiquidAI/LFM2.5-VL-1.6B"
+
+
 class TestQwen25VLServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "Qwen/Qwen2.5-VL-7B-Instruct"
     extra_args = [

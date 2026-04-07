@@ -1,0 +1,176 @@
+name: Rerun Test
+run-name: ${{ inputs.pr_head_sha && format('[rerun-test] {0} {1}', inputs.test_command, inputs.pr_head_sha) || format('[rerun-test] {0}', inputs.test_command) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_command:
+        description: "Test command(s) to run, one per line (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
+        required: true
+        type: string
+      runner_label:
+        description: "Runner label"
+        required: true
+        type: choice
+        options:
+          - 1-gpu-h100
+          - 1-gpu-5090
+          - 2-gpu-h100
+          - 4-gpu-h100
+          - 4-gpu-a10
+          - 4-gpu-b200
+          - 8-gpu-h200
+          - 8-gpu-h20
+          - 8-gpu-b200
+          - ubuntu-latest
+      pr_head_sha:
+        description: "PR head SHA to checkout (for /rerun-test on fork PRs)"
+        required: false
+        type: string
+        default: ""
+      use_deepep:
+        description: "Use ci_install_deepep.sh instead of ci_install_dependency.sh"
+        required: false
+        type: string
+        default: "false"
+      is_cpu:
+        description: "Run as CPU-only test (uses ubuntu-latest with uv pip install)"
+        required: false
+        type: string
+        default: "false"
+
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+
+jobs:
+  rerun-test-cuda:
+    if: inputs.is_cpu != 'true'
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 120
+    env:
+      RUNNER_LABELS: ${{ inputs.runner_label }}
+      SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.runner_label == '8-gpu-h20' && 'mlx5_1,mlx5_2,mlx5_3,mlx5_4' || '' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          if [[ "${{ inputs.use_deepep }}" == "true" ]]; then
+            bash scripts/ci/cuda/ci_install_deepep.sh
+          else
+            bash scripts/ci/cuda/ci_install_dependency.sh
+          fi
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          cd test/
+          # Collect non-empty commands into an array for counting.
+          cmds=()
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            cmds+=("$cmd")
+          done <<< "${{ inputs.test_command }}"
+          total=${#cmds[@]}
+          suite_start=$SECONDS
+          for idx in "${!cmds[@]}"; do
+            i=$((idx + 1))
+            cmd="${cmds[$idx]}"
+            echo ""
+            echo "."
+            echo "Begin ($i/$total): python3 $cmd"
+            echo "."
+            file_start=$SECONDS
+            python3 $cmd -f || exit 1
+            elapsed=$(( SECONDS - file_start ))
+            echo "."
+            echo "End ($i/$total): elapsed=${elapsed}s"
+            echo "."
+            echo ""
+          done
+          total_elapsed=$(( SECONDS - suite_start ))
+          echo "All $total test(s) passed in ${total_elapsed}s"
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: always()
+
+  rerun-test-cpu:
+    if: inputs.is_cpu == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          cd test/
+          # Collect non-empty commands into an array for counting.
+          cmds=()
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            cmds+=("$cmd")
+          done <<< "${{ inputs.test_command }}"
+          total=${#cmds[@]}
+          suite_start=$SECONDS
+          for idx in "${!cmds[@]}"; do
+            i=$((idx + 1))
+            cmd="${cmds[$idx]}"
+            echo ""
+            echo "."
+            echo "Begin ($i/$total): python3 $cmd"
+            echo "."
+            file_start=$SECONDS
+            python3 $cmd -f || exit 1
+            elapsed=$(( SECONDS - file_start ))
+            echo "."
+            echo "End ($i/$total): elapsed=${elapsed}s"
+            echo "."
+            echo ""
+          done
+          total_elapsed=$(( SECONDS - suite_start ))
+          echo "All $total test(s) passed in ${total_elapsed}s"
