@@ -31,7 +31,7 @@ class XPUAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
-        return AttentionBackendEnum.XPU_FA
+        return AttentionBackendEnum.FA
 
     @staticmethod
     def get_impl_cls() -> type["XPUAttentionImpl"]:

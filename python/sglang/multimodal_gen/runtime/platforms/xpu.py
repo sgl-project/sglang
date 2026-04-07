@@ -134,7 +134,7 @@ class XpuPlatform(Platform):
         Defaults to XPU backend (requires fp16/bf16 and a supported head size),
         falling back to Torch SDPA if constraints are not met.
         """
-        if selected_backend in (AttentionBackendEnum.XPU_FA, None):
+        if selected_backend in (AttentionBackendEnum.FA, None):
             if dtype not in (torch.float16, torch.bfloat16):
                 logger.info(
                     "XPU attention backend requires fp16/bf16 but got dtype=%s; falling back to Torch SDPA.",
@@ -166,13 +166,6 @@ class XpuPlatform(Platform):
 
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend for Intel XPU.")
-            return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
-
-        if selected_backend == AttentionBackendEnum.FA:
-            logger.warning(
-                "Flash Attention is not natively supported on Intel XPU. "
-                "Falling back to Torch SDPA backend."
-            )
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
         if selected_backend in (
