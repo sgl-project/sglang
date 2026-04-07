@@ -28,7 +28,10 @@ from typing import TYPE_CHECKING, Union
 import torch
 import tqdm
 
-from sglang.srt.compilation.piecewise_context_manager import set_forward_context
+from sglang.srt.compilation.piecewise_context_manager import (
+    enable_piecewise_cuda_graph,
+    set_forward_context,
+)
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -379,31 +382,32 @@ class BreakablePiecewiseCudaGraphRunner(PiecewiseCudaGraphRunner):
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
 
-        # Reuse parent's buffer preparation and static forward batch construction
-        static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
-        bs = forward_batch.batch_size
+        with enable_piecewise_cuda_graph():
+            # Reuse parent's buffer preparation and static forward batch construction
+            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            bs = forward_batch.batch_size
 
-        # Update static buffers used by graph segments (esp. logits processor).
-        # The graph reads from these addresses — they must have serving-time values.
-        self.static_seq_lens[:bs].copy_(forward_batch.seq_lens)
-        self.static_extend_seq_lens[:bs].copy_(forward_batch.extend_seq_lens)
-        self.static_extend_prefix_lens[:bs].copy_(forward_batch.extend_prefix_lens)
-        self.static_extend_start_loc[:bs].copy_(forward_batch.extend_start_loc)
-        self.static_req_pool_indices[:bs].copy_(forward_batch.req_pool_indices)
-        if forward_batch.orig_seq_lens is not None:
-            self.static_orig_seq_lens[:bs].copy_(forward_batch.orig_seq_lens)
+            # Update static buffers used by graph segments (esp. logits processor).
+            # The graph reads from these addresses — they must have serving-time values.
+            self.static_seq_lens[:bs].copy_(forward_batch.seq_lens)
+            self.static_extend_seq_lens[:bs].copy_(forward_batch.extend_seq_lens)
+            self.static_extend_prefix_lens[:bs].copy_(forward_batch.extend_prefix_lens)
+            self.static_extend_start_loc[:bs].copy_(forward_batch.extend_start_loc)
+            self.static_req_pool_indices[:bs].copy_(forward_batch.req_pool_indices)
+            if forward_batch.orig_seq_lens is not None:
+                self.static_orig_seq_lens[:bs].copy_(forward_batch.orig_seq_lens)
 
-        # Set forward context and replay
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        with set_forward_context(
-            static_forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
-            num_tokens=static_num_tokens,
-        ):
-            self.graphs[static_num_tokens].replay()
+            # Set forward context and replay
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            with set_forward_context(
+                static_forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+                num_tokens=static_num_tokens,
+            ):
+                self.graphs[static_num_tokens].replay()
 
         output = self.output_buffers[static_num_tokens]
         if isinstance(output, LogitsProcessorOutput):
