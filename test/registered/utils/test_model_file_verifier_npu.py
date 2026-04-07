@@ -243,12 +243,12 @@ class TestModelFileVerifierCLI(_FakeModelTestCase):
         )
 
 
-# ======== HuggingFace Tests ========
+# ======== ModelScope Tests ========
 
 
 class TestModelFileVerifierMS(_RealModelTestCase):
 
-    def test_generate_checksums_from_hf(self):
+    def test_generate_checksums_from_ms(self):
         checksums_file = os.path.join(self.test_dir, "checksums.json")
         result = generate_checksums(source=MODEL_NAME, output_path=checksums_file)
 
@@ -257,7 +257,7 @@ class TestModelFileVerifierMS(_RealModelTestCase):
         for filename, file_info in result.files.items():
             self.assertEqual(len(file_info.sha256), 64)
 
-    def test_verify_with_hf_checksums_source(self):
+    def test_verify_with_ms_checksums_source(self):
         verify(model_path=self.test_dir, checksums_source=MODEL_NAME)
 
 
@@ -266,8 +266,8 @@ class TestModelFileVerifierMS(_RealModelTestCase):
 
 class TestModelFileVerifierWithRealModel(_RealModelTestCase):
 
-    def _run_server_test(self, *, corrupt_weights: bool, use_hf_checksum: bool):
-        if use_hf_checksum:
+    def _run_server_test(self, *, corrupt_weights: bool, use_ms_checksum: bool):
+        if use_ms_checksum:
             checksum_arg = MODEL_NAME
         else:
             checksums_file = os.path.join(self.test_dir, "checksums.json")
@@ -310,16 +310,16 @@ class TestModelFileVerifierWithRealModel(_RealModelTestCase):
                 kill_process_tree(process.pid)
 
     def test_server_launch_with_checksum_intact(self):
-        self._run_server_test(corrupt_weights=False, use_hf_checksum=False)
+        self._run_server_test(corrupt_weights=False, use_ms_checksum=False)
 
     def test_server_launch_fails_with_corrupted_weights(self):
-        self._run_server_test(corrupt_weights=True, use_hf_checksum=False)
+        self._run_server_test(corrupt_weights=True, use_ms_checksum=False)
 
-    def test_server_launch_with_hf_checksum_intact(self):
-        self._run_server_test(corrupt_weights=False, use_hf_checksum=True)
+    def test_server_launch_with_ms_checksum_intact(self):
+        self._run_server_test(corrupt_weights=False, use_ms_checksum=True)
 
-    def test_server_launch_with_hf_checksum_corrupted(self):
-        self._run_server_test(corrupt_weights=True, use_hf_checksum=True)
+    def test_server_launch_with_ms_checksum_corrupted(self):
+        self._run_server_test(corrupt_weights=True, use_ms_checksum=True)
 
 
 # ======== Test Utilities ========

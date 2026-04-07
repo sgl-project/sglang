@@ -158,7 +158,7 @@ def _load_file_infos_from_modelscope(*, repo_id: str) -> Dict[str, FileInfo]:
     from modelscope.hub.api import HubApi
 
     api = HubApi()
-    files_data = api.get_model_files(repo_id, recursive=True)
+    files_data = api.get_model_files(repo_id, recursive=False)
 
     file_infos = {}
     for file_data in files_data:
