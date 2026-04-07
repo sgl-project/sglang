@@ -167,6 +167,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
 
     def forward(
@@ -291,7 +292,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
         self.config = config
         self.quant_config = (
             None
-            if "mtp" in getattr(config, "disable_quant_module", [])
+            if "mtp" in getattr(config, "disable_quant_module", []) or _is_npu
             else quant_config
         )
         self.model = LongcatFlashModelNextN(config, self.quant_config)
@@ -412,11 +413,13 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
         ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
         if not use_deep_gemm_bmm:
             self_attn.w_kc = bind_or_assign(
-                self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_kc,
+                w_kc.transpose(1, 2).contiguous().transpose(1, 2),
             )
-            self_attn.w_vc = bind_or_assign(
-                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-            )
+            w_vc = w_vc.contiguous().transpose(1, 2)
+            if _is_npu:
+                w_vc = w_vc.contiguous()
+            self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
             if (
                 hasattr(self_attn.kv_b_proj, "weight_scale")
                 and self_attn.w_scale is None

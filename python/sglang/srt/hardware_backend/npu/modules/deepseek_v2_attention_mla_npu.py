@@ -77,11 +77,17 @@ def forward_mha_prepare_npu(
     kv_a, _ = latent_cache.split([m.kv_lora_rank, m.qk_rope_head_dim], dim=-1)
     latent_cache = latent_cache.unsqueeze(1)
 
-    if m.use_deepseek_yarn_rope:
+    is_longcat = True
+    if m.use_deepseek_yarn_rope or is_longcat:
         B, S = q.shape[0], 1
-        cos, sin = m.rotary_emb.get_cos_sin_cache(
-            positions, hidden_states.dtype, offsets=None
-        )
+        if is_longcat:
+            cos, sin = m.rotary_emb.update_and_get_cos_sin_cache(
+                positions, m.layer_id, hidden_states.dtype, offsets=None
+            )
+        else:
+            cos, sin = m.rotary_emb.get_cos_sin_cache(
+                positions, hidden_states.dtype, offsets=None
+            )
         q_pe = torch_npu.npu_interleave_rope(
             q_pe.reshape(B, -1, S, m.qk_rope_head_dim),
             cos,

@@ -146,6 +146,10 @@ class RotaryEmbedding(MultiPlatformOp):
         cos = freqs.cos()
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
+
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.cos_cached_total = torch.cos(emb)
+        self.sin_cached_total = torch.sin(emb)
         return cache
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
@@ -202,6 +206,36 @@ class RotaryEmbedding(MultiPlatformOp):
         cos, sin = cos_sin.chunk(2, dim=-1)
         return cos, sin
 
+    def get_cos_cached_total(self):
+        return self.cos_cached_total
+
+    def get_sin_cached_total(self):
+        return self.sin_cached_total
+
+    def update_and_get_cos_sin_cache(
+        self, positions, layer_id, dtype, offsets: Optional[torch.Tensor] = None
+    ):
+        if layer_id == 0:
+            self.cos_cached = (
+                self.cos_cached_total[
+                    torch.add(positions, offsets) if offsets is not None else positions
+                ]
+                .unsqueeze(-2)
+                .unsqueeze(-2)
+                .to(dtype)
+            )
+            self.sin_cached = (
+                self.sin_cached_total[
+                    torch.add(positions, offsets) if offsets is not None else positions
+                ]
+                .unsqueeze(-2)
+                .unsqueeze(-2)
+                .to(dtype)
+            )
+        cos = self.cos_cached.to(positions.device)
+        sin = self.sin_cached.to(positions.device)
+        return cos, sin
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -244,6 +278,51 @@ class RotaryEmbedding(MultiPlatformOp):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
+    def deepseek_npu_interleave_rope(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens, num_q_heads, _ = query.shape
+        num_k_heads = key.shape[1]
+
+        # NOTE: Directly use cos_cached and sin_cached here.
+        # Therefore, in deepseek model, need to update_and_get_cos_sin_cache before calling this func.
+        # Otherwise there may be accuracy bug
+        cos, sin = self.cos_cached.to(positions.device), self.sin_cached.to(
+            positions.device
+        )
+        query_rot = query[..., : self.rotary_dim]
+        key_rot = key[..., : self.rotary_dim]
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            key_pass = key[..., self.rotary_dim :]
+
+        query_rot = torch_npu.npu_interleave_rope(
+            query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
+            cos,
+            sin,
+        )
+        key_rot = torch_npu.npu_interleave_rope(
+            key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
+            cos,
+            sin,
+        )
+
+        query_rot = query_rot.reshape(num_tokens, -1, self.rotary_dim)
+        key_rot = key_rot.reshape(num_tokens, -1, self.rotary_dim)
+
+        if self.rotary_dim < self.head_size:
+            query = torch.cat((query_rot, query_pass), dim=-1)
+            key = torch.cat((key_rot, key_pass), dim=-1)
+        else:
+            query = query_rot
+            key = key_rot
+
+        return query, key
+
     def forward_npu(
         self,
         positions: torch.Tensor,
@@ -276,6 +355,9 @@ class RotaryEmbedding(MultiPlatformOp):
                 )
             else:
                 return self.forward_native(positions, query, key, offsets)
+        elif self.rotary_dim == 64 and not self.is_neox_style:
+            # NOTE: npu_interleave_rope only supports rotary_dim=64
+            return self.deepseek_npu_interleave_rope(positions, query, key, offsets)
         if self.is_neox_style:
             rotary_mode = "half"
         else:
