@@ -14,7 +14,7 @@ import unittest
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "stage-a-cpu-only")
+register_cpu_ci(1.0, "stage-a-test-cpu")
 
 
 class TestIsLegacyStructuralTag(unittest.TestCase):

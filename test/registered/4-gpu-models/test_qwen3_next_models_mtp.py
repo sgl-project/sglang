@@ -68,11 +68,10 @@ class TestQwen3NextMTPTopk(
     ]
 
 
-# TODO(hzh): After merging the PR that fixes specv2 to correctly return log probs,
-# add KLDivergenceMixin back. https://github.com/sgl-project/sglang/pull/18645
-class TestQwen3NextMTPV2(GSM8KMixin, DefaultServerBase):
+class TestQwen3NextMTPV2(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
     model = QWEN3_NEXT_MODEL
     gsm8k_accuracy_thres = 0.93
+    kl_div_thres = 0.0035
     other_args = [
         "--trust-remote-code",
         "--speculative-algorithm",
