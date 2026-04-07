@@ -1969,10 +1969,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
 class NSATokenToKVPoolFP4(NSATokenToKVPool):
     """NSA KV pool that stores the MLA KV cache in FP4 (E2M1) format.
 
-    Buffer layout per token (416 bytes, uint8):
+    Buffer layout per token (400 bytes, uint8):
       [0:256)    packed FP4 nope  (512 values, 2 per byte)
-      [256:288)  uint8 block scales  (32 blocks of 16 values)
-      [288:416)  BF16 rope bytes  (64 values × 2 bytes)
+      [256:272)  uint8 block scales  (16 blocks of 32 values)
+      [272:400)  BF16 rope bytes  (64 values × 2 bytes)
 
     At decode time the caller gathers topk pages and dequantises to FP8
     before passing them to the existing FP8 TileLang kernel.
