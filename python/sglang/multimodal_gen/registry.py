@@ -76,6 +76,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
+    Flux2SamplingParams,
     FluxSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
@@ -89,7 +90,10 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
-from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2 import (
+    LTX2SamplingParams,
+    LTX23SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -154,7 +158,18 @@ def _discover_and_register_pipelines():
         package.__path__, package.__name__ + "."
     ):
         if not ispkg:
-            pipeline_module = importlib.import_module(module_name)
+            try:
+                pipeline_module = importlib.import_module(module_name)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping pipeline module %s during discovery due to import failure: %s",
+                    module_name,
+                    exc,
+                )
+                logger.debug(
+                    "Pipeline import failure details for %s", module_name, exc_info=True
+                )
+                continue
             if hasattr(pipeline_module, "EntryClass"):
                 entry_cls = pipeline_module.EntryClass
                 entry_cls_list = (
@@ -593,12 +608,18 @@ def _register_configs():
     register_configs(
         sampling_param_cls=LTX2SamplingParams,
         pipeline_config_cls=LTX2PipelineConfig,
-        hf_model_paths=[
-            "Lightricks/LTX-2",
-        ],
+        hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower(),
+            lambda path: "ltx-2" in path.lower() and "ltx-2.3" not in path.lower(),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LTX23SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.3"],
+        model_detectors=[
+            lambda path: "ltx-2.3" in path.lower(),
         ],
     )
 
@@ -747,7 +768,7 @@ def _register_configs():
         ],
     )
     register_configs(
-        sampling_param_cls=FluxSamplingParams,
+        sampling_param_cls=Flux2SamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",

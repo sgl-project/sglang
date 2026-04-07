@@ -122,6 +122,12 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+_INCREMENTAL_STREAMING_META_INFO_KEYS = (
+    "output_token_logprobs",
+    "output_top_logprobs",
+    "output_token_ids_logprobs",
+)
+
 
 @dataclasses.dataclass
 class ReqState:
@@ -206,6 +212,31 @@ def make_req_state(
         time_stats,
         buffer_text=not is_streaming_request,
     )
+
+
+def _slice_streaming_output_meta_info(
+    meta_info: Dict[Any, Any],
+    last_output_offset: int,
+) -> None:
+    """Align output-side metadata with the current incremental streaming chunk."""
+    for key in meta_info.keys() & set(_INCREMENTAL_STREAMING_META_INFO_KEYS):
+        meta_info[key] = meta_info[key][last_output_offset:]
+
+
+def _merge_incremental_stream_meta_info(
+    out_list: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Preserve delta-style output metadata when queued chunks are coalesced."""
+    meta_info_list = [chunk["meta_info"] for chunk in out_list]
+    meta_info = dict(meta_info_list[-1])
+    for key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+        if any(key in chunk_meta_info for chunk_meta_info in meta_info_list):
+            meta_info[key] = [
+                item
+                for chunk_meta_info in meta_info_list
+                for item in chunk_meta_info.get(key, [])
+            ]
+    return meta_info
 
 
 class InputFormat(Enum):
@@ -1208,9 +1239,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         obj.rid,
                         len(out_list),
                     )
-                # Coalesce all deltas into a single chunk. Both text and
-                # output_ids are incremental, so we concatenate them; all
-                # other fields (meta_info, etc.) are taken from the last chunk.
+                # Coalesce all deltas into a single chunk. Text, output_ids,
+                # and output-side incremental metadata all need to be merged.
                 out = dict(out_list[-1])
                 if "output_ids" in out:
                     out["output_ids"] = [
@@ -1218,6 +1248,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     ]
                 if "text" in out:
                     out["text"] = "".join(chunk["text"] for chunk in out_list)
+                if "meta_info" in out:
+                    out["meta_info"] = _merge_incremental_stream_meta_info(out_list)
             else:
                 out = out_list[-1]
 
@@ -1644,43 +1676,64 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
             state.finished = recv_obj.finished_reasons[i] is not None
-            if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
+            if isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = (
                     self.server_args.incremental_streaming_output and is_stream
                 )
-                if isinstance(recv_obj, BatchStrOutput):
-                    state.append_text(recv_obj.output_strs[i])
+                output_offset = state.last_output_offset
+                state.append_text(recv_obj.output_strs[i])
                 state.output_ids.extend(recv_obj.output_ids[i])
+
                 if is_stream:
                     if incremental:
-                        output_token_ids = state.output_ids[state.last_output_offset :]
+                        output_token_ids = state.output_ids[output_offset:]
+                        _slice_streaming_output_meta_info(meta_info, output_offset)
                         state.last_output_offset = len(state.output_ids)
-                        output_text = (
-                            state.get_text()[state.last_text_offset :]
-                            if isinstance(recv_obj, BatchStrOutput)
-                            else None
-                        )
-                        if output_text is not None:
-                            state.last_text_offset = len(state.get_text())
+                        text = state.get_text()
+                        output_text = text[state.last_text_offset :]
+                        state.last_text_offset = len(text)
                     else:
                         output_token_ids = state.output_ids.copy()
-                        output_text = (
-                            state.get_text()
-                            if isinstance(recv_obj, BatchStrOutput)
-                            else None
-                        )
-                    out_dict = {"output_ids": output_token_ids, "meta_info": meta_info}
-                    if output_text is not None:
-                        out_dict["text"] = output_text
+                        output_text = state.get_text()
+                    out_dict = {
+                        "text": output_text,
+                        "output_ids": output_token_ids,
+                        "meta_info": meta_info,
+                    }
+                elif state.finished:
+                    out_dict = {
+                        "text": state.get_text(),
+                        "output_ids": state.output_ids.copy(),
+                        "meta_info": meta_info,
+                    }
+                else:
+                    out_dict = None
+            elif isinstance(recv_obj, BatchTokenIDOutput):
+                is_stream = getattr(state.obj, "stream", False)
+                incremental = (
+                    self.server_args.incremental_streaming_output and is_stream
+                )
+                output_offset = state.last_output_offset
+                state.output_ids.extend(recv_obj.output_ids[i])
+
+                if is_stream:
+                    if incremental:
+                        output_token_ids = state.output_ids[output_offset:]
+                        _slice_streaming_output_meta_info(meta_info, output_offset)
+                        state.last_output_offset = len(state.output_ids)
+                    else:
+                        output_token_ids = state.output_ids.copy()
+                    out_dict = {
+                        "output_ids": output_token_ids,
+                        "meta_info": meta_info,
+                    }
                 elif state.finished:
                     out_dict = {
                         "output_ids": state.output_ids.copy(),
                         "meta_info": meta_info,
                     }
-                    if isinstance(recv_obj, BatchStrOutput):
-                        out_dict["text"] = state.get_text()
                 else:
                     out_dict = None
             else:
@@ -2348,6 +2401,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
         obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+        # Propagate lora_id to any sub-objects already cached by __getitem__.
+        for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+            sub_obj.lora_id = (
+                obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
+            )
 
     def _req_stats_init(
         self,

@@ -23,6 +23,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    AddExternalCorpusReqInput,
+    AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
@@ -53,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    ListExternalCorporaReqInput,
+    ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -64,6 +68,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    RemoveExternalCorpusReqInput,
+    RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -205,6 +211,15 @@ class TokenizerCommunicatorMixin:
         self.flush_cache_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.add_external_corpus_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.remove_external_corpus_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.list_external_corpora_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -309,6 +324,18 @@ class TokenizerCommunicatorMixin:
                     self.flush_cache_communicator.handle_recv,
                 ),
                 (
+                    AddExternalCorpusReqOutput,
+                    self.add_external_corpus_communicator.handle_recv,
+                ),
+                (
+                    RemoveExternalCorpusReqOutput,
+                    self.remove_external_corpus_communicator.handle_recv,
+                ),
+                (
+                    ListExternalCorporaReqOutput,
+                    self.list_external_corpora_communicator.handle_recv,
+                ),
+                (
                     ProfileReqOutput,
                     self.profile_communicator.handle_recv,
                 ),
@@ -342,6 +369,90 @@ class TokenizerCommunicatorMixin:
                 ),
             ]
         )
+
+    async def add_external_corpus(
+        self: TokenizerManager, obj: AddExternalCorpusReqInput
+    ) -> AddExternalCorpusReqOutput:
+        self.auto_create_handle_loop()
+        truncated = False
+        try:
+            if not obj.corpus_id:
+                import uuid
+
+                obj.corpus_id = uuid.uuid4().hex
+            if obj.file_path is not None:
+                from sglang.srt.speculative.cpp_ngram.external_corpus import (
+                    iter_external_corpus_chunks,
+                )
+
+                max_tokens = (
+                    self.server_args.speculative_ngram_external_corpus_max_tokens
+                )
+                obj.token_chunks = list(
+                    iter_external_corpus_chunks(
+                        obj.file_path, self.tokenizer, max_tokens
+                    )
+                )
+            elif obj.documents is not None:
+                from sglang.srt.speculative.cpp_ngram.external_corpus import (
+                    SEPARATOR_TOKEN,
+                )
+
+                max_tokens = (
+                    self.server_args.speculative_ngram_external_corpus_max_tokens
+                )
+                token_chunks = []
+                total_tokens = 0
+                has_prev = False
+                for doc in obj.documents:
+                    if not doc:
+                        continue
+                    token_ids = list(
+                        self.tokenizer.encode(doc, add_special_tokens=False)
+                    )
+                    if not token_ids:
+                        continue
+                    if has_prev:
+                        token_ids = [SEPARATOR_TOKEN] + token_ids
+                    if total_tokens + len(token_ids) > max_tokens:
+                        truncated = True
+                        break
+                    token_chunks.append(token_ids)
+                    total_tokens += len(token_ids)
+                    has_prev = True
+                obj.token_chunks = token_chunks
+            else:
+                return AddExternalCorpusReqOutput(
+                    success=False,
+                    message="Either file_path or documents must be provided.",
+                )
+            obj.file_path = None
+            obj.documents = None
+            results = await self.add_external_corpus_communicator(obj)
+            result = results[0]
+            if truncated and result.success:
+                result.message += f" (truncated: exceeded {max_tokens} token limit)"
+            return result
+        except Exception as e:
+            return AddExternalCorpusReqOutput(success=False, message=str(e))
+
+    async def remove_external_corpus(
+        self: TokenizerManager, corpus_id: str
+    ) -> RemoveExternalCorpusReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.remove_external_corpus_communicator(
+            RemoveExternalCorpusReqInput(corpus_id=corpus_id)
+        )
+        return results[0]
+
+    async def list_external_corpora(
+        self: TokenizerManager,
+    ) -> ListExternalCorporaReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.list_external_corpora_communicator(
+            ListExternalCorporaReqInput()
+        )
+        return results[0]
 
     async def flush_cache(
         self: TokenizerManager, timeout_s: Optional[float] = None

@@ -134,6 +134,8 @@ srt_mps = [
     "torchao==0.9.0",
     "torchaudio==2.9.1",
     "torchvision",
+    "mlx",
+    "mlx-lm",
 ]
 
 diffusion_mps = [
@@ -209,4 +211,4 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]

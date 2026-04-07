@@ -26,6 +26,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -325,6 +326,7 @@ class ServerArgs:
     ssl_ca_certs: Optional[str] = None
     ssl_keyfile_password: Optional[str] = None
     enable_ssl_refresh: bool = False
+    enable_http2: bool = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -512,6 +514,9 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_max_trie_depth: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_ngram_external_corpus_path: Optional[str] = None
+    speculative_ngram_external_sam_budget: int = 0
+    speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -918,6 +923,26 @@ class ServerArgs:
                 "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
                 "to be specified."
             )
+
+        if self.enable_http2:
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
+            if self.enable_ssl_refresh:
+                raise ValueError(
+                    "--enable-ssl-refresh is not supported with --enable-http2. "
+                    "Granian does not support SSL certificate hot-reloading. "
+                    "Use Uvicorn (the default) or handle certificate rotation externally."
+                )
+            if self.tokenizer_worker_num > 1:
+                raise ValueError(
+                    "--enable-http2 does not yet support --tokenizer-worker-num > 1. "
+                    "Multi-worker HTTP/2 support will be added in a future release."
+                )
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -1498,6 +1523,14 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
+        _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
+        if _hybrid_spec is not None:
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=_hybrid_spec.support_mamba_cache,
+                support_mamba_cache_extra_buffer=_hybrid_spec.support_mamba_cache_extra_buffer,
+            )
+
         if model_arch in [
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
@@ -1875,6 +1908,10 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch == "Gemma4ForConditionalGeneration":
+            if self.is_attention_backend_not_set():
+                self.attention_backend = "triton"
+                logger.info("Use triton as default attention backend for Gemma4")
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
                 logger.warning(
@@ -2188,6 +2225,13 @@ class ServerArgs:
                     == 0
                 ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
         elif not self.disable_radix_cache:  # no_buffer
+            if self.page_size is not None and self.page_size != 1:
+                logger.warning(
+                    f"{model_arch} with radix cache requires page_size=1 in the current "
+                    f"Mamba scheduling mode (no_buffer), but got {self.page_size}. "
+                    "Automatically setting page_size=1."
+                )
+                self.page_size = 1
             if self.speculative_algorithm is None:
                 logger.warning(
                     "Disabling overlap schedule since mamba no_buffer is not compatible with "
@@ -3110,6 +3154,25 @@ class ServerArgs:
                     "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
                     "You can override this by explicitly setting --speculative-num-draft-tokens."
                 )
+            if self.speculative_ngram_external_corpus_path is not None:
+                if self.speculative_ngram_external_sam_budget <= 0:
+                    raise ValueError(
+                        "--speculative-ngram-external-sam-budget must be positive when "
+                        "--speculative-ngram-external-corpus-path is set."
+                    )
+                if self.speculative_ngram_external_corpus_max_tokens <= 0:
+                    raise ValueError(
+                        "--speculative-ngram-external-corpus-max-tokens must be positive when "
+                        "--speculative-ngram-external-corpus-path is set."
+                    )
+                if (
+                    self.speculative_ngram_external_sam_budget
+                    > self.speculative_num_draft_tokens - 1
+                ):
+                    raise ValueError(
+                        "speculative_ngram_external_sam_budget must be less than or equal to "
+                        f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."
+                    )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
                 "using ngram speculative decoding."
@@ -3299,6 +3362,8 @@ class ServerArgs:
             "Qwen3VLForConditionalGeneration",
             "Qwen2_5_VLForConditionalGeneration",
             "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
@@ -3820,6 +3885,14 @@ class ServerArgs:
             default=ServerArgs.enable_ssl_refresh,
             help="Enable automatic SSL certificate hot-reloading when cert/key "
             "files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
+        )
+        parser.add_argument(
+            "--enable-http2",
+            action="store_true",
+            default=ServerArgs.enable_http2,
+            help="Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and "
+            "HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. "
+            "Requires 'pip install sglang[http2]'.",
         )
 
         # Quantization and data type
@@ -4887,6 +4960,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-corpus-path",
+            type=str,
+            default=ServerArgs.speculative_ngram_external_corpus_path,
+            help="Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-sam-budget",
+            type=int,
+            default=ServerArgs.speculative_ngram_external_sam_budget,
+            help="Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-corpus-max-tokens",
+            type=int,
+            default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
+            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
         )
 
         # Multi-layer Eagle speculative decoding
