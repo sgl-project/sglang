@@ -362,6 +362,15 @@ def get_moe_padding_size(is_aiter_moe):
 
 
 def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
+    """
+    Calculate dimensions for MoE weight tensors.
+
+    Args:
+        inter_dim: Base intermediate dimension.
+        is_concat: If True, fusions W1 (gate) and W3 (up) projections.
+        is_packed: If True, uses 4-bit quantization (two FP4 elements per byte).
+        is_aiter_moe: If True, applies Aiter-specific kernel padding alignment.
+    """
     w13_up_dim = 2 * inter_dim if is_concat else inter_dim
     w2_down_dim = inter_dim // 2 if is_packed else inter_dim
 
