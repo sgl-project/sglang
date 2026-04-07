@@ -2,6 +2,7 @@
 
 import logging
 from enum import Enum
+from functools import cached_property
 from typing import List, Optional, Tuple
 
 import torch
@@ -316,6 +317,7 @@ class FusedMoE(torch.nn.Module):
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
 
+    @cached_property
     def use_padded_loading(self) -> bool:
         # This handles the case where the loaded weights are smaller than the padded expert_data
         # Use narrow_padded_param_and_loaded_weight for:
@@ -441,7 +443,7 @@ class FusedMoE(torch.nn.Module):
         else:
             start = 0
 
-        if self.use_padded_loading():
+        if self.use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -510,7 +512,7 @@ class FusedMoE(torch.nn.Module):
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
 
-        if self.use_padded_loading():
+        if self.use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
