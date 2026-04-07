@@ -2817,6 +2817,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner.can_run(forward_batch)
         )
 
+        if (
+            self.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            self.hisparse_coordinator.wait_for_pending_backup()
+
         if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,
