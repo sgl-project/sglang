@@ -98,9 +98,7 @@ class KVArgsRegisterInfo:
         dst_state_item_lens = []
         dst_state_dim_per_tensor = []
         if len(msg) > 12 and len(msg[12]) > 0:
-            dst_state_item_lens = list(
-                struct.unpack(f"{len(msg[12]) // 4}I", msg[12])
-            )
+            dst_state_item_lens = list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
         if len(msg) > 13 and len(msg[13]) > 0:
             dst_state_dim_per_tensor = list(
                 struct.unpack(f"{len(msg[13]) // 4}I", msg[13])
@@ -714,9 +712,7 @@ class NixlKVManager(CommonKVManager):
 
         prefill_state_data_ptrs = self.kv_args.state_data_ptrs
         prefill_state_item_lens = self.kv_args.state_item_lens
-        src_state_dim_per_tensor = getattr(
-            self.kv_args, "state_dim_per_tensor", []
-        )
+        src_state_dim_per_tensor = getattr(self.kv_args, "state_dim_per_tensor", [])
 
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(
