@@ -2,6 +2,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import openai
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -17,7 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=283, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=360, suite="stage-b-test-small-1-gpu")
 
 
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin):
@@ -92,9 +94,65 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin):
         self.assertGreater(metrics["accuracy"], 0.23)
         assert self.process.poll() is None
 
+    def test_early_stop(self):
+        client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
+        for i in range(8):
+            max_tokens = (i % 3) + 1
+            response = client.completions.create(
+                model=self.model,
+                prompt=f"There are {i} apples on the table. How to divide them equally?",
+                max_tokens=max_tokens,
+                temperature=0,
+            )
+            text = response.choices[0].text
+            print(f"early_stop: max_tokens={max_tokens}, text={text!r}")
+        assert self.process.poll() is None
+
+    def test_eos_handling(self):
+        client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": "Today is a sunny day and I like"}],
+            max_tokens=256,
+            temperature=0.1,
+        )
+        text = response.choices[0].message.content
+        print(f"eos_handling: text={text!r}")
+        self.assertNotIn("<|eot_id|>", text)
+        self.assertNotIn("<|end_of_text|>", text)
+        assert self.process.poll() is None
+
+    def test_greedy_determinism(self):
+        client = openai.Client(base_url=self.base_url + "/v1", api_key="EMPTY")
+        prompt = "The capital of France is"
+        outputs = []
+        for _ in range(2):
+            response = client.completions.create(
+                model=self.model,
+                prompt=prompt,
+                max_tokens=32,
+                temperature=0,
+            )
+            outputs.append(response.choices[0].text)
+        print(f"determinism: {outputs=}")
+        self.assertEqual(outputs[0], outputs[1])
+        assert self.process.poll() is None
+
 
 class TestDFlashServerPage(TestDFlashServerBase):
     page_size = 64
+
+
+class TestDFlashServerPage256(TestDFlashServerBase):
+    page_size = 256
+
+
+class TestDFlashServerChunkedPrefill(TestDFlashServerBase):
+    other_launch_args = ["--chunked-prefill-size", "4"]
+
+
+class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
+    other_launch_args = ["--disable-cuda-graph"]
 
 
 if __name__ == "__main__":
