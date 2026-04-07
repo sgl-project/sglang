@@ -154,6 +154,61 @@ python -m sglang_router.launch_router \
 
 ```
 
+### Dynamic Encoder Discovery via Bootstrap Server
+
+Instead of statically listing encoder URLs via `--encoder-urls`, you can have encoders register themselves at runtime. This is useful when encoders start after the prefill server, or when you need to add/replace encoders without restarting the prefill server.
+
+Start the prefill/language-only server with `--encoder-bootstrap-port` to launch a built-in `EncoderBootstrapServer`. Encoder servers then use `--encoder-register-url` to register with it on startup.
+
+```bash
+# Step 1: Start the language-only prefill server with a local bootstrap server on port 8765
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --language-only \
+  --encoder-bootstrap-port 8765 \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --port 30002
+
+# Step 2: Start encoders — they self-register with the bootstrap server
+# Encoder 0
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --encoder-only \
+  --encoder-register-url http://127.0.0.1:8765 \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --port 30000
+
+# Encoder 1 (can be added later without restarting the prefill server)
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --encoder-only \
+  --encoder-register-url http://127.0.0.1:8765 \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --port 30001
+```
+
+You can also query the registered encoder URLs at any time:
+
+```bash
+curl http://127.0.0.1:30002/list_encoder_urls
+# {"encoder_urls": ["http://127.0.0.1:30000", "http://127.0.0.1:30001"]}
+```
+
+If you prefer to run the bootstrap server on a separate host (e.g. shared across multiple prefill instances), use `--encoder-bootstrap-url` to point to it instead:
+
+```bash
+# External bootstrap server (started separately)
+# e.g. reuse any existing EncoderBootstrapServer or start a dedicated one
+
+# Prefill server using an external bootstrap
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --language-only \
+  --encoder-bootstrap-url http://bootstrap-host:8765 \
+  --encoder-transfer-backend zmq_to_scheduler \
+  --port 30002
+```
+
 #### gRPC Encoder (EPD)
 
 You can run the encoder as a gRPC server while keeping prefill/decode as HTTP.

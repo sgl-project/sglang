@@ -1090,6 +1090,46 @@ async def remote_instance_transfer_engine_info(rank: int = None):
     )
 
 
+@app.get("/list_encoder_urls")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_encoder_urls():
+    """List encoder URLs registered with the bootstrap server."""
+    server_args = _global_state.tokenizer_manager.server_args
+    if not server_args.encoder_bootstrap_url:
+        return ORJSONResponse(
+            {"error": {"message": "No encoder_bootstrap_url configured"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    try:
+        resp = requests.get(
+            f"{server_args.encoder_bootstrap_url}/list_encoder_urls",
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning(
+            f"Bootstrap server returned non-200 status {resp.status_code} "
+            f"when listing encoder URLs"
+        )
+        return ORJSONResponse(
+            {
+                "error": {
+                    "message": f"Bootstrap server returned status {resp.status_code}"
+                }
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logger.warning(
+            f"Failed to connect to bootstrap server to list encoder URLs: {e}"
+        )
+        return ORJSONResponse(
+            {"error": {"message": f"Failed to connect to bootstrap server: {e}"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
 @app.post("/init_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
@@ -2031,6 +2071,29 @@ def _setup_and_run_http_server(
 
     Called by launch_server after subprocesses have been launched.
     """
+    # Start the encoder bootstrap server if configured (language-only/prefill side).
+    if server_args.language_only and server_args.encoder_bootstrap_port:
+        from sglang.srt.disaggregation.encoder_bootstrap_server import (
+            EncoderBootstrapServer,
+        )
+        from sglang.srt.utils.network import is_port_available
+
+        bootstrap_port = server_args.encoder_bootstrap_port
+        if not is_port_available(bootstrap_port):
+            raise RuntimeError(
+                f"encoder_bootstrap_port {bootstrap_port} is already in use. "
+                f"Choose a different --encoder-bootstrap-port."
+            )
+        _global_encoder_bootstrap_server = EncoderBootstrapServer(
+            host=server_args.host, port=bootstrap_port
+        )
+        # If no explicit encoder_bootstrap_url is set, point to the local server.
+        if not server_args.encoder_bootstrap_url:
+            server_args.encoder_bootstrap_url = server_args.url(port=bootstrap_port)
+        logger.info(
+            f"EncoderBootstrapServer started; reachable at {server_args.encoder_bootstrap_url}"
+        )
+
     # Set global states
     set_global_state(
         _GlobalState(

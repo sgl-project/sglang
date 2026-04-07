@@ -709,6 +709,9 @@ class ServerArgs:
     language_only: bool = False
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
+    encoder_bootstrap_port: Optional[int] = None
+    encoder_bootstrap_url: Optional[str] = None
+    encoder_register_url: Optional[str] = None
     enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
@@ -3303,10 +3306,27 @@ class ServerArgs:
                 "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
 
-        if self.language_only and len(self.encoder_urls) == 0:
+        if (
+            self.language_only
+            and len(self.encoder_urls) == 0
+            and not self.encoder_bootstrap_url
+            and not self.encoder_bootstrap_port
+        ):
             raise ValueError(
-                "requires at least one encoder urls to be set via --encoder-urls"
+                "requires at least one encoder urls to be set via --encoder-urls, "
+                "or a bootstrap URL via --encoder-bootstrap-url, "
+                "or start a local bootstrap server via --encoder-bootstrap-port"
             )
+
+        # Eagerly compute encoder_bootstrap_url from encoder_bootstrap_port so that
+        # sub-processes (e.g. the scheduler) inherit the correct URL in their copy
+        # of server_args.  This must happen before any subprocess is spawned.
+        if (
+            self.language_only
+            and self.encoder_bootstrap_port
+            and not self.encoder_bootstrap_url
+        ):
+            self.encoder_bootstrap_url = self.url(port=self.encoder_bootstrap_port)
 
         # Validate IB devices when mooncake backend is used
         if (
@@ -5855,6 +5875,28 @@ class ServerArgs:
             type=str,
             default=[],
             help="List of encoder server urls.",
+        )
+        parser.add_argument(
+            "--encoder-bootstrap-port",
+            type=int,
+            default=ServerArgs.encoder_bootstrap_port,
+            help="Port to start the encoder bootstrap server on (language-only/prefill side). "
+            "When set, a dedicated EncoderBootstrapServer is started to allow encoders to "
+            "register dynamically. Encoders use --encoder-register-url to register with it.",
+        )
+        parser.add_argument(
+            "--encoder-bootstrap-url",
+            type=str,
+            default=ServerArgs.encoder_bootstrap_url,
+            help="URL of the encoder bootstrap server to discover encoder URLs dynamically. "
+            "When set, --encoder-urls is optional for --language-only mode.",
+        )
+        parser.add_argument(
+            "--encoder-register-url",
+            type=str,
+            default=ServerArgs.encoder_register_url,
+            help="Encoder bootstrap server URL to register this encoder's URL with, "
+            "for dynamic encoder discovery. Used with --encoder-only servers.",
         )
         parser.add_argument(
             "--enable-adaptive-dispatch-to-encoder",

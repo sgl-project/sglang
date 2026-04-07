@@ -607,7 +607,11 @@ class MMReceiverBase(ABC):
     ):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
-        self.encode_urls = server_args.encoder_urls
+        self.encode_urls = list(server_args.encoder_urls)
+        self.encoder_bootstrap_url = server_args.encoder_bootstrap_url
+        # Timestamp of last bootstrap refresh; used to rate-limit requests.
+        self._last_bootstrap_refresh: float = 0.0
+        self._bootstrap_refresh_interval: float = 5.0
         self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
@@ -684,11 +688,56 @@ class MMReceiverBase(ABC):
     def process_waiting_requests(self, recv_reqs):
         pass
 
+    def _refresh_encoder_urls_from_bootstrap(self):
+        """Fetch encoder URLs from the bootstrap server and update the local list.
+
+        Called on every request when a bootstrap URL is configured, so that
+        dynamically registered or deregistered encoders are reflected immediately.
+        Rate-limited to at most one HTTP call per ``_bootstrap_refresh_interval``
+        seconds to avoid hammering the bootstrap server.
+        """
+        import time
+
+        import requests as http_requests
+
+        now = time.monotonic()
+        if now - self._last_bootstrap_refresh < self._bootstrap_refresh_interval:
+            return
+        self._last_bootstrap_refresh = now
+
+        try:
+            resp = http_requests.get(
+                f"{self.encoder_bootstrap_url}/list_encoder_urls", timeout=5
+            )
+            if resp.status_code == 200:
+                urls = resp.json().get("encoder_urls", [])
+                # Always overwrite the cached list so that newly registered
+                # encoders are picked up and departed encoders are evicted.
+                self.encode_urls = urls
+                if urls:
+                    logger.info(
+                        f"Fetched {len(urls)} encoder URLs from bootstrap: {urls}"
+                    )
+                else:
+                    logger.info(
+                        "Bootstrap server returned no encoder URLs yet; "
+                        "will retry on next request"
+                    )
+            else:
+                logger.warning(
+                    f"Failed to fetch encoder URLs from bootstrap: {resp.status_code}"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to fetch encoder URLs from bootstrap: {e}")
+
     async def recv_mm_data(
         self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
     ):
         req_id = None
         try:
+            # Refresh encoder URLs from bootstrap if using dynamic discovery.
+            if self.encoder_bootstrap_url:
+                self._refresh_encoder_urls_from_bootstrap()
             if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
             req_id = uuid.uuid4().hex
@@ -817,8 +866,21 @@ class MMReceiverBase(ABC):
         mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
+        # Refresh encoder URLs from bootstrap on every request when dynamic
+        # discovery is configured, so newly registered or departed encoders
+        # are reflected without a server restart.
+        if mm_data and self.encoder_bootstrap_url:
+            if not self.encode_urls:
+                logger.info(
+                    f"No encoder URLs available; querying bootstrap at "
+                    f"{self.encoder_bootstrap_url} for request {obj.rid}"
+                )
+            self._refresh_encoder_urls_from_bootstrap()
         if mm_data and self.encode_urls:
-            logger.info(f"Processing {len(mm_data)} mm items for request {obj.rid}")
+            logger.info(
+                f"Dispatching {len(mm_data)} mm items to {len(self.encode_urls)} "
+                f"encoder(s) {self.encode_urls} for request {obj.rid}"
+            )
             obj.need_wait_for_mm_inputs = True
 
             num_items_assigned = self._assign_items_by_modality(
@@ -837,6 +899,18 @@ class MMReceiverBase(ABC):
                 daemon=True,
             )
             encode_thread.start()
+        else:
+            # No encoder URLs available (bootstrap may not have any registered yet);
+            # reset the flag so the scheduler does not wait for embeddings that will
+            # never arrive.  A warning is emitted so the user can diagnose why
+            # disaggregation is not happening for this request.
+            if mm_data:
+                logger.warning(
+                    f"No encoder URLs available for request {obj.rid} "
+                    f"(bootstrap_url={self.encoder_bootstrap_url}); "
+                    "processing without encoder disaggregation."
+                )
+            obj.need_wait_for_mm_inputs = False
 
     # For zmq_to_scheduler
     def _process_waiting_requests(self, recv_reqs, waiting_cls):
@@ -846,6 +920,12 @@ class MMReceiverBase(ABC):
                 isinstance(recv_req, TokenizedGenerateReqInput)
                 and recv_req.need_wait_for_mm_inputs is True
             ):
+                # The scheduler subprocess has its own MMReceiverHTTP instance.
+                # Always refresh from the bootstrap server (subject to rate
+                # limiting) so that newly registered or departed encoders are
+                # reflected without a server restart.
+                if self.encoder_bootstrap_url:
+                    self._refresh_encoder_urls_from_bootstrap()
                 waiting_req = waiting_cls(
                     rid=recv_req.rid,
                     recv_req=recv_req,
