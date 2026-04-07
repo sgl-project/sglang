@@ -232,10 +232,6 @@ class NixlKVManager(CommonKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
-    # ------------------------------------------------------------------
-    # Staging buffer methods (delegate to common/staging_handler.py)
-    # ------------------------------------------------------------------
-
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
             PrefillStagingContext,
@@ -310,10 +306,6 @@ class NixlKVManager(CommonKVManager):
 
         return is_watermark_ready(self._staging_ctx, agent_name, alloc_round, alloc_end)
 
-    # ------------------------------------------------------------------
-    # Decode-side staging thread
-    # ------------------------------------------------------------------
-
     def _start_decode_staging_thread(self):
         """Start a thread on the decode side to recv STAGING_REQ from prefill via ZMQ."""
 
@@ -364,10 +356,6 @@ class NixlKVManager(CommonKVManager):
         if receiver is not None:
             handler.register_wm_subscriber(receiver, session_id)
 
-    # ------------------------------------------------------------------
-    # Prefill-side staging prefetch (delegates to common)
-    # ------------------------------------------------------------------
-
     def _prefetch_staging_reqs(self, room: int):
         """Send STAGING_REQ for all chunks before the prefill forward starts."""
         if not self.enable_staging or self.kv_buffer_tensors is None:
@@ -396,10 +384,6 @@ class NixlKVManager(CommonKVManager):
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
         )
-
-    # ------------------------------------------------------------------
-    # Heartbeat
-    # ------------------------------------------------------------------
 
     def _start_heartbeat_checker_thread(self):
         """
@@ -487,10 +471,6 @@ class NixlKVManager(CommonKVManager):
             logger.error(f"Let room {room} be failed due to prefill down")
             self.update_status(room, KVPoll.Failed)
 
-    # ------------------------------------------------------------------
-    # Buffer registration
-    # ------------------------------------------------------------------
-
     def register_buffer_to_engine(self):
         kv_addrs = []
         for kv_data_ptr, kv_data_len in zip(
@@ -534,10 +514,6 @@ class NixlKVManager(CommonKVManager):
             return
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
-
-    # ------------------------------------------------------------------
-    # KV transfer methods
-    # ------------------------------------------------------------------
 
     def _send_kvcache_generic(
         self,
@@ -912,10 +888,6 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
 
-    # ------------------------------------------------------------------
-    # Aux / state transfer
-    # ------------------------------------------------------------------
-
     def send_aux(
         self,
         peer_name: str,
@@ -1166,10 +1138,6 @@ class NixlKVManager(CommonKVManager):
                 )
             return None
 
-    # ------------------------------------------------------------------
-    # Staging transfer helper
-    # ------------------------------------------------------------------
-
     def _get_staging_strategy(self, staging_buffer):
         """Lazily create or return cached PrefillStagingStrategy."""
         if not hasattr(self, "_staging_strategy") or self._staging_strategy is None:
@@ -1242,10 +1210,6 @@ class NixlKVManager(CommonKVManager):
             decode_tp_rank=decode_info.decode_tp_rank,
             dst_kv_item_len=decode_info.dst_kv_item_len,
         )
-
-    # ------------------------------------------------------------------
-    # Main transfer dispatch
-    # ------------------------------------------------------------------
 
     def add_transfer_request(
         self,
@@ -1357,10 +1321,6 @@ class NixlKVManager(CommonKVManager):
             del self.transfer_infos[bootstrap_room]
         return handles
 
-    # ------------------------------------------------------------------
-    # Notification processing (decode side)
-    # ------------------------------------------------------------------
-
     def update_transfer_status(self):
         # Process notifications from received transfers.
         notif_map = self.agent.get_new_notifs()
@@ -1470,10 +1430,6 @@ class NixlKVManager(CommonKVManager):
         if room not in self.transfer_statuses:
             return False
         return self.transfer_statuses[room].is_done()
-
-    # ------------------------------------------------------------------
-    # Bootstrap thread (prefill side)
-    # ------------------------------------------------------------------
 
     def _handle_watermark_msg(self, msg_parts):
         wm_round = int(msg_parts[1].decode("ascii"))
