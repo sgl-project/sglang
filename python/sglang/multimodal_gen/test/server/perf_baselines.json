@@ -2504,6 +2504,54 @@
             "expected_e2e_ms": 8091.46,
             "expected_avg_denoise_ms": 141.37,
             "expected_median_denoise_ms": 142.63
+        },
+        "ltx_2.3_one_stage_ti2v": {
+            "stages_ms": {
+                "InputValidationStage": 3.27,
+                "TextEncodingStage": 1766.71,
+                "LTX2TextConnectorStage": 27.34,
+                "LTX2SigmaPreparationStage": 0.14,
+                "TimestepPreparationStage": 15.78,
+                "LTX2AVLatentPreparationStage": 0.25,
+                "LTX2AVDenoisingStage": 23757.65,
+                "LTX2AVDecodingStage": 1171.65,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 709.91,
+                "1": 704.93,
+                "2": 707.02,
+                "3": 702.54,
+                "4": 702.07,
+                "5": 746.58,
+                "6": 774.04,
+                "7": 766.37,
+                "8": 751.37,
+                "9": 734.67,
+                "10": 710.79,
+                "11": 689.84,
+                "12": 688.12,
+                "13": 689.74,
+                "14": 687.5,
+                "15": 699.65,
+                "16": 697.09,
+                "17": 686.87,
+                "18": 691.43,
+                "19": 712.52,
+                "20": 705.43,
+                "21": 727.21,
+                "22": 706.73,
+                "23": 705.63,
+                "24": 714.95,
+                "25": 707.69,
+                "26": 748.35,
+                "27": 738.02,
+                "28": 738.05,
+                "29": 726.96
+            },
+            "expected_e2e_ms": 26916.58,
+            "expected_avg_denoise_ms": 715.73,
+            "expected_median_denoise_ms": 707.35
         }
     }
 }
