@@ -57,4 +57,16 @@ impl ResponsesContext {
             requested_servers: Arc::new(StdRwLock::new(Vec::new())),
         }
     }
+
+    /// Clone the shared dependencies while creating a fresh per-request server-key buffer.
+    pub fn clone_for_request(&self) -> Self {
+        Self::new(
+            self.pipeline.clone(),
+            self.components.clone(),
+            self.response_storage.clone(),
+            self.conversation_storage.clone(),
+            self.conversation_item_storage.clone(),
+            self.mcp_manager.clone(),
+        )
+    }
 }
