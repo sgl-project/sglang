@@ -81,11 +81,12 @@ def collect_executed_cases(reports: list[dict]) -> dict[str, set[str]]:
         if suite not in executed:
             executed[suite] = set()
 
-        if report["is_standalone"]:
+        executed_cases = report.get("executed_cases", [])
+        if executed_cases:
+            executed[suite].update(executed_cases)
+        elif report["is_standalone"]:
             standalone_file = report["standalone_file"]
             executed[suite].add(f"standalone:{standalone_file}")
-        else:
-            executed[suite].update(report["executed_cases"])
 
     return executed
 
@@ -108,6 +109,53 @@ def collect_case_results(reports: list[dict]) -> dict[str, dict[str, str]]:
         results[suite].update(case_results)
 
     return results
+
+
+def collect_missing_standalone_estimates(reports: list[dict]) -> dict[str, set[str]]:
+    missing_by_suite: dict[str, set[str]] = {}
+    for report in reports:
+        suite = report["suite"]
+        missing = report.get("missing_standalone_estimates", [])
+        if not missing:
+            continue
+        missing_by_suite.setdefault(suite, set()).update(missing)
+    return missing_by_suite
+
+
+def collect_standalone_measurements(reports: list[dict]) -> dict[tuple[str, str], dict]:
+    measurements: dict[tuple[str, str], dict] = {}
+    for report in reports:
+        for measurement in report.get("standalone_measurements", []):
+            key = (measurement["suite"], measurement["standalone_file"])
+            measurements[key] = measurement
+    return measurements
+
+
+def print_missing_standalone_estimates_summary(
+    missing_by_suite: dict[str, set[str]],
+    measurements: dict[tuple[str, str], dict],
+) -> None:
+    if not missing_by_suite:
+        return
+
+    print("\n" + "=" * 60)
+    print(
+        "Add standalone estimate(s) to "
+        "python/sglang/multimodal_gen/test/run_suite.py"
+    )
+    print("=" * 60)
+    print("The following standalone file(s) used fallback estimate 300.0s.")
+    print("Update STANDALONE_FILE_EST_TIMES with the measured runtime below:\n")
+
+    for suite in sorted(missing_by_suite):
+        print(f'"{suite}": {{')
+        for standalone_file in sorted(missing_by_suite[suite]):
+            measurement = measurements.get((suite, standalone_file))
+            measured_time = (
+                measurement["measured_full_test_time_s"] if measurement else 300.0
+            )
+            print(f'    "{standalone_file}": {measured_time:.1f},')
+        print("}\n")
 
 
 def verify_coverage(
@@ -233,6 +281,8 @@ def main():
 
     # Collect case results
     case_results = collect_case_results(reports)
+    missing_standalone_estimates = collect_missing_standalone_estimates(reports)
+    standalone_measurements = collect_standalone_measurements(reports)
 
     # Verify coverage
     is_complete, missing = verify_coverage(expected, executed)
@@ -252,9 +302,14 @@ def main():
 
     # Print test results summary
     passed_count, failed_count, error_count = print_results_summary(case_results)
+    print_missing_standalone_estimates_summary(
+        missing_standalone_estimates, standalone_measurements
+    )
 
     # Exit with appropriate code
     if not is_complete:
+        sys.exit(1)
+    elif missing_standalone_estimates:
         sys.exit(1)
     elif failed_count > 0 or error_count > 0:
         print("\n" + "=" * 60)

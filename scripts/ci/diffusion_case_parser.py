@@ -56,6 +56,10 @@ class DiffusionSuiteInfo:
     suite: str  # "1-gpu" or "2-gpu"
     cases: List[DiffusionCaseInfo]  # parametrized test cases
     standalone_files: List[str]  # standalone test files
+    standalone_est_times: Dict[str, float]  # standalone file -> estimated seconds
+    missing_standalone_estimates: List[
+        str
+    ]  # standalone files without configured estimate
 
 
 class DiffusionTestCaseVisitor(ast.NodeVisitor):
@@ -113,9 +117,9 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
         return None
 
 
-class StandaloneFilesVisitor(ast.NodeVisitor):
+class RunSuiteVisitor(ast.NodeVisitor):
     """
-    AST visitor to extract STANDALONE_FILES from run_suite.py.
+    AST visitor to extract standalone metadata from run_suite.py.
 
     Parses:
         STANDALONE_FILES = {
@@ -126,14 +130,20 @@ class StandaloneFilesVisitor(ast.NodeVisitor):
 
     def __init__(self):
         self.standalone_files: Dict[str, List[str]] = {}
+        self.standalone_est_times: Dict[str, Dict[str, float]] = {}
 
     def visit_Assign(self, node: ast.Assign):
         for target in node.targets:
             if isinstance(target, ast.Name) and target.id == "STANDALONE_FILES":
-                self.standalone_files = self._extract_dict(node.value)
+                self.standalone_files = self._extract_file_dict(node.value)
+            if (
+                isinstance(target, ast.Name)
+                and target.id == "STANDALONE_FILE_EST_TIMES"
+            ):
+                self.standalone_est_times = self._extract_est_time_dict(node.value)
         self.generic_visit(node)
 
-    def _extract_dict(self, node: ast.AST) -> Dict[str, List[str]]:
+    def _extract_file_dict(self, node: ast.AST) -> Dict[str, List[str]]:
         """Extract dictionary of suite -> file list."""
         result = {}
         if isinstance(node, ast.Dict):
@@ -144,6 +154,29 @@ class StandaloneFilesVisitor(ast.NodeVisitor):
                         elt.value for elt in value.elts if isinstance(elt, ast.Constant)
                     ]
                     result[suite] = files
+        return result
+
+    def _extract_est_time_dict(self, node: ast.AST) -> Dict[str, Dict[str, float]]:
+        """Extract dictionary of suite -> standalone file -> estimated seconds."""
+        result = {}
+        if not isinstance(node, ast.Dict):
+            return result
+
+        for key, value in zip(node.keys, node.values):
+            if not isinstance(key, ast.Constant) or not isinstance(value, ast.Dict):
+                continue
+
+            suite = key.value
+            suite_est_times = {}
+            for inner_key, inner_value in zip(value.keys, value.values):
+                if not (
+                    isinstance(inner_key, ast.Constant)
+                    and isinstance(inner_value, ast.Constant)
+                ):
+                    continue
+                suite_est_times[inner_key.value] = float(inner_value.value)
+            result[suite] = suite_est_times
+
         return result
 
 
@@ -196,22 +229,42 @@ def parse_testcase_configs(config_path: Path) -> Dict[str, List[str]]:
     return visitor.cases
 
 
-def parse_standalone_files(run_suite_path: Path) -> Dict[str, List[str]]:
+def parse_run_suite_standalone_data(
+    run_suite_path: Path,
+) -> tuple[Dict[str, List[str]], Dict[str, Dict[str, float]]]:
     """
-    Parse run_suite.py to extract STANDALONE_FILES.
+    Parse run_suite.py to extract standalone file metadata.
 
     Returns:
-        Dictionary mapping suite to standalone file list.
-        e.g., {"1-gpu": ["../cli/test_generate_t2i_perf.py"], "2-gpu": []}
+        Tuple of:
+          - suite -> standalone file list
+          - suite -> standalone file -> estimated seconds
     """
     with open(run_suite_path, "r", encoding="utf-8") as f:
         content = f.read()
 
     tree = ast.parse(content, filename=str(run_suite_path))
-    visitor = StandaloneFilesVisitor()
+    visitor = RunSuiteVisitor()
     visitor.visit(tree)
 
-    return visitor.standalone_files
+    return visitor.standalone_files, visitor.standalone_est_times
+
+
+def validate_standalone_est_times(
+    standalone_files: Dict[str, List[str]],
+    standalone_est_times: Dict[str, Dict[str, float]],
+) -> Dict[str, List[str]]:
+    missing_by_suite = {}
+    for suite, files in standalone_files.items():
+        suite_est_times = standalone_est_times.get(suite, {})
+        missing = [
+            standalone_file
+            for standalone_file in files
+            if standalone_file not in suite_est_times
+        ]
+        if missing:
+            missing_by_suite[suite] = missing
+    return missing_by_suite
 
 
 def collect_diffusion_suites(
@@ -234,7 +287,12 @@ def collect_diffusion_suites(
     case_lists = parse_testcase_configs(testcase_config_path)
 
     # Parse standalone files from run_suite.py
-    standalone_files = parse_standalone_files(run_suite_path)
+    standalone_files, standalone_est_times = parse_run_suite_standalone_data(
+        run_suite_path
+    )
+    missing_standalone_estimates = validate_standalone_est_times(
+        standalone_files, standalone_est_times
+    )
 
     # Load baselines for time estimation
     baselines = load_baselines(baseline_path)
@@ -257,6 +315,10 @@ def collect_diffusion_suites(
                 suite=suite,
                 cases=[],
                 standalone_files=standalone_files.get(suite, []),
+                standalone_est_times=dict(standalone_est_times.get(suite, {})),
+                missing_standalone_estimates=list(
+                    missing_standalone_estimates.get(suite, [])
+                ),
             )
         suites[suite].cases.extend(cases)
 

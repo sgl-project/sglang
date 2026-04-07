@@ -62,6 +62,8 @@ jobs:
     outputs:
       matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
       matrix-2gpu: ${{ steps.compute.outputs.matrix-2gpu }}
+      plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
+      plan-2gpu: ${{ steps.compute.outputs.plan-2gpu }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -76,7 +78,7 @@ jobs:
       - name: Compute partitions
         id: compute
         run: |
-          python scripts/ci/compute_diffusion_partitions.py --target-time 1200 --max-partitions 10
+          python scripts/ci/compute_diffusion_partitions.py --min-time 1200 --target-time 1800 --max-time 2400 --max-partitions 10
 
   multimodal-gen-test-1-gpu:
     needs: compute-diffusion-partitions
@@ -124,12 +126,14 @@ jobs:
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
             --total-partitions ${{ matrix.total }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             $CONTINUE_ON_ERROR_FLAG
 
       - name: Upload execution report
@@ -192,12 +196,14 @@ jobs:
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
             --total-partitions ${{ matrix.total }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             $CONTINUE_ON_ERROR_FLAG
 
       - name: Upload execution report

@@ -6,12 +6,15 @@ using LPT so each CI shard has a similar total runtime.
 """
 
 import argparse
+import copy
 import json
 import os
 import random
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 
 import tabulate
@@ -30,6 +33,7 @@ logger = init_logger(__name__)
 
 DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0
+DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
 
 _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
 _UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
@@ -80,7 +84,27 @@ STANDALONE_FILES = {
     "2-gpu": [],
 }
 
+# NOTE: This is parsed by diffusion_case_parser.py using AST.
+# New standalone files may omit an estimate once to learn the real CI runtime.
+# CI will use a fallback estimate for sharding, run the test, then print a
+# measured value that must be copied into STANDALONE_FILE_EST_TIMES.
+STANDALONE_FILE_EST_TIMES = {
+    "1-gpu": {
+        "../cli/test_generate_t2i_perf.py": 240.0,
+        "test_update_weights_from_disk.py": 480.0,
+    },
+    "2-gpu": {},
+}
+
 STRICT_SUITES = {"unit"}
+
+
+@dataclass(frozen=True)
+class PartitionAssignment:
+    case_ids: list[str]
+    standalone_files: list[str]
+    estimated_time: float | None = None
+    missing_standalone_estimates: list[str] | None = None
 
 
 def get_case_est_time(case_id: str) -> float:
@@ -90,6 +114,33 @@ def get_case_est_time(case_id: str) -> float:
     if scenario.estimated_full_test_time_s is not None:
         return scenario.estimated_full_test_time_s
     return scenario.expected_e2e_ms / 1000.0 + STARTUP_OVERHEAD_SECONDS
+
+
+def get_standalone_file_est_time(
+    suite: str, standalone_file: str
+) -> tuple[float, bool]:
+    suite_est_times = STANDALONE_FILE_EST_TIMES.get(suite, {})
+    if standalone_file not in suite_est_times:
+        return DEFAULT_STANDALONE_EST_TIME_SECONDS, True
+    return suite_est_times[standalone_file], False
+
+
+def get_all_standalone_file_est_times() -> dict[str, dict[str, float]]:
+    return copy.deepcopy(STANDALONE_FILE_EST_TIMES)
+
+
+def validate_standalone_file_est_times() -> dict[str, list[str]]:
+    missing_by_suite: dict[str, list[str]] = {}
+    for suite, standalone_files in STANDALONE_FILES.items():
+        suite_est_times = STANDALONE_FILE_EST_TIMES.get(suite, {})
+        missing = [
+            standalone_file
+            for standalone_file in standalone_files
+            if standalone_file not in suite_est_times
+        ]
+        if missing:
+            missing_by_suite[suite] = missing
+    return missing_by_suite
 
 
 def auto_partition(
@@ -108,6 +159,138 @@ def auto_partition(
         partition_sums[min_idx] += get_case_est_time(case.id)
 
     return partitions[rank] if rank < size else []
+
+
+def _normalize_standalone_key(standalone_file: str) -> str:
+    return f"standalone:{standalone_file}"
+
+
+def parse_partition_plan(
+    suite: str,
+    partition_id: int,
+    total_partitions: int,
+    plan_json: str,
+) -> PartitionAssignment:
+    plan = json.loads(plan_json)
+    if plan.get("suite") != suite:
+        raise ValueError(
+            f"Partition plan suite mismatch: expected {suite!r}, "
+            f"got {plan.get('suite')!r}"
+        )
+
+    partition_count = plan.get("partition_count")
+    if partition_count != total_partitions:
+        raise ValueError(
+            f"Partition count mismatch for suite {suite!r}: "
+            f"plan={partition_count}, matrix={total_partitions}"
+        )
+
+    partitions = plan.get("partitions", [])
+    selected_partition = None
+    for partition in partitions:
+        if partition.get("part") == partition_id:
+            selected_partition = partition
+            break
+
+    if selected_partition is None:
+        raise ValueError(
+            f"Partition {partition_id} not found in plan for suite {suite!r}"
+        )
+
+    return PartitionAssignment(
+        case_ids=list(selected_partition.get("case_ids", [])),
+        standalone_files=list(selected_partition.get("standalone_files", [])),
+        estimated_time=selected_partition.get("estimated_time"),
+        missing_standalone_estimates=list(
+            selected_partition.get("missing_standalone_estimates", [])
+        ),
+    )
+
+
+def _merge_execution_results(
+    executed_cases: list[str],
+    case_results: dict[str, str],
+    new_executed_cases: list[str],
+    new_case_results: dict[str, str],
+) -> None:
+    executed_cases.extend(
+        case_id for case_id in new_executed_cases if case_id not in executed_cases
+    )
+    case_results.update(new_case_results)
+
+
+def _format_standalone_estimate_snippet(
+    suite: str, standalone_file: str, measured_full_test_time_s: float
+) -> str:
+    return (
+        f'"{suite}": {{\n'
+        f'    "{standalone_file}": {measured_full_test_time_s:.1f},\n'
+        f"}}"
+    )
+
+
+def _print_missing_standalone_estimate_message(
+    suite: str,
+    standalone_file: str,
+    measured_full_test_time_s: float,
+) -> None:
+    snippet = _format_standalone_estimate_snippet(
+        suite, standalone_file, measured_full_test_time_s
+    )
+    logger.error(
+        f'\n{"=" * 60}\n'
+        f'Add standalone estimate for suite "{suite}" and file "{standalone_file}":\n\n'
+        f"File: python/sglang/multimodal_gen/test/run_suite.py\n\n"
+        f"Current partition used fallback estimate: "
+        f"{DEFAULT_STANDALONE_EST_TIME_SECONDS:.1f}s\n\n"
+        f"{snippet}\n"
+        f'{"=" * 60}\n'
+    )
+
+
+def _run_standalone_file(
+    suite: str,
+    standalone_rel: str,
+    target_dir: Path,
+    extra_filter: str | None = None,
+) -> tuple[int, list[str], dict[str, str], dict]:
+    if standalone_rel == _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE:
+        _maybe_pin_update_weights_model_pair([standalone_rel])
+
+    est_time, used_fallback_estimate = get_standalone_file_est_time(
+        suite, standalone_rel
+    )
+    standalone_file = _resolve_suite_files(target_dir, [standalone_rel], strict=True)[0]
+    junit_xml_path = str(
+        target_dir / f"junit_results_{suite}_{Path(standalone_rel).stem}.xml"
+    )
+    start_time = time.perf_counter()
+    exit_code, _, _ = run_pytest(
+        [standalone_file],
+        filter_expr=extra_filter,
+        junit_xml_path=junit_xml_path,
+    )
+    measured_full_test_time_s = round(time.perf_counter() - start_time, 1)
+    standalone_key = _normalize_standalone_key(standalone_rel)
+    measurement = {
+        "suite": suite,
+        "standalone_file": standalone_rel,
+        "measured_full_test_time_s": measured_full_test_time_s,
+        "used_fallback_estimate": used_fallback_estimate,
+        "fallback_estimate_s": DEFAULT_STANDALONE_EST_TIME_SECONDS,
+        "had_configured_estimate": not used_fallback_estimate,
+        "configured_or_fallback_estimate_s": est_time,
+    }
+    if used_fallback_estimate:
+        _print_missing_standalone_estimate_message(
+            suite, standalone_rel, measured_full_test_time_s
+        )
+    return (
+        exit_code,
+        [standalone_key],
+        {standalone_key: "pass" if exit_code == 0 else "fail"},
+        measurement,
+    )
 
 
 def parse_args():
@@ -150,6 +333,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Continue running remaining tests even if one fails.",
+    )
+    parser.add_argument(
+        "--partition-plan-json",
+        type=str,
+        default=None,
+        help="Full partition plan JSON for the current suite.",
     )
     return parser.parse_args()
 
@@ -209,6 +398,8 @@ def write_execution_report(
     is_standalone: bool = False,
     standalone_file: str | None = None,
     case_results: dict[str, str] | None = None,
+    missing_standalone_estimates: list[str] | None = None,
+    standalone_measurements: list[dict] | None = None,
 ) -> str:
     report = {
         "suite": suite,
@@ -218,6 +409,8 @@ def write_execution_report(
         "standalone_file": standalone_file,
         "executed_cases": executed_cases,
         "case_results": case_results or {},
+        "missing_standalone_estimates": missing_standalone_estimates or [],
+        "standalone_measurements": standalone_measurements or [],
     }
 
     report_filename = f"execution_report_{suite}_{partition_id}.json"
@@ -422,6 +615,144 @@ def _get_standalone_file(target_dir: Path, suite: str, index: int) -> str | None
 
 
 def _run_dynamic_suite(args, target_dir: Path) -> int:
+    if args.partition_plan_json:
+        assignment = parse_partition_plan(
+            suite=args.suite,
+            partition_id=args.partition_id,
+            total_partitions=args.total_partitions,
+            plan_json=args.partition_plan_json,
+        )
+
+        rows = [[args.suite, f"{args.partition_id + 1}/{args.total_partitions}"]]
+        print(tabulate.tabulate(rows, headers=["Suite", "Partition"], tablefmt="psql"))
+
+        total_est_time = 0.0
+        executed_cases: list[str] = []
+        case_results: dict[str, str] = {}
+        missing_standalone_estimates: list[str] = []
+        standalone_measurements: list[dict] = []
+        overall_exit_code = 0
+
+        if assignment.case_ids:
+            case_id_set = set(assignment.case_ids)
+            total_est_time += sum(
+                get_case_est_time(case_id) for case_id in assignment.case_ids
+            )
+            suite_files = _get_parametrized_files_for_case_ids(
+                args.suite, case_id_set, target_dir
+            )
+            if not suite_files:
+                print(
+                    f"No valid parametrized test files found for suite '{args.suite}'."
+                )
+                return 0
+
+            partition_filter = " or ".join(
+                f"[{case_id}]" for case_id in assignment.case_ids
+            )
+            filter_expr = (
+                f"({partition_filter}) and ({args.filter})"
+                if args.filter
+                else partition_filter
+            )
+
+            print(
+                f"Running {len(assignment.case_ids)} parametrized cases with estimated total "
+                f"{sum(get_case_est_time(case_id) for case_id in assignment.case_ids):.1f}s:"
+            )
+            for case_id in assignment.case_ids:
+                print(f"  - case: {case_id} ({get_case_est_time(case_id):.1f}s)")
+            print(f"Test files: {[Path(f).name for f in suite_files]}")
+            print(f"Filter expression: {filter_expr}")
+
+            junit_xml_path = str(
+                target_dir / f"junit_results_{args.suite}_{args.partition_id}.xml"
+            )
+            exit_code, new_executed_cases, new_case_results = run_pytest(
+                suite_files,
+                filter_expr=filter_expr,
+                junit_xml_path=junit_xml_path,
+            )
+            _merge_execution_results(
+                executed_cases, case_results, new_executed_cases, new_case_results
+            )
+            if exit_code != 0 and overall_exit_code == 0:
+                overall_exit_code = exit_code
+            if exit_code != 0 and not args.continue_on_error:
+                write_execution_report(
+                    suite=args.suite,
+                    partition_id=args.partition_id,
+                    total_partitions=args.total_partitions,
+                    executed_cases=executed_cases,
+                    is_standalone=False,
+                    standalone_file=None,
+                    case_results=case_results,
+                    missing_standalone_estimates=missing_standalone_estimates,
+                    standalone_measurements=standalone_measurements,
+                )
+                return overall_exit_code
+
+        if assignment.standalone_files:
+            standalone_estimate = sum(
+                get_standalone_file_est_time(args.suite, standalone_file)[0]
+                for standalone_file in assignment.standalone_files
+            )
+            total_est_time += standalone_estimate
+            print(
+                f"Running {len(assignment.standalone_files)} standalone file(s) with estimated total "
+                f"{standalone_estimate:.1f}s:"
+            )
+            for standalone_file in assignment.standalone_files:
+                est_time, used_fallback_estimate = get_standalone_file_est_time(
+                    args.suite, standalone_file
+                )
+                fallback_suffix = (
+                    f", fallback estimate {DEFAULT_STANDALONE_EST_TIME_SECONDS:.1f}s"
+                    if used_fallback_estimate
+                    else ""
+                )
+                print(
+                    f"  - standalone: {standalone_file} "
+                    f"({est_time:.1f}s{fallback_suffix})"
+                )
+
+            for standalone_file in assignment.standalone_files:
+                exit_code, new_executed_cases, new_case_results, measurement = (
+                    _run_standalone_file(
+                        args.suite,
+                        standalone_file,
+                        target_dir,
+                        extra_filter=args.filter,
+                    )
+                )
+                if measurement["used_fallback_estimate"]:
+                    missing_standalone_estimates.append(standalone_file)
+                standalone_measurements.append(measurement)
+                _merge_execution_results(
+                    executed_cases,
+                    case_results,
+                    new_executed_cases,
+                    new_case_results,
+                )
+                if exit_code != 0 and overall_exit_code == 0:
+                    overall_exit_code = exit_code
+                if exit_code != 0 and not args.continue_on_error:
+                    break
+
+        print(f"Partition estimated total time: {total_est_time:.1f}s")
+        write_execution_report(
+            suite=args.suite,
+            partition_id=args.partition_id,
+            total_partitions=args.total_partitions,
+            executed_cases=executed_cases,
+            is_standalone=False,
+            standalone_file=None,
+            case_results=case_results,
+            missing_standalone_estimates=missing_standalone_estimates,
+            standalone_measurements=standalone_measurements,
+        )
+        return overall_exit_code
+
     all_cases = _get_dynamic_suite_cases(args.suite)
     standalone_files = STANDALONE_FILES.get(args.suite, [])
     parametrized_partitions = args.total_partitions - len(standalone_files)
@@ -449,6 +780,8 @@ def _run_dynamic_suite(args, target_dir: Path) -> int:
                 total_partitions=args.total_partitions,
                 executed_cases=[],
                 is_standalone=False,
+                missing_standalone_estimates=[],
+                standalone_measurements=[],
             )
             return 0
 
@@ -496,6 +829,8 @@ def _run_dynamic_suite(args, target_dir: Path) -> int:
             executed_cases=executed_cases,
             is_standalone=False,
             case_results=case_results,
+            missing_standalone_estimates=[],
+            standalone_measurements=[],
         )
         return exit_code
 
@@ -508,45 +843,35 @@ def _run_dynamic_suite(args, target_dir: Path) -> int:
         return 1
 
     standalone_rel = standalone_files[standalone_idx]
-    if standalone_rel == _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE:
-        _maybe_pin_update_weights_model_pair([standalone_rel])
-
-    standalone_file = _get_standalone_file(target_dir, args.suite, standalone_idx)
-    if not standalone_file:
-        print(
-            f"ERROR: Standalone test file '{standalone_rel}' not found for suite "
-            f"'{args.suite}'."
-        )
-        return 1
-
     print(
         f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions} (standalone)"
     )
-    print(f"Running standalone test file: {Path(standalone_file).name}")
-
-    junit_xml_path = str(
-        target_dir / f"junit_results_{args.suite}_{args.partition_id}.xml"
+    print(f"Running standalone test file: {Path(standalone_rel).name}")
+    exit_code, executed_cases, case_results, measurement = _run_standalone_file(
+        args.suite,
+        standalone_rel,
+        target_dir,
+        extra_filter=args.filter,
     )
-    exit_code, _, _ = run_pytest(
-        [standalone_file],
-        filter_expr=args.filter,
-        junit_xml_path=junit_xml_path,
-    )
-    standalone_key = f"standalone:{standalone_rel}"
     write_execution_report(
         suite=args.suite,
         partition_id=args.partition_id,
         total_partitions=args.total_partitions,
-        executed_cases=[],
+        executed_cases=executed_cases,
         is_standalone=True,
         standalone_file=standalone_rel,
-        case_results={standalone_key: "pass" if exit_code == 0 else "fail"},
+        case_results=case_results,
+        missing_standalone_estimates=(
+            [standalone_rel] if measurement["used_fallback_estimate"] else []
+        ),
+        standalone_measurements=[measurement],
     )
     return exit_code
 
 
 def main():
     args = parse_args()
+    validate_standalone_file_est_times()
     test_root_dir = Path(__file__).resolve().parent
     target_dir = test_root_dir / args.base_dir
 
