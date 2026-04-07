@@ -142,33 +142,6 @@ def set_torch_compile_config():
         torch._dynamo.config.cache_size_limit = 1024
 
 
-# Bridge buffers for breakable CUDA graph mode.
-_bridge_buffers = None
-
-
-def get_bridge_buffers():
-    return _bridge_buffers
-
-
-def set_bridge_buffers(buffers):
-    global _bridge_buffers
-    _bridge_buffers = buffers
-
-
-class BridgeBuffers:
-    """Pre-allocated tensors for q, k, v, output at breakable graph break points."""
-
-    def __init__(self, max_tokens, attention_layer, device, dtype):
-        q_dim = attention_layer.tp_q_head_num * attention_layer.qk_head_dim
-        k_dim = attention_layer.tp_k_head_num * attention_layer.qk_head_dim
-        v_dim = attention_layer.tp_v_head_num * attention_layer.v_head_dim
-        out_dim = attention_layer.tp_q_head_num * attention_layer.v_head_dim
-        self.q = torch.empty((max_tokens, q_dim), dtype=dtype, device=device)
-        self.k = torch.empty((max_tokens, k_dim), dtype=dtype, device=device)
-        self.v = torch.empty((max_tokens, v_dim), dtype=dtype, device=device)
-        self.output = torch.empty((max_tokens, out_dim), dtype=dtype, device=device)
-
-
 class PiecewiseCudaGraphRunner:
     """A PiecewiseCudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
@@ -179,14 +152,13 @@ class PiecewiseCudaGraphRunner:
             and self.model_runner.spec_algorithm.is_none()
         )
 
-    def __init__(self, model_runner: ModelRunner, use_breakable: bool = False):
+    def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
-        self.use_breakable = use_breakable
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -199,11 +171,10 @@ class PiecewiseCudaGraphRunner:
         assert (
             self.model_runner.server_args.piecewise_cuda_graph_tokens is not None
         ), "piecewise_cuda_graph_tokens is not set"
-        if not use_breakable:
-            assert self.model_runner.server_args.piecewise_cuda_graph_compiler in [
-                "eager",
-                "inductor",
-            ], "By now, only eager and inductor are supported for piecewise cuda graph compiler."
+        assert self.model_runner.server_args.piecewise_cuda_graph_compiler in [
+            "eager",
+            "inductor",
+        ], "By now, only eager and inductor are supported for piecewise cuda graph compiler."
         self.compile_config = CompilationConfig(
             self.model_runner.server_args.piecewise_cuda_graph_tokens,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
@@ -305,49 +276,45 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        if self.use_breakable:
-            # Experimental: breakable CUDA graph — no torch.compile needed
-            self._init_breakable(model_runner)
-        else:
-            with enable_piecewise_cuda_graph():
-                language_model = getattr(
-                    self.model_runner.model, "language_model", self.model_runner.model
+        with enable_piecewise_cuda_graph():
+            language_model = getattr(
+                self.model_runner.model, "language_model", self.model_runner.model
+            )
+            with patch_model(
+                language_model.model, self.compile_config.compiler
+            ) as patched_model:
+
+                # Dummy warmup for jit kernel
+                self.warmup_compile(num_tokens=self.capture_num_tokens[0])
+
+                install_torch_compiled(
+                    patched_model,
+                    fullgraph=True,
+                    dynamic_arg_dims=None,
+                    compile_config=self.compile_config,
+                    graph_pool=get_global_graph_memory_pool(),
                 )
-                with patch_model(
-                    language_model.model, self.compile_config.compiler
-                ) as patched_model:
 
-                    # Dummy warmup for jit kernel
-                    self.warmup_compile(num_tokens=self.capture_num_tokens[0])
-
-                    install_torch_compiled(
-                        patched_model,
-                        fullgraph=True,
-                        dynamic_arg_dims=None,
-                        compile_config=self.compile_config,
-                        graph_pool=get_global_graph_memory_pool(),
+                with enable_piecewise_cuda_graph_compile():
+                    compile_range = (
+                        tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+                        if get_tensor_model_parallel_rank() == 0
+                        else reversed(self.capture_num_tokens)
                     )
+                    for _, num_tokens in enumerate(compile_range):
+                        if get_tensor_model_parallel_rank() == 0:
+                            compile_range.set_description(
+                                f"Compiling num tokens ({num_tokens=})"
+                            )
+                        self.warmup_compile(num_tokens=num_tokens)
 
-                    with enable_piecewise_cuda_graph_compile():
-                        compile_range = (
-                            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-                            if get_tensor_model_parallel_rank() == 0
-                            else reversed(self.capture_num_tokens)
-                        )
-                        for _, num_tokens in enumerate(compile_range):
-                            if get_tensor_model_parallel_rank() == 0:
-                                compile_range.set_description(
-                                    f"Compiling num tokens ({num_tokens=})"
-                                )
-                            self.warmup_compile(num_tokens=num_tokens)
+                set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+                set_graph_pool_id(get_global_graph_memory_pool())
 
-                    set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-                    set_graph_pool_id(get_global_graph_memory_pool())
-
-                    self.device_module.synchronize()
-                    self.model_runner.tp_group.barrier()
-                    # Capture
-                    self.capture()
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                # Capture
+                self.capture()
 
         self.raw_num_tokens = 0
 
@@ -787,9 +754,6 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        if self.use_breakable:
-            return self._replay_breakable(forward_batch, **kwargs)
-
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
@@ -834,220 +798,6 @@ class PiecewiseCudaGraphRunner:
                     raise NotImplementedError(
                         "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
                     )
-
-    # =========================================================================
-    # Breakable piecewise CUDA graph (experimental)
-    # =========================================================================
-
-    def _init_breakable(self, model_runner):
-        """Initialize breakable CUDA graph mode."""
-        from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
-            BreakableCUDAGraph,
-            BreakableCUDAGraphContext,
-        )
-
-        self._BreakableCUDAGraph = BreakableCUDAGraph
-        self._BreakableCUDAGraphContext = BreakableCUDAGraphContext
-
-        # Bridge buffers for q/k/v at graph break points
-        set_bridge_buffers(
-            BridgeBuffers(
-                self.max_num_tokens,
-                self.attention_layers[0],
-                self.device,
-                model_runner.dtype,
-            )
-        )
-
-        # Static buffers for forward_batch GPU tensors read inside graph segments
-        # (esp. by the logits processor). Must persist so graph reads stable addresses.
-        with torch.device(self.device):
-            self._static_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
-            self._static_extend_seq_lens = torch.zeros(
-                (self.max_bs,), dtype=torch.int64
-            )
-            self._static_extend_prefix_lens = torch.zeros(
-                (self.max_bs,), dtype=torch.int64
-            )
-            self._static_extend_start_loc = torch.zeros(
-                (self.max_bs,), dtype=torch.int64
-            )
-            self._static_req_pool_indices = torch.zeros(
-                (self.max_bs,), dtype=torch.int64
-            )
-            self._static_orig_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
-
-        # Warmup + capture
-        self._breakable_warmup()
-        self.device_module.synchronize()
-        self.model_runner.tp_group.barrier()
-        self._breakable_capture_all()
-
-    def _breakable_build_forward_batch(self, num_tokens):
-        """Build ForwardBatch for breakable capture using static buffers."""
-        buffers = self.buffers
-        bs = 1
-        self._static_seq_lens[:bs].fill_(num_tokens)
-        self._static_extend_seq_lens[:bs].fill_(num_tokens)
-        self._static_extend_prefix_lens[:bs].zero_()
-        self._static_extend_start_loc[:bs].zero_()
-        self._static_req_pool_indices[:bs].copy_(torch.arange(bs, device=self.device))
-        self._static_orig_seq_lens[:bs].fill_(num_tokens)
-
-        return ForwardBatch(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=bs,
-            input_ids=buffers.input_ids[:num_tokens],
-            input_embeds=(
-                buffers.input_embeds[:num_tokens] if self.is_multimodal else None
-            ),
-            req_pool_indices=self._static_req_pool_indices[:bs],
-            seq_lens=self._static_seq_lens[:bs],
-            next_token_logits_buffer=None,
-            orig_seq_lens=self._static_orig_seq_lens[:bs],
-            seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            out_cache_loc_swa=(
-                buffers.out_cache_loc_swa[:num_tokens]
-                if buffers.out_cache_loc_swa is not None
-                else None
-            ),
-            seq_lens_sum=num_tokens,
-            mamba_track_indices=None,
-            mamba_track_mask=None,
-            mamba_track_seqlens=None,
-            encoder_lens=None,
-            return_logprob=False,
-            extend_num_tokens=num_tokens,
-            extend_seq_lens=self._static_extend_seq_lens[:bs],
-            extend_prefix_lens=self._static_extend_prefix_lens[:bs],
-            extend_start_loc=self._static_extend_start_loc[:bs],
-            extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-            extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            positions=buffers.positions[:num_tokens],
-            global_num_tokens_gpu=None,
-            global_num_tokens_for_logprob_gpu=None,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-            global_dp_buffer_len=None,
-            mrope_positions=(
-                buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
-            ),
-            spec_algorithm=None,
-            spec_info=None,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_token_non_padded=None,
-            global_forward_mode=ForwardMode.EXTEND,
-            lora_ids=None,
-        )
-
-    def _breakable_run_forward(self, forward_batch, num_tokens):
-        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
-        set_is_extend_in_batch(False)
-        with set_forward_context(
-            forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
-        ):
-            return self.model_runner.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch
-            )
-
-    def _breakable_warmup(self):
-        num_tokens = self.capture_num_tokens[0]
-        fb = self._breakable_build_forward_batch(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(fb)
-        self._breakable_run_forward(fb, num_tokens)
-
-    def _breakable_capture_all(self):
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as ctx:
-            stream = ctx.stream
-            pool = get_global_graph_memory_pool()
-            capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_num_tokens)))
-                if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_num_tokens)
-            )
-            for num_tokens in capture_range:
-                if get_tensor_model_parallel_rank() == 0:
-                    avail = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    capture_range.set_description(
-                        f"[Breakable PCG] Capturing ({num_tokens=} avail={avail:.2f} GB)"
-                    )
-                fb = self._breakable_build_forward_batch(num_tokens)
-                self.model_runner.attn_backend.init_forward_metadata(fb)
-
-                def run_once():
-                    return self._breakable_run_forward(fb, num_tokens)
-
-                for _ in range(2):
-                    self.device_module.synchronize()
-                    self.model_runner.tp_group.barrier()
-                    run_once()
-
-                graph = self._BreakableCUDAGraph()
-                with self._BreakableCUDAGraphContext(
-                    cuda_graph=graph, pool=pool, stream=stream
-                ):
-                    output = run_once()
-
-                self.graphs[num_tokens] = graph
-                self.output_buffers[num_tokens] = output
-
-    def _replay_breakable(self, forward_batch, **kwargs):
-        num_tokens = len(forward_batch.input_ids)
-        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
-        static_num_tokens = self.capture_num_tokens[index]
-        bs = forward_batch.batch_size
-
-        static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
-
-        # Update static buffers read by graph segments
-        self._static_seq_lens[:bs].copy_(forward_batch.seq_lens)
-        self._static_extend_seq_lens[:bs].copy_(forward_batch.extend_seq_lens)
-        self._static_extend_prefix_lens[:bs].copy_(forward_batch.extend_prefix_lens)
-        self._static_extend_start_loc[:bs].copy_(forward_batch.extend_start_loc)
-        self._static_req_pool_indices[:bs].copy_(forward_batch.req_pool_indices)
-        if forward_batch.orig_seq_lens is not None:
-            self._static_orig_seq_lens[:bs].copy_(forward_batch.orig_seq_lens)
-
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        with set_forward_context(
-            static_forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
-            num_tokens=static_num_tokens,
-        ):
-            self.graphs[static_num_tokens].replay()
-
-        output = self.output_buffers[static_num_tokens]
-        if isinstance(output, LogitsProcessorOutput):
-            return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_tokens],
-                hidden_states=(
-                    output.hidden_states[: self.raw_num_tokens]
-                    if output.hidden_states is not None
-                    else None
-                ),
-            )
-        elif isinstance(output, EmbeddingPoolerOutput):
-            return output
-        else:
-            raise NotImplementedError("PPProxyTensors not supported in breakable PCG.")
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

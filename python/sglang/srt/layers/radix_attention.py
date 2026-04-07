@@ -117,7 +117,7 @@ class RadixAttention(nn.Module):
 
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if get_global_server_args().enable_breakable_cuda_graph:
-                from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+                from sglang.srt.model_executor.breakable_piecewise_cuda_graph_runner import (
                     get_bridge_buffers,
                 )
 
