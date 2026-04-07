@@ -123,7 +123,7 @@ srt_musa = [
   "sglang[runtime_common]",
   "torch",
   "torch_musa",
-  "torchada>=0.1.25",
+  "torchada>=0.1.45",
   "mthreads-ml-py",
   "numpy<2.0",
 ]
@@ -210,4 +210,4 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]

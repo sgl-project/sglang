@@ -60,6 +60,7 @@ class LoRAMemoryPool:
         base_model: torch.nn.Module,
         eviction_policy: str,
         lora_added_tokens_size: int,
+        experts_shared_outer_loras: bool = False,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -70,6 +71,7 @@ class LoRAMemoryPool:
         self.lora_added_tokens_size: int = lora_added_tokens_size
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
+        self.experts_shared_outer_loras: bool = experts_shared_outer_loras
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
@@ -140,6 +142,18 @@ class LoRAMemoryPool:
         """Check if module is part of MoE experts."""
         return "moe" in module_name
 
+    @staticmethod
+    def _get_num_experts(base_model: torch.nn.Module) -> int:
+        cfg = base_model.config
+        if hasattr(cfg, "get_text_config"):
+            cfg = cfg.get_text_config()
+        return (
+            getattr(cfg, "num_experts", None)
+            or getattr(cfg, "num_local_experts", None)
+            or getattr(cfg, "n_routed_experts", None)
+            or 1
+        )
+
     def _get_standard_shape(
         self,
         module_name: str,
@@ -178,10 +192,13 @@ class LoRAMemoryPool:
             input_dim = divide(input_dim, self.tp_size)
 
         if self.is_moe_module(module_name):
-            num_experts = base_model.config.num_experts
+            num_experts = self._get_num_experts(base_model)
+            expert_dim = num_experts
+            if self.experts_shared_outer_loras and module_name == "gate_up_proj_moe":
+                expert_dim = 1
             return (
                 self.max_loras_per_batch,
-                num_experts,
+                expert_dim,
                 max_lora_dim * c,
                 input_dim,
             )
@@ -228,8 +245,11 @@ class LoRAMemoryPool:
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
-            num_experts = base_model.config.num_experts
-            return (self.max_loras_per_batch, num_experts, output_dim, max_lora_dim)
+            num_experts = self._get_num_experts(base_model)
+            expert_dim = num_experts
+            if self.experts_shared_outer_loras and module_name == "down_proj_moe":
+                expert_dim = 1
+            return (self.max_loras_per_batch, expert_dim, output_dim, max_lora_dim)
         else:
             return (self.max_loras_per_batch, output_dim, max_lora_dim)
 
@@ -264,37 +284,38 @@ class LoRAMemoryPool:
             target_modules: Set[str],
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
         ):
-            # Check if model has both shared experts and MoE experts
+            cfg = base_model.config
+            if hasattr(cfg, "get_text_config"):
+                cfg = cfg.get_text_config()
             has_shared_experts = (
-                hasattr(base_model.config, "shared_expert_intermediate_size")
-                and base_model.config.shared_expert_intermediate_size > 0
-            )
-            has_moe = getattr(base_model.config, "num_experts", 1) > 1
+                hasattr(cfg, "shared_expert_intermediate_size")
+                and cfg.shared_expert_intermediate_size > 0
+            ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
+            has_moe = self._get_num_experts(base_model) > 1
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
             target_modules = target_modules - set(EMBEDDING_NAMES)
             for module_name in target_modules:
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
-                if module_name in ambiguous_modules and has_shared_experts and has_moe:
-                    # Allocate separate buffers for shared and MoE contexts
-                    # Shared expert version (3D)
-                    shared_key = module_name
-                    buffer[shared_key] = [
-                        torch.empty(
-                            get_lora_shape_fn(
-                                module_name, base_model, self.max_lora_rank, idx
-                            ),
-                            dtype=self.dtype,
-                            device=device,
-                        )
-                        for idx in range(self.num_layer)
-                    ]
+                if module_name in ambiguous_modules and has_moe:
+                    # Allocate shared expert version (3D) only when model has shared experts
+                    if has_shared_experts:
+                        buffer[module_name] = [
+                            torch.zeros(
+                                get_lora_shape_fn(
+                                    module_name, base_model, self.max_lora_rank, idx
+                                ),
+                                dtype=self.dtype,
+                                device=device,
+                            )
+                            for idx in range(self.num_layer)
+                        ]
 
                     # MoE expert version (4D)
                     moe_key = f"{module_name}_moe"
                     buffer[moe_key] = [
-                        torch.empty(
+                        torch.zeros(
                             get_lora_shape_fn(
                                 moe_key, base_model, self.max_lora_rank, idx
                             ),
@@ -306,7 +327,7 @@ class LoRAMemoryPool:
                 else:
                     # Standard allocation for unambiguous modules
                     buffer[module_name] = [
-                        torch.empty(
+                        torch.zeros(
                             get_lora_shape_fn(
                                 module_name,
                                 base_model,
@@ -326,7 +347,7 @@ class LoRAMemoryPool:
         ):
             target_modules = target_modules & set(EMBEDDING_NAMES)
             for module_name in target_modules:
-                buffer[module_name] = torch.empty(
+                buffer[module_name] = torch.zeros(
                     get_lora_shape_fn(
                         module_name,
                         base_model,
@@ -338,7 +359,7 @@ class LoRAMemoryPool:
                 )
 
         if self.lora_added_tokens_size > 0:
-            self.new_embeddings_buffer["input_embeddings"] = torch.empty(
+            self.new_embeddings_buffer["input_embeddings"] = torch.zeros(
                 (
                     self.max_loras_per_batch,
                     self.lora_added_tokens_size,
@@ -521,8 +542,8 @@ class LoRAMemoryPool:
                 expert_match = re.search(r"experts\.(\d+)\.", name)
 
                 if expert_match:
+                    # Per-expert MoE weight — 2D tensors, one per expert
                     target_module = target_module + "_moe"
-                    # MoE weight - multiple tensors per module (one per expert)
                     if temp_A_buffer[target_module] is None:
                         temp_A_buffer[target_module] = {}
                         temp_B_buffer[target_module] = {}
@@ -532,8 +553,15 @@ class LoRAMemoryPool:
                         temp_A_buffer[target_module][expert_id] = weights
                     else:
                         temp_B_buffer[target_module][expert_id] = weights
+                elif "experts" in name and weights.dim() == 3:
+                    # Shared outer MoE weight — 3D tensor [expert_dim, rank, hidden]
+                    target_module = target_module + "_moe"
+                    if "lora_A" in name:
+                        temp_A_buffer[target_module] = weights
+                    else:
+                        temp_B_buffer[target_module] = weights
                 else:
-                    # Standard weight - single tensor per module
+                    # Standard weight — single tensor per module
                     if "lora_A" in name:
                         temp_A_buffer[target_module] = weights
                     else:
@@ -549,20 +577,18 @@ class LoRAMemoryPool:
                     if isinstance(module, FusedMoEWithLoRA):
                         moe_target_modules = ["gate_up_proj_moe", "down_proj_moe"]
                         for target_module in moe_target_modules:
-                            if temp_A_buffer[target_module] is None:
-                                continue
-
-                            for expert_id in temp_A_buffer[target_module].keys():
-                                temp_A_buffer[target_module][expert_id] = (
+                            if temp_A_buffer.get(target_module) is not None:
+                                temp_A_buffer[target_module] = (
                                     module.slice_moe_lora_a_weights(
-                                        temp_A_buffer[target_module][expert_id],
+                                        temp_A_buffer[target_module],
                                         self.tp_rank,
                                         target_module,
                                     )
                                 )
-                                temp_B_buffer[target_module][expert_id] = (
+                            if temp_B_buffer.get(target_module) is not None:
+                                temp_B_buffer[target_module] = (
                                     module.slice_moe_lora_b_weights(
-                                        temp_B_buffer[target_module][expert_id],
+                                        temp_B_buffer[target_module],
                                         self.tp_rank,
                                         target_module,
                                     )
@@ -587,22 +613,54 @@ class LoRAMemoryPool:
                         temp_B_buffer[target_module], self.tp_rank
                     )
 
-            # Load weights into buffers (handles both 3D standard and 4D MoE)
             for name, weights in temp_A_buffer.items():
                 c = get_stacked_multiply(name)
                 target_buffer = self.A_buffer[name][layer_id]
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
-                    # MoE: multiple tensors per module (one per expert)
-                    for expert_id, expert_weight in weights.items():
-                        # Buffer shape: [num_loras, num_experts, max_rank, hidden_dim]
-                        buffer_view = target_buffer[
-                            buffer_id, expert_id, : lora_rank * c, :
-                        ]
-                        load_lora_weight_tensor(buffer_view, expert_weight)
+                    if self.experts_shared_outer_loras and name == "gate_up_proj_moe":
+                        if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                            if weights.shape[0] != 1:
+                                raise ValueError(
+                                    f"experts_shared_outer_loras is enabled but "
+                                    f"gate_up_proj_moe lora_A has expert_dim="
+                                    f"{weights.shape[0]} (expected 1)."
+                                )
+                            buffer_view = target_buffer[
+                                buffer_id, 0, : lora_rank * c, :
+                            ]
+                            load_lora_weight_tensor(buffer_view, weights[0])
+                        elif isinstance(weights, dict) and len(weights) > 0:
+                            if len(weights) != 1:
+                                raise ValueError(
+                                    f"experts_shared_outer_loras is enabled but "
+                                    f"gate_up_proj_moe lora_A dict has "
+                                    f"{len(weights)} entries (expected 1)."
+                                )
+                            rep = next(iter(weights.values()))
+                            buffer_view = target_buffer[
+                                buffer_id, 0, : lora_rank * c, :
+                            ]
+                            load_lora_weight_tensor(buffer_view, rep)
+                        else:
+                            raise ValueError(
+                                f"Unexpected weight format for shared outer gate_up_proj_moe lora_A: "
+                                f"type={type(weights)}, "
+                                f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
+                            )
+                    elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                        for eid in range(weights.shape[0]):
+                            buffer_view = target_buffer[
+                                buffer_id, eid, : lora_rank * c, :
+                            ]
+                            load_lora_weight_tensor(buffer_view, weights[eid])
+                    elif isinstance(weights, dict):
+                        for expert_id, expert_weight in weights.items():
+                            buffer_view = target_buffer[
+                                buffer_id, expert_id, : lora_rank * c, :
+                            ]
+                            load_lora_weight_tensor(buffer_view, expert_weight)
                 else:
-                    # Standard: single tensor per module
-                    c = get_stacked_multiply(name)
                     buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
                     load_lora_weight_tensor(buffer_view, weights)
 
@@ -610,18 +668,54 @@ class LoRAMemoryPool:
                 target_buffer = self.B_buffer[name][layer_id]
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
-                    # MoE: multiple tensors per module (one per expert)
-                    for expert_id, expert_weight in weights.items():
-                        # Buffer shape: [num_loras, num_experts, intermediate_dim, max_rank]
-                        buffer_view = target_buffer[buffer_id, expert_id, :, :lora_rank]
-
-                        weight_to_load = expert_weight
-                        if weight_to_load is not None:
-                            weight_to_load = weight_to_load * lora_adapter.scaling
-
-                        load_lora_weight_tensor(buffer_view, weight_to_load)
+                    if self.experts_shared_outer_loras and name == "down_proj_moe":
+                        if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                            if weights.shape[0] != 1:
+                                raise ValueError(
+                                    f"experts_shared_outer_loras is enabled but "
+                                    f"down_proj_moe lora_B has expert_dim="
+                                    f"{weights.shape[0]} (expected 1)."
+                                )
+                            buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
+                            w = weights[0]
+                            if w is not None:
+                                w = w * lora_adapter.scaling
+                            load_lora_weight_tensor(buffer_view, w)
+                        elif isinstance(weights, dict) and len(weights) > 0:
+                            if len(weights) != 1:
+                                raise ValueError(
+                                    f"experts_shared_outer_loras is enabled but "
+                                    f"down_proj_moe lora_B dict has "
+                                    f"{len(weights)} entries (expected 1)."
+                                )
+                            rep = next(iter(weights.values()))
+                            buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
+                            if rep is not None:
+                                rep = rep * lora_adapter.scaling
+                            load_lora_weight_tensor(buffer_view, rep)
+                        else:
+                            raise ValueError(
+                                f"Unexpected weight format for shared outer down_proj_moe lora_B: "
+                                f"type={type(weights)}, "
+                                f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
+                            )
+                    elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                        for eid in range(weights.shape[0]):
+                            buffer_view = target_buffer[buffer_id, eid, :, :lora_rank]
+                            w = weights[eid]
+                            if w is not None:
+                                w = w * lora_adapter.scaling
+                            load_lora_weight_tensor(buffer_view, w)
+                    elif isinstance(weights, dict):
+                        for expert_id, expert_weight in weights.items():
+                            buffer_view = target_buffer[
+                                buffer_id, expert_id, :, :lora_rank
+                            ]
+                            w = expert_weight
+                            if w is not None:
+                                w = w * lora_adapter.scaling
+                            load_lora_weight_tensor(buffer_view, w)
                 else:
-                    # Standard: single tensor per module
                     buffer_view = target_buffer[buffer_id, :, :lora_rank]
                     load_lora_weight_tensor(buffer_view, weights)
 
