@@ -2335,6 +2335,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
         # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
         obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+        # Propagate lora_id to any sub-objects already cached by __getitem__.
+        for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+            sub_obj.lora_id = (
+                obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
+            )
 
     def _req_stats_init(
         self,

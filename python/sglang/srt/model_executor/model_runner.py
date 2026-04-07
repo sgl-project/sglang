@@ -50,6 +50,7 @@ from sglang.srt.configs import (
     Qwen3NextConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
@@ -1890,14 +1891,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return config
         return None
 
+    def _get_linear_attn_registry_result(self):
+        if not hasattr(self, "_linear_attn_registry_cache"):
+            self._linear_attn_registry_cache = get_linear_attn_config(
+                self.model_config.hf_config
+            )
+        return self._linear_attn_registry_cache
+
+    @property
+    def linear_attn_model_spec(self):
+        result = self._get_linear_attn_registry_result()
+        return result[0] if result else None
+
     @property
     def mambaish_config(self):
-        return (
+        existing = (
             self.mamba2_config
             or self.hybrid_gdn_config
             or self.kimi_linear_config
             or self.hybrid_lightning_config
         )
+        if existing:
+            return existing
+        result = self._get_linear_attn_registry_result()
+        return result[1] if result else None
 
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
