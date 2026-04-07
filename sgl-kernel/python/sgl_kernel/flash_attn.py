@@ -257,6 +257,7 @@ def flash_attn_varlen_func(
     score_mod=None,
     aux_tensors=None,
     ver=3,
+    out=None,
 ):
 
     if not is_fa3_supported():
@@ -281,7 +282,7 @@ def flash_attn_varlen_func(
         None,  # k_new
         None,  # v_new
         qv,  # qv
-        None,  # out
+        out,  # out
         cu_seqlens_q,
         cu_seqlens_k,
         None,  # cu_seqlens_k_new
