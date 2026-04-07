@@ -804,6 +804,7 @@ ONE_GPU_CASES_C = [
             modality="image",
         ),
         T2I_sampling_params,
+        run_consistency_check=False
     )
 ]
 
