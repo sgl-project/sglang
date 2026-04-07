@@ -7,9 +7,9 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE,
@@ -86,19 +86,19 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=1000,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=1000,
+            num_threads=128,
         )
         metrics = run_eval(args)
         print(f"TestEagleLargeBS -- {metrics=}")
         self.assertGreater(
-            metrics["accuracy"], 0.23
-        )  # 0.3333 for 60 questions; 0.234 for 1319 questions
+            metrics["score"], 0.22
+        )  # ~0.227 for 1000 questions via /v1/completions
         assert self.process.poll() is None
 
     def test_logprob_spec_v2_match(self):

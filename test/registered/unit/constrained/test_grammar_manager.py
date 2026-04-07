@@ -26,7 +26,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(2.0, "stage-a-cpu-only")
+register_cpu_ci(2.0, "stage-a-test-cpu")
 
 
 def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):

@@ -1,7 +1,5 @@
-import json
 import logging
-import os
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 
@@ -15,25 +13,17 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
-from sglang.multimodal_gen.runtime.loader.utils import (
-    _list_safetensors_files,
-    _normalize_component_type,
+from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    resolve_transformer_quant_load_spec,
+    resolve_transformer_safetensors_to_load,
 )
+from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
-    maybe_download_model,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
-from sglang.multimodal_gen.runtime.utils.quantization_utils import (
-    build_nvfp4_config_from_safetensors_list,
-    get_metadata_from_safetensors_file,
-    get_quant_config,
-    get_quant_config_from_safetensors_metadata,
-)
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -150,16 +140,11 @@ class TransformerLoader(ComponentLoader):
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
 
-        # 2. quant config
-        safetensors_list = self.get_list_of_safetensors_to_load(
+        safetensors_list = resolve_transformer_safetensors_to_load(
             server_args, component_model_path
         )
 
-        quant_config = self._resolve_quant_config(
-            config, server_args, safetensors_list, component_model_path
-        )
-
-        # 3. dit config
+        # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
         component_name = _normalize_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
@@ -175,9 +160,13 @@ class TransformerLoader(ComponentLoader):
         cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
-        nunchaku_config = server_args.nunchaku_config
-        param_dtype = self._resolve_target_param_dtype(
-            quant_config, nunchaku_config, model_cls, server_args
+        quant_spec = resolve_transformer_quant_load_spec(
+            hf_config=config,
+            server_args=server_args,
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+            model_cls=model_cls,
+            cls_name=cls_name,
         )
 
         logger.info(
@@ -185,14 +174,13 @@ class TransformerLoader(ComponentLoader):
             cls_name,
             len(safetensors_list),
             f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
-            param_dtype,
+            quant_spec.param_dtype,
         )
-
         # prepare init_param
         init_params: dict[str, Any] = {
             "config": dit_config,
             "hf_config": config,
-            "quant_config": (quant_config if quant_config else nunchaku_config),
+            "quant_config": quant_spec.runtime_quant_config,
         }
         if (
             init_params["quant_config"] is None
@@ -215,23 +203,28 @@ class TransformerLoader(ComponentLoader):
             cpu_offload=server_args.dit_cpu_offload,
             pin_cpu_memory=server_args.pin_cpu_memory,
             fsdp_inference=server_args.use_fsdp_inference,
-            # TODO(will): make these configurable
-            param_dtype=param_dtype,
+            param_dtype=quant_spec.param_dtype,
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
         )
 
-        if nunchaku_config is not None:
-            _patch_nunchaku_scales(model, safetensors_list)
+        # post-hooks (e.g., patch scales (nunchaku))
+        for post_load_hook in quant_spec.post_load_hooks:
+            post_load_hook(model)
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
         # considering the existent of mixed-precision models (e.g., nunchaku)
-        if next(model.parameters()).dtype != param_dtype and param_dtype:
+        if (
+            next(model.parameters()).dtype != quant_spec.param_dtype
+            and quant_spec.param_dtype
+        ):
             logger.warning(
-                f"Model dtype does not match expected param dtype, {next(model.parameters()).dtype} vs {param_dtype}"
+                "Model dtype does not match expected param dtype, %s vs %s",
+                next(model.parameters()).dtype,
+                quant_spec.param_dtype,
             )
 
         return model

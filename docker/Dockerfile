@@ -11,7 +11,7 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.0
+ARG SGL_KERNEL_VERSION=0.4.1
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -19,7 +19,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.6
+ARG FLASHINFER_VERSION=0.6.7.post2
 ARG MOONCAKE_VERSION=0.3.9
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -114,6 +114,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libczmq4 \
     libczmq-dev \
     libfabric-dev \
+    linux-libc-dev \
     # Package building tools
     devscripts \
     debhelper \
@@ -218,6 +219,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+    && kernels download python
+    && kernels lock python
+    && mv python/kernels.lock /root/.cache/sglang
 
 # DeepEP
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
@@ -306,9 +310,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cubloaty \
     google-cloud-storage
 
-# Build and install sgl-model-gateway (install Rust, build, then remove to save space)
+# Build and install sgl-model-gateway (install Rust, build, then remove Rust toolchain)
+# Cleanup runs unconditionally via trap to ensure Rust artifacts don't bloat the layer
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    cleanup() { rm -rf /root/.cargo /root/.rustup /sgl-workspace/sglang/sgl-model-gateway/target /sgl-workspace/sglang/sgl-model-gateway/bindings/python/target /sgl-workspace/sglang/sgl-model-gateway/bindings/python/dist; sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null; } \
+    && trap cleanup EXIT \
+    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && rustc --version && cargo --version \
     && python3 -m pip install maturin \
@@ -316,10 +323,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
     && cd /sgl-workspace/sglang/sgl-model-gateway \
-    && cargo build --release --bin sglang-router --features vendored-openssl \
-    && cp target/release/sglang-router /usr/local/bin/sglang-router \
-    && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
-    && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
+    && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
+    && cp target/release/sgl-model-gateway /usr/local/bin/sgl-model-gateway
 
 RUN --mount=type=cache,target=/root/.cache/pip \
    python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
@@ -448,7 +453,7 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
         ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
-RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
+RUN python3 -m pip install --upgrade "urllib3>=2.6.3" "pillow>=12.1.1"
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
@@ -532,6 +537,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     libnccl-dev \
     # GPG key verification
     gnupg2 \
+    linux-libc-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
@@ -557,6 +563,10 @@ COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/pyt
 
 # Copy SGLang workspace
 COPY --from=framework /sgl-workspace /sgl-workspace
+
+# Copy cache for kernels from kernels community
+COPY --from=framework /root/.cache/huggingface /root/.cache/huggingface
+COPY --from=framework /root/.cache/sglang /root/.cache/sglang
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
