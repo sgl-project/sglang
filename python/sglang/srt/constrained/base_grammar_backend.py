@@ -116,7 +116,15 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
-INVALID_GRAMMAR_OBJ = BaseGrammarObject()
+class InvalidGrammarObject(BaseGrammarObject):
+    """Represents a grammar that failed to compile, carrying the original error message."""
+
+    def __init__(self, error_message: str = "Unknown grammar error"):
+        super().__init__()
+        self.error_message = error_message
+
+    def __repr__(self):
+        return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
 
 class BaseGrammarBackend:
@@ -126,7 +134,7 @@ class BaseGrammarBackend:
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
-        return INVALID_GRAMMAR_OBJ
+        return InvalidGrammarObject()
 
     def dispatch_fallback(self, key_type: str, key_string: str) -> BaseGrammarObject:
         """
@@ -196,6 +204,7 @@ def create_grammar_backend(
     tokenizer,
     vocab_size: int,
     eos_token_ids: Optional[set] = None,
+    think_end_id: Optional[int] = None,
 ) -> Optional[BaseGrammarBackend]:
     name = server_args.grammar_backend
 
@@ -250,13 +259,11 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+    if server_args.reasoning_parser and think_end_id is not None:
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
 
-        grammar_backend = ReasonerGrammarBackend(
-            grammar_backend, tokenizer.think_end_id
-        )
+        grammar_backend = ReasonerGrammarBackend(grammar_backend, think_end_id)
 
     return grammar_backend

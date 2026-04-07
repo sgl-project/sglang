@@ -12,7 +12,6 @@ from collections.abc import Generator, Iterable
 from pathlib import Path
 
 import filelock
-import huggingface_hub.constants
 import torch
 from safetensors.torch import safe_open
 from torch.distributed.tensor import DTensor
@@ -25,6 +24,7 @@ try:
 except ImportError:
     HAS_RUNAI_MODEL_STREAMER = False
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -35,21 +35,6 @@ logger = init_logger(__name__)
 # lock files in the temp directory will be automatically deleted when the
 # system reboots, so users will not complain about annoying lock files
 temp_dir = tempfile.gettempdir()
-
-
-def enable_hf_transfer() -> None:
-    """automatically activates hf_transfer"""
-    if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
-        try:
-            # enable hf hub transfer if available
-            import hf_transfer  # type: ignore # noqa
-
-            huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
-        except ImportError:
-            pass
-
-
-enable_hf_transfer()
 
 
 class DisabledTqdm(tqdm):
@@ -151,13 +136,17 @@ def _validate_safetensors_file(file_path: str) -> bool:
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
-    use_runai_model_streamer: bool = HAS_RUNAI_MODEL_STREAMER,
+    use_runai_model_streamer: bool | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
     device = "cpu" if to_cpu else str(get_local_torch_device())
+    if use_runai_model_streamer is None:
+        use_runai_model_streamer = (
+            HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
+        )
 
     # Validate files before loading
     corrupted_files = [

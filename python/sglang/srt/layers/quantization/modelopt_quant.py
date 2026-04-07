@@ -86,12 +86,18 @@ try:
 
     enable_flashinfer_fp4_gemm = True
 except ImportError:
-    if is_cuda():
-        from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
     shuffle_matrix_sf_a = None
+
+if is_cuda():
+    try:
+        from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+    except ImportError:
+        cutlass_fp4_gemm = None
+else:
+    cutlass_fp4_gemm = None
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
@@ -134,7 +140,15 @@ def fp4_gemm(
     out_features: int,
 ) -> torch.Tensor:
     fp4_backend = get_fp4_gemm_runner_backend()
-    if enable_flashinfer_fp4_gemm:
+    if fp4_backend.is_cutlass() and cutlass_fp4_gemm is not None:
+        # flashinfer.fp4_quantize returns scale factors as uint8 (e4m3fn bits
+        # stored in uint8 memory). The JIT kernel requires float8_e4m3fn dtype.
+        if input_sf.dtype != torch.float8_e4m3fn:
+            input_sf = input_sf.view(torch.float8_e4m3fn)
+        if weight_sf.dtype != torch.float8_e4m3fn:
+            weight_sf = weight_sf.view(torch.float8_e4m3fn)
+        return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
+    elif enable_flashinfer_fp4_gemm:
         # Use the remapping logic to convert SGLang backend names to FlashInfer API names
         backend = fp4_backend.get_flashinfer_backend()
         return flashinfer_fp4_gemm(
@@ -589,6 +603,183 @@ class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: ModelOptFp8Config):
         super().__init__(quant_config)
+
+
+class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
+    """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
+
+    def __init__(
+        self,
+        kv_cache_quant_algo: Optional[str],
+        exclude_modules: Optional[List[str]],
+        packed_modules_mapping: Optional[Dict[str, List[str]]],
+        quantized_layers: Dict[str, Dict[str, Any]],
+        fp8_config: ModelOptFp8Config,
+        nvfp4_config: "ModelOptFp4Config",
+    ) -> None:
+        super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
+        self.quantized_layers = quantized_layers
+        self.fp8_config = fp8_config
+        self.nvfp4_config = nvfp4_config
+
+    @classmethod
+    def override_quantization_method(cls, hf_quant_config, user_quant):
+        if hf_quant_config is None:
+            return None
+        if hf_quant_config.get("quant_method", "") == "modelopt_mixed":
+            return "modelopt_mixed"
+        return None
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "modelopt_mixed"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.bfloat16, torch.half]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return ModelOptFp4Config.get_min_capability()
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "ModelOptMixedPrecisionConfig":
+        kv_cache_quant_algo = None
+        exclude_modules = None
+        quantized_layers = {}
+
+        quant_algo = config.get("quant_algo")
+        if quant_algo is not None:
+            kv_cache_scheme = config.get("kv_cache_scheme")
+            if isinstance(kv_cache_scheme, dict):
+                if (
+                    kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_algo = "FP8"
+                elif (
+                    kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 4
+                ):
+                    kv_cache_quant_algo = "NVFP4"
+                else:
+                    kv_cache_quant_algo = "auto"
+            exclude_modules = config.get("ignore")
+            quantized_layers = config.get("quantized_layers", {})
+        else:
+            quantization_section = cls.get_from_keys(config, ["quantization"])
+            quant_algo = quantization_section.get("quant_algo")
+            kv_cache_quant_algo = quantization_section.get("kv_cache_quant_algo")
+            exclude_modules = quantization_section.get("exclude_modules")
+            quantized_layers = quantization_section.get("quantized_layers", {})
+
+        if quant_algo != "MIXED_PRECISION":
+            raise ValueError(
+                "ModelOptMixedPrecisionConfig only supports MIXED_PRECISION checkpoints."
+            )
+        if not quantized_layers:
+            raise ValueError(
+                "MIXED_PRECISION quantization requires a non-empty quantized_layers map."
+            )
+
+        group_size = None
+        for layer_info in quantized_layers.values():
+            if layer_info.get("quant_algo", "").upper() == "NVFP4":
+                group_size = layer_info.get("group_size", 16)
+                break
+        if group_size is None:
+            group_size = 16
+
+        packed_modules_mapping = config.get("packed_modules_mapping")
+        fp8_config = ModelOptFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            kv_cache_quant_method=kv_cache_quant_algo,
+            exclude_modules=[],
+            packed_modules_mapping=packed_modules_mapping,
+        )
+        nvfp4_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            exclude_modules=[],
+            packed_modules_mapping=packed_modules_mapping,
+            group_size=group_size,
+        )
+
+        return cls(
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=packed_modules_mapping,
+            quantized_layers=quantized_layers,
+            fp8_config=fp8_config,
+            nvfp4_config=nvfp4_config,
+        )
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+        super().apply_weight_name_mapper(hf_to_sglang_mapper)
+        if self.quantized_layers:
+            self.quantized_layers = hf_to_sglang_mapper.apply_dict(
+                self.quantized_layers
+            )
+
+    def _resolve_quant_algo(self, prefix: str) -> Optional[str]:
+        if prefix in self.quantized_layers:
+            return self.quantized_layers[prefix]["quant_algo"].upper()
+
+        proj_name = prefix.rsplit(".", 1)[-1]
+        if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
+            algos = set()
+            base = prefix.rsplit(".", 1)[0]
+            for shard_name in self.packed_modules_mapping[proj_name]:
+                shard_prefix = f"{base}.{shard_name}"
+                if shard_prefix in self.quantized_layers:
+                    algos.add(self.quantized_layers[shard_prefix]["quant_algo"].upper())
+            if len(algos) == 1:
+                return algos.pop()
+            if len(algos) > 1:
+                raise ValueError(
+                    f"Mixed quant_algo within fused layer {prefix}: {algos}. "
+                    "All shards must use the same quantization."
+                )
+
+        prefix_dot = prefix + "."
+        for key, info in self.quantized_layers.items():
+            if key.startswith(prefix_dot):
+                return info["quant_algo"].upper()
+
+        return None
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        quant_algo = self._resolve_quant_algo(prefix)
+
+        if isinstance(layer, LinearBase):
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            ) or self.is_layer_excluded(prefix):
+                return UnquantizedLinearMethod()
+            if quant_algo == "FP8":
+                return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo == "NVFP4":
+                return ModelOptFp4LinearMethod(self.nvfp4_config)
+            return UnquantizedLinearMethod()
+
+        if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
+            return ModelOptFp8KVCacheMethod(self.fp8_config)
+
+        if isinstance(layer, FusedMoE):
+            if self.is_layer_excluded(prefix):
+                return None
+            if quant_algo == "FP8":
+                return ModelOptFp8MoEMethod(self.fp8_config)
+            if quant_algo == "NVFP4":
+                return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
+            return None
+
+        return None
 
 
 class ModelOptFp8MoEMethod(FusedMoEMethodBase):
@@ -1082,7 +1273,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             layer,
             prefix,
             Linear=ModelOptFp4LinearMethod,
-            Moe=ModelOptNvFp4FusedMoEMethod,  # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
+            Moe=ModelOptNvFp4FusedMoEMethod,
         )
 
 
@@ -1301,7 +1492,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
-        if enable_flashinfer_fp4_gemm:
+        if (
+            enable_flashinfer_fp4_gemm
+            and not get_fp4_gemm_runner_backend().is_cutlass()
+        ):
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
 
