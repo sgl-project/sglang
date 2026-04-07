@@ -64,13 +64,20 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        if is_extend_in_batch:
+        dp_size = get_attention_dp_size()
+
+        # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
+        # overhead from uneven token distribution.
+        # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
+        # to enable symmetric memory optimization (needed for NSA CP, etc.).
+        if is_extend_in_batch and dp_size > 1:
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
+        # prefer MAX_LEN when communication cost is equal to enable symmetric memory
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)
-        if sum_len * 2 > max_len * get_attention_dp_size():
+        if sum_len * 2 >= max_len * dp_size:
             return cls.MAX_LEN
         else:
             return cls.SUM_LEN

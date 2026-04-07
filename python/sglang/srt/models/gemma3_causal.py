@@ -35,14 +35,17 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -92,11 +95,12 @@ class Gemma3MLP(nn.Module):
         )
         if hidden_activation != "gelu_pytorch_tanh":
             raise ValueError(
-                "Gemma3 uses `gelu_pytorch_tanh` as the hidden activation "
+                f"{self.__class__.__name__} uses `gelu_pytorch_tanh` as the hidden activation "
                 "function. Please set `hidden_activation` to "
                 "`gelu_pytorch_tanh`."
             )
         self.act_fn = GeluAndMul()
+        self.prefix = prefix
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
@@ -141,7 +145,8 @@ class Gemma3Attention(nn.Module):
             config, "head_dim", hidden_size // config.num_attention_heads
         )
         self.head_dim = head_dim
-
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
+        self.rotary_dim = int(partial_rotary_factor * self.head_dim)
         self.q_size = self.num_heads * self.head_dim
 
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -166,20 +171,45 @@ class Gemma3Attention(nn.Module):
 
         self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
 
+        # In transformers v5, rope_parameters is nested per layer type:
+        #   {"sliding_attention": {"rope_theta": 10000}, "full_attention": {"rope_theta": 1000000}}
+        # In v4 it was flat: {"rope_type": "default", "rope_theta": ...}
+        rope_params = config.rope_parameters
+        is_nested = isinstance(rope_params, dict) and "full_attention" in rope_params
+
         # Initialize the rotary embedding.
         if self.is_sliding:
             # Local attention. Override the values in config.json.
-            self.rope_theta = config.rope_local_base_freq
+            if is_nested:
+                self.rope_theta = rope_params["sliding_attention"].get(
+                    "rope_theta", 10000.0
+                )
+            else:
+                self.rope_theta = getattr(config, "rope_local_base_freq", 10000.0)
             self.rope_scaling = {"rope_type": "default"}
             # FIXME(mick): idk why vllm does this
             # self.sliding_window = config.interleaved_sliding_window
             self.sliding_window = get_attention_sliding_window_size(config)
         else:
             # Global attention. Use the values in config.json.
-            self.rope_theta = config.rope_theta
-            self.rope_scaling = config.rope_scaling
+            if is_nested:
+                self.rope_theta = rope_params["full_attention"].get(
+                    "rope_theta", 1000000.0
+                )
+            else:
+                self.rope_theta = (
+                    rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
+                )
+            self.rope_scaling = {"rope_type": "default"}
             self.sliding_window = None
-
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.rotary_dim,
+            max_position=max_position_embeddings,
+            base=self.rope_theta,
+            rope_scaling=self.rope_scaling,
+            is_neox_style=getattr(config, "rope_is_neox_style", True),
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -199,8 +229,39 @@ class Gemma3Attention(nn.Module):
         self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
 
-    def forward(
+    def forward_cpu(
         self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        forward_batch: ForwardBatch,
+        **kwargs,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        # [s, h * head_dim]
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # [s, h, head_dim]
+        q = q.unflatten(-1, (self.num_heads, self.head_dim)).unsqueeze(0)
+        q = self.q_norm(q)
+        k = k.unflatten(-1, (self.num_kv_heads, self.head_dim)).unsqueeze(0)
+        k = self.k_norm(k)
+        q, k = self.rotary_emb(positions, q, k)
+
+        attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+
+        # Compatible with triton backend which returns [1, s, h, head_dim]
+        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
+            attn_output = attn_output.squeeze(0)
+            attn_output = attn_output.flatten(-2, -1)
+        # [s, h * head_dim]
+
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def forward_native(
+        self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         forward_batch: ForwardBatch,
@@ -238,6 +299,22 @@ class Gemma3Attention(nn.Module):
 
         output, _ = self.o_proj(attn_output)
         return output
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        forward_batch: ForwardBatch,
+        **kwargs,
+    ) -> torch.Tensor:
+        if _is_cpu and _is_cpu_amx_available:
+            return self.forward_cpu(
+                positions, hidden_states, position_embeddings, forward_batch, **kwargs
+            )
+        return self.forward_native(
+            positions, hidden_states, position_embeddings, forward_batch, **kwargs
+        )
 
 
 class Gemma3DecoderLayer(nn.Module):
@@ -325,9 +402,10 @@ class Gemma3RotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma3TextConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type", "default")
+        rope_scaling = config.rope_parameters
+        if rope_scaling is not None:
+            self.rope_type = rope_scaling.get(
+                "rope_type", rope_scaling.get("type", "default")
             )
 
         else:
@@ -341,7 +419,10 @@ class Gemma3RotaryEmbedding(nn.Module):
 
         self.config = config
 
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        if self.rope_type == "default":
+            self.rope_init_fn = self.compute_default_rope_parameters
+        else:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -372,6 +453,35 @@ class Gemma3RotaryEmbedding(nn.Module):
             self.original_inv_freq = self.original_inv_freq.to(device)
             self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
             self.max_seq_len_cached = self.original_max_seq_len
+
+    @staticmethod
+    def compute_default_rope_parameters(config, device=None, seq_len=None):
+        """Standard RoPE: no scaling, just base frequency."""
+        rope_params = config.rope_parameters
+        if isinstance(rope_params, dict) and "rope_theta" not in rope_params:
+            # Nested per-layer-type format; pick the first available theta
+            for v in rope_params.values():
+                if isinstance(v, dict) and "rope_theta" in v:
+                    base = v["rope_theta"]
+                    break
+            else:
+                base = 10000.0
+        else:
+            base = rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
+        dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
+        )
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.int64).to(
+                    device=device, dtype=torch.float
+                )
+                / dim
+            )
+        )
+        return inv_freq, 1.0
 
     @torch.no_grad()
     def forward(self, x, position_ids):
@@ -447,14 +557,36 @@ class Gemma3TextModel(PreTrainedModel):
         )
 
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Gemma3RotaryEmbedding(config=config)
+
+        # In transformers v5, rope_parameters is nested per layer type:
+        #   {"sliding_attention": {"rope_type": ..., "rope_theta": 10000},
+        #    "full_attention":    {"rope_type": ..., "rope_theta": 1000000}}
+        # Flatten into the format Gemma3RotaryEmbedding expects.
+        rope_params = config.rope_parameters
+        if isinstance(rope_params, dict) and "full_attention" in rope_params:
+            global_theta = rope_params["full_attention"].get("rope_theta", 1000000.0)
+            local_theta = rope_params["sliding_attention"].get("rope_theta", 10000.0)
+        else:
+            # v4 flat format fallback
+            global_theta = (
+                rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
+            )
+            local_theta = getattr(config, "rope_local_base_freq", 10000.0)
+
+        global_config = copy.deepcopy(config)
+        global_config.rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": global_theta,
+        }
+        self.rotary_emb = Gemma3RotaryEmbedding(config=global_config)
         self.gradient_checkpointing = False
 
-        # when we want to create a local RoPE layer. Config defaults should hold values for global RoPE
-        config = copy.deepcopy(config)
-        config.rope_theta = config.rope_local_base_freq
-        config.rope_scaling = {"rope_type": "default"}
-        self.rotary_emb_local = Gemma3RotaryEmbedding(config=config)
+        local_config = copy.deepcopy(config)
+        local_config.rope_parameters = {
+            "rope_type": "default",
+            "rope_theta": local_theta,
+        }
+        self.rotary_emb_local = Gemma3RotaryEmbedding(config=local_config)
 
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -482,21 +614,33 @@ class Gemma3TextModel(PreTrainedModel):
         else:
             hidden_states = input_embeds
 
-        if positions.dim() == 1:
-            positions = einops.rearrange(positions, "s -> 1 s")
+        if _is_cpu and _is_cpu_amx_available:
+            for layer in self.layers:
+                layer_outputs = layer(
+                    positions=positions,
+                    position_embeddings_global=None,
+                    position_embeddings_local=None,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    **kwargs,
+                )
+                hidden_states = layer_outputs[0]
+        else:
+            if positions.dim() == 1:
+                positions = einops.rearrange(positions, "s -> 1 s")
 
-        position_embeddings_global = self.rotary_emb(hidden_states, positions)
-        position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
-        for layer in self.layers:
-            layer_outputs = layer(
-                positions=positions,
-                position_embeddings_global=position_embeddings_global,
-                position_embeddings_local=position_embeddings_local,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                **kwargs,
-            )
-            hidden_states = layer_outputs[0]
+            position_embeddings_global = self.rotary_emb(hidden_states, positions)
+            position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
+            for layer in self.layers:
+                layer_outputs = layer(
+                    positions=positions,
+                    position_embeddings_global=position_embeddings_global,
+                    position_embeddings_local=position_embeddings_local,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    **kwargs,
+                )
+                hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
 
@@ -506,7 +650,7 @@ class Gemma3TextModel(PreTrainedModel):
 class Gemma3ForCausalLM(PreTrainedModel):
     config_class = Gemma3TextConfig
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     config_class = Gemma3TextConfig

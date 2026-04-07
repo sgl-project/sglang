@@ -25,9 +25,9 @@ COMMIT_FILES=$(git diff --name-only | sed 's/^/          - /')
 # Commit changes
 echo "Committing changes..."
 git add -A
-git commit -m "chore: bump sgl-kernel version to ${KERNEL_VERSION} in SGLang
+git commit -m "chore: bump sglang-kernel version to ${KERNEL_VERSION} in SGLang
 
-This commit updates the sgl-kernel version across SGLang files to match
+This commit updates the sglang-kernel version across SGLang files to match
 the version defined in sgl-kernel/pyproject.toml.
 
 Files updated:
@@ -42,10 +42,10 @@ git push origin "${BRANCH_NAME}"
 # Create pull request
 echo "Creating pull request..."
 PR_URL=$(gh pr create \
-  --title "chore: bump sgl-kernel version to ${KERNEL_VERSION}" \
+  --title "chore: bump sglang-kernel version to ${KERNEL_VERSION}" \
   --body "## Summary
 
-This PR bumps the \`sgl-kernel\` version to \`${KERNEL_VERSION}\` across SGLang files to match the version defined in \`sgl-kernel/pyproject.toml\`.
+This PR bumps the \`sglang-kernel\` version to \`${KERNEL_VERSION}\` across SGLang files to match the version defined in \`sgl-kernel/pyproject.toml\`.
 
 **Kernel Version:** \`${KERNEL_VERSION}\`
 
@@ -54,7 +54,7 @@ ${FILES_LIST}
 
 ## Context
 
-The sgl-kernel version in \`sgl-kernel/pyproject.toml\` has been updated. This PR ensures that all SGLang files referencing the kernel version are updated accordingly:
+The kernel version in \`sgl-kernel/pyproject.toml\` has been updated. This PR ensures that all SGLang files referencing the \`sglang-kernel\` dependency are updated accordingly:
 - \`python/pyproject.toml\` - dependency specification
 - \`python/sglang/srt/entrypoints/engine.py\` - version check
 - \`docker/Dockerfile\` - Docker build argument

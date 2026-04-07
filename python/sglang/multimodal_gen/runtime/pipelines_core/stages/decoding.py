@@ -56,10 +56,11 @@ class DecodingStage(PipelineStage):
     output format (e.g., pixel values).
     """
 
-    def __init__(self, vae, pipeline=None) -> None:
+    def __init__(self, vae, pipeline=None, component_name: str = "vae") -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
+        self.component_name = component_name
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -118,10 +119,9 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
-        self.vae = self.vae.to(get_local_torch_device())
-        latents = latents.to(get_local_torch_device())
-        # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        self.vae = self.vae.to(device=get_local_torch_device(), dtype=vae_dtype)
+        latents = latents.to(get_local_torch_device())
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
@@ -157,14 +157,17 @@ class DecodingStage(PipelineStage):
     def load_model(self):
         # load vae if not already loaded (used for memory constrained devices)
         pipeline = self.pipeline() if self.pipeline else None
-        if not self.server_args.model_loaded["vae"]:
+        if not self.server_args.model_loaded[self.component_name]:
             loader = VAELoader()
-            self.vae = loader.load(
-                self.server_args.model_paths["vae"], self.server_args
+            self.vae, _ = loader.load(
+                self.server_args.model_paths[self.component_name],
+                self.server_args,
+                component_name=self.component_name,
+                transformers_or_diffusers=loader.expected_library,
             )
             if pipeline:
-                pipeline.add_module("vae", self.vae)
-            self.server_args.model_loaded["vae"] = True
+                pipeline.add_module(self.component_name, self.vae)
+            self.server_args.model_loaded[self.component_name] = True
 
     def offload_model(self):
         # Offload models if needed
@@ -174,11 +177,13 @@ class DecodingStage(PipelineStage):
             self.vae.to("cpu", non_blocking=True)
 
         if torch.backends.mps.is_available():
+            # Flush lazy MPS kernels before freeing weights to avoid hangs.
+            torch.mps.synchronize()
             del self.vae
             pipeline = self.pipeline() if self.pipeline else None
-            if pipeline is not None and "vae" in pipeline.modules:
-                del pipeline.modules["vae"]
-            self.server_args.model_loaded["vae"] = False
+            if pipeline is not None and self.component_name in pipeline.modules:
+                del pipeline.modules[self.component_name]
+            self.server_args.model_loaded[self.component_name] = False
 
     @torch.no_grad()
     def forward(
@@ -233,8 +238,11 @@ class DecodingStage(PipelineStage):
             trajectory_latents=batch.trajectory_latents,
             trajectory_decoded=trajectory_decoded,
             metrics=batch.metrics,
+            noise_pred=None,
         )
 
-        self.offload_model()
+        # Keep VAE resident during warmup; the real request needs it next.
+        if not getattr(batch, "is_warmup", False):
+            self.offload_model()
 
         return output_batch

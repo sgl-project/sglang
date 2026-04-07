@@ -7,7 +7,7 @@ import torch
 from sglang.srt.debug_utils.dump_loader import read_tokenizer_path
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="default", nightly=True)
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu", nightly=True)
 
 
 def _save_pt(
