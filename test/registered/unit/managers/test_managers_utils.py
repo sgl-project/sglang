@@ -1,53 +1,16 @@
 """Unit tests for managers/utils.py — no server, no model loading."""
 
-import importlib
-import importlib.abc
-import importlib.machinery
-import sys
-import types
-from unittest.mock import MagicMock, Mock
-
-
-# Stub out sgl_kernel (and all submodules) before any sglang import so
-# the test runs on CPU-only runners without the real CUDA library.
-class _SglKernelMockLoader(importlib.abc.Loader):
-    def create_module(self, spec):
-        mod = types.ModuleType(spec.name)
-        mod.__path__ = []
-        mod.__package__ = spec.name
-        mod.__loader__ = self
-        mod.__getattr__ = lambda name: MagicMock()
-        return mod
-
-    def exec_module(self, module):
-        pass
-
-
-class _SglKernelMockFinder(importlib.abc.MetaPathFinder):
-    """Import hook that intercepts all sgl_kernel.* imports and returns mocks."""
-
-    _PREFIX = "sgl_kernel"
-    _loader = _SglKernelMockLoader()
-
-    def find_spec(self, fullname, path, target=None):
-        if fullname == self._PREFIX or fullname.startswith(self._PREFIX + "."):
-            return importlib.machinery.ModuleSpec(
-                fullname, self._loader, is_package=True
-            )
-        return None
-
-
-if "sgl_kernel" not in sys.modules:
-    sys.meta_path.insert(0, _SglKernelMockFinder())
+import unittest
+from unittest.mock import Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
-
-import unittest
+maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.utils import get_alloc_len_per_decode, validate_input_length
-from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 def _make_req(input_ids):
