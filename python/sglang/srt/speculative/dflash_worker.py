@@ -142,6 +142,7 @@ class DFlashWorker:
             is_draft_worker=True,
             req_to_token_pool=shared_req_to_token_pool,
             token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
+            memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
