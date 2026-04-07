@@ -881,6 +881,11 @@ class FlashAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
+                    _fa_out = (
+                        output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                        if output is not None
+                        else None
+                    )
                     output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
@@ -892,6 +897,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
+                        out=_fa_out,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
@@ -907,6 +913,11 @@ class FlashAttentionBackend(AttentionBackend):
                         if not forward_batch.mha_one_shot
                         else metadata.max_seq_len_k
                     )
+                    _fa_out = (
+                        output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                        if output is not None
+                        else None
+                    )
                     output = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
@@ -918,6 +929,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
+                        out=_fa_out,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
