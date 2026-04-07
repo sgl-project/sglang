@@ -1664,7 +1664,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Convert to extend-tensor coordinates by subtracting pre_len,
                 # then skip any that fall within the cached prefix.
                 embeds_to_add = []
-                for embed_idx, pos in enumerate(req.positional_embed_overrides.positions):
+                for embed_idx, pos in enumerate(
+                    req.positional_embed_overrides.positions
+                ):
                     extend_pos = pos - pre_len
                     if extend_pos < 0 or extend_pos >= req.extend_input_len:
                         continue  # Outside current extend chunk, skip
