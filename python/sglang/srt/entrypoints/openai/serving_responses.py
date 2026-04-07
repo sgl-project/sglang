@@ -529,7 +529,16 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer: Any,
     ):
         # Handle reasoning parsing if enabled
-        if self.reasoning_parser:
+        # For models like qwen3/glm45/nemotron_3/interns1, check enable_thinking
+        # to determine if reasoning should be parsed, mirroring serving_chat.py logic
+        enable_reasoning = True
+        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
+            enable_reasoning = (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking") is not False
+            )
+
+        if self.reasoning_parser and enable_reasoning:
             # Use standard reasoning parser (openai maps to T4Detector internally)
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,

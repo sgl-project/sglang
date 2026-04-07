@@ -83,6 +83,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.srt.utils import get_compiler_backend, is_npu
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 from sglang.srt.utils.common import get_compiler_backend
 

@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import get_compiler_backend, is_npu
 
 logger = init_logger(__name__)
 
@@ -637,15 +638,25 @@ class DiffusersPipeline(ComposedPipelineBase):
                     # TODO(DefTruth): Add support for 'compile_repeated_blocks' for 'transformer'
                     # modules which can significantly reduce compilation time for large models
                     # with repeated blocks.
-                    if isinstance(component, torch.nn.Module) and hasattr(
-                        component, "compile"
-                    ):
-                        # Prefer in-place compilation if supported. According to PyTorch documentation:
-                        # https://docs.pytorch.org/docs/stable/generated/torch.compile.html
-                        component.compile()
+                    if is_npu():
+                        backend = get_compiler_backend()
+                        if isinstance(component, torch.nn.Module) and hasattr(
+                            component, "compile"
+                        ):
+                            component.compile(backend=backend)
+                        else:
+                            compiled_component = torch.compile(component, backend=backend)
+                            setattr(pipe, comp, compiled_component)
                     else:
-                        compiled_component = torch.compile(component)
-                        setattr(pipe, comp, compiled_component)
+                        if isinstance(component, torch.nn.Module) and hasattr(
+                            component, "compile"
+                        ):
+                            # Prefer in-place compilation if supported. According to PyTorch documentation:
+                            # https://docs.pytorch.org/docs/stable/generated/torch.compile.html
+                            component.compile()
+                        else:
+                            compiled_component = torch.compile(component)
+                            setattr(pipe, comp, compiled_component)
                     logger.info(
                         f"Applied torch.compile to {comp} component of the pipeline"
                     )

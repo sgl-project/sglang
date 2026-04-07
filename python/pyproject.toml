@@ -129,6 +129,10 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+model-gateway = [
+  "sglang-router",
+]
+
 test = [
   "accelerate",
   "addict",
@@ -153,6 +157,7 @@ dev = ["sglang[test]"]
 all = [
   "sglang[diffusion]",
   "sglang[tracing]",
+  "sglang[model-gateway]",
 ]
 
 [tool.uv.extra-build-dependencies]
