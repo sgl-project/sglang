@@ -718,7 +718,7 @@ class EAGLEWorker(TpModelWorker):
             top_scores_index.float(),
             "draft_forward: NaN in top_scores_index after organize_draft_results",
         )
-        total_candidates = self.topk + (self.speculative_num_steps - 1) * self.topk
+        total_candidates = self.topk + (self.speculative_num_steps - 1) * self.topk**2
         maybe_detect_oob(
             top_scores_index,
             0,
