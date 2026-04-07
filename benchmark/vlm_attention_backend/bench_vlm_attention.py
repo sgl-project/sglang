@@ -284,15 +284,8 @@ def benchmark_attention(
         )
         run_fn = lambda: run_flashinfer_cudnn(q, k, v, fi_inputs)
     else:
-        from sglang.srt.layers.attention.vision import prepare_vision_attention_metadata
-
-        cu_gpu = cu_seqlens.to("cuda")
-        metadata = prepare_vision_attention_metadata(
-            cu_gpu, device=torch.device("cuda")
-        )
-        run_fn = lambda: backend.forward(
-            q, k, v, cu_seqlens=None, bsz=bsz, seq_len=0, forward_metadata=metadata
-        )
+        cu_gpu = cu_seqlens.to(device="cuda", dtype=torch.int32)
+        run_fn = lambda: backend.forward(q, k, v, cu_seqlens=cu_gpu, bsz=bsz, seq_len=0)
 
     # Warmup
     for _ in range(num_warmup):
