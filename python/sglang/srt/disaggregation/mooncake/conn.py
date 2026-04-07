@@ -297,7 +297,9 @@ class MooncakeKVManager(CommonKVManager):
         )
 
         self._staging_ctx.buffers = init_staging_buffers(
-            self.engine, self.kv_args, count
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+            count,
         )
         self.kv_buffer_tensors = None
 
@@ -306,7 +308,10 @@ class MooncakeKVManager(CommonKVManager):
             init_staging_allocator,
         )
 
-        self._staging_ctx.allocator = init_staging_allocator(self.engine, self.kv_args)
+        self._staging_ctx.allocator = init_staging_allocator(
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+        )
         self.kv_buffer_tensors = None
 
     def _handle_staging_req(self, msg):

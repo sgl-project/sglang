@@ -256,38 +256,27 @@ class NixlKVManager(CommonKVManager):
         self._init_staging_allocator()
 
     def _init_staging_buffers(self, count: int):
-        from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
-        from sglang.srt.disaggregation.mooncake.utils import init_mooncake_custom_mem_pool
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_buffers,
+        )
 
-        size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
-        size_bytes = size_mb * 1024 * 1024
         gpu_id = self.kv_args.gpu_id
-        device = f"cuda:{gpu_id}"
-        _, custom_mem_pool, _ = init_mooncake_custom_mem_pool(device)
-
-        buffers = []
-        for _ in range(count):
-            buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
-            self._register_staging_memory(buf.get_ptr(), buf.get_size(), gpu_id)
-            buffers.append(buf)
-        self._staging_ctx.buffers = buffers
-        return buffers
+        self._staging_ctx.buffers = init_staging_buffers(
+            lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
+            self.kv_args,
+            count,
+        )
 
     def _init_staging_allocator(self):
-        from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
-        from sglang.srt.disaggregation.mooncake.utils import init_mooncake_custom_mem_pool
-
-        pool_size_mb = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get()
-        pool_size_bytes = pool_size_mb * 1024 * 1024
-        gpu_id = self.kv_args.gpu_id
-        device = f"cuda:{gpu_id}"
-        _, custom_mem_pool, _ = init_mooncake_custom_mem_pool(device)
-
-        allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)
-        self._register_staging_memory(
-            allocator.get_base_ptr(), allocator.get_total_size(), gpu_id
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_staging_allocator,
         )
-        self._staging_ctx.allocator = allocator
+
+        gpu_id = self.kv_args.gpu_id
+        self._staging_ctx.allocator = init_staging_allocator(
+            lambda ptr, size: self._register_staging_memory(ptr, size, gpu_id),
+            self.kv_args,
+        )
 
     def _register_staging_memory(self, ptr: int, size: int, gpu_id: int):
         """Register a staging buffer with the NIXL agent."""
@@ -1182,7 +1171,7 @@ class NixlKVManager(CommonKVManager):
             return None
 
     # ------------------------------------------------------------------
-    # Staging transfer helper (mirrors mooncake's _do_staging_transfer)
+    # Staging transfer helper
     # ------------------------------------------------------------------
 
     def _do_staging_transfer(
@@ -1197,7 +1186,11 @@ class NixlKVManager(CommonKVManager):
     ):
         """Attempt staging transfer for one request. Returns xfer_handle or None on fallback."""
         page_size = self.kv_buffer_tensors["page_size"]
-        cps = self.server_args.chunked_prefill_size or 8192
+        from sglang.srt.disaggregation.common.staging_handler import (
+            DEFAULT_CHUNKED_PREFILL_SIZE,
+        )
+
+        cps = self.server_args.chunked_prefill_size or DEFAULT_CHUNKED_PREFILL_SIZE
         full_chunk_pages = max(1, cps // page_size)
 
         page_start = index_slice.start

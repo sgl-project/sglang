@@ -18,6 +18,8 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CHUNKED_PREFILL_SIZE = 8192
+
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
 
@@ -426,7 +428,7 @@ class PrefillStagingStrategy:
         self.kv_manager = kv_manager
         self.staging_buffer = staging_buffer
         page_size = kv_manager.kv_buffer_tensors["page_size"]
-        cps = kv_manager.server_args.chunked_prefill_size or 8192
+        cps = kv_manager.server_args.chunked_prefill_size or DEFAULT_CHUNKED_PREFILL_SIZE
         self.full_chunk_pages = max(1, cps // page_size)
 
     def check_ready(
@@ -499,21 +501,15 @@ class PrefillStagingStrategy:
             ) from e
 
 
-def init_staging_buffers(engine, kv_args, count: int) -> list:
-    """Create prefill-side staging buffers and register them with the engine.
+def _get_custom_mem_pool(device: str):
+    """Get custom memory pool for staging buffer allocation (backend-agnostic).
 
-    Returns list of StagingBuffer instances.
+    Returns (custom_mem_pool, pool_type) tuple. custom_mem_pool may be None
+    if no custom pool is configured.
     """
-    from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
     from sglang.srt.disaggregation.mooncake.utils import (
         init_mooncake_custom_mem_pool,
     )
-    from sglang.srt.environ import envs
-
-    size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
-    size_bytes = size_mb * 1024 * 1024
-    gpu_id = kv_args.gpu_id
-    device = f"cuda:{gpu_id}"
 
     _, custom_mem_pool, pool_type = init_mooncake_custom_mem_pool(device)
     if custom_mem_pool is None:
@@ -522,24 +518,49 @@ def init_staging_buffers(engine, kv_args, count: int) -> list:
             "This works for all GPU architectures. "
             "For NVLink/MNNVL transport, set SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
         )
+    return custom_mem_pool, pool_type
+
+
+def init_staging_buffers(register_fn, kv_args, count: int) -> list:
+    """Create prefill-side staging buffers and register them with the transport.
+
+    Args:
+        register_fn: callable(ptr: int, size: int) that registers a memory
+            region with the transport backend.
+        kv_args: KVArgs with gpu_id.
+        count: number of staging buffers to create.
+
+    Returns list of StagingBuffer instances.
+    """
+    from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+    from sglang.srt.environ import envs
+
+    size_mb = envs.SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB.get()
+    size_bytes = size_mb * 1024 * 1024
+    gpu_id = kv_args.gpu_id
+    device = f"cuda:{gpu_id}"
+
+    custom_mem_pool, _ = _get_custom_mem_pool(device)
 
     buffers = []
     for _ in range(count):
         buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
-        engine.batch_register([buf.get_ptr()], [buf.get_size()])
+        register_fn(buf.get_ptr(), buf.get_size())
         buffers.append(buf)
     return buffers
 
 
-def init_staging_allocator(engine, kv_args):
-    """Create decode-side staging ring-buffer allocator and register with engine.
+def init_staging_allocator(register_fn, kv_args):
+    """Create decode-side staging ring-buffer allocator and register with transport.
+
+    Args:
+        register_fn: callable(ptr: int, size: int) that registers a memory
+            region with the transport backend.
+        kv_args: KVArgs with gpu_id.
 
     Returns a StagingAllocator instance.
     """
     from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
-    from sglang.srt.disaggregation.mooncake.utils import (
-        init_mooncake_custom_mem_pool,
-    )
     from sglang.srt.environ import envs
 
     pool_size_mb = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get()
@@ -547,9 +568,9 @@ def init_staging_allocator(engine, kv_args):
     gpu_id = kv_args.gpu_id
     device = f"cuda:{gpu_id}"
 
-    _, custom_mem_pool, _ = init_mooncake_custom_mem_pool(device)
+    custom_mem_pool, _ = _get_custom_mem_pool(device)
     allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)
-    engine.batch_register([allocator.get_base_ptr()], [allocator.get_total_size()])
+    register_fn(allocator.get_base_ptr(), allocator.get_total_size())
     return allocator
 
 
@@ -692,7 +713,7 @@ def prefetch_staging_reqs(
     from sglang.srt.utils.network import NetworkAddress
 
     page_size = kv_buffer_tensors["page_size"]
-    cps = chunked_prefill_size or 8192
+    cps = chunked_prefill_size or DEFAULT_CHUNKED_PREFILL_SIZE
     full_chunk_pages = max(1, cps // page_size)
 
     for session_id, tinfo in transfer_infos[room].items():
