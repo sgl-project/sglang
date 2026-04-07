@@ -317,7 +317,14 @@ def _build_sglang_payload(case: dict) -> dict:
         "n": 1,
         "response_format": "b64_json",
     }
-    for key in ("num_inference_steps", "guidance_scale", "seed", "num_frames"):
+    for key in (
+        "num_inference_steps",
+        "guidance_scale",
+        "seed",
+        "num_frames",
+        "fps",
+        "negative_prompt",
+    ):
         if key in case:
             payload[key] = case[key]
     return payload
@@ -447,7 +454,14 @@ def send_image_conditioned_request_sglang(
         "n": "1",
         "response_format": "b64_json",
     }
-    for key in ("num_inference_steps", "guidance_scale", "seed", "num_frames"):
+    for key in (
+        "num_inference_steps",
+        "guidance_scale",
+        "seed",
+        "num_frames",
+        "fps",
+        "negative_prompt",
+    ):
         if key in case:
             data[key] = str(case[key])
     if perf_dump_path:
@@ -521,6 +535,10 @@ def send_request_vllm_omni(base_url: str, case: dict, config: dict) -> float:
     }
     if "num_frames" in case:
         extra_body["num_frames"] = case["num_frames"]
+    if "fps" in case:
+        extra_body["fps"] = case["fps"]
+    if "negative_prompt" in case:
+        extra_body["negative_prompt"] = case["negative_prompt"]
 
     # Build message content (text or text+image)
     content: list[dict] | str = case["prompt"]
@@ -583,6 +601,10 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
         payload["width"] = case["width"]
     if "guidance_scale" in case:
         payload["guidance_scale"] = case["guidance_scale"]
+    if "fps" in case:
+        payload["fps"] = case["fps"]
+    if "negative_prompt" in case:
+        payload["negative_prompt"] = case["negative_prompt"]
     # Image-conditioned: LightX2V accepts image_path (URL or local path)
     if case.get("reference_image"):
         payload["image_path"] = config.get("test_image_url", "")

@@ -26,6 +26,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -373,6 +374,7 @@ class ServerArgs:
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
+    stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     random_seed: Optional[int] = None
@@ -511,6 +513,9 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_max_trie_depth: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_ngram_external_corpus_path: Optional[str] = None
+    speculative_ngram_external_sam_budget: int = 0
+    speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -1497,6 +1502,14 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
 
+        _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
+        if _hybrid_spec is not None:
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=_hybrid_spec.support_mamba_cache,
+                support_mamba_cache_extra_buffer=_hybrid_spec.support_mamba_cache_extra_buffer,
+            )
+
         if model_arch in [
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
@@ -1874,6 +1887,10 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
+        elif model_arch == "Gemma4ForConditionalGeneration":
+            if self.is_attention_backend_not_set():
+                self.attention_backend = "triton"
+                logger.info("Use triton as default attention backend for Gemma4")
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
                 logger.warning(
@@ -3109,6 +3126,25 @@ class ServerArgs:
                     "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
                     "You can override this by explicitly setting --speculative-num-draft-tokens."
                 )
+            if self.speculative_ngram_external_corpus_path is not None:
+                if self.speculative_ngram_external_sam_budget <= 0:
+                    raise ValueError(
+                        "--speculative-ngram-external-sam-budget must be positive when "
+                        "--speculative-ngram-external-corpus-path is set."
+                    )
+                if self.speculative_ngram_external_corpus_max_tokens <= 0:
+                    raise ValueError(
+                        "--speculative-ngram-external-corpus-max-tokens must be positive when "
+                        "--speculative-ngram-external-corpus-path is set."
+                    )
+                if (
+                    self.speculative_ngram_external_sam_budget
+                    > self.speculative_num_draft_tokens - 1
+                ):
+                    raise ValueError(
+                        "speculative_ngram_external_sam_budget must be less than or equal to "
+                        f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."
+                    )
             logger.warning(
                 "The overlap scheduler and mixed chunked prefill are disabled because of "
                 "using ngram speculative decoding."
@@ -3298,6 +3334,8 @@ class ServerArgs:
             "Qwen3VLForConditionalGeneration",
             "Qwen2_5_VLForConditionalGeneration",
             "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
@@ -4140,6 +4178,12 @@ class ServerArgs:
             help="Whether to output as a sequence of disjoint segments.",
         )
         parser.add_argument(
+            "--stream-response-default-include-usage",
+            action="store_true",
+            help="Include usage in every streaming response "
+            "(even when stream_options is not specified).",
+        )
+        parser.add_argument(
             "--stream-output",
             action=DeprecatedStoreTrueAction,
             dest="incremental_streaming_output",
@@ -4640,10 +4684,11 @@ class ServerArgs:
         parser.add_argument(
             "--experts-shared-outer-loras",
             default=ServerArgs.experts_shared_outer_loras,
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             help="Force shared outer LoRA mode for MoE models. "
             "When set, w1/w3 lora_A and w2 lora_B are shared across experts "
-            "(expert_dim=1). By default this is auto-detected from adapter weights.",
+            "(expert_dim=1). Use --no-experts-shared-outer-loras to force disable. "
+            "By default this is auto-detected from adapter weights.",
         )
 
         # Kernel backend
@@ -4879,6 +4924,24 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-corpus-path",
+            type=str,
+            default=ServerArgs.speculative_ngram_external_corpus_path,
+            help="Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-sam-budget",
+            type=int,
+            default=ServerArgs.speculative_ngram_external_sam_budget,
+            help="Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-external-corpus-max-tokens",
+            type=int,
+            default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
+            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
         )
 
         # Multi-layer Eagle speculative decoding
@@ -6173,6 +6236,14 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+
+            hf_config = self.get_model_config().hf_config
+            assert is_deepseek_nsa(hf_config), (
+                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
+                "(e.g., DeepSeek V3.2, GLM-5). "
+            )
+
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."

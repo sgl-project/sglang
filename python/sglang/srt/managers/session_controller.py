@@ -167,7 +167,7 @@ class Session:
                 # Adjust mm_item offsets since they were computed on
                 # the pre-strip sequence (with BOS at position 0)
                 if req.mm_inputs:
-                    for item in req.mm_inputs.get("mm_items", []):
+                    for item in req.mm_inputs.mm_items:
                         if item.offsets:
                             if any(s == 0 for s, _ in item.offsets):
                                 logging.warning(
