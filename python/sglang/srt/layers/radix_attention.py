@@ -23,7 +23,6 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -138,7 +137,11 @@ class RadixAttention(nn.Module):
                     if bv is not None:
                         bv.copy_(v)
                     output = bridges.output[:n]
-                    del q, k, v  # release refs so originals can be freed in this segment
+                    del (
+                        q,
+                        k,
+                        v,
+                    )  # release refs so originals can be freed in this segment
                     breakable_unified_attention_with_output(
                         bq,
                         bk,
@@ -233,9 +236,7 @@ def breakable_unified_attention_with_output(
             non_graph,
         )
 
-        _breakable_attention_fn = non_graph(True)(
-            _unified_attention_with_output_impl
-        )
+        _breakable_attention_fn = non_graph(True)(_unified_attention_with_output_impl)
     return _breakable_attention_fn(
         query, key, value, output, save_kv_cache, layer_id, **kwargs
     )

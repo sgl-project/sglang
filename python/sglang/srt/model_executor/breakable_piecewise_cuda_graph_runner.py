@@ -22,16 +22,13 @@ as a single breakable CUDA graph that automatically splits at @non_graph points
 from __future__ import annotations
 
 import bisect
-import gc
 import logging
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 import tqdm
 
 from sglang.srt.compilation.piecewise_context_manager import (
-    ForwardContext,
     set_forward_context,
 )
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -41,8 +38,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
@@ -52,15 +47,15 @@ from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import 
     BreakableCUDAGraph,
     BreakableCUDAGraphContext,
 )
+from sglang.srt.model_executor.cuda_graph_runner import (
+    get_global_graph_memory_pool,
+    set_global_graph_memory_pool,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
-)
-from sglang.srt.model_executor.cuda_graph_runner import (
-    get_global_graph_memory_pool,
-    set_global_graph_memory_pool,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PrefillInputBuffers,
@@ -100,6 +95,8 @@ class BridgeBuffers:
         self.k = torch.empty((max_tokens, k_dim), dtype=dtype, device=device)
         self.v = torch.empty((max_tokens, v_dim), dtype=dtype, device=device)
         self.output = torch.empty((max_tokens, out_dim), dtype=dtype, device=device)
+
+
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -131,7 +128,9 @@ class BreakablePiecewiseCudaGraphRunner:
         capture_tokens = model_runner.server_args.piecewise_cuda_graph_tokens
         assert capture_tokens is not None
         self.capture_num_tokens = sorted(capture_tokens)
-        self.max_num_tokens = max(self.capture_num_tokens) if self.capture_num_tokens else 8192
+        self.max_num_tokens = (
+            max(self.capture_num_tokens) if self.capture_num_tokens else 8192
+        )
         self.max_bs = model_runner.req_to_token_pool.size
 
         log_info_on_rank0(
@@ -143,7 +142,8 @@ class BreakablePiecewiseCudaGraphRunner:
         with torch.device(self.device):
             input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             out_cache_loc = torch.zeros(
-                (self.max_num_tokens,), dtype=torch.int64 if not is_npu() else torch.int32
+                (self.max_num_tokens,),
+                dtype=torch.int64 if not is_npu() else torch.int32,
             )
             out_cache_loc_swa = (
                 torch.zeros((self.max_num_tokens,), dtype=torch.int64)
@@ -157,7 +157,9 @@ class BreakablePiecewiseCudaGraphRunner:
                     (self.max_num_tokens, model_runner.model_config.hidden_size),
                     dtype=model_runner.dtype,
                 )
-                mrope_positions = torch.zeros((3, self.max_num_tokens), dtype=torch.int64)
+                mrope_positions = torch.zeros(
+                    (3, self.max_num_tokens), dtype=torch.int64
+                )
             else:
                 input_embeds = None
                 mrope_positions = None
@@ -190,9 +192,15 @@ class BreakablePiecewiseCudaGraphRunner:
         with torch.device(self.device):
             self.static_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
             self.static_extend_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
-            self.static_extend_prefix_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
-            self.static_extend_start_loc = torch.zeros((self.max_bs,), dtype=torch.int64)
-            self.static_req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
+            self.static_extend_prefix_lens = torch.zeros(
+                (self.max_bs,), dtype=torch.int64
+            )
+            self.static_extend_start_loc = torch.zeros(
+                (self.max_bs,), dtype=torch.int64
+            )
+            self.static_req_pool_indices = torch.zeros(
+                (self.max_bs,), dtype=torch.int64
+            )
             self.static_orig_seq_lens = torch.zeros((self.max_bs,), dtype=torch.int64)
 
         # Graph storage
@@ -225,9 +233,7 @@ class BreakablePiecewiseCudaGraphRunner:
         self.static_extend_seq_lens[:bs].fill_(num_tokens)
         self.static_extend_prefix_lens[:bs].zero_()
         self.static_extend_start_loc[:bs].zero_()
-        self.static_req_pool_indices[:bs].copy_(
-            torch.arange(bs, device=self.device)
-        )
+        self.static_req_pool_indices[:bs].copy_(torch.arange(bs, device=self.device))
         self.static_orig_seq_lens[:bs].fill_(num_tokens)
 
         return ForwardBatch(
@@ -263,18 +269,14 @@ class BreakablePiecewiseCudaGraphRunner:
             extend_start_loc=self.static_extend_start_loc[:bs],
             extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
             extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            extend_logprob_start_lens_cpu=torch.tensor(
-                [num_tokens], device="cpu"
-            ),
+            extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
             positions=buffers.positions[:num_tokens],
             global_num_tokens_gpu=None,
             global_num_tokens_for_logprob_gpu=None,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=None,
             mrope_positions=(
-                buffers.mrope_positions[:, :num_tokens]
-                if self.is_multimodal
-                else None
+                buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
             ),
             spec_algorithm=None,
             spec_info=None,
@@ -365,9 +367,7 @@ class BreakablePiecewiseCudaGraphRunner:
 
         # Capture
         graph = BreakableCUDAGraph()
-        with BreakableCUDAGraphContext(
-            cuda_graph=graph, pool=pool, stream=stream
-        ):
+        with BreakableCUDAGraphContext(cuda_graph=graph, pool=pool, stream=stream):
             output = run_once()
 
         return graph, output
