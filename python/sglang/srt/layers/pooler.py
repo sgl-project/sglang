@@ -55,13 +55,9 @@ class Pooler(nn.Module):
             first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
             pooled_data = hidden_states[first_token_flat_indices]
         elif self.pooling_type == PoolingType.MEAN:
-            prompt_lens = forward_batch.extend_seq_lens.to(
-                device=hidden_states.device, dtype=torch.int64
-            )
+            prompt_lens = forward_batch.extend_seq_lens.to(device=hidden_states.device)
             batch_indices = torch.repeat_interleave(
-                torch.arange(
-                    prompt_lens.shape[0], device=hidden_states.device, dtype=torch.int64
-                ),
+                torch.arange(prompt_lens.shape[0], device=hidden_states.device),
                 prompt_lens,
             )
             pooled_data = torch.zeros(
