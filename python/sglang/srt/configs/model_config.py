@@ -232,6 +232,8 @@ class ModelConfig:
 
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
+        # Set by scheduler when reasoning_parser is enabled
+        self.think_end_id: Optional[int] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -374,6 +376,8 @@ class ModelConfig:
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
             "MiMoV2FlashForCausalLM",
             "MiMoV2MTP",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
         ]
 
     def _derive_context_length(self, context_length: int):
@@ -431,7 +435,7 @@ class ModelConfig:
         self.swa_v_head_dim = getattr(
             self.hf_text_config,
             "swa_v_head_dim",
-            self.v_head_dim,
+            self.swa_head_dim,
         )
         # FIXME: temporary special judge for MLA architecture
         if (
@@ -562,12 +566,6 @@ class ModelConfig:
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
-        )
-        self.first_k_dense_replace = getattr(
-            self.hf_text_config, "first_k_dense_replace", None
-        )
-        self.full_attention_interval = getattr(
-            self.hf_text_config, "full_attention_interval", None
         )
 
         # for Dbrx and MPT models
@@ -1305,6 +1303,7 @@ multimodal_model_archs = [
     "Ernie4_5_VLMoeForConditionalGeneration",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
+    "Gemma4ForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
@@ -1317,6 +1316,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
@@ -1338,6 +1338,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "VoxtralForConditionalGeneration",
     "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
@@ -1449,6 +1450,8 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1466,7 +1469,7 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
     elif "GptOssForCausalLM" in model_architectures:
-        layer_types = getattr(hf_text_config, "layer_types", None)
+        layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"
         ]
@@ -1499,6 +1502,17 @@ def get_hybrid_layer_ids(
     elif "Step3p5MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
+    elif (
+        "Gemma4ForCausalLM" in model_architectures
+        or "Gemma4ForConditionalGeneration" in model_architectures
+    ):
+        layer_types = getattr(hf_text_config, "layer_types", [])
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

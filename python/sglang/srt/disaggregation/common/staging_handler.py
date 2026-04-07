@@ -517,9 +517,10 @@ def init_staging_buffers(engine, kv_args, count: int) -> list:
 
     _, custom_mem_pool, pool_type = init_mooncake_custom_mem_pool(device)
     if custom_mem_pool is None:
-        logger.warning(
-            "No mooncake custom mem pool available for staging buffer. "
-            "NVLink transport will NOT work. Set SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
+        logger.info(
+            "Staging buffer using cudaMalloc (no custom mem pool). "
+            "This works for all GPU architectures. "
+            "For NVLink/MNNVL transport, set SGLANG_MOONCAKE_CUSTOM_MEM_POOL."
         )
 
     buffers = []

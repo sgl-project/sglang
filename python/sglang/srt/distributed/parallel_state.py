@@ -560,26 +560,6 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        # On AMD, use the deterministic 1-stage kernel when:
-        # - SGLANG_USE_1STAGE_ALLREDUCE=1 (explicitly enabled), OR
-        # - SGLANG_USE_1STAGE_ALLREDUCE not set AND --enable-deterministic-inference is on
-        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
-            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
-        else:
-            use_1stage_ar = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
-        use_deterministic_ar = is_hip() and use_1stage_ar
-        if use_deterministic_ar:
-            if not input_.is_cpu and self.ca_comm is not None:
-                inp_size = input_.numel() * input_.element_size()
-                # Try unregistered mode first (faster for smaller tensors)
-                if inp_size < self.ca_comm.max_size:
-                    return self.ca_comm.deterministic_all_reduce(
-                        input_, registered=False
-                    )
-                # Use registered mode for larger tensors
-                self.ca_comm.register_buffer(input_)
-                return self.ca_comm.deterministic_all_reduce(input_, registered=True)
-
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
@@ -679,6 +659,7 @@ class GroupCoordinator:
                 512,
                 1024,
                 2048,
+                2880,
                 4096,
             }
 
@@ -1551,11 +1532,12 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     with get_tp_group().graph_capture(
         stream=stream
     ) as context, get_pp_group().graph_capture(context):
-        moe_ep = _MOE_EP
-        if moe_ep is not None and moe_ep is not _TP:
-            with moe_ep.graph_capture(context):
-                yield context
-        else:
+        with contextlib.ExitStack() as stack:
+            seen = {id(_TP)}
+            for group in (_MOE_EP, _MOE_TP):
+                if group is not None and id(group) not in seen:
+                    seen.add(id(group))
+                    stack.enter_context(group.graph_capture(context))
             yield context
 
 
