@@ -87,6 +87,7 @@ def _sgemm_lora_b_kernel(
     )
 
     # Iterate to compute the block in output matrix
+    n_mask = n_offset[None, :] < N
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
@@ -96,7 +97,7 @@ def _sgemm_lora_b_kernel(
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K),
+            mask=(k_offset[:, None] < K - k * BLOCK_K) & n_mask,
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -110,8 +111,8 @@ def _sgemm_lora_b_kernel(
     output_ptr = (output + seg_start * output_stride_0) + (
         s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = s_offset[:, None] < seg_len
-    partial_sum += tl.load(output_ptr, mask=output_mask)
+    output_mask = (s_offset[:, None] < seg_len) & n_mask
+    partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 

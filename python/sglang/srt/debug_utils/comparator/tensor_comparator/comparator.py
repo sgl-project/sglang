@@ -23,6 +23,22 @@ QUANTILE_NUMEL_THRESHOLD = 10_000_000
 SAMPLE_DIFF_THRESHOLD = 1e-3
 
 
+def compute_tensor_info(
+    tensor: torch.Tensor, *, include_sample: bool = False
+) -> TensorInfo:
+    """Compute TensorInfo (shape, dtype, stats, optional sample) for a single tensor."""
+    stats: TensorStats = _compute_tensor_stats(tensor.float())
+    sample: Optional[str] = (
+        str(get_truncated_value(tensor.float())) if include_sample else None
+    )
+    return TensorInfo(
+        shape=list(tensor.shape),
+        dtype=str(tensor.dtype),
+        stats=stats,
+        sample=sample,
+    )
+
+
 def compare_tensor_pair(
     x_baseline: torch.Tensor,
     x_target: torch.Tensor,
@@ -30,16 +46,8 @@ def compare_tensor_pair(
     diff_threshold: float = 1e-3,
     seq_dim: Optional[int] = None,
 ) -> TensorComparisonInfo:
-    baseline_info = TensorInfo(
-        shape=list(x_baseline.shape),
-        dtype=str(x_baseline.dtype),
-        stats=_compute_tensor_stats(x_baseline.float()),
-    )
-    target_info = TensorInfo(
-        shape=list(x_target.shape),
-        dtype=str(x_target.dtype),
-        stats=_compute_tensor_stats(x_target.float()),
-    )
+    baseline_info: TensorInfo = compute_tensor_info(x_baseline)
+    target_info: TensorInfo = compute_tensor_info(x_target)
 
     x_baseline = try_unify_shape(x_baseline, target_shape=x_target.shape)
     unified_shape = list(x_baseline.shape)

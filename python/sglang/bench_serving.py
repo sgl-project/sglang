@@ -44,6 +44,7 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
@@ -128,7 +129,7 @@ def get_request_headers() -> Dict[str, str]:
 
 
 def _fetch_server_info_payload(base_url: str) -> Optional[Dict[str, Any]]:
-    url = base_url + "/get_server_info"
+    url = base_url + "/server_info"
     response = requests.get(url, headers=get_auth_headers())
     if response.status_code != 200:
         return None
@@ -1734,10 +1735,16 @@ def run_benchmark(args_: argparse.Namespace):
             "truss": 8080,
         }.get(args.backend, 30000)
 
+    # Build base URL with proper IPv6 bracket wrapping (only when base_url is not provided)
+    if not args.base_url:
+        _na = NetworkAddress(args.host, args.port)
+        _host_base = _na.to_url()
+    else:
+        _na = None
+        _host_base = None
+
     model_url = (
-        f"{args.base_url}/v1/models"
-        if args.base_url
-        else f"http://{args.host}:{args.port}/v1/models"
+        f"{args.base_url}/v1/models" if args.base_url else f"{_host_base}/v1/models"
     )
 
     if args.backend == "sglang-embedding":
@@ -1748,43 +1755,39 @@ def run_benchmark(args_: argparse.Namespace):
         )
     elif args.backend in ["sglang", "sglang-native"]:
         api_url = (
-            f"{args.base_url}/generate"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/generate"
+            f"{args.base_url}/generate" if args.base_url else f"{_host_base}/generate"
         )
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
         api_url = (
             f"{args.base_url}/v1/completions"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/completions"
+            else f"{_host_base}/v1/completions"
         )
     elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
         api_url = (
             f"{args.base_url}/v1/chat/completions"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/chat/completions"
+            else f"{_host_base}/v1/chat/completions"
         )
     elif args.backend == "trt":
         api_url = (
             f"{args.base_url}/v2/models/ensemble/generate_stream"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v2/models/ensemble/generate_stream"
+            else f"{_host_base}/v2/models/ensemble/generate_stream"
         )
         if args.model is None:
             print("Please provide a model using `--model` when using `trt` backend.")
             sys.exit(1)
     elif args.backend == "gserver":
-        api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
+        api_url = args.base_url if args.base_url else _na.to_host_port_str()
         args.model = args.model or "default"
     elif args.backend == "truss":
         api_url = (
             f"{args.base_url}/v1/models/model:predict"
             if args.base_url
-            else f"http://{args.host}:{args.port}/v1/models/model:predict"
+            else f"{_host_base}/v1/models/model:predict"
         )
-    base_url = (
-        f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
-    )
+    base_url = _host_base if args.base_url is None else args.base_url
 
     # Wait for server to be ready
     if args.ready_check_timeout_sec > 0:
@@ -1936,6 +1939,7 @@ if __name__ == "__main__":
         type=str,
         default="sharegpt",
         choices=[
+            "autobench",
             "sharegpt",
             "custom",
             "openai",
@@ -1945,6 +1949,7 @@ if __name__ == "__main__":
             "mmmu",
             "image",
             "mooncake",
+            "longbench_v2",
         ],
         help="Name of the dataset to benchmark on.",
     )
