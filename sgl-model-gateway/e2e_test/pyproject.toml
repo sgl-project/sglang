@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sgl-model-gateway-e2e-tests"
 version = "0.1.0"
@@ -11,6 +15,7 @@ dependencies = [
   "openai",
   "pytest",
   "pytest-rerunfailures",
+  "websockets",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +29,9 @@ markers = [
   "e2e: mark test as end-to-end test requiring GPU workers",
   "slow: mark test as slow-running",
   "thread_unsafe: mark test as incompatible with parallel thread execution",
+  "model(name): specify which model spec to use for this test",
+  "gateway(**kwargs): configure gateway extra_args, policy, timeout",
+  "workers(**kwargs): configure worker count, prefill, decode topology",
 ]
 addopts = "-v -s"
 # Explicitly disable live log to avoid "---- live log ----" dividers
@@ -37,3 +45,7 @@ log_cli = false
 # eviction-bound across 5 model:mode combos. ModelPool / GPUAllocator
 # remain thread-safe so re-introducing parallelism (xdist or otherwise)
 # stays a tractable option.
+[tool.setuptools]
+# This test harness is a dependency-only project; disabling auto-discovery keeps
+# `uv pip install .` working in the flat repo layout.
+py-modules = []

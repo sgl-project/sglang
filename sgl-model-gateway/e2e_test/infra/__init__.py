@@ -63,7 +63,13 @@ from .process_utils import (
     wait_for_health,
     wait_for_workers_ready,
 )
-from .run_eval import run_eval
+
+
+def run_eval(*args, **kwargs):
+    """Lazy-import the eval runner to keep non-eval test collection lightweight."""
+    from .run_eval import run_eval as _run_eval
+
+    return _run_eval(*args, **kwargs)
 
 __all__ = [
     # Enums and Identity

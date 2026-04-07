@@ -687,6 +687,7 @@ def _install_sglang_stubs(monkeypatch):
 
     http_server_mod.launch_server = launch_server
     server_args_mod.ServerArgs = ServerArgs
+    utils_mod.is_port_available = is_port_available
     network_mod.is_port_available = is_port_available
     utils_mod.network = network_mod
 

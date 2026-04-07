@@ -41,6 +41,22 @@ def _shutdown_model_pool() -> None:
         _model_pool = None
 
 
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Ensure pooled model workers are released at pytest session end.
+
+    In the local single-GPU loop, relying only on ``atexit`` can leave a worker
+    behind if pytest-parallel or a threaded session exits in an unexpected
+    order. This hook gives pytest a deterministic cleanup point before process
+    teardown.
+    """
+    _shutdown_model_pool()
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Fallback cleanup hook for pytest shutdown paths."""
+    _shutdown_model_pool()
+
+
 @pytest.fixture(scope="session")
 def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     """Session-scoped fixture that manages SGLang worker processes.
