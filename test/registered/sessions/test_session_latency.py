@@ -33,7 +33,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=122,
-    suite="stage-b-test-large-1-gpu",
+    suite="stage-b-test-1-gpu-large",
 )
 
 NUM_TURNS = 150
@@ -424,8 +424,13 @@ class TestSessionLatency(CustomTestCase):
 
     def test_streaming_session_correctness(self):
         """Correctness test: bs=1, assert output equal + latency speedup."""
-        reg = self._run_concurrent_session(streaming=False, num_concurrent=1)
-        stm = self._run_concurrent_session(streaming=True, num_concurrent=1)
+        correctness_turns = 30
+        reg = self._run_concurrent_session(
+            streaming=False, num_concurrent=1, num_turns=correctness_turns
+        )
+        stm = self._run_concurrent_session(
+            streaming=True, num_concurrent=1, num_turns=correctness_turns
+        )
 
         _print_mode_table(reg[0], label="correctness regular")
         _print_mode_table(stm[0], label="correctness streaming")

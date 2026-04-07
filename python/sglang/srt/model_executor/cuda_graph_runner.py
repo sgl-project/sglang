@@ -590,12 +590,20 @@ class CudaGraphRunner:
             else self.dllm_config.block_size
         )
 
-        self.encoder_len_fill_value = 0
+        # Non-zero encoder length ensures cross-attention kernels are captured in the graph.
+        self.encoder_len_fill_value = (
+            getattr(model_runner.model_config.hf_config, "max_source_positions", 0)
+            if self.is_encoder_decoder
+            else 0
+        )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
 
         if self.model_runner.server_args.enable_lora:
+            # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
+            # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
+            # lora_manager.init_cuda_graph_moe_buffers().
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
                 num_tokens_per_bs=self.num_tokens_per_bs,
@@ -955,6 +963,12 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
+
+        # HiSparse: set coordinator so the hisparse code path is captured into the graph
+        forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
+        if forward_batch.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
@@ -1120,6 +1134,9 @@ class CudaGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+
+        if self.model_runner.hisparse_coordinator is not None:
+            self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
     def replay(
         self,

@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -6,6 +8,10 @@ from sglang.jit_kernel.nvfp4 import (
     scaled_fp4_experts_quant,
     scaled_fp4_quant,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -125,3 +131,7 @@ def test_nvfp4_blockwise_moe_grouped_mm(dtype: torch.dtype) -> None:
         ref[start:end] = torch.matmul(a[start:end], b[i].t())
 
     torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=487,
-    suite="stage-b-test-large-1-gpu",
+    suite="stage-b-test-1-gpu-large",
 )
 
 PROMPTS = [

@@ -104,6 +104,7 @@ def run_combined_tests(
 
         model_result = {
             "model": model.model_path,
+            "variant": model.variant,
             "perf_result": None,
             "accuracy_result": None,
             "tool_call_result": None,
@@ -243,8 +244,9 @@ def run_combined_tests(
 
                 failed_test_str = ", ".join(failed_tests) if failed_tests else "unknown"
                 error_str = "; ".join(str(e) for e in r["errors"])
+                variant_str = f" [{r['variant']}]" if r.get("variant") else ""
                 failure_lines.append(
-                    f"  Model {i + 1} ({r['model']}): {failed_test_str} - {error_str}"
+                    f"  Model {i + 1} ({r['model']}{variant_str}): {failed_test_str} - {error_str}"
                 )
 
         failure_summary = "\n".join(failure_lines)

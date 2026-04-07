@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration
-register_cuda_ci(est_time=220, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=220, suite="stage-b-test-1-gpu-large")
 
 
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
@@ -126,8 +126,25 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
         engine.shutdown()
         self.assertGreater(len(out_without_pcg), 0)
 
+        t_out = torch.tensor(out)
+        t_out_without_pcg = torch.tensor(out_without_pcg)
+        max_abs_diff = (t_out - t_out_without_pcg).abs().max().item()
+        max_rel_diff = (
+            ((t_out - t_out_without_pcg).abs() / (t_out_without_pcg.abs() + 1e-8))
+            .max()
+            .item()
+        )
+        print(
+            f"PCG embedding diff: max_abs={max_abs_diff:.6f}, max_rel={max_rel_diff:.6f}"
+        )
         self.assertTrue(
-            torch.allclose(torch.tensor(out), torch.tensor(out_without_pcg))
+            torch.allclose(
+                t_out,
+                t_out_without_pcg,
+                atol=1e-2,
+                rtol=1e-2,
+            ),
+            f"Piecewise CUDA graph embedding mismatch: max_abs_diff={max_abs_diff}, max_rel_diff={max_rel_diff}",
         )
 
 

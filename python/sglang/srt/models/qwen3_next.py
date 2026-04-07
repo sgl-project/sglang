@@ -3,6 +3,7 @@ import logging
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
+import triton
 from torch import nn
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
@@ -55,149 +56,13 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_cat
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
-
-
-import triton
-import triton.language as tl
-
-
-@triton.jit
-def fused_qkvzba_split_reshape_cat_kernel(
-    mixed_qkv,
-    z,
-    b,
-    a,
-    mixed_qkvz,
-    mixed_ba,
-    NUM_HEADS_QK: tl.constexpr,
-    NUM_HEADS_V: tl.constexpr,
-    HEAD_QK: tl.constexpr,
-    HEAD_V: tl.constexpr,
-):
-    i_bs, i_qk = tl.program_id(0), tl.program_id(1)
-    QKVZ_DIM_T: tl.constexpr = HEAD_QK * 2 + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V * 2
-    BA_DIM_T: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK * 2
-    QKV_DIM_T: tl.constexpr = HEAD_QK * 2 + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
-    q_end: tl.constexpr = HEAD_QK
-    blk_q_ptr = (
-        mixed_qkvz
-        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
-        + i_qk * QKVZ_DIM_T
-        + tl.arange(0, q_end)
-    )
-    k_end: tl.constexpr = q_end + HEAD_QK
-    blk_k_ptr = (
-        mixed_qkvz
-        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
-        + i_qk * QKVZ_DIM_T
-        + tl.arange(q_end, k_end)
-    )
-    v_end: tl.constexpr = k_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
-    blk_v_ptr = (
-        mixed_qkvz
-        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
-        + i_qk * QKVZ_DIM_T
-        + tl.arange(k_end, v_end)
-    )
-    z_end: tl.constexpr = v_end + NUM_HEADS_V // NUM_HEADS_QK * HEAD_V
-    blk_z_ptr = (
-        mixed_qkvz
-        + i_bs * NUM_HEADS_QK * QKVZ_DIM_T
-        + i_qk * QKVZ_DIM_T
-        + tl.arange(v_end, z_end)
-    )
-    blk_q_st_ptr = (
-        mixed_qkv
-        + i_bs * NUM_HEADS_QK * QKV_DIM_T
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
-    )
-    blk_k_st_ptr = (
-        mixed_qkv
-        + i_bs * NUM_HEADS_QK * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK
-        + i_qk * HEAD_QK
-        + tl.arange(0, HEAD_QK)
-    )
-    blk_v_st_ptr = (
-        mixed_qkv
-        + i_bs * NUM_HEADS_QK * QKV_DIM_T
-        + NUM_HEADS_QK * HEAD_QK * 2
-        + i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK
-        + tl.arange(0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK)
-    )
-    blk_z_st_ptr = (
-        z
-        + i_bs * NUM_HEADS_V * HEAD_V
-        + i_qk * HEAD_V * NUM_HEADS_V // NUM_HEADS_QK
-        + tl.arange(0, HEAD_V * NUM_HEADS_V // NUM_HEADS_QK)
-    )
-    tl.store(blk_q_st_ptr, tl.load(blk_q_ptr))
-    tl.store(blk_k_st_ptr, tl.load(blk_k_ptr))
-    tl.store(blk_v_st_ptr, tl.load(blk_v_ptr))
-    tl.store(blk_z_st_ptr, tl.load(blk_z_ptr))
-    b_end: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
-    a_end: tl.constexpr = b_end + NUM_HEADS_V // NUM_HEADS_QK
-    for i in tl.static_range(b_end):
-        blk_b_ptr = mixed_ba + i_bs * NUM_HEADS_QK * BA_DIM_T + i_qk * BA_DIM_T + i
-        blk_b_st_ptr = b + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + i
-        tl.store(blk_b_st_ptr, tl.load(blk_b_ptr))
-    for i in tl.static_range(b_end, a_end):
-        blk_a_ptr = mixed_ba + i_bs * NUM_HEADS_QK * BA_DIM_T + i_qk * BA_DIM_T + i
-        blk_a_st_ptr = (
-            a + i_bs * NUM_HEADS_V + i_qk * NUM_HEADS_V // NUM_HEADS_QK + (i - b_end)
-        )
-        tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
-
-
-def fused_qkvzba_split_reshape_cat(
-    mixed_qkvz,
-    mixed_ba,
-    num_heads_qk,
-    num_heads_v,
-    head_qk,
-    head_v,
-):
-    batch, seq_len = mixed_qkvz.shape[0], 1
-    qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
-    mixed_qkv = torch.empty(
-        [batch * seq_len, qkv_dim_t],
-        dtype=mixed_qkvz.dtype,
-        device=mixed_qkvz.device,
-    )
-    z = torch.empty(
-        [batch * seq_len, num_heads_v, head_v],
-        dtype=mixed_qkvz.dtype,
-        device=mixed_qkvz.device,
-    )
-    b = torch.empty(
-        [batch * seq_len, num_heads_v],
-        dtype=mixed_ba.dtype,
-        device=mixed_ba.device,
-    )
-    a = torch.empty_like(b)
-    grid = (batch * seq_len, num_heads_qk)
-    fused_qkvzba_split_reshape_cat_kernel[grid](
-        mixed_qkv,
-        z,
-        b,
-        a,
-        mixed_qkvz,
-        mixed_ba,
-        num_heads_qk,
-        num_heads_v,
-        head_qk,
-        head_v,
-        num_warps=1,
-        num_stages=3,
-    )
-    return mixed_qkv, z, b, a
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -270,11 +135,11 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         # Override weight_loader for packed checkpoint format.
         # Must capture original_loader BEFORE overwriting.
-        self.in_proj_qkvz.weight.weight_loader = self._make_packed_weight_loader(
-            self.in_proj_qkvz
+        self._override_weight_loader(
+            self.in_proj_qkvz, self._make_packed_weight_loader(self.in_proj_qkvz)
         )
-        self.in_proj_ba.weight.weight_loader = self._make_packed_weight_loader(
-            self.in_proj_ba
+        self._override_weight_loader(
+            self.in_proj_ba, self._make_packed_weight_loader(self.in_proj_ba)
         )
 
         # Conv1d weight loader setup
@@ -350,6 +215,19 @@ class Qwen3GatedDeltaNet(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
         )
+
+    @staticmethod
+    def _override_weight_loader(module, new_loader):
+        """Override weight_loader on a module's weight parameter.
+
+        ModelWeightParameter exposes weight_loader as a read-only property
+        backed by _weight_loader, while plain parameters store it as a
+        regular attribute.  This helper handles both cases."""
+        param = module.weight
+        if hasattr(param, "_weight_loader"):
+            param._weight_loader = new_loader
+        else:
+            param.weight_loader = new_loader
 
     @staticmethod
     def _make_packed_weight_loader(module):

@@ -112,4 +112,4 @@ jobs:
       - name: Publish GT images to sglang-bot/sglang-ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-        run: python scripts/ci/utils/publish_diffusion_gt.py --source-dir gt_images
+        run: python scripts/ci/utils/diffusion/publish_diffusion_gt.py --source-dir gt_images

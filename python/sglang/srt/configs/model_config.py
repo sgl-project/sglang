@@ -34,6 +34,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_hf_text_config,
     get_sparse_attention_config,
 )
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ class ModelConfig:
         self._validate_quantize_and_serve_config()
 
         # Get hf config
+        self._maybe_pull_model_for_runai(self.model_path)
         self._maybe_pull_model_tokenizer_from_remote()
         self.model_override_args = json.loads(model_override_args)
         kwargs = {}
@@ -156,7 +158,10 @@ class ModelConfig:
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
             ]
-            if self.hf_config.architectures[0] in mm_disabled_models:
+            if (
+                self.hf_config.architectures[0] in mm_disabled_models
+                and self.model_impl != ModelImpl.TRANSFORMERS
+            ):
                 enable_multimodal = False
                 logger.info(
                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
@@ -175,14 +180,14 @@ class ModelConfig:
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        self.is_multimodal = enable_multimodal and is_multimodal_model(
-            self.hf_config.architectures
+        has_multimodal_subconfig = (
+            self.hf_config is not self.hf_text_config
+            or hasattr(self.hf_config, "vision_config")
+            or hasattr(self.hf_config, "audio_config")
         )
-        self.is_multimodal_gen = enable_multimodal and is_multimodal_gen_model(
-            self.hf_config.architectures
-        )
-        self.is_image_gen = enable_multimodal and is_image_gen_model(
-            self.hf_config.architectures
+        self.is_multimodal = enable_multimodal and (
+            is_multimodal_model(self.hf_config.architectures)
+            or has_multimodal_subconfig
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
@@ -227,6 +232,8 @@ class ModelConfig:
 
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
+        # Set by scheduler when reasoning_parser is enabled
+        self.think_end_id: Optional[int] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -497,6 +504,11 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                self.scaling = compute_mla_mscale_scaling(
+                    self.hf_config.rope_scaling, self.scaling
+                )
         elif (
             "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
             or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
@@ -779,6 +791,8 @@ class ModelConfig:
         return quant_cfg
 
     def _find_quant_modelslim_config(self):
+        if self.is_draft_model:
+            return None
         quant_config_file = Path(self.model_path, "quant_model_description.json")
         quant_cfg = None
         if quant_config_file.is_file():
@@ -1094,13 +1108,6 @@ class ModelConfig:
                     f"or model type {self.hf_config.model_type}. "
                     "Please upgrade transformers to >= 5.0.0."
                 )
-        elif not needs_tf_v5:
-            logger.warning(
-                f"Transformers version {tf_version_str} is used for model type {self.hf_config.model_type}. "
-                "If you experience issues related to RoPE parameters, "
-                "they may be due to incompatibilities between Transformers >=5.0.0 and some models. "
-                "You can try downgrading to transformers==4.57.1 as a workaround."
-            )
 
     def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
@@ -1153,6 +1160,13 @@ class ModelConfig:
         }
 
         return default_sampling_params
+
+    def _maybe_pull_model_for_runai(self, model: str) -> None:
+        if is_runai_obj_uri(model):
+            # local path for loading the config
+            self.model_path = ObjectStorageModel.get_path(model)
+            # remote path for loading the weights
+            self.model_weights = model
 
     def _maybe_pull_model_tokenizer_from_remote(self) -> None:
         """
@@ -1299,6 +1313,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
@@ -1320,6 +1335,7 @@ multimodal_model_archs = [
     "InternS1ForConditionalGeneration",
     "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
+    "VoxtralForConditionalGeneration",
     "WhisperForConditionalGeneration",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
@@ -1356,14 +1372,6 @@ def is_multimodal_model(model_architectures: List[str]):
         return True
     else:
         return False
-
-
-def is_multimodal_gen_model(model_architectures: List[str]):
-    return False
-
-
-def is_image_gen_model(model_architectures: List[str]):
-    return False
 
 
 def is_audio_model(model_architectures: List[str]):
