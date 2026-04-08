@@ -623,10 +623,7 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        # When paused, hold is_pause_cond during the update to prevent
-        # unpause from racing (TOCTOU). In practice this race is near
-        # impossible since callers always do pause → update → resume
-        # sequentially, but holding the lock makes it correct by construction.
+        # Hold is_pause_cond while updating to prevent unpause from racing.
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
@@ -714,8 +711,6 @@ class TokenizerCommunicatorMixin:
             ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
             logger.info("Starting IPC weight update")
 
-            # When paused, hold is_pause_cond during the update so
-            # unpause cannot race between the check and the update.
             async with self.is_pause_cond:
                 is_paused = self.is_pause
                 if is_paused:
