@@ -97,7 +97,7 @@ class FlashinferDispatcher(BaseDispatcher):
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
 
-        # TODO: Can other moe runners use payload_in_workspace too?
+        # TODO: Enable for flashinfer_trtllm_routed if possible.
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
 
         # FlashInfer sizes the workspace from the maximum dispatched tokens per
@@ -225,7 +225,7 @@ class FlashinferDispatcher(BaseDispatcher):
         # and waste downstream MoE compute. Sanitizing the padding to a
         # sentinel id is structural, not optional.
         recv_tensors = self.moe_a2a.dispatch(
-            self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
+            topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
             invalid_token_expert_id=self.num_experts,
@@ -234,7 +234,7 @@ class FlashinferDispatcher(BaseDispatcher):
         if x_sf is not None:
             x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
-            # TODO: fuse interleave into cutlass moe
+            # TODO: Fuse interleave into cutlass moe when flashinfer is updated to have https://github.com/flashinfer-ai/flashinfer/pull/2330
             if get_moe_runner_backend().is_flashinfer_cutlass():
                 x_sf = nvfp4_block_scale_interleave(x_sf)
         else:
