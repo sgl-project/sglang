@@ -52,10 +52,16 @@ class PEModelWrapper:
         generate_kwargs = dict(
             **inputs,
             max_new_tokens=sampling_params.get("max_new_tokens", self.model_max_length),
-            temperature=sampling_params.get("temperature"),
-            top_p=sampling_params.get("top_p"),
             do_sample=True,
         )
+        # Only pass temperature/top_p when explicitly provided;
+        # passing None would cause HuggingFace generate() to raise.
+        temperature = sampling_params.get("temperature")
+        top_p = sampling_params.get("top_p")
+        if temperature is not None:
+            generate_kwargs["temperature"] = temperature
+        if top_p is not None:
+            generate_kwargs["top_p"] = top_p
 
         with torch.no_grad():
             output_ids = self.model.generate(**generate_kwargs)
@@ -94,20 +100,35 @@ class PELoader(ComponentLoader):
     ):
         logger.info("Loading PE model from %s ...", component_model_path)
 
-        model_max_length = _read_model_max_length(component_model_path)
+        # Tokenizer files may live in a sibling `pe_tokenizer/` directory instead
+        # of alongside the model weights in `pe/`.  Check that directory first.
+        pe_tokenizer_dir = os.path.join(os.path.dirname(component_model_path), "pe_tokenizer")
+        if not os.path.exists(os.path.join(component_model_path, "tokenizer_config.json")) and \
+                os.path.exists(os.path.join(pe_tokenizer_dir, "tokenizer_config.json")):
+            tokenizer_path = pe_tokenizer_dir
+            logger.info(
+                "PE tokenizer files not found in %s, using %s",
+                component_model_path,
+                tokenizer_path,
+            )
+        else:
+            tokenizer_path = component_model_path
+
+        model_max_length = _read_model_max_length(tokenizer_path)
         if model_max_length is None:
             raise RuntimeError(
                 f"Cannot load PE model: 'model_max_length' not found in "
-                f"{os.path.join(component_model_path, 'tokenizer_config.json')}. "
-                "Please ensure the PE component directory contains a valid "
-                "tokenizer_config.json with a 'model_max_length' field."
+                f"{os.path.join(tokenizer_path, 'tokenizer_config.json')}. "
+                "Please ensure the PE component directory (or its sibling "
+                "pe_tokenizer/ directory) contains a valid tokenizer_config.json "
+                "with a 'model_max_length' field."
             )
         logger.info(
             "PE model_max_length=%d (from tokenizer_config.json)", model_max_length
         )
 
         tokenizer = AutoTokenizer.from_pretrained(
-            component_model_path,
+            tokenizer_path,
             trust_remote_code=server_args.trust_remote_code,
         )
         # Pad token required for batched generation; use eos if unset.
