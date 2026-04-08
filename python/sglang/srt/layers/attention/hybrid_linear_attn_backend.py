@@ -1005,7 +1005,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             last_steps = accepted_steps.to(torch.int64)  # [N]
 
             move_intermediate_cache(
-                ssm_states, intermediate_state_cache, valid_state_indices, valid_state_indices, last_steps
+                ssm_states, intermediate_state_cache, valid_state_indices, last_steps
             )
 
             draft_token_num = intermediate_state_cache.shape[2]
