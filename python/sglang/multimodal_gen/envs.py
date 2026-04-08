@@ -245,6 +245,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # If set, diffusion denoising will reuse persistent per-request workspaces
+    # to avoid per-step allocations in denoising loops.
+    "SGLANG_DIFFUSION_PERSISTENT_WORKSPACE": _lazy_bool(
+        "SGLANG_DIFFUSION_PERSISTENT_WORKSPACE", "false"
+    ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "false"
     ),

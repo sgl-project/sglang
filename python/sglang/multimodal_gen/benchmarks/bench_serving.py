@@ -519,6 +519,16 @@ async def benchmark(args):
 
     setattr(args, "task_name", task_name)
 
+    if (
+        task_name in ("image-to-image", "image-to-video")
+        and args.dataset == "random"
+        and not getattr(args, "image_path", None)
+    ):
+        raise ValueError(
+            "Random dataset for image-conditional tasks requires --image-path. "
+            "Provide a local image file path to use as input_reference."
+        )
+
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
     elif args.dataset == "random":
@@ -694,6 +704,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to local dataset file (optional).",
+    )
+    parser.add_argument(
+        "--image-path",
+        type=str,
+        default=None,
+        help="Local image path for random dataset when task requires image input.",
     )
     parser.add_argument(
         "--num-prompts", type=int, default=10, help="Number of prompts to benchmark."

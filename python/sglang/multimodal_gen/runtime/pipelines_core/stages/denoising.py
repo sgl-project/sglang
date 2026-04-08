@@ -89,6 +89,31 @@ from sglang.srt.utils.common import get_compiler_backend
 logger = init_logger(__name__)
 
 
+class DiffusionWorkspace:
+    """Simple per-request buffer cache keyed by buffer name."""
+
+    def __init__(self) -> None:
+        self.buffers: dict[str, torch.Tensor] = {}
+
+    def get_buffer(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        buf = self.buffers.get(name)
+        if (
+            buf is None
+            or buf.shape != shape
+            or buf.dtype != dtype
+            or buf.device != device
+        ):
+            buf = torch.empty(shape, dtype=dtype, device=device)
+            self.buffers[name] = buf
+        return buf
+
+
 class DenoisingStage(PipelineStage):
     """
     Stage for running the denoising loop in diffusion pipelines.
@@ -133,6 +158,78 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+
+    def _workspace_enabled(self) -> bool:
+        return getattr(envs, "SGLANG_DIFFUSION_PERSISTENT_WORKSPACE", False)
+
+    def _get_workspace_pool(
+        self, batch: Req
+    ) -> dict[tuple[Any, ...], DiffusionWorkspace]:
+        pool = batch.extra.get("diffusion_workspace")
+        if pool is None:
+            pool = {}
+            batch.extra["diffusion_workspace"] = pool
+        return pool
+
+    def _build_workspace_key(
+        self,
+        batch: Req,
+        latents: torch.Tensor,
+        target_dtype: torch.dtype,
+        server_args: ServerArgs,
+    ) -> tuple[Any, ...]:
+        bucket_id = getattr(batch, "bucket_id", None)
+        raw_shape = (
+            tuple(batch.raw_latent_shape)
+            if batch.raw_latent_shape is not None
+            else None
+        )
+        exec_shape = tuple(latents.shape)
+        return (
+            latents.device,
+            target_dtype,
+            exec_shape,
+            raw_shape,
+            self.attn_backend.get_enum(),
+            batch.do_classifier_free_guidance,
+            server_args.pipeline_config.task_type,
+            bucket_id,
+        )
+
+    def _get_or_create_workspace(
+        self,
+        batch: Req,
+        latents: torch.Tensor,
+        target_dtype: torch.dtype,
+        server_args: ServerArgs,
+    ) -> DiffusionWorkspace:
+        pool = self._get_workspace_pool(batch)
+        key = self._build_workspace_key(batch, latents, target_dtype, server_args)
+        workspace = pool.get(key)
+        if workspace is None:
+            workspace = DiffusionWorkspace()
+            pool[key] = workspace
+        batch.extra["diffusion_workspace_key"] = key
+        return workspace
+
+    def _get_workspace_entry(self, batch: Req) -> DiffusionWorkspace | None:
+        pool = batch.extra.get("diffusion_workspace")
+        key = batch.extra.get("diffusion_workspace_key")
+        if pool is None or key is None:
+            return None
+        return pool.get(key)
+
+    def _get_or_create_buffer(
+        self,
+        workspace: DiffusionWorkspace | None,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if workspace is None:
+            return torch.empty(shape, dtype=dtype, device=device)
+        return workspace.get_buffer(name, shape, dtype, device)
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -532,6 +629,12 @@ class DenoisingStage(PipelineStage):
             A dictionary containing all the prepared variables for the denoising loop.
         """
         assert self.transformer is not None
+        if batch.extra.get("logged_workspace_flag") is None:
+            batch.extra["logged_workspace_flag"] = True
+            logger.info(
+                "SGLANG_DIFFUSION_PERSISTENT_WORKSPACE=%s",
+                getattr(envs, "SGLANG_DIFFUSION_PERSISTENT_WORKSPACE", False),
+            )
         pipeline = self.pipeline() if self.pipeline else None
 
         boundary_timestep = self._handle_boundary_ratio(server_args, batch)
@@ -636,6 +739,12 @@ class DenoisingStage(PipelineStage):
             latents.device,
         )
 
+        workspace = None
+        if self._workspace_enabled():
+            workspace = self._get_or_create_workspace(
+                batch, latents, target_dtype, server_args
+            )
+
         image_kwargs = self.prepare_extra_func_kwargs(
             getattr(self.transformer, "forward", self.transformer),
             {
@@ -705,6 +814,7 @@ class DenoisingStage(PipelineStage):
             "reserved_frames_mask": reserved_frames_mask_sp,  # Use SP-sharded version
             "seq_len": seq_len,
             "guidance": guidance,
+            "workspace": workspace,
         }
 
     def _post_denoising_loop(
@@ -908,6 +1018,7 @@ class DenoisingStage(PipelineStage):
         target_dtype,
         seq_len: int | None,
         reserved_frames_mask,
+        workspace: DiffusionWorkspace | None = None,
     ):
         bsz = batch.raw_latent_shape[0]
         should_preprocess_for_wan_ti2v = (
@@ -915,6 +1026,8 @@ class DenoisingStage(PipelineStage):
             and batch.condition_image is not None
             and type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
         )
+
+        use_workspace = workspace is not None
 
         # expand timestep
         if should_preprocess_for_wan_ti2v:
@@ -933,24 +1046,59 @@ class DenoisingStage(PipelineStage):
                 # Rank 0 has the first frame, create a special timestep tensor
                 # NOTE: The spatial downsampling in the next line is suspicious but kept
                 # to match original model's potential training configuration.
-                temp_ts = (
-                    reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded
-                ).flatten()
+                if use_workspace:
+                    timestep = self._get_or_create_buffer(
+                        workspace,
+                        "timestep_ti2v",
+                        (bsz, local_seq_len),
+                        target_dtype,
+                        t_device.device,
+                    )
+                    timestep.fill_(t_device_rounded)
+                    temp_ts_view = reserved_frames_mask[0][:, ::2, ::2]
+                    temp_len = temp_ts_view.numel()
+                    temp_slice = timestep[:, :temp_len]
+                    temp_slice.copy_(temp_ts_view.reshape(1, -1))
+                    temp_slice.mul_(t_device_rounded)
+                else:
+                    temp_ts = (
+                        reserved_frames_mask[0][:, ::2, ::2] * t_device_rounded
+                    ).flatten()
 
-                # Pad to full local sequence length
-                temp_ts = torch.cat(
-                    [
-                        temp_ts,
-                        temp_ts.new_ones(local_seq_len - temp_ts.size(0))
-                        * t_device_rounded,
-                    ]
-                )
-                timestep = temp_ts.unsqueeze(0).repeat(bsz, 1)
+                    # Pad to full local sequence length
+                    temp_ts = torch.cat(
+                        [
+                            temp_ts,
+                            temp_ts.new_ones(local_seq_len - temp_ts.size(0))
+                            * t_device_rounded,
+                        ]
+                    )
+                    timestep = temp_ts.unsqueeze(0).repeat(bsz, 1)
             else:
                 # Other ranks get a uniform timestep tensor of the correct shape [B, local_seq_len]
-                timestep = t_device.repeat(bsz, local_seq_len)
+                if use_workspace:
+                    timestep = self._get_or_create_buffer(
+                        workspace,
+                        "timestep_ti2v",
+                        (bsz, local_seq_len),
+                        t_device.dtype,
+                        t_device.device,
+                    )
+                    timestep.copy_(t_device.expand(bsz, local_seq_len))
+                else:
+                    timestep = t_device.repeat(bsz, local_seq_len)
         else:
-            timestep = t_device.repeat(bsz)
+            if use_workspace:
+                timestep = self._get_or_create_buffer(
+                    workspace,
+                    "timestep",
+                    (bsz,),
+                    t_device.dtype,
+                    t_device.device,
+                )
+                timestep.copy_(t_device.expand(bsz))
+            else:
+                timestep = t_device.repeat(bsz)
         return timestep
 
     def post_forward_for_ti2v_task(
@@ -1007,6 +1155,7 @@ class DenoisingStage(PipelineStage):
         reserved_frames_mask = prepared_vars["reserved_frames_mask"]
         seq_len = prepared_vars["seq_len"]
         guidance = prepared_vars["guidance"]
+        workspace = prepared_vars.get("workspace")
 
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
@@ -1046,15 +1195,44 @@ class DenoisingStage(PipelineStage):
                         )
 
                         # Expand latents for I2V
-                        latent_model_input = latents.to(target_dtype)
+                        if workspace is not None:
+                            latent_model_input = self._get_or_create_buffer(
+                                workspace,
+                                "latent_model_input",
+                                tuple(latents.shape),
+                                target_dtype,
+                                latents.device,
+                            )
+                            latent_model_input.copy_(latents)
+                        else:
+                            latent_model_input = latents.to(target_dtype)
                         if batch.image_latent is not None:
                             assert (
                                 not server_args.pipeline_config.task_type
                                 == ModelTaskType.TI2V
                             ), "image latents should not be provided for TI2V task"
-                            latent_model_input = torch.cat(
-                                [latent_model_input, batch.image_latent], dim=1
-                            ).to(target_dtype)
+                            if workspace is not None:
+                                cat_shape = (
+                                    latent_model_input.shape[0],
+                                    latent_model_input.shape[1]
+                                    + batch.image_latent.shape[1],
+                                    *latent_model_input.shape[2:],
+                                )
+                                latent_cat = self._get_or_create_buffer(
+                                    workspace,
+                                    "latent_cat",
+                                    cat_shape,
+                                    target_dtype,
+                                    latent_model_input.device,
+                                )
+                                c = latent_model_input.shape[1]
+                                latent_cat[:, :c].copy_(latent_model_input)
+                                latent_cat[:, c:].copy_(batch.image_latent)
+                                latent_model_input = latent_cat
+                            else:
+                                latent_model_input = torch.cat(
+                                    [latent_model_input, batch.image_latent], dim=1
+                                ).to(target_dtype)
 
                         timestep = self.expand_timestep_before_forward(
                             batch,
@@ -1063,6 +1241,7 @@ class DenoisingStage(PipelineStage):
                             target_dtype,
                             seq_len,
                             reserved_frames_mask,
+                            workspace,
                         )
 
                         latent_model_input = self.scheduler.scale_model_input(
@@ -1287,8 +1466,17 @@ class DenoisingStage(PipelineStage):
             assert noise_pred_cond is not None
             cond_noise = noise_pred_cond
         else:
-            # TODO: cache this?
-            cond_noise = torch.empty_like(noise_pred)
+            workspace = self._get_workspace_entry(batch)
+            if workspace is not None:
+                cond_noise = self._get_or_create_buffer(
+                    workspace,
+                    "cond_noise",
+                    tuple(noise_pred.shape),
+                    noise_pred.dtype,
+                    noise_pred.device,
+                )
+            else:
+                cond_noise = torch.empty_like(noise_pred)
         cond_noise = get_cfg_group().broadcast(cond_noise, src=0)
 
         # qwen-image uses true_cfg_scale, match the per-token norm back to the conditional branch
@@ -1382,18 +1570,20 @@ class DenoisingStage(PipelineStage):
             i: The current timestep index.
         """
         attn_metadata = None
-        self.attn_metadata_builder = None
         try:
-            self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+            attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
         except NotImplementedError:
-            self.attn_metadata_builder_cls = None
-        if self.attn_metadata_builder_cls:
-            self.attn_metadata_builder = self.attn_metadata_builder_cls()
+            attn_metadata_builder_cls = None
+        if attn_metadata_builder_cls:
+            attn_metadata_builder = batch.extra.get("attn_metadata_builder")
+            if not isinstance(attn_metadata_builder, attn_metadata_builder_cls):
+                attn_metadata_builder = attn_metadata_builder_cls()
+                batch.extra["attn_metadata_builder"] = attn_metadata_builder
         if (
             self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
             or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
         ):
-            attn_metadata = self.attn_metadata_builder.build(
+            attn_metadata = attn_metadata_builder.build(
                 current_timestep=i,
                 raw_latent_shape=batch.raw_latent_shape[2:5],
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
@@ -1469,7 +1659,7 @@ class DenoisingStage(PipelineStage):
                 if prompt_length is None:
                     prompt_length = context_length
 
-            attn_metadata = self.attn_metadata_builder.build(
+            attn_metadata = attn_metadata_builder.build(
                 current_timestep=current_timestep,
                 raw_latent_shape=batch.raw_latent_shape,
                 patch_size=patch_size,
@@ -1498,7 +1688,7 @@ class DenoisingStage(PipelineStage):
                 }
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
-            attn_metadata = self.attn_metadata_builder.build(
+            attn_metadata = attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
             )
         else:

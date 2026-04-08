@@ -69,13 +69,29 @@ class DmdDenoisingStage(DenoisingStage):
         autocast_enabled = prepared_vars["autocast_enabled"]
         num_warmup_steps = prepared_vars["num_warmup_steps"]
         latents = prepared_vars["latents"]
+        workspace = prepared_vars.get("workspace")
         video_raw_latent_shape = latents.shape
 
-        timesteps = torch.tensor(
-            server_args.pipeline_config.dmd_denoising_steps,
-            dtype=torch.long,
-            device=get_local_torch_device(),
-        )
+        dmd_steps = server_args.pipeline_config.dmd_denoising_steps
+        if not dmd_steps:
+            if batch.timesteps is None:
+                raise ValueError(
+                    "DMD denoising steps are not set and no timesteps were prepared. "
+                    "Provide dmd_denoising_steps in the pipeline config."
+                )
+            timesteps = batch.timesteps
+            if isinstance(timesteps, torch.Tensor):
+                timesteps = timesteps.to(
+                    device=get_local_torch_device(), dtype=torch.long
+                )
+            else:
+                timesteps = torch.tensor(
+                    timesteps, dtype=torch.long, device=get_local_torch_device()
+                )
+        else:
+            timesteps = torch.tensor(
+                dmd_steps, dtype=torch.long, device=get_local_torch_device()
+            )
 
         # prepare image_kwargs
         image_embeds = batch.image_embeds
@@ -122,23 +138,68 @@ class DmdDenoisingStage(DenoisingStage):
                         current_model = self.transformer
                         self._manage_device_placement(current_model, None, server_args)
                     # Expand latents for I2V
-                    noise_latents = latents.clone()
-                    latent_model_input = latents.to(target_dtype)
+                    if workspace is not None:
+                        noise_latents = self._get_or_create_buffer(
+                            workspace,
+                            "noise_latents",
+                            tuple(latents.shape),
+                            latents.dtype,
+                            latents.device,
+                        )
+                        noise_latents.copy_(latents)
+                        latent_model_input = self._get_or_create_buffer(
+                            workspace,
+                            "latent_model_input",
+                            tuple(latents.shape),
+                            target_dtype,
+                            latents.device,
+                        )
+                        latent_model_input.copy_(latents)
+                    else:
+                        noise_latents = latents.clone()
+                        latent_model_input = latents.to(target_dtype)
 
                     if batch.image_latent is not None:
-                        latent_model_input = torch.cat(
-                            [
-                                latent_model_input,
-                                batch.image_latent.permute(0, 2, 1, 3, 4),
-                            ],
-                            dim=2,
-                        ).to(target_dtype)
+                        image_latent = batch.image_latent.permute(0, 2, 1, 3, 4)
+                        if workspace is not None:
+                            cat_shape = (
+                                latent_model_input.shape[0],
+                                latent_model_input.shape[1],
+                                latent_model_input.shape[2] + image_latent.shape[2],
+                                *latent_model_input.shape[3:],
+                            )
+                            latent_cat = self._get_or_create_buffer(
+                                workspace,
+                                "latent_cat",
+                                cat_shape,
+                                target_dtype,
+                                latent_model_input.device,
+                            )
+                            c = latent_model_input.shape[2]
+                            latent_cat[:, :, :c].copy_(latent_model_input)
+                            latent_cat[:, :, c:].copy_(image_latent)
+                            latent_model_input = latent_cat
+                        else:
+                            latent_model_input = torch.cat(
+                                [latent_model_input, image_latent],
+                                dim=2,
+                            ).to(target_dtype)
                     assert not torch.isnan(
                         latent_model_input
                     ).any(), "latent_model_input contains nan"
 
                     # Prepare inputs for transformer
-                    t_expand = t.repeat(latent_model_input.shape[0])
+                    if workspace is not None:
+                        t_expand = self._get_or_create_buffer(
+                            workspace,
+                            "t_expand",
+                            (latent_model_input.shape[0],),
+                            t.dtype,
+                            t.device,
+                        )
+                        t_expand.copy_(t.expand_as(t_expand))
+                    else:
+                        t_expand = t.repeat(latent_model_input.shape[0])
 
                     guidance_expand = self.get_or_build_guidance(
                         latent_model_input.shape[0],
@@ -177,15 +238,33 @@ class DmdDenoisingStage(DenoisingStage):
                         ).unflatten(0, pred_noise.shape[:2])
 
                         if i < len(timesteps) - 1:
-                            next_timestep = timesteps[i + 1] * torch.ones(
-                                [1], dtype=torch.long, device=pred_video.device
-                            )
-                            noise = torch.randn(
-                                video_raw_latent_shape,
-                                dtype=pred_video.dtype,
-                                generator=batch.generator[0],
-                                device=self.device,
-                            )
+                            if workspace is not None:
+                                next_timestep = self._get_or_create_buffer(
+                                    workspace,
+                                    "next_timestep",
+                                    (1,),
+                                    timesteps.dtype,
+                                    pred_video.device,
+                                )
+                                next_timestep.fill_(timesteps[i + 1])
+                                noise = self._get_or_create_buffer(
+                                    workspace,
+                                    "noise",
+                                    tuple(video_raw_latent_shape),
+                                    pred_video.dtype,
+                                    self.device,
+                                )
+                                noise.normal_(generator=batch.generator[0])
+                            else:
+                                next_timestep = timesteps[i + 1] * torch.ones(
+                                    [1], dtype=torch.long, device=pred_video.device
+                                )
+                                noise = torch.randn(
+                                    video_raw_latent_shape,
+                                    dtype=pred_video.dtype,
+                                    generator=batch.generator[0],
+                                    device=self.device,
+                                )
                             latents = self.scheduler.add_noise(
                                 pred_video.flatten(0, 1),
                                 noise.flatten(0, 1),

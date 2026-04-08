@@ -13,12 +13,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DiffusionWorkspace,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -86,6 +90,19 @@ def sample_block_noise(
     return noise
 
 
+def get_request_workspace(batch: Req, key: tuple) -> DiffusionWorkspace:
+    pool = batch.extra.get("diffusion_workspace")
+    if pool is None:
+        pool = {}
+        batch.extra["diffusion_workspace"] = pool
+    workspace = pool.get(key)
+    if workspace is None:
+        workspace = DiffusionWorkspace()
+        pool[key] = workspace
+    batch.extra["diffusion_workspace_key"] = key
+    return workspace
+
+
 class HeliosChunkedDenoisingStage(PipelineStage):
     """
     Helios chunked denoising stage implementing Stage 1 loop.
@@ -131,6 +148,34 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         batch_size = latents.shape[0]
         do_cfg = guidance_scale > 1.0
 
+        workspace = None
+        if batch is not None and envs.SGLANG_DIFFUSION_PERSISTENT_WORKSPACE:
+            bucket_id = getattr(batch, "bucket_id", None)
+            key = (
+                device,
+                target_dtype,
+                tuple(latents.shape),
+                "helios_stage1",
+                bucket_id,
+            )
+            workspace = get_request_workspace(batch, key)
+
+        latents_history_short_cast = (
+            latents_history_short.to(target_dtype)
+            if latents_history_short is not None
+            else None
+        )
+        latents_history_mid_cast = (
+            latents_history_mid.to(target_dtype)
+            if latents_history_mid is not None
+            else None
+        )
+        latents_history_long_cast = (
+            latents_history_long.to(target_dtype)
+            if latents_history_long is not None
+            else None
+        )
+
         for i, t in enumerate(timesteps):
             with StageProfiler(
                 f"denoising_step_{global_step_offset + i}",
@@ -140,8 +185,21 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     batch.perf_dump_path is not None if batch is not None else False
                 ),
             ):
-                timestep = t.expand(batch_size)
-                latent_model_input = latents.to(target_dtype)
+                if workspace is not None:
+                    timestep = workspace.get_buffer(
+                        "timestep", (batch_size,), t.dtype, t.device
+                    )
+                    timestep.copy_(t.expand_as(timestep))
+                    latent_model_input = workspace.get_buffer(
+                        "latent_model_input",
+                        tuple(latents.shape),
+                        target_dtype,
+                        latents.device,
+                    )
+                    latent_model_input.copy_(latents)
+                else:
+                    timestep = t.expand(batch_size)
+                    latent_model_input = latents.to(target_dtype)
 
                 with set_forward_context(
                     current_timestep=t,
@@ -156,21 +214,9 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         indices_latents_history_short=indices_latents_history_short,
                         indices_latents_history_mid=indices_latents_history_mid,
                         indices_latents_history_long=indices_latents_history_long,
-                        latents_history_short=(
-                            latents_history_short.to(target_dtype)
-                            if latents_history_short is not None
-                            else None
-                        ),
-                        latents_history_mid=(
-                            latents_history_mid.to(target_dtype)
-                            if latents_history_mid is not None
-                            else None
-                        ),
-                        latents_history_long=(
-                            latents_history_long.to(target_dtype)
-                            if latents_history_long is not None
-                            else None
-                        ),
+                        latents_history_short=latents_history_short_cast,
+                        latents_history_mid=latents_history_mid_cast,
+                        latents_history_long=latents_history_long_cast,
                     )
 
                 if do_cfg:
@@ -187,21 +233,9 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                             indices_latents_history_short=indices_latents_history_short,
                             indices_latents_history_mid=indices_latents_history_mid,
                             indices_latents_history_long=indices_latents_history_long,
-                            latents_history_short=(
-                                latents_history_short.to(target_dtype)
-                                if latents_history_short is not None
-                                else None
-                            ),
-                            latents_history_mid=(
-                                latents_history_mid.to(target_dtype)
-                                if latents_history_mid is not None
-                                else None
-                            ),
-                            latents_history_long=(
-                                latents_history_long.to(target_dtype)
-                                if latents_history_long is not None
-                                else None
-                            ),
+                            latents_history_short=latents_history_short_cast,
+                            latents_history_mid=latents_history_mid_cast,
+                            latents_history_long=latents_history_long_cast,
                         )
 
                     if is_cfg_zero_star:
@@ -282,6 +316,26 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         do_cfg = guidance_scale > 1.0
         step_counter = global_step_offset
 
+        workspace_enabled = (
+            batch is not None and envs.SGLANG_DIFFUSION_PERSISTENT_WORKSPACE
+        )
+        bucket_id = getattr(batch, "bucket_id", None) if batch is not None else None
+        latents_history_short_cast = (
+            latents_history_short.to(target_dtype)
+            if latents_history_short is not None
+            else None
+        )
+        latents_history_mid_cast = (
+            latents_history_mid.to(target_dtype)
+            if latents_history_mid is not None
+            else None
+        )
+        latents_history_long_cast = (
+            latents_history_long.to(target_dtype)
+            if latents_history_long is not None
+            else None
+        )
+
         for i_s in range(pyramid_num_stages):
             # Compute mu for current resolution
             image_seq_len = (
@@ -300,6 +354,18 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                 is_amplify_first_chunk=is_amplify_first_chunk,
             )
             timesteps = self.scheduler.timesteps
+
+            workspace = None
+            if workspace_enabled:
+                key = (
+                    device,
+                    target_dtype,
+                    tuple(latents.shape),
+                    "helios_stage2",
+                    i_s,
+                    bucket_id,
+                )
+                workspace = get_request_workspace(batch, key)
 
             if i_s > 0:
                 # Upsample 2x nearest-neighbor
@@ -339,8 +405,21 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                         batch.perf_dump_path is not None if batch is not None else False
                     ),
                 ):
-                    timestep = t.expand(batch_size)
-                    latent_model_input = latents.to(target_dtype)
+                    if workspace is not None:
+                        timestep = workspace.get_buffer(
+                            "timestep", (batch_size,), t.dtype, t.device
+                        )
+                        timestep.copy_(t.expand_as(timestep))
+                        latent_model_input = workspace.get_buffer(
+                            "latent_model_input",
+                            tuple(latents.shape),
+                            target_dtype,
+                            latents.device,
+                        )
+                        latent_model_input.copy_(latents)
+                    else:
+                        timestep = t.expand(batch_size)
+                        latent_model_input = latents.to(target_dtype)
 
                     with set_forward_context(
                         current_timestep=t,
@@ -355,21 +434,9 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                             indices_latents_history_short=indices_latents_history_short,
                             indices_latents_history_mid=indices_latents_history_mid,
                             indices_latents_history_long=indices_latents_history_long,
-                            latents_history_short=(
-                                latents_history_short.to(target_dtype)
-                                if latents_history_short is not None
-                                else None
-                            ),
-                            latents_history_mid=(
-                                latents_history_mid.to(target_dtype)
-                                if latents_history_mid is not None
-                                else None
-                            ),
-                            latents_history_long=(
-                                latents_history_long.to(target_dtype)
-                                if latents_history_long is not None
-                                else None
-                            ),
+                            latents_history_short=latents_history_short_cast,
+                            latents_history_mid=latents_history_mid_cast,
+                            latents_history_long=latents_history_long_cast,
                         )
 
                     if do_cfg:
@@ -386,21 +453,9 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                                 indices_latents_history_short=indices_latents_history_short,
                                 indices_latents_history_mid=indices_latents_history_mid,
                                 indices_latents_history_long=indices_latents_history_long,
-                                latents_history_short=(
-                                    latents_history_short.to(target_dtype)
-                                    if latents_history_short is not None
-                                    else None
-                                ),
-                                latents_history_mid=(
-                                    latents_history_mid.to(target_dtype)
-                                    if latents_history_mid is not None
-                                    else None
-                                ),
-                                latents_history_long=(
-                                    latents_history_long.to(target_dtype)
-                                    if latents_history_long is not None
-                                    else None
-                                ),
+                                latents_history_short=latents_history_short_cast,
+                                latents_history_mid=latents_history_mid_cast,
+                                latents_history_long=latents_history_long_cast,
                             )
 
                         if is_cfg_zero_star:

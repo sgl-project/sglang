@@ -30,6 +30,12 @@ See [cache-dit documentation](performance/cache/cache_dit.md) for detailed confi
 | `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | not set | Custom SCM compute bins                  |
 | `SGLANG_CACHE_DIT_SCM_CACHE_BINS`   | not set | Custom SCM cache bins                    |
 
+### Workspace Reuse
+
+| Environment Variable | Default | Description |
+|----------------------|---------|-------------|
+| `SGLANG_DIFFUSION_PERSISTENT_WORKSPACE` | false | Reuse diffusion workspace buffers between requests to reduce allocation overhead. |
+
 ## Cloud Storage
 
 These variables configure S3-compatible cloud storage for automatically uploading generated images and videos.

@@ -298,4 +298,9 @@ class RandomDataset(BaseDataset):
             height=self.args.height,
             num_frames=self.args.num_frames,
             fps=self.args.fps,
+            image_paths=(
+                [self.args.image_path]
+                if getattr(self.args, "image_path", None)
+                else None
+            ),
         )
