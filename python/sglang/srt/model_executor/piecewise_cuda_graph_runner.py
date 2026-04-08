@@ -58,10 +58,16 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.utils import get_available_gpu_memory, is_hip, is_npu, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    get_bool_env_var,
+    is_hip,
+    is_npu,
+    log_info_on_rank0,
+)
 
 _is_hip = is_hip()
-
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
@@ -321,7 +327,7 @@ class PiecewiseCudaGraphRunner:
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
 
-                if _is_hip:
+                if _use_aiter:
                     self._pre_warm_aiter_chip_info()
 
                 self.device_module.synchronize()
