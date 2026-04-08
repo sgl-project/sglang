@@ -33,36 +33,28 @@ class EngineScoreMixin:
         item_first: bool = False,
     ) -> ScoreResult:
         """
-        Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
-        query = "<|user|>Is the following city the capital of France? "
-        items = ["Paris <|assistant|>", "London <|assistant|>", "Berlin <|assistant|>"]
-        label_token_ids = [2332, 1223] # Token IDs for "Yes" and "No"
-        item_first = False
+        Score items against a query using the loaded model.
 
-        This would pass the following prompts to the model:
-        "<|user|>Is the following city the capital of France? Paris <|assistant|>"
-        "<|user|>Is the following city the capital of France? London <|assistant|>"
-        "<|user|>Is the following city the capital of France? Berlin <|assistant|>"
-        The api would then return the probabilities of the model producing "Yes" and "No" as the next token.
-        The output would look like:
-        [[0.9, 0.1], [0.2, 0.8], [0.1, 0.9]]
+        For generation (CausalLM) models, returns the probability of each label_token_id
+        being generated after the query+item prompt. Example:
+            query = "<|user|>Is the following city the capital of France? "
+            items = ["Paris <|assistant|>", "London <|assistant|>"]
+            label_token_ids = [2332, 1223]  # "Yes" / "No"
+            # -> [[0.9, 0.1], [0.2, 0.8]]
 
+        For SequenceClassification models, returns the pooled class logits directly from
+        the classification head. label_token_ids is optional and ignored.
 
         Args:
-            query: The query text or pre-tokenized query token IDs. Must be provided.
-            items: The item text(s) or pre-tokenized item token IDs. Must be provided.
-            label_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
-            apply_softmax: Whether to normalize probabilities using softmax.
-            item_first: If True, prepend items to query. Otherwise append items to query.
+            query: The query text or pre-tokenized token IDs.
+            items: The item text(s) or pre-tokenized token IDs.
+            label_token_ids: Token IDs to score (required for CausalLM; ignored for
+                SequenceClassification).
+            apply_softmax: Whether to normalize scores using softmax.
+            item_first: If True, prepend items before query (single-item mode only).
 
         Returns:
-            ScoreResult with:
-                scores: List of lists containing probabilities for each item and each label token
-                prompt_tokens: The number of prompt tokens processed.
-
-        Raises:
-            ValueError: If query is not provided, or if items is not provided,
-                      or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
+            ScoreResult with scores (one list per item) and prompt token count.
         """
         return self.loop.run_until_complete(
             self.tokenizer_manager.score_request(
@@ -83,11 +75,7 @@ class EngineScoreMixin:
         apply_softmax: bool = False,
         item_first: bool = False,
     ) -> ScoreResult:
-        """
-        Asynchronous version of score method.
-
-        See score() for detailed documentation.
-        """
+        """Asynchronous version of score(). See score() for full documentation."""
         return await self.tokenizer_manager.score_request(
             query=query,
             items=items,
