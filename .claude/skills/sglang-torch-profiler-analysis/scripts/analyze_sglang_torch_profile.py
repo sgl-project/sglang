@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Unified entrypoint for SGLang torch-profiler analysis workflows."""
 
 from __future__ import annotations

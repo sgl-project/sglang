@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Shared helpers for SGLang torch-profiler skill scripts."""
 
 from __future__ import annotations

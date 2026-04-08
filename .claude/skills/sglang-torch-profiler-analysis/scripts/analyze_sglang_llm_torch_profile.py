@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Analyze SGLang LLM torch profiler traces into kernel/category shares."""
 
 from __future__ import annotations

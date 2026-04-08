@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Analyze SGLang PyTorch profiler traces with a two-stage workflow.
 
 This script correlates two traces:
