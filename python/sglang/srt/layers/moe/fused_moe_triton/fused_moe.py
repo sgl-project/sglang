@@ -437,6 +437,8 @@ def fused_experts_impl(
         if tokens_in_chunk == 0:
             break
 
+        cache.zero_()
+
         if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
             # Adjust the intermediate cache size and config for the last
             # chunk. Note that in most cases we only have one chunk

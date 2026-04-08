@@ -100,6 +100,7 @@ def fused_moe_kernel_gptq_awq(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    pid_map_ptr,
     # Matrix dimensions
     N: tl.constexpr,
     K: tl.constexpr,
@@ -136,6 +137,7 @@ def fused_moe_kernel_gptq_awq(
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
+    use_pid_map: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -174,6 +176,9 @@ def fused_moe_kernel_gptq_awq(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+
+    if use_pid_map:
+        pid_m = tl.load(pid_map_ptr + pid_m)
 
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
@@ -335,6 +340,7 @@ def fused_moe_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    pid_map_ptr,
     # Matrix dimensions
     N,
     K,
@@ -379,6 +385,7 @@ def fused_moe_kernel(
     swap_ab: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
+    use_pid_map: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -419,6 +426,9 @@ def fused_moe_kernel(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+
+    if use_pid_map:
+        pid_m = tl.load(pid_map_ptr + pid_m)
 
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
@@ -773,8 +783,18 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
+    use_pid_map = False
+    pid_map = None
+    if filter_expert:
+        valid_mask = expert_ids != -1
+        if not valid_mask.all():
+            pid_map = torch.nonzero(valid_mask, as_tuple=True)[0].to(torch.int32)
+            use_pid_map = True
+
+    EM = pid_map.numel() * config["BLOCK_SIZE_M"] if use_pid_map else sorted_token_ids.shape[0]
+
     grid = lambda META: (
-        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
 
@@ -808,9 +828,10 @@ def invoke_fused_moe_kernel(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
+            pid_map,
             B.shape[1],
             A.shape[1],
-            sorted_token_ids.shape[0],
+            EM,
             topk_ids.numel(),
             A.stride(0),
             A.stride(1),
@@ -834,6 +855,7 @@ def invoke_fused_moe_kernel(
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
             filter_expert=filter_expert,
+            use_pid_map=use_pid_map,
             **config,
         )
 
@@ -870,9 +892,10 @@ def invoke_fused_moe_kernel(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
+            pid_map,
             B.shape[1],
             B.shape[2] - padded_size,
-            sorted_token_ids.shape[0],
+            EM,
             topk_ids.numel(),
             A.stride(0),
             A.stride(1),
@@ -903,6 +926,7 @@ def invoke_fused_moe_kernel(
             swap_ab=swap_ab,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
+            use_pid_map=use_pid_map,
             **config,
         )
 
