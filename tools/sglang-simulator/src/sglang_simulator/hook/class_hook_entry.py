@@ -17,7 +17,9 @@ _builtins_build_class_ = builtins.__build_class__
 def _custom_build_class_(func, name: str, *bases, **kwargs):
     for hook in CLASS_HOOKS:
         if (
-            hook.REGEX and re.search(hook.HOOK_CLASS_NAME, name)
+            hook.REGEX
+            and hook.HOOK_CLASS_NAME
+            and re.search(hook.HOOK_CLASS_NAME, name)
         ) or name == hook.HOOK_CLASS_NAME:
             module_name = None
             if isinstance(func, FunctionType):

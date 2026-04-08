@@ -1,4 +1,5 @@
 import json
+from typing import Optional
 
 from sglang_simulator.simulation.manager.env import Envs
 from sglang_simulator.simulation.types import PlatformConfig, SchedulerConfig
@@ -19,10 +20,10 @@ logger = get_logger()
 class ConfigManager:
     """Centralized configuration manager with caching."""
 
-    _model_info: ModelInfo = None
-    _platform_config: PlatformConfig = None
-    _scheduler_config: SchedulerConfig = None
-    _raw_config: dict = None
+    _model_info: Optional[ModelInfo] = None
+    _platform_config: Optional[PlatformConfig] = None
+    _scheduler_config: Optional[SchedulerConfig] = None
+    _raw_config: Optional[dict] = None
 
     @classmethod
     def _get_raw_config(cls) -> dict:
@@ -102,7 +103,6 @@ class ConfigManager:
             "tp_size",
             "dp_size",
             "ep_size",
-            "dp_size",
             "backend_name",
             "backend_version",
         ]:

@@ -1,17 +1,22 @@
+from typing import Optional
+
 import numpy as np
 import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
+from sglang_simulator.utils import get_logger
+
+logger = get_logger()
 
 
 class C_MHATokenToKVPoolHostHook(BaseHook):
     HOOK_CLASS_NAME = "MHATokenToKVPoolHost"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool_host"
 
-    KV_CACHE_BYTES: int = None
-    KV_CACHE_BYTES_PER_LAYER: int = None
-    MEMORY_READ_BANDWIDTH_BYTES: float = None
-    MEMORY_WRITE_BANDWIDTH_BYTES: float = None
+    KV_CACHE_BYTES: Optional[int] = None
+    KV_CACHE_BYTES_PER_LAYER: Optional[int] = None
+    MEMORY_READ_BANDWIDTH_BYTES: Optional[float] = None
+    MEMORY_WRITE_BANDWIDTH_BYTES: Optional[float] = None
 
     @classmethod
     def hook(cls, target):
@@ -121,9 +126,13 @@ class C_HostKVCacheHook(BaseHook):
             # Disable pip memory, which might fail on CPU platforms.
             if "pin_memory" in kwargs:
                 kwargs["pin_memory"] = False
-            else:
+            elif len(args) > 5:
                 args = list(args)
                 args[5] = False
+            else:
+                logger.warning(
+                    "Failed to disable pip memory while initializing the hoot memory pool."
+                )
             return original_init(self, *args, **kwargs)
 
         target.__init__ = wrapped_init

@@ -13,6 +13,10 @@ class IndexableWrapper:
         return self._fn(*args, **kwargs)
 
 
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
 def alloc_extend_cpu(
     pre_lens_ptr: torch.Tensor,
     seq_lens_ptr: torch.Tensor,
@@ -29,9 +33,6 @@ def alloc_extend_cpu(
     free_pages = free_page_ptr.cpu().tolist()
 
     batch_size = len(pre_lens)
-
-    def ceil_div(a, b):
-        return (a + b - 1) // b
 
     extend_lens = [seq_lens[i] - pre_lens[i] for i in range(batch_size)]
     num_new_pages_per_seq = []
@@ -114,9 +115,6 @@ def alloc_decode_cpu(
     free_pages = free_page_ptr.cpu().tolist()
 
     batch_size = len(seq_lens)
-
-    def ceil_div(a, b):
-        return (a + b - 1) // b
 
     # Calculate the number of new pages needed for each sequence (used to determine free_page offset)
     num_new_pages_per_seq = []

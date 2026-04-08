@@ -32,7 +32,7 @@ class Envs:
             raise RuntimeError(
                 f"{SGLANG_SIMULATOR_OUTPUT_DIR} exists but is not a directory."
             )
-        os.makedirs(os.path.dirname(SGLANG_SIMULATOR_OUTPUT_DIR), exist_ok=True)
+        os.makedirs(SGLANG_SIMULATOR_OUTPUT_DIR, exist_ok=True)
         return SGLANG_SIMULATOR_OUTPUT_DIR
 
     @classmethod
