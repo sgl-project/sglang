@@ -52,6 +52,7 @@ async def get_weights_checksum(request: Request):
     body = await request.json()
     req = GetWeightsChecksumReqInput(
         module_names=body.get("module_names"),
+        content_only=body.get("content_only", False),
     )
 
     try:

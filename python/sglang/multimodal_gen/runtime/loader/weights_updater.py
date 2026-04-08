@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    get_disk_to_model_weights,
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
@@ -252,7 +253,9 @@ class WeightsUpdater:
 
         for module_name, module in modules_to_update:
             try:
-                weights_iter = _get_weights_iter(weights_map[module_name])
+                raw_iter = _get_weights_iter(weights_map[module_name])
+                arch = type(module).__name__
+                weights_iter = get_disk_to_model_weights(arch, raw_iter)
                 _load_weights_into_module(module, weights_iter)
                 updated_modules.append(module_name)
             except Exception as e:
@@ -289,5 +292,7 @@ class WeightsUpdater:
             weights_dir = Path(original_path) / name
             if not weights_dir.exists():
                 continue
-            weights_iter = _get_weights_iter(str(weights_dir))
+            raw_iter = _get_weights_iter(str(weights_dir))
+            arch = type(module).__name__
+            weights_iter = get_disk_to_model_weights(arch, raw_iter)
             _load_weights_into_module(module, weights_iter)
