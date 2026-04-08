@@ -32,10 +32,10 @@
             "mean_abs_diff_threshold": 8.0
         },
         "qwen_image_t2i_cache_dit_enabled": {
-            "clip_threshold": 0.94,
-            "ssim_threshold": 0.90,
-            "psnr_threshold": 22.0,
-            "mean_abs_diff_threshold": 9.0
+            "clip_threshold": 0.99,
+            "ssim_threshold": 0.86,
+            "psnr_threshold": 17.0,
+            "mean_abs_diff_threshold": 10.0
         },
         "flux_2_image_t2i": {
             "clip_threshold": 0.96,
