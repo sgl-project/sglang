@@ -83,6 +83,9 @@ class NGRAMWorker:
     def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
         return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
 
+    def commit_corpus_load(self, corpus_id: str, loaded_token_count: int) -> None:
+        self.ngram_corpus.commit_external_corpus_load(corpus_id, loaded_token_count)
+
     def remove_external_corpus(self, corpus_id: str) -> None:
         self.ngram_corpus.remove_external_corpus(corpus_id)
 

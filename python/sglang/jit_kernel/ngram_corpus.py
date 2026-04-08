@@ -119,7 +119,7 @@ def get_ngram_corpus_cls():
             self.erase_match_state(state_ids_t)  # type: ignore
 
         def load_external_corpus_named(
-            self, corpus_id: str, chunks: Iterable[Sequence[int]]
+            self, corpus_id: str, chunks: Iterable[Sequence[int]], max_tokens: int
         ) -> Tuple[int, int]:
             self.start_external_corpus_load()  # type: ignore
             chunk_count = 0
@@ -127,6 +127,11 @@ def get_ngram_corpus_cls():
             try:
                 for chunk in chunks:
                     tokens_t = torch.tensor(list(chunk), dtype=torch.int32)
+                    if loaded_token_count + len(tokens_t) > max_tokens:
+                        raise ValueError(
+                            "External ngram corpus exceeds the remaining token budget "
+                            f"({max_tokens}) after loading {loaded_token_count} tokens."
+                        )
                     loaded_token_count += len(tokens_t)
                     self.append_external_corpus_tokens(tokens_t)  # type: ignore
                     chunk_count += 1

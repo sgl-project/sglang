@@ -991,8 +991,8 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         corpus.load_external_corpus_named("c", [[100, 200, 300]])
         self.assertEqual(sorted(corpus.list_external_corpora()), ["b", "c"])
 
-    def test_replace_corpus_respects_budget(self):
-        """Replacing an existing corpus_id should account for the old token count."""
+    def test_duplicate_corpus_id_is_rejected(self):
+        """Adding a duplicate corpus_id should fail without replacing the original corpus."""
         corpus = _make_corpus(
             "BFS",
             draft_token_num=4,
@@ -1000,10 +1000,21 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             external_corpus_max_tokens=10,
         )
         corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
-        # Replace "a" with a larger corpus that still fits.
-        corpus.load_external_corpus_named("a", [[10, 20, 30, 40, 50, 60, 70, 80]])
-        self.assertEqual(corpus.remaining_token_budget, 2)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            corpus.load_external_corpus_named("a", [[10, 20, 30]])
+
+        self.assertEqual(corpus.remaining_token_budget, 5)
         self.assertEqual(corpus.list_external_corpora(), ["a"])
+
+        # The original corpus must still be usable for matching.
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(4, 4).tolist()
+        )
+        self.assertTrue(
+            any(4 in path or 5 in path for path in leaf_paths),
+            f"Expected tokens from corpus 'a' in {leaf_paths}",
+        )
 
     def test_error_on_load_preserves_existing_corpora(self):
         """A failed load must not wipe previously loaded corpora (staging-only cleanup)."""
@@ -1018,6 +1029,9 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         # Force an error by exceeding the budget.
         with self.assertRaises(ValueError):
             corpus.load_external_corpus_named("b", [[10, 20, 30, 40, 50, 60]])
+
+        self.assertEqual(corpus.list_external_corpora(), ["a"])
+        self.assertEqual(corpus.remaining_token_budget, 5)
 
         # "a" must still be usable for matching.
         ids, masks = _batch_get(corpus, [[1, 2, 3]])

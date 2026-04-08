@@ -50,6 +50,7 @@ class Ngram {
 
   void appendExternalCorpusTokens(const std::vector<int32_t>& tokens);
 
+  // Publishes the staged corpus. Duplicate corpus_id is rejected.
   void finishExternalCorpusLoad(const std::string& corpus_id);
 
   void removeExternalCorpus(const std::string& corpus_id);
