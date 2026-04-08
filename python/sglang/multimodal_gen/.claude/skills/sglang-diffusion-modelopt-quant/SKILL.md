@@ -31,7 +31,10 @@ The important implementation fact is:
 - the authoritative FP8 scales still exist in `backbone.pt` as `*.weight_quantizer._amax` and `*.input_quantizer._amax`
 
 That means:
-- NVFP4 can usually use the official diffusers export directly
+- NVFP4 can often use the official diffusers export directly, because the export
+  already contains the packed FP4 weights, the scale tensors, and enough
+  safetensors metadata for SGLang to reconstruct the quant config without an
+  extra conversion pass
 - FP8 currently needs one extra materialization step before SGLang can load it natively
 
 ## What SGLang Supports Here
@@ -64,21 +67,6 @@ Model-specific pieces:
 - external runtime dependencies outside diffusers, such as `ltx_core`
 
 Treat FLUX.2 as the validated reference example, not as the only supported shape.
-
-## PR-Ready Snapshot
-
-| Model | SGLang scope | Status | PR claim |
-| --- | --- | --- | --- |
-| FLUX.2 | single-transformer ModelOpt FP8 + NVFP4 | validated end-to-end on H100 | safe to claim |
-| WAN2.2 A14B | primary `transformer` FP8 override with exact-nightly benchmark parity, `transformer_2` kept BF16 | validated end-to-end on H100 | safe to claim as the current benchmarked recipe |
-| WAN2.2 A14B | dual-transformer FP8 via per-component overrides (`transformer` + `transformer_2`) | validated as a TP2 smoke path after local ModelOpt export on `radixark02` | mention as a smoke / recipe, not as the exact-nightly benchmark |
-| LTX-2 | base SGLang generation | validated on H100 | safe to claim separately from ModelOpt |
-| LTX-2 | ModelOpt FP8 quantize/export/load recipe | investigated, not validated | do not claim |
-
-PR wording rule:
-- claim only the scopes that were actually validated end-to-end
-- do not collapse "WAN2.2 primary-transformer FP8" into "WAN2.2 full FP8"
-- do not present LTX-2 ModelOpt FP8 as supported until the two-stage ModelOpt path is stable
 
 ## Preflight
 
