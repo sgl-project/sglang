@@ -33,6 +33,10 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.srt.compilation.piecewise_context_manager import (
+    enable_piecewise_cuda_graph,
+    set_forward_context,
+)
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -2507,6 +2511,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     attn_layer = layer.self_attn.attn_mqa
+                    if _is_hip and hasattr(layer.self_attn, "attn_mha"):
+                        attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
             # For hybrid model
             elif hasattr(layer, "attn"):
                 attn_layer = layer.attn
@@ -2671,6 +2677,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
+
+        if _is_hip and self.piecewise_cuda_graph_runner is not None:
+            # AMD/HIP: when PCG is enabled but the batch exceeds max captured
+            # size, run eagerly under enable_piecewise_cuda_graph() and
+            # set_forward_context() so that (a) Dynamo guards on
+            # _in_piecewise_cuda_graph stay consistent with the PCG-traced
+            # graph (preventing runtime recompilation) and (b) PCG-specific
+            # code paths (MoE, attention) can access their layer objects.
+            with enable_piecewise_cuda_graph(), set_forward_context(
+                forward_batch,
+                self.attention_layers,
+                getattr(self.model, "quant_config", None),
+                self.moe_layers,
+                self.moe_fusions,
+            ):
+                return (
+                    self.model.forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    ),
+                    can_run_graph,
+                )
 
         return (
             self.model.forward(

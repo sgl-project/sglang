@@ -148,6 +148,29 @@ class CUDAPiecewiseBackend:
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
+            # During normal capture (PiecewiseCudaGraphRunner.capture()),
+            # set_pcg_capture_stream() guarantees a valid stream.  However,
+            # Dynamo may silently recompile the graph during serving when it
+            # encounters a shape that exceeds the symbolic constraints
+            # inferred at compile time. This happens on MLA models (e.g.
+            # DeepSeek) where piecewise_cuda_graph_max_tokens is capped well
+            # below chunked_prefill_size - large prefill batches exceed the
+            # captured range, and when they reach the compiled graph (e.g.
+            # via the model_runner eager-fallback wrapping), Dynamo sees an
+            # unseen shape, fails its guards, and creates a brand-new
+            # CUDAPiecewiseBackend whose entries have no CUDA graph.  On
+            # non-MLA models the cap equals chunked_prefill_size so no batch
+            # ever exceeds the captured range - which is why CUDA has not
+            # hit this in practice.  Fall back to eager instead of crashing.
+            stream = get_pcg_capture_stream()
+            if stream is None:
+                logger.warning_once(
+                    "PCG capture stream is not set — likely a Dynamo runtime "
+                    "recompilation.  Falling back to eager execution for this "
+                    "subgraph."
+                )
+                return entry.runnable(*args)
+
             if self.compile_config.get_enable_debug_mode():
                 input_addresses = [
                     x.data_ptr() for x in args if isinstance(x, torch.Tensor)
@@ -166,10 +189,6 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
-                stream = get_pcg_capture_stream()
-                assert (
-                    stream is not None
-                ), "PCG capture stream is not set, please check if runtime recompilation happened"
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)

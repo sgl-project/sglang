@@ -23,7 +23,10 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -154,6 +157,13 @@ def unified_attention_with_output(
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
 
+    # DeepSeek MLA has two RadixAttention instances per layer (attn_mqa and
+    # attn_mha) that share the same layer_id. The attention_layers list only
+    # stores attn_mqa. When the MHA path is active (save_kv_cache=False), use
+    # the companion attn_mha so the backend sees correct head/dim metadata.
+    if _is_hip and not save_kv_cache and hasattr(attention_layer, "_pcg_mha_companion"):
+        attention_layer = attention_layer._pcg_mha_companion
+
     kwargs = {}
     if q_rope is not None:
         kwargs["q_rope"] = q_rope
@@ -170,4 +180,23 @@ def unified_attention_with_output(
     ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
 
     output.view(ret.shape).copy_(ret)
+
+    if _is_hip:
+        # During PCG replay on AMD, varlen attention kernels only fill positions
+        # 0..actual_tokens-1 and leave padded positions with uninitialized
+        # garbage from torch.empty.  Zero these so garbage (NaN/Inf) does not
+        # propagate through residual connections, MoE routing, and allreduce.
+        # Use context.raw_num_tokens (pre-padding count from PCG runner)
+        # instead of forward_batch.extend_num_tokens, because
+        # extend_num_tokens is None for TARGET_VERIFY (EAGLE) batches.
+        pcg_static_tokens = context.num_tokens
+        actual_tokens = context.raw_num_tokens
+        if (
+            pcg_static_tokens is not None
+            and actual_tokens is not None
+            and pcg_static_tokens > actual_tokens
+        ):
+            first_dim = ret.shape[0]
+            elems_per_token = output.numel() // first_dim
+            output.view(first_dim, elems_per_token)[actual_tokens:].zero_()
     return
