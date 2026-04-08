@@ -64,27 +64,6 @@ from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
 
-# These models consume `out_cache_loc` directly in model forward, so piecewise
-# replay must keep the captured static buffer shape instead of swapping in the
-# runtime tensor.
-_PCG_STATIC_OUT_CACHE_LOC_MODEL_TYPES = frozenset(
-    {
-        "BailingMoEForCausalLM",
-        "BailingMoeForCausalLM",
-        "BailingMoeV2ForCausalLM",
-        "DeepseekV2ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV32ForCausalLM",
-        "GptOssForCausalLM",
-        "LLaDA2MoeModelLM",
-        "Qwen3MoeForCausalLM",
-        "SarvamMLAForCausalLM",
-        "SarvamMoEForCausalLM",
-        "SDARForCausalLM",
-        "SDARMoeForCausalLM",
-    }
-)
-
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -171,22 +150,6 @@ class PiecewiseCudaGraphRunner:
             self.model_runner.server_args.enable_mamba_extra_buffer()
             and not self.model_runner.server_args.disable_radix_cache
             and self.model_runner.spec_algorithm.is_none()
-        )
-
-    def should_use_static_out_cache_loc_in_pcg(self) -> bool:
-        if self.model_runner.use_mla_backend:
-            return True
-
-        language_model = getattr(
-            self.model_runner.model, "language_model", self.model_runner.model
-        )
-        model_types = {
-            type(self.model_runner.model).__name__,
-            type(language_model).__name__,
-        }
-        return any(
-            model_type in _PCG_STATIC_OUT_CACHE_LOC_MODEL_TYPES
-            for model_type in model_types
         )
 
     def __init__(self, model_runner: ModelRunner):
@@ -643,9 +606,7 @@ class PiecewiseCudaGraphRunner:
         self.raw_num_tokens = num_tokens
         real_num_tokens = forward_batch.num_token_non_padded_cpu
         use_runtime_out_cache_loc = (
-            real_num_tokens is not None
-            and real_num_tokens < static_num_tokens
-            and not self.should_use_static_out_cache_loc_in_pcg()
+            real_num_tokens is not None and real_num_tokens < static_num_tokens
         )
         if static_num_tokens != num_tokens:
             if not use_runtime_out_cache_loc:
