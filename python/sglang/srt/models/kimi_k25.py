@@ -726,15 +726,18 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.vision_tower.dtype
+        target_device = self.vision_tower.device
+        target_dtype = self.vision_tower.dtype
+        # mm_utils can offload multimodal features back to CPU between
+        # chunked-prefill batches, so restore the concatenated feature tensor
+        # onto the vision tower device before re-embedding on cache miss.
+        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
+            device=target_device,
+            dtype=target_dtype,
         )
         grid_thws = torch.concat([item.grid_thws for item in items], dim=0).to(
-            self.vision_tower.device
+            target_device
         )
-
-        target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = pixel_values.to(target_dtype)
 
         if self.use_data_parallel:
             image_embeds = run_dp_sharded_mrope_vision_model(
