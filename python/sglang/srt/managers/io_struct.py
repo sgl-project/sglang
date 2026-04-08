@@ -607,7 +607,9 @@ class GenerateReqInput(BaseReq):
             ):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
-    def _get_positional_embed_overrides_item(self, i: int) -> Optional[PositionalEmbeds]:
+    def _get_positional_embed_overrides_item(
+        self, i: int
+    ) -> Optional[PositionalEmbeds]:
         """Extract the i-th item from positional_embed_overrides."""
         if self.positional_embed_overrides is None:
             return None
@@ -926,7 +928,9 @@ class EmbeddingReqInput(BaseReq):
             or has_valid_data(self.audio_data)
         )
 
-    def _get_positional_embed_overrides_item(self, i: int) -> Optional[PositionalEmbeds]:
+    def _get_positional_embed_overrides_item(
+        self, i: int
+    ) -> Optional[PositionalEmbeds]:
         """Extract the i-th item from positional_embed_overrides."""
         if self.positional_embed_overrides is None:
             return None

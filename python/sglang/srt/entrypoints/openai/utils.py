@@ -137,9 +137,7 @@ def process_cached_tokens_details_from_ret(
 
 
 def convert_embeds_to_tensors(
-    embeds: Optional[
-        Union[List[Optional[List[List[float]]]], List[List[float]]]
-    ],
+    embeds: Optional[Union[List[Optional[List[List[float]]]], List[List[float]]]],
 ) -> Optional[List[Optional[List[torch.Tensor]]]]:
     """Convert nested float lists from the HTTP API to lists of tensors.
 

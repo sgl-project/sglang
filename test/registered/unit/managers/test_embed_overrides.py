@@ -382,7 +382,9 @@ class TestBuildTokenIdInputs(CustomTestCase):
             item_embed_overrides=None,
         )
         # query<D>item1<D>item2<D>
-        self.assertEqual(input_ids, [[1, 2, DELIM_TOKEN, 3, 4, DELIM_TOKEN, 5, 6, DELIM_TOKEN]])
+        self.assertEqual(
+            input_ids, [[1, 2, DELIM_TOKEN, 3, 4, DELIM_TOKEN, 5, 6, DELIM_TOKEN]]
+        )
         self.assertIsNone(injection)
 
     # --- single-item mode, with embeds ---
@@ -484,7 +486,9 @@ class TestBuildTokenIdInputs(CustomTestCase):
         # query<D>item1<D>item2<D> = [50,10, 99, 20,50, 99, 30,40, 99]
         self.assertEqual(len(input_ids), 1)
         self.assertIsNotNone(injection)
-        self.assertEqual(len(injection), 1)  # single PositionalEmbeds for combined sequence
+        self.assertEqual(
+            len(injection), 1
+        )  # single PositionalEmbeds for combined sequence
         pe = injection[0]
         # query override at pos 0, item[0] override at pos 4 (query_len=2 + delim=1 + idx=1)
         self.assertIn(0, pe.positions)
