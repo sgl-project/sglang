@@ -841,6 +841,10 @@ class ModelRunnerKVCacheMixin:
                 )
             token_capacity = min(token_capacity, user_limit)
 
+        # Align to page boundary
+        page_size = self.server_args.page_size
+        token_capacity = token_capacity // page_size * page_size
+
         # Sync across PP ranks (each may have different layer counts)
         if self.pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
