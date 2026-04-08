@@ -6,13 +6,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.multimodal_gen.runtime.models.dits.qwen_image import QwenImageTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageTransformerBlock,
+)
 
 partial_json_parser = types.ModuleType("partial_json_parser")
 partial_json_parser_core = types.ModuleType("partial_json_parser.core")
-partial_json_parser_exceptions = types.ModuleType(
-    "partial_json_parser.core.exceptions"
-)
+partial_json_parser_exceptions = types.ModuleType("partial_json_parser.core.exceptions")
 partial_json_parser_options = types.ModuleType("partial_json_parser.core.options")
 
 
@@ -39,16 +39,14 @@ sys.modules.setdefault("partial_json_parser.core", partial_json_parser_core)
 sys.modules.setdefault(
     "partial_json_parser.core.exceptions", partial_json_parser_exceptions
 )
-sys.modules.setdefault(
-    "partial_json_parser.core.options", partial_json_parser_options
-)
+sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_options)
 
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
-    _Flux2Nvfp4FallbackAdapter,
     _filter_duplicate_precision_variant_safetensors,
+    _Flux2Nvfp4FallbackAdapter,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )

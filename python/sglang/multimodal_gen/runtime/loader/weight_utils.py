@@ -164,7 +164,9 @@ def _raise_if_duplicate_safetensors_keys(hf_weights_files: list[str]) -> None:
 
     examples = []
     for key in sorted(duplicate_files_by_key)[:8]:
-        files = ", ".join(sorted(os.path.basename(p) for p in duplicate_files_by_key[key]))
+        files = ", ".join(
+            sorted(os.path.basename(p) for p in duplicate_files_by_key[key])
+        )
         examples.append(f"{key} [{files}]")
 
     raise ValueError(
