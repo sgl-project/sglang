@@ -754,6 +754,7 @@ class LTX2TransformerBlock(nn.Module):
             dim_head=audio_attention_head_dim,
             norm_eps=norm_eps,
             qk_norm=qk_norm,
+            skip_sequence_parallel=True,
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_attn1",
@@ -813,6 +814,7 @@ class LTX2TransformerBlock(nn.Module):
             norm_eps=norm_eps,
             qk_norm=qk_norm,
             use_local_attention=use_local_av_cross_attention,
+            skip_sequence_parallel=not use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=(
                 {AttentionBackendEnum.TORCH_SDPA}
