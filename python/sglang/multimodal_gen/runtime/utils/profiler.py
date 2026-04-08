@@ -69,7 +69,7 @@ class SGLDiffusionProfiler:
         if current_platform.is_npu():
             activities.append(torch_npu.profiler.ProfilerActivity.NPU)
 
-        if torch.xpu.is_available():
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
             activities.append(torch.profiler.ProfilerActivity.XPU)
 
         common_torch_profiler_args = dict(

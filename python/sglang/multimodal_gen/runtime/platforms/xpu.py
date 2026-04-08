@@ -30,8 +30,9 @@ class XpuPlatform(Platform):
 
     @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        """Intel XPU doesn't have CUDA-style compute capability."""
-        return None
+        device = torch.xpu.current_device()
+        major, minor = torch.ops.sgl_kernel.query_device.default(device)
+        return DeviceCapability(major=major, minor=minor)
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
