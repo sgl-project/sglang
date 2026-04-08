@@ -168,13 +168,14 @@ def _fwd_kernel(
 
 
 def context_attention_fwd(
-    q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True
+    q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True, sm_scale=None
 ):
     """
     q, k, v: [b * s, head, head_dim]
     b_start_loc: [b]
     b_seq_len: [b]
     out: [b * s, head, head_dim]
+    sm_scale: softmax scale, defaults to 1/sqrt(head_dim)
     """
     if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
         BLOCK = 128
@@ -183,7 +184,8 @@ def context_attention_fwd(
 
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
 
-    sm_scale = 1.0 / (Lq**0.5)
+    if sm_scale is None:
+        sm_scale = 1.0 / (Lq**0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
 

@@ -106,6 +106,15 @@ class RotaryEmbedding(MultiPlatformOp):
             )
         self.position_cos, self.position_sin = None, None
 
+    def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
+        # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
+        # is expensive, so avoid calling it if possible
+        if (
+            self.cos_sin_cache.device != query.device
+            or self.cos_sin_cache.dtype != query.dtype
+        ):
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to

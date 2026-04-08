@@ -9,11 +9,11 @@ from sglang.test.test_utils import ModelLaunchSettings
 # Runs on B200 via nightly-4-gpu-b200 suite
 register_cuda_ci(est_time=2000, suite="nightly-4-gpu-b200", nightly=True)
 
-DEEPSEEK_R1_FP4_MODEL_PATH = "nvidia/DeepSeek-R1-0528-NVFP4-v2"
+FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 
 
 class TestDeepseekR1FP4Unified(unittest.TestCase):
-    """Unified test class for DeepSeek-R1-0528-NVFP4-v2 performance and accuracy.
+    """Unified test class for DeepSeek-V3-0324-FP4 performance and accuracy.
 
     Two variants:
     - basic: Standard TP=4
@@ -44,28 +44,29 @@ class TestDeepseekR1FP4Unified(unittest.TestCase):
         variants = [
             # Variant: "basic" - Standard TP=4
             ModelLaunchSettings(
-                DEEPSEEK_R1_FP4_MODEL_PATH,
+                FULL_DEEPSEEK_V3_FP4_MODEL_PATH,
                 tp_size=4,
                 extra_args=base_args,
                 variant="TP4",
             ),
             # Variant: "mtp" - TP=4 + EAGLE speculative decoding
             ModelLaunchSettings(
-                DEEPSEEK_R1_FP4_MODEL_PATH,
+                FULL_DEEPSEEK_V3_FP4_MODEL_PATH,
                 tp_size=4,
                 extra_args=base_args + mtp_args,
                 variant="TP4+MTP",
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
 
         run_combined_tests(
             models=variants,
-            test_name="DeepSeek-R1-0528-NVFP4-v2 Unified",
+            test_name="DeepSeek-V3-0324-FP4 Unified",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k", baseline_accuracy=0.935
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_deepseek_r1_fp4",
+                profile_dir="performance_profiles_deepseek_v3_fp4",
             ),
         )
 
