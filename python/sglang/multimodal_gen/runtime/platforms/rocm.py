@@ -153,13 +153,23 @@ class RocmPlatform(Platform):
                     FlashAttentionBackend,
                 )
 
-                supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
+                from sglang.jit_kernel.flash_attention_v3 import _is_fa3_supported
+
+                if not _is_fa3_supported():
                     logger.info(
-                        "Cannot use FlashAttention-2 backend for head size %d.",
-                        head_size,
+                        "FlashAttention backend now dispatches through FA3 "
+                        "(CUDA-only). Using Torch SDPA backend on ROCm."
                     )
                     target_backend = AttentionBackendEnum.TORCH_SDPA
+
+                if target_backend == AttentionBackendEnum.FA:
+                    supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
+                    if head_size not in supported_sizes:
+                        logger.info(
+                            "Cannot use FlashAttention-2 backend for head size %d.",
+                            head_size,
+                        )
+                        target_backend = AttentionBackendEnum.TORCH_SDPA
             except ImportError:
                 logger.info(
                     "Cannot use FlashAttention backend because the "
