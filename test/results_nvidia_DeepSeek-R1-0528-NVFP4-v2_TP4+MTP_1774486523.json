@@ -1,0 +1,53 @@
+[
+  {
+    "model_path": "nvidia/DeepSeek-R1-0528-NVFP4-v2",
+    "run_name": "TP4+MTP",
+    "batch_size": 1,
+    "input_len": 4096,
+    "output_len": 512,
+    "latency": 1.6770051680505276,
+    "input_throughput": 24399.993530319705,
+    "output_throughput": 339.26691035878093,
+    "overall_throughput": 2747.7553962201996,
+    "last_ttft": 0.16786889696959406,
+    "last_gen_throughput": 364.584114428417,
+    "acc_length": 3.6333333333333333,
+    "profile_link_extend": "/workspace/test/performance_profiles_deepseek_r1_fp4/nvidia_DeepSeek-R1-0528-NVFP4-v2_TP4+MTP_1774486523/1774486576.3029041/bs-1-il-4096-1774486576.3118222-TP-0-EXTEND.trace.json.gz",
+    "profile_link_decode": "/workspace/test/performance_profiles_deepseek_r1_fp4/nvidia_DeepSeek-R1-0528-NVFP4-v2_TP4+MTP_1774486523/1774486576.3029041/bs-1-il-4096-1774486576.3118222-TP-0-DECODE.trace.json.gz",
+    "server_args": []
+  },
+  {
+    "model_path": "nvidia/DeepSeek-R1-0528-NVFP4-v2",
+    "run_name": "TP4+MTP",
+    "batch_size": 8,
+    "input_len": 4096,
+    "output_len": 512,
+    "latency": 4.874693458084948,
+    "input_throughput": 43931.24699930611,
+    "output_throughput": 992.0556404667972,
+    "overall_throughput": 7562.321675603831,
+    "last_ttft": 0.7458927810657769,
+    "last_gen_throughput": 467.6325264125459,
+    "acc_length": 2.6704021094264996,
+    "profile_link_extend": "/workspace/test/performance_profiles_deepseek_r1_fp4/nvidia_DeepSeek-R1-0528-NVFP4-v2_TP4+MTP_1774486523/1774486585.202696/bs-8-il-4096-1774486585.2126265-TP-0-EXTEND.trace.json.gz",
+    "profile_link_decode": "/workspace/test/performance_profiles_deepseek_r1_fp4/nvidia_DeepSeek-R1-0528-NVFP4-v2_TP4+MTP_1774486523/1774486585.202696/bs-8-il-4096-1774486585.2126265-TP-0-DECODE.trace.json.gz",
+    "server_args": []
+  },
+  {
+    "model_path": "nvidia/DeepSeek-R1-0528-NVFP4-v2",
+    "run_name": "TP4+MTP",
+    "batch_size": 16,
+    "input_len": 4096,
+    "output_len": 512,
+    "latency": 7.442399570019916,
+    "input_throughput": 43147.852783995455,
+    "output_throughput": 1382.9593608311854,
+    "overall_throughput": 9906.482352411873,
+    "last_ttft": 1.518870483036153,
+    "last_gen_throughput": 952.62020431188,
+    "acc_length": 2.3723032069970844,
+    "profile_link_extend": "/workspace/test/performance_profiles_deepseek_r1_fp4/nvidia_DeepSeek-R1-0528-NVFP4-v2_TP4+MTP_1774486523/1774486602.666186/bs-16-il-4096-1774486602.6764817-TP-0-EXTEND.trace.json.gz",
+    "profile_link_decode": "/workspace/test/performance_profiles_deepseek_r1_fp4/nvidia_DeepSeek-R1-0528-NVFP4-v2_TP4+MTP_1774486523/1774486602.666186/bs-16-il-4096-1774486602.6764817-TP-0-DECODE.trace.json.gz",
+    "server_args": []
+  }
+]

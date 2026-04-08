@@ -618,9 +618,32 @@ jobs:
 
       - name: Run test
         timeout-minutes: 300
+        env:
+          GPU_CONFIG: "4-gpu-b200"
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error --timeout-per-file 12000
+
+      - name: Collect performance metrics
+        if: always()
+        run: |
+          python3 scripts/ci/utils/save_metrics.py \
+            --gpu-config 4-gpu-b200 \
+            --partition 0 \
+            --run-id ${{ github.run_id }} \
+            --output test/metrics-4gpu-b200-partition-0.json \
+            --search-dir test/performance_profiles_gpt_oss_4gpu \
+            --search-dir test/performance_profiles_deepseek_r1_fp4 \
+            --search-dir test
+
+      - name: Upload partition metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-4gpu-b200-partition-0
+          path: test/metrics-4gpu-b200-partition-0.json
+          retention-days: 5
+          if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -724,6 +747,7 @@ jobs:
     needs:
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-b200
+      - nightly-test-perf-4-gpu-b200
       - nightly-test-multimodal-server-1-gpu
       - nightly-test-multimodal-server-2-gpu
     runs-on: ubuntu-latest
