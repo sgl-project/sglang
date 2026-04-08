@@ -2265,7 +2265,6 @@ def _setup_and_run_http_server(
                 "propagate": False,
             }
 
-
             if server_args.enable_ssl_refresh:
                 logger.warning(
                     "--enable-ssl-refresh is not supported with multiple "
