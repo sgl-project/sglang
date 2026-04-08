@@ -354,6 +354,59 @@ class MultimodalDataItem:
 
 
 @dataclasses.dataclass
+class MultimodalProcessorOutput:
+    """Raw output from multimodal processors, before pad/hash computation.
+
+    This is the typed replacement for the dict previously returned by
+    ``BaseMultimodalProcessor.process_mm_data_async``.  Unlike
+    ``MultimodalInputs``, items here do NOT carry pad_value or hash yet.
+    """
+
+    mm_items: List[MultimodalDataItem]
+    input_ids: Optional[List[int]] = None
+
+    # image
+    im_token_id: Optional[int] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
+
+    # video
+    video_token_id: Optional[int] = None
+
+    # audio
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
+
+    # QWen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
+
+    # for transformers-compatibility
+    token_type_ids: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def from_dict(d: dict) -> "MultimodalProcessorOutput":
+        return MultimodalProcessorOutput(
+            mm_items=d["mm_items"],
+            input_ids=d.get("input_ids"),
+            im_token_id=d.get("im_token_id"),
+            im_start_id=d.get("im_start_id"),
+            im_end_id=d.get("im_end_id"),
+            slice_start_id=d.get("slice_start_id"),
+            slice_end_id=d.get("slice_end_id"),
+            video_token_id=d.get("video_token_id"),
+            audio_token_id=d.get("audio_token_id"),
+            audio_start_id=d.get("audio_start_id"),
+            audio_end_id=d.get("audio_end_id"),
+            mrope_positions=d.get("mrope_positions"),
+            mrope_position_delta=d.get("mrope_position_delta"),
+        )
+
+
+@dataclasses.dataclass
 class MultimodalInputs:
     """The multimodal data related inputs."""
 
@@ -388,8 +441,8 @@ class MultimodalInputs:
             item.feature = None
 
     @staticmethod
-    def from_dict(obj: dict):
-        mm_items = obj["mm_items"]
+    def from_processor_output(obj: "MultimodalProcessorOutput"):
+        mm_items = obj.mm_items
         for mm_item in mm_items:
             mm_item.reconstruct()
 
@@ -442,8 +495,9 @@ class MultimodalInputs:
             "audio_token_id",
         ]
         for arg in optional_args:
-            if arg in obj:
-                setattr(ret, arg, obj[arg])
+            val = getattr(obj, arg, None)
+            if val is not None:
+                setattr(ret, arg, val)
 
         return ret
 
@@ -580,8 +634,12 @@ class Req(ReqDllmMixin):
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
-        # Require reasoning for the request (hybrid reasoning model only)
+        # Require reasoning for the request
         self.require_reasoning = require_reasoning
+
+        # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
+        self._is_reasoning_over = False
+        self.reasoning_tokens = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1222,6 +1280,20 @@ class Req(ReqDllmMixin):
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
 
+    def update_reasoning_tokens(self, token_id, think_end_id):
+        if self._is_reasoning_over:
+            return
+
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        try:
+            end_pos = token_id.index(think_end_id)
+            self.reasoning_tokens += end_pos + 1
+            self._is_reasoning_over = True
+        except ValueError:
+            self.reasoning_tokens += len(token_id)
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
@@ -1676,21 +1748,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
-        for mm_input in multimodal_inputs:
-            if mm_input is None:
-                continue
-            for mm_item in mm_input.mm_items:
-                pixel_values = getattr(mm_item, "feature", None)
-                if isinstance(pixel_values, torch.Tensor):
-                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
-                if get_global_server_args().language_only:
-                    precomputed_embeddings = getattr(
-                        mm_item, "precomputed_embeddings", None
-                    )
-                    if isinstance(precomputed_embeddings, torch.Tensor):
-                        mm_item.precomputed_embeddings = precomputed_embeddings.to(
-                            self.device, non_blocking=True
-                        )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -1963,6 +2020,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.retract_req(req)
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
