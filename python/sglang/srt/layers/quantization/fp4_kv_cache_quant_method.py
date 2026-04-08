@@ -108,7 +108,7 @@ class FP4KVCacheQuantMethod(ABC):
         pass
 
 
-class NVFP4Method(FP4KVCacheQuantMethod):
+class NVFP4KVMethod(FP4KVCacheQuantMethod):
     """NVFP4 two-level scaling: global FP32 + per-block FP8 E4M3.
 
     Supported on SM100 and SM120.
@@ -300,7 +300,7 @@ class NVFP4Method(FP4KVCacheQuantMethod):
         return fp4_size + scale_size + dq_size
 
 
-class BlockFP4Method(FP4KVCacheQuantMethod):
+class BlockFP4KVMethod(FP4KVCacheQuantMethod):
     """Block-wise FP4 single-level scaling (similar to MXFP4 but block_size=16)."""
 
     name = "blockfp4"
@@ -406,8 +406,8 @@ class BlockFP4Method(FP4KVCacheQuantMethod):
 
 # Registry: name → class.  Only classes for fp4_e2m1 dtype need to be listed.
 FP4_KV_CACHE_QUANT_REGISTRY: dict[str, type[FP4KVCacheQuantMethod]] = {
-    "nvfp4": NVFP4Method,
-    "blockfp4": BlockFP4Method,
+    "nvfp4": NVFP4KVMethod,
+    "blockfp4": BlockFP4KVMethod,
 }
 
 
