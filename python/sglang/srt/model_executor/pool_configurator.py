@@ -208,24 +208,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         def align_page_size(x: int) -> int:
             return (x // page_size) * page_size
 
-        if self._full_layers_num == 0:
-            # All layers are SWA
-            swa_tokens = align_page_size(
-                total_memory // self._swa_per_token // self._swa_layers_num
-            )
-            self.max_total_num_tokens = swa_tokens
-            self.full_max_total_num_tokens = 0
-            self.swa_max_total_num_tokens = swa_tokens
-            logger.info(
-                f"Use sliding window memory pool (all SWA). "
-                f"swa_layer_tokens={swa_tokens}"
-            )
-            return
-
         # Solve:
         #   full_tokens * F * n_full + swa_tokens * S * n_swa = total_memory
         #   swa_tokens = full_tokens * r
         # => full_tokens = total_memory / (F * n_full + r * S * n_swa)
+        # When full_layers_num == 0, denominator = r * S * n_swa, formula still works.
         denominator = (
             self._full_per_token * self._full_layers_num
             + self._swa_full_tokens_ratio * self._swa_per_token * self._swa_layers_num
@@ -240,9 +227,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         full_tokens = align_page_size(int(total_memory / denominator))
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
-        self.max_total_num_tokens = full_tokens
         self.full_max_total_num_tokens = full_tokens
         self.swa_max_total_num_tokens = swa_tokens
+        self.max_total_num_tokens = (
+            full_tokens if self._full_layers_num > 0 else swa_tokens
+        )
 
         logger.info(
             f"Use sliding window memory pool. "
