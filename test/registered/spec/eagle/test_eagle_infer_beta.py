@@ -101,7 +101,7 @@ class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
         )
         metrics = run_eval(args)
         print(f"TestEagle3LargeBS -- {metrics=}")
-        self.assertGreater(metrics["score"], 0.55)
+        self.assertGreater(metrics["score"], 0.7)
         assert self.process.poll() is None
 
     def test_logprob_spec_v2_match(self):
