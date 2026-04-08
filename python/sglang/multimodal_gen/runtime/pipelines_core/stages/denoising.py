@@ -1547,9 +1547,6 @@ class DenoisingStage(PipelineStage):
                 }
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
-            if current_platform.is_xpu():
-                # On Intel XPU, FA backend does not require attention metadata
-                return None
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
             )

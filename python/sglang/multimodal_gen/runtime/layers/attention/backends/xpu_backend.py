@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionMetadataBuilder,
+)
 
 
 class XPUAttentionBackend(AttentionBackend):
@@ -44,7 +47,7 @@ class XPUAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        raise NotImplementedError
+        return FlashAttentionMetadataBuilder
 
 
 @lru_cache(maxsize=128)
