@@ -16,8 +16,8 @@ from sglang.test.test_utils import (
 )
 
 # Sliding window attention with Triton backend (Gemma-3 model)
-register_cuda_ci(est_time=100, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=200, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=100, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestSlidingWindowAttentionTriton(CustomTestCase):
@@ -43,12 +43,9 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
         cls.short_context_prompt = "The capital of France is"
 
         # Test prompt longer than window size
-        cls.long_context_prompt = (
-            """
+        cls.long_context_prompt = """
         Once upon a time, there was a mountain. In the mountain, there was a temple. In the temple, there was an old monk telling a story. The story was:
-        """
-            * 100
-        )
+        """ * 100
         cls.long_context_prompt += "\nNow, summarize the story in one sentence:"
 
     def _test_mmlu(self):

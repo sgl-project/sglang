@@ -1,128 +1,102 @@
-import hashlib
 import json
 import logging
 import os
 import subprocess
-import tempfile
 from functools import lru_cache
-from typing import Optional
 
-import filelock
-from huggingface_hub import hf_hub_download
+from huggingface_hub import HfApi
+
+from sglang.srt.environ import envs
+from sglang.utils import (
+    has_diffusion_overlay_registry_match,
+    is_known_non_diffusers_diffusion_model,
+    load_diffusion_overlay_registry_from_env,
+)
 
 logger = logging.getLogger(__name__)
 
-temp_dir = tempfile.gettempdir()
+
+@lru_cache(maxsize=1)
+def _load_overlay_registry() -> dict:
+    return load_diffusion_overlay_registry_from_env()
 
 
-def _get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
-    lock_dir = cache_dir or temp_dir
-    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
-    model_name = model_name_or_path.replace("/", "-")
-    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
-    lock_file_name = hash_name + model_name + ".lock"
-    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
-    return lock
+def _is_overlay_diffusion_model(model_path: str) -> bool:
+    return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
-# Copied and adapted from hf_diffusers_utils.py
-def _maybe_download_model(
-    model_name_or_path: str, local_dir: str | None = None, download: bool = True
-) -> str:
-    """
-    Resolve a model path. If it's a local directory, return it.
-    If it's a Hugging Face Hub ID, download only the config file
-    (`model_index.json` or `config.json`) and return its directory.
+def _is_registered_diffusion_model(model_path: str) -> bool:
+    try:
+        from sglang.multimodal_gen.registry import has_registered_diffusion_model_path
+    except ImportError:
+        # if diffusion dependencies are not installed
+        return False
 
-    Args:
-        model_name_or_path: Local path or Hugging Face Hub model ID
-        local_dir: Local directory to save the downloaded file (if any)
-        download: Whether to download from Hugging Face Hub when needed
-
-    Returns:
-        Local directory path that contains the downloaded config file, or the original local directory.
-    """
-
-    if os.path.exists(model_name_or_path):
-        logger.info("Model already exists locally")
-        return model_name_or_path
-
-    if not download:
-        return model_name_or_path
-
-    with _get_lock(model_name_or_path):
-        # Try `model_index.json` first (diffusers models)
-        try:
-            logger.info(
-                "Downloading model_index.json from HF Hub for %s...",
-                model_name_or_path,
-            )
-            file_path = hf_hub_download(
-                repo_id=model_name_or_path,
-                filename="model_index.json",
-                local_dir=local_dir,
-            )
-            logger.info("Downloaded to %s", file_path)
-            return os.path.dirname(file_path)
-        except Exception as e_index:
-            logger.debug("model_index.json not found or failed: %s", e_index)
-
-        # Fallback to `config.json`
-        try:
-            logger.info(
-                "Downloading config.json from HF Hub for %s...", model_name_or_path
-            )
-            file_path = hf_hub_download(
-                repo_id=model_name_or_path,
-                filename="config.json",
-                local_dir=local_dir,
-            )
-            logger.info("Downloaded to %s", file_path)
-            return os.path.dirname(file_path)
-        except Exception as e_config:
-            raise ValueError(
-                (
-                    "Could not find model locally at %s and failed to download "
-                    "model_index.json/config.json from HF Hub: %s"
-                )
-                % (model_name_or_path, e_config)
-            ) from e_config
+    return has_registered_diffusion_model_path(model_path)
 
 
-# Copied and adapted from hf_diffusers_utils.py
-def is_diffusers_model_path(model_path: str) -> True:
-    """
-    Verify if the model directory contains a valid diffusers configuration.
-
-    Args:
-        model_path: Path to the model directory
-
-    Returns:
-        The loaded model configuration as a dictionary if the model is a diffusers model
-        None if the model is not a diffusers model
-    """
-
-    # Prefer model_index.json which indicates a diffusers pipeline
-    config_path = os.path.join(model_path, "model_index.json")
+def _is_diffusers_model_dir(model_dir: str) -> bool:
+    """Check if a local directory contains a valid diffusers model_index.json."""
+    config_path = os.path.join(model_dir, "model_index.json")
     if not os.path.exists(config_path):
         return False
 
-    # Load the config
     with open(config_path) as f:
         config = json.load(f)
 
-    # Verify diffusers version exists
-    if "_diffusers_version" not in config:
+    return "_diffusers_version" in config
+
+
+def _is_gated_diffusion_repo(repo_id: str) -> bool:
+    """Query HF model card metadata to check if a gated repo is a diffusers model."""
+    try:
+        info = HfApi().model_info(repo_id)
+        return getattr(info, "library_name", None) == "diffusers"
+    except Exception:
         return False
-    return True
 
 
-def get_is_diffusion_model(model_path: str):
-    model_path = _maybe_download_model(model_path)
-    is_diffusion_model = is_diffusers_model_path(model_path)
-    if is_diffusion_model:
-        logger.info("Diffusion model detected")
-    return is_diffusion_model
+def get_is_diffusion_model(model_path: str) -> bool:
+    """Detect whether model_path points to a diffusion model.
+
+    For local directories, checks the filesystem directly.
+    For HF/ModelScope model IDs, attempts to fetch only model_index.json.
+    For gated repos where file download fails, falls back to HF model card
+    metadata (library_name == "diffusers").
+    Returns False on any failure (network error, 404, offline mode, etc.)
+    so that the caller falls through to the standard LLM server path.
+    """
+    if _is_overlay_diffusion_model(model_path):
+        # short-circuit, if applicable for the overlay mechanism (diffusion-only)
+        return True
+
+    if os.path.isdir(model_path):
+        if _is_diffusers_model_dir(model_path):
+            return True
+        return is_known_non_diffusers_diffusion_model(model_path)
+
+    if is_known_non_diffusers_diffusion_model(model_path):
+        return True
+
+    if _is_registered_diffusion_model(model_path):
+        return True
+
+    try:
+        if envs.SGLANG_USE_MODELSCOPE.get():
+            from modelscope import model_file_download
+
+            file_path = model_file_download(
+                model_id=model_path, file_path="model_index.json"
+            )
+        else:
+            from huggingface_hub import hf_hub_download
+
+            file_path = hf_hub_download(repo_id=model_path, filename="model_index.json")
+
+        return _is_diffusers_model_dir(os.path.dirname(file_path))
+    except Exception as e:
+        logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
+        return False
 
 
 def get_model_path(extra_argv):
@@ -143,8 +117,7 @@ def get_model_path(extra_argv):
             raise Exception(
                 "Usage: sglang serve --model-path <model-name-or-path> [additional-arguments]\n\n"
                 "This command can launch either a standard language model server or a diffusion model server.\n"
-                "The server type is determined by the model path.\n"
-                "For specific arguments, please provide a model_path."
+                "The server type is determined by the --model-path.\n"
             )
         else:
             raise Exception(

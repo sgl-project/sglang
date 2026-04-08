@@ -9,8 +9,15 @@ Most documentation files are located under the `docs/` folder.
 
 ### Install Dependency
 
+**Linux:**
 ```bash
 apt-get update && apt-get install -y pandoc parallel retry
+pip install -r requirements.txt
+```
+
+**macOS:**
+```bash
+brew install pandoc parallel retry
 pip install -r requirements.txt
 ```
 

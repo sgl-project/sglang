@@ -1,7 +1,7 @@
 import torch
 
+from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.layers.triton_ops import fuse_scale_shift_kernel
 
 
 class MulAdd(CustomOp):
@@ -23,7 +23,7 @@ class MulAdd(CustomOp):
             num_frames = b.shape[1]
             frame_seqlen = a.shape[1] // num_frames
             return c + (
-                a.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * b
+                a.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (k + b)
             ).flatten(1, 2)
         else:
             # b.shape: [batch_size, 1, inner_dim]

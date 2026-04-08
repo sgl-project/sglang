@@ -161,6 +161,7 @@ class NgramVerifyInput(SpecInput):
         accept_index_cpu = self.accepted_indices.tolist()
         predict_cpu = self.predict.tolist()
         has_finished = False
+        think_end_id = batch.model_config.think_end_id
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -170,6 +171,8 @@ class NgramVerifyInput(SpecInput):
                     break
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
+                if req.require_reasoning and think_end_id is not None:
+                    req.update_reasoning_tokens(id, think_end_id)
                 req.check_finished()
                 if req.finished():
                     has_finished = True
@@ -188,9 +191,9 @@ class NgramVerifyInput(SpecInput):
                             )
                             raise e
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += (
-                sum(1 for idx in accept_index_row if idx != -1) - 1
-            )
+            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         if has_finished:
             self.accept_length = (self.accepted_indices != -1).sum(dim=1) - 1
@@ -398,17 +401,20 @@ class NgramVerifyInput(SpecInput):
             )
 
         # Apply penalty
-        if sampling_info.penalizer_orchestrator.is_required:
+        if (
+            sampling_info.penalizer_orchestrator.is_required
+            or sampling_info.logit_bias is not None
+        ):
             # This is a relaxed version of penalties for speculative decoding.
-            linear_penalty = torch.zeros(
-                (bs, logits_output.next_token_logits.shape[1]),
-                dtype=torch.float32,
-                device=self.device,
+            sampling_info.penalizer_orchestrator.apply(
+                logits_output.next_token_logits, repeat=self.draft_token_num
             )
-            sampling_info.apply_logits_bias(linear_penalty)
-            logits_output.next_token_logits.add_(
-                torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-            )
+            if sampling_info.logit_bias is not None:
+                logits_output.next_token_logits.add_(
+                    torch.repeat_interleave(
+                        sampling_info.logit_bias, self.draft_token_num, dim=0
+                    )
+                )
 
         # Apply grammar mask
         if vocab_mask is not None:

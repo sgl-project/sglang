@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -38,14 +37,13 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     is_triton_kernels_available,
-    log_info_on_rank0,
     mxfp_supported,
     next_power_of_2,
     round_up,
@@ -54,20 +52,56 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
-_is_sm100_supported = is_cuda() and is_sm100_supported()
-_is_sm90_supported = is_cuda() and is_sm90_supported()
 has_triton_kernels = is_triton_kernels_available()
 
 
 if is_flashinfer_available():
     from flashinfer import (
         mxfp8_quantize,
-        shuffle_matrix_a,
-        shuffle_matrix_sf_a,
+        nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
+    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
 
-logger = logging.getLogger(__name__)
+_flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
+_flashinfer_mxfp4_permute_indices_device_cache: dict[
+    tuple[tuple[int, ...], int, int, str, int], torch.Tensor
+] = {}
+
+
+def _get_flashinfer_mxfp4_device_permute_indices(
+    x: torch.Tensor,
+    epilogue_tile_m: int,
+    num_elts_per_sf: Optional[int] = None,
+) -> torch.Tensor:
+    extra_args = {} if num_elts_per_sf is None else {"num_elts_per_sf": num_elts_per_sf}
+    permute_indices = get_w2_permute_indices_with_cache(
+        _flashinfer_mxfp4_permute_indices_cache,
+        x,
+        epilogue_tile_m,
+        **extra_args,
+    )
+
+    device_index = -1 if x.device.index is None else x.device.index
+    num_elts_per_sf_key = -1 if num_elts_per_sf is None else num_elts_per_sf
+    cache_key = (
+        tuple(x.shape),
+        epilogue_tile_m,
+        num_elts_per_sf_key,
+        x.device.type,
+        device_index,
+    )
+    cached_device_indices = _flashinfer_mxfp4_permute_indices_device_cache.get(
+        cache_key
+    )
+    if cached_device_indices is None:
+        cached_device_indices = permute_indices.to(x.device)
+        _flashinfer_mxfp4_permute_indices_device_cache[cache_key] = (
+            cached_device_indices
+        )
+
+    return cached_device_indices
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -104,23 +138,42 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
 
-    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-        mx_axis=1
-    )
-    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=1, num_warps=num_warps
-    )
-    if _is_sm100_supported:
+    if is_sm120_supported():
+        # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
+        # This MXFP4 path uses StridedLayout and the non-persistent kernel with
+        # block_k=128 so the selected tile stays within the per-block shared-memory budget.
+        from triton_kernels.tensor_details.layout import StridedLayout
+
+        value_layout = StridedLayout
+        value_layout_opts = {}
+        scale_layout = StridedLayout
+        scale_layout_opts = {}
         constraints = {
-            "is_persistent": True,
-            "epilogue_subtile": 1,
+            "is_persistent": False,
+            "block_k": 128,
+            "num_stages": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
-    elif _is_sm90_supported:
-        constraints = {
-            "split_k": 1,
-        }
-        opt_flags.update_opt_flags_constraints(constraints)
+    else:
+        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
+            mx_axis=1
+        )
+        scale_layout, scale_layout_opts = (
+            layout.make_default_matmul_mxfp4_w_scale_layout(
+                mx_axis=1, num_warps=num_warps
+            )
+        )
+        if is_sm100_supported():
+            constraints = {
+                "is_persistent": True,
+                "epilogue_subtile": 1,
+            }
+            opt_flags.update_opt_flags_constraints(constraints)
+        elif is_sm90_supported():
+            constraints = {
+                "split_k": 1,
+            }
+            opt_flags.update_opt_flags_constraints(constraints)
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -284,11 +337,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
+        triton_kernels_padding_alignment = 64
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        if _is_sm100_supported:
+        if is_sm100_supported():
             if self.use_flashinfer:
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, 256
@@ -296,7 +350,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size = round_up(hidden_size, 256)
             else:
                 intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size_per_partition, 64
+                    intermediate_size_per_partition, triton_kernels_padding_alignment
                 )
         elif _use_aiter:
 
@@ -311,11 +365,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 - layer.intermediate_size_per_partition
             )
         elif has_triton_kernels:
-            # TODO: this is a hack to make
-            # intermediate_size_per_partition_after_pad the same as the
-            # per_rank_intermediate_size during weight loading
             intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, mxfp4_block
+                intermediate_size_per_partition, triton_kernels_padding_alignment
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
@@ -391,10 +442,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer):
         if self.use_flashinfer:
-            log_info_on_rank0(
-                logger,
-                f"Shuffling MoE weights for FlashInfer MXFP4 moe kernel (layer: {self.prefix}), it might take a while...",
-            )
             # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
@@ -486,31 +533,69 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             gemm1_bias_shuffled = []
             gemm2_bias_shuffled = []
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
+            w13_weight_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
+                w13_weight[0].view(torch.uint8),
+                epilogue_tile_m,
+            )
+            w13_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
+                w13_weight_scale[0].view(torch.uint8),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+            )
+            w13_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
+                w13_bias[0].reshape(-1, 1),
+                epilogue_tile_m,
+            )
+
+            w2_weight_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
+                w2_weight[0].view(torch.uint8),
+                epilogue_tile_m,
+            )
+            w2_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
+                w2_weight_scale[0].view(torch.uint8),
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+            )
+            w2_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
+                w2_bias[0].reshape(-1, 1),
+                epilogue_tile_m,
+            )
+
             for i in range(self.num_experts):
                 gemm1_weights_mxfp4_shuffled.append(
-                    shuffle_matrix_a(w13_weight[i].view(torch.uint8), epilogue_tile_m)
+                    w13_weight[i]
+                    .view(torch.uint8)[w13_weight_permute_indices]
+                    .contiguous()
                 )
+
                 gemm1_scales_mxfp4_shuffled.append(
-                    shuffle_matrix_sf_a(
-                        w13_weight_scale[i].view(torch.uint8), epilogue_tile_m
-                    )
-                )
-                gemm1_bias_shuffled.append(
-                    shuffle_matrix_a(
-                        w13_bias[i].clone().reshape(-1, 1), epilogue_tile_m
+                    nvfp4_block_scale_interleave(
+                        w13_weight_scale[i]
+                        .view(torch.uint8)[w13_scale_permute_indices]
+                        .contiguous()
                     )
                 )
 
-                gemm2_weights_mxfp4_shuffled.append(
-                    shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
+                gemm1_bias_shuffled.append(
+                    w13_bias[i].reshape(-1, 1)[w13_bias_permute_indices].contiguous()
                 )
+
+                gemm2_weights_mxfp4_shuffled.append(
+                    w2_weight[i]
+                    .view(torch.uint8)[w2_weight_permute_indices]
+                    .contiguous()
+                )
+
                 gemm2_scales_mxfp4_shuffled.append(
-                    shuffle_matrix_sf_a(
-                        w2_weight_scale[i].view(torch.uint8), epilogue_tile_m
+                    nvfp4_block_scale_interleave(
+                        w2_weight_scale[i]
+                        .view(torch.uint8)[w2_scale_permute_indices]
+                        .contiguous()
                     )
                 )
+
                 gemm2_bias_shuffled.append(
-                    shuffle_matrix_a(w2_bias[i].clone().reshape(-1, 1), epilogue_tile_m)
+                    w2_bias[i].reshape(-1, 1)[w2_bias_permute_indices].contiguous()
                 )
 
             w13_weight = torch.stack(gemm1_weights_mxfp4_shuffled)
@@ -681,13 +766,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
             # which can theoretically improve performance
+            origin_hidden_states_dim = x.shape[-1]
             if self.flashinfer_mxfp4_moe_precision == "bf16":
                 assert x.dtype == torch.bfloat16
                 x_quant = x
                 x_scale = None
 
                 # May be fused later if this code branch is frequently needed
-                origin_hidden_states_dim = x_quant.shape[-1]
                 if self.hidden_size != origin_hidden_states_dim:
                     x_quant = torch.nn.functional.pad(
                         x_quant,
@@ -711,11 +796,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 num_tokens = x_quant.shape[0]
-                hidden_size = (
-                    x_quant.shape[-1] * 2
-                    if x_quant.dtype == torch.uint8
-                    else x_quant.shape[-1]
-                )
+                hidden_size = origin_hidden_states_dim
                 symm_output = torch.empty(
                     num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
                 )
@@ -743,7 +824,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.intermediate_size_per_partition,  # padded to multiple of 256
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
-                None,
+                None,  # routed_scaling_factor
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),

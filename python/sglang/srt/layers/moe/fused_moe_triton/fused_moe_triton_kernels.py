@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import os
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -376,6 +377,8 @@ def fused_moe_kernel(
     c_sorted: tl.constexpr,
     filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
+    FUSE_SUM_ALL_REDUCE: tl.constexpr,
+    ROUTER_TOPK: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -600,14 +603,88 @@ def fused_moe_kernel(
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    if c_sorted:
+
+    if FUSE_SUM_ALL_REDUCE:
+        offs_token_out = offs_token // ROUTER_TOPK
         c_ptrs = (
-            c_ptr + stride_cm * offs_token_id[:, None] + stride_cn * offs_cn[None, :]
+            c_ptr + stride_cm * offs_token_out[:, None] + stride_cn * offs_cn[None, :]
         )
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
     else:
-        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+        if c_sorted:
+            c_ptrs = (
+                c_ptr
+                + stride_cm * offs_token_id[:, None]
+                + stride_cn * offs_cn[None, :]
+            )
+        else:
+            c_ptrs = (
+                c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+            )
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+# -----------------------------------------------------------------------------
+# TMA allocator: set once per process (avoid per-call triton.set_allocator)
+# -----------------------------------------------------------------------------
+_TMA_ALLOCATOR_SET = False
+
+
+def _set_triton_tma_allocator():
+    """TMA descriptors require a global allocator; set it once to avoid per-call overhead."""
+    global _TMA_ALLOCATOR_SET
+    if _TMA_ALLOCATOR_SET:
+        return
+
+    # TMA descriptors require a global memory allocation
+    def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+        # NOTE: keep this allocation on CUDA device
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
+    _TMA_ALLOCATOR_SET = True
+
+
+# --- B TensorDescriptor cache (LRU) ---
+_B_DESC_CACHE_MAX = 64
+_B_DESC_CACHE: "OrderedDict[tuple, TensorDescriptor]" = OrderedDict()
+
+
+def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
+    """
+    Cache TensorDescriptor for constant weight B.
+    Keyed by storage ptr + shape/stride/dtype + tile shape.
+    """
+    key = (
+        int(B.data_ptr()),
+        tuple(B.shape),
+        tuple(B.stride()),
+        str(B.dtype),
+        int(block_n),
+        int(block_k),
+    )
+
+    desc = _B_DESC_CACHE.get(key, None)
+    if desc is not None:
+        _B_DESC_CACHE.move_to_end(key)
+        return desc
+
+    # Create outside lock to reduce lock hold time (ok if duplicated rarely)
+    desc = TensorDescriptor(
+        B,
+        B.shape,
+        B.stride(),
+        [1, block_n, block_k],
+    )
+
+    _B_DESC_CACHE[key] = desc
+    _B_DESC_CACHE.move_to_end(key)
+    if len(_B_DESC_CACHE) > _B_DESC_CACHE_MAX:
+        _B_DESC_CACHE.popitem(last=False)
+
+    return desc
 
 
 def invoke_fused_moe_kernel(
@@ -638,6 +715,8 @@ def invoke_fused_moe_kernel(
     b_use_tma: bool = False,
     c_sorted: bool = False,
     filter_expert: bool = True,
+    fuse_sum_all_reduce: bool = False,
+    router_topk: int = 1,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -705,11 +784,17 @@ def invoke_fused_moe_kernel(
     else:
         even_Ks = False
 
+    if fuse_sum_all_reduce:
+        assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
+
     if (
         (use_int8_w8a16 or use_int4_w4a16)
         and block_shape is not None
         and block_shape[1] > 0
     ):
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
@@ -754,11 +839,8 @@ def invoke_fused_moe_kernel(
 
     else:
         if a_use_tma or b_use_tma:
-            # TMA descriptors require a global memory allocation
-            def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-                return torch.empty(size, device="cuda", dtype=torch.int8)
+            _set_triton_tma_allocator()
 
-            triton.set_allocator(alloc_fn)
         if a_use_tma:
             a_desc = TensorDescriptor(
                 A, A.shape, A.stride(), [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
@@ -766,11 +848,11 @@ def invoke_fused_moe_kernel(
         else:
             a_desc = None
         if b_use_tma:
-            b_desc = TensorDescriptor(
+            # B is constant weights -> cache descriptor
+            b_desc = _get_b_tma_desc_cached(
                 B,
-                B.shape,
-                B.stride(),
-                [1, config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"]],
+                config["BLOCK_SIZE_N"],
+                config["BLOCK_SIZE_K"],
             )
         else:
             b_desc = None
@@ -819,6 +901,8 @@ def invoke_fused_moe_kernel(
             c_sorted=c_sorted,
             filter_expert=filter_expert,
             swap_ab=swap_ab,
+            FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
+            ROUTER_TOPK=router_topk,
             **config,
         )
 

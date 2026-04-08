@@ -4,7 +4,7 @@ A ComfyUI plugin for integrating with SGLang Diffusion server, supporting image 
 
 ## Installation
 
-1. **Install SGLang**: Follow the [Installation Guide](../../docs/install.md) to install `sglang[diffusion]`.
+1. **Install SGLang**: Follow the [Installation Guide](../../../../../docs/diffusion/installation.md) to install `sglang[diffusion]`.
 2. **Install Plugin**: Copy this entire directory (`ComfyUI_SGLDiffusion`) to your ComfyUI `custom_nodes/` folder.
 3. **Restart ComfyUI**: Restart ComfyUI to load the plugin.
 
@@ -52,7 +52,6 @@ To use these workflows:
 2. Load the workflow JSON file from the `workflows/` directory.
 3. Adjust the parameters and model paths as needed.
 4. Run the workflow.
-
 
 ## Current Implementation
 

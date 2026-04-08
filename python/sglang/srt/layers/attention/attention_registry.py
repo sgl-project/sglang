@@ -1,6 +1,11 @@
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.configs.linear_attn_model_registry import (
+    get_linear_attn_config,
+    import_backend_class,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -189,20 +194,29 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     if cfg := runner.mambaish_config:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-            GDNAttnBackend,
             HybridLinearAttnBackend,
-            KimiLinearAttnBackend,
             Mamba2AttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.layers.attention.linear.lightning_backend import (
+            LightningAttentionBackend,
+        )
+        from sglang.srt.layers.attention.linear.utils import (
+            initialize_linear_attn_config,
         )
         from sglang.srt.utils import is_blackwell, is_npu
 
         check_environments()
+        initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
                     runner.server_args.attention_backend == "triton"
                     or runner.server_args.attention_backend == "trtllm_mha"
-                ), "triton or trtllm_mha backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
+                    or runner.server_args.attention_backend == "fa4"
+                    or runner.server_args.attention_backend == "flashinfer"
+                ), "triton, trtllm_mha, fa4, or flashinfer backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend to specify the backend."
             if is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
@@ -212,11 +226,21 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
-            linear_attn_backend = KimiLinearAttnBackend(runner)
+            linear_attn_backend = KDAAttnBackend(runner)
+        elif runner.hybrid_lightning_config is not None:
+            linear_attn_backend = LightningAttentionBackend(runner)
         else:
-            raise ValueError(
-                "Expected hybrid GDN or NemotronH models, but got unknown model."
-            )
+            spec_result = get_linear_attn_config(runner.model_config.hf_config)
+            if spec_result is not None:
+                spec, _ = spec_result
+                BackendClass = import_backend_class(spec.backend_class_name)
+                linear_attn_backend = BackendClass(runner)
+            else:
+                raise ValueError(
+                    "Expected hybrid GDN or NemotronH models, but got unknown model. "
+                    "If this is a custom hybrid model, use register_linear_attn_model() "
+                    "from sglang.srt.configs.linear_attn_model_registry."
+                )
         full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(
             full_attn_backend, linear_attn_backend, full_attn_layers

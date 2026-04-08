@@ -88,7 +88,10 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
-        worker = self.draft_worker or self.tp_worker
+        if recv_req.disable_draft_model:
+            worker = self.tp_worker
+        else:
+            worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
@@ -122,8 +125,8 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
         assert (
-            self._is_no_request()
-        ), "release_memory_occupation should be called only when no ongoing request."
+            self.is_fully_idle()
+        ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
 

@@ -40,8 +40,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
         cls.start_decode()
 
         # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -51,6 +51,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -73,6 +75,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--base-gpu-id",
@@ -129,8 +133,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
         cls.start_decode()
 
         # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -140,6 +144,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -163,6 +169,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--base-gpu-id",
@@ -219,8 +227,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
         cls.start_decode()
 
         # Block until both
-        cls.wait_server_ready(cls.prefill_url + "/health")
-        cls.wait_server_ready(cls.decode_url + "/health")
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
 
         cls.launch_lb()
 
@@ -230,6 +238,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -252,6 +262,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",

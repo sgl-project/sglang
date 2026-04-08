@@ -5,6 +5,7 @@ Usage:
 python3 -m sglang.test.send_one
 python3 -m sglang.test.send_one --profile --profile-steps 5
 python3 -m sglang.test.send_one --profile --profile-by-stage
+python3 -m sglang.test.send_one --stop "<|separator|>" "<|eos|>" --max-new-tokens 2048
 """
 
 import argparse
@@ -24,6 +25,7 @@ class BenchArgs:
     port: int = 30000
     batch_size: int = 1
     different_prompts: bool = False
+    seed: Optional[int] = None
     temperature: float = 0.0
     max_new_tokens: int = 512
     frequency_penalty: float = 0.0
@@ -35,9 +37,10 @@ class BenchArgs:
     )
     image: bool = False
     many_images: bool = False
+    stop: Optional[list] = None
     stream: bool = False
     profile: bool = False
-    profile_steps: int = 3
+    profile_steps: int = 5
     profile_by_stage: bool = False
     profile_prefix: Optional[str] = None
 
@@ -51,6 +54,7 @@ class BenchArgs:
             action="store_true",
             default=BenchArgs.different_prompts,
         )
+        parser.add_argument("--seed", type=int, default=BenchArgs.seed)
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
         parser.add_argument(
             "--max-new-tokens", type=int, default=BenchArgs.max_new_tokens
@@ -64,6 +68,7 @@ class BenchArgs:
         parser.add_argument("--json", action="store_true")
         parser.add_argument("--return-logprob", action="store_true")
         parser.add_argument("--prompt", type=str, default=BenchArgs.prompt)
+        parser.add_argument("--stop", type=str, nargs="*", default=None)
         parser.add_argument("--image", action="store_true")
         parser.add_argument("--many-images", action="store_true")
         parser.add_argument("--stream", action="store_true")
@@ -127,12 +132,13 @@ def send_one_prompt(args: BenchArgs):
         "text": prompt,
         "image_data": image_data,
         "sampling_params": {
+            "sampling_seed": args.seed,
             "temperature": args.temperature,
             "max_new_tokens": args.max_new_tokens,
             "frequency_penalty": args.frequency_penalty,
             "presence_penalty": args.presence_penalty,
             "json_schema": json_schema,
-            "stop": ["Question", "Assistant:", "<|separator|>", "<|eos|>"],
+            "stop": args.stop,
         },
         "return_logprob": args.return_logprob,
         "stream": args.stream,

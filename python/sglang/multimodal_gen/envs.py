@@ -55,6 +55,8 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
+    SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
+    SGLANG_USE_ROCM_VAE: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -243,6 +245,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
+        "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "false"
+    ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
@@ -272,6 +277,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
+    # FlashInfer FP4 GEMM backend for the generic diffusion NVFP4 fallback.
+    "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
+    ),
+    # ROCm: use AITer GroupNorm in VAE for improved performance
+    "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
