@@ -9,6 +9,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
+from sglang.srt.multimodal.gpu_image_processing import (
+    get_image_dimensions,
+    gpu_preprocess_images,
+    navit_resize_config,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -20,7 +25,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
-    gpu_image_decode = False  # KimiK2.5VL HF processor does not support tensor inputs
+    gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -30,6 +35,28 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             image_token_id=hf_config.media_placeholder_token_id,
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
         ).build(_processor)
+
+        # Extract media processing config from HF processor
+        media_proc_cfg = _processor.media_processor.media_proc_cfg
+        self._patch_size = media_proc_cfg["patch_size"]
+        self._merge_kernel_size = media_proc_cfg["merge_kernel_size"]
+        self._in_patch_limit = media_proc_cfg["in_patch_limit"]
+        self._patch_limit_on_one_side = media_proc_cfg["patch_limit_on_one_side"]
+        self._fixed_output_tokens = media_proc_cfg.get("fixed_output_tokens")
+        self._image_mean = media_proc_cfg["image_mean"]
+        self._image_std = media_proc_cfg["image_std"]
+        self._gpu_norm_tensors = None
+
+    def _get_gpu_norm_tensors(self, device="cuda"):
+        if self._gpu_norm_tensors is None:
+            image_mean = torch.tensor(
+                self._image_mean, device=device, dtype=torch.float32
+            ).view(1, 3, 1, 1)
+            image_std_inv = (
+                1.0 / torch.tensor(self._image_std, device=device, dtype=torch.float32)
+            ).view(1, 3, 1, 1)
+            self._gpu_norm_tensors = (image_mean, image_std_inv)
+        return self._gpu_norm_tensors
 
     async def process_mm_data_async(
         self,
@@ -123,13 +150,65 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
     def _process_and_collect_mm_items(
         self, input_text: str, images=None, audios=None, videos=None, **kwargs
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
-        """
-        Helper method to process multimodal data and create mm_items in one step.
+        if images and torch.cuda.is_available():
+            return self._gpu_process_and_collect_mm_items(
+                input_text, images, audios, videos, **kwargs
+            )
+        return self._cpu_process_and_collect_mm_items(
+            input_text, images, audios, videos, **kwargs
+        )
 
-        Returns:
-            Tuple of (created mm_items, input_ids)
-        """
+    def _gpu_process_and_collect_mm_items(
+        self, input_text: str, images, audios=None, videos=None, **kwargs
+    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+        # 1. Compute resize configs (CPU math, no PIL needed)
+        resize_configs = []
+        for image in images:
+            w, h = get_image_dimensions(image)
+            config = navit_resize_config(
+                w,
+                h,
+                self._patch_size,
+                self._merge_kernel_size,
+                self._in_patch_limit,
+                self._patch_limit_on_one_side,
+                self._fixed_output_tokens,
+            )
+            resize_configs.append(config)
 
+        # 2. Expand image tokens in input_text
+        parts = input_text.split(self.mm_tokens.image_token)
+        result = [parts[0]]
+        for config, part in zip(resize_configs, parts[1:]):
+            result.append(self.mm_tokens.image_token * config["num_tokens"] + part)
+        input_text = "".join(result)
+
+        # 3. Tokenize text (unchanged)
+        text_inputs = self._processor.tokenizer(input_text, return_tensors="pt")
+        input_ids = text_inputs["input_ids"].flatten()
+
+        # 4. GPU image processing
+        image_mean, image_std_inv = self._get_gpu_norm_tensors()
+        pixel_values, grid_thws = gpu_preprocess_images(
+            images, resize_configs, image_mean, image_std_inv, self._patch_size
+        )
+
+        # 5. Assemble result
+        ret = {
+            "input_ids": input_ids.unsqueeze(0),
+            "pixel_values": pixel_values,
+            "grid_thws": grid_thws,
+        }
+        if not self.server_args.keep_mm_feature_on_device:
+            ret["pixel_values"] = ret["pixel_values"].to("cpu")
+
+        collected_items = self.collect_mm_items_from_processor_output(ret)
+        return collected_items, input_ids, ret
+
+    def _cpu_process_and_collect_mm_items(
+        self, input_text: str, images=None, audios=None, videos=None, **kwargs
+    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+        """Original CPU path using HF processor."""
         parts = input_text.split(self.mm_tokens.image_token)
 
         result = [parts[0]]
@@ -150,7 +229,11 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             images = None
 
         ret = self.process_mm_data(
-            input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
+            input_text=input_text,
+            images=images,
+            audios=audios,
+            videos=videos,
+            **kwargs,
         )
 
         input_ids = ret["input_ids"].flatten()
