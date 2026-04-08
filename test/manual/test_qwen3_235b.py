@@ -5,7 +5,6 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
 
-# Manual-only: not registered in any CI suite
 QWEN3_235B_FP8_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
 QWEN3_235B_EAGLE3_MODEL_PATH = (
     "lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan"
