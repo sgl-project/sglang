@@ -210,7 +210,7 @@ def select_component_source(
     model_index_keys: Tuple[str, ...],
 ) -> ComponentSelection:
     component_paths = extract_component_path_overrides(extra_args)
-    base_model_root = maybe_download_model(model_id)
+    base_model_root = maybe_download_model(model_id, force_diffusers_model=True)
     search_keys = [component.value]
     for key in model_index_keys:
         if key not in search_keys:
