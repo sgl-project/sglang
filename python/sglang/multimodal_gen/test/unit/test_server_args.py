@@ -122,5 +122,43 @@ class TestComponentPathParsing(unittest.TestCase):
         self.assertEqual(remaining, [])
 
 
+class TestLTX23ParallelismSelection(unittest.TestCase):
+    def _from_dict_without_model_resolution(self, kwargs):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            return ServerArgs.from_dict(kwargs)
+
+    def test_ltx23_one_stage_prefers_tp_on_2_gpus(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 2,
+            }
+        )
+
+        self.assertEqual(args.tp_size, 2)
+        self.assertEqual(args.sp_degree, 1)
+        self.assertEqual(args.ulysses_degree, 1)
+        self.assertEqual(args.ring_degree, 1)
+
+    def test_explicit_parallelism_is_not_overridden(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 2,
+                "tp_size": 1,
+                "sp_degree": 2,
+                "ulysses_degree": 2,
+                "ring_degree": 1,
+            }
+        )
+
+        self.assertEqual(args.tp_size, 1)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.ulysses_degree, 2)
+        self.assertEqual(args.ring_degree, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
