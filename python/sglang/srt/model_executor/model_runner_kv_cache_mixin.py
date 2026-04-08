@@ -245,24 +245,10 @@ class ModelRunnerKVCacheMixin:
 
         Returns (effective_capacity, full_max_total_num_tokens, swa_max_total_num_tokens).
         """
-        page_size = self.server_args.page_size
-
-        assert self.sliding_window_size is not None and self.sliding_window_size > 0
-        full_layers_num = len(self.model_config.full_attention_layer_ids)
-        swa_layers_num = len(self.model_config.swa_attention_layer_ids)
-
-        assert swa_layers_num > 0, "Hybrid SWA model must have at least one SWA layer"
-
         from sglang.srt.model_executor.memory_profiler import resolve_hybrid_swa_tokens
 
-        return resolve_hybrid_swa_tokens(
-            token_capacity,
-            full_layers_num,
-            swa_layers_num,
-            page_size,
-            self.server_args.swa_full_tokens_ratio,
-            self,
-        )
+        assert self.sliding_window_size is not None and self.sliding_window_size > 0
+        return resolve_hybrid_swa_tokens(self, token_capacity)
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
         if self.server_args.disable_radix_cache:

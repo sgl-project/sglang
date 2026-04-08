@@ -88,13 +88,20 @@ def get_cell_size_per_token(mr: ModelRunner, num_layers: int) -> int:
 
 
 def resolve_hybrid_swa_tokens(
-    token_capacity: int,
-    full_layers_num: int,
-    swa_layers_num: int,
-    page_size: int,
-    swa_full_tokens_ratio: float,
-    mr: ModelRunner,
-):
+    mr: ModelRunner, token_capacity: int
+) -> tuple[int, int, int]:
+    """Split token_capacity into full/swa pools.
+
+    Returns (effective_capacity, full_max_total_num_tokens, swa_max_total_num_tokens).
+    """
+    model_config = mr.model_config
+    page_size = mr.server_args.page_size
+    swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
+
+    full_layers_num = len(model_config.full_attention_layer_ids)
+    swa_layers_num = len(model_config.swa_attention_layer_ids)
+    assert swa_layers_num > 0, "Hybrid SWA model must have at least one SWA layer"
+
     def align_page_size(x: int) -> int:
         return (x // page_size) * page_size
 
@@ -126,10 +133,7 @@ def resolve_hybrid_swa_tokens(
     #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
     #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
 
-    kv_cache_dtype = mr.kv_cache_dtype
-    model_config = mr.model_config
-
-    kv_size = torch._utils._element_size(kv_cache_dtype)
+    kv_size = torch._utils._element_size(mr.kv_cache_dtype)
 
     # Full layer per-token memory
     full_per_token = (
