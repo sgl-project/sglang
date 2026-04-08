@@ -17,6 +17,7 @@ from sglang.srt.server_args import get_global_server_args
 class PoolingType(IntEnum):
     LAST = 0
     CLS = 1
+    MEAN = 2
 
 
 @dataclass
@@ -102,6 +103,11 @@ class Pooler(nn.Module):
             first_token_flat_indices = torch.zeros_like(prompt_lens)
             first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
             pooled_data = hidden_states[first_token_flat_indices]
+        elif self.pooling_type == PoolingType.MEAN:
+            # use segment_reduce to compute mean pooling
+            pooled_data = torch.segment_reduce(
+                data=hidden_states, reduce="mean", lengths=forward_batch.extend_seq_lens
+            )
         else:
             raise ValueError(f"Invalid pooling type: {self.pooling_type}")
 
