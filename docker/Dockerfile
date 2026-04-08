@@ -219,6 +219,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+    && kernels download python
+    && kernels lock python
+    && mv python/kernels.lock /root/.cache/sglang
 
 # DeepEP
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
@@ -560,6 +563,10 @@ COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/pyt
 
 # Copy SGLang workspace
 COPY --from=framework /sgl-workspace /sgl-workspace
+
+# Copy cache for kernels from kernels community
+COPY --from=framework /root/.cache/huggingface /root/.cache/huggingface
+COPY --from=framework /root/.cache/sglang /root/.cache/sglang
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \

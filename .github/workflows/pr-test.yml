@@ -602,7 +602,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   stage-a-test-cpu:
     needs: [check-changes, call-gate]
@@ -711,7 +711,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
 
@@ -767,7 +767,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
 
@@ -822,7 +822,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
 
@@ -880,7 +880,7 @@ jobs:
           python3 -m pytest -q python/sglang/jit_kernel/tests/test_flash_attention_4.py
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   call-multimodal-gen-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
@@ -962,7 +962,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -1030,7 +1030,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -1086,7 +1086,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -1148,7 +1148,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   stage-c-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1162,7 +1162,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 8-gpu-h200
+    runs-on: 8-gpu-h200-deepep
     timeout-minutes: 240
     steps:
       - name: Checkout code
@@ -1209,7 +1209,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   stage-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-stage-b]
@@ -1262,7 +1262,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -1316,7 +1316,7 @@ jobs:
   #         python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
   #
   #     - uses: ./.github/actions/upload-cuda-coredumps
-  #       if: always()
+  #       if: failure()
 
   pr-test-finish:
     needs:

@@ -49,12 +49,6 @@
             "psnr_threshold": 19.0,
             "mean_abs_diff_threshold": 10.0
         },
-        "sana_image_t2i": {
-            "clip_threshold": 0.91,
-            "ssim_threshold": 0.88,
-            "psnr_threshold": 21.0,
-            "mean_abs_diff_threshold": 8.4
-        },
         "qwen_image_edit_2509_ti2i": {
             "clip_threshold": 0.92,
             "ssim_threshold": 0.65,
