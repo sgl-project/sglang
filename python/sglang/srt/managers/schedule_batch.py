@@ -1215,14 +1215,6 @@ class Req(ReqDllmMixin):
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
-        # When using input_embeds, we cannot easily mix the original input embeddings
-        # with the newly generated output token IDs during re-prefill of retracted request.
-        # output_ids will have no use, but will lead to wrong size cache indexes.
-        # Therefore, we discard the generated output_ids and restart prefill and generation
-        # to ensure shape consistency in KV cache.
-        if self.input_embeds is not None:
-            self.output_ids = []
-
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1940,12 +1932,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
-        retracted_reqs = self.reqs
+        retracted_reqs = []
+        reqs_to_abort = []
         for idx in range(len(self.reqs)):
+            req = self.reqs[idx]
+            if req.input_embeds is not None:
+                # See retract_decode for why retraction is unsafe here.
+                req.to_finish = FINISH_ABORT(
+                    "Engine pause requested. Requests using input_embeds "
+                    "cannot be safely retracted; aborting instead.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                reqs_to_abort.append(req)
+            else:
+                retracted_reqs.append(req)
             self.release_req(idx, len(self.reqs) - idx, server_args)
 
-        self.filter_batch(retracted_reqs)
-        return retracted_reqs
+        self.filter_batch(self.reqs)
+        return retracted_reqs, reqs_to_abort
 
     def retract_decode(
         self, server_args: ServerArgs
@@ -1959,8 +1963,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO(sang): Clean up finish path and support better retract
         # policy.
         if not server_args.speculative_algorithm:
+            # Prefer evicting requests that free the most KV (long output, short
+            # prompt). Sort input_embeds requests to the FRONT so they are popped
+            # LAST — retracting them cannot safely preserve decode progress (see
+            # the abort path below).
             sorted_indices.sort(
                 key=lambda i: (
+                    self.reqs[i].input_embeds is None,
                     len(self.reqs[i].output_ids),
                     -len(self.reqs[i].origin_input_ids),
                 ),
@@ -1968,22 +1977,48 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
         ):
             if len(sorted_indices) == 1:
-                # Always keep at least one request
+                # Always keep at least one request (also prevents the
+                # new_token_ratio calculation below from dividing into zero
+                # and livelocking admission).
                 break
 
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
+
+            if req.input_embeds is not None:
+                # Retracting an input_embeds request cannot preserve decode
+                # progress: re-prefill needs embeddings for the generated
+                # output_ids, but the model's embed_tokens (with its per-model
+                # scaling) is unreachable here, and clearing output_ids leaves
+                # per-step accumulators (logprobs, streaming offsets,
+                # cross-process detokenizer state) stale. Abort is the only
+                # correct outcome. Tune --schedule-conservativeness to reduce
+                # retraction pressure.
+                req.to_finish = FINISH_ABORT(
+                    "Out of memory during decode. Requests using input_embeds "
+                    "cannot be safely retracted (re-prefill would desync "
+                    "accumulated output state); aborting instead. Consider "
+                    "raising --schedule-conservativeness.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                reqs_to_abort.append(req)
+                logger.warning(
+                    "retract_decode: aborted input_embeds request %s "
+                    "(retraction unsafe for input_embeds)",
+                    req.rid,
+                )
+            else:
+                retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):

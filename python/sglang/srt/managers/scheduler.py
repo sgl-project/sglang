@@ -3388,9 +3388,20 @@ class Scheduler(
         if recv_req.mode == "retract" and not self.running_batch.is_empty():
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if len(self.running_batch.reqs) != 0:
-                retracted_reqs = self.running_batch.retract_all(self.server_args)
+                retracted_reqs, reqs_to_abort = self.running_batch.retract_all(
+                    self.server_args
+                )
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
+                for req in reqs_to_abort:
+                    abort_reason: FINISH_ABORT = req.to_finish
+                    self.send_to_tokenizer.send_output(
+                        AbortReq(
+                            finished_reason=abort_reason.to_json(),
+                            rid=req.rid,
+                        ),
+                        req,
+                    )
 
             self.running_batch.batch_is_full = False
             self.chunked_req = None
