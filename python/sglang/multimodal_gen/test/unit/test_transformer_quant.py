@@ -121,15 +121,15 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(resolved, files)
 
     @patch(
-        "sglang.multimodal_gen.runtime.loader.quantization.transformer.build_nvfp4_config_from_safetensors_list",
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
         return_value=None,
     )
     @patch(
-        "sglang.multimodal_gen.runtime.loader.quantization.transformer.get_quant_config_from_safetensors_metadata",
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_quant_config_from_safetensors_metadata",
         return_value=None,
     )
     @patch(
-        "sglang.multimodal_gen.runtime.loader.quantization.transformer.get_metadata_from_safetensors_file"
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.get_metadata_from_safetensors_file"
     )
     def test_resolve_transformer_quant_load_spec_keeps_nunchaku_hook(
         self,
@@ -171,15 +171,11 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             text_encoder_cpu_offload=True,
         )
 
-        with patch(
-            "sglang.multimodal_gen.runtime.loader.quantization.transformer.current_platform.should_use_modelopt_fp4_best_performance_kit",
-            return_value=False,
-        ):
-            _Flux2Nvfp4FallbackAdapter._maybe_adjust_flux2_nvfp4_fallback_defaults(
-                cls_name="Flux2Transformer2DModel",
-                server_args=server_args,
-                quant_config=_FakeQuantConfig(),
-            )
+        _Flux2Nvfp4FallbackAdapter._maybe_adjust_flux2_nvfp4_fallback_defaults(
+            cls_name="Flux2Transformer2DModel",
+            server_args=server_args,
+            quant_config=_FakeQuantConfig(),
+        )
 
         self.assertFalse(server_args.dit_cpu_offload)
         self.assertFalse(server_args.text_encoder_cpu_offload)
