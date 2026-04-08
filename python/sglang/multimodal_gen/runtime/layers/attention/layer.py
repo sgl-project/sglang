@@ -423,31 +423,68 @@ class USPAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
         if attn_mask is not None:
-            if not (
-                self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1
-            ):
+            def _prepare_sdpa_mask(
+                mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
+            ) -> torch.Tensor:
+                mask = mask.to(device=device)
+                if torch.is_floating_point(mask):
+                    mask = mask.to(dtype=dtype)
+                    if mask.dim() == 2:
+                        mask = mask[:, None, None, :]
+                    elif mask.dim() == 3:
+                        mask = mask[:, None, :, :]
+                    return mask
+
+                mask = mask.to(dtype=dtype)
+                if mask.dim() == 2:
+                    mask = mask[:, None, None, :]
+                elif mask.dim() == 3:
+                    mask = mask[:, None, :, :]
+                return (mask - 1.0) * torch.finfo(dtype).max
+
+            sp_world_size = get_sequence_parallel_world_size()
+            if self.skip_sequence_parallel or sp_world_size == 1:
+                q_ = q.transpose(1, 2)
+                k_ = k.transpose(1, 2)
+                v_ = v.transpose(1, 2)
+                mask = _prepare_sdpa_mask(
+                    attn_mask, dtype=q_.dtype, device=q_.device
+                )
+                return torch.nn.functional.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.softmax_scale,
+                ).transpose(1, 2)
+
+            if get_ring_parallel_world_size() > 1:
                 raise NotImplementedError(
-                    "USPAttention masked path requires local execution or "
-                    "skip_sequence_parallel=True."
+                    "USPAttention masked path does not support ring parallelism yet."
+                )
+            if attn_mask.dim() != 2:
+                raise NotImplementedError(
+                    "USPAttention masked SP path currently expects a [B, S_local] key mask."
                 )
 
+            sp_size = get_ulysses_parallel_world_size()
+            if sp_size > 1:
+                q = _usp_input_all_to_all(q, head_dim=2)
+                k = _usp_input_all_to_all(k, head_dim=2)
+                v = _usp_input_all_to_all(v, head_dim=2)
+
+            gathered_mask = sequence_model_parallel_all_gather(
+                attn_mask.contiguous(), dim=1
+            )
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
-            mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-            if torch.is_floating_point(attn_mask):
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-            else:
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-                mask = (mask - 1.0) * torch.finfo(q_.dtype).max
-
-            return torch.nn.functional.scaled_dot_product_attention(
+            mask = _prepare_sdpa_mask(
+                gathered_mask, dtype=q_.dtype, device=q_.device
+            )
+            out = torch.nn.functional.scaled_dot_product_attention(
                 q_,
                 k_,
                 v_,
@@ -456,6 +493,9 @@ class USPAttention(nn.Module):
                 is_causal=False,
                 scale=self.softmax_scale,
             ).transpose(1, 2)
+            if sp_size > 1:
+                out = _usp_output_all_to_all(out, head_dim=2)
+            return out
 
         if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.

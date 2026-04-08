@@ -345,6 +345,7 @@ class LTX2PipelineConfig(PipelineConfig):
         latent_frames, tokens_per_frame = (
             self._infer_video_latent_frames_and_tokens_per_frame(batch, seq_len)
         )
+        orig_latent_frames = int(latent_frames)
 
         # Pad whole frames so `latent_frames` is divisible by `sp_world_size`.
         pad_frames = (sp_world_size - (latent_frames % sp_world_size)) % sp_world_size
@@ -360,6 +361,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
         local_frames = int(latent_frames) // int(sp_world_size)
         start_frame = int(sp_rank) * int(local_frames)
+        valid_local_frames = max(
+            min(int(orig_latent_frames) - int(start_frame), int(local_frames)), 0
+        )
         start = int(start_frame) * int(tokens_per_frame)
         end = int(start) + int(local_frames) * int(tokens_per_frame)
         latents = latents[:, start:end, :]
@@ -368,6 +372,7 @@ class LTX2PipelineConfig(PipelineConfig):
         batch.sp_video_latent_num_frames = int(local_frames)
         batch.sp_video_start_frame = int(start_frame)
         batch.sp_video_tokens_per_frame = int(tokens_per_frame)
+        batch.sp_video_valid_token_count = int(valid_local_frames) * int(tokens_per_frame)
 
         return latents, True
 
@@ -403,10 +408,15 @@ class LTX2PipelineConfig(PipelineConfig):
         local_frames = seq_len // sp_world_size
         start_frame = sp_rank * local_frames
         end_frame = start_frame + local_frames
+        valid_local_frames = max(
+            min(int(batch.sp_audio_orig_num_frames) - int(start_frame), int(local_frames)),
+            0,
+        )
         audio_latents = audio_latents[:, start_frame:end_frame, :]
 
         batch.sp_audio_latent_num_frames = int(local_frames)
         batch.sp_audio_start_frame = int(start_frame)
+        batch.sp_audio_valid_token_count = int(valid_local_frames)
         return audio_latents, True
 
     def gather_audio_latents_for_sp(self, audio_latents, batch):

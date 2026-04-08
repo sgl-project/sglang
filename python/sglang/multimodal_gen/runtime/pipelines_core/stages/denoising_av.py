@@ -196,6 +196,25 @@ class LTX2AVDenoisingStage(DenoisingStage):
         repeat_factor = int(target_batch_size) // int(tensor.shape[0])
         return tensor.repeat(repeat_factor, *([1] * (tensor.ndim - 1)))
 
+    @staticmethod
+    def _build_ltx2_sp_padding_mask(
+        batch: Req,
+        *,
+        seq_len: int,
+        batch_size: int,
+        key: str,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        valid = getattr(batch, key, None)
+        if valid is None:
+            return None
+        valid = int(valid)
+        if valid <= 0 or valid >= int(seq_len):
+            return None
+        mask = torch.ones((batch_size, int(seq_len)), device=device, dtype=torch.float32)
+        mask[:, valid:] = 0.0
+        return mask
+
     @classmethod
     def _ltx2_calculate_guided_x0(
         cls,
@@ -696,6 +715,23 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 * timestep_scale_multiplier
                             ).expand(batch_size)
 
+                        video_self_attention_mask = self._build_ltx2_sp_padding_mask(
+                            batch,
+                            seq_len=video_num_tokens,
+                            batch_size=batch_size,
+                            key="sp_video_valid_token_count",
+                            device=latent_model_input.device,
+                        )
+                        audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
+                            batch,
+                            seq_len=audio_num_frames_latent,
+                            batch_size=batch_size,
+                            key="sp_audio_valid_token_count",
+                            device=audio_latent_model_input.device,
+                        )
+                        a2v_cross_attention_mask = audio_self_attention_mask
+                        v2a_cross_attention_mask = video_self_attention_mask
+
                         use_official_cfg_path = stage1_guider_params is None
                         if use_official_cfg_path:
                             encoder_hidden_states = batch.prompt_embeds[0]
@@ -744,6 +780,22 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     prompt_timestep_audio = self._repeat_batch_dim(
                                         prompt_timestep_audio, cfg_batch_size
                                     )
+                                if video_self_attention_mask is not None:
+                                    video_self_attention_mask = self._repeat_batch_dim(
+                                        video_self_attention_mask, cfg_batch_size
+                                    )
+                                if audio_self_attention_mask is not None:
+                                    audio_self_attention_mask = self._repeat_batch_dim(
+                                        audio_self_attention_mask, cfg_batch_size
+                                    )
+                                if a2v_cross_attention_mask is not None:
+                                    a2v_cross_attention_mask = self._repeat_batch_dim(
+                                        a2v_cross_attention_mask, cfg_batch_size
+                                    )
+                                if v2a_cross_attention_mask is not None:
+                                    v2a_cross_attention_mask = self._repeat_batch_dim(
+                                        v2a_cross_attention_mask, cfg_batch_size
+                                    )
 
                             with set_forward_context(
                                 current_timestep=i, attn_metadata=attn_metadata
@@ -759,6 +811,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     audio_prompt_timestep=prompt_timestep_audio,
                                     encoder_attention_mask=encoder_attention_mask,
                                     audio_encoder_attention_mask=encoder_attention_mask,
+                                    video_self_attention_mask=video_self_attention_mask,
+                                    audio_self_attention_mask=audio_self_attention_mask,
+                                    a2v_cross_attention_mask=a2v_cross_attention_mask,
+                                    v2a_cross_attention_mask=v2a_cross_attention_mask,
                                     num_frames=latent_num_frames,
                                     height=latent_height,
                                     width=latent_width,
@@ -838,6 +894,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     audio_prompt_timestep=prompt_timestep_audio,
                                     encoder_attention_mask=encoder_attention_mask,
                                     audio_encoder_attention_mask=encoder_attention_mask,
+                                    video_self_attention_mask=video_self_attention_mask,
+                                    audio_self_attention_mask=audio_self_attention_mask,
+                                    a2v_cross_attention_mask=a2v_cross_attention_mask,
+                                    v2a_cross_attention_mask=v2a_cross_attention_mask,
                                     num_frames=latent_num_frames,
                                     height=latent_height,
                                     width=latent_width,
@@ -874,6 +934,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         audio_prompt_timestep=prompt_timestep_audio,
                                         encoder_attention_mask=neg_encoder_attention_mask,
                                         audio_encoder_attention_mask=neg_encoder_attention_mask,
+                                        video_self_attention_mask=video_self_attention_mask,
+                                        audio_self_attention_mask=audio_self_attention_mask,
+                                        a2v_cross_attention_mask=a2v_cross_attention_mask,
+                                        v2a_cross_attention_mask=v2a_cross_attention_mask,
                                         num_frames=latent_num_frames,
                                         height=latent_height,
                                         width=latent_width,
@@ -957,6 +1021,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         audio_prompt_timestep=prompt_timestep_audio,
                                         encoder_attention_mask=encoder_attention_mask,
                                         audio_encoder_attention_mask=encoder_attention_mask,
+                                        video_self_attention_mask=video_self_attention_mask,
+                                        audio_self_attention_mask=audio_self_attention_mask,
+                                        a2v_cross_attention_mask=a2v_cross_attention_mask,
+                                        v2a_cross_attention_mask=v2a_cross_attention_mask,
                                         num_frames=latent_num_frames,
                                         height=latent_height,
                                         width=latent_width,
@@ -1001,6 +1069,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         audio_prompt_timestep=prompt_timestep_audio,
                                         encoder_attention_mask=encoder_attention_mask,
                                         audio_encoder_attention_mask=encoder_attention_mask,
+                                        video_self_attention_mask=video_self_attention_mask,
+                                        audio_self_attention_mask=audio_self_attention_mask,
+                                        a2v_cross_attention_mask=a2v_cross_attention_mask,
+                                        v2a_cross_attention_mask=v2a_cross_attention_mask,
                                         num_frames=latent_num_frames,
                                         height=latent_height,
                                         width=latent_width,
