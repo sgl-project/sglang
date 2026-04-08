@@ -79,6 +79,8 @@ class TestNightlyGLM5Performance(unittest.TestCase):
                 "tilelang",
                 "--nsa-decode-backend",
                 "tilelang",
+                "--kv-cache-dtype",
+                "fp8_e4m3",
                 "--chunked-prefill-size",
                 "131072",
                 "--mem-fraction-static",
