@@ -1428,9 +1428,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     def _get_av_ca_gate_timestep_factor(self) -> float:
         ltx_variant = str(getattr(self.config.arch_config, "ltx_variant", "ltx_2"))
         if ltx_variant == "ltx_2_3":
-            return (
-                self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
-            )
+            return self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
         return float(self.av_ca_timestep_scale_multiplier)
 
     def forward(

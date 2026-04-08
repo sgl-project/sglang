@@ -650,7 +650,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         prompt_timestep_audio = None
                         if is_ltx23_variant:
                             timestep_scale_multiplier = float(
-                                getattr(current_model, "timestep_scale_multiplier", 1000)
+                                getattr(
+                                    current_model, "timestep_scale_multiplier", 1000
+                                )
                             )
                             prompt_timestep_video = (
                                 sigma.to(

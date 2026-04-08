@@ -4,10 +4,10 @@ import pytest
 
 pytest.importorskip("pybase64")
 
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import LTX2VideoTransformer3DModel
 from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
     LTX2TwoStagePipeline,
 )
-from sglang.multimodal_gen.runtime.models.dits.ltx_2 import LTX2VideoTransformer3DModel
 
 
 def _make_server_args(ltx_variant: str):
