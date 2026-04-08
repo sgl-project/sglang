@@ -1304,8 +1304,7 @@ class NixlKVManager(CommonKVManager):
         notif_map = self.agent.get_new_notifs()
         for peer_name, messages in notif_map.items():
             for msg in messages:
-                decoded = msg.decode("ascii")
-                components = decoded.split("_")
+                components = msg.decode("ascii").split("_")
                 room = int(components[0])
                 tag = components[1]
                 if tag == "kv":
@@ -1314,31 +1313,39 @@ class NixlKVManager(CommonKVManager):
                     pp_rank = int(components[4]) if len(components) > 4 else 0
                     self._track_kv_arrival(room, chunk_id, is_last, pp_rank)
                 elif tag == "stg":
-                    # Format: {room}_stg_{chunk_id}_{is_last}_{pp_rank}_{chunk_idx}_{page_start}_{num_pages}_{agent_name}
-                    chunk_id = int(components[2])
-                    is_last = bool(int(components[3]))
-                    pp_rank = int(components[4])
-                    chunk_idx = int(components[5])
-                    page_start = int(components[6])
-                    num_pages = int(components[7])
-                    agent_name = components[8] if len(components) > 8 else ""
-                    # Track as kv for TransferStatus.is_done()
-                    self._track_kv_arrival(room, chunk_id, is_last, pp_rank)
-                    # Handle staging scatter
-                    self._handle_staging_chunk_arrived(
-                        room, chunk_idx, page_start, num_pages, agent_name
-                    )
+                    self._handle_stg_notification(components, room)
                 elif tag == "aux":
-                    self.transfer_statuses[room].received_aux = True
-                    if (
-                        self.enable_staging
-                        and self._staging_handler is not None
-                        and self._staging_handler.is_staging_room(room)
-                    ):
-                        self._maybe_submit_last_scatter(room)
+                    self._handle_aux_notification(room)
                 elif tag == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+
+    def _handle_stg_notification(self, components, room: int):
+        """Handle a staging RDMA notification tag.
+
+        Format: {room}_stg_{chunk_id}_{is_last}_{pp_rank}_{chunk_idx}_{page_start}_{num_pages}_{agent_name}
+        """
+        chunk_id = int(components[2])
+        is_last = bool(int(components[3]))
+        pp_rank = int(components[4])
+        chunk_idx = int(components[5])
+        page_start = int(components[6])
+        num_pages = int(components[7])
+        agent_name = components[8] if len(components) > 8 else ""
+        self._track_kv_arrival(room, chunk_id, is_last, pp_rank)
+        self._handle_staging_chunk_arrived(
+            room, chunk_idx, page_start, num_pages, agent_name
+        )
+
+    def _handle_aux_notification(self, room: int):
+        """Handle an aux notification and trigger last scatter if staging is complete."""
+        self.transfer_statuses[room].received_aux = True
+        if (
+            self.enable_staging
+            and self._staging_handler is not None
+            and self._staging_handler.is_staging_room(room)
+        ):
+            self._maybe_submit_last_scatter(room)
 
     def _track_kv_arrival(self, room: int, chunk_id: int, is_last: bool, pp_rank: int):
         """Update transfer status tracking for a kv chunk arrival."""
