@@ -19,14 +19,10 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
-
-
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
-    from sglang.multimodal_gen.configs.sample.ltx_2 import LTX23SamplingParams
-
 
 
 def _json_safe(obj: Any):
@@ -597,16 +593,6 @@ class SamplingParams:
 
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
-
-        # handle semantics of width and height for LTX2 models
-        if (
-            server_args.pipeline_class_name == "LTX2TwoStagePipeline"
-            and sampling_params.__class__.__name__ == "LTX23SamplingParams".__class__.name
-        ):
-            if "height" not in user_kwargs and sampling_params.height is not None:
-                sampling_params.height *= 2
-            if "width" not in user_kwargs and sampling_params.width is not None:
-                sampling_params.width *= 2
 
         user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
