@@ -40,6 +40,7 @@ def _discover_unit_tests() -> list[str]:
 
 
 SUITES = {
+    # no GPU required; safe to run on any CPU-only runner
     # Auto-discovered from test/unit/test_*.py
     "unit": _discover_unit_tests(),
     "1-gpu": [
