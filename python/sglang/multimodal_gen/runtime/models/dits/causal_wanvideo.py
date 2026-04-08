@@ -92,6 +92,7 @@ class CausalWanSelfAttention(nn.Module):
             causal=False,
             supported_attention_backends=(
                 AttentionBackendEnum.FA,
+                AttentionBackendEnum.FA2,
                 AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
             ),

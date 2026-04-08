@@ -600,6 +600,7 @@ class QwenImageCrossAttention(nn.Module):
             causal=False,
             supported_attention_backends={
                 AttentionBackendEnum.FA,
+                AttentionBackendEnum.FA2,
                 AttentionBackendEnum.AITER,
                 AttentionBackendEnum.AITER_SAGE,
                 AttentionBackendEnum.TORCH_SDPA,
