@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.activation import get_cross_encoder_activation_function
+
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 
@@ -145,6 +145,7 @@ class CrossEncodingPooler(nn.Module):
         super().__init__()
         self.classifier = classifier
         self.pooler = pooler
+        from sglang.srt.layers.activation import get_cross_encoder_activation_function
         self.default_activation_function = get_cross_encoder_activation_function(config)
 
     def forward(
