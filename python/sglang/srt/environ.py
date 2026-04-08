@@ -491,6 +491,7 @@ class Envs:
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+    SGLANG_TIMEOUT_WORKER_HEALTHCHECK = EnvInt(10)
 
     # HTTP/2 Server
     SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
