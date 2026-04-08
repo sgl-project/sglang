@@ -1217,15 +1217,14 @@ class NixlKVManager(CommonKVManager):
             notif = (
                 f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
             )
-            dst_info = self.decode_kv_args_table[req.agent_name]
-            decode_tp_size = dst_info.decode_tp_size
+            decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
 
             # Staging path: heterogeneous TP with staging buffer enabled
             use_staging = (
                 self.enable_staging
                 and not self.is_mla_backend
                 and decode_tp_size != self.attn_tp_size
-                and dst_info.staging is not None
+                and self.decode_kv_args_table[req.agent_name].staging is not None
                 and self.kv_buffer_tensors is not None
                 and self._staging_ctx.buffers
             )
@@ -1237,7 +1236,7 @@ class NixlKVManager(CommonKVManager):
                     index_slice,
                     chunk_id,
                     is_last,
-                    dst_info,
+                    self.decode_kv_args_table[req.agent_name],
                     self._staging_ctx.buffers[0],
                 )
                 if xfer_handle is not None:
@@ -1246,23 +1245,27 @@ class NixlKVManager(CommonKVManager):
                     kv_xfer_handle = self.send_kvcache_slice(
                         req.agent_name,
                         kv_indices,
-                        dst_info.dst_kv_ptrs,
+                        self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
                         chunked_dst_kv_indice,
-                        dst_info.gpu_id,
+                        self.decode_kv_args_table[req.agent_name].gpu_id,
                         notif,
                         prefill_tp_size=self.attn_tp_size,
                         decode_tp_size=decode_tp_size,
-                        decode_tp_rank=dst_info.decode_tp_rank,
-                        dst_kv_item_len=dst_info.dst_kv_item_len,
+                        decode_tp_rank=self.decode_kv_args_table[
+                            req.agent_name
+                        ].decode_tp_rank,
+                        dst_kv_item_len=self.decode_kv_args_table[
+                            req.agent_name
+                        ].dst_kv_item_len,
                     )
                     handles.append(kv_xfer_handle)
             elif self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
                     kv_indices,
-                    dst_info.dst_kv_ptrs,
+                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
                     chunked_dst_kv_indice,
-                    dst_info.gpu_id,
+                    self.decode_kv_args_table[req.agent_name].gpu_id,
                     notif,
                 )
                 handles.append(kv_xfer_handle)
@@ -1270,14 +1273,18 @@ class NixlKVManager(CommonKVManager):
                 kv_xfer_handle = self.send_kvcache_slice(
                     req.agent_name,
                     kv_indices,
-                    dst_info.dst_kv_ptrs,
+                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
                     chunked_dst_kv_indice,
-                    dst_info.gpu_id,
+                    self.decode_kv_args_table[req.agent_name].gpu_id,
                     notif,
                     prefill_tp_size=self.attn_tp_size,
                     decode_tp_size=decode_tp_size,
-                    decode_tp_rank=dst_info.decode_tp_rank,
-                    dst_kv_item_len=dst_info.dst_kv_item_len,
+                    decode_tp_rank=self.decode_kv_args_table[
+                        req.agent_name
+                    ].decode_tp_rank,
+                    dst_kv_item_len=self.decode_kv_args_table[
+                        req.agent_name
+                    ].dst_kv_item_len,
                 )
                 handles.append(kv_xfer_handle)
 
@@ -1304,7 +1311,7 @@ class NixlKVManager(CommonKVManager):
                 aux_xfer_handle = self.send_aux(
                     req.agent_name,
                     aux_index,
-                    dst_info.dst_aux_ptrs,
+                    self.decode_kv_args_table[req.agent_name].dst_aux_ptrs,
                     req.dst_aux_index,
                     f"{req.room}_aux",
                 )
