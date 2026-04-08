@@ -18,8 +18,6 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CHUNKED_PREFILL_SIZE = 8192
-
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
 
@@ -462,7 +460,7 @@ class PrefillStagingStrategy:
         self.kv_manager = kv_manager
         self.staging_buffer = staging_buffer
         page_size = kv_manager.kv_buffer_tensors["page_size"]
-        cps = kv_manager.server_args.chunked_prefill_size or DEFAULT_CHUNKED_PREFILL_SIZE
+        cps = kv_manager.server_args.chunked_prefill_size or 8192
         self.full_chunk_pages = max(1, cps // page_size)
 
     def check_ready(
@@ -493,7 +491,7 @@ class PrefillStagingStrategy:
             else 0
         )
 
-        stg = getattr(req, "staging", None)
+        stg = req.staging
         if stg is None or chunk_idx >= len(stg.offsets):
             return (False, chunk_idx, -1, 0, -1)
 
@@ -755,7 +753,7 @@ def prefetch_staging_reqs(
     from sglang.srt.utils.network import NetworkAddress
 
     page_size = kv_buffer_tensors["page_size"]
-    cps = chunked_prefill_size or DEFAULT_CHUNKED_PREFILL_SIZE
+    cps = chunked_prefill_size or 8192
     full_chunk_pages = max(1, cps // page_size)
 
     for session_id, tinfo in transfer_infos[room].items():
