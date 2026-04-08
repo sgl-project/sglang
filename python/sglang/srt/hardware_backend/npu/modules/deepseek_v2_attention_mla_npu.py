@@ -231,6 +231,10 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
+        m.rotary_emb.update_and_get_cos_sin_cache(
+            positions, m.layer_id, hidden_states.dtype, offsets=None
+        )
+
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if nsa_use_prefill_cp(forward_batch):
