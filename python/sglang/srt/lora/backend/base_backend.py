@@ -147,17 +147,96 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
     ):
-        """Initialize the batch info for CUDA Graph mode.
+        """Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
 
-        This method provides a hook for each backend to conduct its own initialization
-        logic for CUDA Graph mode.
+        Called during CudaGraphRunner.__init__(), after init_memory_pool().
 
         Args:
-            cuda_graph_batch_info: the LoRABatchInfo object created in LoraManager
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
             num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
         """
         pass
+
+    def init_cuda_graph_moe_buffers(
+        self,
+        max_bs: int,
+        max_loras: int,
+        compute_dtype: torch.dtype,
+        moe_layer,
+    ):
+        """Phase 1 of LoRA CUDA graph init: MoE intermediate buffers.
+
+        Called once before init_memory_pool() with a representative MoE layer
+        to extract dimensions.  All FusedMoEWithLoRA layers share the same
+        buffers since they execute sequentially during forward.
+
+        This is backend-agnostic because MoE LoRA always uses the same
+        fused Triton kernel (TritonRunnerCoreWithLoRA) regardless of which
+        dense LoRA backend is selected.
+        """
+        base = moe_layer.base_layer
+        top_k = base.top_k
+        qinfo = moe_layer._quant_info
+        E, N, _ = qinfo.w13_weight.shape
+        hidden_dim = qinfo.w2_weight.shape[1]
+        device = qinfo.w13_weight.device
+        dtype = compute_dtype
+        num_experts = base.num_experts
+
+        block_size_m = 64
+        max_num_tokens_padded = max_bs * top_k + num_experts * (block_size_m - 1)
+        max_num_tokens_padded = (
+            (max_num_tokens_padded + block_size_m - 1) // block_size_m
+        ) * block_size_m
+        max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
+
+        self.moe_cg_buffers = {
+            "intermediate_cache1": torch.empty(
+                (max_bs, top_k, N), device=device, dtype=dtype
+            ),
+            "intermediate_cache2": torch.empty(
+                (max_bs * top_k, N // 2), device=device, dtype=dtype
+            ),
+            "intermediate_cache3": torch.empty(
+                (max_bs, top_k, hidden_dim), device=device, dtype=dtype
+            ),
+            "out_hidden_states": torch.empty(
+                (max_bs, hidden_dim), device=device, dtype=dtype
+            ),
+            "sorted_token_ids_lora": torch.empty(
+                (max_loras * max_num_tokens_padded,),
+                device=device,
+                dtype=torch.int32,
+            ),
+            "expert_ids_lora": torch.empty(
+                (max_loras * max_num_m_blocks,),
+                device=device,
+                dtype=torch.int32,
+            ),
+            "num_tokens_post_padded_lora": torch.empty(
+                (max_loras,), device=device, dtype=torch.int32
+            ),
+            "adapter_enabled": torch.zeros(max_loras, dtype=torch.int32, device=device),
+            # int64 copy of weight_indices for index_fill_(), which requires
+            # LongTensor.  weight_indices itself must stay int32 because the
+            # CUDA moe_lora_align kernel casts it to int32_t*.
+            "weight_indices_long": torch.zeros(
+                max_bs, dtype=torch.int64, device=device
+            ),
+            "lora_ids": torch.arange(max_loras, dtype=torch.int32, device=device),
+            "cumsum_buffer": torch.zeros(
+                max_loras * (num_experts + 1),
+                dtype=torch.int32,
+                device=device,
+            ),
+            "token_mask": torch.empty(
+                (max_loras * max_bs * top_k,),
+                dtype=torch.int32,
+                device=device,
+            ),
+            "max_num_tokens_padded": max_num_tokens_padded,
+            "max_num_m_blocks": max_num_m_blocks,
+        }
 
     def prepare_lora_batch(
         self,

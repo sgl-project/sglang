@@ -915,9 +915,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             rope_dim_list=self.rope_dim_list,
             rope_theta=10000,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
         )
 
@@ -1090,7 +1090,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             encoder_hidden_states.to(orig_dtype)
             if not current_platform.is_amp_supported()
             else encoder_hidden_states
-        )  # cast to orig_dtype for MPS
+        )  # cast to orig_dtype if amp is not supported
 
         assert encoder_hidden_states.dtype == orig_dtype
 

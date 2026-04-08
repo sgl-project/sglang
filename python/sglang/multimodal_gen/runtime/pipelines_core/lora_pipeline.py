@@ -397,6 +397,7 @@ class LoRAPipeline(ComposedPipelineBase):
         rank: int,
         strengths: list[float],
         clear_existing: bool = False,
+        merge_weights: bool = True,
     ) -> int:
         """
         Apply LoRA weights to the given lora_layers. Supports multiple LoRA adapters.
@@ -435,38 +436,29 @@ class LoRAPipeline(ComposedPipelineBase):
                     lora_A_name in self.lora_adapters[nickname]
                     and lora_B_name in self.lora_adapters[nickname]
                 ):
-                    # Some LoRA checkpoints (e.g. Lightning distill) store per-layer alpha as "<layer>.alpha".
-                    # If present, we must apply the standard LoRA scaling: scale = alpha / rank.
-                    try:
-                        inferred_rank = int(
-                            self.lora_adapters[nickname][lora_A_name].shape[0]
-                        )
-                    except Exception:
-                        inferred_rank = None
-                    # Default to None for some checkpoints without "<layer>.alpha"
-                    inferred_alpha: int | None = None
+                    inferred_rank = int(
+                        self.lora_adapters[nickname][lora_A_name].shape[0]
+                    )
                     alpha_key = name + ".alpha"
                     if alpha_key in self.lora_adapters[nickname]:
-                        try:
-                            inferred_alpha = int(
-                                self.lora_adapters[nickname][alpha_key].item()
-                            )
-                        except Exception:
-                            inferred_alpha = None
-
-                    if inferred_rank is not None:
-                        layer.lora_rank = inferred_rank
-                        layer.lora_alpha = (
-                            inferred_alpha
-                            if inferred_alpha is not None
-                            else inferred_rank
+                        inferred_alpha = int(
+                            self.lora_adapters[nickname][alpha_key].item()
                         )
+                    else:
+                        # Some distilled LoRAs omit per-layer alpha and rely on the
+                        # default LoRA scale of alpha == rank. Falling back to rank
+                        # keeps the effective delta consistent with the official path.
+                        inferred_alpha = inferred_rank
+
+                    layer.lora_rank = inferred_rank
+                    layer.lora_alpha = inferred_alpha
 
                     layer.set_lora_weights(
                         self.lora_adapters[nickname][lora_A_name],
                         self.lora_adapters[nickname][lora_B_name],
                         lora_path=path,
                         strength=lora_strength,
+                        merge_weights=merge_weights,
                         clear_existing=(
                             clear_existing and idx == 0
                         ),  # Only clear on first LoRA
@@ -514,16 +506,25 @@ class LoRAPipeline(ComposedPipelineBase):
             return bool(self.cur_adapter_name)
         return target in self.cur_adapter_name
 
-    def load_lora_adapter(self, lora_path: str, lora_nickname: str, rank: int):
+    def load_lora_adapter(
+        self,
+        lora_path: str,
+        lora_nickname: str,
+        rank: int,
+        weight_name: str | None = None,
+    ):
         """
         Load the LoRA, and setup the lora_adapters for later weight replacement
         """
         assert lora_path is not None
 
+        if weight_name is None and lora_path == self.server_args.lora_path:
+            weight_name = self.server_args.lora_weight_name
+
         # Only rank 0 downloads to avoid race conditions where other ranks
         # try to load incomplete downloads
         if rank == 0:
-            lora_local_path = maybe_download_lora(lora_path)
+            lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
         else:
             lora_local_path = None
 
@@ -533,7 +534,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
         # Non-rank-0 workers now download (will hit cache since rank 0 completed)
         if rank != 0:
-            lora_local_path = maybe_download_lora(lora_path)
+            lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
 
         raw_state_dict = load_file(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)
@@ -589,6 +590,7 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_path: str | None | list[str | None] = None,
         target: str | list[str] = "all",
         strength: float | list[float] = 1.0,
+        merge_weights: bool = True,
     ):  # type: ignore
         """
         Load LoRA adapter(s) into the pipeline and apply them to the specified transformer(s).
@@ -682,6 +684,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         rank,
                         tgt_strengths,
                         clear_existing=True,
+                        merge_weights=merge_weights,
                     )
                     adapted_count += count
                     self.cur_adapter_name[module_name] = merged_name
@@ -689,7 +692,7 @@ class LoRAPipeline(ComposedPipelineBase):
                         str(p or self.loaded_adapter_paths.get(n, ""))
                         for n, p in zip(tgt_nicknames, tgt_paths)
                     )
-                    self.is_lora_merged[module_name] = True
+                    self.is_lora_merged[module_name] = merge_weights
                     self.cur_adapter_strength[module_name] = tgt_strengths[0]
                     # Store full configuration for multi-LoRA support (preserves order and all strengths)
                     self.cur_adapter_config[module_name] = (
@@ -698,7 +701,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     )
 
         logger.info(
-            "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s)",
+            "Rank %d: LoRA adapter(s) %s applied to %d layers (targets: %s, strengths: %s, merge_weights=%s)",
             rank,
             ", ".join(map(str, lora_paths)) if lora_paths else None,
             adapted_count,
@@ -708,7 +711,41 @@ class LoRAPipeline(ComposedPipelineBase):
                 if len(strengths) > 1
                 else f"{strengths[0]:.2f}"
             ),
+            merge_weights,
         )
+
+    def deactivate_lora_weights(self, target: str = "all") -> None:
+        """
+        Disable LoRA for the specified target, regardless of whether weights were
+        merged into the base model or are still active in the wrapped LoRA path.
+        """
+        target_modules, error = self._get_target_lora_layers(target)
+        if error:
+            logger.warning("deactivate_lora_weights: %s", error)
+        if not target_modules:
+            return
+
+        modules_requiring_unmerge = []
+        for module_name, lora_layers_dict in target_modules:
+            if self.is_lora_merged.get(module_name, False) or any(
+                layer.merged for layer in lora_layers_dict.values()
+            ):
+                modules_requiring_unmerge.append((module_name, lora_layers_dict))
+
+        offload_context = self._temporarily_disable_offload(
+            target_modules=modules_requiring_unmerge
+        )
+        with offload_context:
+            for module_name, lora_layers_dict in target_modules:
+                for layer in lora_layers_dict.values():
+                    if layer.merged:
+                        layer.unmerge_lora_weights()
+                    if not layer.disable_lora:
+                        layer.disable_lora = True
+                self.is_lora_merged[module_name] = False
+                self.cur_adapter_strength.pop(module_name, None)
+                self.cur_adapter_config.pop(module_name, None)
+                logger.info("LoRA weights deactivated for %s", module_name)
 
     def merge_lora_weights(self, target: str = "all", strength: float = 1.0) -> None:
         """
