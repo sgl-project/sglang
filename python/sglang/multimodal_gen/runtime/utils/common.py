@@ -264,7 +264,6 @@ def set_cuda_arch():
     # For XPU or other platforms, no arch setting needed
 
 
-
 # musa
 
 

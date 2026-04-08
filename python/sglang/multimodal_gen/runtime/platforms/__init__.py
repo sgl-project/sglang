@@ -137,6 +137,7 @@ def musa_platform_plugin() -> str | None:
         "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform" if is_musa else None
     )
 
+
 def xpu_platform_plugin() -> str | None:
     """Detect if Intel XPU platform is available."""
     is_xpu = False

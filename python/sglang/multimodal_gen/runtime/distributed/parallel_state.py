@@ -192,7 +192,9 @@ def init_distributed_environment(
 
     if backend is None:
         backend = current_platform.get_torch_distributed_backend_str()
-        logger.info("Using %s backend for %s platform", backend, current_platform.device_name)
+        logger.info(
+            "Using %s backend for %s platform", backend, current_platform.device_name
+        )
 
     logger.debug(
         "world_size=%d rank=%d local_rank=%d "
