@@ -38,7 +38,7 @@ class EngineScoreMixin:
         # Query embedding overrides.
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         # Item embedding overrides: per-item list of tensors.
-        item_embed_overrides: Optional[List[List[Optional[torch.Tensor]]]] = None,
+        item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
     ) -> ScoreResult:
         """
         Score items against a query using the loaded model.
@@ -90,7 +90,7 @@ class EngineScoreMixin:
         item_first: bool = False,
         embed_override_token_id: Optional[int] = None,
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
-        item_embed_overrides: Optional[List[List[Optional[torch.Tensor]]]] = None,
+        item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
     ) -> ScoreResult:
         """Asynchronous version of score(). See score() for full documentation."""
         return await self.tokenizer_manager.score_request(

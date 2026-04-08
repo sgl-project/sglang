@@ -815,7 +815,8 @@ class EmbeddingReqInput(BaseReq):
     # Unresolved embedding overrides: per-input list of tensors.
     # Position resolution happens in the tokenizer manager after tokenization.
     # Shape: [num_inputs][num_replacements] where each entry is a torch.Tensor of [hidden_size].
-    embed_overrides: Optional[List[List[torch.Tensor]]] = None
+    # Per-input entry may be None when only some inputs in a batch need overrides.
+    embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     positional_embed_overrides: Optional[
         Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]

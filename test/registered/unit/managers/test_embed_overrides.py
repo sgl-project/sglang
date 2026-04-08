@@ -9,6 +9,7 @@ Covers:
 """
 
 import unittest
+from unittest.mock import AsyncMock, MagicMock
 
 import torch
 
@@ -86,6 +87,8 @@ class TestConvertEmbedsToTensors(CustomTestCase):
         self.assertEqual(len(result[0]), 2)  # two replacement vectors
         self.assertTrue(torch.is_tensor(result[0][0]))
         self.assertEqual(result[0][0].tolist(), [1.0, 2.0])
+        self.assertEqual(result[0][0].dtype, torch.float32)
+        self.assertEqual(result[0][0].dim(), 1)  # each vector is 1-D
 
     def test_batch_input(self):
         """[num_inputs][num_replacements][hidden_size] -> [[tensor, ...], ...]"""
@@ -198,10 +201,21 @@ class TestEmbeddingReqInputEmbedOverride(CustomTestCase):
 # ========================================================================
 
 
+class _FakeServerArgs:
+    """Minimal stub for server_args."""
+
+    def __init__(self, multi_item_scoring_delimiter=None):
+        self.multi_item_scoring_delimiter = multi_item_scoring_delimiter
+
+
 class _FakeMixin(TokenizerManagerScoreMixin):
     """Minimal stub to call mixin methods without a full TokenizerManager."""
 
-    pass
+    def __init__(self, delimiter=None):
+        self.server_args = _FakeServerArgs(delimiter)
+        self.multi_item_delimiter_text = None
+        self.tokenizer = None
+        self.is_generation = True
 
 
 class TestResolveOverridesForSequence(CustomTestCase):
@@ -235,6 +249,16 @@ class TestResolveOverridesForSequence(CustomTestCase):
             position_offset=100,
         )
         self.assertEqual(positions, [101])
+
+    def test_empty_embeds_list(self):
+        """Empty embeds list with no placeholders succeeds."""
+        embeds, positions = self.mixin._resolve_overrides_for_sequence(
+            token_ids=[10, 20],
+            embeds=[],
+            embed_override_token_id=50,
+        )
+        self.assertEqual(embeds, [])
+        self.assertEqual(positions, [])
 
     def test_count_mismatch_raises(self):
         with self.assertRaises(ValueError):
@@ -304,6 +328,270 @@ class TestResolveEmbedOverridesForRequest(CustomTestCase):
         )
         self.assertEqual(pe.positions, [0, 3])  # query pos 0, item pos 1+offset 2
         self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
+
+
+# ========================================================================
+# Score mixin: _build_token_id_inputs
+# ========================================================================
+
+DELIM_TOKEN = 99
+
+
+class TestBuildTokenIdInputs(CustomTestCase):
+    def setUp(self):
+        self.mixin = _FakeMixin(delimiter=DELIM_TOKEN)
+
+    # --- single-item mode, no embeds ---
+
+    def test_single_item_no_embeds(self):
+        _, input_ids, injection = self.mixin._build_token_id_inputs(
+            query=[1, 2],
+            items=[[3, 4], [5, 6]],
+            item_first=False,
+            use_multi_item_scoring=False,
+            embed_override_token_id=None,
+            query_embed_overrides=None,
+            item_embed_overrides=None,
+        )
+        self.assertEqual(input_ids, [[1, 2, 3, 4], [1, 2, 5, 6]])
+        self.assertIsNone(injection)
+
+    def test_single_item_no_embeds_item_first(self):
+        _, input_ids, injection = self.mixin._build_token_id_inputs(
+            query=[1, 2],
+            items=[[3, 4]],
+            item_first=True,
+            use_multi_item_scoring=False,
+            embed_override_token_id=None,
+            query_embed_overrides=None,
+            item_embed_overrides=None,
+        )
+        self.assertEqual(input_ids, [[3, 4, 1, 2]])
+        self.assertIsNone(injection)
+
+    # --- multi-item mode, no embeds ---
+
+    def test_multi_item_no_embeds(self):
+        _, input_ids, injection = self.mixin._build_token_id_inputs(
+            query=[1, 2],
+            items=[[3, 4], [5, 6]],
+            item_first=False,
+            use_multi_item_scoring=True,
+            embed_override_token_id=None,
+            query_embed_overrides=None,
+            item_embed_overrides=None,
+        )
+        # query<D>item1<D>item2<D>
+        self.assertEqual(input_ids, [[1, 2, DELIM_TOKEN, 3, 4, DELIM_TOKEN, 5, 6, DELIM_TOKEN]])
+        self.assertIsNone(injection)
+
+    # --- single-item mode, with embeds ---
+
+    def test_single_item_query_embeds(self):
+        """Query placeholder overrides are resolved per item."""
+        _, input_ids, injection = self.mixin._build_token_id_inputs(
+            query=[50, 10],
+            items=[[20, 30], [40, 50]],
+            item_first=False,
+            use_multi_item_scoring=False,
+            embed_override_token_id=50,
+            query_embed_overrides=[_vec(1)],
+            item_embed_overrides=None,
+        )
+        self.assertEqual(input_ids, [[50, 10, 20, 30], [50, 10, 40, 50]])
+        self.assertIsNotNone(injection)
+        self.assertEqual(len(injection), 2)
+        # Each item gets its own PositionalEmbeds with query override at pos 0
+        self.assertEqual(injection[0].positions, [0])
+        self.assertEqual(injection[1].positions, [0])
+
+    def test_single_item_item_embeds(self):
+        """Per-item overrides with correct position offsets."""
+        _, input_ids, injection = self.mixin._build_token_id_inputs(
+            query=[10, 20],
+            items=[[50, 30]],
+            item_first=False,
+            use_multi_item_scoring=False,
+            embed_override_token_id=50,
+            query_embed_overrides=None,
+            item_embed_overrides=[[_vec(2)]],
+        )
+        self.assertEqual(input_ids, [[10, 20, 50, 30]])
+        self.assertIsNotNone(injection)
+        # item placeholder at index 0 of item, offset by query length 2
+        self.assertEqual(injection[0].positions, [2])
+
+    def test_single_item_no_override_positions_returns_none_injection(self):
+        """When no items have placeholders, injection should be None."""
+        _, input_ids, injection = self.mixin._build_token_id_inputs(
+            query=[10, 20],
+            items=[[30, 40]],
+            item_first=False,
+            use_multi_item_scoring=False,
+            embed_override_token_id=50,
+            query_embed_overrides=None,
+            item_embed_overrides=[None],
+        )
+        self.assertIsNone(injection)
+
+    def test_single_item_query_and_item_embeds(self):
+        """Single-item mode with both query and item overrides in one request."""
+        _, input_ids, injection = self.mixin._build_token_id_inputs(
+            query=[50, 10],
+            items=[[20, 50]],
+            item_first=False,
+            use_multi_item_scoring=False,
+            embed_override_token_id=50,
+            query_embed_overrides=[_vec(1)],
+            item_embed_overrides=[[_vec(2)]],
+        )
+        self.assertEqual(input_ids, [[50, 10, 20, 50]])
+        self.assertIsNotNone(injection)
+        pe = injection[0]
+        # query override at pos 0, item override at pos 3 (query_len=2 + idx=1)
+        self.assertEqual(pe.positions, [0, 3])
+        self.assertEqual(pe.embeds.shape, (2, HIDDEN_DIM))
+
+    def test_single_item_empty_query(self):
+        """Empty query with item-only overrides (valid from score_prompts)."""
+        _, input_ids, injection = self.mixin._build_token_id_inputs(
+            query=[],
+            items=[[50, 10]],
+            item_first=False,
+            use_multi_item_scoring=False,
+            embed_override_token_id=50,
+            query_embed_overrides=None,
+            item_embed_overrides=[[_vec(1)]],
+        )
+        self.assertEqual(input_ids, [[50, 10]])
+        self.assertIsNotNone(injection)
+        # item placeholder at absolute pos 0 (offset=len([])=0)
+        self.assertEqual(injection[0].positions, [0])
+
+    # --- multi-item mode, with embeds ---
+
+    def test_multi_item_with_query_and_item_embeds(self):
+        """Multi-item mode resolves query overrides once and item overrides per item."""
+        _, input_ids, injection = self.mixin._build_token_id_inputs(
+            query=[50, 10],
+            items=[[20, 50], [30, 40]],
+            item_first=False,
+            use_multi_item_scoring=True,
+            embed_override_token_id=50,
+            query_embed_overrides=[_vec(1)],
+            item_embed_overrides=[[_vec(2)], None],
+        )
+        # query<D>item1<D>item2<D> = [50,10, 99, 20,50, 99, 30,40, 99]
+        self.assertEqual(len(input_ids), 1)
+        self.assertIsNotNone(injection)
+        self.assertEqual(len(injection), 1)  # single PositionalEmbeds for combined sequence
+        pe = injection[0]
+        # query override at pos 0, item[0] override at pos 4 (query_len=2 + delim=1 + idx=1)
+        self.assertIn(0, pe.positions)
+        self.assertIn(4, pe.positions)
+        self.assertEqual(pe.embeds.shape[0], 2)
+
+
+# ========================================================================
+# Score mixin: score_request validation
+# ========================================================================
+
+
+class TestScoreRequestValidation(CustomTestCase):
+    """Test validation guards in score_request without running full pipeline."""
+
+    def setUp(self):
+        self.mixin = _FakeMixin()
+
+    def _call(self, **kwargs):
+        """Wrapper to call score_request synchronously."""
+        import asyncio
+
+        return asyncio.run(self.mixin.score_request(**kwargs))
+
+    def test_generation_requires_label_token_ids(self):
+        self.mixin.is_generation = True
+        with self.assertRaisesRegex(ValueError, "label_token_ids is required"):
+            self._call(
+                query=[1, 2],
+                items=[[3, 4]],
+                label_token_ids=None,
+            )
+
+    def test_seq_classification_allows_none_label_token_ids(self):
+        """SequenceClassification models should not require label_token_ids.
+        Verify it passes validation and reaches generate_request."""
+        self.mixin.is_generation = False
+        mock_result = AsyncMock()
+        mock_result.__anext__ = AsyncMock(
+            return_value=[{"embedding": [0.1, 0.9], "meta_info": {"prompt_tokens": 2}}]
+        )
+        self.mixin.generate_request = MagicMock(return_value=mock_result)
+        result = self._call(
+            query=[1, 2],
+            items=[[3, 4]],
+            label_token_ids=None,
+        )
+        self.mixin.generate_request.assert_called_once()
+        self.assertEqual(len(result.scores), 1)
+
+    def test_items_none_raises(self):
+        with self.assertRaisesRegex(ValueError, "items must be provided"):
+            self._call(
+                query=[1, 2],
+                items=None,
+                label_token_ids=[100],
+            )
+
+    def test_empty_items_returns_empty(self):
+        result = self._call(
+            query=[1, 2],
+            items=[],
+            label_token_ids=[100],
+        )
+        self.assertEqual(result.scores, [])
+        self.assertEqual(result.prompt_tokens, 0)
+
+    def test_embed_override_token_id_required_with_query_embeds(self):
+        with self.assertRaisesRegex(ValueError, "embed_override_token_id is required"):
+            self._call(
+                query=[1, 2],
+                items=[[3, 4]],
+                label_token_ids=[100],
+                query_embed_overrides=[_vec(1)],
+                embed_override_token_id=None,
+            )
+
+    def test_embed_override_token_id_required_with_item_embeds(self):
+        with self.assertRaisesRegex(ValueError, "embed_override_token_id is required"):
+            self._call(
+                query=[1, 2],
+                items=[[3, 4]],
+                label_token_ids=[100],
+                item_embed_overrides=[[_vec(1)]],
+                embed_override_token_id=None,
+            )
+
+    def test_item_first_with_embeds_raises(self):
+        with self.assertRaisesRegex(ValueError, "item_first is not supported"):
+            self._call(
+                query=[1, 2],
+                items=[[3, 4]],
+                label_token_ids=[100],
+                item_first=True,
+                embed_override_token_id=50,
+                query_embed_overrides=[_vec(1)],
+            )
+
+    def test_item_embed_overrides_length_mismatch_raises(self):
+        with self.assertRaisesRegex(ValueError, "must match items length"):
+            self._call(
+                query=[1, 2],
+                items=[[3, 4], [5, 6]],
+                label_token_ids=[100],
+                embed_override_token_id=50,
+                item_embed_overrides=[[_vec(1)]],  # 1 override for 2 items
+            )
 
 
 if __name__ == "__main__":

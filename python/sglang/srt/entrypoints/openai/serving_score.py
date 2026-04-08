@@ -52,10 +52,14 @@ class OpenAIServingScore(OpenAIServingBase):
                 if request.query_embed_overrides is not None
                 else None
             )
-            # item_embed_overrides is [num_items][num_replacements][hidden_size] -> List[List[Tensor]]
+            # item_embed_overrides is [num_items][num_replacements][hidden_size] -> List[Optional[List[Tensor]]]
             item_embed_overrides = (
                 [
-                    [torch.tensor(v, dtype=torch.float32) for v in per_item]
+                    (
+                        [torch.tensor(v, dtype=torch.float32) for v in per_item]
+                        if per_item is not None
+                        else None
+                    )
                     for per_item in request.item_embed_overrides
                 ]
                 if request.item_embed_overrides is not None

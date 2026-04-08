@@ -326,14 +326,13 @@ class TokenizerManagerScoreMixin:
             for idx, tok in enumerate(token_ids)
             if tok == embed_override_token_id
         ]
-        non_none = [e for e in embeds if e is not None]
-        if len(positions) != len(non_none):
+        if len(positions) != len(embeds):
             raise ValueError(
                 f"{label} contains {len(positions)} occurrences of "
                 f"embed_override_token_id={embed_override_token_id}, "
-                f"but {len(non_none)} override embeddings were provided."
+                f"but {len(embeds)} override embeddings were provided."
             )
-        return non_none, positions
+        return embeds, positions
 
     def _resolve_embed_overrides_for_request(
         self,
@@ -636,6 +635,7 @@ class TokenizerManagerScoreMixin:
             batch_request = EmbeddingReqInput(
                 text=text_prompts,
                 input_ids=input_ids,
+                positional_embed_overrides=positional_embed_overrides,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()
