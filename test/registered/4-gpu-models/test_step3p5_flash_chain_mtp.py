@@ -50,7 +50,7 @@ class TestStep3p5FlashChainMTP(CustomTestCase):
             "fa3",
             "--enable-multi-layer-eagle",
             "--mem-fraction-static",
-            "0.82",
+            "0.75",
             "--chunked-prefill-size",
             "4096",
             "--model-loader-extra-config",
