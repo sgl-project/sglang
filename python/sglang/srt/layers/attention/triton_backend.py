@@ -111,6 +111,7 @@ class TritonAttnBackend(AttentionBackend):
         elif (
             model_runner.hybrid_gdn_config is not None
             or model_runner.kimi_linear_config is not None
+            or model_runner.linear_attn_model_spec is not None
         ):
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
