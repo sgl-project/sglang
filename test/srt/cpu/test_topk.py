@@ -64,13 +64,22 @@ class TestGroupedTopK(CustomTestCase):
 # DeepSeek V2/V3/R1 uses biased_grouped_top
 class TestBiasedGroupedTopK(CustomTestCase):
     def _run_single_test(
-        self, M, E, G, topk, topk_group, renormalize, dtype, bias_dtype
+        self,
+        M,
+        E,
+        G,
+        topk,
+        topk_group,
+        renormalize,
+        gating_dtype,
+        bias_dtype,
+        routed_scaling_factor,
     ):
-        torch.manual_seed(1234)
+        torch.manual_seed(800)
 
         # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
-        hidden_states = torch.randn(M, 100, dtype=dtype)
-        gating_output = torch.randn(M, E, dtype=dtype) * 2 * M
+        hidden_states = torch.randn(M, 100, dtype=torch.bfloat16)
+        gating_output = torch.randn(M, E, dtype=gating_dtype) * 2 * M
         correction_bias = torch.randn(E, dtype=bias_dtype)
 
         ref_topk_weights, ref_topk_ids = native_biased_grouped_topk(
@@ -81,6 +90,10 @@ class TestBiasedGroupedTopK(CustomTestCase):
             renormalize,
             G,
             topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=(
+                True if routed_scaling_factor is not None else False
+            ),
         )
 
         # fused version
@@ -93,7 +106,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
             G,
             topk_group,
             0,
-            None,
+            routed_scaling_factor,
             None,
         )
 
@@ -106,9 +119,20 @@ class TestBiasedGroupedTopK(CustomTestCase):
     def test_biased_grouped_topk(self):
         for renormalize in [True, False]:
             for bias_dtype in [torch.float32, torch.bfloat16]:
-                self._run_single_test(
-                    122, 256, 8, 8, 2, renormalize, torch.bfloat16, bias_dtype
-                )
+                for gating_dtype in [torch.float32, torch.bfloat16]:
+                    for routed_scaling_factor in [None, 1.0, 2.0]:
+                        for E_num in [192, 256, 384]:
+                            self._run_single_test(
+                                122,
+                                E_num,
+                                8,
+                                8,
+                                2,
+                                renormalize,
+                                gating_dtype,
+                                bias_dtype,
+                                routed_scaling_factor,
+                            )
 
 
 class TestTopK(CustomTestCase):
