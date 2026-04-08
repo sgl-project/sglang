@@ -2552,10 +2552,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         num_tokens = batch_size * num_tokens_per_bs
 
-        # When require_mlp_sync is True, the scheduler's prepare_mlp_sync_batch
-        # ceil-aligns num_tokens to attn_tp_size at runtime. _dummy_run bypasses the
-        # scheduler, so we must replicate that alignment here to avoid shape mismatches
-        # (e.g. reduce_scatter_tensor failing when tensor size % world_size != 0).
+        # Keep warmup aligned with scheduler MLP-sync padding.
         if require_mlp_sync(self.server_args):
             attn_tp_size = get_attention_tp_size()
             if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
