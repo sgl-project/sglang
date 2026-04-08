@@ -228,7 +228,8 @@ class TestGetJsonSchemaConstraint(CustomTestCase):
         result = get_json_schema_constraint(tools, choice)
         self.assertEqual(result["type"], "array")
         self.assertEqual(result["minItems"], 1)
-        self.assertEqual(result["maxItems"], 1)
+        # parallel_tool_calls defaults to True, so maxItems is not set (#20208)
+        self.assertNotIn("maxItems", result)
 
     def test_specific_tool_choice_not_found_returns_none(self):
         tools = [_make_tool("weather", {"type": "object"})]
