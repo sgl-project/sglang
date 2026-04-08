@@ -2,16 +2,17 @@ import bisect
 import logging
 import math
 import os
-from contextlib import contextmanager
 from enum import IntEnum
 from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
-from torch.distributed import ProcessGroup, ReduceOp
+from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.utils import is_hip
+
+from .base import AllReduceMode, BaseCommunicator
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,8 @@ def mscclpp_bench_time(func, test_niter: int = 10, warmup_niter: int = 2):
     return func_cost_us
 
 
-class PyMscclppCommunicator:
+class PyMscclppCommunicator(BaseCommunicator):
+    name = "pymscclpp"
     _SUPPORTED_WORLD_SIZES = [8, 16]
     _MAX_BYTES = mscclpp_convert_to_bytes(os.getenv("SGLANG_MSCCLPP_MAX_BYTES", "1MB"))
     _SUPPORTED_DTYPE = [torch.float, torch.float16, torch.bfloat16]
@@ -111,13 +113,14 @@ class PyMscclppCommunicator:
         is bind to a unique device, and all communicators in this group
         are in the same node.
         """
-        self._IS_CAPTURING = False
-        self.disabled = True
 
         if not ops.IS_MSCCLPP_AR_AVAILABLE:
             # disable because of missing mscclpp library
             # e.g. in a non-cuda environment
-            return
+            raise RuntimeError(
+                "PyMscclpp is disabled because the mscclpp library is not found."
+                "To silence this warning, specify disable_mscclpp=True explicitly."
+            )
 
         self.group = group
 
@@ -127,31 +130,29 @@ class PyMscclppCommunicator:
 
         rank = dist.get_rank(group=self.group)
         world_size = dist.get_world_size(group=self.group)
-        if world_size == 1:
-            # No need to initialize mscclpp for single GPU case.
-            return
+        assert world_size > 1
+        # PyMscclpp is enabled only in cuda graph
+        super().__init__(world_size=world_size, disabled=True)
 
         if world_size not in PyMscclppCommunicator._SUPPORTED_WORLD_SIZES:
-            logger.warning(
+            raise ValueError(
                 "PyMscclpp is disabled due to an unsupported world"
                 " size: %d. Supported world sizes: %s. To silence this "
                 "warning, specify disable_mscclpp=True explicitly.",
                 world_size,
                 str(PyMscclppCommunicator._SUPPORTED_WORLD_SIZES),
             )
-            return
 
         self.ranks = torch.distributed.get_process_group_ranks(group)
         self.nranks_per_node = torch.cuda.device_count()
         # for now mscclpp with stride in the communicator is not tested
         if not (abs(self.ranks[-1] - self.ranks[0]) == world_size - 1):
-            logger.warning(
+            raise ValueError(
                 "PyMscclpp is disabled due to an unsupported group %s."
                 "Please ensure all ranks in the group are consecutive."
                 "To silence this warning, specify disable_mscclpp=True explicitly.",
                 str(self.ranks),
             )
-            return
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -224,9 +225,6 @@ class PyMscclppCommunicator:
         )
         self.msg_size2best_config = msg_size2best_config[0]
 
-        # PyMscclpp is enabled only in cuda graph
-        self.disabled = True
-
     def pre_tune_config(self, dtype=torch.bfloat16) -> bool:
         logger.debug(f"start to pre-tune configs for rank {self.rank}")
         nthreads_to_try = [256, 512, 1024]
@@ -257,46 +255,35 @@ class PyMscclppCommunicator:
                     f"for msg_size {msg_size}, best_config: {best_config}, best_time: {best_time}us"
                 )
 
-    def should_mscclpp_allreduce(
-        self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
-    ) -> bool:
-        if self.disabled or self._context is None:
-            return False
-        if inp.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
-            return False
-        if not mscclpp_is_weak_contiguous(inp):
-            return False
-        # only support sum op
-        if op != ReduceOp.SUM:
-            return False
-        if inp.numel() * inp.element_size() > self.max_bytes:
-            return False
+    def graph_capture_context(self):
+        return self.change_state(enable=True)
+
+    def should_use_custom_op(self) -> bool:
         return True
 
-    def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM):
-        if self._IS_CAPTURING:
-            if torch.cuda.is_current_stream_capturing():
-                self.graph_input_set.add((tensor.dtype, tensor.numel()))
-        msg_size = tensor.numel() * tensor.itemsize
+    def get_all_reduce_mode(self, input_: torch.Tensor) -> Optional[AllReduceMode]:
+        if self.disabled or self._context is None:
+            return None
+        if input_.dtype not in PyMscclppCommunicator._SUPPORTED_DTYPE:
+            return None
+        if not mscclpp_is_weak_contiguous(input_):
+            return None
+        if input_.numel() * input_.element_size() > self.max_bytes:
+            return None
+        return AllReduceMode.OUTPLACE
+
+    @BaseCommunicator.validate
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        *,
+        inplace: Optional[bool] = None,
+    ) -> torch.Tensor:
+        self.assert_outplace("all_reduce", inplace)
+        msg_size = input_.numel() * input_.element_size()
         index = bisect.bisect_left(self.msg_size_for_finetune, msg_size)
         msg_size_finetune = self.msg_size_for_finetune[index]
         nthreads, nblocks = self.msg_size2best_config[msg_size_finetune]
-        result = torch.empty_like(tensor)
-        ops.mscclpp_allreduce(self._context, tensor, result, nthreads, nblocks)
+        result = torch.empty_like(input_)
+        ops.mscclpp_allreduce(self._context, input_, result, nthreads, nblocks)
         return result
-
-    @contextmanager
-    def change_state(
-        self,
-        enable: Optional[bool] = None,
-    ):
-        if enable is None:
-            # guess a default value when not specified
-            enable = self.available
-
-        old_disable = self.disabled
-        self.disabled = not enable
-
-        yield
-
-        self.disabled = old_disable

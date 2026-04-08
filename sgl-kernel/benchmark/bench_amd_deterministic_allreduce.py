@@ -258,7 +258,7 @@ def worker(world_size, rank, port, results_queue):
                         # Measure latency
                         torch.cuda.synchronize()
                         start = time.perf_counter()
-                        result_kernel = custom_ar.custom_all_reduce(inp_kernel)
+                        result_kernel = custom_ar.all_reduce(inp_kernel)
                         torch.cuda.synchronize()
                         end = time.perf_counter()
                         latencies_deterministic_kernel.append(end - start)

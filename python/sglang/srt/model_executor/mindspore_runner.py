@@ -13,7 +13,7 @@ import torch
 from mindspore._c_expression import GroupOptions
 from mindspore.communication import create_group
 
-from sglang.srt.distributed.parallel_state import _groups
+from sglang.srt.distributed.device_communicators.impl import _GROUPS
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +89,7 @@ def set_ms_parallel_env(rank, local_rank, world_size, init_method):
 
 
 def reuse_hccl_comm():
-    for group_name, group in _groups.items():
+    for group_name, group in _GROUPS.items():
         # Torch ProcessGroupHccl
         device_group = group().device_group
         hccl_comm_handle = device_group._get_backend(torch.device("npu")).get_hccl_comm(

@@ -107,6 +107,8 @@ def run_once(comm, inp: torch.Tensor) -> Optional[torch.Tensor]:
         return comm.all_reduce_unreg(inp)
     if hasattr(comm, "custom_all_reduce"):
         return comm.custom_all_reduce(inp)
+    if hasattr(comm, "all_reduce"):
+        return comm.all_reduce(inp)
     raise RuntimeError("No known all-reduce method found on the communicator.")
 
 

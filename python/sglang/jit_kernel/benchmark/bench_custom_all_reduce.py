@@ -97,8 +97,7 @@ class AOTAllReduceBackend:
         return self.comm.capture()  # ignore register_input since v1 always requires it
 
     def all_reduce(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
-        assert self.comm.should_custom_ar(tensor), str(tensor.shape)
-        return self.comm.custom_all_reduce(tensor)
+        return self.comm.all_reduce(tensor)
 
 
 class JITAllReduceBackend:
@@ -118,8 +117,7 @@ class JITAllReduceBackend:
         return self.comm.capture() if register_input else contextlib.nullcontext()
 
     def all_reduce(self, tensor: torch.Tensor) -> Optional[torch.Tensor]:
-        assert self.comm.should_custom_ar(tensor), str(tensor.shape)
-        return self.comm.custom_all_reduce(tensor)
+        return self.comm.all_reduce(tensor)
 
 
 class FlashInferAllReduceBackend:
