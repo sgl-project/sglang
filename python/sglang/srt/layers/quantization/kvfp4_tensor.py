@@ -59,7 +59,11 @@ E2M1_BOUNDS = torch.tensor(
 
 
 class BlockFP4KVQuantizeUtil:
-    """Utility class for MXFP4 block-wise quantization and dequantization."""
+    """Block-wise FP4 (E2M1) quantization for KV cache.
+
+    Similar to MXFP4 but uses block_size=16 (MXFP4 spec defines block_size=32).
+    Each block of 16 elements shares one uint8 exponent-only scale factor.
+    """
 
     @staticmethod
     @torch.compile
