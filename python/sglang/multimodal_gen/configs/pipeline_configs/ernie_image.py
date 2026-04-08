@@ -14,6 +14,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 def ernie_image_postprocess_text(outputs, _text_inputs, hidden_layer_index=-2):
@@ -85,11 +88,31 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
             dict(
                 padding=False,
                 truncation=True,
-                max_length=1536,
+                max_length=None,  # Loaded at runtime from tokenizer/tokenizer_config.json
                 add_special_tokens=True,
             ),
         ]
     )
+
+    def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
+        max_length = tok_kwargs.get("max_length")
+        if max_length is not None:
+            check = tokenizer(
+                prompt,
+                truncation=False,
+                return_tensors="pt",
+                add_special_tokens=tok_kwargs.get("add_special_tokens", True),
+            )
+            for i, ids in enumerate(check["input_ids"]):
+                if ids.shape[-1] > max_length:
+                    logger.warning(
+                        "Prompt #%d has %d tokens, exceeds max_length=%d. "
+                        "The tail will be silently truncated.",
+                        i,
+                        ids.shape[-1],
+                        max_length,
+                    )
+        return tokenizer(prompt, **tok_kwargs)
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)

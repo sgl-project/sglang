@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """ErnieImage text-to-image pipeline."""
 
+import json
 import os
 
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -37,11 +38,65 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         except Exception:
             return False
 
+    def _read_tokenizer_model_max_length(self, model_path: str):
+        """Read model_max_length from tokenizer/tokenizer_config.json.
+
+        Supports both local paths and HuggingFace Hub model IDs.
+        Returns None if the value cannot be determined.
+        """
+        tokenizer_config_subpath = os.path.join("tokenizer", "tokenizer_config.json")
+
+        # Local path
+        if os.path.exists(model_path):
+            config_path = os.path.join(model_path, tokenizer_config_subpath)
+            if os.path.exists(config_path):
+                with open(config_path) as f:
+                    config = json.load(f)
+                return config.get("model_max_length")
+            return None
+
+        # Remote HuggingFace Hub model ID
+        try:
+            from huggingface_hub import hf_hub_download
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                config_path = hf_hub_download(
+                    repo_id=model_path,
+                    filename=tokenizer_config_subpath,
+                    local_dir=tmp_dir,
+                )
+                with open(config_path) as f:
+                    config = json.load(f)
+                return config.get("model_max_length")
+        except Exception as e:
+            logger.warning("Failed to read tokenizer_config.json from %s: %s", model_path, e)
+            return None
+
     def load_modules(self, server_args, loaded_modules=None):
         if self._has_pe_in_model_index(server_args):
             if "pe" not in self._required_config_modules:
                 self._required_config_modules.insert(0, "pe")
             logger.info("PE model detected in model_index.json, will load PE module.")
+
+        model_max_length = self._read_tokenizer_model_max_length(server_args.model_path)
+        if model_max_length is not None:
+            pipeline_config = server_args.pipeline_config
+            if (
+                hasattr(pipeline_config, "text_encoder_extra_args")
+                and pipeline_config.text_encoder_extra_args
+            ):
+                pipeline_config.text_encoder_extra_args[0]["max_length"] = model_max_length
+                logger.info(
+                    "Set text encoder max_length=%d from tokenizer/tokenizer_config.json",
+                    model_max_length,
+                )
+        else:
+            logger.warning(
+                "Could not read model_max_length from tokenizer/tokenizer_config.json, "
+                "using default max_length from pipeline config."
+            )
+
         return super().load_modules(server_args, loaded_modules)
 
     def create_pipeline_stages(self, server_args):
