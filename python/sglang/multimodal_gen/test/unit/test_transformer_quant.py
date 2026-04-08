@@ -1,5 +1,5 @@
 """
-    This unittest is introduced in #22360, preventing duplicate transformer safetensors variants being loaded together
+This unittest is introduced in #22360, preventing duplicate transformer safetensors variants being loaded together
 """
 
 import json
