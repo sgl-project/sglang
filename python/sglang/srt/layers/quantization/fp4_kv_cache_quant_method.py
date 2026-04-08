@@ -108,37 +108,6 @@ class FP4KVCacheQuantMethod(ABC):
         pass
 
 
-class NoneMethod(FP4KVCacheQuantMethod):
-    """Identity method for BF16 / FP8 KV cache — no extra quantization."""
-
-    name = "none"
-    SCALE_BLOCK_SIZE = 1
-
-    def create_buffers(self, size, head_num, head_dim, layer_num, device) -> dict:
-        # Not used: base MHATokenToKVPool handles BF16/FP8 buffer creation itself.
-        return {}
-
-    def quantize_and_store(
-        self,
-        k_buffer,
-        v_buffer,
-        k_scale_buffer,
-        v_scale_buffer,
-        loc,
-        cache_k,
-        cache_v,
-        k_scale=None,
-        v_scale=None,
-    ) -> None:
-        pass  # base class set_kv_buffer handles this
-
-    def dequantize_prev_kv(self, k_fp4, k_scales, v_fp4, v_scales, layer_id):
-        return k_fp4, v_fp4  # identity
-
-    def compute_cell_size(self, head_num, head_dim, num_layers, kv_size):
-        return 0  # base pool handles BF16/FP8 sizing
-
-
 class NVFP4Method(FP4KVCacheQuantMethod):
     """NVFP4 two-level scaling: global FP32 + per-block FP8 E4M3.
 
@@ -331,10 +300,10 @@ class NVFP4Method(FP4KVCacheQuantMethod):
         return fp4_size + scale_size + dq_size
 
 
-class MXFP4Method(FP4KVCacheQuantMethod):
-    """MXFP4 single-level block-wise scaling."""
+class BlockFP4Method(FP4KVCacheQuantMethod):
+    """Block-wise FP4 single-level scaling (similar to MXFP4 but block_size=16)."""
 
-    name = "mxfp4"
+    name = "blockfp4"
     SCALE_BLOCK_SIZE = 16
 
     def needs_dequant_workspace(self) -> bool:
@@ -438,7 +407,7 @@ class MXFP4Method(FP4KVCacheQuantMethod):
 # Registry: name → class.  Only classes for fp4_e2m1 dtype need to be listed.
 FP4_KV_CACHE_QUANT_REGISTRY: dict[str, type[FP4KVCacheQuantMethod]] = {
     "nvfp4": NVFP4Method,
-    "mxfp4": MXFP4Method,
+    "blockfp4": BlockFP4Method,
 }
 
 
