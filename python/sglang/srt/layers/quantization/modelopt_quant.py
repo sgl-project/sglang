@@ -1528,6 +1528,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
         self.enable_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self._cache_permute_indices = {}
 
