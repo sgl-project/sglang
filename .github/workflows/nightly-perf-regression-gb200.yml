@@ -1,4 +1,4 @@
-name: Nightly Test (GB200)
+name: Nightly Perf Regression (GB200)
 
 # NOTE: This workflow is intentionally cron-only.
 # It must NOT be triggered manually (no workflow_dispatch) to prevent

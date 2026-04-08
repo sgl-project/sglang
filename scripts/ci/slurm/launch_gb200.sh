@@ -38,7 +38,7 @@ set -x
 
 SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-sglang}"
-SRT_SLURM_BRANCH="${SRT_SLURM_BRANCH:-test-dynamo-1.0.0}"
+SRT_SLURM_BRANCH="${SRT_SLURM_BRANCH:-sync-from-origin-v2}"
 
 # ---------------------------------------------------------------------------
 # Resolve local model paths on Lustre (avoids re-downloading on each run)
@@ -72,7 +72,7 @@ SRT_REPO_DIR="$LUSTRE_WORKSPACE/srt-slurm"
 #     rm -rf "$SRT_REPO_DIR"
 # fi
 
-git clone https://github.com/csahithi/srt-slurm.git "$SRT_REPO_DIR"
+git clone https://github.com/csahithi/nv-srt-slurm.git "$SRT_REPO_DIR"
 cd "$SRT_REPO_DIR"
 git checkout "$SRT_SLURM_BRANCH"
 echo "--- srt-slurm last commit ---"
