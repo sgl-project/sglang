@@ -1,10 +1,11 @@
+import os
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from sglang.test.test_utils import ModelLaunchSettings
 from sglang.test.tool_call_test_runner import ToolCallTestParams
 
 register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
@@ -103,7 +104,7 @@ class TestDeepseekV32(unittest.TestCase):
             ),
         )
 
-    @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
+    @unittest.skipIf(os.environ.get("IS_BLACKWELL") == "1", "Requires H200 system")
     def test_deepseek_v32_nsa_backends(self):
         """Test NSA attention backend variants (H200 only).
 
@@ -160,7 +161,7 @@ class TestDeepseekV32(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        not is_blackwell_system(),
+        os.environ.get("IS_BLACKWELL") != "1",
         "Hardware agnostic - just using B200 for efficiency reasons",
     )
     def test_deepseek_v32_b200(self):

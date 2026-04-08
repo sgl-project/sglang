@@ -214,10 +214,10 @@ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 10
 if is_in_amd_ci():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600  # Match H200 timeout for large models
 
-if is_blackwell_system():
+if os.environ.get("IS_BLACKWELL") == "1":
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
-if is_h200_system():
+if os.environ.get("IS_H200") == "1":
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
 

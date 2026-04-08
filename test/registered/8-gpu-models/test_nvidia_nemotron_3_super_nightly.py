@@ -1,10 +1,11 @@
+import os
 import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both Hopper and Blackwell via nightly-8-gpu-common suite
 register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
@@ -94,7 +95,7 @@ class TestNvidiaNemotron3SuperNightly(unittest.TestCase):
             ),
         )
 
-    @unittest.skipIf(not is_blackwell_system(), "NVFP4 requires Blackwell")
+    @unittest.skipIf(os.environ.get("IS_BLACKWELL") != "1", "NVFP4 requires Blackwell")
     def test_nemotron_3_super_nvfp4(self):
         """Run performance and accuracy for all Nemotron 3 Super NVFP4 variants (Blackwell only)."""
         variants = [

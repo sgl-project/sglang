@@ -5,7 +5,7 @@ from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 # Note: trtllm_mla backend may have hardware-specific behavior
@@ -16,7 +16,7 @@ MISTRAL_LARGE3_NVFP4_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-
 MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-Eagle"
 
 
-@unittest.skipIf(not is_blackwell_system(), "Requires B200")
+@unittest.skipIf(os.environ.get("IS_BLACKWELL") != "1", "Requires B200")
 class TestMistralLarge3(unittest.TestCase):
     """Unified test class for Mistral-Large-3 performance and accuracy.
 

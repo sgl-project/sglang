@@ -43,7 +43,6 @@ jobs:
         timeout-minutes: 120
         env:
           GPU_CONFIG: "8-gpu-h200"
-          IS_H200: "1"
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite weekly-8-gpu-h200 --nightly --continue-on-error --timeout-per-file 7200
