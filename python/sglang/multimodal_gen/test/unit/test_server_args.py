@@ -129,12 +129,32 @@ class TestLTX23ParallelismSelection(unittest.TestCase):
         ):
             return ServerArgs.from_dict(kwargs)
 
+    def _from_cli_without_model_resolution(self, argv):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            with patch.object(sys, "argv", ["sglang"] + argv):
+                args, unknown_args = parser.parse_known_args(argv)
+                return ServerArgs.from_cli_args(args, unknown_args)
+
     def test_ltx23_one_stage_prefers_tp_on_2_gpus(self):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "Lightricks/LTX-2.3",
                 "num_gpus": 2,
             }
+        )
+
+        self.assertEqual(args.tp_size, 2)
+        self.assertEqual(args.sp_degree, 1)
+        self.assertEqual(args.ulysses_degree, 1)
+        self.assertEqual(args.ring_degree, 1)
+
+    def test_cli_ltx23_one_stage_prefers_tp_on_2_gpus(self):
+        args = self._from_cli_without_model_resolution(
+            ["--model-path", "Lightricks/LTX-2.3", "--num-gpus", "2"]
         )
 
         self.assertEqual(args.tp_size, 2)
@@ -152,6 +172,29 @@ class TestLTX23ParallelismSelection(unittest.TestCase):
                 "ulysses_degree": 2,
                 "ring_degree": 1,
             }
+        )
+
+        self.assertEqual(args.tp_size, 1)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.ulysses_degree, 2)
+        self.assertEqual(args.ring_degree, 1)
+
+    def test_cli_explicit_parallelism_is_not_overridden(self):
+        args = self._from_cli_without_model_resolution(
+            [
+                "--model-path",
+                "Lightricks/LTX-2.3",
+                "--num-gpus",
+                "2",
+                "--tp-size",
+                "1",
+                "--sp-degree",
+                "2",
+                "--ulysses-degree",
+                "2",
+                "--ring-degree",
+                "1",
+            ]
         )
 
         self.assertEqual(args.tp_size, 1)
