@@ -22,6 +22,29 @@ class TranscriptionAdapter(ABC):
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         """Return the ``sampling_params`` dict for ``GenerateReqInput``."""
 
+    @property
+    def supports_chunked_streaming(self) -> bool:
+        """Whether this model uses chunk-based streaming instead of token-level streaming."""
+        return False
+
+    @property
+    def prompt_template(self) -> str:
+        """Prompt template for chunked streaming requests.
+
+        Only used when ``supports_chunked_streaming`` is True.
+        The default returns an empty string.
+        """
+        return ""
+
+    @property
+    def chunked_streaming_config(self) -> dict:
+        """Parameters for ``StreamingASRState`` when using chunked streaming.
+
+        Only used when ``supports_chunked_streaming`` is True.
+        Keys: ``chunk_size_sec``, ``unfixed_chunk_num``, ``unfixed_token_num``.
+        """
+        return {}
+
     def postprocess_text(self, text: str) -> str:
         """Strip model-specific markers from raw decoded text.
 

@@ -15,6 +15,30 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 class Qwen3ASRAdapter(TranscriptionAdapter):
     ASR_TEXT_TAG = "<asr_text>"
 
+    @property
+    def supports_chunked_streaming(self) -> bool:
+        return True
+
+    @property
+    def chunked_streaming_config(self) -> dict:
+        # Qwen3-ASR paper (arXiv:2601.21337), Table 8:
+        # 2-second chunk size, 5-token fallback, last 2 chunks unfixed.
+        # TODO: allow users to override these via API request parameters.
+        return {
+            "chunk_size_sec": 2.0,
+            "unfixed_chunk_num": 2,
+            "unfixed_token_num": 5,
+        }
+
+    @property
+    def prompt_template(self) -> str:
+        return (
+            "<|im_start|>user\n"
+            "<|audio_start|><|audio_pad|><|audio_end|>"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         temperature = request.temperature
         if temperature == 0.0:
