@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import torch
 from safetensors import safe_open
 
 from sglang.multimodal_gen.runtime.layers.quantization import (
@@ -27,7 +28,9 @@ def _resolve_quant_method_name(quant_cfg: dict) -> str:
         or ""
     ).upper()
     if quant_algo == "MIXED_PRECISION":
-        raise ValueError("ModelOpt mixed precision is not supported in diffusion yet.")
+        raise ValueError(
+            "ModelOpt mixed precision is not supported by the current SGLang diffusion runtime."
+        )
     if "FP8" in quant_algo:
         return "modelopt_fp8"
     if "FP4" in quant_algo or "NVFP4" in quant_algo:
@@ -214,8 +217,6 @@ def _build_nvfp4_config_from_safetensors_files(
     safetensors. Building the config from only the first matching file can
     incorrectly exclude layers that are quantized in a later shard.
     """
-    import torch
-
     group_size = None
     quantized_bfl_modules: set[str] = set()
     non_quantized_bfl_modules: set[str] = set()
