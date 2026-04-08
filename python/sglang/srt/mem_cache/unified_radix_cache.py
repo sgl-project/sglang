@@ -48,11 +48,11 @@ if TYPE_CHECKING:
 class UnifiedTreeNode:
     counter = 0
 
-    def __init__(self, tree_components: list[ComponentType]):
+    def __init__(self, tree_components: tuple[ComponentType, ...]):
         self.children = defaultdict(partial(UnifiedTreeNode, tree_components))
         self.parent: UnifiedTreeNode | None = None
         self.key: Optional[RadixKey] = None
-        self.tree_components = list(tree_components)
+        self.tree_components = tree_components
         self.component_data = {ct: ComponentData() for ct in self.tree_components}
         self.last_access_time = get_and_increase_time_counter()
         self.host_value = None
@@ -75,7 +75,7 @@ class UnifiedTreeNode:
 
 class UnifiedLRUList:
     def __init__(
-        self, component_type: ComponentType, tree_components: list[ComponentType]
+        self, component_type: ComponentType, tree_components: tuple[ComponentType, ...]
     ):
         self.component_type = component_type
         self.head = UnifiedTreeNode(tree_components)
@@ -195,7 +195,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.get_child_key_fn = partial(get_child_key, page_size=self.page_size)
 
         assert params.tree_components is not None
-        self.tree_components = list(params.tree_components)
+        self.tree_components = tuple(params.tree_components)
         self.components: dict[ComponentType, TreeComponent] = {
             ct: COMPONENT_REGISTRY[ct](self, params) for ct in self.tree_components
         }
@@ -659,6 +659,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 for comp in self.components.values()
             ):
+                # TODO: When leaf creation is skipped, We should release all component
+                # resources here or propagate a flag so that
+                # cleanup_after_caching_req can free them properly.
                 self.token_to_kv_pool_allocator.free(value)
                 return InsertResult(prefix_len=total_prefix_length)
             target_node = self._add_new_node(node, key, value)
