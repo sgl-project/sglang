@@ -71,6 +71,7 @@ class NGRAMWorker:
                 )
             )
             loaded = self.add_external_corpus(corpus_path, chunks)
+            self.commit_corpus_load(corpus_path, loaded)
             logger.info(
                 "Loaded external ngram corpus '%s' (%d tokens).",
                 corpus_path,

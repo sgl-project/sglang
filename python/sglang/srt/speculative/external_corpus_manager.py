@@ -83,6 +83,8 @@ class ExternalCorpusManager:
         thread.start()
         return None  # response sent later by check_pending_load
 
+    # FIXME(kpham-sgl): remove a corpus during a pending load is an undefined behaviour
+    # and should be explicitly prevented.
     def remove(
         self, recv_req: RemoveExternalCorpusReqInput
     ) -> RemoveExternalCorpusReqOutput:

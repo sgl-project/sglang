@@ -94,8 +94,7 @@ void Ngram::finishExternalCorpusLoad(const std::string& corpus_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   if (sams_.find(corpus_id) != sams_.end()) {
     throw std::runtime_error(
-        "External corpus '" + corpus_id +
-        "' already exists. Remove it before adding a new corpus with the same id.");
+        "External corpus '" + corpus_id + "' already exists. Remove it before adding a new corpus with the same id.");
   }
   sams_.emplace(corpus_id, std::move(staging_sam_));
 }
