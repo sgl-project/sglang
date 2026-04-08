@@ -19,7 +19,7 @@ from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import is_allreduce_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1564,7 +1564,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_tp_group(), disabled=not is_allreduce_allocation_symmetric()
             ):
                 symm_output = torch.empty_like(x)
 

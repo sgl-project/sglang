@@ -24,7 +24,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import is_allreduce_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_deepep_mode,
@@ -1018,7 +1018,7 @@ class FusedMoE(torch.nn.Module):
         )
 
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_tp_group(), disabled=not is_allreduce_allocation_symmetric()
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 

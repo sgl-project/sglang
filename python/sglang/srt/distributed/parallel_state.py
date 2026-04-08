@@ -577,18 +577,30 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
-            self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
-            with self.pynccl_comm.change_state(enable=True):
-                self.pynccl_comm.all_reduce(input_)
-                return input_
-
         outplace_all_reduce_method = None
-        if (
+        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
+            # When symmetric memory is enabled, default to NCCL symm-mem.
+            # Optionally allow Custom AR for small tensors when
+            # SGLANG_ENABLE_CA_WITH_SYMM=1 (for decode latency optimization).
+            if (
+                _ENABLE_CA_WITH_SYMM
+                and self.ca_comm is not None
+                and not self.ca_comm.disabled
+                and self.ca_comm.should_custom_ar(input_)
+            ):
+                outplace_all_reduce_method = "ca"
+            else:
+                # Default: NCCL symmetric memory allreduce.
+                self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
+                with self.pynccl_comm.change_state(enable=True):
+                    self.pynccl_comm.all_reduce(input_)
+                    return input_
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         ):
+            # No symm-mem: normal Custom AR path.
             outplace_all_reduce_method = "ca"
         elif (
             self.qr_comm is not None
@@ -1547,6 +1559,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_ENABLE_CA_WITH_SYMM = os.environ.get("SGLANG_ENABLE_CA_WITH_SYMM", "0") == "1"
 
 
 def set_custom_all_reduce(enable: bool):

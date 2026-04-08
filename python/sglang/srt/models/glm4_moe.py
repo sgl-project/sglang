@@ -49,7 +49,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    is_allocation_symmetric,
+    is_allreduce_allocation_symmetric,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -622,7 +622,8 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(
-                parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
+                parallel_state.get_tp_group(),
+                disabled=not is_allreduce_allocation_symmetric(),
             ):
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)

@@ -12,7 +12,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import is_allreduce_allocation_symmetric
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_wrapper,
     trtllm_fp8_block_scale_routed_moe_wrapper,
@@ -396,7 +396,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_tp_group(), disabled=not is_allreduce_allocation_symmetric()
         ):
             symm_output = torch.empty(
                 hidden_states.shape[0],
@@ -498,7 +498,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_tp_group(), disabled=not is_allreduce_allocation_symmetric()
         ):
             symm_output = torch.empty(
                 hidden_states.shape[0],
@@ -637,7 +637,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         *hs_scale_linear.shape[:-1], -1
     )
 
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_tp_group(), disabled=not is_allreduce_allocation_symmetric()
+    ):
         num_tokens = hs_fp4.shape[0]
         hidden_size = (
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
@@ -795,7 +797,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+    with use_symmetric_memory(
+        get_tp_group(), disabled=not is_allreduce_allocation_symmetric()
+    ):
         if use_routed_topk:
             assert (
                 runner_config.top_k is not None

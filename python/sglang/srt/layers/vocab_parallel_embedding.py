@@ -23,7 +23,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     get_attention_tp_rank,
     get_attention_tp_size,
-    is_allocation_symmetric,
+    is_allreduce_allocation_symmetric,
 )
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -484,7 +484,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Get the embeddings.
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_tp_group(), disabled=not is_allreduce_allocation_symmetric()
         ):
             output_parallel = self.quant_method.embedding(self, masked_input.long())
 
