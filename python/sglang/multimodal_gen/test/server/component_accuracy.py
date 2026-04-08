@@ -151,11 +151,9 @@ def _load_wan_reference_vae(comp_path: str, pipeline_config) -> nn.Module:
 
 def _load_reference_component(
     comp_path: str,
-    source_root: str,
     component: ComponentType,
     hub_id: str,
     pipeline_config,
-    subfolder: str,
 ) -> nn.Module:
     # WAN VAE does not have a clean generic diffusers auto-load path here, and we
     # explicitly need checkpoint-loaded weights for reference-side transfer/parity.
@@ -169,8 +167,7 @@ def _load_reference_component(
         if cls is None:
             cls = diffusers.AutoencoderKL
         return cls.from_pretrained(
-            source_root,
-            subfolder=subfolder,
+            comp_path,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         )
@@ -499,11 +496,9 @@ class AccuracyEngine:
 
         ref_component = _load_reference_component(
             component_selection.source_path,
-            component_selection.source_root,
             component,
             hub_id,
             sgl_args.pipeline_config,
-            component_selection.source_subfolder,
         )
         if materialize_ref_on_device:
             ref_component = ref_component.to(device=device, dtype=torch.bfloat16)

@@ -61,9 +61,7 @@ class ComponentSelection:
     base_model_id: str
     base_model_root: str
     component_paths: Dict[str, str]
-    source_root: str
     source_path: str
-    source_subfolder: str
 
 
 @dataclass(frozen=True)
@@ -133,7 +131,7 @@ def _resolve_component_subfolder(
 
 def resolve_component_path(
     local_root: str, component: ComponentType, model_index_keys: Tuple[str, ...]
-) -> Tuple[str, str]:
+) -> str:
     model_index_path = os.path.join(local_root, "model_index.json")
     model_index = read_json_file(model_index_path)
 
@@ -149,13 +147,13 @@ def resolve_component_path(
                 candidate
             ):
                 continue
-            return candidate, subfolder
+            return candidate
 
     if has_component_files(local_root):
         if component != ComponentType.TEXT_ENCODER or is_text_encoder_config(
             local_root
         ):
-            return local_root, ""
+            return local_root
 
     raise FileNotFoundError(
         f"Could not resolve {component.value} from model_index.json under {local_root}"
@@ -216,31 +214,36 @@ def select_component_source(
         if key not in search_keys:
             search_keys.append(key)
 
-    source_root = base_model_root
-    component_key = component.value
     for key in search_keys:
         override_path = component_paths.get(key)
-        if override_path:
-            source_root = maybe_download_model(override_path)
-            component_key = key
-            break
+        if override_path is None:
+            continue
+        assert has_component_files(override_path), (
+            f"Component override for {component.value} must point directly to a "
+            f"component directory: {override_path}"
+        )
+        if component == ComponentType.TEXT_ENCODER:
+            assert is_text_encoder_config(override_path), (
+                f"Text encoder override must point to a text encoder directory: "
+                f"{override_path}"
+            )
+        return ComponentSelection(
+            base_model_id=model_id,
+            base_model_root=base_model_root,
+            component_paths=component_paths,
+            source_path=override_path,
+        )
 
-    ordered_keys = [component_key]
-    for key in search_keys:
-        if key not in ordered_keys:
-            ordered_keys.append(key)
-    source_path, source_subfolder = resolve_component_path(
-        source_root,
+    source_path = resolve_component_path(
+        base_model_root,
         component,
-        tuple(ordered_keys),
+        tuple(search_keys),
     )
     return ComponentSelection(
         base_model_id=model_id,
         base_model_root=base_model_root,
         component_paths=component_paths,
-        source_root=source_root,
         source_path=source_path,
-        source_subfolder=source_subfolder,
     )
 
 
