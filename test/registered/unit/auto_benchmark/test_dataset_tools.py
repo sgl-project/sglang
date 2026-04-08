@@ -5,10 +5,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
+PARENT_DIR = CURRENT_DIR.parent
+if str(PARENT_DIR) not in sys.path:
+    sys.path.insert(0, str(PARENT_DIR))
 
-from common import AutoBenchmarkTestCase
+from auto_benchmark import AutoBenchmarkTestCase
 
 from sglang.auto_benchmark_lib import infer_backend, prepare_dataset
 from sglang.benchmark.datasets.autobench import sample_autobench_requests
