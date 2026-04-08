@@ -21,7 +21,8 @@ from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdap
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
 from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
-from sglang.srt.utils.common import is_npu, rank0_log
+from sglang.srt.environ import envs
+from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -375,7 +376,6 @@ class SGLangBackend:
         config: CompilationConfig,
         graph_pool: Any,
     ):
-        rank0_log(f"Initializing SGLangBackend")
         assert graph_pool is not None
         self.graph_pool = graph_pool
 
@@ -394,10 +394,7 @@ class SGLangBackend:
         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
-        rank0_log(f"SGLangBackend __call__")
-        base_cache_dir = os.path.expanduser(
-            os.getenv("SGLANG_CACHE_DIR", "~/.cache/sglang/")
-        )
+        base_cache_dir = envs.SGLANG_CACHE_DIR.get()
 
         cache_hash = self.compiler_manager.compute_hash()
         cache_dir = os.path.join(
@@ -465,8 +462,6 @@ class SGLangBackend:
                 src = src.replace("<lambda>", "GraphModule")
                 with open(graph_path, "w") as f:
                     f.write(src)
-
-                rank0_log(f"Computation graph saved to {graph_path}")
 
         self._called = True
         return self.split_gm

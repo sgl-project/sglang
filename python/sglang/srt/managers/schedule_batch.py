@@ -39,6 +39,7 @@ import copy
 import dataclasses
 import logging
 import re
+from concurrent.futures import Future
 from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
@@ -93,6 +94,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -196,7 +198,6 @@ class FINISH_ABORT(BaseFinishReason):
 
 class Modality(Enum):
     IMAGE = auto()
-    MULTI_IMAGES = auto()
     VIDEO = auto()
     AUDIO = auto()
 
@@ -223,9 +224,10 @@ class MultimodalInputFormat(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    One MultimodalDataItem contains all inputs for one modality.
-    For example, if there are 3 images and 1 audio inputs, there will be 2 MultimodalDataItem.
-    One for images and one for audio.
+    One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
+    For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
+
+    Each item has its own hash and pad_value, enabling per-image RadixAttention caching.
 
     We put the common fields first and the model-specific fields in model_specific_data.
     """
@@ -303,7 +305,7 @@ class MultimodalDataItem:
         return self.modality == Modality.AUDIO
 
     def is_image(self):
-        return self.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]
+        return self.modality == Modality.IMAGE
 
     def is_video(self):
         return self.modality == Modality.VIDEO
@@ -328,11 +330,80 @@ class MultimodalDataItem:
         ret.validate()
         return ret
 
-    def merge(self, other):
-        self.feature += other.feature
-        self.offsets += other.offsets
-        self.hash = hash((self.hash, other.hash))
-        self.set_pad_value()
+    def reconstruct(self):
+        if not isinstance(self.feature, CudaIpcTensorTransportProxy):
+            return
+
+        reconstruct_device = torch.cuda.current_device()
+        if isinstance(self.feature, CudaIpcTensorTransportProxy):
+            self.feature = self.feature.reconstruct_on_target_device(reconstruct_device)
+        if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
+            self.precomputed_embeddings = (
+                self.precomputed_embeddings.reconstruct_on_target_device(
+                    reconstruct_device
+                )
+            )
+        for extra_key in self.model_specific_data:
+            if isinstance(
+                self.model_specific_data[extra_key], CudaIpcTensorTransportProxy
+            ):
+                extra_data = self.model_specific_data[
+                    extra_key
+                ].reconstruct_on_target_device(reconstruct_device)
+                self.model_specific_data[extra_key] = extra_data
+
+
+@dataclasses.dataclass
+class MultimodalProcessorOutput:
+    """Raw output from multimodal processors, before pad/hash computation.
+
+    This is the typed replacement for the dict previously returned by
+    ``BaseMultimodalProcessor.process_mm_data_async``.  Unlike
+    ``MultimodalInputs``, items here do NOT carry pad_value or hash yet.
+    """
+
+    mm_items: List[MultimodalDataItem]
+    input_ids: Optional[List[int]] = None
+
+    # image
+    im_token_id: Optional[int] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
+
+    # video
+    video_token_id: Optional[int] = None
+
+    # audio
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
+
+    # QWen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
+
+    # for transformers-compatibility
+    token_type_ids: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def from_dict(d: dict) -> "MultimodalProcessorOutput":
+        return MultimodalProcessorOutput(
+            mm_items=d["mm_items"],
+            input_ids=d.get("input_ids"),
+            im_token_id=d.get("im_token_id"),
+            im_start_id=d.get("im_start_id"),
+            im_end_id=d.get("im_end_id"),
+            slice_start_id=d.get("slice_start_id"),
+            slice_end_id=d.get("slice_end_id"),
+            video_token_id=d.get("video_token_id"),
+            audio_token_id=d.get("audio_token_id"),
+            audio_start_id=d.get("audio_start_id"),
+            audio_end_id=d.get("audio_end_id"),
+            mrope_positions=d.get("mrope_positions"),
+            mrope_position_delta=d.get("mrope_position_delta"),
+        )
 
 
 @dataclasses.dataclass
@@ -364,17 +435,16 @@ class MultimodalInputs:
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
 
-    @staticmethod
-    def from_dict(obj: dict):
-        # Check if MM splitting is enabled
-        if not envs.SGLANG_ENABLE_MM_SPLITTING.get():
-            mm_items = obj["mm_items"]
-        else:
-            from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+    def release_features(self):
+        """Release feature tensors to free GPU memory."""
+        for item in self.mm_items:
+            item.feature = None
 
-            original_mm_items = obj["mm_items"]
-            # Now, `mm_items` contains one item per image.
-            mm_items = get_new_expanded_mm_items(original_mm_items)
+    @staticmethod
+    def from_processor_output(obj: "MultimodalProcessorOutput"):
+        mm_items = obj.mm_items
+        for mm_item in mm_items:
+            mm_item.reconstruct()
 
         ret = MultimodalInputs(
             mm_items=mm_items,
@@ -425,8 +495,9 @@ class MultimodalInputs:
             "audio_token_id",
         ]
         for arg in optional_args:
-            if arg in obj:
-                setattr(ret, arg, obj[arg])
+            val = getattr(obj, arg, None)
+            if val is not None:
+                setattr(ret, arg, val)
 
         return ret
 
@@ -563,8 +634,12 @@ class Req(ReqDllmMixin):
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
-        # Require reasoning for the request (hybrid reasoning model only)
+        # Require reasoning for the request
         self.require_reasoning = require_reasoning
+
+        # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
+        self._is_reasoning_over = False
+        self.reasoning_tokens = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -639,7 +714,6 @@ class Req(ReqDllmMixin):
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
         self.last_host_node: Any = None
-        self.last_host_backup_node: Any = None
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
@@ -725,8 +799,10 @@ class Req(ReqDllmMixin):
         self.embedding = None
 
         # Constrained decoding
-        self.grammar_key: Optional[str] = None
-        self.grammar: Optional[BaseGrammarObject] = None
+        self.grammar_key: Optional[Tuple[str, str]] = None
+        self.grammar: Optional[Union[BaseGrammarObject, Future[BaseGrammarObject]]] = (
+            None
+        )
         self.grammar_wait_ct = 0
 
         # The number of cached tokens that were already cached in the KV cache
@@ -795,6 +871,9 @@ class Req(ReqDllmMixin):
 
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
+
+        # For hisparse
+        self.hisparse_staging = False
 
     @property
     def seqlen(self) -> int:
@@ -870,6 +949,23 @@ class Req(ReqDllmMixin):
             self.fill_ids = self.origin_input_ids + self.output_ids
 
         input_len = len(self.fill_ids)
+
+        # Streaming sessions reuse committed KV from the session slot, so
+        # custom logprob_start_len is not supported — override to -1.
+        if (
+            self.session is not None
+            and self.session.streaming
+            and self.return_logprob
+            and self.logprob_start_len >= 0
+        ):
+            logger.warning(
+                "logprob_start_len=%d is not supported for streaming sessions "
+                "and will be ignored (rid=%s). Only new-token logprobs are returned.",
+                self.logprob_start_len,
+                self.rid,
+            )
+            self.logprob_start_len = -1
+
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
@@ -891,14 +987,12 @@ class Req(ReqDllmMixin):
                 self.prefix_indices,
                 self.last_node,
                 self.last_host_node,
-                self.last_host_backup_node,
                 self.host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
                 match_result.last_host_node,
-                match_result.last_host_backup_node,
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
@@ -1121,6 +1215,14 @@ class Req(ReqDllmMixin):
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
+        # When using input_embeds, we cannot easily mix the original input embeddings
+        # with the newly generated output token IDs during re-prefill of retracted request.
+        # output_ids will have no use, but will lead to wrong size cache indexes.
+        # Therefore, we discard the generated output_ids and restart prefill and generation
+        # to ensure shape consistency in KV cache.
+        if self.input_embeds is not None:
+            self.output_ids = []
+
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
@@ -1157,7 +1259,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.fill_ids) - 1
+            logprob_start_len = len(self.fill_ids)
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
@@ -1177,6 +1279,20 @@ class Req(ReqDllmMixin):
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+
+    def update_reasoning_tokens(self, token_id, think_end_id):
+        if self._is_reasoning_over:
+            return
+
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        try:
+            end_pos = token_id.index(think_end_id)
+            self.reasoning_tokens += end_pos + 1
+            self._is_reasoning_over = True
+        except ValueError:
+            self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
         return (
@@ -1216,6 +1332,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+    ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -1313,6 +1430,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
+
+    # HiSparse
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     @classmethod
     def init_new(
@@ -1516,8 +1636,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
-                # If req.input_embeds is already a list, append its content directly
-                input_embeds.extend(req.input_embeds)  # Use extend to avoid nesting
+                # Slice to match extend_input_len — PrefillAdder truncates
+                # fill_ids/extend_input_len on chunk overflow but not input_embeds.
+                input_embeds.extend(
+                    req.input_embeds[pre_len : pre_len + req.extend_input_len]
+                )
 
             multimodal_inputs.append(req.multimodal_inputs)
 
@@ -1581,7 +1704,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     len(req.fill_ids),
                 )
                 if req.logprob_start_len == -1:
-                    logprob_start_len = len(req.origin_input_ids) - 1
+                    logprob_start_len = len(req.origin_input_ids)
                 else:
                     logprob_start_len = req.logprob_start_len
                 # Apply logprob_start_len
@@ -1625,28 +1748,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if input_embeds
             else None
         )
-        for mm_input in multimodal_inputs:
-            if mm_input is None:
-                continue
-            for mm_item in mm_input.mm_items:
-                pixel_values = getattr(mm_item, "feature", None)
-                if isinstance(pixel_values, torch.Tensor):
-                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
-                elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
-                    mm_item.feature = pixel_values.reconstruct_on_target_device(
-                        torch.cuda.current_device()
-                    )
-                    # The reference by CudaIpcTensorTransportProxy was cut off,
-                    # proactively delete to avoid slow gc.
-                    del pixel_values
-                if get_global_server_args().language_only:
-                    precomputed_embeddings = getattr(
-                        mm_item, "precomputed_embeddings", None
-                    )
-                    if isinstance(precomputed_embeddings, torch.Tensor):
-                        mm_item.precomputed_embeddings = precomputed_embeddings.to(
-                            self.device, non_blocking=True
-                        )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
@@ -1882,12 +1983,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 
+        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
-            # Retracting loops ends and still not enough memory
-            raise ValueError(
-                "Out of memory even after retracting all other requests in the decode batch."
+            # Even the last remaining request cannot fit in memory.
+            # Instead of crashing the scheduler, gracefully abort it.
+            last_idx = sorted_indices.pop()
+            last_req = self.reqs[last_idx]
+            last_req.to_finish = FINISH_ABORT(
+                "Out of memory even after retracting all other requests "
+                "in the decode batch. Aborting the last request.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            reqs_to_abort.append(last_req)
+            self.release_req(last_idx, 0, server_args)
+            logger.warning(
+                "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
 
         self.filter_batch(keep_indices=sorted_indices)
@@ -1904,10 +2016,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
-        return retracted_reqs, new_estimate_ratio, []
+        return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
         req = self.reqs[idx]
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.retract_req(req)
 
         if server_args.disaggregation_mode == "decode":
             req.offload_kv_cache(
@@ -1932,7 +2047,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+        self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -1950,6 +2065,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        # Decode embeds the last output token via embed_tokens; clear the stale
+        # prefill-time tensor so it doesn't leak into ForwardBatch.
+        self.input_embeds = None
+
+        # Clear context parallel metadata - CP is only for prefill, not decode
+        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
+            self.attn_cp_metadata = None
+        if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
+            self.nsa_cp_metadata = None
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
@@ -2012,6 +2136,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.map_last_loc_to_buffer(
+                self.seq_lens,
+                self.out_cache_loc,
+                self.req_pool_indices,
+                self.seq_lens_cpu,
+            )
 
         if get_global_server_args().enable_mamba_extra_buffer():
             if len(self.reqs) == 0:
@@ -2179,6 +2311,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+        self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
@@ -2234,6 +2367,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
+            ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
@@ -2294,13 +2428,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
-
-            if (
-                self.forward_mode.is_decode()
-                and not server_args.disable_piecewise_cuda_graph
-                and not self.tree_cache.is_chunk_cache()
-            ):
-                return
 
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
@@ -2415,6 +2542,9 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.Tensor] = None
+
+    # token table for ngram embedding
+    ne_token_table: Optional[torch.Tensor] = None
 
     # For corss-encoder model
     token_type_ids: Optional[torch.Tensor] = None

@@ -241,12 +241,18 @@ def _jit_add_constant_module(constant: int) -> Module:
 
 
 def add_constant(src: torch.Tensor, constant: int) -> torch.Tensor:
+    if not src.is_cuda:
+        raise RuntimeError("src must be a CUDA tensor")
+    if src.dtype != torch.int32:
+        raise RuntimeError(f"Unsupported dtype {src.dtype}. Supported: int32")
     dst = torch.empty_like(src)
     module = _jit_add_constant_module(constant)
     module.add_constant(dst, src)
     return dst
 
 ```
+
+Keep the Python wrapper thin, but still validate the basic invariants such as device and dtype before dispatch. In the current JIT/FFI path, invalid tensors are not always rejected safely before launch.
 
 ### STEP 3: Use your kernel
 

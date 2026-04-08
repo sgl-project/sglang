@@ -37,12 +37,13 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_blackwell,
     is_cuda,
-    is_port_available,
     is_xpu,
     kill_process_tree,
     retry,
 )
+from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
 
@@ -105,6 +106,10 @@ DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
 # EAGLE3 model
 DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+
+# DFLASH model
+DEFAULT_TARGET_MODEL_DFLASH = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_DFLASH = "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat"
 
 # EAGLE2 with DP-Attention models
 DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
@@ -178,8 +183,8 @@ def is_in_amd_ci():
 
 
 def is_blackwell_system():
-    """Return whether it is running on a Blackwell (B200) system."""
-    return envs.IS_BLACKWELL.get()
+    """Same CUDA capability + toolkit semantics as ``sglang.srt.utils.is_blackwell``."""
+    return is_blackwell()
 
 
 def is_h200_system():
@@ -1124,12 +1129,26 @@ def run_bench_serving(
         other_args=other_server_args,
     )
 
+    # Resolve tokenizer to local snapshot path when available, so the benchmark
+    # client's AutoTokenizer.from_pretrained uses the local path directly instead
+    # of calling the HF Hub API (which can stall for minutes in CI).
+    bench_tokenizer = tokenizer
+    if bench_tokenizer is None:
+        try:
+            from sglang.srt.utils import find_local_repo_dir
+
+            local_dir = find_local_repo_dir(model, revision=None)
+            if local_dir and os.path.isdir(local_dir):
+                bench_tokenizer = local_dir
+        except Exception:
+            pass
+
     # Run benchmark
     args = get_benchmark_args(
         base_url=base_url,
         dataset_name=dataset_name,
         dataset_path=dataset_path,
-        tokenizer=tokenizer,
+        tokenizer=bench_tokenizer,
         num_prompts=num_prompts,
         random_input_len=random_input_len,
         random_output_len=random_output_len,
@@ -2055,7 +2074,75 @@ def _distributed_worker(rank, world_size, backend, port, func, result_queue, kwa
         dist.destroy_process_group()
 
 
+def maybe_stub_sgl_kernel():
+    """Stub sgl_kernel if it cannot be imported (e.g. no GPU).
+
+    Must be called before any import that transitively depends on sgl_kernel.
+    On machines with a working sgl_kernel this is a no-op.
+    """
+    try:
+        import sgl_kernel  # noqa: F401
+
+        return
+    except (ImportError, OSError):
+        pass
+
+    import importlib.abc
+    import importlib.machinery
+
+    class _SglKernelLoader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            from unittest.mock import MagicMock
+
+            module.__getattr__ = lambda name: MagicMock()
+
+    class _SglKernelFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname == "sgl_kernel" or fullname.startswith("sgl_kernel."):
+                return importlib.machinery.ModuleSpec(
+                    fullname,
+                    _SglKernelLoader(),
+                    is_package=True,
+                )
+            return None
+
+    sys.meta_path.insert(0, _SglKernelFinder())
+
+
 class CustomTestCase(unittest.TestCase):
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        # Wrap the effective setUpClass so that tearDownClass is called
+        # even when setUpClass fails. Python's unittest skips tearDownClass
+        # if setUpClass raises, which can leak resources (ports, processes).
+        setup = cls.setUpClass
+        if getattr(setup, "_safe_setup_wrapped", False):
+            return
+
+        orig_func = setup.__func__
+
+        def safe_setUpClass(klass):
+            try:
+                orig_func(klass)
+            except Exception:
+                # Best-effort cleanup; suppress teardown errors so the
+                # original setUpClass exception propagates clearly.
+                try:
+                    klass.tearDownClass()
+                except Exception:
+                    pass
+                raise
+
+        # Set sentinel on the raw function so that bound method attribute
+        # lookup (which delegates to __func__) can detect it in subclasses.
+        safe_setUpClass._safe_setup_wrapped = True
+        cls.setUpClass = classmethod(safe_setUpClass)
+
     def _callTestMethod(self, method):
         max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
         if max_retry is None:
@@ -2112,12 +2199,14 @@ class ModelLaunchSettings:
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
         variant: Optional[str] = None,
+        launch_timeout: Optional[float] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
         self.variant = variant
+        self.launch_timeout = launch_timeout
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])

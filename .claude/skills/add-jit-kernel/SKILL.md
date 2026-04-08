@@ -11,7 +11,7 @@ This tutorial walks through adding a simple element-wise scale operation as a JI
 
 Add a new operation that scales each element of a tensor by a scalar factor:
 
-- Input: tensor `x` (CUDA) and scalar `factor` (float, passed as C++ template argument)
+- Input: tensor `x` (CUDA) and scalar `factor` (float, passed at runtime)
 - Output: `x * factor` (element-wise), allocated internally
 - Supported dtypes: **FP16 (`torch.float16`), BF16 (`torch.bfloat16`), FP32 (`torch.float32`)**
 
@@ -72,7 +72,7 @@ This is the **primary validation API** for all kernel launchers. Use it to valid
 - **`host::TensorMatcher({dims...})`** — Fluent builder for tensor validation:
   - `.with_dtype<T>()` — require a specific C++ type (e.g. `fp16_t`)
   - `.with_dtype<T1, T2, ...>()` — allow a set of types
-  - `.with_device<kDLCUDA>(device_sym)` — require CUDA, bind device to symbol
+  - `.with_device<kDLCUDA>(device_sym)` — require CUDA and bind the checked device to a `SymbolicDevice`
   - `.with_strides({strides...})` — validate strides (omit to require contiguous)
   - `.verify(tensor_view)` — execute the check; throws `PanicError` with full context on failure; **chainable** (`verify(a).verify(b)` to check multiple tensors with the same shape)
 
@@ -213,18 +213,15 @@ namespace {
 // Kernel: element-wise scale using vectorized 128-bit loads/stores
 // T       = fp16_t | bf16_t | fp32_t
 // kVecN   = number of elements per vector load (e.g. 8 for fp16)
-// kFactor = scale factor encoded as kFactorNumer / kFactorDenom
+// factor  = runtime scale factor
 // ----------------------------------------------------------------
-template <typename T, int kVecN, int32_t kFactorNumer, int32_t kFactorDenom>
+template <typename T, int kVecN>
 __global__ void scale_kernel(T* __restrict__ dst,
                               const T* __restrict__ src,
-                              uint32_t n_vecs,
-                              uint32_t n_remainder,
+                              float factor,
                               uint32_t n_total) {
-  constexpr float kFactor = static_cast<float>(kFactorNumer)
-                          / static_cast<float>(kFactorDenom);
-
   using vec_t = device::AlignedVector<T, kVecN>;
+  const uint32_t n_vecs = n_total / kVecN;
 
   // --- vectorised body ---
   const uint32_t vec_stride = blockDim.x * gridDim.x;
@@ -235,7 +232,7 @@ __global__ void scale_kernel(T* __restrict__ dst,
     v.load(src, vi);
 #pragma unroll
     for (int i = 0; i < kVecN; ++i) {
-      v[i] = static_cast<T>(static_cast<float>(v[i]) * kFactor);
+      v[i] = static_cast<T>(static_cast<float>(v[i]) * factor);
     }
     v.store(dst, vi);
   }
@@ -244,17 +241,17 @@ __global__ void scale_kernel(T* __restrict__ dst,
   const uint32_t base = n_vecs * kVecN;
   const uint32_t scalar_stride = blockDim.x * gridDim.x;
   for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-       i < n_remainder;
+       base + i < n_total;
        i += scalar_stride) {
-    dst[base + i] = static_cast<T>(static_cast<float>(src[base + i]) * kFactor);
+    dst[base + i] = static_cast<T>(static_cast<float>(src[base + i]) * factor);
   }
 }
 
 // ----------------------------------------------------------------
 // Launcher: validates tensors, selects vector width, launches kernel
 // ----------------------------------------------------------------
-template <typename T, int32_t kFactorNumer, int32_t kFactorDenom>
-void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
+template <typename T>
+void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src, float factor) {
   using namespace host;
 
   // 1. Validate input tensors with TensorMatcher
@@ -268,28 +265,26 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
       .verify(dst)
       .verify(src);  // same shape / dtype / device as dst
 
-  const uint32_t n         = static_cast<uint32_t>(N.unwrap());
-  const DLDevice device    = device_.unwrap();
+  const uint32_t n = static_cast<uint32_t>(N.unwrap());
+  const DLDevice device = device_.unwrap();
 
   RuntimeCheck(n > 0, "scale: num_elements must be > 0, got ", n);
 
   // 2. Choose vector width for 128-bit loads (16 bytes)
   //    fp16/bf16: 8 elements × 2 bytes = 16 bytes
   //    fp32:      4 elements × 4 bytes = 16 bytes
-  constexpr int kVecN    = 16 / sizeof(T);
-  const uint32_t n_vecs      = n / kVecN;
-  const uint32_t n_remainder = n % kVecN;
+  constexpr int kVecN = 16 / sizeof(T);
+  const uint32_t n_work_items = div_ceil(n, static_cast<uint32_t>(kVecN));
 
   // 3. Launch
   constexpr uint32_t kBlockSize = 256;
-  const uint32_t grid           = div_ceil(std::max(n_vecs, n_remainder), kBlockSize);
+  const uint32_t grid = div_ceil(n_work_items, kBlockSize);
 
   LaunchKernel(grid, kBlockSize, device)(
-      scale_kernel<T, kVecN, kFactorNumer, kFactorDenom>,
+      scale_kernel<T, kVecN>,
       static_cast<T*>(dst.data_ptr()),
       static_cast<const T*>(src.data_ptr()),
-      n_vecs,
-      n_remainder,
+      factor,
       n);
 }
 
@@ -304,6 +299,7 @@ void scale(tvm::ffi::TensorView dst, tvm::ffi::TensorView src) {
 - Use `AlignedVector` for vectorised 128-bit loads/stores — significant bandwidth win
 - Use `LaunchKernel` — it resolves the stream and checks errors automatically
 - Use `RuntimeCheck` for runtime assertions with useful error messages
+- Prefer passing runtime scalars like `factor` directly unless compile-time specialisation is genuinely required
 - `fp16_t` / `bf16_t` / `fp32_t` are the project's type aliases (from `utils.cuh`)
 - `device::cast<To, From>` or `dtype_trait<T>::from(val)` for cross-type conversions
 - `device::math::` functions for device math instead of bare `__` intrinsics
@@ -328,9 +324,9 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_scale_module(dtype: torch.dtype, factor_numer: int, factor_denom: int) -> Module:
-    """Compile and cache the JIT scale module for a given dtype and factor."""
-    args = make_cpp_args(dtype, factor_numer, factor_denom)
+def _jit_scale_module(dtype: torch.dtype) -> Module:
+    """Compile and cache the JIT scale module for a given dtype."""
+    args = make_cpp_args(dtype)
     return load_jit(
         "scale",
         *args,
@@ -355,22 +351,26 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
     -------
     Scaled tensor (dst = src * factor).
     """
-    assert src.is_cuda, "src must be a CUDA tensor"
-    assert src.dtype in (torch.float16, torch.bfloat16, torch.float32), (
-        f"Unsupported dtype {src.dtype}. Supported: float16, bfloat16, float32"
-    )
+    if not src.is_cuda:
+        raise RuntimeError("src must be a CUDA tensor")
+    if src.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise RuntimeError(
+            f"Unsupported dtype {src.dtype}. Supported: float16, bfloat16, float32"
+        )
     if out is None:
         out = torch.empty_like(src)
     else:
-        assert out.shape == src.shape, "out shape must match src"
-        assert out.dtype == src.dtype,  "out dtype must match src"
+        if out.shape != src.shape:
+            raise RuntimeError("out shape must match src")
+        if out.dtype != src.dtype:
+            raise RuntimeError("out dtype must match src")
+        if out.device != src.device:
+            raise RuntimeError("out device must match src")
 
-    # Encode factor as integer ratio; denom=1000 gives 3 decimal places of precision
-    factor_denom = 1000
-    factor_numer = round(factor * factor_denom)
-
-    module = _jit_scale_module(src.dtype, factor_numer, factor_denom)
-    module.scale(out, src)
+    # Keep the Python wrapper thin, but still enforce the basic preconditions
+    # that the current JIT/FFI path does not reject safely on its own.
+    module = _jit_scale_module(src.dtype)
+    module.scale(out, src, factor)
     return out
 ```
 
@@ -378,8 +378,10 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 
 - Use `cache_once` — **not** `functools.lru_cache` (incompatible with `torch.compile`)
 - `load_jit` first arg(s) form the unique build marker; same marker = same cached binary
+- Only include compile-time specialisation knobs in the build marker; runtime values like `factor` should stay runtime unless the kernel truly needs templating
 - `cuda_wrappers`: `(export_name, kernel_symbol)` — `export_name` is called from Python
 - `make_cpp_args(dtype, ...)` converts `torch.dtype` to C++ type alias:
+- Keep Python launchers thin, but still validate the basic invariants (`is_cuda`, supported dtype, `out` metadata). In the current JIT/FFI path, invalid tensors are not always rejected safely before launch
 
 | `torch.dtype`      | C++ type   |
 |--------------------|------------|
@@ -412,12 +414,42 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 ## Step 4: Write tests (required)
 
+JIT kernel tests live under `python/sglang/jit_kernel/tests/`. **CI does not run `pytest` in that directory directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` there (and every `bench_*.py` under `benchmark/`), collects `register_*_ci(...)` calls by **statically parsing each file’s AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
+
+- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `stage-b-kernel-unit-1-gpu-large` (see `.github/workflows/pr-test-jit-kernel.yml`: `python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large`).
+- **Nightly kernel suite**: `nightly-kernel-1-gpu` with `--nightly` — typically used with `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` in CI for expanded parameter grids (see `python/sglang/jit_kernel/utils.py` → `should_run_full_tests` / `get_ci_test_range`). Wired in `.github/workflows/nightly-test-nvidia.yml` (e.g. `python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error`).
+
+Registration pattern (module level, **literal** `est_time` and `suite` strings — required for AST parsing):
+
+```python
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+# Optional second registration: same file also listed under the nightly kernel suite
+# register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
+```
+
+Keep `est_time` and `suite` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
+
+Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but should be skipped in CI (e.g. multi-GPU only).
+
+**Run like CI** (from repo root):
+
+```bash
+cd test && python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large
+```
+
+For fast iteration you can still run `pytest` on a single file locally; CI coverage is via `run_suite.py`.
+
 Create `python/sglang/jit_kernel/tests/test_scale.py`:
 
 ```python
 import pytest
 import torch
 from sglang.jit_kernel.scale import scale
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -443,23 +475,26 @@ def test_scale_out_param(dtype):
 
 def test_scale_cpu_error():
     src = torch.randn(128, dtype=torch.float16)  # CPU tensor
-    with pytest.raises(AssertionError, match="CUDA"):
+    with pytest.raises(RuntimeError, match="CUDA"):
         scale(src, 2.0)
 
 
 def test_scale_unsupported_dtype():
     src = torch.randint(0, 10, (128,), dtype=torch.int32, device="cuda")
-    with pytest.raises(AssertionError, match="Unsupported dtype"):
+    with pytest.raises(RuntimeError, match="dtype"):
         scale(src, 2.0)
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    import sys
+    sys.exit(pytest.main([__file__, "-v", "-s"]))
 ```
 
 ---
 
 ## Step 5: Add a benchmark (required)
+
+Benchmarks are `bench_*.py` files under `python/sglang/jit_kernel/benchmark/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`stage-b-kernel-benchmark-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite stage-b-kernel-benchmark-1-gpu-large`).
 
 Create `python/sglang/jit_kernel/benchmark/bench_scale.py`:
 
@@ -477,7 +512,9 @@ from sglang.jit_kernel.benchmark.utils import (
     run_benchmark,
 )
 from sglang.jit_kernel.scale import scale as jit_scale
+from sglang.test.ci.ci_register import register_cuda_ci
 
+register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 SIZE_LIST = get_benchmark_range(
     full_range=[2**n for n in range(10, 20)],  # 1K … 512K elements
@@ -516,16 +553,23 @@ if __name__ == "__main__":
     benchmark.run(print_data=True)
 ```
 
-Run:
+Run locally:
 
 ```bash
 python python/sglang/jit_kernel/benchmark/bench_scale.py
+```
+
+Run the benchmark suite the way CI does:
+
+```bash
+cd test && python3 run_suite.py --hw cuda --suite stage-b-kernel-benchmark-1-gpu-large
 ```
 
 ---
 
 ## Troubleshooting
 
+- **`No CI registry found in ...` from `run_suite.py`**: add a module-level `register_cuda_ci(...)` with literal `est_time` and `suite` (and optional `nightly=True`); starred args and non-literal values break AST collection
 - **JIT compilation fails**: ensure the `.cuh` file is under `python/sglang/jit_kernel/csrc/`; reduce template argument combinations
 - **CUDA crash / illegal memory access**: `CUDA_LAUNCH_BLOCKING=1`; `compute-sanitizer --tool memcheck python ...`
 - **Unstable benchmark results**: `run_benchmark` uses CUDA-graph-based timing by default
@@ -535,7 +579,9 @@ python python/sglang/jit_kernel/benchmark/bench_scale.py
 ## References
 
 - `docs/developer_guide/development_jit_kernel_guide.md`
-- `python/sglang/jit_kernel/utils.py` — `cache_once`, `load_jit`, `make_cpp_args`
+- `test/run_suite.py` — suite names, discovery of `jit_kernel/tests/` and `jit_kernel/benchmark/`, execution entrypoint for CI
+- `python/sglang/test/ci/ci_register.py` — `register_cuda_ci` and AST registration rules
+- `python/sglang/jit_kernel/utils.py` — `cache_once`, `load_jit`, `make_cpp_args`, `should_run_full_tests`, `get_ci_test_range`
 - `python/sglang/jit_kernel/include/sgl_kernel/tensor.h` — `TensorMatcher`, `SymbolicSize/DType/Device`
 - `python/sglang/jit_kernel/include/sgl_kernel/utils.cuh` — type aliases, `LaunchKernel`, `SGL_DEVICE`
 - `python/sglang/jit_kernel/include/sgl_kernel/vec.cuh` — `AlignedVector`

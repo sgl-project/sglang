@@ -31,6 +31,7 @@ class LoadFormat(str, enum.Enum):
     LOCAL_CACHED = "local_cached"
     FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
+    RUNAI_STREAMER = "runai_streamer"
 
 
 @dataclass
@@ -76,6 +77,8 @@ class LoadConfig:
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
     remote_instance_weight_loader_backend: Optional[str] = None
     remote_instance_weight_loader_transfer_engine: Optional[Any] = None
+    modelexpress_url: Optional[str] = None
+    modelexpress_model_name: Optional[str] = None
 
     # ModelOpt-specific loading options
     modelopt_checkpoint_restore_path: Optional[str] = None

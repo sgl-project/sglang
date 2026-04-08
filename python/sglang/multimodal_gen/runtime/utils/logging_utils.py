@@ -6,12 +6,15 @@
 
 import argparse
 import contextlib
+import dataclasses
 import datetime
+import inspect
 import logging
 import os
 import sys
 import time
 from contextlib import contextmanager
+from enum import Enum
 from functools import lru_cache, partial
 from logging import Logger
 from types import MethodType
@@ -281,6 +284,107 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 logger = init_logger(__name__)
 
 
+def _is_torch_tensor(obj: Any) -> tuple[bool, Any]:
+    """Return (is_tensor, torch_module_or_None) without importing torch at module import time."""
+    try:
+        import torch  # type: ignore
+
+        return isinstance(obj, torch.Tensor), torch
+    except Exception:
+        return False, None
+
+
+def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
+    """Recursively convert objects to JSON-serializable forms for concise logging.
+
+    Rules:
+    - Drop any field/dict key named 'param_names_mapping'.
+    - Render Enums using their value.
+    - Render torch.Tensor as a compact summary; if key name is 'scaling_factor', include stats.
+    - Dataclasses are expanded to dicts and sanitized recursively.
+    - Callables/functions are rendered as their qualified name.
+    - Redact sensitive fields like 'prompt' and 'negative_prompt' (only show length).
+    - Fallback to str(...) for unknown types.
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        if key_hint in ("prompt", "negative_prompt"):
+            if isinstance(obj, str):
+                return f"<redacted, len={len(obj)}>"
+        return obj
+
+    if isinstance(obj, Enum):
+        return obj.value
+
+    is_tensor, torch_mod = _is_torch_tensor(obj)
+    if is_tensor:
+        try:
+            ten = obj.detach().cpu()
+            if key_hint == "scaling_factor":
+                stats = {
+                    "shape": list(ten.shape),
+                    "dtype": str(ten.dtype),
+                }
+                try:
+                    stats["min"] = float(ten.min().item())
+                except Exception:
+                    pass
+                try:
+                    stats["max"] = float(ten.max().item())
+                except Exception:
+                    pass
+                try:
+                    stats["mean"] = float(ten.float().mean().item())
+                except Exception:
+                    pass
+                return {"tensor": "scaling_factor", **stats}
+            return {"tensor": True, "shape": list(ten.shape), "dtype": str(ten.dtype)}
+        except Exception:
+            return "<tensor>"
+
+    if dataclasses.is_dataclass(obj):
+        result: dict[str, Any] = {}
+        for f in dataclasses.fields(obj):
+            if not f.repr:
+                continue
+            name = f.name
+            if "names_mapping" in name:
+                continue
+            try:
+                value = getattr(obj, name)
+            except Exception:
+                continue
+            result[name] = _sanitize_for_logging(value, key_hint=name)
+        return result
+
+    if isinstance(obj, dict):
+        result_dict: dict[str, Any] = {}
+        for k, v in obj.items():
+            try:
+                key_str = str(k)
+            except Exception:
+                key_str = "<key>"
+            if key_str == "param_names_mapping":
+                continue
+            result_dict[key_str] = _sanitize_for_logging(v, key_hint=key_str)
+        return result_dict
+
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_logging(x, key_hint=key_hint) for x in obj]
+
+    try:
+        if inspect.isroutine(obj) or inspect.isclass(obj):
+            module = getattr(obj, "__module__", "")
+            qn = getattr(obj, "__qualname__", getattr(obj, "__name__", "<callable>"))
+            return f"{module}.{qn}" if module else qn
+    except Exception:
+        pass
+
+    try:
+        return str(obj)
+    except Exception:
+        return "<unserializable>"
+
+
 def _trace_calls(log_path, root_dir, frame, event, arg=None):
     if event in ["call", "return"]:
         # Extract the filename, line number, function name, and the code object
@@ -347,7 +451,7 @@ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
     sys.settrace(partial(_trace_calls, log_file_path, root_dir))
 
 
-def set_uvicorn_logging_configs():
+def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
     LOGGING_CONFIG["formatters"]["default"][
@@ -358,6 +462,59 @@ def set_uvicorn_logging_configs():
         "fmt"
     ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+    # Install access log path filter into LOGGING_CONFIG so it survives
+    # uvicorn's internal dictConfig() call during startup.
+    prefixes = getattr(server_args, "uvicorn_access_log_exclude_prefixes", None)
+    if prefixes:
+        _install_access_log_filter(LOGGING_CONFIG, prefixes)
+
+
+def _install_access_log_filter(config: dict, prefixes: list[str]):
+    """Register a path-based access log filter into uvicorn's LOGGING_CONFIG dict.
+
+    Only attaches to the ``access`` handler (not the ``uvicorn.access`` logger)
+    to avoid filtering the same record twice.
+    """
+    # Sanitize: drop empty strings (would match all paths) and deduplicate.
+    prefixes = [str(p) for p in prefixes if p]
+    prefixes = list(dict.fromkeys(prefixes))
+    if not prefixes:
+        return
+
+    name = "sglang_diffusion_path_filter"
+    config.setdefault("filters", {})[name] = {
+        "()": "sglang.multimodal_gen.runtime.utils.logging_utils._UvicornAccessLogFilter",
+        "prefixes": prefixes,
+    }
+
+    handler_cfg = config.get("handlers", {}).get("access")
+    if handler_cfg is not None:
+        fl = handler_cfg.setdefault("filters", [])
+        if name not in fl:
+            fl.append(name)
+
+
+class _UvicornAccessLogFilter(logging.Filter):
+    """Suppress uvicorn access logs whose path starts with an excluded prefix.
+
+    uvicorn's ``AccessFormatter`` injects ``request_line`` during ``format()``,
+    which runs *after* filters.  We therefore extract the path from
+    ``record.args`` which uvicorn populates as::
+
+        (client_addr, method, full_path, http_version, status_code)
+    """
+
+    def __init__(self, prefixes: list[str] | None = None):
+        super().__init__()
+        self.prefixes = tuple(str(p) for p in (prefixes or ()) if p)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3:
+            path = str(args[2]).split("?", 1)[0]
+            return not path.startswith(self.prefixes)
+        return True
 
 
 def configure_logger(server_args, prefix: str = ""):
@@ -373,7 +530,7 @@ def configure_logger(server_args, prefix: str = ""):
     root.addHandler(handler)
     root.setLevel(getattr(logging, server_args.log_level.upper()))
 
-    set_uvicorn_logging_configs()
+    set_uvicorn_logging_configs(server_args)
 
 
 @lru_cache(maxsize=1)
@@ -403,6 +560,9 @@ def globally_suppress_loggers():
         "python_multipart.multipart",
         "filelock",
         "urllib3",
+        "httpx",
+        "httpcore",
+        "flash_attn.cute.cache_utils",
     ]
 
     for name in target_names:
@@ -457,7 +617,7 @@ def log_generation_timer(
             "Processing prompt %d/%d: %s",
             request_idx,
             total_requests,
-            prompt[:100],
+            _sanitize_for_logging(prompt, key_hint="prompt"),
         )
 
     timer = GenerationTimer()

@@ -8,7 +8,7 @@ on:
       - 'docker/npu.Dockerfile'
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 16 * * *" # Execute at 0:00 a.m. Beijing Time every day
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
@@ -80,6 +80,6 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=2026.02.01.post2
+            SGLANG_KERNEL_NPU_TAG=2026.03.10.rc1
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}

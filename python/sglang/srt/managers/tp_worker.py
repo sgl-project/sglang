@@ -54,6 +54,7 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner_kv_cache_mixin import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +232,7 @@ class TpModelWorker(BaseTpWorker):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
     ):
         # Parse args
@@ -248,6 +250,7 @@ class TpModelWorker(BaseTpWorker):
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.memory_pool_config = memory_pool_config
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
 
@@ -354,6 +357,7 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=self.is_draft_worker,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
 
@@ -379,6 +383,7 @@ class TpModelWorker(BaseTpWorker):
                     is_draft_worker=self.is_draft_worker,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    memory_pool_config=self.memory_pool_config,
                     draft_model_idx=i,
                 )
             )
@@ -401,6 +406,9 @@ class TpModelWorker(BaseTpWorker):
     def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+
+    def register_hisparse_coordinator(self, coordinator):
+        self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
         return (
@@ -431,12 +439,6 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
-        )
-
-    def get_remote_instance_transfer_engine_info(self):
-        return (
-            self.model_runner.remote_instance_transfer_engine_session_id,
-            self.model_runner.remote_instance_transfer_engine_weight_info,
         )
 
     def forward_batch_generation(
