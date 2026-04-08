@@ -501,6 +501,53 @@ if (SGL_KERNEL_ENABLE_FA3)
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
 
+# ============================ cuLA KDA SM90 Prefill ============================= #
+# Build cula_kda_ops as a separate, optional extension for KDA prefill on SM90a.
+# Reuses the SGL_KERNEL_ENABLE_FA3 guard (CUDA >= 12.4 + SM90a).
+if (SGL_KERNEL_ENABLE_FA3)
+    set(SGL_KDA_CUDA_FLAGS
+        "-O3"
+        "-Xcompiler"
+        "-fPIC"
+        "-gencode=arch=compute_90a,code=sm_90a"
+        "-std=c++17"
+        "-DSGL_KDA_SM90A_ENABLED"
+        "-DCUTE_USE_PACKED_TUPLE=1"
+        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
+        "-DCUTLASS_VERSIONS_GENERATED"
+        "-DCUTLASS_TEST_LEVEL=0"
+        "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
+        "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90"
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"
+        "--expt-relaxed-constexpr"
+        "--expt-extended-lambda"
+        "--use_fast_math"
+        "-Xcompiler=-Wconversion"
+        "-Xcompiler=-fno-strict-aliasing"
+        "--threads=${SGL_KERNEL_COMPILE_THREADS}"
+    )
+
+    set(KDA_SOURCES
+        "csrc/kda/kda_sm90_api.cu"
+        "csrc/kda/sm90/kda_fwd_sm90.cu"
+        "csrc/kda/sm90/kda_fwd_sm90_safe_gate.cu"
+    )
+
+    Python_add_library(cula_kda_ops MODULE WITH_SOABI ${KDA_SOURCES})
+
+    target_compile_options(cula_kda_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KDA_CUDA_FLAGS}>)
+    target_include_directories(cula_kda_ops PRIVATE
+        csrc/
+        csrc/kerutils/include/
+        ${repo-cutlass_SOURCE_DIR}/include
+        ${repo-cutlass_SOURCE_DIR}/tools/util/include
+    )
+    target_link_libraries(cula_kda_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+
+    install(TARGETS cula_kda_ops LIBRARY DESTINATION "sgl_kernel")
+endif()
+
 # Build spatial_ops as a separate, optional extension for green contexts
 set(SPATIAL_SOURCES
     "csrc/spatial/greenctx_stream.cu"

@@ -55,15 +55,23 @@ class KDAKernelDispatcher:
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
-                "KDA currently only supports 'triton'."
+                "KDA decode supports 'triton' and 'cutedsl'."
             )
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
+        elif prefill_backend.is_cula():
+            if not is_cuda():
+                raise ValueError("KDA cuLA backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_cula import (
+                CulaKDAKernel,
+            )
+
+            self.extend_kernel = CulaKDAKernel()
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
-                "KDA currently only supports 'triton'."
+                "KDA currently supports 'triton' and 'cula'."
             )
 
         rank0_log(

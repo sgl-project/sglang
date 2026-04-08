@@ -228,7 +228,7 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer", "cula"]
 
 
 # Allow external code to add more choices
@@ -2629,6 +2629,13 @@ class ServerArgs:
     def _handle_linear_attn_backend(self):
         # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         import torch
+
+        # cuLA only supports prefill; auto-fallback decode to triton.
+        if (
+            self.linear_attn_backend == "cula"
+            and self.linear_attn_decode_backend is None
+        ):
+            self.linear_attn_decode_backend = "triton"
 
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
