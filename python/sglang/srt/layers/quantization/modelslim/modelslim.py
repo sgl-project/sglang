@@ -20,6 +20,8 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A8Int8MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
+    ModelSlimW8A8MxFp8,
+    ModelSlimW8A8MxFp8MoE,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
@@ -95,6 +97,7 @@ class ModelSlimConfig(QuantizationConfig):
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
+        self.model_quant_type = quant_config.get("model_quant_type")
 
         for name in self.quant_description.keys():
             if "norm.bias" in name:
@@ -190,6 +193,10 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimW4A4Int4(
                 quant_config=self.quant_description, prefix=layer_name
             )
+        elif quant_type == "W8A8_MXFP8":
+            return ModelSlimW8A8MxFp8(
+                quant_config=self.quant_description, prefix=layer_name
+            )
         raise NotImplementedError("No modelslim compatible scheme was found.")
 
     def get_linear_scheme(
@@ -218,6 +225,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
+            ("W8A8_MXFP8", ModelSlimW8A8MxFp8MoE),
         ]
 
         moe_weight_suffixes = [".0.gate_proj.weight", ".0.w2.weight"]

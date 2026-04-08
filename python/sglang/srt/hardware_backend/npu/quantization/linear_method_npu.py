@@ -1,13 +1,57 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, List
 
 import torch
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.utils import is_npu, is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
+
+def fp8_matmul_npu(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None, # if input is dynamic quant, input_scale == None
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if block_size != [128, 128]:
+        raise ValueError("fp8_matmul_npu func now only supports block_size == [128, 128]")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError("fp8_matmul_npu func now only supports fp8e4m3")
+
+    orig_shape = input.shape
+    k = orig_shape[-1]
+    input_2d = input.reshape(-1, k).contiguous()
+ 
+    if _is_npu_before_atlas_a5:
+        output_2d = torch.ops.npu.fp8_w8a16_matmul(input_2d, weight, weight_scale, "bf16")
+    else:
+        group_sizes = (1, 128, 128)
+
+        x_fp8, x_scale = torch.ops.npu.npu_dynamic_block_quant(
+            input_2d,
+            dst_type=torch.float8_e4m3fn,
+            row_block_size=1,
+            col_block_size=128,
+        )
+
+        output_2d = torch.ops.npu.npu_quant_matmul(
+            x_fp8,
+            weight,
+            scale=weight_scale,
+            pertoken_scale=x_scale,
+            output_dtype=torch.bfloat16,
+            group_sizes=group_sizes,
+        )
+
+    output = output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
+ 
+    return output
 
 class _NPULinearMethodBase(LinearMethodBase):
 
@@ -16,6 +60,53 @@ class _NPULinearMethodBase(LinearMethodBase):
         quant_config: Optional["QuantizationConfig"] = None,
     ):
         self.quant_config = quant_config
+
+
+class NPUW8A8MxFp8LinearMethod(_NPULinearMethodBase):
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
+        layer.weight.data = npu_format_cast(layer.weight.data)
+        weight_scale = layer.weight_scale.data.transpose(
+            -1, -2
+        ).contiguous()
+        k32, n = weight_scale.shape
+        weight_scale = weight_scale.view(k32 // 2, 2, n).permute(0, 2, 1).contiguous()
+        layer.weight_scale.data = weight_scale
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        weight=layer.weight
+        weight_scale=layer.weight_scale
+        group_sizes = (1, 1, 32)
+
+        orig_shape = x.shape
+        K = orig_shape[-1]
+        x = x.reshape(-1, K).contiguous()
+
+        x_fp8, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            x,
+            axis=1,
+            dst_type=torch.float8_e4m3fn,
+            block_size=32,
+            scale_alg=None,
+        )
+
+        out = torch.ops.npu.npu_quant_matmul(
+            x_fp8,
+            weight,
+            scale=weight_scale,
+            pertoken_scale=x_scale,
+            output_dtype=torch.bfloat16,
+            group_sizes=group_sizes,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale_dtype=torch_npu.float8_e8m0fnu
+        )
+
+        return out.reshape(*orig_shape[:-1], out.shape[-1])
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):

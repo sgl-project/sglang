@@ -29,11 +29,13 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2, is_npu_before_atlas_a5
+from sglang.srt.hardware_backend.npu.triton import cache_loc_update
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -489,12 +491,21 @@ def assign_extend_cache_locs_func(
             dtype=torch.int32,
             device=device,
         )
-        torch.ops.npu.cache_loc_update(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-        )
+        if _is_npu_before_atlas_a5:
+            torch.ops.npu.cache_loc_update(
+                req_pool_indices,
+                req_to_token,
+                start_offset,
+                end_offset,
+                out_cache_loc,
+            )
+        else:
+            cache_loc_update(
+                req_pool_indices,
+                req_to_token,
+                start_offset,
+                end_offset,
+                out_cache_loc,
+            )
 
         return out_cache_loc

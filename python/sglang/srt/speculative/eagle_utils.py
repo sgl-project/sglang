@@ -4,11 +4,13 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_npu_before_atlas_a5
+from sglang.srt.hardware_backend.npu.triton import build_tree_kernel_efficient_triton, verify_tree_greedy_triton
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 
 if _is_cuda or _is_hip:
     from sgl_kernel import (
@@ -119,20 +121,36 @@ def build_tree_kernel_efficient(
         )
 
     if _is_npu:
-        torch.ops.npu.build_tree_kernel_efficient(
-            parent_list.to(dtype=torch.int64),
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
+        if _is_npu_before_atlas_a5:
+            torch.ops.npu.build_tree_kernel_efficient(
+                parent_list.to(dtype=torch.int64),
+                top_scores_index,
+                seq_lens,
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                topk,
+                spec_steps,
+                num_verify_tokens,
+                tree_mask_mode,
+            )
+        else:
+            build_tree_kernel_efficient_triton(
+                parent_list.to(dtype=torch.int64),
+                top_scores_index,
+                seq_lens,
+                tree_mask,
+                positions,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                topk,
+                spec_steps,
+                num_verify_tokens,
+                tree_mask_mode,
+            )
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
@@ -184,16 +202,28 @@ def verify_tree_greedy_func(
         )
 
     elif _is_npu:
-        from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
+        if _is_npu_before_atlas_a5:
+            from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
 
-        verify_tree_greedy(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            target_predict=target_predict,
-        )
+            verify_tree_greedy(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                target_predict=target_predict,
+            )
+        else:
+            verify_tree_greedy_triton(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                target_predict=target_predict,
+            )
     return predicts, accept_index, accept_token_num

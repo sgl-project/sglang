@@ -77,6 +77,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
+    dequant_mxfp8_weight_to_bf16,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -127,6 +128,7 @@ elif _is_hip:
     )
 elif _is_npu:
     from sgl_kernel_npu.moe.zero_experts_compute_identity import zero_experts_compute_identity_triton
+    from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 else:
     pass
 
@@ -448,7 +450,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_prefill():
+        if get_global_server_args().enable_longcat_double_stream and MultiStreamUtils().main_stream is None and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().main_stream = torch.npu.current_stream()
         # first_attn
         if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
@@ -472,7 +474,7 @@ class LongcatFlashDecoderLayer(nn.Module):
         mlp_hidden_states = hidden_states.clone()
 
         # moe
-        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_prefill():
+        if get_global_server_args().enable_longcat_double_stream and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             MultiStreamUtils().first_attn_finished.record()
             # moe
             moe_hidden_states = None
@@ -801,6 +803,14 @@ class LongcatFlashForCausalLM(nn.Module):
                                 weight, weight_scale, weight_block_size
                             )
                             self_attn.w_scale = scale
+                    elif _is_npu and isinstance(self.quant_config, ModelSlimConfig):
+                        if self.quant_config.model_quant_type == "W8A8_MXFP8":
+                            weight = w
+                            weight_scale = self_attn.kv_b_proj.weight_scale
+                            w = dequant_mxfp8_weight_to_bf16(
+                                weight,
+                                weight_scale,
+                            )
                     else:
                         if _is_fp8_fnuz:
                             weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(

@@ -3,10 +3,19 @@
 import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
+from common import is_npu
 
 import torch
 
 from sglang.srt.server_args import get_global_server_args
+
+_is_npu = is_npu()
+if _is_npu:
+    device = torch.npu.current_device()
+    import triton
+    import triton.runtime.driver as driver
+    properties = driver.active.utils.get_device_properties(device)
+    AICORE_NUM = properties["num_aicore"]
 
 class do_multi_stream_local(threading.local):
 
@@ -88,7 +97,7 @@ class MultiStreamUtils(metaclass=Singleton):
             self.stream_8 = torch.npu.Stream()
             self.stream_16 = torch.npu.Stream()
             torch.npu.set_stream_limit(self.stream_8, 8, 16)
-            torch.npu.set_stream_limit(self.stream_16, 16, 32)
+            torch.npu.set_stream_limit(self.stream_16, AICORE_NUM-8, (AICORE_NUM-8)*2)
             self.main_stream = None
             self.forward_moe_func = None
 
