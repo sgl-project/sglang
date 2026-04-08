@@ -17,6 +17,7 @@ from safetensors.torch import load_file as safetensors_load_file
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
+from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
     LTX23VideoConditionEncoder,
@@ -510,6 +511,20 @@ class LTX2AVDenoisingStage(DenoisingStage):
         # Prepare TI2V conditioning once (encode image -> patchify tokens).
         self._prepare_ltx2_image_latent(batch, server_args)
 
+        if (
+            get_sp_world_size() > 1
+            and isinstance(batch.audio_latents, torch.Tensor)
+            and hasattr(server_args.pipeline_config, "shard_audio_latents_for_sp")
+        ):
+            batch.audio_latents, batch.did_sp_shard_audio_latents = (
+                server_args.pipeline_config.shard_audio_latents_for_sp(
+                    batch, batch.audio_latents
+                )
+            )
+            audio_latents = batch.audio_latents
+        else:
+            batch.did_sp_shard_audio_latents = False
+
         # For LTX-2 packed token latents, SP sharding happens on the time dimension
         # (frames). The model must see local latent frames (RoPE offset is applied
         # inside the model using SP rank).
@@ -621,6 +636,18 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         # LTX-2 model can generate coords internally.
                         video_coords = None
                         audio_coords = None
+                        if (
+                            getattr(batch, "did_sp_shard_audio_latents", False)
+                            and hasattr(current_model, "audio_rope")
+                        ):
+                            audio_coords = current_model.audio_rope.prepare_audio_coords(
+                                batch_size=int(audio_latent_model_input.shape[0]),
+                                num_frames=audio_num_frames_latent,
+                                device=audio_latent_model_input.device,
+                                start_frame=int(
+                                    getattr(batch, "sp_audio_start_frame", 0)
+                                ),
+                            )
 
                         batch_size = int(latent_model_input.shape[0])
                         video_num_tokens = int(latent_model_input.shape[1])
@@ -1185,6 +1212,15 @@ class LTX2AVDenoisingStage(DenoisingStage):
         # batch.audio_latents is audio latents.
 
         audio_latents = batch.audio_latents
+        if (
+            getattr(batch, "did_sp_shard_audio_latents", False)
+            and isinstance(audio_latents, torch.Tensor)
+            and hasattr(server_args.pipeline_config, "gather_audio_latents_for_sp")
+        ):
+            audio_latents = server_args.pipeline_config.gather_audio_latents_for_sp(
+                audio_latents, batch
+            )
+            batch.audio_latents = audio_latents
 
         # NOTE: self.vae and self.audio_vae should be populated via __init__ or manual setting
         if self.vae is None or self.audio_vae is None:
