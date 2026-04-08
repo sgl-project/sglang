@@ -11,14 +11,11 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
+    Flux2MistralTextConfig,
     T5Config,
-    TextEncoderConfig,
+    build_flux2_text_messages,
 )
-from sglang.multimodal_gen.configs.models.encoders.base import TextEncoderArchConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
-from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
-    _is_transformer_layer,
-)
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -353,61 +350,6 @@ def flux2_klein_postprocess_text(
     return prompt_embeds
 
 
-@dataclass
-class Flux2MistralTextArchConfig(TextEncoderArchConfig):
-    stacked_params_mapping: list[tuple[str, str, str]] = field(
-        default_factory=lambda: [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-    )
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer]
-    )
-
-    def __post_init__(self):
-        self.tokenizer_kwargs = {
-            "padding": "max_length",
-            "truncation": True,
-            "max_length": 512,
-            "add_special_tokens": True,
-            "return_attention_mask": True,
-            "return_tensors": "pt",
-        }
-
-
-@dataclass
-class Flux2MistralTextConfig(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(
-        default_factory=Flux2MistralTextArchConfig
-    )
-
-
-def format_text_input(prompts: List[str], system_message: str = None):
-    # Remove [IMG] tokens from prompts to avoid Pixtral validation issues
-    # when truncation is enabled. The processor counts [IMG] tokens and fails
-    # if the count changes after truncation.
-    cleaned_txt = [prompt.replace("[IMG]", "") for prompt in prompts]
-
-    return [
-        [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": system_message}],
-            },
-            {"role": "user", "content": [{"type": "text", "text": prompt}]},
-        ]
-        for prompt in cleaned_txt
-    ]
-
-
-def flux_2_preprocess_text(prompt: str):
-    system_message = "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object attribution and actions without speculation."
-    return format_text_input([prompt], system_message=system_message)
-
-
 # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._pack_latents
 def flux2_pack_latents(latents):
     batch_size, num_channels, height, width = latents.shape
@@ -428,7 +370,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         default_factory=lambda: (Flux2MistralTextConfig(),)
     )
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (flux_2_preprocess_text,),
+        default_factory=lambda: (None,),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
@@ -448,10 +390,9 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     )
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        # flatten to 1-d list
-        prompts = [p for prompt in prompts for p in prompt]
+        messages = build_flux2_text_messages(prompts)
         inputs = tokenizer.apply_chat_template(
-            prompts,
+            messages,
             add_generation_prompt=False,
             tokenize=True,
             return_dict=True,

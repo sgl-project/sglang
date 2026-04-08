@@ -127,7 +127,7 @@ BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elaps
 
 @lru_cache(maxsize=1)
 def is_cuda():
-    return torch.cuda.is_available() and torch.version.cuda
+    return torch.cuda.is_available() and torch.version.cuda is not None
 
 
 @lru_cache(maxsize=1)
@@ -1023,7 +1023,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.7")
+        min_version: Minimum version required (e.g., "0.6.7.post2")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise

@@ -17,6 +17,7 @@
 
 import logging
 import math
+import re
 from collections.abc import Iterable
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -650,6 +651,13 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    _lora_pattern_moe = re.compile(
+        r"^(?:model\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)|lm_head|model\.embed_tokens)$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern_moe.match(module_name))
 
     def __init__(
         self,

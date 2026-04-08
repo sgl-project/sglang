@@ -410,7 +410,7 @@ jobs:
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py --suite 8-npu
 
-  pr-test-finish:
+  pr-test-npu-finish:
     needs:
       [
         check-changes,

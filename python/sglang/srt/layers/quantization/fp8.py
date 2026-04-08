@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
+    from sglang.srt.models.utils import WeightsMapper
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -240,6 +241,12 @@ class Fp8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+        if self.ignored_layers:
+            self.ignored_layers = list(
+                dict.fromkeys(hf_to_sglang_mapper.apply_list(self.ignored_layers))
+            )
 
 
 class Fp8LinearMethod(LinearMethodBase):
