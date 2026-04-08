@@ -456,7 +456,6 @@ class LTX2Attention(nn.Module):
         norm_eps: float = 1e-6,
         qk_norm: bool = True,
         use_local_attention: bool = False,
-        skip_sequence_parallel: bool = False,
         apply_gated_attention: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
@@ -472,7 +471,6 @@ class LTX2Attention(nn.Module):
         self.norm_eps = float(norm_eps)
         self.qk_norm = bool(qk_norm)
         self.use_local_attention = bool(use_local_attention)
-        self.skip_sequence_parallel = bool(skip_sequence_parallel)
         self.apply_gated_attention = bool(apply_gated_attention)
         self.prefix = prefix
 
@@ -571,7 +569,6 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
-                skip_sequence_parallel=self.skip_sequence_parallel,
                 prefix=f"{prefix}.attn",
             )
 
@@ -754,7 +751,6 @@ class LTX2TransformerBlock(nn.Module):
             dim_head=audio_attention_head_dim,
             norm_eps=norm_eps,
             qk_norm=qk_norm,
-            skip_sequence_parallel=True,
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_attn1",
@@ -800,7 +796,6 @@ class LTX2TransformerBlock(nn.Module):
             norm_eps=norm_eps,
             qk_norm=qk_norm,
             use_local_attention=use_local_av_cross_attention,
-            skip_sequence_parallel=not use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.audio_to_video_attn",
@@ -814,7 +809,6 @@ class LTX2TransformerBlock(nn.Module):
             norm_eps=norm_eps,
             qk_norm=qk_norm,
             use_local_attention=use_local_av_cross_attention,
-            skip_sequence_parallel=not use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=(
                 {AttentionBackendEnum.TORCH_SDPA}
