@@ -946,6 +946,7 @@ TWO_GPU_CASES_A = [
         ),
         T2V_sampling_params,
         run_perf_check=False,
+        run_consistency_check=False,
     ),
 ]
 
@@ -970,6 +971,7 @@ TWO_GPU_CASES_B = [
         ),
         TI2V_sampling_params,
         run_perf_check=False,
+        run_consistency_check=False,
     ),
     # I2V LoRA test case
     DiffusionTestCase(

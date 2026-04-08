@@ -265,6 +265,10 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     pipeline_name = "LTX2TwoStagePipeline"
     STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
+    @staticmethod
+    def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:
+        return is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config)
+
     def initialize_pipeline(self, server_args: ServerArgs):
         super().initialize_pipeline(server_args)
         server_args.component_paths = _resolve_ltx2_two_stage_component_paths(
@@ -334,10 +338,11 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 target=lora_targets,
                 strength=lora_strengths,
                 # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
-                # into the transformer weights. Keep the native explicit two-stage path
-                # aligned to that behavior and rely on deactivate_lora_weights() to
-                # unmerge before the next stage-1 request.
-                merge_weights=True,
+                # into the transformer weights. Legacy LTX-2 should keep the
+                # preexisting unmerged behavior to avoid regressing stage 2 quality.
+                merge_weights=self._should_merge_stage2_distilled_lora(
+                    self.server_args
+                ),
             )
         else:
             raise ValueError(f"Unknown LTX2 two-stage LoRA phase: {phase}")
