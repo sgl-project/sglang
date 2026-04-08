@@ -1,3 +1,16 @@
+"""Memory pool configurators for profiling and sizing KV cache pools.
+
+Each model architecture has its own configurator that computes pool sizes
+from available GPU memory using a unified coeff+bias model:
+
+    available_bytes = max_tokens * coeff + bias
+    max_tokens = (available_bytes - bias) / coeff
+
+Two entry points, same core computation:
+- calculate_pool_sizes(available_bytes, page_size): profiling path
+- calculate_pool_sizes_from_max_tokens(max_tokens, page_size): constraint path
+"""
+
 from __future__ import annotations
 
 import logging
@@ -16,157 +29,242 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def get_cell_size_per_token(mr: ModelRunner, num_layers: int) -> int:
-    # args to config cell size
-    model_config = mr.model_config
-    kv_cache_dtype = mr.kv_cache_dtype
-    use_mla_backend = mr.use_mla_backend
+class MemoryPoolConfigurator:
+    """Base class for memory pool configurators.
 
-    kv_size = torch._utils._element_size(kv_cache_dtype)
-    if use_mla_backend:
-        cell_size = (
-            (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-            * num_layers
-            * kv_size
-        )
-        if is_float4_e2m1fn_x2(kv_cache_dtype):
-            # kv_scale_buffer
-            scale_block_size = 16
-            cell_size = (cell_size // 2) + (
-                (
-                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                    // scale_block_size
+    Subclasses compute pool sizes for their architecture via coeff+bias model.
+    Output fields are read by _resolve_memory_pool_config to build MemoryPoolConfig.
+    """
+
+    max_total_num_tokens: int = 0
+
+    def calculate_pool_sizes(self, available_bytes: int, page_size: int) -> None:
+        """Profiling path: compute pool sizes from available bytes."""
+        raise NotImplementedError
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> None:
+        """Constraint path: recalculate pool sizes from a constrained max_tokens."""
+        raise NotImplementedError
+
+
+class DefaultPoolConfigurator(MemoryPoolConfigurator):
+    """Configurator for standard models: MHA, MLA, NSA, FP4.
+
+    coeff = cell_size (bytes per token across all layers)
+    bias = 0
+    """
+
+    def __init__(self, mr: ModelRunner):
+        self._use_mla_backend = mr.use_mla_backend
+
+        # Determine effective number of layers for KV cache
+        if mambaish := mr.mambaish_config:
+            effective_layer_ids = [
+                i
+                for i in mambaish.full_attention_layer_ids
+                if mr.start_layer <= i < mr.end_layer
+            ]
+            num_layers = len(effective_layer_ids)
+        else:
+            num_layers = mr.num_effective_layers
+
+        self._cell_size = self._compute_cell_size(mr, num_layers)
+
+        # DFLASH: scale cell_size to account for draft model KV cache
+        if mr.spec_algorithm.is_dflash() and not mr.is_draft_worker:
+            from sglang.srt.speculative.dflash_utils import (
+                scale_kv_cell_size_per_token_for_dflash,
+            )
+
+            draft_num_layers = getattr(mr, "dflash_draft_num_layers", None)
+            if (
+                draft_num_layers is not None
+                and int(draft_num_layers) > 0
+                and int(num_layers) > 0
+            ):
+                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                    target_cell_size_per_token=self._cell_size,
+                    target_num_layers=int(num_layers),
+                    draft_num_layers=int(draft_num_layers),
                 )
+
+    def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:
+        """Compute per-token KV cache cost in bytes. Subclasses can override."""
+        # args to config cell size
+        model_config = mr.model_config
+        kv_cache_dtype = mr.kv_cache_dtype
+
+        kv_size = torch._utils._element_size(kv_cache_dtype)
+        tp_size = get_attention_tp_size()
+
+        if self._use_mla_backend:
+            cell_size = (
+                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                 * num_layers
                 * kv_size
             )
+            if is_float4_e2m1fn_x2(kv_cache_dtype):
+                # kv_scale_buffer
+                scale_block_size = 16
+                cell_size = (cell_size // 2) + (
+                    (
+                        (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                        // scale_block_size
+                    )
+                    * num_layers
+                    * kv_size
+                )
 
-        # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
-        if is_deepseek_nsa(model_config.hf_config):
-            index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
-            indexer_size_per_token = (
-                index_head_dim + index_head_dim // NSATokenToKVPool.quant_block_size * 4
-            )
-            element_size = torch._utils._element_size(
-                NSATokenToKVPool.index_k_with_scale_buffer_dtype
-            )
-            cell_size += indexer_size_per_token * num_layers * element_size
-    else:
-        if model_config.is_hybrid_swa:
-            full_layers_num = len(model_config.full_attention_layer_ids)
-            swa_layers_num = len(model_config.swa_attention_layer_ids)
-
-            full_per_token = model_config.get_num_kv_heads(get_attention_tp_size()) * (
-                model_config.head_dim + model_config.v_head_dim
-            )
-
-            swa_per_token = model_config.get_swa_num_kv_heads(
-                get_attention_tp_size()
-            ) * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-
-            cell_size = (
-                full_per_token * full_layers_num + swa_per_token * swa_layers_num
-            ) * kv_size
+            # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
+            if is_deepseek_nsa(model_config.hf_config):
+                index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
+                indexer_size_per_token = (
+                    index_head_dim
+                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                )
+                element_size = torch._utils._element_size(
+                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                )
+                cell_size += indexer_size_per_token * num_layers * element_size
         else:
             cell_size = (
-                model_config.get_num_kv_heads(get_attention_tp_size())
+                model_config.get_num_kv_heads(tp_size)
                 * (model_config.head_dim + model_config.v_head_dim)
                 * num_layers
                 * kv_size
             )
 
-        if is_float4_e2m1fn_x2(kv_cache_dtype):
-            # kv_scale_buffer
-            scale_block_size = 16
+            if is_float4_e2m1fn_x2(kv_cache_dtype):
+                # kv_scale_buffer
+                scale_block_size = 16
+                n = model_config.get_num_kv_heads(tp_size)
+                k = model_config.head_dim
+                cell_size = (cell_size // 2) + (
+                    (n * k * num_layers * 2 * kv_size) // scale_block_size
+                )
 
-            n = model_config.get_num_kv_heads(get_attention_tp_size())
-            k = model_config.head_dim
-            cell_size = (cell_size // 2) + (
-                (n * k * num_layers * 2 * kv_size) // scale_block_size
-            )
-    return cell_size
+        return cell_size
+
+    def calculate_pool_sizes(self, available_bytes: int, page_size: int) -> None:
+        self.max_total_num_tokens = int(available_bytes) // self._cell_size
+        self.max_total_num_tokens = self.max_total_num_tokens // page_size * page_size
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> None:
+        self.max_total_num_tokens = max_total_num_tokens // page_size * page_size
 
 
-def resolve_hybrid_swa_tokens(
-    mr: ModelRunner, token_capacity: int
-) -> tuple[int, int, int]:
-    """Split token_capacity into full/swa pools.
+class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
+    """Configurator for hybrid sliding window attention models (Gemma2, Command-R, MiMo).
 
-    Returns (effective_capacity, full_max_total_num_tokens, swa_max_total_num_tokens).
+    Splits available memory between full attention and SWA pools.
+    Does NOT inherit DefaultPoolConfigurator — different coeff model.
     """
-    model_config = mr.model_config
-    page_size = mr.server_args.page_size
-    swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
-    full_layers_num = len(model_config.full_attention_layer_ids)
-    swa_layers_num = len(model_config.swa_attention_layer_ids)
-    assert swa_layers_num > 0, "Hybrid SWA model must have at least one SWA layer"
+    full_max_total_num_tokens: int = 0
+    swa_max_total_num_tokens: int = 0
 
-    def align_page_size(x: int) -> int:
-        return (x // page_size) * page_size
+    def __init__(self, mr: ModelRunner):
+        model_config = mr.model_config
+        kv_cache_dtype = mr.kv_cache_dtype
+        kv_size = torch._utils._element_size(kv_cache_dtype)
+        tp_size = get_attention_tp_size()
 
-    if full_layers_num == 0:
-        # all layers are SWA
-        swa_tokens = align_page_size(token_capacity)
-        logger.info(
-            f"Use sliding window memory pool (all SWA). swa_layer_tokens={swa_tokens}"
+        self._full_layers_num = len(model_config.full_attention_layer_ids)
+        self._swa_layers_num = len(model_config.swa_attention_layer_ids)
+        assert (
+            self._swa_layers_num > 0
+        ), "Hybrid SWA model must have at least one SWA layer"
+
+        self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
+
+        # Full layer per-token memory (bytes)
+        self._full_per_token = (
+            model_config.get_num_kv_heads(tp_size)
+            * (model_config.head_dim + model_config.v_head_dim)
+            * kv_size
         )
-        return swa_tokens, 0, swa_tokens
 
-    # Use unified memory-based allocation for all hybrid SWA models.
-    #
-    # Let:
-    #   F = Full layer per-token memory
-    #   S = SWA layer per-token memory (may differ from F)
-    #   r = swa_full_tokens_ratio = swa_tokens / full_tokens
-    #
-    # The profile phase computed:
-    #   cell_size = F * n_full + S * n_swa
-    #   token_capacity = rest_memory / cell_size
-    #   => total_memory = token_capacity * (F * n_full + S * n_swa)
-    #
-    # We need to solve:
-    #   full_tokens * F * n_full + swa_tokens * S * n_swa = total_memory
-    #   swa_tokens = full_tokens * r
-    #
-    # Solution:
-    #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
-    #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
+        # SWA layer per-token memory (bytes)
+        self._swa_per_token = (
+            model_config.get_swa_num_kv_heads(tp_size)
+            * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+            * kv_size
+        )
 
-    kv_size = torch._utils._element_size(mr.kv_cache_dtype)
+        # Profiling cell_size: weighted sum across all layers
+        # Used to convert between bytes and tokens for the constraint path.
+        self._cell_size = (
+            self._full_per_token * self._full_layers_num
+            + self._swa_per_token * self._swa_layers_num
+        )
 
-    # Full layer per-token memory
-    full_per_token = (
-        model_config.get_num_kv_heads(get_attention_tp_size())
-        * (model_config.head_dim + model_config.v_head_dim)
-        * kv_size
-    )
+    def _solve_pool_sizes(self, total_memory: int, page_size: int) -> None:
+        """Core computation: split total_memory into full/swa pool sizes."""
 
-    # SWA layer per-token memory
-    swa_per_token = (
-        model_config.get_swa_num_kv_heads(get_attention_tp_size())
-        * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-        * kv_size
-    )
+        def align_page_size(x: int) -> int:
+            return (x // page_size) * page_size
 
-    # Total memory available from profile
-    total_memory = token_capacity * (
-        full_per_token * full_layers_num + swa_per_token * swa_layers_num
-    )
+        if self._full_layers_num == 0:
+            # All layers are SWA
+            swa_tokens = align_page_size(
+                total_memory // self._swa_per_token // self._swa_layers_num
+            )
+            self.max_total_num_tokens = swa_tokens
+            self.full_max_total_num_tokens = 0
+            self.swa_max_total_num_tokens = swa_tokens
+            logger.info(
+                f"Use sliding window memory pool (all SWA). "
+                f"swa_layer_tokens={swa_tokens}"
+            )
+            return
 
-    # Solve the equations
-    denominator = (
-        full_per_token * full_layers_num
-        + swa_full_tokens_ratio * swa_per_token * swa_layers_num
-    )
-    assert (
-        denominator > 0
-    ), f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
+        # Solve:
+        #   full_tokens * F * n_full + swa_tokens * S * n_swa = total_memory
+        #   swa_tokens = full_tokens * r
+        # => full_tokens = total_memory / (F * n_full + r * S * n_swa)
+        denominator = (
+            self._full_per_token * self._full_layers_num
+            + self._swa_full_tokens_ratio * self._swa_per_token * self._swa_layers_num
+        )
+        assert denominator > 0, (
+            f"Invalid denominator={denominator}. "
+            f"full_per_token={self._full_per_token}, full_layers={self._full_layers_num}, "
+            f"swa_per_token={self._swa_per_token}, swa_layers={self._swa_layers_num}, "
+            f"ratio={self._swa_full_tokens_ratio}"
+        )
 
-    full_tokens = align_page_size(int(total_memory / denominator))
-    swa_tokens = align_page_size(int(full_tokens * swa_full_tokens_ratio))
+        full_tokens = align_page_size(int(total_memory / denominator))
+        swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
 
-    logger.info(
-        f"Use sliding window memory pool. full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
-    )
-    return full_tokens, full_tokens, swa_tokens
+        self.max_total_num_tokens = full_tokens
+        self.full_max_total_num_tokens = full_tokens
+        self.swa_max_total_num_tokens = swa_tokens
+
+        logger.info(
+            f"Use sliding window memory pool. "
+            f"full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
+        )
+
+    def calculate_pool_sizes(self, available_bytes: int, page_size: int) -> None:
+        self._solve_pool_sizes(int(available_bytes), page_size)
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> None:
+        # Reconstruct total memory from constrained max_tokens
+        total_memory = max_total_num_tokens * self._cell_size
+        self._solve_pool_sizes(total_memory, page_size)
+
+
+def create_memory_pool_configurator(
+    mr: ModelRunner,
+) -> MemoryPoolConfigurator:
+    """Factory: select the right configurator for the model architecture."""
+    if mr.is_hybrid_swa:
+        return HybridSWAPoolConfigurator(mr)
+    # Future: MambaPoolConfigurator
+    return DefaultPoolConfigurator(mr)

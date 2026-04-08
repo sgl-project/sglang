@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -90,47 +90,6 @@ class ModelRunnerKVCacheMixin:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
         return rest_memory * (1 << 30)  # return in bytes
-
-    def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
-        # Get the number of layers used for KV cache calculation
-        if self.is_draft_worker:
-            num_layers = getattr(
-                self.model_config.hf_config,
-                "num_nextn_predict_layers",
-                self.num_effective_layers,
-            )
-        elif mambaish := self.mambaish_config:
-            effective_layer_ids = [
-                i
-                for i in mambaish.full_attention_layer_ids
-                if self.start_layer <= i < self.end_layer
-            ]
-            num_layers = len(effective_layer_ids)
-        else:
-            num_layers = self.num_effective_layers
-
-        from sglang.srt.model_executor.pool_configurator import get_cell_size_per_token
-
-        cell_size = get_cell_size_per_token(self, num_layers)
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import (
-                scale_kv_cell_size_per_token_for_dflash,
-            )
-
-            draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
-            if (
-                draft_num_layers is not None
-                and int(draft_num_layers) > 0
-                and int(num_layers) > 0
-            ):
-                cell_size = scale_kv_cell_size_per_token_for_dflash(
-                    target_cell_size_per_token=cell_size,
-                    target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers),
-                )
-
-        available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        return int(available_bytes) // cell_size
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
@@ -239,20 +198,6 @@ class ModelRunnerKVCacheMixin:
             )
 
         return kv_cache_dim
-
-    def _resolve_hybrid_swa_tokens(
-        self: ModelRunner, token_capacity: int
-    ) -> Tuple[int, int, int]:
-        """Split token_capacity into full/swa pools.
-
-        Returns (effective_capacity, full_max_total_num_tokens, swa_max_total_num_tokens).
-        """
-        from sglang.srt.model_executor.pool_configurator import (
-            resolve_hybrid_swa_tokens,
-        )
-
-        assert self.sliding_window_size is not None and self.sliding_window_size > 0
-        return resolve_hybrid_swa_tokens(self, token_capacity)
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
         if self.server_args.disable_radix_cache:
@@ -753,19 +698,31 @@ class ModelRunnerKVCacheMixin:
         self: ModelRunner, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
-        profiled_tokens = self.profile_max_num_token(pre_model_load_memory)
-        token_capacity = self._apply_token_constraints(profiled_tokens)
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
 
-        full_tokens = None
-        swa_tokens = None
-        if self.is_hybrid_swa:
-            token_capacity, full_tokens, swa_tokens = self._resolve_hybrid_swa_tokens(
-                token_capacity
-            )
+        available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        page_size = self.server_args.page_size
+
+        configurator = create_memory_pool_configurator(self)
+        configurator.calculate_pool_sizes(available_bytes, page_size)
+
+        # Apply external constraints (user cap, page alignment, PP sync)
+        constrained = self._apply_token_constraints(configurator.max_total_num_tokens)
+        if constrained != configurator.max_total_num_tokens:
+            configurator.calculate_pool_sizes_from_max_tokens(constrained, page_size)
+
+        full_tokens = getattr(configurator, "full_max_total_num_tokens", None)
+        swa_tokens = getattr(configurator, "swa_max_total_num_tokens", None)
+
+        max_running_requests = self._resolve_max_num_reqs(
+            configurator.max_total_num_tokens
+        )
 
         return MemoryPoolConfig(
-            max_total_num_tokens=token_capacity,
-            max_running_requests=self._resolve_max_num_reqs(token_capacity),
+            max_total_num_tokens=configurator.max_total_num_tokens,
+            max_running_requests=max_running_requests,
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
             mem_fraction_static=self.server_args.mem_fraction_static,
