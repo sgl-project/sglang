@@ -2130,15 +2130,15 @@ class ServerArgs:
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
                 "GptOssForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
-                "DeepseekV32ForCausalLM",
-                "GlmMoeDsaForCausalLM",
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and self.tp_size > 1
