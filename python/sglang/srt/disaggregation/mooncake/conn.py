@@ -585,6 +585,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_item_lens: Optional[list[int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -594,6 +595,12 @@ class MooncakeKVManager(CommonKVManager):
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
         )
+
+        # Resolve per-side item lengths.
+        # src_item_lens: used for src_addr computation (local prefill/NPU side)
+        # eff_dst_item_lens: used for dst_addr computation (remote decode/GPU side)
+        src_item_lens = item_lens
+        eff_dst_item_lens = dst_item_lens if dst_item_lens is not None else item_lens
 
         layers_params = None
 
@@ -606,7 +613,8 @@ class MooncakeKVManager(CommonKVManager):
                 (
                     src_kv_ptrs[layer_id],
                     dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
+                    src_item_lens[layer_id], 
+                    eff_dst_item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -626,40 +634,50 @@ class MooncakeKVManager(CommonKVManager):
                 (
                     src_k_ptrs[layer_id],
                     dst_k_ptrs[layer_id],
-                    item_lens[layer_id],  # K item length
+                    # item_lens[layer_id],  # K item length
+                    src_item_lens[layer_id], 
+                    eff_dst_item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ] + [
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    item_lens[layers_current_pp_stage + layer_id],  # V item length
+                    # item_lens[layers_current_pp_stage + layer_id],  # V item length
+                    src_item_lens[layers_current_pp_stage + layer_id], 
+                    eff_dst_item_lens[layers_current_pp_stage + layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
 
         def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
+            src_ptr: int, dst_ptr: int, src_item_len: int, dst_item_len: int
         ) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
+                src_addr = src_ptr + int(prefill_index[0]) * src_item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * dst_item_len
+                length = src_item_len * len(prefill_index)
                 transfer_blocks.append((src_addr, dst_addr, length))
             return transfer_blocks
 
         # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
+        def process_layer(
+            src_ptr: int, dst_ptr: int, src_item_len: int, dst_item_len: int
+        ) -> int:
+            transfer_blocks = set_transfer_blocks(
+                src_ptr, dst_ptr, src_item_len, dst_item_len
+            )
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
+        def process_layers(layers_params: List[Tuple[int, int, int, int]]) -> int:
             transfer_blocks = []
-            for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+            for src_ptr, dst_ptr, src_item_len, dst_item_len in layers_params:
+                transfer_blocks.extend(
+                    set_transfer_blocks(src_ptr, dst_ptr, src_item_len, dst_item_len)
+                )
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
@@ -668,9 +686,10 @@ class MooncakeKVManager(CommonKVManager):
                     process_layer,
                     src_ptr,
                     dst_ptr,
-                    item_len,
+                    src_item_len,
+                    dst_item_len,
                 )
-                for (src_ptr, dst_ptr, item_len) in layers_params
+                for (src_ptr, dst_ptr, src_item_len, dst_item_len) in layers_params
             ]
             for future in concurrent.futures.as_completed(futures):
                 status = future.result()
@@ -691,7 +710,14 @@ class MooncakeKVManager(CommonKVManager):
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        dst_kv_item_len: Optional[int] = None, 
     ):
+        # Build per-layer dst_item_lens from the scalar dst_kv_item_len when provided.
+        # This is required for heterogeneous P/D deployments (e.g. Ascend NPU prefill +
+        # GPU decode) where the two sides may have different per-token KV slot sizes.
+        dst_item_lens: Optional[list[int]] = None
+        if dst_kv_item_len is not None:
+            dst_item_lens = [dst_kv_item_len] * len(self.kv_args.kv_item_lens)
         return self._send_kvcache_generic(
             mooncake_session_id=mooncake_session_id,
             src_data_ptrs=self.kv_args.kv_data_ptrs,
@@ -700,6 +726,7 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            dst_item_lens=dst_item_lens, 
         )
 
     def send_kvcache_hisparse(
