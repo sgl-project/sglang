@@ -40,17 +40,6 @@ def _discover_unit_tests() -> list[str]:
 
 
 SUITES = {
-    # no GPU required; safe to run on any CPU-only runner
-    "unit": [
-        "../unit/test_sampling_params.py",
-        "../unit/test_storage.py",
-        "../unit/test_lora_format_adapter.py",
-        "../unit/test_server_args.py",
-        "../unit/test_scheduler_rollout_unit.py",
-        "../unit/test_input_validation.py",
-        "../unit/test_resolve_prompts.py",
-        # add new unit tests here
-    ],
     # Auto-discovered from test/unit/test_*.py
     "unit": _discover_unit_tests(),
     "1-gpu": [
