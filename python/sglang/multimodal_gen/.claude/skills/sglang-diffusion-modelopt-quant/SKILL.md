@@ -143,8 +143,8 @@ Multi-transformer example:
 ```bash
 sglang generate \
   --model-path <base-model> \
-  --component_paths.transformer=<quantized-transformer> \
-  --component_paths.transformer_2=<another-transformer-or-bf16-override> \
+  --transformer-path <quantized-transformer> \
+  --transformer-2-path <another-transformer-or-bf16-override> \
   --prompt "<prompt>" \
   --seed <seed> \
   --save-output
@@ -153,6 +153,8 @@ sglang generate \
 Guideline:
 - use the global `--transformer-path` only when the model effectively has one transformer override to apply
 - use per-component overrides when different backbones need different checkpoints
+- the preferred CLI form is `--<component>-path`
+- config-expanded forms such as `--component_paths.transformer_2=...` also resolve to the same internal override map
 
 ### 5. Validate Accuracy
 
@@ -285,4 +287,3 @@ When documenting results:
 | `runtime/models/dits/flux_2.py` | packed-QKV handling for the packed FLUX.2 NVFP4 family |
 | `tools/convert_modelopt_fp8_checkpoint.py` | FP8 offline conversion into SGLang-native layout |
 | `tools/compare_diffusion_trajectory_similarity.py` | reduced deterministic BF16-vs-quantized validation |
-
