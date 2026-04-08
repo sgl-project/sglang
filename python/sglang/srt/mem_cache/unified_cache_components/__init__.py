@@ -6,6 +6,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentData,
     ComponentType,
     TreeComponent,
+    _NUM_COMPONENT_TYPES,
     get_and_increase_time_counter,
     next_component_uuid,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "MambaComponent",
     "SWAComponent",
     "TreeComponent",
+    "_NUM_COMPONENT_TYPES",
     "next_component_uuid",
     "get_and_increase_time_counter",
 ]

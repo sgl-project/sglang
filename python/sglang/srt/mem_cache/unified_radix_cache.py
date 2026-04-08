@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     MambaComponent,
     SWAComponent,
     TreeComponent,
+    _NUM_COMPONENT_TYPES,
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
@@ -48,21 +49,38 @@ if TYPE_CHECKING:
 class UnifiedTreeNode:
     counter = 0
 
+    __slots__ = (
+        "children",
+        "parent",
+        "key",
+        "tree_components",
+        "component_data",
+        "last_access_time",
+        "host_value",
+        "hit_count",
+        "lru_prev",
+        "lru_next",
+        "id",
+    )
+
     def __init__(self, tree_components: tuple[ComponentType, ...]):
         self.children = defaultdict(partial(UnifiedTreeNode, tree_components))
         self.parent: UnifiedTreeNode | None = None
         self.key: Optional[RadixKey] = None
         self.tree_components = tree_components
-        self.component_data = {ct: ComponentData() for ct in self.tree_components}
+        # list indexed by ComponentType (int enum 0..N-1)
+        self.component_data: list[ComponentData] = [
+            ComponentData() for _ in range(_NUM_COMPONENT_TYPES)
+        ]
         self.last_access_time = get_and_increase_time_counter()
         self.host_value = None
         self.hit_count = 0
-        self.lru_prev: dict[ComponentType, UnifiedTreeNode | None] = {
-            ct: None for ct in self.tree_components
-        }
-        self.lru_next: dict[ComponentType, UnifiedTreeNode | None] = {
-            ct: None for ct in self.tree_components
-        }
+        self.lru_prev: list[UnifiedTreeNode | None] = [
+            None
+        ] * _NUM_COMPONENT_TYPES
+        self.lru_next: list[UnifiedTreeNode | None] = [
+            None
+        ] * _NUM_COMPONENT_TYPES
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
 

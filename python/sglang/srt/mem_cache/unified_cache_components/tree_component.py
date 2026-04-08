@@ -27,10 +27,15 @@ if TYPE_CHECKING:
     )
 
 
-class ComponentType(str, Enum):
-    FULL = "full"
-    SWA = "swa"
-    MAMBA = "mamba"
+class ComponentType(int, Enum):
+    """Integer enum so that per-node list/tuple storage can be indexed directly."""
+
+    FULL = 0
+    SWA = 1
+    MAMBA = 2
+
+    def __str__(self) -> str:  # keep human-readable logging
+        return self.name.lower()
 
     @property
     def is_full(self) -> bool:
@@ -46,6 +51,7 @@ class ComponentType(str, Enum):
 
 
 BASE_COMPONENT_TYPE = ComponentType.FULL
+_NUM_COMPONENT_TYPES = len(ComponentType)
 
 _LAST_ACCESS_TIME_COUNTER_FLOAT = float64(1.0)
 _COMPONENT_UUID_COUNTER = 1
