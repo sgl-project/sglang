@@ -27,6 +27,11 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 
+from sglang.jit_kernel.flash_attention import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -616,9 +621,6 @@ class FlashAttentionBackend(AttentionBackend):
             and not is_swa_layer
         )
 
-        flash_attn_varlen_func = self.flash_attn_varlen_func
-        flash_attn_with_kvcache = self.flash_attn_with_kvcache
-
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
@@ -696,6 +698,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v_descale=v_descale,
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
+                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
 
@@ -723,6 +726,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
 
@@ -750,6 +754,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -789,6 +794,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
+                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
                 else:
@@ -814,6 +820,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
+                        ver=self.fa_impl_ver,
                         **kwargs,
                     )
                 if forward_batch.mha_return_lse:
@@ -822,7 +829,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver in [3], "Only FA3 support here"
+                assert self.fa_impl_ver == 3, "Only FA3 support here"
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
@@ -865,6 +872,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -887,6 +895,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            ver=self.fa_impl_ver,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -964,8 +973,6 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
-        flash_attn_with_kvcache = self.flash_attn_with_kvcache
-
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1009,6 +1016,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
             elif use_local_attn:
@@ -1029,6 +1037,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
             else:
@@ -1066,6 +1075,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1088,6 +1098,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            ver=self.fa_impl_ver,
                             **kwargs,
                         )
                     )
@@ -1144,6 +1155,7 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
+                ver=self.fa_impl_ver,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -1165,6 +1177,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    ver=self.fa_impl_ver,
                 )
                 o, _ = merge_state_v2(
                     o,
@@ -2421,7 +2434,11 @@ def prepare_swa_spec_page_table_triton(
 class FlashAttentionMultiStepBackend:
 
     def __init__(
-        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+        fa_impl_ver: int = 3,
     ):
         self.model_runner = model_runner
         self.topk = topk
@@ -2434,6 +2451,7 @@ class FlashAttentionMultiStepBackend:
                     speculative_step_id=i,
                     topk=self.topk,
                     speculative_num_steps=self.speculative_num_steps,
+                    fa_impl_ver=fa_impl_ver,
                 )
             )
 

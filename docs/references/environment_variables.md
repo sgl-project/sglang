@@ -19,6 +19,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_FORWARD_UNKNOWN_TOOLS`            | Forward unknown tool calls to clients instead of dropping them                                                                   | `false` (drop unknown tools) |
 | `SGLANG_REQ_WAITING_TIMEOUT`              | Timeout (in seconds) for requests waiting in the queue before being scheduled                                                    | `-1`                         |
 | `SGLANG_REQ_RUNNING_TIMEOUT`              | Timeout (in seconds) for requests running in the decode batch                                                                    | `-1`                         |
+| `SGLANG_CACHE_DIR`                        | Cache directory for model weights and other data | `~/.cache/sglang` |
 
 ## Performance Tuning
 
@@ -47,6 +48,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_CUSTOM_ALLREDUCE_ALGO` | The algorithm of custom all-reduce. Set to `oneshot` or `1stage` to force use one-shot. Set to `twoshot` or `2stage` to force use two-shot. | `` |
 | `SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM prefill attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
 | `SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM decode attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
+| `SGLANG_USE_SGL_FA3_KERNEL`               | Use sgl-kernel implementation for FlashAttention v3 | `true` |
 
 
 ## DeepGEMM Configuration (Advanced Optimization)
@@ -136,6 +138,15 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_IS_FIRST_RANK_ON_NODE` | Indicates if the current process is the first rank on its node | `"true"` |
 | `SGLANG_PP_LAYER_PARTITION` | Pipeline parallel layer partition specification | Not set |
 | `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` | Set one visible device per process for distributed computing | `false` |
+
+## PD Disaggregation — Staging Buffer (Heterogeneous TP)
+
+| Environment Variable | Description | Default Value |
+| --- | --- | --- |
+| `SGLANG_DISAGG_STAGING_BUFFER` | Enable GPU staging buffer for heterogeneous TP KV transfer. Required when prefill and decode use different TP/attention-TP sizes. Only for non-MLA models (e.g. GQA, MHA). | `false` |
+| `SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB` | Prefill-side per-worker staging buffer size in MB. Used for gathering KV head slices before bulk RDMA transfer. | `64` |
+| `SGLANG_DISAGG_STAGING_POOL_SIZE_MB` | Decode-side ring buffer pool total size in MB. Shared buffer receiving RDMA data from all prefill ranks. Larger values support higher concurrency. | `4096` |
+| `SGLANG_STAGING_USE_TORCH` | Force using PyTorch gather/scatter fallback instead of Triton fused kernels for staging operations. Useful for debugging. | `false` |
 
 ## Testing & Debugging (Internal/CI)
 

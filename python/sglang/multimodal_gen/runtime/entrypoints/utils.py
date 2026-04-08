@@ -288,12 +288,7 @@ def prepare_request(
         sampling_params=sampling_params,
         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
-    try:
-        diffusers_kwargs = sampling_params.diffusers_kwargs
-    except AttributeError:
-        diffusers_kwargs = None
-    if diffusers_kwargs:
-        req.extra["diffusers_kwargs"] = diffusers_kwargs
+    sampling_params.apply_request_extra(req)
 
     req.adjust_size(server_args)
 

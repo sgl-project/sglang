@@ -120,6 +120,11 @@ class OpenAIServingChat(OpenAIServingBase):
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
             and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
         )
+        self.is_gemma4 = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gemma4"
+        )
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
 
@@ -331,7 +336,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         # GptOss model needs to keep special tokens for harmony parsing
-        if self.is_gpt_oss:
+        if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False
 
         self._patch_mistral_skip_special_tokens(request)
@@ -649,6 +654,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Usage tracking
         prompt_tokens = {}
+        reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
@@ -669,6 +675,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens[index] = content["meta_info"].get(
                     "completion_tokens", 0
+                )
+                reasoning_tokens[index] = content["meta_info"].get(
+                    "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
@@ -752,6 +761,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
 
@@ -805,6 +815,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         if continuous_usage_stats:
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
+                                reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
                             )
 
@@ -885,8 +896,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
+                    reasoning_tokens,
                     completion_tokens,
-                    cached_tokens,
+                    cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
@@ -1200,13 +1212,18 @@ class OpenAIServingChat(OpenAIServingBase):
         total_output_logprobs: int,
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
+        output_token_logprobs = content["meta_info"]["output_token_logprobs"]
+        output_top_logprobs = content["meta_info"].get("output_top_logprobs", [])
+        if not self.tokenizer_manager.server_args.incremental_streaming_output:
+            output_token_logprobs = output_token_logprobs[
+                n_prev_token:total_output_logprobs
+            ]
+            output_top_logprobs = output_top_logprobs[
+                n_prev_token:total_output_logprobs
+            ]
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=content["meta_info"]["output_token_logprobs"][
-                n_prev_token:total_output_logprobs
-            ],
-            output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
-                n_prev_token:total_output_logprobs
-            ],
+            output_token_logprobs=output_token_logprobs,
+            output_top_logprobs=output_top_logprobs,
         )
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)
@@ -1273,11 +1290,17 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if not self.reasoning_parser:
             return False
-        if self.reasoning_parser in ["deepseek-v3"]:
+
+        if self.reasoning_parser == "deepseek-v3":
             # Models that require explicit enable thinking (thinking=True)
             return (
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
+            )
+        if self.reasoning_parser == "gemma4":
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
             )
         if self.reasoning_parser in ["kimi_k2"]:
             # Models that thinking by default, and can be disabled by setting thinking=False
@@ -1356,9 +1379,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1406,9 +1431,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"

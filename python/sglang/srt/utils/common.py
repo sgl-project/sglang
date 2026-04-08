@@ -234,18 +234,6 @@ def _check_cuda_device_version(
     )
 
 
-def _check_cuda_device_exact(
-    device_capability: Tuple[int, int], cuda_version: Tuple[int, int]
-):
-    """Check for an exact compute capability (major, minor) match."""
-    if not is_cuda():
-        return False
-    return (
-        torch.cuda.get_device_capability() == device_capability
-        and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
-    )
-
-
 is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
@@ -272,11 +260,6 @@ is_sm100_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
     )
-)
-# TODO(mmangkad): Remove the TRTLLM attention skips for SM103 once FlashInfer
-# ships a fix. Tracking: https://github.com/flashinfer-ai/flashinfer/issues/2939
-is_sm103_supported = lru_cache(maxsize=1)(
-    partial(_check_cuda_device_exact, device_capability=(10, 3), cuda_version=(13, 0))
 )
 is_sm90_supported = lru_cache(maxsize=1)(
     partial(
@@ -1040,7 +1023,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.7")
+        min_version: Minimum version required (e.g., "0.6.7.post2")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise

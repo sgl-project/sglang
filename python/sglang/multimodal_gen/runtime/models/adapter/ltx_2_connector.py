@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple, Union
 
 import torch
@@ -89,6 +90,7 @@ class LTX2Attention(torch.nn.Module):
         norm_eps: float = 1e-6,
         norm_elementwise_affine: bool = True,
         rope_type: str = "interleaved",
+        apply_gated_attention: bool = False,
         processor=None,
     ):
         super().__init__()
@@ -125,6 +127,9 @@ class LTX2Attention(torch.nn.Module):
         self.to_v = torch.nn.Linear(
             self.cross_attention_dim, self.inner_kv_dim, bias=bias
         )
+        self.to_gate_logits = None
+        if apply_gated_attention:
+            self.to_gate_logits = torch.nn.Linear(query_dim, heads, bias=True)
         self.to_out = torch.nn.ModuleList([])
         self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
         self.to_out.append(torch.nn.Dropout(dropout))
@@ -153,6 +158,7 @@ class LTX2Attention(torch.nn.Module):
         query_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         key_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        gate_input = hidden_states
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
 
@@ -198,6 +204,15 @@ class LTX2Attention(torch.nn.Module):
         )
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
+
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(gate_input)
+            b, t, _ = hidden_states.shape
+            hidden_states = hidden_states.view(b, t, self.heads, self.head_dim)
+            hidden_states = hidden_states * (
+                2.0 * torch.sigmoid(gate_logits).unsqueeze(-1)
+            )
+            hidden_states = hidden_states.view(b, t, self.heads * self.head_dim)
 
         hidden_states = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
@@ -317,6 +332,7 @@ class LTX2TransformerBlock1d(nn.Module):
         activation_fn: str = "gelu-approximate",
         eps: float = 1e-6,
         rope_type: str = "interleaved",
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
 
@@ -327,6 +343,7 @@ class LTX2TransformerBlock1d(nn.Module):
             kv_heads=num_attention_heads,
             dim_head=attention_head_dim,
             rope_type=rope_type,
+            apply_gated_attention=apply_gated_attention,
         )
 
         self.norm2 = torch.nn.RMSNorm(dim, eps=eps, elementwise_affine=False)
@@ -373,6 +390,7 @@ class LTX2ConnectorTransformer1d(nn.Module):
         eps: float = 1e-6,
         causal_temporal_positioning: bool = False,
         rope_type: str = "interleaved",
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -403,6 +421,7 @@ class LTX2ConnectorTransformer1d(nn.Module):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     rope_type=rope_type,
+                    apply_gated_attention=apply_gated_attention,
                 )
                 for _ in range(num_layers)
             ]
@@ -516,10 +535,37 @@ class LTX2TextConnectors(nn.Module):
         rope_double_precision = config.rope_double_precision
         causal_temporal_positioning = config.causal_temporal_positioning
         rope_type = config.rope_type
-
-        self.text_proj_in = nn.Linear(
-            caption_channels * text_proj_in_factor, caption_channels, bias=False
+        connector_apply_gated_attention = config.connector_apply_gated_attention
+        feature_extractor_in_features = config.feature_extractor_in_features
+        video_feature_extractor_out_features = (
+            config.video_feature_extractor_out_features
         )
+        audio_feature_extractor_out_features = (
+            config.audio_feature_extractor_out_features
+        )
+
+        self.text_proj_in: nn.Linear | None = None
+        self.video_aggregate_embed: nn.Linear | None = None
+        self.audio_aggregate_embed: nn.Linear | None = None
+        if (
+            feature_extractor_in_features > 0
+            and video_feature_extractor_out_features > 0
+            and audio_feature_extractor_out_features > 0
+        ):
+            self.video_aggregate_embed = nn.Linear(
+                feature_extractor_in_features,
+                video_feature_extractor_out_features,
+                bias=True,
+            )
+            self.audio_aggregate_embed = nn.Linear(
+                feature_extractor_in_features,
+                audio_feature_extractor_out_features,
+                bias=True,
+            )
+        else:
+            self.text_proj_in = nn.Linear(
+                caption_channels * text_proj_in_factor, caption_channels, bias=False
+            )
         self.video_connector = LTX2ConnectorTransformer1d(
             num_attention_heads=video_connector_num_attention_heads,
             attention_head_dim=video_connector_attention_head_dim,
@@ -530,6 +576,7 @@ class LTX2TextConnectors(nn.Module):
             rope_double_precision=rope_double_precision,
             causal_temporal_positioning=causal_temporal_positioning,
             rope_type=rope_type,
+            apply_gated_attention=connector_apply_gated_attention,
         )
         self.audio_connector = LTX2ConnectorTransformer1d(
             num_attention_heads=audio_connector_num_attention_heads,
@@ -541,7 +588,14 @@ class LTX2TextConnectors(nn.Module):
             rope_double_precision=rope_double_precision,
             causal_temporal_positioning=causal_temporal_positioning,
             rope_type=rope_type,
+            apply_gated_attention=connector_apply_gated_attention,
         )
+
+    @staticmethod
+    def _rescale_v2_features(
+        x: torch.Tensor, target_dim: int, source_dim: int
+    ) -> torch.Tensor:
+        return x * math.sqrt(target_dim / source_dim)
 
     def forward(
         self,
@@ -556,12 +610,6 @@ class LTX2TextConnectors(nn.Module):
                 attention_mask.shape[0], 1, -1, attention_mask.shape[-1]
             )
             attention_mask = attention_mask.to(text_dtype) * torch.finfo(text_dtype).max
-
-        # Ensure input dtype matches the layer's weight dtype
-        if text_encoder_hidden_states.dtype != self.text_proj_in.weight.dtype:
-            text_encoder_hidden_states = text_encoder_hidden_states.to(
-                self.text_proj_in.weight.dtype
-            )
 
         # Ensure sequence length is divisible by num_learnable_registers (128)
         seq_len = text_encoder_hidden_states.shape[1]
@@ -579,10 +627,44 @@ class LTX2TextConnectors(nn.Module):
                 # Pad with a large negative value to mask out the new tokens
                 attention_mask = F.pad(attention_mask, (0, pad_len), value=-1000000.0)
 
-        text_encoder_hidden_states = self.text_proj_in(text_encoder_hidden_states)
+        if (
+            self.video_aggregate_embed is not None
+            and self.audio_aggregate_embed is not None
+        ):
+            video_hidden_states = text_encoder_hidden_states
+            audio_hidden_states = text_encoder_hidden_states
+            if video_hidden_states.dtype != self.video_aggregate_embed.weight.dtype:
+                video_hidden_states = video_hidden_states.to(
+                    self.video_aggregate_embed.weight.dtype
+                )
+            if audio_hidden_states.dtype != self.audio_aggregate_embed.weight.dtype:
+                audio_hidden_states = audio_hidden_states.to(
+                    self.audio_aggregate_embed.weight.dtype
+                )
+            source_dim = self.video_aggregate_embed.out_features
+            video_hidden_states = self._rescale_v2_features(
+                video_hidden_states,
+                self.video_aggregate_embed.out_features,
+                source_dim,
+            )
+            audio_hidden_states = self._rescale_v2_features(
+                audio_hidden_states,
+                self.audio_aggregate_embed.out_features,
+                source_dim,
+            )
+            video_hidden_states = self.video_aggregate_embed(video_hidden_states)
+            audio_hidden_states = self.audio_aggregate_embed(audio_hidden_states)
+        else:
+            assert self.text_proj_in is not None
+            if text_encoder_hidden_states.dtype != self.text_proj_in.weight.dtype:
+                text_encoder_hidden_states = text_encoder_hidden_states.to(
+                    self.text_proj_in.weight.dtype
+                )
+            video_hidden_states = self.text_proj_in(text_encoder_hidden_states)
+            audio_hidden_states = video_hidden_states
 
         video_text_embedding, new_attn_mask = self.video_connector(
-            text_encoder_hidden_states, attention_mask
+            video_hidden_states, attention_mask
         )
 
         attn_mask = (new_attn_mask < 1e-6).to(torch.int64)
@@ -593,7 +675,7 @@ class LTX2TextConnectors(nn.Module):
         new_attn_mask = attn_mask.squeeze(-1)
 
         audio_text_embedding, _ = self.audio_connector(
-            text_encoder_hidden_states, attention_mask
+            audio_hidden_states, attention_mask
         )
 
         return video_text_embedding, audio_text_embedding, new_attn_mask

@@ -83,6 +83,8 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    AddExternalCorpusReqInput,
+    AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BaseBatchReq,
@@ -114,6 +116,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    ListExternalCorporaReqInput,
+    ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -122,6 +126,8 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    RemoveExternalCorpusReqInput,
+    RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -268,6 +274,24 @@ class EmbeddingBatchResult:
             ]
 
         self.copy_done.record()
+
+
+def validate_dflash_request(req: Req) -> Optional[str]:
+    if req.return_logprob:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+
+    if (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    ):
+        return (
+            "DFLASH speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
+
+    return None
 
 
 class Scheduler(
@@ -549,7 +573,7 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            self.tokenizer.think_end_id = self.tokenizer.encode(
+            self.model_config.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
@@ -599,6 +623,7 @@ class Scheduler(
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():
             self.draft_worker = None
+            self.external_corpus_manager = None
             return
 
         # Launch a draft worker for speculative decoding
@@ -624,6 +649,18 @@ class Scheduler(
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
+        if self.spec_algorithm.is_ngram():
+            from sglang.srt.speculative.external_corpus_manager import (
+                ExternalCorpusManager,
+            )
+
+            self.external_corpus_manager = ExternalCorpusManager(
+                self.draft_worker,
+                self.send_to_tokenizer.send_output,
+            )
+        else:
+            self.external_corpus_manager = None
 
     def init_model_worker(self):
         self.init_tp_model_worker()
@@ -706,9 +743,14 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
+        _spec = self.tp_worker.model_runner.linear_attn_model_spec
+        _registry_needs_mamba = (
+            _spec.uses_mamba_radix_cache if _spec is not None else False
+        )
         self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
+            or _registry_needs_mamba
         )
 
         self.sliding_window_size = None
@@ -1251,6 +1293,15 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (AddExternalCorpusReqInput, self.add_external_corpus),
+                (
+                    RemoveExternalCorpusReqInput,
+                    self.remove_external_corpus,
+                ),
+                (
+                    ListExternalCorporaReqInput,
+                    self.list_external_corpora,
+                ),
             ]
         )
 
@@ -1605,6 +1656,8 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
 
         self._check_pending_flush()
+        if self.external_corpus_manager is not None:
+            self.external_corpus_manager.check_pending_load()
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -1825,6 +1878,14 @@ class Scheduler(
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        if self.spec_algorithm.is_dflash():
+            error_msg = validate_dflash_request(req)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -2201,6 +2262,8 @@ class Scheduler(
                 else:
                     self.running_batch.merge_batch(new_batch)
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
+            # Reset batch_is_full so the scheduler can schedule more prefills.
+            self.running_batch.batch_is_full = False
 
         if (
             not self.enable_hisparse
@@ -2603,8 +2666,6 @@ class Scheduler(
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.retract_req(req)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -2864,6 +2925,36 @@ class Scheduler(
                 ),
                 pending_req,
             )
+
+    def add_external_corpus(
+        self, recv_req: AddExternalCorpusReqInput
+    ) -> Optional[AddExternalCorpusReqOutput]:
+        if self.external_corpus_manager is None:
+            return AddExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        return self.external_corpus_manager.add(recv_req)
+
+    def remove_external_corpus(
+        self, recv_req: RemoveExternalCorpusReqInput
+    ) -> RemoveExternalCorpusReqOutput:
+        if self.external_corpus_manager is None:
+            return RemoveExternalCorpusReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        return self.external_corpus_manager.remove(recv_req)
+
+    def list_external_corpora(
+        self, recv_req: ListExternalCorporaReqInput
+    ) -> ListExternalCorporaReqOutput:
+        if self.external_corpus_manager is None:
+            return ListExternalCorporaReqOutput(
+                success=False,
+                message="Ngram speculative decoding is not enabled.",
+            )
+        return self.external_corpus_manager.list(recv_req)
 
     def flush_cache_wrapped(
         self, recv_req: FlushCacheReqInput
@@ -3578,9 +3669,10 @@ def run_scheduler_process(
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
-    numa_node = get_numa_node_if_available(server_args, gpu_id)
-    if numa_node is not None and not envs.SGLANG_NUMA_BIND_V2.get():
-        numa_bind_to_node(numa_node)
+    if not envs.SGLANG_NUMA_BIND_V2.get():
+        numa_node = get_numa_node_if_available(server_args, gpu_id)
+        if numa_node is not None:
+            numa_bind_to_node(numa_node)
 
     # Set up tracing
     if server_args.enable_trace:

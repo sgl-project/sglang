@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List, Optional
+
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.nn.functional as F
@@ -469,28 +472,37 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     topk_weights = torch.ones_like(
                         topk_weights, dtype=torch.float32
                     )  # topk_weights must be FP32 (float32)
-                output = fused_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    activation=(
-                        ActivationType.Silu
-                        if moe_runner_config.activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                    expert_mask=layer.expert_mask_gpu,
-                )
-                return StandardCombineInput(hidden_states=output)
-            else:
-                quant_info = TritonMoeQuantInfo(
-                    w13_weight=layer.w13_weight,
-                    w2_weight=layer.w2_weight,
-                    b13=getattr(layer, "w13_weight_bias", None),
-                    b2=getattr(layer, "w2_weight_bias", None),
-                )
-                return self.runner.run(dispatch_output, quant_info)
+                try:
+                    output = fused_moe(
+                        x,
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        topk_weights,
+                        topk_ids,
+                        activation=(
+                            ActivationType.Silu
+                            if moe_runner_config.activation == "silu"
+                            else ActivationType.Gelu
+                        ),
+                        expert_mask=layer.expert_mask_gpu,
+                    )
+                    return StandardCombineInput(hidden_states=output)
+                except RuntimeError as e:
+                    # AITER CK fused_moe may not support all GEMM dimensions
+                    # (e.g. Gemma4 MoE with 128 experts × 704 intermediate size).
+                    # Fall through to Triton MoE runner below.
+                    logger.warning_once(
+                        f"AITER CK fused_moe failed ({e}), "
+                        "falling back to Triton MoE runner."
+                    )
+
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
         self,

@@ -217,6 +217,11 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
+        has_mamba_track_mask = bool(
+            forward_batch.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask.any()
+        )
+
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
@@ -228,6 +233,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            has_mamba_track_mask=has_mamba_track_mask,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -613,10 +619,7 @@ class MambaAttnBackendBase(AttentionBackend):
         Note: Conv state tracking for extend is handled separately via gather operations
         using indices computed by `_init_track_conv_indices`.
         """
-        if (
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        ):
+        if forward_metadata.has_mamba_track_mask:
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:

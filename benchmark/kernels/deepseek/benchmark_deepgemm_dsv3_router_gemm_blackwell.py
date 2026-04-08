@@ -147,7 +147,7 @@ def get_benchmark_plot_friendly(tp_sizes):
             line_names=["SGLang", "Flashinfer"],
             styles=[("blue", "-"), ("red", "-")],
             ylabel="us",
-            plot_name=f"fp8-gemm-performance-comparison-tp-{"-".join(str(tp) for tp in tp_sizes)}",
+            plot_name=f"fp8-gemm-performance-comparison-tp-{'-'.join(str(tp) for tp in tp_sizes)}",
             args={},
         )
     )
@@ -176,7 +176,7 @@ def get_benchmark(tp_sizes):
             line_names=["SGLang", "Flashinfer"],
             styles=[("blue", "-"), ("red", "-")],
             ylabel="us",
-            plot_name=f"fp8-gemm-performance-comparison-tp-{"-".join(str(tp) for tp in tp_sizes)}",
+            plot_name=f"fp8-gemm-performance-comparison-tp-{'-'.join(str(tp) for tp in tp_sizes)}",
             args={},
         )
     )
