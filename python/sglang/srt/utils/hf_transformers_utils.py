@@ -27,6 +27,7 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.gguf_utils import check_gguf_file
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 # Compatibility shim: flash-attn-4 registers a bare ``flash_attn`` namespace
@@ -1479,16 +1480,3 @@ def _patch_mistral_common_tokenizer(tokenizer):
         return tokenizer._orig_apply_chat_template(cleaned, **kwargs)
 
     tokenizer.apply_chat_template = _safe_apply_chat_template
-
-
-def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
-    """Check if the file is a GGUF model."""
-    model = Path(model)
-    if not model.is_file():
-        return False
-    elif model.suffix == ".gguf":
-        return True
-
-    with open(model, "rb") as f:
-        header = f.read(4)
-    return header == b"GGUF"

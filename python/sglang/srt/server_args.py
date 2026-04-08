@@ -67,7 +67,7 @@ from sglang.srt.utils.common import (
     torch_release,
     xpu_has_xmx_support,
 )
-from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils.gguf_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
