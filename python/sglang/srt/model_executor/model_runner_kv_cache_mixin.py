@@ -821,37 +821,31 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
-    def _resolve_token_capacity(self: ModelRunner, profiled_tokens: int) -> int:
+    def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Compute final token pool capacity from profiled value,
         applying user cap, page alignment, and PP sync"""
         user_limit = self.server_args.max_total_tokens
 
         # Apply user-specified upper bound
         if user_limit is not None:
-            if user_limit > profiled_tokens:
+            if user_limit > token_capacity:
                 logging.warning(
                     f"max_total_tokens={user_limit} is larger than the profiled value "
-                    f"{profiled_tokens}. Use the profiled value instead."
+                    f"{token_capacity}. Use the profiled value instead."
                 )
-            capacity = min(profiled_tokens, user_limit)
-        else:
-            capacity = profiled_tokens
-
-        # Align to page boundary
-        page_size = self.server_args.page_size
-        capacity = capacity // page_size * page_size
+            token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
         if self.pp_size > 1:
-            tensor = torch.tensor(capacity, dtype=torch.int64)
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
             )
-            capacity = tensor.item()
+            token_capacity = tensor.item()
 
-        return capacity
+        return token_capacity
 
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
@@ -889,7 +883,7 @@ class ModelRunnerKVCacheMixin:
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
         profiled_tokens = self.profile_max_num_token(pre_model_load_memory)
-        token_capacity = self._resolve_token_capacity(profiled_tokens)
+        token_capacity = self._apply_token_constraints(profiled_tokens)
 
         full_tokens = None
         swa_tokens = None
