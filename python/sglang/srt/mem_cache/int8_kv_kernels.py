@@ -120,9 +120,7 @@ def _dequant_from_int8_kernel(
     q_ptrs = q_ptr + pid_tok * q_s0 + pid_head * q_s1 + offs * q_s2
     q = tl.load(q_ptrs, mask=mask, other=0).to(tl.float32)
 
-    scale = tl.load(scale_ptr + pid_tok * scale_s0 + pid_head * scale_s1).to(
-        tl.float32
-    )
+    scale = tl.load(scale_ptr + pid_tok * scale_s0 + pid_head * scale_s1).to(tl.float32)
     zp = tl.load(zp_ptr + pid_tok * scale_s0 + pid_head * scale_s1).to(tl.float32)
     out = q * scale + zp
 
@@ -180,13 +178,17 @@ def _scatter_quant_tensor_to_pool(
     if src.ndim != 3:
         raise ValueError(f"src must be [tokens, heads, dim], got {tuple(src.shape)}")
     if q_pool.ndim != 3:
-        raise ValueError(f"q_pool must be [pool, heads, dim], got {tuple(q_pool.shape)}")
+        raise ValueError(
+            f"q_pool must be [pool, heads, dim], got {tuple(q_pool.shape)}"
+        )
     if scale_pool.ndim != 3 or scale_pool.shape[-1] != 1:
         raise ValueError(
             f"scale_pool must be [pool, heads, 1], got {tuple(scale_pool.shape)}"
         )
     if zp_pool.ndim != 3 or zp_pool.shape[-1] != 1:
-        raise ValueError(f"zp_pool must be [pool, heads, 1], got {tuple(zp_pool.shape)}")
+        raise ValueError(
+            f"zp_pool must be [pool, heads, 1], got {tuple(zp_pool.shape)}"
+        )
     if src.shape[0] != loc.numel():
         raise ValueError(f"src tokens {src.shape[0]} != len(loc) {loc.numel()}")
     if src.shape[1] != q_pool.shape[1] or src.shape[2] != q_pool.shape[2]:
@@ -267,7 +269,9 @@ def dequant_int8_kv(
     if out is None:
         out = torch.empty(q_pool.shape, dtype=out_dtype, device=q_pool.device)
     elif out.shape != q_pool.shape:
-        raise ValueError(f"out shape {tuple(out.shape)} != q_pool shape {tuple(q_pool.shape)}")
+        raise ValueError(
+            f"out shape {tuple(out.shape)} != q_pool shape {tuple(q_pool.shape)}"
+        )
 
     if not q_pool.is_cuda:
         out.copy_(

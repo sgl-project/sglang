@@ -15,16 +15,12 @@ register_amd_ci(est_time=1, suite="stage-b-test-small-1-gpu-amd")
 
 class TestInt8KVKernels(unittest.TestCase):
     def test_dequant_formula_cpu(self):
-        q = torch.tensor(
-            [[[-128, -1, 0, 127], [10, -10, 20, -20]]], dtype=torch.int8
-        )
+        q = torch.tensor([[[-128, -1, 0, 127], [10, -10, 20, -20]]], dtype=torch.int8)
         scale = torch.tensor([[[0.5], [0.25]]], dtype=torch.float16)
         zp = torch.tensor([[[1.0], [-2.0]]], dtype=torch.float16)
 
         out = dequant_int8_kv(q, scale, zp, out_dtype=torch.float32)
-        expected = q.to(torch.float32) * scale.to(torch.float32) + zp.to(
-            torch.float32
-        )
+        expected = q.to(torch.float32) * scale.to(torch.float32) + zp.to(torch.float32)
 
         torch.testing.assert_close(out, expected)
 

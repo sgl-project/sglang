@@ -68,7 +68,9 @@ class TestInt8KVCacheServerArgs(unittest.TestCase):
 
     def test_int8_kv_cache_requires_page_size_one(self):
         with self.assertRaisesRegex(ValueError, "page-size 1"):
-            server_args = ServerArgs(model_path="dummy", int8_kv_cache=True, page_size=16)
+            server_args = ServerArgs(
+                model_path="dummy", int8_kv_cache=True, page_size=16
+            )
             server_args._handle_int8_kv_cache_compatibility()
 
     def test_int8_kv_cache_rejects_disaggregation(self):

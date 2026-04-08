@@ -105,20 +105,17 @@ class INT8MHATokenToKVPool(MHATokenToKVPool):
             enable_kv_cache_copy=enable_kv_cache_copy,
         )
         self.int8_kv_cache_enabled = True
-        self.kv_capacity_factor = (
-            self.get_baseline_bytes_per_token(
-                self.head_num,
-                self.head_dim,
-                self.layer_num,
-                self.dtype,
-                v_head_dim=self.v_head_dim,
-            )
-            / self.get_bytes_per_token(
-                self.head_num,
-                self.head_dim,
-                self.layer_num,
-                v_head_dim=self.v_head_dim,
-            )
+        self.kv_capacity_factor = self.get_baseline_bytes_per_token(
+            self.head_num,
+            self.head_dim,
+            self.layer_num,
+            self.dtype,
+            v_head_dim=self.v_head_dim,
+        ) / self.get_bytes_per_token(
+            self.head_num,
+            self.head_dim,
+            self.layer_num,
+            v_head_dim=self.v_head_dim,
         )
         self._write_version = [0 for _ in range(self.layer_num)]
         self._last_dequant_layer = -1
@@ -197,7 +194,11 @@ class INT8MHATokenToKVPool(MHATokenToKVPool):
             dim=0,
         )
         self.data_strides = torch.tensor(
-            [np.prod(x.shape[1:]) * x.dtype.itemsize for group in ptr_groups for x in group],
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for group in ptr_groups
+                for x in group
+            ],
             device=self.device,
         )
 
@@ -217,13 +218,15 @@ class INT8MHATokenToKVPool(MHATokenToKVPool):
                 np.prod(self.k_buffer[i].shape) * self.k_buffer[i].dtype.itemsize
                 + np.prod(self.k_scale_buffer[i].shape)
                 * self.k_scale_buffer[i].dtype.itemsize
-                + np.prod(self.k_zp_buffer[i].shape) * self.k_zp_buffer[i].dtype.itemsize
+                + np.prod(self.k_zp_buffer[i].shape)
+                * self.k_zp_buffer[i].dtype.itemsize
             )
             v_size_bytes += (
                 np.prod(self.v_buffer[i].shape) * self.v_buffer[i].dtype.itemsize
                 + np.prod(self.v_scale_buffer[i].shape)
                 * self.v_scale_buffer[i].dtype.itemsize
-                + np.prod(self.v_zp_buffer[i].shape) * self.v_zp_buffer[i].dtype.itemsize
+                + np.prod(self.v_zp_buffer[i].shape)
+                * self.v_zp_buffer[i].dtype.itemsize
             )
         return k_size_bytes, v_size_bytes
 
@@ -299,9 +302,7 @@ class INT8MHATokenToKVPool(MHATokenToKVPool):
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                k_i8, v_i8, k_s, k_z, v_s, v_z = kv_cache_cpu[layer_id][
-                    i // chunk_size
-                ]
+                k_i8, v_i8, k_s, k_z, v_s, v_z = kv_cache_cpu[layer_id][i // chunk_size]
                 self.k_buffer[layer_id][chunk_indices] = k_i8.to(
                     self.device, non_blocking=True
                 )
@@ -386,7 +387,9 @@ class INT8MHATokenToKVPool(MHATokenToKVPool):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        layer_id = layer_id_override if layer_id_override is not None else layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
