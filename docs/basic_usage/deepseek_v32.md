@@ -468,3 +468,9 @@ python -m sglang.launch_server \
 ```
 
 For the Decode nodes, it is recommended to use the **EP mode**.
+
+## HiSparse: Hierarchical Sparse Attention for DSA (experimental)
+
+HiSparse reduces per-request GPU memory during decode by keeping only a small "hot" KV buffer on GPU while storing complete KV data in CPU pinned memory. A CUDA kernel dynamically swaps in the top-k most relevant KV entries from host memory on each decode step. This enables significantly higher decode concurrency for long-context DSA models.
+
+HiSparse currently requires PD disaggregation mode and is enabled on the decode instance only. For detailed design, configuration, and deployment instructions, see the [HiSparse Guide](../advanced_features/hisparse_guide.md).
