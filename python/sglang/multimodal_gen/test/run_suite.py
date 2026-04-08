@@ -426,7 +426,6 @@ def run_pytest(
     files: list[str],
     filter_expr: str | None = None,
     junit_xml_path: str | None = None,
-    exitfirst: bool = False,
 ) -> tuple[int, list[str], dict[str, str]]:
     if not files:
         print("No files to run.")
@@ -449,8 +448,6 @@ def run_pytest(
         "--log-cli-date-format=%Y-%m-%d %H:%M:%S",
     ]
 
-    if exitfirst:
-        base_cmd.append("-x")
     if junit_xml_path:
         base_cmd.extend(["--junit-xml", junit_xml_path])
     if filter_expr:
@@ -579,7 +576,6 @@ def _run_file_suite(args, target_dir: Path) -> int:
         suite_files_abs,
         filter_expr=args.filter,
         junit_xml_path=None,
-        exitfirst=not args.continue_on_error,
     )
     return exit_code
 
@@ -676,7 +672,6 @@ def _run_dynamic_suite(args, target_dir: Path) -> int:
                 suite_files,
                 filter_expr=filter_expr,
                 junit_xml_path=junit_xml_path,
-                exitfirst=not args.continue_on_error,
             )
             _merge_execution_results(
                 executed_cases, case_results, new_executed_cases, new_case_results
@@ -826,7 +821,6 @@ def _run_dynamic_suite(args, target_dir: Path) -> int:
             suite_files,
             filter_expr=filter_expr,
             junit_xml_path=junit_xml_path,
-            exitfirst=not args.continue_on_error,
         )
         write_execution_report(
             suite=args.suite,
