@@ -2117,6 +2117,17 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
+        if (
+            not self.enable_fused_qk_norm_rope
+            and model_arch == "Qwen3MoeForCausalLM"
+            and (is_sm90_supported() or is_sm100_supported())
+            and not self.enable_deterministic_inference
+        ):
+            self.enable_fused_qk_norm_rope = True
+            logger.info(
+                "Auto-enabling fused QK-norm+RoPE on SM90/SM10X for Qwen3MoeForCausalLM"
+            )
+
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
         # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
