@@ -73,7 +73,9 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
 
-    def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int):
+    def _profile_available_bytes(
+        self: ModelRunner, pre_model_load_memory: int
+    ) -> float:
         post_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -107,7 +109,7 @@ class ModelRunnerKVCacheMixin:
         else:
             num_layers = self.num_effective_layers
 
-        from sglang.srt.model_executor.memory_profiler import get_cell_size_per_token
+        from sglang.srt.model_executor.pool_configurator import get_cell_size_per_token
 
         cell_size = get_cell_size_per_token(self, num_layers)
         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
@@ -245,7 +247,9 @@ class ModelRunnerKVCacheMixin:
 
         Returns (effective_capacity, full_max_total_num_tokens, swa_max_total_num_tokens).
         """
-        from sglang.srt.model_executor.memory_profiler import resolve_hybrid_swa_tokens
+        from sglang.srt.model_executor.pool_configurator import (
+            resolve_hybrid_swa_tokens,
+        )
 
         assert self.sliding_window_size is not None and self.sliding_window_size > 0
         return resolve_hybrid_swa_tokens(self, token_capacity)
