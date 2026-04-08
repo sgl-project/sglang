@@ -2,8 +2,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 from sgl_kernel_npu.fla.fused_gdn_gating import (
-    fused_gdn_gating_npu,
     fused_gdn_gating_kernel_without_sigmoid,
+    fused_gdn_gating_npu,
 )
 from sgl_kernel_npu.mamba.causal_conv1d import (
     causal_conv1d_fn_npu,
