@@ -14,9 +14,10 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=360, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=720, suite="stage-c-test-8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
+GLM5_MODEL_PATH = "zai-org/GLM-5-FP8"
 
 
 class TestDeepseekV32DP(CustomTestCase):
@@ -136,6 +137,125 @@ class TestDeepseekV32TP(CustomTestCase):
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 80)
+
+
+class TestGLM5DP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = GLM5_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--tp",
+            "8",
+            "--dp",
+            "8",
+            "--enable-dp-attention",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=1400,
+            num_threads=1400,
+            num_shots=20,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (glm-5)\n" f'{metrics["score"]=:.3f}\n'
+            )
+            self.assertGreater(metrics["score"], 0.935)
+
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+
+        print(f"{speed=:.2f}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_bs_1_speed (glm-5)\n" f"{speed=:.2f} token/s\n"
+            )
+            self.assertGreater(speed, 40)
+
+
+class TestGLM5TP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = GLM5_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--tp",
+            "8",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=1400,
+            num_threads=1400,
+            num_shots=20,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (glm-5)\n" f'{metrics["score"]=:.3f}\n'
+            )
+            self.assertGreater(metrics["score"], 0.935)
+
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+
+        print(f"{speed=:.2f}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_bs_1_speed (glm-5)\n" f"{speed=:.2f} token/s\n"
+            )
+            self.assertGreater(speed, 60)
 
 
 if __name__ == "__main__":

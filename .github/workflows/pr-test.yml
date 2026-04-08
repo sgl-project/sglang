@@ -705,6 +705,7 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           source /etc/profile.d/sglang-ci.sh
           cd test/
