@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
 
 # CI Registration
 register_cuda_ci(est_time=220, suite="stage-b-test-1-gpu-large")
+register_amd_ci(est_time=220, suite="stage-b-test-1-gpu-large-amd")
 
 
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
