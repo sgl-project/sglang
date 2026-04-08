@@ -21,6 +21,16 @@ if TYPE_CHECKING:
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
 
+    def __init__(self, cache, params):
+        super().__init__(cache, params)
+        allocator = cache.token_to_kv_pool_allocator
+        # When SWA is present, only free full-attention KV here;
+        # SWA KV will be freed by cascade via SWAComponent.evict_component.
+        if ComponentType.SWA in cache.tree_components:
+            self._free_full = allocator.full_attn_allocator.free
+        else:
+            self._free_full = allocator.free
+
     def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
         # Override so _for_each_component_lru includes Full in LRU operations
         return node.component_data[self.component_type].value is not None
@@ -36,10 +46,9 @@ class FullComponent(TreeComponent):
         ].lock_ref
 
     def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
-        self.cache.token_to_kv_pool_allocator.free(
-            node.component_data[self.component_type].value
-        )
-        freed = len(node.component_data[self.component_type].value)
+        cd = node.component_data[self.component_type]
+        self._free_full(cd.value)
+        freed = len(cd.value)
         self.cache.component_evictable_size_[self.component_type] -= freed
         return freed
 
