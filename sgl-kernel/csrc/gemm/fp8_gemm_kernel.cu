@@ -51,6 +51,9 @@ limitations under the License.
 #include "math.hpp"
 #include "utils.h"
 
+// Custom EVT broadcast nodes that handle both per-row/col and per-tensor (scalar) scales
+#include "cutlass_extensions/epilogue/broadcast_load_epilogue_c3x.hpp"
+
 using namespace cute;
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12040
@@ -497,17 +500,15 @@ struct DeviceGemmFp8RowwiseSm90 {
   using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;  // Kernel to launch based on the default
                                                                          // setting in the Collective Builder
   // Implement rowwise scaling epilogue.
-  using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<
+  using XScale = cutlass::epilogue::fusion::Sm90ColOrScalarBroadcast<
       0,
       TileShape,
-      ElementComputeEpilogue,
       ElementComputeEpilogue,
       cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
 
-  using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<
+  using WScale = cutlass::epilogue::fusion::Sm90RowOrScalarBroadcast<
       0,
       TileShape,
-      ElementComputeEpilogue,
       ElementComputeEpilogue,
       cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
@@ -639,11 +640,14 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
        stride_c,
        ptr_d,
        stride_d}};
+  bool a_is_vector = (scales_a.numel() != 1);
+  bool b_is_vector = (scales_b.numel() != 1);
+
   if constexpr (WithBias) {
     args.epilogue.thread = {
-        {ptr_scales_a},
+        {ptr_scales_a, a_is_vector},
         {
-            {ptr_scales_b},
+            {ptr_scales_b, b_is_vector},
             {},  // Accumulator
             {}   // Multiplies
         },
@@ -652,9 +656,9 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
     };
   } else {
     args.epilogue.thread = {
-        {ptr_scales_a},
+        {ptr_scales_a, a_is_vector},
         {
-            {ptr_scales_b},
+            {ptr_scales_b, b_is_vector},
             {},  // Accumulator
             {}   // Multiplies
         },
@@ -1453,7 +1457,8 @@ torch::Tensor fp8_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias) {
+    const c10::optional<torch::Tensor>& bias,
+    const c10::optional<torch::Tensor>& out_opt) {
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
@@ -1470,12 +1475,14 @@ torch::Tensor fp8_scaled_mm(
   TORCH_CHECK(mat_b.scalar_type() == torch::kFloat8_e4m3fn, "mat_b must be Float8_e4m3fn");
   TORCH_CHECK(out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "out_dtype must be Half or BFloat16");
 
-  TORCH_CHECK(scales_a.numel() == mat_a.size(0), "size of scales_a is not matched");
-  TORCH_CHECK(scales_b.numel() == mat_b.size(1), "size of scales_b is not matched");
+  TORCH_CHECK(scales_a.numel() == mat_a.size(0) || scales_a.numel() == 1, "size of scales_a is not matched");
+  TORCH_CHECK(scales_b.numel() == mat_b.size(1) || scales_b.numel() == 1, "size of scales_b is not matched");
   TORCH_CHECK(scales_a.is_contiguous(), "scales_a must be contiguous");
   TORCH_CHECK(scales_b.is_contiguous(), "scales_b msut be contiguous");
   TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
   TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
+
+
 
   if (bias) {
     TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched");
@@ -1483,7 +1490,18 @@ torch::Tensor fp8_scaled_mm(
     TORCH_CHECK(bias->dtype() == out_dtype, "bias dtype must match output dtype");
   }
 
-  torch::Tensor out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
+  torch::Tensor out;
+  if (out_opt.has_value()) {
+    out = out_opt.value();
+    TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
+    TORCH_CHECK(out.dim() == 2, "out must be a 2D tensor");
+    TORCH_CHECK(out.size(0) == mat_a.size(0) && out.size(1) == mat_b.size(1),
+                "out shape must be [", mat_a.size(0), ", ", mat_b.size(1), "]");
+    TORCH_CHECK(out.dtype() == out_dtype, "out dtype must match out_dtype");
+    TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  } else {
+    out = torch::empty({mat_a.size(0), mat_b.size(1)}, mat_a.options().dtype(out_dtype));
+  }
   TORCH_CHECK((out.size(1) * out.element_size()) % 16 == 0, "out must be multiple of 16 bytes for memory alignment");
 
   auto sm_version = getSMVersion();

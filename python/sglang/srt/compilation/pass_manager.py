@@ -5,6 +5,8 @@ import logging
 from torch import fx as fx
 
 from sglang.srt.compilation.fix_functionalization import FixFunctionalizationPass
+from sglang.srt.compilation.replace_scaled_mm import install_cutlass_scaled_mm
+
 from sglang.srt.compilation.inductor_pass import (
     CustomGraphPass,
     InductorPass,
@@ -47,6 +49,8 @@ class PostGradPassManager(CustomGraphPass):
     ):
         self.pass_config = dict()
         self.fix_functionalization = FixFunctionalizationPass()
+        install_cutlass_scaled_mm()
+
 
     def add(self, pass_: InductorPass):
         assert isinstance(pass_, InductorPass)
