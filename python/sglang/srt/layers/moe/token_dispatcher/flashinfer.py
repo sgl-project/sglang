@@ -95,7 +95,7 @@ class FlashinferDispatcher(BaseDispatcher):
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
 
-        # TODO: Enable for flashinfer_trtllm_routed when https://github.com/flashinfer-ai/flashinfer/issues/2703 is fixed.
+        # TODO: Enable for flashinfer_trtllm_routed if possible.
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
