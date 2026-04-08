@@ -195,9 +195,9 @@ def _filter_duplicate_precision_variant_safetensors(
     Diffusers checkpoints sometimes ship both `foo.safetensors` and
     `foo.fp16.safetensors` (and their sharded variants) in the same directory.
     Loading both is unsafe because duplicate parameter names race and whichever
-    tensor arrives last wins.
+    tensor arrives last wins, leading to non-deterministic behavior
 
-    If a canonical unsuffixed file exists, prefer it and drop the precision
+    If a canonical unsuffixed (non bf16|fp32) file exists, prefer it and drop the precision
     variant from the same family. Precision-only families are left untouched.
     """
     canonical_paths = set(safetensors_list)

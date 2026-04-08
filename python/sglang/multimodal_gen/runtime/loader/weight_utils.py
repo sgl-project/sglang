@@ -135,7 +135,7 @@ def _validate_safetensors_file(file_path: str) -> bool:
 
 
 def _raise_if_duplicate_safetensors_keys(hf_weights_files: list[str]) -> None:
-    """Fail fast when multiple safetensors files define the same tensor name.
+    """Fail fast when multiple safetensors files define the same tensor name. Make sure runtime behavior is deterministic
 
     Duplicate keys across files are almost always a packaging error for inference:
     for example shipping both full and fp16 variants, or mixing consolidated and
