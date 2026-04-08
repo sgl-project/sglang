@@ -826,10 +826,7 @@ class ModelRunnerKVCacheMixin:
                 )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
-        """Apply external constraints to token capacity: user cap, PP sync.
-
-        Page alignment is handled by the configurator, not here.
-        """
+        """Apply external constraints to token capacity: user cap, page alignment, PP sync."""
         user_limit = self.server_args.max_total_tokens
 
         # Apply user-specified upper bound
