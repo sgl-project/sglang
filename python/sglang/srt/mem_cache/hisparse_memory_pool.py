@@ -379,3 +379,23 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size()
             <= self.hisparse_attn_allocator.size
         )
+
+    def backup_state(self):
+        # Full backup — only used by callers that don't go through
+        # alloc_extend_with_device_mapping (which does incremental backup).
+        return (
+            self.logical_attn_allocator.backup_state(),
+            self.full_to_hisparse_device_index_mapping.clone(),
+        )
+
+    def restore_state(self, state):
+        logical_state, mapping_info = state
+        self.logical_attn_allocator.restore_state(logical_state)
+        if mapping_info.shape[0] < self.full_to_hisparse_device_index_mapping.shape[0]:
+            # Incremental restore from alloc_extend_with_device_mapping:
+            # mapping_info is the tensor of allocated indices whose mapping
+            # was 0 (unallocated) before the alloc. Reset them to 0.
+            self.full_to_hisparse_device_index_mapping[mapping_info] = 0
+        else:
+            # Full restore from backup_state()
+            self.full_to_hisparse_device_index_mapping.copy_(mapping_info)

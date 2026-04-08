@@ -90,6 +90,8 @@ def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
 
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
+    if req.bootstrap_host is None:
+        return ""
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
