@@ -14,6 +14,7 @@ python3 -m unittest test_tokenizer_manager.TestTokenizerManagerIntegration
 import unittest
 from unittest.mock import Mock, patch
 
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import InputFormat, TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -402,6 +403,56 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
             result_input_ids, [[101, 7592, 102], [101, 2088, 102], [101, 2774, 102]]
         )
         self.assertIsNone(result_token_type_ids)
+
+
+class TestTokenizerRequestValidation(unittest.TestCase):
+    """Test request length validation and auto truncation behavior."""
+
+    def setUp(self):
+        with patch("sglang.srt.utils.get_device", return_value="cpu"):
+            self.server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+            self.server_args.allow_auto_truncate = True
+            self.port_args = PortArgs.init_new(self.server_args)
+
+        with patch("zmq.asyncio.Context"), patch(
+            "sglang.srt.utils.get_zmq_socket"
+        ), patch(
+            "sglang.srt.utils.hf_transformers_utils.get_tokenizer"
+        ) as mock_tokenizer:
+            mock_tokenizer.return_value = Mock(vocab_size=32000)
+            self.tokenizer_manager = TokenizerManager(self.server_args, self.port_args)
+
+        self.tokenizer_manager.context_len = 16
+        self.tokenizer_manager.validate_total_tokens = True
+        self.tokenizer_manager.num_reserved_tokens = 0
+
+    def test_auto_truncate_preserves_requested_generation_space(self):
+        req = GenerateReqInput(text="hello", sampling_params={"max_new_tokens": 4})
+        input_ids = list(range(20))
+
+        self.tokenizer_manager._validate_one_request(req, input_ids)
+
+        self.assertEqual(len(input_ids), 10)
+        self.assertEqual(req.sampling_params["max_new_tokens"], 4)
+
+    def test_auto_truncate_accounts_for_reserved_tokens(self):
+        self.tokenizer_manager.num_reserved_tokens = 2
+        req = GenerateReqInput(text="hello", sampling_params={"max_new_tokens": 4})
+        input_ids = list(range(20))
+
+        self.tokenizer_manager._validate_one_request(req, input_ids)
+
+        self.assertEqual(len(input_ids), 8)
+        self.assertEqual(req.sampling_params["max_new_tokens"], 4)
+
+    def test_auto_truncate_does_not_drop_entire_prompt_for_oversized_generation(self):
+        req = GenerateReqInput(text="hello", sampling_params={"max_new_tokens": 100})
+        input_ids = list(range(20))
+
+        self.tokenizer_manager._validate_one_request(req, input_ids)
+
+        self.assertEqual(len(input_ids), 1)
+        self.assertEqual(req.sampling_params["max_new_tokens"], 13)
 
 
 if __name__ == "__main__":
