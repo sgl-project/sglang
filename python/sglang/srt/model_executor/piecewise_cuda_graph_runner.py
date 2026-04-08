@@ -389,6 +389,7 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                mm_inputs=[] if self.is_multimodal else None,
             )
 
         # Attention backend
@@ -546,6 +547,7 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                mm_inputs=[] if self.is_multimodal else None,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
