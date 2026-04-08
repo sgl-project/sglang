@@ -622,7 +622,6 @@ class NGRAMWorker:
         bs = len(model_worker_batch.seq_lens)
         self._prepare_for_speculative_decoding(model_worker_batch)
         verify_input: NgramVerifyInput = model_worker_batch.spec_info
-        accept_length = torch.tensor([1] * bs, dtype=torch.int32, device=self.device)
 
         if model_worker_batch.forward_mode.is_target_verify():
             # Prepare grammar data on CPU if needed
@@ -674,8 +673,6 @@ class NGRAMWorker:
             ) = verify_input.sample(model_worker_batch, logits_output, vocab_mask)
             new_seq_lens = model_worker_batch.seq_lens + accept_length
             verified_tokens = predict[accept_index].flatten()
-            # Save accept_index for path-aware matching in precompute cache
-            prev_accept_index = accept_index
 
             # copy kvcache will not use the new_seq_lens
             move_accepted_tokens_to_target_kvcache(
@@ -711,9 +708,21 @@ class NGRAMWorker:
             )
             verified_tokens[:, 0] = predict
             verified_tokens = verified_tokens.flatten()
+            accept_length = torch.tensor(
+                [1] * bs, dtype=torch.int32, device=self.device
+            )
+            accept_index = torch.full(
+                (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
+            )
+            accept_index[:, 0] = torch.arange(
+                0,
+                bs * self.draft_token_num,
+                self.draft_token_num,
+                dtype=torch.int32,
+                device=self.device,
+            )
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
-            prev_accept_index = None
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
@@ -723,7 +732,7 @@ class NGRAMWorker:
             verify_done=verify_done,
             verified_tokens=verified_tokens,
             accept_lens=accept_length,
-            accept_index=prev_accept_index,
+            accept_index=accept_index,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
