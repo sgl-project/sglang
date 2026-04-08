@@ -106,9 +106,7 @@ class TestNetworkAddress(CustomTestCase):
         self.assertEqual(
             NetworkAddress("127.0.0.1", 5000).to_tcp(), "tcp://127.0.0.1:5000"
         )
-        self.assertEqual(
-            NetworkAddress("::1", 5000).to_tcp(), "tcp://[::1]:5000"
-        )
+        self.assertEqual(NetworkAddress("::1", 5000).to_tcp(), "tcp://[::1]:5000")
 
     def test_to_host_port_str(self):
         self.assertEqual(
