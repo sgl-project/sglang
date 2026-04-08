@@ -77,6 +77,8 @@ class NgramCorpus:
         )
         return loaded_token_count
 
+    # Commit corpus bookkeeping after successful load. Call only at background thread join.
+    # (or after synchronous load_external_corpus_named returns)
     def commit_external_corpus_load(
         self, corpus_id: str, loaded_token_count: int
     ) -> None:
