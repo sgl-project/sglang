@@ -41,6 +41,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -1153,16 +1154,18 @@ class CudaGraphRunner:
             return
 
         logger.info("Compiling cuda graph replay preparation")
+        inductor_kwargs = {"combo_kernels": True}
+        if envs.SGLANG_TORCH_COMPILE_CPP_WRAPPER.get() and hasattr(
+            torch._inductor.config, "cpp_wrapper"
+        ):
+            inductor_kwargs["cpp_wrapper"] = True
         self.compiled_replay_prepare = _torch_compile(
             self._populate_from_forward_batch_and_init_attn_backend,
             compile_kwargs={
                 "fullgraph": True,
             },
             dynamo_kwargs={"capture_scalar_outputs": True},
-            inductor_kwargs={
-                "cpp_wrapper": True,
-                "combo_kernels": True,
-            },
+            inductor_kwargs=inductor_kwargs,
         )
         warmup_compiled_fn(self.compiled_replay_prepare, *args)
 
