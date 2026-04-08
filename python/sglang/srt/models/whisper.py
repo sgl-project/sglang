@@ -458,8 +458,12 @@ class WhisperForConditionalGeneration(torch.nn.Module):
                     features.device, non_blocking=True
                 )
 
+                # Move features to the same device as model weights
+                device = self.encoder.conv1.weight.device
                 req_encoder_output = self.encoder(
-                    features.to(dtype), encoder_position_ids, forward_batch
+                    features.to(device=device, dtype=dtype),
+                    encoder_position_ids.to(device),
+                    forward_batch,
                 )
                 req_encoder_output = req_encoder_output.squeeze(0)
                 encoder_list.append(req_encoder_output)
