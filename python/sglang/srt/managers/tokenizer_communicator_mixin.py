@@ -712,8 +712,18 @@ class TokenizerCommunicatorMixin:
                 self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
             logger.info("Starting IPC weight update")
-            # This means that weight sync cannot run while requests are in progress.
-            async with self.model_update_lock.writer_lock:
+
+            # Skip the writer lock when paused: readers are blocked on
+            # is_pause_cond so no concurrent inference can race, and
+            # waiting for the writer lock would deadlock because existing
+            # readers are stuck waiting on the paused scheduler.
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+
+            lock_context = (
+                self.model_update_lock.writer_lock if not is_paused else nullcontext()
+            )
+            async with lock_context:
                 result = (await self.update_weights_from_ipc_communicator(obj))[0]
                 success, message = result.success, result.message
         except Exception as e:
