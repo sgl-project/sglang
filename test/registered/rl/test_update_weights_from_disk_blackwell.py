@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 )
 
 
-class UpdateWeightsFromDiskModelBase:
+class UpdateWeightsFromDiskBase:
     model = None
     base_url = DEFAULT_URL_FOR_TEST
     request_timeout = 120
@@ -156,9 +156,7 @@ class UpdateWeightsFromDiskModelBase:
                     kill_process_tree(process.pid)
 
 
-class TestServerUpdateWeightsFromDiskMXFP8(
-    UpdateWeightsFromDiskModelBase, CustomTestCase
-):
+class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
     model = "zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8-last-8-BF16"
     backend_test_suites = (
         {
@@ -177,9 +175,7 @@ class TestServerUpdateWeightsFromDiskMXFP8(
     )
 
 
-class TestServerUpdateWeightsFromDiskNVFP4(
-    UpdateWeightsFromDiskModelBase, CustomTestCase
-):
+class TestServerUpdateWeightsFromDiskNVFP4(UpdateWeightsFromDiskBase, CustomTestCase):
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
     backend_test_suites = (
         {
