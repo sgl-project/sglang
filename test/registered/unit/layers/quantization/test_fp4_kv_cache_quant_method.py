@@ -241,15 +241,15 @@ class TestMXFP4Method(CustomTestCase):
         self.assertEqual(k_out.dtype, torch.float8_e4m3fn)
 
 
-class TestKVFP4QuantizeUtil(CustomTestCase):
-    """Test the existing MXFP4 KVFP4QuantizeUtil roundtrip."""
+class TestBlockFP4KVQuantizeUtil(CustomTestCase):
+    """Test the existing MXFP4 BlockFP4KVQuantizeUtil roundtrip."""
 
     def test_roundtrip_cpu(self):
-        from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
 
         x = torch.randn(4, 8, 128, dtype=torch.bfloat16)
-        packed, scales = KVFP4QuantizeUtil.batched_quantize(x)
-        reconstructed = KVFP4QuantizeUtil.batched_dequantize(packed, scales)
+        packed, scales = BlockFP4KVQuantizeUtil.batched_quantize(x)
+        reconstructed = BlockFP4KVQuantizeUtil.batched_dequantize(packed, scales)
 
         self.assertEqual(reconstructed.shape, x.shape)
         rel_error = (

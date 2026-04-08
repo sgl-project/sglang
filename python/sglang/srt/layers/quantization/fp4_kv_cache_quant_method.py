@@ -28,10 +28,14 @@ from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
 
 
 class FP4KVCacheQuantMethod(ABC):
-    """Abstract base for KV cache quantization strategies.
+    """Abstract base for FP4 KV cache quantization strategies.
 
     Owns the quantize/dequantize computation.  The Pool owns the buffers and
     orchestrates the batch dequant loop.  Backends only do view/reshape.
+
+    Note: These methods are called during prefill (extend) only, not during
+    CUDA graph capture or decode. Decode reads raw FP4 buffers directly via
+    the XQA kernel. Therefore CUDA graph compatibility is not required here.
     """
 
     name: str
@@ -87,8 +91,10 @@ class FP4KVCacheQuantMethod(ABC):
     ) -> tuple[Tensor, Tensor]:
         """Dequantize stored FP4 KV (selected token indices already applied).
 
-        Returns (k_fp8, v_fp8) in torch.float8_e4m3fn, ready to be written
-        into the dequant workspace buffer.
+        Returns:
+            (k_fp8, v_fp8): Both in torch.float8_e4m3fn dtype with shape
+            matching the input (after unpacking). These are written into the
+            shared dequant workspace buffer for the FlashInfer FP8 prefill kernel.
         """
 
     @abstractmethod
@@ -276,12 +282,12 @@ class NVFP4Method(FP4KVCacheQuantMethod):
         k_scale=None,
         v_scale=None,
     ) -> None:
-        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
-        cache_k, cache_k_fp4_sf, _ = NVFP4QuantizeUtil.quantize(
+        cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
             cache_k.contiguous(), k_scale
         )
-        cache_v, cache_v_fp4_sf, _ = NVFP4QuantizeUtil.quantize(
+        cache_v, cache_v_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
             cache_v.contiguous(), v_scale
         )
 
@@ -299,14 +305,14 @@ class NVFP4Method(FP4KVCacheQuantMethod):
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
         """Dequantize FP4 KV (indexed tokens) → FP8 E4M3."""
-        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4KVQuantizeUtil
 
         cur_k_scale = self.k_scales_gpu[layer_id : layer_id + 1]
         cur_v_scale = self.v_scales_gpu[layer_id : layer_id + 1]
-        k_bf16 = NVFP4QuantizeUtil.dequantize(
+        k_bf16 = NVFP4KVQuantizeUtil.dequantize(
             k_fp4.view(torch.uint8), k_scales, cur_k_scale
         )
-        v_bf16 = NVFP4QuantizeUtil.dequantize(
+        v_bf16 = NVFP4KVQuantizeUtil.dequantize(
             v_fp4.view(torch.uint8), v_scales, cur_v_scale
         )
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
@@ -395,10 +401,10 @@ class MXFP4Method(FP4KVCacheQuantMethod):
         k_scale=None,
         v_scale=None,
     ) -> None:
-        from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
 
-        cache_k_fp4, cache_k_sf = KVFP4QuantizeUtil.batched_quantize(cache_k)
-        cache_v_fp4, cache_v_sf = KVFP4QuantizeUtil.batched_quantize(cache_v)
+        cache_k_fp4, cache_k_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_k)
+        cache_v_fp4, cache_v_sf = BlockFP4KVQuantizeUtil.batched_quantize(cache_v)
         k_buffer[loc] = cache_k_fp4
         v_buffer[loc] = cache_v_fp4
         k_scale_buffer[loc] = cache_k_sf
@@ -412,10 +418,10 @@ class MXFP4Method(FP4KVCacheQuantMethod):
         v_scales: Tensor,
         layer_id: int,
     ) -> tuple[Tensor, Tensor]:
-        from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+        from sglang.srt.layers.quantization.kvfp4_tensor import BlockFP4KVQuantizeUtil
 
-        k_bf16 = KVFP4QuantizeUtil.batched_dequantize(k_fp4, k_scales)
-        v_bf16 = KVFP4QuantizeUtil.batched_dequantize(v_fp4, v_scales)
+        k_bf16 = BlockFP4KVQuantizeUtil.batched_dequantize(k_fp4, k_scales)
+        v_bf16 = BlockFP4KVQuantizeUtil.batched_dequantize(v_fp4, v_scales)
         return k_bf16.to(torch.float8_e4m3fn), v_bf16.to(torch.float8_e4m3fn)
 
     def compute_cell_size(

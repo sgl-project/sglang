@@ -58,8 +58,8 @@ E2M1_BOUNDS = torch.tensor(
 )
 
 
-class KVFP4QuantizeUtil:
-    """Utility class for MXFP4 quantization and dequantization operations."""
+class BlockFP4KVQuantizeUtil:
+    """Utility class for MXFP4 block-wise quantization and dequantization."""
 
     @staticmethod
     @torch.compile
@@ -145,7 +145,11 @@ class KVFP4QuantizeUtil:
         return scaled.view(b, m, n).to(dtype)
 
 
-class NVFP4QuantizeUtil:
+# Backward-compatible alias (used by memory_pool.py and existing tests)
+KVFP4QuantizeUtil = BlockFP4KVQuantizeUtil
+
+
+class NVFP4KVQuantizeUtil:
     """Utility class for NVFP4 quantization and dequantization with two-level scaling
     (global FP32 + block FP8 E4M3).
 
