@@ -333,11 +333,7 @@ def is_allreduce_allocation_symmetric() -> bool:
 
     if torch.cuda.is_current_stream_capturing():
         tp_group = get_tp_group()
-        if (
-            tp_group is not None
-            and tp_group.ca_comm is not None
-            and not tp_group.ca_comm.disabled
-        ):
+        if tp_group and tp_group.ca_comm and not tp_group.ca_comm.disabled:
             return False
     return is_allocation_symmetric()
 
