@@ -26,6 +26,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    CUSTOMIZED = "customized"
 
     @classmethod
     def _missing_(cls, value):
@@ -56,6 +57,9 @@ class MoeA2ABackend(Enum):
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
+
+    def is_customized(self):
+        return self == MoeA2ABackend.CUSTOMIZED
 
 
 class MoeRunnerBackend(Enum):

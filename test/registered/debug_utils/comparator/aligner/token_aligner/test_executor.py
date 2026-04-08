@@ -25,7 +25,7 @@ from sglang.srt.debug_utils.comparator.dims_spec import TokenLayout
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="default", nightly=True)
+register_cpu_ci(est_time=15, suite="stage-a-test-cpu", nightly=True)
 
 
 def _named(tensor: torch.Tensor, names: list[str]) -> torch.Tensor:

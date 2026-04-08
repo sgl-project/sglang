@@ -136,6 +136,7 @@ async def generations(
             enable_upscaling=request.enable_upscaling,
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
+            perf_dump_path=request.perf_dump_path,
         )
         batch = prepare_request(
             server_args=server_args,

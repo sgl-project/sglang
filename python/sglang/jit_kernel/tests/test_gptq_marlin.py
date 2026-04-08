@@ -1,10 +1,16 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
 from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
+
+register_cuda_ci(est_time=13, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 MNK_FACTORS = [
     (1, 1, 1),
@@ -96,4 +102,4 @@ def test_gptq_marlin_gemm(
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

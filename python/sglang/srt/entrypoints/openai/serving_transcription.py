@@ -12,7 +12,11 @@
 # limitations under the License.
 # ==============================================================================
 """
-OpenAI-compatible transcription endpoint handler for Whisper models.
+OpenAI-compatible transcription endpoint handler for audio ASR models.
+
+New ASR models are supported by subclassing ``TranscriptionAdapter`` and
+registering via the ``@register_transcription_adapter`` decorator.
+See ``transcription_adapters/`` for built-in implementations.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import logging
 import math
 import time
 import uuid
-from typing import TYPE_CHECKING, AsyncGenerator, Optional, Union
+from typing import TYPE_CHECKING, AsyncGenerator, List, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -35,8 +39,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionStreamChoice,
     TranscriptionStreamResponse,
     TranscriptionUsage,
+    TranscriptionVerboseResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 if TYPE_CHECKING:
@@ -50,6 +56,10 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         super().__init__(tokenizer_manager)
+        model_config = tokenizer_manager.model_config
+        self._adapter = resolve_adapter(
+            getattr(model_config.hf_config, "architectures", [])
+        )
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
@@ -65,16 +75,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, TranscriptionRequest]:
         """Convert transcription request to internal format."""
-        # Build sampling params - include language for WhisperProcessor
-        sampling_params = {
-            "temperature": request.temperature,
-            "max_new_tokens": 448,  # Whisper default max tokens
-            "language": request.language,  # Pass to WhisperProcessor for language-specific decoding
-        }
-
-        # For Whisper, we pass audio_data and let the processor handle it
+        sampling_params = self._adapter.build_sampling_params(request)
         adapted_request = GenerateReqInput(
-            text="",  # Empty text - Whisper processor will set proper decoder tokens
+            text="",  # Empty text — the multimodal processor sets proper decoder/prompt tokens
             audio_data=request.audio_data,
             sampling_params=sampling_params,
             stream=request.stream,
@@ -84,14 +87,14 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _get_audio_duration(self, audio_data: bytes) -> float:
+    @staticmethod
+    def _get_audio_duration(audio_data: bytes) -> float:
         """Calculate audio duration in seconds."""
         try:
             import soundfile as sf
 
-            audio_array, sr = sf.read(io.BytesIO(audio_data))
-            duration = len(audio_array) / sr
-            return duration
+            info = sf.info(io.BytesIO(audio_data))
+            return info.duration
         except Exception as e:
             logger.warning(f"Could not calculate audio duration: {e}")
             return 0.0
@@ -105,7 +108,14 @@ class OpenAIServingTranscription(OpenAIServingBase):
         temperature: float,
         stream: bool,
         raw_request: Request,
-    ) -> Union[TranscriptionResponse, StreamingResponse, Response, ORJSONResponse]:
+        timestamp_granularities: Optional[List[str]] = None,
+    ) -> Union[
+        TranscriptionResponse,
+        TranscriptionVerboseResponse,
+        StreamingResponse,
+        Response,
+        ORJSONResponse,
+    ]:
         """Main entry point for transcription requests."""
         # Calculate audio duration for usage reporting
         audio_duration_s = self._get_audio_duration(audio_data)
@@ -117,6 +127,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             language=language,
             response_format=response_format,
             temperature=temperature,
+            timestamp_granularities=timestamp_granularities,
             stream=stream,
             audio_duration_s=audio_duration_s,
         )
@@ -129,7 +140,13 @@ class OpenAIServingTranscription(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: TranscriptionRequest,
         raw_request: Request,
-    ) -> Union[TranscriptionResponse, ErrorResponse, ORJSONResponse, Response]:
+    ) -> Union[
+        TranscriptionResponse,
+        TranscriptionVerboseResponse,
+        ErrorResponse,
+        ORJSONResponse,
+        Response,
+    ]:
         """Handle non-streaming transcription request."""
         try:
             ret = await self.tokenizer_manager.generate_request(
@@ -138,15 +155,20 @@ class OpenAIServingTranscription(OpenAIServingBase):
         except ValueError as e:
             return self.create_error_response(str(e))
 
-        text = ret.get("text", "")
+        text = self._adapter.postprocess_text(ret.get("text", ""))
+        usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
 
         # Build response based on format
         if request.response_format == "text":
             return Response(content=text, media_type="text/plain")
 
-        # JSON format
-        usage = TranscriptionUsage(seconds=int(math.ceil(request.audio_duration_s)))
+        if request.response_format == "verbose_json":
+            tokenizer = self.tokenizer_manager.tokenizer
+            return self._adapter.build_verbose_response(
+                request, text, ret, tokenizer, usage
+            )
 
+        # Default JSON format
         return TranscriptionResponse(text=text, usage=usage)
 
     async def _handle_streaming_request(

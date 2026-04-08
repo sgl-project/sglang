@@ -135,7 +135,7 @@ class Req:
     trajectory_latents: torch.Tensor | None = None
     trajectory_audio_latents: torch.Tensor | None = None
 
-    # Extra parameters that might be needed by specific pipeline implementations
+    # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
 
     is_warmup: bool = False
@@ -260,8 +260,13 @@ class Req:
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
-        # Set do_classifier_free_guidance based on guidance scale and negative prompt
-        if self.guidance_scale > 1.0 and self.negative_prompt is not None:
+        # Prefer true_cfg_scale when it is explicitly provided.
+        cfg_scale = (
+            self.true_cfg_scale
+            if self.true_cfg_scale is not None
+            else self.guidance_scale
+        )
+        if cfg_scale > 1.0 and self.negative_prompt is not None:
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []

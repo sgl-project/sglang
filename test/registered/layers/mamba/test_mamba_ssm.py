@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=7, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=20, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=7, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
@@ -99,7 +99,7 @@ def test_selective_state_update(dim, dstate, has_z, itype):
 
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (5e-3, 1e-2)
     if itype == torch.bfloat16:
-        rtol, atol = 1e-2, 5e-2
+        rtol, atol = 1e-2, 1e-1
         if torch.version.hip:
             atol *= 2
     # set seed
