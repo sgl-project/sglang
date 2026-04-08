@@ -175,6 +175,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
 
+      - uses: ./.github/actions/check-stage-health
 
       - uses: ./.github/actions/check-maintenance
 
