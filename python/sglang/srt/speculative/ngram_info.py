@@ -513,19 +513,14 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             d = self.draft_token_num
             accept_2d = self.accept_index.reshape(-1, d)[new_indices]  # (new_bs, d)
             # Remap global indices: old row i had offset old_i*d, new row j needs offset j*d
-            if not isinstance(new_indices, torch.Tensor):
-                old_indices = torch.tensor(
-                    new_indices, device=accept_2d.device, dtype=torch.int64
-                )
-            else:
-                old_indices = new_indices.to(device=accept_2d.device, dtype=torch.int64)
+            old_indices = new_indices
             new_i = torch.arange(len(old_indices), device=accept_2d.device)
             shift = (
                 ((new_i - old_indices) * d).to(accept_2d.dtype).unsqueeze(1)
             )  # (new_bs, 1)
             self.accept_index = torch.where(
                 accept_2d != -1, accept_2d + shift, accept_2d
-            ).flatten()
+            )
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
 
