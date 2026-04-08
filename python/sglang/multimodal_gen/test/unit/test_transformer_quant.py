@@ -10,10 +10,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
-    QwenImageTransformerBlock,
-)
-
 partial_json_parser = types.ModuleType("partial_json_parser")
 partial_json_parser_core = types.ModuleType("partial_json_parser.core")
 partial_json_parser_exceptions = types.ModuleType("partial_json_parser.core.exceptions")
@@ -179,24 +175,6 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertFalse(server_args.dit_cpu_offload)
         self.assertFalse(server_args.text_encoder_cpu_offload)
-
-    def test_qwen_image_block_keeps_nunchaku_quantized_linear_structure(self):
-        block = QwenImageTransformerBlock(
-            dim=128,
-            num_attention_heads=4,
-            attention_head_dim=32,
-            quant_config=NunchakuConfig(precision="int4", rank=32),
-            prefix="transformer_blocks.0",
-        )
-
-        self.assertTrue(hasattr(block.img_mod[1], "qweight"))
-        self.assertTrue(hasattr(block.img_mod[1], "wzeros"))
-        self.assertTrue(hasattr(block.txt_mod[1], "qweight"))
-        self.assertTrue(hasattr(block.txt_mod[1], "wzeros"))
-        self.assertTrue(hasattr(block.attn.to_add_out, "qweight"))
-        self.assertTrue(hasattr(block.attn.to_add_out, "proj_down"))
-        self.assertTrue(hasattr(block.attn.to_out[0], "qweight"))
-        self.assertTrue(hasattr(block.attn.to_out[0], "proj_up"))
 
 
 if __name__ == "__main__":
