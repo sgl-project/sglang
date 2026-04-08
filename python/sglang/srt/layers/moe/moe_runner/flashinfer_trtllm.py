@@ -96,6 +96,10 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+        FlashinferDispatchOutput,
+    )
 
 if is_flashinfer_available():
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
@@ -926,7 +930,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     topk_output = dispatch_output.topk_output
 
     # Quantize hidden states to FP4
-    if quant_info.use_per_token_activation:
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    per_token_scale = None
+    if hidden_states_scale is not None:
+        # NVFP4 dispatch, inputs are already quantized.
+        hs_fp4 = hidden_states
+        hs_scale_linear = hidden_states_scale
+    elif quant_info.use_per_token_activation:
+        #  Enable FlashInfer TRTLLM per-token NVFP4 activation scaling; ignores checkpoint activation FP32 scale by treating it as
         from flashinfer import SfLayout, nvfp4_quantize
 
         e4m3_max = 448.0
@@ -949,7 +960,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             seq_len, hidden_size // 16
         )
     else:
-        per_token_scale = None
         hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
             hidden_states, quant_info.w13_input_scale_quant
         )
@@ -960,6 +970,48 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         runner_config.activation, is_gated=runner_config.is_gated
     )
 
+<<<<<<< HEAD
+=======
+    # Build per-expert clamp-limit tensor from the per-layer scalar.
+    _clamp_val = runner_config.gemm1_clamp_limit
+    if _clamp_val is not None:
+        gemm1_clamp_limit = torch.full(
+            (quant_info.local_num_experts,),
+            _clamp_val,
+            dtype=torch.float32,
+            device=hs_fp4.device,
+        )
+    else:
+        gemm1_clamp_limit = None
+
+    num_tokens = hs_fp4.shape[0]
+    hidden_size = (
+        hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
+    )
+    output_dtype = (
+        hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
+    )
+    _provided = _moe_output_buf.get()
+    _symm_required = is_allocation_symmetric()
+    if (
+        _provided is not None
+        and _provided.shape == (num_tokens, hidden_size)
+        and _provided.dtype == output_dtype
+        and _provided.device == hs_fp4.device
+        and (
+            not _symm_required
+            or not is_symmetric_memory_enabled()
+            or is_tensor_in_symmetric_mempool(_provided)
+        )
+    ):
+        symm_output = _provided
+    else:
+        with use_symmetric_memory(get_tp_group(), disabled=not _symm_required):
+            symm_output = torch.empty(
+                num_tokens, hidden_size, dtype=output_dtype, device=hs_fp4.device
+            )
+
+>>>>>>> c5de784adc (Support flashinfer_trtllm_routed with flashinfer a2a)
     # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
     if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
         use_routed_topk = True
@@ -1285,7 +1337,54 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     )
 
 
+<<<<<<< HEAD
 # Register the experimental experimental_sgl_trtllm MoE fused-func (MoeRunner needs it at
 # build time even for LoRA); gated by the master switch so the upstream path is untouched.
 if _SGLANG_EXPERIMENTAL_LORA_OPTI:
     from sglang.srt.lora.trtllm_lora_temp import sgl_backend  # noqa: E402,F401
+=======
+@register_fused_func("flashinfer", "flashinfer_trtllm_routed")
+def fused_experts_flashinfer_to_flashinfer_trtllm_routed(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> FlashinferCombineInput:
+    """Fused function for flashinfer A2A + flashinfer_trtllm_routed runner.
+
+    FlashinferDispatchOutput and StandardDispatchOutput share the same field
+    layout (hidden_states, hidden_states_scale, topk_output), so the existing
+    FP8/FP4/BF16 implementations work unchanged.  We wrap the returned
+    StandardCombineInput into a FlashinferCombineInput for the FlashinferDispatcher
+    combine path.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+    )
+
+    if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
+        result = fused_experts_none_to_flashinfer_trtllm_fp4(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            use_routed_topk=True,
+        )
+    elif isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
+        result = fused_experts_none_to_flashinfer_trtllm_fp8(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            use_routed_topk=True,
+        )
+    elif isinstance(quant_info, FlashInferTrtllmBf16MoeQuantInfo):
+        result = fused_experts_none_to_flashinfer_trtllm_bf16(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            use_routed_topk=True,
+        )
+    else:
+        raise TypeError(
+            f"Unexpected quant_info type for flashinfer a2a + flashinfer_trtllm_routed: {type(quant_info)}"
+        )
+    return FlashinferCombineInput(hidden_states=result.hidden_states)
+>>>>>>> c5de784adc (Support flashinfer_trtllm_routed with flashinfer a2a)
