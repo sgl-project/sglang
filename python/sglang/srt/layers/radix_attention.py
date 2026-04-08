@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -167,8 +168,24 @@ def unified_attention_with_output(
     if sinks is not None:
         kwargs["sinks"] = sinks
 
+    attn_forward_batch = replace(
+        forward_batch,
+        out_cache_loc=forward_batch.out_cache_loc[:real_num_tokens],
+        out_cache_loc_swa=(
+            forward_batch.out_cache_loc_swa[:real_num_tokens]
+            if forward_batch.out_cache_loc_swa is not None
+            else None
+        ),
+    )
+
     ret = forward_batch.attn_backend.forward(
-        query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
+        query,
+        key,
+        value,
+        attention_layer,
+        attn_forward_batch,
+        save_kv_cache,
+        **kwargs,
     )
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
