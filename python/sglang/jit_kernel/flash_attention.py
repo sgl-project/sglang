@@ -23,6 +23,7 @@ def _lazy_load_fa4_kernels():
 
     global fa4_flash_attn_varlen_func
     global fa4_flash_attn_with_kvcache
+
     fa4_flash_attn_varlen_func = flash_attn_varlen_func
     fa4_flash_attn_with_kvcache = flash_attn_with_kvcache
 
