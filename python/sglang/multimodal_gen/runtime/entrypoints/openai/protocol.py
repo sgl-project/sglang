@@ -55,6 +55,8 @@ class ImageGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    # Prompt enhancement (ErnieImage)
+    use_pe: Optional[bool] = None
 
 
 # Video API protocol models
