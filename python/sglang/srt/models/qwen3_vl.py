@@ -1122,6 +1122,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.capture_aux_hidden_states = False
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
@@ -1246,6 +1247,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
@@ -1253,11 +1258,22 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     hidden_states,
                     self.lm_head,
                     forward_batch,
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
