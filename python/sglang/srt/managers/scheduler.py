@@ -486,6 +486,9 @@ class Scheduler(
             self.recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
+            send_to_controller = get_zmq_socket(
+                context, zmq.PUSH, port_args.controller_input_ipc_name, False
+            )
 
             send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
@@ -503,6 +506,7 @@ class Scheduler(
 
             self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
             self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+            self.send_to_controller = SenderWrapper(send_to_controller)
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -516,6 +520,7 @@ class Scheduler(
             self.recv_from_rpc = None
             self.send_to_tokenizer = SenderWrapper(None)
             self.send_to_detokenizer = SenderWrapper(None)
+            self.send_to_controller = SenderWrapper(None)
 
         if self.current_scheduler_metrics_enabled:
             self.send_metrics_from_scheduler = get_zmq_socket(
@@ -2850,7 +2855,7 @@ class Scheduler(
             tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
             tp_active_ranks &= tp_active_ranks_cpu
             dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
-            self.send_to_tokenizer.send_output(
+            self.send_to_controller.send_output(
                 ActiveRanksOutput(status=dp_active_ranks.tolist())
             )
 

@@ -139,6 +139,9 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            self.recv_from_scheduler = get_zmq_socket(
+                self.context, zmq.PULL, port_args.controller_input_ipc_name, True
+            )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -455,7 +458,10 @@ class DataParallelController:
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
-                        server_args, dp_rank, worker_ports
+                        server_args,
+                        dp_rank,
+                        worker_ports,
+                        controller_input_ipc_name=port_args.controller_input_ipc_name,
                     )
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
@@ -536,7 +542,7 @@ class DataParallelController:
 
         while True:
             if self.status[self.round_robin_counter]:
-                logger.debug(f"Choose worker {self.round_robin_counter}")
+                logger.info(f"Choose worker {self.round_robin_counter}")
                 self.workers[self.round_robin_counter].send_pyobj(req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
@@ -583,11 +589,23 @@ class DataParallelController:
         while True:
             while True:
                 self.soft_watchdog.feed()
+                drained = False
                 try:
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    self._request_dispatcher(recv_req)
+                    drained = True
                 except zmq.ZMQError:
+                    pass
+
+                try:
+                    recv_req = self.recv_from_scheduler.recv_pyobj(zmq.NOBLOCK)
+                    self._request_dispatcher(recv_req)
+                    drained = True
+                except zmq.ZMQError:
+                    pass
+
+                if not drained:
                     break
-                self._request_dispatcher(recv_req)
 
 
 def run_data_parallel_controller_process(

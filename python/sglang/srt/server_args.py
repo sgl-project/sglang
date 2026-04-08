@@ -6941,6 +6941,8 @@ class PortArgs:
     tokenizer_ipc_name: str
     # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
     scheduler_input_ipc_name: str
+    # The ipc filename for DataParallelController to receive control-plane updates (zmq)
+    controller_input_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
 
@@ -6961,6 +6963,7 @@ class PortArgs:
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
         worker_ports: Optional[List[int]] = None,
+        controller_input_ipc_name: Optional[str] = None,
     ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = get_free_port()
@@ -6979,6 +6982,8 @@ class PortArgs:
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                controller_input_ipc_name=controller_input_ipc_name
+                or f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -6998,6 +7003,9 @@ class PortArgs:
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
+            default_controller_input_ipc_name = NetworkAddress(
+                dist_init_host, port_base + 5
+            ).to_tcp()
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
@@ -7013,6 +7021,7 @@ class PortArgs:
                     wait_port_available(nccl_port, "nccl_port")
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
+                    wait_port_available(port_base + 5, "controller_input_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -7028,6 +7037,8 @@ class PortArgs:
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),
+                controller_input_ipc_name=controller_input_ipc_name
+                or default_controller_input_ipc_name,
                 detokenizer_ipc_name=NetworkAddress(
                     dist_init_host, detokenizer_port
                 ).to_tcp(),
