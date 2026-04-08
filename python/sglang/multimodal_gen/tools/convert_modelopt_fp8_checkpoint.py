@@ -1,11 +1,14 @@
-"""Materialize a ModelOpt diffusers FP8 export into an SGLang-loadable checkpoint.
+"""Convert a ModelOpt diffusion FP8 export into an SGLang-loadable checkpoint.
 
-ModelOpt's diffusers `quantize.py --hf-ckpt-dir ... --format fp8` exports FP8
-weights plus `quantization_config`, but it does not currently materialize the
-per-layer `weight_scale` / `input_scale` tensors that SGLang's diffusion FP8
-runtime consumes. This tool rebuilds those tensors from ModelOpt's
-`backbone.pt`, injects them into the exported safetensors shards, and optionally
-patches model-specific BF16 fallback layers from the original transformer.
+The core conversion path is model-agnostic:
+- read the ModelOpt diffusers transformer export
+- rebuild per-layer `weight_scale` / `input_scale` tensors from `backbone.pt`
+- materialize SGLang-native `float8_e4m3fn` weights
+- preserve ModelOpt `ignore` layers in their original dtype
+
+Some models still benefit from a small validated BF16 fallback set. Those
+fallback profiles are intentionally isolated so the generic FP8 conversion path
+remains reusable across future diffusion backbones.
 
 Example:
 
@@ -115,6 +118,9 @@ def _load_config(model_dir: str) -> dict:
 def get_default_keep_bf16_patterns(
     *, model_type: str, class_name: str | None
 ) -> list[str]:
+    # Most diffusion backbones can run through the generic conversion path.
+    # Validated fallback profiles live here when a family needs a few BF16
+    # modules preserved for accuracy or loader compatibility.
     if model_type == "flux2":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
     if model_type == "none":
@@ -397,8 +403,9 @@ def _parse_args() -> argparse.Namespace:
         choices=["auto", "flux2", "none"],
         default="auto",
         help=(
-            "Model-specific BF16 fallback profile. 'auto' enables the validated "
-            "FLUX.2 fallback set when the export config says Flux2Transformer2DModel."
+            "Optional model-family BF16 fallback profile. 'none' uses the generic "
+            "conversion path. 'auto' only enables the validated FLUX.2 fallback "
+            "set when the export config says Flux2Transformer2DModel."
         ),
     )
     parser.add_argument(

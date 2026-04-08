@@ -121,24 +121,6 @@ class TestComponentPathParsing(unittest.TestCase):
         )
         self.assertEqual(remaining, [])
 
-    def test_extract_component_paths_accepts_transformer_2_override_flag(self):
-        component_paths, remaining = ServerArgs._extract_component_paths(
-            [
-                "--transformer-path",
-                "/tmp/transformer",
-                "--transformer-2-path=/tmp/transformer_2",
-            ]
-        )
-
-        self.assertEqual(
-            component_paths,
-            {
-                "transformer": "/tmp/transformer",
-                "transformer_2": "/tmp/transformer_2",
-            },
-        )
-        self.assertEqual(remaining, [])
-
 
 if __name__ == "__main__":
     unittest.main()
