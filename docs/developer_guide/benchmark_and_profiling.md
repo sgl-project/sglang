@@ -257,6 +257,52 @@ The profile merger generates:
 - Individual rank trace files: `{profile_id}-TP-{tp}-DP-{dp}-PP-{pp}-EP-{ep}.trace.json.gz`
 - Merged trace file: `merged-{profile_id}.trace.json.gz`
 
+### Analyze PyTorch profiler traces
+
+Once you have a profiler directory, you can use the analysis scripts in `scripts/` to turn raw traces into actionable tables instead of manually inspecting every kernel in Perfetto.
+
+Use `breakdown` when one trace is enough and you want kernel/category share plus source attribution:
+
+```bash
+python3 scripts/analyze_sglang_torch_profile.py breakdown \
+  --input /tmp/profiles/1719876543
+```
+
+Use `triage` when you want the compact three-table workflow:
+
+- kernel table
+- overlap-opportunity table
+- fuse-opportunity table
+
+For the most useful overlap diagnosis, profile twice:
+
+1. Collect a mapping trace with `--disable-cuda-graph --disable-piecewise-cuda-graph` so kernel launches still map cleanly back to Python scopes.
+2. Collect a formal trace with your real serving flags enabled.
+3. Run:
+
+```bash
+python3 scripts/analyze_sglang_torch_profile.py triage \
+  --mapping-input /tmp/profiles/graph_off \
+  --formal-input /tmp/profiles/graph_on
+```
+
+If you already have two live servers, the same command can trigger `sglang.profiler` for both URLs and send a small probe workload automatically:
+
+```bash
+python3 scripts/analyze_sglang_torch_profile.py triage \
+  --mapping-url http://127.0.0.1:31025 \
+  --formal-url http://127.0.0.1:31026 \
+  --num-steps 5 \
+  --profile-by-stage
+```
+
+If Perfetto drops obviously overlapping lanes, you can rewrite the trace into a more viewer-friendly file:
+
+```bash
+python3 scripts/analyze_sglang_torch_profile.py perfetto-fix \
+  --input /tmp/profiles/merged.trace.json.gz
+```
+
 ### Possible PyTorch bugs
 If in any cases you encounter the following error (for example, using qwen 2.5 VL):
 ```bash
