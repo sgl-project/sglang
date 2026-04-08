@@ -593,17 +593,8 @@ class LTX2Attention(nn.Module):
 
             if self.qk_norm:
                 assert self.q_norm is not None and self.k_norm is not None
-                if (
-                    get_tp_world_size() == 1
-                    and get_sp_world_size() > 1
-                    and isinstance(self.q_norm, torch.nn.RMSNorm)
-                    and isinstance(self.k_norm, torch.nn.RMSNorm)
-                ):
-                    q = self._apply_rms_norm_module(q, self.q_norm)
-                    k = self._apply_rms_norm_module(k, self.k_norm)
-                else:
-                    q = self.q_norm(q)
-                    k = self.k_norm(k)
+                q = self.q_norm(q)
+                k = self.k_norm(k)
 
             if pe is not None:
                 cos, sin = pe
@@ -651,16 +642,6 @@ class LTX2Attention(nn.Module):
         out_proj, _ = self.to_out[0](out_flat)
 
         return out_proj
-
-    @staticmethod
-    def _apply_rms_norm_module(
-        x: torch.Tensor, norm: torch.nn.RMSNorm
-    ) -> torch.Tensor:
-        orig_dtype = x.dtype
-        weight = norm.weight.to(dtype=orig_dtype, device=x.device)
-        var = x.float().pow(2).mean(dim=-1, keepdim=True)
-        inv_rms = torch.rsqrt(var + float(norm.eps))
-        return (x.float() * inv_rms).to(dtype=orig_dtype) * weight
 
     def _slice_rope_for_tp(
         self,
