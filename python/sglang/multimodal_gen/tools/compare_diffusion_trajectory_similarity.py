@@ -11,7 +11,7 @@ The intended use is quant validation on reduced deterministic smoke settings:
 
 Example:
 
-    PYTHONPATH=python python -m sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity \
+    python -m sglang.multimodal_gen.tools.compare_diffusion_trajectory_similarity \
         --model-path /path/to/model \
         --prompt "A futuristic cyberpunk city at night" \
         --width 512 --height 512 --num-inference-steps 8 --seed 42 \
