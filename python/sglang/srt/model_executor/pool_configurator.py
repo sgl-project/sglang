@@ -14,7 +14,8 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -22,6 +23,26 @@ from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
+
+
+@dataclass
+class MemoryPoolConfig:
+    """Resolved memory pool config, shared between target and draft workers."""
+
+    max_total_num_tokens: int
+    max_running_requests: Optional[int] = None
+    full_max_total_num_tokens: Optional[int] = None
+    swa_max_total_num_tokens: Optional[int] = None
+
+    mem_fraction_static: Optional[float] = None
+
+    def __post_init__(self):
+        if self.max_total_num_tokens <= 0:
+            msg = "Not enough memory. Please try to increase --mem-fraction-static."
+            if self.mem_fraction_static is not None:
+                msg += f" Current value: mem_fraction_static={self.mem_fraction_static}"
+            raise RuntimeError(msg)
+
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -33,18 +54,19 @@ class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
     Subclasses compute pool sizes for their architecture via coeff+bias model.
-    Output fields are read by _resolve_memory_pool_config to build MemoryPoolConfig.
+    Both entry points return MemoryPoolConfig (with max_running_requests=0,
+    to be filled by the consumer).
     """
 
-    max_total_num_tokens: int = 0
-
-    def calculate_pool_sizes(self, available_bytes: int, page_size: int) -> None:
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
         """Profiling path: compute pool sizes from available bytes."""
         raise NotImplementedError
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
-    ) -> None:
+    ) -> MemoryPoolConfig:
         """Constraint path: recalculate pool sizes from a constrained max_tokens."""
         raise NotImplementedError
 
@@ -147,14 +169,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         return cell_size
 
-    def calculate_pool_sizes(self, available_bytes: int, page_size: int) -> None:
-        self.max_total_num_tokens = int(available_bytes) // self._cell_size
-        self.max_total_num_tokens = self.max_total_num_tokens // page_size * page_size
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        max_total_num_tokens = int(available_bytes) // self._cell_size
+        max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
-    ) -> None:
-        self.max_total_num_tokens = max_total_num_tokens // page_size * page_size
+    ) -> MemoryPoolConfig:
+        max_total_num_tokens = max_total_num_tokens // page_size * page_size
+        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
@@ -163,9 +189,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     Splits available memory between full attention and SWA pools.
     Does NOT inherit DefaultPoolConfigurator — different coeff model.
     """
-
-    full_max_total_num_tokens: int = 0
-    swa_max_total_num_tokens: int = 0
 
     def __init__(self, mr: ModelRunner):
         model_config = mr.model_config
@@ -202,7 +225,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             + self._swa_per_token * self._swa_layers_num
         )
 
-    def _solve_pool_sizes(self, total_memory: int, page_size: int) -> None:
+    def _solve_pool_sizes(self, total_memory: int, page_size: int) -> MemoryPoolConfig:
         """Core computation: split total_memory into full/swa pool sizes."""
 
         def align_page_size(x: int) -> int:
@@ -226,27 +249,30 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         full_tokens = align_page_size(int(total_memory / denominator))
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
-
-        self.full_max_total_num_tokens = full_tokens
-        self.swa_max_total_num_tokens = swa_tokens
-        self.max_total_num_tokens = (
-            full_tokens if self._full_layers_num > 0 else swa_tokens
-        )
+        max_total_num_tokens = full_tokens if self._full_layers_num > 0 else swa_tokens
 
         logger.info(
             f"Use sliding window memory pool. "
             f"full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
         )
 
-    def calculate_pool_sizes(self, available_bytes: int, page_size: int) -> None:
-        self._solve_pool_sizes(int(available_bytes), page_size)
+        return MemoryPoolConfig(
+            max_total_num_tokens=max_total_num_tokens,
+            full_max_total_num_tokens=full_tokens,
+            swa_max_total_num_tokens=swa_tokens,
+        )
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        return self._solve_pool_sizes(int(available_bytes), page_size)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
-    ) -> None:
+    ) -> MemoryPoolConfig:
         # Reconstruct total memory from constrained max_tokens
         total_memory = max_total_num_tokens * self._cell_size
-        self._solve_pool_sizes(total_memory, page_size)
+        return self._solve_pool_sizes(total_memory, page_size)
 
 
 def create_memory_pool_configurator(

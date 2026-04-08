@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -30,6 +29,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig  # noqa: F401
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -39,25 +39,6 @@ from sglang.srt.utils.common import (
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-
-@dataclass
-class MemoryPoolConfig:
-    """Resolved memory pool config, shared between target and draft workers."""
-
-    max_total_num_tokens: int
-    max_running_requests: int
-    full_max_total_num_tokens: Optional[int] = None
-    swa_max_total_num_tokens: Optional[int] = None
-
-    mem_fraction_static: Optional[float] = None
-
-    def __post_init__(self):
-        if self.max_total_num_tokens <= 0:
-            msg = "Not enough memory. Please try to increase --mem-fraction-static."
-            if self.mem_fraction_static is not None:
-                msg += f" Current value: mem_fraction_static={self.mem_fraction_static}"
-            raise RuntimeError(msg)
 
 
 # the ratio of mamba cache pool size to max_running_requests
@@ -706,27 +687,20 @@ class ModelRunnerKVCacheMixin:
         page_size = self.server_args.page_size
 
         configurator = create_memory_pool_configurator(self)
-        configurator.calculate_pool_sizes(available_bytes, page_size)
+        config = configurator.calculate_pool_sizes(available_bytes, page_size)
 
         # Apply external constraints (user cap, page alignment, PP sync)
-        constrained = self._apply_token_constraints(configurator.max_total_num_tokens)
-        if constrained != configurator.max_total_num_tokens:
-            configurator.calculate_pool_sizes_from_max_tokens(constrained, page_size)
+        constrained = self._apply_token_constraints(config.max_total_num_tokens)
+        if constrained != config.max_total_num_tokens:
+            config = configurator.calculate_pool_sizes_from_max_tokens(
+                constrained, page_size
+            )
 
-        full_tokens = getattr(configurator, "full_max_total_num_tokens", None)
-        swa_tokens = getattr(configurator, "swa_max_total_num_tokens", None)
-
-        max_running_requests = self._resolve_max_num_reqs(
-            configurator.max_total_num_tokens
+        config.max_running_requests = self._resolve_max_num_reqs(
+            config.max_total_num_tokens
         )
-
-        return MemoryPoolConfig(
-            max_total_num_tokens=configurator.max_total_num_tokens,
-            max_running_requests=max_running_requests,
-            full_max_total_num_tokens=full_tokens,
-            swa_max_total_num_tokens=swa_tokens,
-            mem_fraction_static=self.server_args.mem_fraction_static,
-        )
+        config.mem_fraction_static = self.server_args.mem_fraction_static
+        return config
 
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
