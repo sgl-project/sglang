@@ -119,6 +119,7 @@ class TestCalculateStreamingUsage(CustomTestCase):
     def test_single_choice(self):
         usage = UsageProcessor.calculate_streaming_usage(
             prompt_tokens={0: 10},
+            reasoning_tokens={0: 0},
             completion_tokens={0: 20},
             cached_tokens={0: 0},
             n_choices=1,
@@ -131,6 +132,7 @@ class TestCalculateStreamingUsage(CustomTestCase):
         while completion tokens are summed across all indices."""
         usage = UsageProcessor.calculate_streaming_usage(
             prompt_tokens={0: 10, 1: 99, 2: 10, 3: 99},
+            reasoning_tokens={0: 0, 1: 0, 2: 0, 3: 0},
             completion_tokens={0: 5, 1: 5, 2: 5, 3: 5},
             cached_tokens={0: 0, 1: 0, 2: 0, 3: 0},
             n_choices=2,
@@ -141,6 +143,7 @@ class TestCalculateStreamingUsage(CustomTestCase):
     def test_streaming_cache_report(self):
         usage = UsageProcessor.calculate_streaming_usage(
             prompt_tokens={0: 10},
+            reasoning_tokens={0: 0},
             completion_tokens={0: 5},
             cached_tokens={0: 3},
             n_choices=1,
@@ -151,6 +154,7 @@ class TestCalculateStreamingUsage(CustomTestCase):
     def test_streaming_cache_report_disabled(self):
         usage = UsageProcessor.calculate_streaming_usage(
             prompt_tokens={0: 10},
+            reasoning_tokens={0: 0},
             completion_tokens={0: 5},
             cached_tokens={0: 3},
             n_choices=1,
