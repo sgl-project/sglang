@@ -157,9 +157,11 @@ def convert_embeds_to_tensors(
     if first_non_none is None:
         # All entries are None
         return [None] * len(embeds)
-    # Detect nesting depth: if first element is empty or its first element is a float,
-    # it's a single input [num_replacements][hidden_size]
-    if not first_non_none[0] or isinstance(first_non_none[0][0], (int, float)):
+    # Detect nesting depth by checking the first non-None entry:
+    # - Single input [num_replacements][hidden_size]: first element is List[float]
+    # - Batch [num_inputs][num_replacements][hidden_size]: first element is List[List[float]]
+    if not first_non_none or not isinstance(first_non_none[0], list):
+        # Single input: each entry is a float vector
         return [[torch.tensor(vec, dtype=torch.float32) for vec in embeds]]
     # Otherwise it's batch: [num_inputs][num_replacements][hidden_size]
     return [
