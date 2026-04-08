@@ -1,3 +1,7 @@
+"""
+    This unittest is introduced in #22360, preventing duplicate transformer safetensors variants being loaded together
+"""
+
 import json
 import sys
 import tempfile
@@ -64,7 +68,7 @@ class _FakeQuantConfig:
 
 class TestTransformerQuantHelpers(unittest.TestCase):
     def _make_server_args(self, **overrides):
-        return SimpleNamespace(
+        defaults = dict(
             transformer_weights_path=None,
             pipeline_config=SimpleNamespace(
                 dit_precision="bf16",
@@ -76,8 +80,9 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             tp_size=1,
             dit_cpu_offload=False,
             text_encoder_cpu_offload=False,
-            **overrides,
         )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
 
     def test_resolve_transformer_safetensors_to_load_uses_single_override_file(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
