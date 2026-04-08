@@ -154,7 +154,7 @@ class UnifiedLRUList:
         if check_id:
             assert node.id in self.cache
         x = node.lru_prev[self.component_type]
-        while x.component(self.component_type).lock_ref > 0:
+        while x.component_data[self.component_type].lock_ref > 0:
             x = x.lru_prev[self.component_type]
         if x == self.head:
             return None
@@ -164,7 +164,7 @@ class UnifiedLRUList:
         if check_id:
             assert node.id in self.cache
         x = node.lru_prev[self.component_type]
-        while x.component(self.component_type).lock_ref > 0 or len(x.children) > 0:
+        while x.component_data[self.component_type].lock_ref > 0 or len(x.children) > 0:
             x = x.lru_prev[self.component_type]
         if x == self.head:
             return None
@@ -227,9 +227,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def reset(self) -> None:
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.key = RadixKey([], None)
-        self.root_node.component(BASE_COMPONENT_TYPE).value = []
+        self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         for ct in self.tree_components:
-            self.root_node.component(ct).lock_ref = 1
+            self.root_node.component_data[ct].lock_ref = 1
         self.component_evictable_size_ = {ct: 0 for ct in self.tree_components}
         self.component_protected_size_ = {ct: 0 for ct in self.tree_components}
         self.lru_lists = {
@@ -493,7 +493,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if prefix_len < len(child.key):
                 # Read-only: do not split, ignore partial match and stop
                 break
-            value.append(child.component(BASE_COMPONENT_TYPE).value)
+            value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
             key = key[prefix_len:]
@@ -525,10 +525,10 @@ class UnifiedRadixCache(BasePrefixCache):
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 node = self._split_node(child.key, child, prefix_len)
-                value.append(node.component(BASE_COMPONENT_TYPE).value)
+                value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 _update_best_if_valid(node)
                 break
-            value.append(child.component(BASE_COMPONENT_TYPE).value)
+            value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
             key = key[prefix_len:]
@@ -580,16 +580,16 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
-        new_node.component(BASE_COMPONENT_TYPE).value = (
-            child.component(BASE_COMPONENT_TYPE).value[:split_len].clone()
+        new_node.component_data[BASE_COMPONENT_TYPE].value = (
+            child.component_data[BASE_COMPONENT_TYPE].value[:split_len].clone()
         )
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
         child.parent = new_node
         child.key = child.key[split_len:]
-        child.component(BASE_COMPONENT_TYPE).value = (
-            child.component(BASE_COMPONENT_TYPE).value[split_len:].clone()
+        child.component_data[BASE_COMPONENT_TYPE].value = (
+            child.component_data[BASE_COMPONENT_TYPE].value[split_len:].clone()
         )
 
         for component in self.components.values():
@@ -615,7 +615,7 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node = UnifiedTreeNode(self.tree_components)
         new_node.parent = parent
         new_node.key = key
-        new_node.component(BASE_COMPONENT_TYPE).value = value.clone()
+        new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[self.get_child_key_fn(key)] = new_node
         self.lru_lists[BASE_COMPONENT_TYPE].insert_mru(new_node)
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -717,7 +717,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self.components.values():
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node):
-                    assert node.component(comp.component_type).lock_ref == 0
+                    assert node.component_data[comp.component_type].lock_ref == 0
                     self._evict_component_and_detach_lru(
                         node, comp, is_leaf=is_leaf, tracker=tracker
                     )
@@ -760,7 +760,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 break
 
             if any(
-                cur.component(comp.component_type).lock_ref > 0
+                cur.component_data[comp.component_type].lock_ref > 0
                 for comp in self.components.values()
                 if comp.node_has_component_data(cur)
             ):
@@ -824,11 +824,11 @@ class UnifiedRadixCache(BasePrefixCache):
         stack = [self.root_node]
         while stack:
             node = stack.pop()
-            total_size += len(node.component(BASE_COMPONENT_TYPE).value)
+            total_size += len(node.component_data[BASE_COMPONENT_TYPE].value)
             for ct in self.tree_components:
                 if ct == BASE_COMPONENT_TYPE:
                     continue
-                value = node.component(ct).value
+                value = node.component_data[ct].value
                 if value is not None:
                     total_aux_size += len(value)
             for child in node.children.values():
@@ -840,7 +840,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def _dfs(node: UnifiedTreeNode):
             for child in node.children.values():
-                values.append(child.component(BASE_COMPONENT_TYPE).value)
+                values.append(child.component_data[BASE_COMPONENT_TYPE].value)
                 _dfs(child)
 
         _dfs(self.root_node)
@@ -857,7 +857,7 @@ class UnifiedRadixCache(BasePrefixCache):
         values = []
 
         def _dfs(node: UnifiedTreeNode):
-            value = node.component(component_type).value
+            value = node.component_data[component_type].value
             if value is not None:
                 values.append(value)
             for child in node.children.values():
@@ -910,14 +910,14 @@ class UnifiedRadixCache(BasePrefixCache):
         while stack:
             node, indent = stack.pop()
             component_str = " ".join(
-                f"{ct}={'yes' if node.component(ct).value is not None else 'no'}"
+                f"{ct}={'yes' if node.component_data[ct].value is not None else 'no'}"
                 for ct in self.tree_components
             )
             print(
                 " " * indent,
                 f"[{node.id}]",
                 len(node.key),
-                f"full_lock={node.component(BASE_COMPONENT_TYPE).lock_ref}",
+                f"full_lock={node.component_data[BASE_COMPONENT_TYPE].lock_ref}",
                 component_str,
             )
             for child in node.children.values():

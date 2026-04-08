@@ -81,18 +81,15 @@ class TreeComponent(ABC):
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         self.cache = cache
 
+    # Subclasses MUST set this as a class attribute (not @property)
+    component_type: ComponentType
+
     def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
-        return node.component(self.component_type).value is not None
+        return node.component_data[self.component_type].value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
-        value = node.component(self.component_type).value
+        value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
-
-    @property
-    @abstractmethod
-    def component_type(self) -> ComponentType:
-        """Component identifier — one of the ``ComponentType`` enum values."""
-        ...
 
     @abstractmethod
     def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:

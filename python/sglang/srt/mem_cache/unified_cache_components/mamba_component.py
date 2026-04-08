@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 
 class MambaComponent(TreeComponent):
+    component_type = ComponentType.MAMBA
+
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
@@ -43,13 +45,9 @@ class MambaComponent(TreeComponent):
         super().__init__(cache, params)
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
 
-    @property
-    def component_type(self) -> ComponentType:
-        return ComponentType.MAMBA
-
     def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
         ct = self.component_type
-        return lambda node: node.component(ct).value is not None
+        return lambda node: node.component_data[ct].value is not None
 
     def finalize_match_result(
         self,
@@ -71,7 +69,7 @@ class MambaComponent(TreeComponent):
         else:
             branching_seqlen = None
 
-        mamba_value = last_node.component(self.component_type).value
+        mamba_value = last_node.component_data[self.component_type].value
         if cow_mamba and mamba_value is not None:
             assert req is not None
             if req.mamba_pool_idx is None:
@@ -103,14 +101,14 @@ class MambaComponent(TreeComponent):
     ) -> None:
         assert params.mamba_value is not None
         if is_new_leaf:
-            node.component(self.component_type).value = params.mamba_value
+            node.component_data[self.component_type].value = params.mamba_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
             )
             return
-        if node.component(self.component_type).value is None:
-            node.component(self.component_type).value = params.mamba_value
+        if node.component_data[self.component_type].value is None:
+            node.component_data[self.component_type].value = params.mamba_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(
                 params.mamba_value
@@ -124,16 +122,16 @@ class MambaComponent(TreeComponent):
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
-        new_parent.component(self.component_type).value = None
-        new_parent.component(self.component_type).lock_ref = 0
+        new_parent.component_data[self.component_type].value = None
+        new_parent.component_data[self.component_type].lock_ref = 0
 
     def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
-        value = node.component(self.component_type).value
+        value = node.component_data[self.component_type].value
         self.cache.req_to_token_pool.mamba_pool.free(value)
         freed = len(value)
         self.cache.component_evictable_size_[self.component_type] -= freed
         if not is_leaf:
-            node.component(self.component_type).value = None
+            node.component_data[self.component_type].value = None
         return freed
 
     def drive_eviction(
@@ -145,7 +143,7 @@ class MambaComponent(TreeComponent):
         while (
             tracker[self.component_type] < request and x is not None and lru.in_list(x)
         ):
-            assert x.component(self.component_type).value is not None
+            assert x.component_data[self.component_type].value is not None
             if len(x.children) > 0:
                 x_next = lru.get_prev_no_lock(x)
                 self.cache._evict_component_and_detach_lru(
@@ -163,24 +161,24 @@ class MambaComponent(TreeComponent):
     def acquire_component_lock(
         self, node: UnifiedTreeNode, result: IncLockRefResult
     ) -> IncLockRefResult:
-        value = node.component(self.component_type).value
+        value = node.component_data[self.component_type].value
         if value is not None:
-            if node.component(self.component_type).lock_ref == 0:
+            if node.component_data[self.component_type].lock_ref == 0:
                 self.cache.component_evictable_size_[self.component_type] -= len(value)
                 self.cache.component_protected_size_[self.component_type] += len(value)
-            node.component(self.component_type).lock_ref += 1
+            node.component_data[self.component_type].lock_ref += 1
         return result
 
     def release_component_lock(
         self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
     ) -> None:
-        value = node.component(self.component_type).value
+        value = node.component_data[self.component_type].value
         if value is not None:
-            assert node.component(self.component_type).lock_ref > 0
-            if node.component(self.component_type).lock_ref == 1:
+            assert node.component_data[self.component_type].lock_ref > 0
+            if node.component_data[self.component_type].lock_ref == 1:
                 self.cache.component_evictable_size_[self.component_type] += len(value)
                 self.cache.component_protected_size_[self.component_type] -= len(value)
-            node.component(self.component_type).lock_ref -= 1
+            node.component_data[self.component_type].lock_ref -= 1
 
     def prepare_for_caching_req(
         self,
