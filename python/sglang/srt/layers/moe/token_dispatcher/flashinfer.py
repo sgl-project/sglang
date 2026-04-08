@@ -225,7 +225,7 @@ class FlashinferDispatcher(BaseDispatcher):
             x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
             # TODO: Fuse interleave into cutlass moe when flashinfer is updated to have https://github.com/flashinfer-ai/flashinfer/pull/2330
-            if get_moe_runner_backend().is_flashinfer_cutlass_moe():
+            if get_moe_runner_backend().is_flashinfer_cutlass():
                 x_sf = nvfp4_block_scale_interleave(x_sf)
         else:
             x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
