@@ -130,7 +130,6 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-        **kwargs,
     ):
         """Run a forward for decode."""
         raise NotImplementedError()
@@ -143,7 +142,6 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
-        **kwargs,
     ):
         """Run a forward for extend."""
         raise NotImplementedError()

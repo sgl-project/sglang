@@ -179,6 +179,9 @@ def unified_attention_with_output(
         if hasattr(token_to_kv_pool, "set_swa_loc"):
             token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
+    # Store pre-allocated output for FA backend to write directly into
+    forward_batch._attn_output = output
+
     ret = forward_batch.attn_backend.forward(
         query,
         key,
@@ -186,7 +189,6 @@ def unified_attention_with_output(
         attention_layer,
         forward_batch,
         save_kv_cache,
-        output=output,
         **kwargs,
     )
     forward_batch.out_cache_loc = original_out_cache_loc

@@ -606,7 +606,6 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
-        output: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert v is not None
@@ -693,8 +692,8 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         _fa_out = (
-            output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            if output is not None
+            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if getattr(forward_batch, "_attn_output", None) is not None
             else None
         )
 
@@ -1022,7 +1021,6 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
-        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -1076,8 +1074,8 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         _fa_out = (
-            output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            if output is not None
+            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if getattr(forward_batch, "_attn_output", None) is not None
             else None
         )
 
@@ -1176,11 +1174,6 @@ class FlashAttentionBackend(AttentionBackend):
                     and not use_cascade_attn
                 ):
                     sched_meta = metadata.scheduler_metadata
-                _fa_out = (
-                    output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                    if output is not None
-                    else None
-                )
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
