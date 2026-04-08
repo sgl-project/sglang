@@ -10,6 +10,12 @@ The core idea is:
 - load the converted checkpoint through the diffusion runtime's native FP8 linear path
 - validate both speed and quality against the BF16 reference with fixed prompts, seeds, and profiler traces
 
+Published ready-to-use checkpoints:
+- FLUX.2 FP8 transformer override:
+  `https://huggingface.co/BBuf/flux2-dev-modelopt-fp8-sglang-transformer`
+- WAN2.2 A14B FP8 primary-transformer override:
+  `https://huggingface.co/BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer`
+
 ## What This PR Changes
 
 ### Runtime / Loader
@@ -54,6 +60,38 @@ The core idea is:
 - WAN2.2 exact-nightly benchmark numbers below are for the currently validated benchmarked path:
   - quantized `transformer`
   - BF16 `transformer_2`
+
+## Ready-To-Use Model Cards
+
+Users do not need to rerun ModelOpt PTQ or the SGLang converter to try the
+validated checkpoints from this PR. The converted SGLang-ready transformer
+overrides have been published on Hugging Face:
+
+- FLUX.2:
+  `BBuf/flux2-dev-modelopt-fp8-sglang-transformer`
+- WAN2.2 A14B primary transformer only:
+  `BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer`
+
+Example usage:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --transformer-path BBuf/flux2-dev-modelopt-fp8-sglang-transformer \
+  ...
+```
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --transformer-path BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
+  ...
+```
+
+Scope note:
+- the published WAN2.2 checkpoint overrides only the primary `transformer`
+- `transformer_2` is still loaded from the base BF16 model
 
 ## Implementation Notes
 
@@ -149,6 +187,8 @@ Observed H100 smoke numbers:
 - Images:
   - `/Users/bbuf/Desktop/flux2_h100_2gpu_20260408/flux2_bf16.png`
   - `/Users/bbuf/Desktop/flux2_h100_2gpu_20260408/flux2_fp8.png`
+- Published FP8 checkpoint:
+  - `https://huggingface.co/BBuf/flux2-dev-modelopt-fp8-sglang-transformer`
 - Reduced-smoke trajectory outputs:
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/flux2_outputs/reference/A_futuristic_cyberpunk_city_at_night_neon_lights_reflecting_on_wet_streets_20260408-111716_771f10f5.png`
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/flux2_outputs/candidate/A_futuristic_cyberpunk_city_at_night_neon_lights_reflecting_on_wet_streets_20260408-111830_4330a9c1.png`
@@ -166,6 +206,8 @@ Observed H100 smoke numbers:
 - Full-run videos:
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/wan22/bf16_nocompile/wan22_bf16_nocompile.mp4`
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/wan22/fp8_nocompile/wan22_fp8_nocompile.mp4`
+- Published FP8 checkpoint:
+  - `https://huggingface.co/BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer`
 - Reduced-smoke trajectory outputs:
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/wan22_outputs/reference/A_cat_and_a_dog_baking_a_cake_together_in_a_kitchen._20260408-112053_71432b1d.mp4`
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/wan22_outputs/candidate/A_cat_and_a_dog_baking_a_cake_together_in_a_kitchen._20260408-112216_8a6dc947.mp4`

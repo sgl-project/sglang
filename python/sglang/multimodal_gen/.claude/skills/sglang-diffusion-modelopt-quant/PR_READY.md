@@ -24,6 +24,17 @@ Use [PR_BODY.md](./PR_BODY.md) as the primary draft PR description.
   - `/tmp/modelopt_accuracy/flux2_similarity.json`
   - `/tmp/modelopt_accuracy/wan22_similarity.json`
 
+## Published Checkpoints
+
+- FLUX.2 FP8 transformer override:
+  `https://huggingface.co/BBuf/flux2-dev-modelopt-fp8-sglang-transformer`
+- WAN2.2 A14B FP8 primary-transformer override:
+  `https://huggingface.co/BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer`
+
+Usage note:
+- both repos are SGLang-ready and can be used directly with `--transformer-path`
+- the WAN repo overrides only the primary `transformer`; `transformer_2` stays BF16
+
 ## Current Code Areas
 
 | File | Summary |

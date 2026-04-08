@@ -43,6 +43,9 @@ This repo now contains:
 - automatic `dit_cpu_offload/dit_layerwise_offload -> false` protection for diffusion ModelOpt FP8 runs
 - a conversion tool for ModelOpt diffusers FP8 exports:
   [`python/sglang/multimodal_gen/tools/convert_modelopt_fp8_checkpoint.py`](../../../tools/convert_modelopt_fp8_checkpoint.py)
+- public SGLang-ready FP8 checkpoints for direct consumption:
+  - `BBuf/flux2-dev-modelopt-fp8-sglang-transformer`
+  - `BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer`
 
 ## Generic Vs Model-Specific
 
@@ -220,6 +223,28 @@ Current FP8 caveat:
   if different components need different checkpoints; use
   `--component_paths.transformer=...` and `--component_paths.transformer_2=...`
 
+If you just want to run the validated checkpoints instead of reproducing the
+export/conversion flow, use the published Hugging Face repos directly:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --transformer-path BBuf/flux2-dev-modelopt-fp8-sglang-transformer \
+  ...
+```
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --transformer-path BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
+  ...
+```
+
+WAN scope note:
+- the published WAN2.2 checkpoint overrides only the primary `transformer`
+- `transformer_2` is still taken from the base BF16 model
+
 ## NVFP4 Workflow
 
 ### 1. Quantize With Official ModelOpt Script
@@ -247,6 +272,9 @@ That means the skill for NVFP4 is:
 
 FLUX.2 is the validated FP8 and NVFP4 reference in this skill.
 Use it as the first end-to-end example when extending the workflow.
+
+Published SGLang-ready FP8 override:
+- `https://huggingface.co/BBuf/flux2-dev-modelopt-fp8-sglang-transformer`
 
 ### WAN2.2
 
@@ -288,6 +316,11 @@ Current conclusion:
   `--dit-layerwise-offload false`
 - do not present WAN2.2 as a fully quantized dual-transformer FP8 recipe until the
   `transformer_2` export failure is resolved
+
+Published SGLang-ready FP8 override for the benchmarked path:
+- `https://huggingface.co/BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer`
+- this repo contains only the primary `transformer`
+- `transformer_2` remains BF16 from the base WAN2.2 checkpoint
 
 Benchmark snapshot with the same command shape on H100:
 
