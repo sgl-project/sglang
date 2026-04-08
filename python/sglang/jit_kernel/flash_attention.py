@@ -2,10 +2,29 @@ from typing import Optional, Union
 
 import torch
 
-from .flash_attention_v3 import flash_attn_varlen_func as fa3_flash_attn_varlen_func
-from .flash_attention_v3 import flash_attn_with_kvcache as fa3_flash_attn_with_kvcache
-from .flash_attention_v4 import flash_attn_varlen_func as fa4_flash_attn_varlen_func
-from .flash_attention_v4 import flash_attn_with_kvcache as fa4_flash_attn_with_kvcache
+fa3_flash_attn_varlen_func = None
+fa3_flash_attn_with_kvcache = None
+fa4_flash_attn_varlen_func = None
+fa4_flash_attn_with_kvcache = None
+
+
+def _lazy_load_fa3_kernels():
+    from .flash_attention_v3 import flash_attn_varlen_func, flash_attn_with_kvcache
+
+    global fa3_flash_attn_varlen_func
+    global fa3_flash_attn_with_kvcache
+
+    fa3_flash_attn_varlen_func = flash_attn_varlen_func
+    fa3_flash_attn_with_kvcache = flash_attn_with_kvcache
+
+
+def _lazy_load_fa4_kernels():
+    from .flash_attention_v4 import flash_attn_varlen_func, flash_attn_with_kvcache
+
+    global fa4_flash_attn_varlen_func
+    global fa4_flash_attn_with_kvcache
+    fa4_flash_attn_varlen_func = flash_attn_varlen_func
+    fa4_flash_attn_with_kvcache = flash_attn_with_kvcache
 
 
 def flash_attn_with_kvcache(
@@ -134,6 +153,8 @@ def flash_attn_with_kvcache(
     """
 
     if ver == 3:
+        if fa3_flash_attn_with_kvcache is None:
+            _lazy_load_fa3_kernels()
         return fa3_flash_attn_with_kvcache(
             q,
             k_cache,
@@ -168,6 +189,8 @@ def flash_attn_with_kvcache(
             sinks=sinks,
         )
     elif ver == 4:
+        if fa4_flash_attn_with_kvcache is None:
+            _lazy_load_fa4_kernels()
         return fa4_flash_attn_with_kvcache(
             q,
             k_cache,
@@ -233,6 +256,8 @@ def flash_attn_varlen_func(
 ):
 
     if ver == 3:
+        if fa3_flash_attn_varlen_func is None:
+            _lazy_load_fa3_kernels()
         return fa3_flash_attn_varlen_func(
             q,
             k,
@@ -260,6 +285,8 @@ def flash_attn_varlen_func(
             sinks=sinks,
         )
     elif ver == 4:
+        if fa4_flash_attn_varlen_func is None:
+            _lazy_load_fa4_kernels()
         return fa4_flash_attn_varlen_func(
             q,
             k,
