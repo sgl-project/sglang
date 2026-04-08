@@ -5,7 +5,6 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Manual-only: not registered in any CI suite
 GLM_4_6_FP8_MODEL_PATH = "zai-org/GLM-4.6-FP8"
 
 

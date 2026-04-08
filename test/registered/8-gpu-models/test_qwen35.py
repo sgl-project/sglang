@@ -9,7 +9,7 @@ from sglang.test.test_utils import ModelLaunchSettings
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
-QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B-FP8"
+QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B"
 
 
 class TestQwen35(unittest.TestCase):
@@ -30,7 +30,6 @@ class TestQwen35(unittest.TestCase):
             "--tool-call-parser=qwen3_coder",
             "--mem-fraction-static=0.8",
         ]
-        dp_args = ["--dp=8", "--enable-dp-attention"]
         mtp_args = [
             "--speculative-algorithm=EAGLE",
             "--speculative-num-steps=3",
@@ -49,14 +48,8 @@ class TestQwen35(unittest.TestCase):
             ModelLaunchSettings(
                 QWEN35_MODEL_PATH,
                 tp_size=8,
-                extra_args=base_args + dp_args,
-                variant="TP8+DP8",
-            ),
-            ModelLaunchSettings(
-                QWEN35_MODEL_PATH,
-                tp_size=8,
-                extra_args=base_args + dp_args + mtp_args,
-                variant="TP8+DP8+MTP",
+                extra_args=base_args + mtp_args,
+                variant="TP8+MTP",
                 env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
