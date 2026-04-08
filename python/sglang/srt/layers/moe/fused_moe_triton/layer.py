@@ -291,13 +291,18 @@ class FusedMoE(torch.nn.Module):
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
 
-        self.should_fuse_routed_scaling_factor_in_topk = isinstance(
-            self.quant_method, ModelOptNvFp4FusedMoEMethod
-        ) or (
-            isinstance(self.quant_method, Fp8MoEMethod)
-            and (
-                get_moe_runner_backend().is_cutlass()
-                or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        self.should_fuse_routed_scaling_factor_in_topk = (
+            isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            or (
+                isinstance(self.quant_method, Fp8MoEMethod)
+                and (
+                    get_moe_runner_backend().is_cutlass()
+                    or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                )
+            )
+            or (
+                isinstance(self.quant_method, UnquantizedFusedMoEMethod)
+                and get_moe_runner_backend().is_flashinfer_trtllm_routed()
             )
         )
 

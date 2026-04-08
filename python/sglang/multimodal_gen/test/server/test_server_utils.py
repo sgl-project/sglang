@@ -375,8 +375,10 @@ class ServerManager:
         # Apply custom environment variables
         env.update(self.env_vars)
 
-        # TODO: unify with run_command
-        logger.info(f"Running command: {shlex.join(command)}")
+        cmd_str = shlex.join(command)
+        # Use print (not logger) so the command always appears in CI output
+        # regardless of log-level configuration.
+        print(f"[server-test] Running command: {cmd_str}", flush=True)
 
         process = subprocess.Popen(
             command,
@@ -412,11 +414,10 @@ class ServerManager:
             log_thread.daemon = True
             log_thread.start()
 
-        logger.info(
-            "[server-test] Starting server pid=%s, model=%s, log=%s",
-            process.pid,
-            self.model,
-            stdout_path,
+        print(
+            f"[server-test] Starting server pid={process.pid}, "
+            f"model={self.model}, log={stdout_path}",
+            flush=True,
         )
 
         self._wait_for_ready(process, stdout_path)

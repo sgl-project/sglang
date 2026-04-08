@@ -170,7 +170,7 @@ export SGLANG_SET_CPU_AFFINITY=1
 python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
 ```
 
-#### PD Separation Scene
+#### PD Disaggregation Scene
 1. Launch Prefill Server
 ```shell
 # Enabling CPU Affinity

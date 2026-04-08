@@ -27,8 +27,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.7", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.7",
+  "flashinfer_python==0.6.7.post2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.7.post2",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
@@ -58,7 +58,7 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "flash-attn-4>=4.0.0b4",
-  "sglang-kernel==0.4.0",
+  "sglang-kernel==0.4.1",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -77,6 +77,7 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
+  "kernels",
 ]
 
 [[tool.uv.index]]
@@ -129,6 +130,10 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+http2 = [
+  "granian>=2.6.0",
+]
+
 test = [
   "accelerate",
   "addict",
@@ -146,6 +151,7 @@ test = [
   "diff-cover",
   "sentence_transformers",
   "tabulate",
+  "granian>=2.6.0",
 ]
 
 dev = ["sglang[test]"]
@@ -153,6 +159,7 @@ dev = ["sglang[test]"]
 all = [
   "sglang[diffusion]",
   "sglang[tracing]",
+  "sglang[http2]",
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -198,6 +205,9 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["bash", "-c", "git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
+
+[tool.kernels.dependencies]
+"kernels-community/sgl-flash-attn3" = 1
