@@ -165,24 +165,33 @@ def main(args, server_args):
             other_args = []
         else:
             other_args = [
-                f"--speculative-num-steps={steps}",
-                f"--speculative-eagle-topk={topk}",
-                f"--speculative-num-draft-tokens={num_draft_tokens}",
+                "--speculative-num-steps",
+                steps,
+                "--speculative-eagle-topk",
+                topk,
+                "--speculative-num-draft-tokens",
+                num_draft_tokens,
             ]
             if server_args.speculative_draft_model_path is not None:
                 other_args.extend(
                     [
-                        f"--speculative-draft-model-path={server_args.speculative_draft_model_path}",
-                        f"--speculative-algorithm={server_args.speculative_algorithm}",
+                        "--speculative-draft-model-path",
+                        server_args.speculative_draft_model_path,
+                        "--speculative-algorithm",
+                        server_args.speculative_algorithm,
                     ]
                 )
 
         other_args.extend(
             [
-                f"--cuda-graph-max-bs={batch_size}",
-                f"--mem-fraction-static={server_args.mem_fraction_static}",
-                f"--tp-size={server_args.tp_size}",
-                f"--max-running-requests={batch_size}",
+                "--cuda-graph-max-bs",
+                batch_size,
+                "--mem-fraction-static",
+                server_args.mem_fraction_static,
+                "--tp-size",
+                server_args.tp_size,
+                "--max-running-requests",
+                batch_size,
             ]
         )
 
@@ -196,14 +205,16 @@ def main(args, server_args):
         if server_args.attention_backend:
             other_args.extend(
                 [
-                    f"--attention-backend={server_args.attention_backend}",
+                    "--attention-backend",
+                    server_args.attention_backend,
                 ]
             )
 
         if server_args.quantization:
             other_args.extend(
                 [
-                    f"--quantization={server_args.quantization}",
+                    "--quantization",
+                    server_args.quantization,
                 ]
             )
 
