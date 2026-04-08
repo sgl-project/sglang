@@ -1425,6 +1425,14 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             return video_coords.to(device=hidden_device, dtype=hidden_dtype)
         return video_coords.to(device=hidden_device)
 
+    def _get_av_ca_gate_timestep_factor(self) -> float:
+        ltx_variant = str(getattr(self.config.arch_config, "ltx_variant", "ltx_2"))
+        if ltx_variant == "ltx_2_3":
+            return (
+                self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
+            )
+        return float(self.av_ca_timestep_scale_multiplier)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1564,9 +1572,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             batch_size, -1, temb_ca_scale_shift.shape[-1]
         )
 
-        av_ca_gate_factor = (
-            self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
-        )
+        av_ca_gate_factor = self._get_av_ca_gate_timestep_factor()
         temb_ca_gate, _ = self.av_ca_a2v_gate_adaln_single(
             timestep.flatten() * av_ca_gate_factor,
             hidden_dtype=hidden_dtype,
