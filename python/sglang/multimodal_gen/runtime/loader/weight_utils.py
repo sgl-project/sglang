@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import tempfile
+from collections import defaultdict
 from collections.abc import Generator, Iterable
 from pathlib import Path
 
@@ -133,6 +134,49 @@ def _validate_safetensors_file(file_path: str) -> bool:
         return False
 
 
+def _raise_if_duplicate_safetensors_keys(hf_weights_files: list[str]) -> None:
+    """Fail fast when multiple safetensors files define the same tensor name.
+
+    Duplicate keys across files are almost always a packaging error for inference:
+    for example shipping both full and fp16 variants, or mixing consolidated and
+    sharded checkpoints. Continuing would make the final loaded value depend on
+    file iteration or streamer delivery order.
+    """
+    if len(hf_weights_files) <= 1:
+        return
+
+    key_to_file: dict[str, str] = {}
+    duplicate_files_by_key: dict[str, set[str]] = defaultdict(set)
+
+    for st_file in hf_weights_files:
+        with safe_open(st_file, framework="pt", device="cpu") as f:
+            for name in f.keys():  # noqa: SIM118
+                previous_file = key_to_file.get(name)
+                if previous_file is None:
+                    key_to_file[name] = st_file
+                    continue
+                if previous_file == st_file:
+                    continue
+                duplicate_files_by_key[name].update((previous_file, st_file))
+
+    if not duplicate_files_by_key:
+        return
+
+    examples = []
+    for key in sorted(duplicate_files_by_key)[:8]:
+        files = ", ".join(sorted(os.path.basename(p) for p in duplicate_files_by_key[key]))
+        examples.append(f"{key} [{files}]")
+
+    raise ValueError(
+        "Duplicate tensor names detected across safetensors files. Refusing to load "
+        "because final weights would depend on file or streamer ordering. "
+        f"Found {len(duplicate_files_by_key)} duplicate tensor name(s). "
+        f"Examples: {examples}. "
+        "This usually means multiple precision variants or consolidated+sharded "
+        "checkpoints were passed together."
+    )
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
@@ -183,6 +227,8 @@ def safetensors_weights_iterator(
             f"Files have been removed: {[os.path.basename(f) for f in corrupted_files]}. "
             "Please retry - the files will be re-downloaded automatically."
         )
+
+    _raise_if_duplicate_safetensors_keys(hf_weights_files)
 
     if use_runai_model_streamer:
         with SafetensorsStreamer() as streamer:
