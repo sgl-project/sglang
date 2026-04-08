@@ -86,7 +86,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 |----------------------------------------------------|----------|---------------------------|:----------------:|
 | `--device`                                         | `None`   | Type: str                 |      A2, A3      |
 | `--tensor-parallel-size`<br/>`--tp-size`           | `1`      | Type: int                 |      A2, A3      |
-| `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Type: int                 |      A2, A3      |
+| `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Currently only `1` supported |      A2, A3      |
 | `--attention-context-parallel-size`<br/>`--attn-cp-size`  | `1` | Type: int               |      A2, A3      |
 | `--moe-data-parallel-size`<br/>`--moe-dp-size`     | `1`      | Type: int                 |      A2, A3      |
 | `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
@@ -256,7 +256,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--ep-dispatch-algorithm`                             | `None`    | `static`,<br/> `dynamic`,<br/> `fake`       |      A2, A3      |
 | `--init-expert-location`                              | `trivial` | Type: str                                   |      A2, A3      |
 | `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              |      A2, A3      |
-| `--eplb-algorithm`                                    | `auto`    | Type: str                                   |      A2, A3      |
+| `--eplb-algorithm`                                    | `deepseek`| Type: str                                   |      A2, A3      |
 | `--eplb-rebalance-num-iterations`                     | `1000`    | Type: int                                   |      A2, A3      |
 | `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   |      A2, A3      |
 | `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 |      A2, A3      |
