@@ -378,7 +378,10 @@ def check_gguf_file(model: str | os.PathLike) -> bool:
 
 
 def maybe_download_lora(
-    model_name_or_path: str, local_dir: str | None = None, download: bool = True
+    model_name_or_path: str,
+    local_dir: str | None = None,
+    download: bool = True,
+    weight_name: str | None = None,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -386,6 +389,8 @@ def maybe_download_lora(
         model_name_or_path: Local path or Hugging Face Hub model ID
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
+        weight_name: Specific safetensors filename to load (pins deterministic selection
+                     for repos with multiple weight files)
 
     Returns:
         Local path to the model
@@ -403,14 +408,22 @@ def maybe_download_lora(
     if os.path.isfile(local_path):
         return local_path
 
-    weight_name = _best_guess_weight_name(local_path, file_extension=".safetensors")
+    if weight_name is not None:
+        target = os.path.join(local_path, weight_name)
+        if not os.path.isfile(target):
+            raise FileNotFoundError(
+                f"Specified lora_weight_name '{weight_name}' not found in {local_path}"
+            )
+        return target
+
+    guessed = _best_guess_weight_name(local_path, file_extension=".safetensors")
     # AMD workaround: PR 15813 changed from model_name_or_path to local_path,
     # which can return None. Fall back to original behavior on ROCm.
-    if weight_name is None and current_platform.is_rocm():
-        weight_name = _best_guess_weight_name(
+    if guessed is None and current_platform.is_rocm():
+        guessed = _best_guess_weight_name(
             model_name_or_path, file_extension=".safetensors"
         )
-    return os.path.join(local_path, weight_name)
+    return os.path.join(local_path, guessed)
 
 
 def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
@@ -489,15 +502,16 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
 
     from huggingface_hub.errors import EntryNotFoundError
 
-    # If it's a local path, verify it directly
+    overlay_config = maybe_load_overlay_model_index(
+        model_name_or_path,
+        snapshot_download_fn=snapshot_download,
+        hf_hub_download_fn=hf_hub_download,
+    )
+    if overlay_config is not None:
+        return overlay_config
+
+    # If it's a local path, verify it directly.
     if os.path.exists(model_name_or_path):
-        overlay_config = maybe_load_overlay_model_index(
-            model_name_or_path,
-            snapshot_download_fn=snapshot_download,
-            hf_hub_download_fn=hf_hub_download,
-        )
-        if overlay_config is not None:
-            return overlay_config
         try:
             return verify_model_config_and_directory(model_name_or_path)
         except ValueError:
@@ -508,15 +522,6 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
                     config = json.load(f)
                 return config
             raise
-
-    # return resolved overlay config if applicable
-    overlay_config = maybe_load_overlay_model_index(
-        model_name_or_path,
-        snapshot_download_fn=snapshot_download,
-        hf_hub_download_fn=hf_hub_download,
-    )
-    if overlay_config is not None:
-        return overlay_config
 
     # For remote models, download just the model_index.json
     try:
@@ -553,7 +558,7 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             )
             return config
     except EntryNotFoundError:
-        logger.warning(
+        logger.debug(
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )

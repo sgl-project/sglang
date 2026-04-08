@@ -45,11 +45,13 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
     set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.utils import (
@@ -75,6 +77,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_fp8_fnuz = is_fp8_fnuz()
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1572,7 +1575,17 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if self.nsa_kv_cache_store_fp8:
+        if _is_hip and self.use_nsa and self.dtype == fp8_dtype:
+            # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
+            # Fuse BF16/FP16 -> FP8 cast with paged KV write.
+            set_mla_kv_buffer_triton_fp8_quant(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                fp8_dtype,
+            )
+        elif self.nsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes

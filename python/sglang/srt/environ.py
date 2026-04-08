@@ -243,6 +243,10 @@ class Envs:
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
+    # Extra slots in req_to_token_pool for decode workers (only effective when
+    # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
+    # can overlap with decode execution without raising max_running_requests.
+    SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS = EnvInt(0)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -280,9 +284,13 @@ class Envs:
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
-    # Max fraction of cache (by token count) that can be pinned; 0 = disable pinning.
-    SGLANG_HICACHE_MAX_PINNED_RATIO = EnvFloat(0.0)
-
+    # Staging buffer for heterogeneous TP KV transfer
+    SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
+    SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
+    SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
+    # staging_buffer.py once Triton kernels are fully validated in production.
+    SGLANG_STAGING_USE_TORCH = EnvBool(False)
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
@@ -398,6 +406,9 @@ class Envs:
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
+    # Flash Attention
+    SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
+
     # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
@@ -455,9 +466,6 @@ class Envs:
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
-    # MM splitting behavior control
-    SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
-
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
@@ -483,6 +491,9 @@ class Envs:
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+
+    # HTTP/2 Server
+    SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
 
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
@@ -525,6 +536,9 @@ class Envs:
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
+
+    # Sglang Cache Dir
+    SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
 
 
 envs = Envs()

@@ -16,12 +16,15 @@ from sglang.test.test_utils import (
     write_results_to_json,
 )
 
-register_cuda_ci(est_time=185, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=370, suite="stage-b-test-1-gpu-large")
 
 MODEL_SCORE_THRESHOLDS = {
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.825,
-    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.825,
-    "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4": 0.615,
+    # Baselines observed with gsm8k 5-shot concatenated format via chat API,
+    # which scores lower than reported benchmarks using proper CoT format.
+    # Thresholds set 5% below observed to catch catastrophic regressions.
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4": 0.74,  # observed: 0.781
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4": 0.74,  # observed: 0.785
+    "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4": 0.36,  # observed: 0.380
 }
 
 
@@ -93,7 +96,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-    def test_mgsm_en_all_models(self):
+    def test_gsm8k_all_models(self):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
         )
@@ -110,7 +113,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     args = SimpleNamespace(
                         base_url=self.base_url,
                         model=model,
-                        eval_name="mgsm_en",
+                        eval_name="gsm8k",
                         num_examples=None,
                         num_threads=1024,
                     )
