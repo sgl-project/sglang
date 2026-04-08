@@ -2681,6 +2681,7 @@ def is_fa3_default_architecture(hf_config):
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "Olmo2ForCausalLM",
+        "OlmoHybridForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "MixtralForCausalLM",

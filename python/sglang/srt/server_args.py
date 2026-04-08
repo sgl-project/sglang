@@ -1994,6 +1994,7 @@ class ServerArgs:
             "Qwen3NextForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "OlmoHybridForCausalLM",
         ]:
             if is_sm100_supported():
                 quant_method = get_quantization_config(hf_config)
@@ -2017,6 +2018,7 @@ class ServerArgs:
                 "Qwen3NextForCausalLM",
                 "Qwen3_5MoeForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
+                "OlmoHybridForCausalLM",
             ]:
                 sm100_default_attn_backend = "triton"
                 if is_sm100_supported():

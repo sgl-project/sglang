@@ -45,6 +45,7 @@ from sglang.srt.configs import (
     Lfm2VlConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
+    OlmoHybridConfig,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
@@ -1895,7 +1896,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             | Qwen3_5Config
             | Qwen3_5MoeConfig
             | JetNemotronConfig
-            | JetVLMConfig,
+            | JetVLMConfig
+            | OlmoHybridConfig
         ):
             return config
         return None
