@@ -58,6 +58,11 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
 
+    # Maximum sequence length for the PE (prompt-enhancement) model.
+    # Injected at load time from pe/tokenizer_config.json -> model_max_length.
+    # Used for both tokenizer truncation and max_new_tokens during PE generation.
+    pe_model_max_length: int = None
+
     vae_tiling: bool = False
     vae_sp: bool = False
 

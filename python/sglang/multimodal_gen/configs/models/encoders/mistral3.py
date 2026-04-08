@@ -27,6 +27,12 @@ class Mistral3EncoderArchConfig(TextEncoderArchConfig):
 
     Uses Mistral3Model (vision-language model) as text encoder,
     extracting the second-to-last hidden state layer.
+
+    ``text_len`` controls both the tokenizer truncation length
+    (via ``tokenizer_kwargs["max_length"]``) and the arch-level sequence
+    budget.  Its value is injected at load time from
+    ``tokenizer/tokenizer_config.json`` → ``model_max_length`` by
+    ``ErnieImagePipeline.load_modules``.
     """
 
     vocab_size: int = 131072
@@ -44,7 +50,9 @@ class Mistral3EncoderArchConfig(TextEncoderArchConfig):
     tie_word_embeddings: bool = True
     head_dim: int = 128
     hidden_state_skip_layer: int = 2  # Use second-to-last hidden state
-    text_len: int = 1536
+    # text_len is intentionally left at 0 here; it will be overwritten at
+    # load time from tokenizer/tokenizer_config.json -> model_max_length.
+    text_len: int = 0
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
@@ -59,6 +67,10 @@ class Mistral3EncoderArchConfig(TextEncoderArchConfig):
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
     )
+
+    def __post_init__(self):
+        # Let the parent populate tokenizer_kwargs["max_length"] = self.text_len
+        super().__post_init__()
 
 
 @dataclass

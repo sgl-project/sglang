@@ -36,6 +36,9 @@ class PromptEnhancementStage(PipelineStage):
             )
             return batch
 
+        # Read max_new_tokens from pipeline config (injected from tokenizer_config.json at load time)
+        max_new_tokens = server_args.pipeline_config.pe_model_max_length
+
         prompt = batch.prompt
         if isinstance(prompt, str):
             prompts = [prompt]
@@ -47,7 +50,7 @@ class PromptEnhancementStage(PipelineStage):
 
         enhanced = []
         for p in prompts:
-            enhanced_p = self._enhance_single_prompt(p, width, height)
+            enhanced_p = self._enhance_single_prompt(p, width, height, max_new_tokens=max_new_tokens)
             enhanced.append(enhanced_p)
 
         if isinstance(batch.prompt, str):
@@ -61,11 +64,11 @@ class PromptEnhancementStage(PipelineStage):
     def _enhance_single_prompt(
         self,
         prompt: str,
-        width: int = 1024,
-        height: int = 1024,
-        max_new_tokens: int = 1536,
-        temperature: float = 0.6,
-        top_p: float = 0.95,
+        width: int,
+        height: int,
+        max_new_tokens: int,
+        temperature: float = None,
+        top_p: float = None,
     ) -> str:
         user_content = json.dumps(
             {"prompt": prompt, "width": width, "height": height},
@@ -79,14 +82,15 @@ class PromptEnhancementStage(PipelineStage):
             add_generation_prompt=False,
         )
 
-        # Use srt Engine for optimized generation
+        sampling_params = {"max_new_tokens": max_new_tokens}
+        if temperature is not None:
+            sampling_params["temperature"] = temperature
+        if top_p is not None:
+            sampling_params["top_p"] = top_p
+
         output = self.pe_model.generate(
             prompt=input_text,
-            sampling_params={
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-            },
+            sampling_params=sampling_params,
         )
 
         return output["text"].strip()
