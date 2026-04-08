@@ -141,7 +141,7 @@ class ModelRunnerKVCacheMixin:
                 )
         return cell_size
 
-    def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
+    def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int):
         post_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -149,6 +149,15 @@ class ModelRunnerKVCacheMixin:
             cpu_group=get_world_group().cpu_group,
         )
 
+        rest_memory = post_model_load_memory - pre_model_load_memory * (
+            1 - self.mem_fraction_static
+        )
+        if self.mambaish_config is not None:
+            rest_memory = self.handle_max_mamba_cache(rest_memory)
+
+        return rest_memory * (1 << 30)  # return in bytes
+
+    def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
         # Get the number of layers used for KV cache calculation
         if self.is_draft_worker:
             num_layers = getattr(
@@ -184,13 +193,8 @@ class ModelRunnerKVCacheMixin:
                     draft_num_layers=int(draft_num_layers),
                 )
 
-        rest_memory = post_model_load_memory - pre_model_load_memory * (
-            1 - self.mem_fraction_static
-        )
-        if self.mambaish_config is not None:
-            rest_memory = self.handle_max_mamba_cache(rest_memory)
-
-        return int(rest_memory * (1 << 30)) // cell_size
+        available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        return int(available_bytes) // cell_size
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
