@@ -687,4 +687,14 @@ class Qwen3ForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
+    def set_dflash_layers_to_capture(self, layer_ids):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                'DFLASH requires explicit layer_ids for aux hidden capture.'
+            )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
 EntryClass = Qwen3ForCausalLM
