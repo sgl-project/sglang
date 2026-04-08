@@ -308,6 +308,16 @@ class SchedulerMetricsCollector:
             documentation="Total number of retracted output tokens.",
             labelnames=labels.keys(),
         )
+        self.num_prefill_only_requests_total = Counter(
+            name="sglang:num_prefill_only_requests_total",
+            documentation="Total number of prefill-only requests (max_new_tokens=0) processed.",
+            labelnames=labels.keys(),
+        )
+        self.prefill_only_tokens_total = Counter(
+            name="sglang:prefill_only_tokens_total",
+            documentation="Total number of tokens processed by prefill-only requests.",
+            labelnames=labels.keys(),
+        )
         self.num_paused_reqs = Gauge(
             name="sglang:num_paused_reqs",
             documentation="The number of paused requests by async weight sync.",
@@ -889,6 +899,12 @@ class SchedulerMetricsCollector:
         self.num_retracted_output_tokens_total.labels(**self.labels).inc(
             num_retracted_output_tokens
         )
+
+    def increment_prefill_only_reqs(
+        self, num_reqs: int, num_tokens: int
+    ) -> None:
+        self.num_prefill_only_requests_total.labels(**self.labels).inc(num_reqs)
+        self.prefill_only_tokens_total.labels(**self.labels).inc(num_tokens)
 
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"

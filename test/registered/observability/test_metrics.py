@@ -139,6 +139,16 @@ class TestEnableMetrics(CustomTestCase):
             )
             self.assertEqual(response.status_code, 200)
 
+            # Send a prefill-only request (max_new_tokens=0)
+            response = requests.post(
+                f"{DEFAULT_URL_FOR_TEST}/generate",
+                json={
+                    "text": "The capital of France is Paris",
+                    "sampling_params": {"max_new_tokens": 0},
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+
             # Get metrics
             metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
             self.assertEqual(metrics_response.status_code, 200)
@@ -212,6 +222,8 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:gpu_execution_seconds_total", {"category": "forward_extend"}),
             ("sglang:gpu_execution_seconds_total", {"category": "forward_decode"}),
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
+            ("sglang:num_prefill_only_requests_total", {}),
+            ("sglang:prefill_only_tokens_total", {}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 

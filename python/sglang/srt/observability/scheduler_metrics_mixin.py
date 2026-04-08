@@ -55,6 +55,8 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    num_prefill_only_reqs: int
+    num_prefill_only_tokens: int
 
     @classmethod
     def from_adder(
@@ -63,6 +65,7 @@ class PrefillStats:
         running_reqs: List[Req],
         enable_priority_scheduling: bool = False,
     ):
+        prefill_only_reqs = [r for r in adder.can_run_list if r.is_prefill_only]
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
@@ -71,6 +74,10 @@ class PrefillStats:
                 running_reqs, enable_priority_scheduling
             ),
             num_new_seqs=len(adder.can_run_list),
+            num_prefill_only_reqs=len(prefill_only_reqs),
+            num_prefill_only_tokens=sum(
+                len(r.origin_input_ids) for r in prefill_only_reqs
+            ),
         )
 
 
@@ -432,6 +439,11 @@ class SchedulerMetricsMixin:
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
                 dp_cooperation_info=dp_cooperation_info,
             )
+            if prefill_stats.num_prefill_only_reqs > 0:
+                self.metrics_collector.increment_prefill_only_reqs(
+                    num_reqs=prefill_stats.num_prefill_only_reqs,
+                    num_tokens=prefill_stats.num_prefill_only_tokens,
+                )
             if self.enable_mfu_metrics:
                 flops, read_bytes, write_bytes = self._estimate_prefill_perf(
                     prefill_stats.log_input_tokens
