@@ -457,7 +457,7 @@ class Mistral3ForConditionalGeneration(nn.Module):
 
 
 class Mistral3CausalLM(nn.Module):
-    """CausalLM variant for PE (Prompt Enhancement).
+    """CausalLM variant for ERNIE-Image PE (Prompt Enhancement).
 
     Uses ``self.model = MistralModel(config)`` directly (NOT Mistral3Model)
     so that parameter names match the PE weight keys exactly::

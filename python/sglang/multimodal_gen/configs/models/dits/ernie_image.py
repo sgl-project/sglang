@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DiT architecture config for ErnieImage (Text2ImgDiT with Shared AdaLN)."""
 
 from dataclasses import dataclass, field
 from typing import Tuple
@@ -13,16 +12,6 @@ def _is_transformer_layer(n: str, m) -> bool:
 
 @dataclass
 class ErnieImageArchConfig(DiTArchConfig):
-    """Architecture config for ErnieImage DiT.
-
-    Single-stream DiT with Shared AdaLN, QK LayerNorm, 3D RoPE, Gated MLP.
-    Image and text tokens are concatenated into a single sequence.
-
-    Supports tensor parallelism: attention Q/K/V use ColumnParallelLinear,
-    output projection uses RowParallelLinear, MLP uses MergedColumnParallelLinear
-    for fused gate+up and RowParallelLinear for fc2.
-    """
-
     patch_size: int = 1
     in_channels: int = 128
     out_channels: int = 128
@@ -36,14 +25,8 @@ class ErnieImageArchConfig(DiTArchConfig):
     eps: float = 1e-6
     qk_layernorm: bool = True
 
-    # TP uses native ColumnParallel/RowParallel/MergedColumnParallel layers.
-    # Merging of gate_proj+up_proj into gate_up_proj is handled by param_names_mapping.
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 
-    # Merge gate_proj and up_proj checkpoint weights into gate_up_proj
-    # for MergedColumnParallelLinear.
-    # Attention weights (to_q/to_k/to_v/to_out.0/norm_q/norm_k) match the model
-    # module names directly — no remapping needed.
     param_names_mapping: dict = field(default_factory=lambda: {
         r"(.*)\.mlp\.gate_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 0, 2),
         r"(.*)\.mlp\.up_proj\.(.*)":   (r"\1.mlp.gate_up_proj.\2", 1, 2),

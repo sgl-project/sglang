@@ -870,7 +870,7 @@ def _register_configs():
         ],
     )
 
-    # ErnieImage (Text2ImgDiT)
+    # ErnieImage
     register_configs(
         sampling_param_cls=ErnieImageSamplingParams,
         pipeline_config_cls=ErnieImagePipelineConfig,

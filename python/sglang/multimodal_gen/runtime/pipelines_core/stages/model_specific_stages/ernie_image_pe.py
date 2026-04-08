@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prompt enhancement stage for ErnieImage pipeline.
-
-Uses a fine-tuned Ministral-3B causal LM (served via ``sglang.srt.Engine``)
-to rewrite short user prompts into richer visual descriptions before text
-encoding.
+"""
+Prompt enhancement stage for ErnieImage pipeline.
 """
 
 import json
@@ -19,15 +16,6 @@ logger = init_logger(__name__)
 
 
 class PromptEnhancementStage(PipelineStage):
-    """Stage that rewrites user prompts using a PE (prompt-enhancement) model.
-
-    The PE model is served by an ``sglang.srt.Engine`` instance, which
-    provides paged KV-cache, FlashInfer attention, CUDA graph replay,
-    and fused QKV projections for fast autoregressive generation.
-
-    This stage modifies ``batch.prompt`` in place so that the subsequent
-    TextEncodingStage encodes the enhanced text.
-    """
 
     def __init__(self, pe_model, pe_tokenizer):
         super().__init__()
@@ -79,7 +67,6 @@ class PromptEnhancementStage(PipelineStage):
         temperature: float = 0.6,
         top_p: float = 0.95,
     ) -> str:
-        """Use the PE model to rewrite a single prompt via chat template."""
         user_content = json.dumps(
             {"prompt": prompt, "width": width, "height": height},
             ensure_ascii=False,

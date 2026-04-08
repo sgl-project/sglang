@@ -19,12 +19,6 @@ logger = init_logger(__name__)
 
 
 class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
-    """Pipeline for ErnieImage text-to-image generation.
-
-    Uses a single-stream DiT with Shared AdaLN, Mistral3 text encoder,
-    and Flux2 VAE. Optionally enhances prompts via a PE (prompt-enhancement)
-    causal LM before text encoding.
-    """
 
     pipeline_name = "ErnieImagePipeline"
 
@@ -37,11 +31,6 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
     ]
 
     def _has_pe_in_model_index(self, server_args) -> bool:
-        """Check if the model declares a 'pe' component in model_index.json.
-
-        Uses maybe_download_model_index to correctly resolve both local paths
-        and remote HuggingFace model IDs (e.g. 'baidu/ERNIE-Image-Turbo').
-        """
         try:
             model_index = maybe_download_model_index(server_args.model_path)
             return "pe" in model_index and model_index["pe"] is not None
@@ -49,7 +38,6 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
             return False
 
     def load_modules(self, server_args, loaded_modules=None):
-        # Dynamically add "pe" to required modules if present in model_index.json
         if self._has_pe_in_model_index(server_args):
             if "pe" not in self._required_config_modules:
                 self._required_config_modules.insert(0, "pe")
@@ -59,7 +47,6 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
     def create_pipeline_stages(self, server_args):
         self.add_stage(InputValidationStage())
 
-        # Prompt enhancement stage (PE model rewrites short prompts)
         pe_model = self.get_module("pe")
         if pe_model is not None:
             pe_tokenizer = getattr(pe_model, "pe_tokenizer", None)

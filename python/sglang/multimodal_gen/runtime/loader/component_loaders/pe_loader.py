@@ -1,13 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
-"""Loader for prompt enhancement (PE) causal language model.
-
-Loads a Ministral-3B causal LM via ``AutoModelForCausalLM`` with
-**Flash Attention 2** (fused attention kernel, ~2x faster than SDPA).
-
-Note: ``srt.Engine`` cannot be used here because the multimodal_gen
-pipeline runs inside a daemon subprocess, and daemon processes are not
-allowed to spawn children (which Engine requires).
-"""
+# Copyright 2025 Baidu ERNIE-Image Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -22,12 +25,6 @@ logger = init_logger(__name__)
 
 
 class PEModelWrapper:
-    """Wraps an ``AutoModelForCausalLM`` + tokenizer for use by
-    :class:`PromptEnhancementStage`.
-
-    The wrapper provides the same ``.generate()`` / ``.pe_tokenizer``
-    interface that ``PromptEnhancementStage`` expects.
-    """
 
     def __init__(self, model, tokenizer, device):
         self.model = model
@@ -35,16 +32,6 @@ class PEModelWrapper:
         self.device = device
 
     def generate(self, prompt: str, sampling_params: dict) -> dict:
-        """Generate text using the HuggingFace model.
-
-        Args:
-            prompt: Already-formatted input text (chat template applied).
-            sampling_params: Dict with ``max_new_tokens``, ``temperature``,
-                ``top_p``, etc.
-
-        Returns:
-            Dict with a ``"text"`` key containing the generated text.
-        """
         inputs = self.pe_tokenizer(
             prompt, return_tensors="pt", truncation=True, max_length=2048
         ).to(self.device)
