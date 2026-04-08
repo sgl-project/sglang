@@ -20,7 +20,7 @@ segments. All segments share the same memory pool for cross-segment reuse.
 
 import logging
 from contextvars import ContextVar
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional
 
 import torch
 
