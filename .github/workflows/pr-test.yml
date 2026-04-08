@@ -1162,7 +1162,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 8-gpu-h200
+    runs-on: 8-gpu-h200-deepep
     timeout-minutes: 240
     steps:
       - name: Checkout code
