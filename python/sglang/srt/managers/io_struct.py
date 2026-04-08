@@ -139,11 +139,9 @@ class GenerateReqInput(BaseReq):
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # Embedding overrides to place at specific token positions.
-    # - Single example: PositionalEmbeds
-    # - Batch: List[Optional[PositionalEmbeds]]
-    positional_embed_overrides: Optional[
-        Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
-    ] = None
+    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
+    positional_embed_overrides: Any = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -818,11 +816,12 @@ class EmbeddingReqInput(BaseReq):
     # Position resolution happens in the tokenizer manager after tokenization.
     # Shape: [num_inputs][num_replacements] where each entry is a torch.Tensor of [hidden_size].
     # Per-input entry may be None when only some inputs in a batch need overrides.
-    embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None
+    # Runtime type: Optional[List[Optional[List[torch.Tensor]]]]
+    # Typed as Any to avoid Pydantic/FastAPI schema errors (contains torch.Tensor).
+    embed_overrides: Any = None
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
-    positional_embed_overrides: Optional[
-        Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]
-    ] = None
+    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    positional_embed_overrides: Any = None
     # Dummy sampling params for compatibility
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Dummy input embeds for compatibility
