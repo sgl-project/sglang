@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,6 +12,8 @@ from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
 
 
 def get_cell_size_per_token(mr: ModelRunner, num_layers: int) -> int:
@@ -82,3 +85,84 @@ def get_cell_size_per_token(mr: ModelRunner, num_layers: int) -> int:
                 (n * k * num_layers * 2 * kv_size) // scale_block_size
             )
     return cell_size
+
+
+def resolve_hybrid_swa_tokens(
+    token_capacity: int,
+    full_layers_num: int,
+    swa_layers_num: int,
+    page_size: int,
+    swa_full_tokens_ratio: float,
+    mr: ModelRunner,
+):
+    def align_page_size(x: int) -> int:
+        return (x // page_size) * page_size
+
+    if full_layers_num == 0:
+        # all layers are SWA
+        swa_tokens = align_page_size(token_capacity)
+        logger.info(
+            f"Use sliding window memory pool (all SWA). swa_layer_tokens={swa_tokens}"
+        )
+        return swa_tokens, 0, swa_tokens
+
+    # Use unified memory-based allocation for all hybrid SWA models.
+    #
+    # Let:
+    #   F = Full layer per-token memory
+    #   S = SWA layer per-token memory (may differ from F)
+    #   r = swa_full_tokens_ratio = swa_tokens / full_tokens
+    #
+    # The profile phase computed:
+    #   cell_size = F * n_full + S * n_swa
+    #   token_capacity = rest_memory / cell_size
+    #   => total_memory = token_capacity * (F * n_full + S * n_swa)
+    #
+    # We need to solve:
+    #   full_tokens * F * n_full + swa_tokens * S * n_swa = total_memory
+    #   swa_tokens = full_tokens * r
+    #
+    # Solution:
+    #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
+    #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
+
+    kv_cache_dtype = mr.kv_cache_dtype
+    model_config = mr.model_config
+
+    kv_size = torch._utils._element_size(kv_cache_dtype)
+
+    # Full layer per-token memory
+    full_per_token = (
+        model_config.get_num_kv_heads(get_attention_tp_size())
+        * (model_config.head_dim + model_config.v_head_dim)
+        * kv_size
+    )
+
+    # SWA layer per-token memory
+    swa_per_token = (
+        model_config.get_swa_num_kv_heads(get_attention_tp_size())
+        * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+        * kv_size
+    )
+
+    # Total memory available from profile
+    total_memory = token_capacity * (
+        full_per_token * full_layers_num + swa_per_token * swa_layers_num
+    )
+
+    # Solve the equations
+    denominator = (
+        full_per_token * full_layers_num
+        + swa_full_tokens_ratio * swa_per_token * swa_layers_num
+    )
+    assert (
+        denominator > 0
+    ), f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
+
+    full_tokens = align_page_size(int(total_memory / denominator))
+    swa_tokens = align_page_size(int(full_tokens * swa_full_tokens_ratio))
+
+    logger.info(
+        f"Use sliding window memory pool. full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
+    )
+    return full_tokens, full_tokens, swa_tokens

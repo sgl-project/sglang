@@ -253,76 +253,16 @@ class ModelRunnerKVCacheMixin:
 
         assert swa_layers_num > 0, "Hybrid SWA model must have at least one SWA layer"
 
-        def align_page_size(x: int) -> int:
-            return (x // page_size) * page_size
+        from sglang.srt.model_executor.memory_profiler import resolve_hybrid_swa_tokens
 
-        if full_layers_num == 0:
-            # all layers are SWA
-            swa_tokens = align_page_size(token_capacity)
-            logger.info(
-                f"Use sliding window memory pool (all SWA). swa_layer_tokens={swa_tokens}"
-            )
-            return swa_tokens, 0, swa_tokens
-
-        swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
-
-        # Use unified memory-based allocation for all hybrid SWA models.
-        #
-        # Let:
-        #   F = Full layer per-token memory
-        #   S = SWA layer per-token memory (may differ from F)
-        #   r = swa_full_tokens_ratio = swa_tokens / full_tokens
-        #
-        # The profile phase computed:
-        #   cell_size = F * n_full + S * n_swa
-        #   token_capacity = rest_memory / cell_size
-        #   => total_memory = token_capacity * (F * n_full + S * n_swa)
-        #
-        # We need to solve:
-        #   full_tokens * F * n_full + swa_tokens * S * n_swa = total_memory
-        #   swa_tokens = full_tokens * r
-        #
-        # Solution:
-        #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
-        #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
-
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
-
-        # Full layer per-token memory
-        full_per_token = (
-            self.model_config.get_num_kv_heads(get_attention_tp_size())
-            * (self.model_config.head_dim + self.model_config.v_head_dim)
-            * kv_size
+        return resolve_hybrid_swa_tokens(
+            token_capacity,
+            full_layers_num,
+            swa_layers_num,
+            page_size,
+            self.server_args.swa_full_tokens_ratio,
+            self,
         )
-
-        # SWA layer per-token memory
-        swa_per_token = (
-            self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
-            * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
-            * kv_size
-        )
-
-        # Total memory available from profile
-        total_memory = token_capacity * (
-            full_per_token * full_layers_num + swa_per_token * swa_layers_num
-        )
-
-        # Solve the equations
-        denominator = (
-            full_per_token * full_layers_num
-            + swa_full_tokens_ratio * swa_per_token * swa_layers_num
-        )
-        assert (
-            denominator > 0
-        ), f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
-
-        full_tokens = align_page_size(int(total_memory / denominator))
-        swa_tokens = align_page_size(int(full_tokens * swa_full_tokens_ratio))
-
-        logger.info(
-            f"Use sliding window memory pool. full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
-        )
-        return full_tokens, full_tokens, swa_tokens
 
     def _calculate_mamba_ratio(self: ModelRunner) -> int:
         if self.server_args.disable_radix_cache:
