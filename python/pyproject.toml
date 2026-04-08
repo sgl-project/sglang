@@ -77,6 +77,7 @@ dependencies = [
   "watchfiles",
   "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
+  "kernels",
 ]
 
 [[tool.uv.index]]
@@ -207,3 +208,6 @@ version_file = "sglang/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
+
+[tool.kernels.dependencies]
+"kernels-community/sgl-flash-attn3" = 1
