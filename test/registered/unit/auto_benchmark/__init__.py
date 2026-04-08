@@ -1,7 +1,6 @@
 import json
-import sys
 import tempfile
-import types
+import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -10,10 +9,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-sys.modules.setdefault("zmq", types.SimpleNamespace())
-
 from sglang.auto_benchmark_lib import build_candidates, build_server_candidates
-from sglang.test.test_utils import CustomTestCase
 
 
 def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
@@ -39,7 +35,7 @@ def create_lightweight_tokenizer() -> PreTrainedTokenizerFast:
     return hf_tokenizer
 
 
-class AutoBenchmarkTestCase(CustomTestCase):
+class AutoBenchmarkTestCase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.tmpdir_path = Path(self.tmpdir.name)
