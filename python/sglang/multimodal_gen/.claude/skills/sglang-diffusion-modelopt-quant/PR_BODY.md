@@ -149,6 +149,11 @@ Observed H100 smoke numbers:
 - Images:
   - `/Users/bbuf/Desktop/flux2_h100_2gpu_20260408/flux2_bf16.png`
   - `/Users/bbuf/Desktop/flux2_h100_2gpu_20260408/flux2_fp8.png`
+- Reduced-smoke trajectory outputs:
+  - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/flux2_outputs/reference/A_futuristic_cyberpunk_city_at_night_neon_lights_reflecting_on_wet_streets_20260408-111716_771f10f5.png`
+  - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/flux2_outputs/candidate/A_futuristic_cyberpunk_city_at_night_neon_lights_reflecting_on_wet_streets_20260408-111830_4330a9c1.png`
+- Trajectory summary:
+  - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/flux2_similarity.json`
 - Perf:
   - `/Users/bbuf/Desktop/flux2_h100_2gpu_20260408/bf16_perf.json`
   - `/Users/bbuf/Desktop/flux2_h100_2gpu_20260408/fp8_perf.json`
@@ -161,6 +166,11 @@ Observed H100 smoke numbers:
 - Full-run videos:
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/wan22/bf16_nocompile/wan22_bf16_nocompile.mp4`
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/wan22/fp8_nocompile/wan22_fp8_nocompile.mp4`
+- Reduced-smoke trajectory outputs:
+  - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/wan22_outputs/reference/A_cat_and_a_dog_baking_a_cake_together_in_a_kitchen._20260408-112053_71432b1d.mp4`
+  - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/wan22_outputs/candidate/A_cat_and_a_dog_baking_a_cake_together_in_a_kitchen._20260408-112216_8a6dc947.mp4`
+- Trajectory summary:
+  - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/accuracy_smoke/wan22_similarity.json`
 - Perf:
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/wan22/bf16_nocompile/perf.json`
   - `/Users/bbuf/Desktop/modelopt_nightly_rerun_20260408/wan22/fp8_nocompile/perf.json`
@@ -178,7 +188,7 @@ Remote H100 validation:
 - `PYTHONPATH=python /tmp/bench_venv/bin/python3 -m pytest -q python/sglang/multimodal_gen/test/unit/test_compare_diffusion_trajectory_similarity.py python/sglang/multimodal_gen/test/unit/test_convert_modelopt_fp8_checkpoint.py python/sglang/multimodal_gen/test/unit/test_diffusion_modelopt_quant.py`
 
 Current observed result:
-- `14 passed` for the combined remote quant/accuracy unit-test set
+- `16 passed` for the combined remote quant/accuracy unit-test set
 
 ## Known Limitations
 
