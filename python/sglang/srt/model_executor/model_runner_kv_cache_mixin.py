@@ -820,6 +820,14 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
+            if self.enable_hisparse:
+                assert (
+                    self.token_to_kv_pool_allocator.__class__
+                    == HiSparseTokenToKVPoolAllocator
+                )
+                self.token_to_kv_pool.full_to_hisparse_device_index_mapping = (
+                    self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+                )
 
     def _resolve_token_capacity(self: ModelRunner, profiled_tokens: int) -> int:
         """Compute final token pool capacity from profiled value,

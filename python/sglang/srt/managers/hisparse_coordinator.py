@@ -15,10 +15,22 @@ from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.jit_kernel.hisparse import (
+    prepare_swap_mla,
+    execute_h2d_copy_mla,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
+
+
+class SwapResult(NamedTuple):
+    top_k_device_locs: torch.Tensor
+    hit_device_locs: torch.Tensor
+    miss_device_locs: torch.Tensor
+    hit_count: torch.Tensor
+    miss_src_locs: torch.Tensor
+    miss_dst_locs: torch.Tensor
 
 
 class HiSparseAct(NamedTuple):
@@ -117,6 +129,27 @@ class HiSparseCoordinator:
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
+
+        # --- Dual-attention overlap buffers ---
+        self.transfer_stream = device_module.Stream()
+        self.h2d_start_event = device_module.Event()
+        self.h2d_finish_event = device_module.Event()
+
+        self.hit_device_locs_buffer = torch.full(
+            (max_num_reqs, self.top_k), -1, dtype=torch.int32, device=device
+        )
+        self.miss_device_locs_buffer = torch.full(
+            (max_num_reqs, self.top_k), -1, dtype=torch.int32, device=device
+        )
+        self.hit_count_buffer = torch.empty(
+            (max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.miss_src_locs_buffer = torch.empty(
+            (max_num_reqs, self.top_k), dtype=torch.int64, device=device
+        )
+        self.miss_dst_locs_buffer = torch.empty(
+            (max_num_reqs, self.top_k), dtype=torch.int64, device=device
+        )
 
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
@@ -605,9 +638,14 @@ class HiSparseCoordinator:
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
         ]
-        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
-            allocated_locs
-        ] = 0
+        # Only clear the mapping when alloc_device_buffer was actually called
+        # (current_cap > 0).  When current_cap == 0 the mapping still holds valid
+        # hisparse indices that will be freed by the subsequent release_kv_cache →
+        # cache_finished_req → free() → free_hisparse() path.
+        if current_cap > 0:
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+                allocated_locs
+            ] = 0
 
         host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
         host_indices = host_indices[host_indices >= 0]
@@ -628,8 +666,13 @@ class HiSparseCoordinator:
         seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
-    ) -> torch.Tensor:
-        """Swap selected top-k tokens into device memory and return their indices."""
+    ):
+        """Classify hit/miss, update LRU, assign slots. H2D copy is NOT done here.
+
+        Returns:
+            (top_k_device_locs, hit_device_locs, miss_device_locs,
+             hit_count, miss_src_locs, miss_dst_locs)
+        """
         # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32 or int64.
         if req_pool_indices.dtype != torch.int64:
             raise ValueError(
@@ -647,16 +690,26 @@ class HiSparseCoordinator:
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
-        # todo, adjustable for performance
+        hit_locs = self.hit_device_locs_buffer[:num_reqs]
+        hit_locs.fill_(-1)
+        miss_locs = self.miss_device_locs_buffer[:num_reqs]
+        miss_locs.fill_(-1)
+        hit_count = self.hit_count_buffer[:num_reqs]
+        miss_src = self.miss_src_locs_buffer[:num_reqs]
+        miss_dst = self.miss_dst_locs_buffer[:num_reqs]
+
         block_size = 1024
-        load_cache_to_device_buffer_mla(
+        prepare_swap_mla(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
             host_cache_locs=self.req_to_host_pool,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
             top_k_device_locs=top_k_indices,
+            hit_device_locs=hit_locs,
+            miss_device_locs=miss_locs,
+            hit_count=hit_count,
+            miss_src_locs=miss_src,
+            miss_dst_locs=miss_dst,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             lru_slots=self.lru_slots[layer_id],
@@ -667,4 +720,55 @@ class HiSparseCoordinator:
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
         )
-        return top_k_indices
+        return SwapResult(top_k_indices, hit_locs, miss_locs, hit_count, miss_src, miss_dst)
+
+    def execute_h2d_async(
+        self,
+        miss_src_locs: torch.Tensor,
+        miss_dst_locs: torch.Tensor,
+        hit_count: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        """Launch H2D copy on the transfer stream. Non-blocking."""
+        self.h2d_start_event.record()
+        self.transfer_stream.wait_event(self.h2d_start_event)
+
+        with device_module.stream(self.transfer_stream):
+            execute_h2d_copy_mla(
+                miss_src_locs=miss_src_locs,
+                miss_dst_locs=miss_dst_locs,
+                hit_count=hit_count,
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                item_size_bytes=self.mem_pool_host.token_stride_size,
+                num_top_k=self.top_k,
+                hot_buffer_size=self.device_buffer_size,
+                block_size=1024,
+                num_real_reqs=self.num_real_reqs,
+            )
+        self.h2d_finish_event.record(self.transfer_stream)
+
+    def execute_h2d_sync(
+        self,
+        miss_src_locs: torch.Tensor,
+        miss_dst_locs: torch.Tensor,
+        hit_count: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        """Synchronous H2D copy on the current stream. Used by non-dual-attention backends."""
+        execute_h2d_copy_mla(
+            miss_src_locs=miss_src_locs,
+            miss_dst_locs=miss_dst_locs,
+            hit_count=hit_count,
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            item_size_bytes=self.mem_pool_host.token_stride_size,
+            num_top_k=self.top_k,
+            hot_buffer_size=self.device_buffer_size,
+            block_size=1024,
+            num_real_reqs=self.num_real_reqs,
+        )
+
+    def wait_h2d(self) -> None:
+        """Block current stream until H2D transfer completes."""
+        device_module.current_stream().wait_event(self.h2d_finish_event)

@@ -1535,12 +1535,40 @@ class NativeSparseAttnBackend(
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
         if forward_batch.hisparse_coordinator is not None:
-            page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
+            coord = forward_batch.hisparse_coordinator
+            (
+                page_table_1,
+                hit_device_locs,
+                miss_device_locs,
+                hit_count,
+                miss_src_locs,
+                miss_dst_locs,
+            ) = coord.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 topk_indices,
                 layer.layer_id,
             )
+            if self.nsa_decode_impl == "flashmla_kv":
+                # Dual-attention: async H2D overlaps hit-attention
+                coord.execute_h2d_async(miss_src_locs, miss_dst_locs, hit_count, layer.layer_id)
+
+                if q_rope is not None:
+                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                return self._forward_flashmla_sparse_dual(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    hit_device_locs=hit_device_locs,
+                    miss_device_locs=miss_device_locs,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    hisparse_coordinator=coord,
+                    layer=layer,
+                    metadata=metadata,
+                )
+            else:
+                # Non-dual backends: synchronous H2D before attention
+                coord.execute_h2d_sync(miss_src_locs, miss_dst_locs, hit_count, layer.layer_id)
         elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
@@ -1699,6 +1727,75 @@ class NativeSparseAttnBackend(
             o = o[:, :num_heads, :]
 
         return o
+
+    def _forward_flashmla_sparse_dual(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        hit_device_locs: torch.Tensor,
+        miss_device_locs: torch.Tensor,
+        sm_scale: float,
+        v_head_dim: int,
+        hisparse_coordinator,
+        layer,
+        metadata: "NSAMetadata",
+    ) -> torch.Tensor:
+        """Dual-attention: hit attn overlaps H2D, then miss attn, then combine."""
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+        from sglang.srt.layers.attention.merge_state import merge_state
+
+        num_tokens = q_all.shape[0]
+
+        q = q_all.view(num_tokens, 1, layer.tp_q_head_num, layer.head_dim)
+        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+
+        if not self.nsa_kv_cache_store_fp8:
+            kv_cache = quantize_k_cache(kv_cache)
+
+        cache_seqlens = metadata.nsa_cache_seqlens_int32
+        tile_meta = metadata.flashmla_metadata.flashmla_metadata
+        num_splits = metadata.flashmla_metadata.num_splits
+        block_table = torch.empty(
+            (num_tokens, 0), dtype=torch.int32, device=q.device
+        )
+
+        # Hit attention (overlaps with H2D on transfer stream)
+        hit_indices = hit_device_locs.unsqueeze(1)  # (num_reqs, 1, topk)
+        o_hit, lse_hit = flash_mla_with_kvcache(
+            q=q, k_cache=kv_cache,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=v_head_dim,
+            tile_scheduler_metadata=tile_meta,
+            num_splits=num_splits,
+            softmax_scale=sm_scale,
+            block_table=block_table,
+            is_fp8_kvcache=True,
+            indices=hit_indices,
+        )
+
+        hisparse_coordinator.wait_h2d()
+
+        # Miss attention: -1 indices → lse=-inf, merge_state gives zero weight
+        miss_indices = miss_device_locs.unsqueeze(1)  # (num_reqs, 1, topk)
+        o_miss, lse_miss = flash_mla_with_kvcache(
+            q=q, k_cache=kv_cache,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=v_head_dim,
+            tile_scheduler_metadata=tile_meta,
+            num_splits=num_splits,
+            softmax_scale=sm_scale,
+            block_table=block_table,
+            is_fp8_kvcache=True,
+            indices=miss_indices,
+        )
+
+        # flash_mla_with_kvcache returns natural-log lse; merge_state expects the same
+        o, _ = merge_state(
+            o_hit.squeeze(1), lse_hit.squeeze(-1),
+            o_miss.squeeze(1), lse_miss.squeeze(-1),
+        )
+        # Restore seq_len_q dim to match _forward_flashmla_kv output shape
+        return o.unsqueeze(1)
 
     def _forward_flashmla_kv(
         self,
