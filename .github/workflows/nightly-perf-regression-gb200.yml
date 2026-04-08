@@ -17,7 +17,7 @@ concurrency:
 
 env:
   SGLANG_IS_IN_CI: true
-  SRT_SLURM_BRANCH: test-dynamo-1.0.0
+  SRT_SLURM_BRANCH: sync-from-origin-v2
   SLURM_PARTITION: batch
   SLURM_ACCOUNT: sglang
 
