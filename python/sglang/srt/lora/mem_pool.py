@@ -15,8 +15,10 @@ from sglang.srt.lora.utils import (
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
+    get_hidden_size,
     get_lm_head_lora_b_shard_size,
     get_normalized_target_modules,
+    get_num_layers,
     get_stacked_multiply,
     get_target_module_name,
 )
@@ -63,7 +65,7 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
-        self.num_layer: int = base_hf_config.num_hidden_layers
+        self.num_layer: int = get_num_layers(base_hf_config)
         self.max_loras_per_batch: int = max_loras_per_batch
         self.dtype: torch.dtype = dtype
         self.tp_size: int = tp_size
@@ -90,7 +92,7 @@ class LoRAMemoryPool:
         self.lm_head_B_buffer: Dict[str, torch.Tensor] = {}
         self.new_embeddings_buffer: Dict[str, torch.Tensor] = {}
 
-        self.embedding_dim: int = self.base_hf_config.hidden_size
+        self.embedding_dim: int = get_hidden_size(base_hf_config)
 
         # Lora uid -> buffer idx in memory pool
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}

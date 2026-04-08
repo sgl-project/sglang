@@ -54,6 +54,44 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
+def get_num_layers(config: AutoConfig):
+    # Standard HF models
+    num_layers = getattr(config, "num_hidden_layers", None)
+    if num_layers is not None:
+        return num_layers
+
+    # multimodal models (like Qwen3_5_30B)
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        num_layers = getattr(text_config, "num_hidden_layers", None)
+        if num_layers is not None:
+            return num_layers
+
+    raise AttributeError(
+        "num_hidden_layers not found in base_hf_config or text_config. "
+        "Model architecture may not be supported."
+    )
+
+
+def get_hidden_size(config: AutoConfig):
+    # Standard HF models
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is not None:
+        return hidden_size
+
+    # multimodal models (like Qwen3_5_30B)
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        hidden_size = getattr(text_config, "hidden_size", None)
+        if hidden_size is not None:
+            return hidden_size
+
+    raise AttributeError(
+        "hidden_size not found in base_hf_config or text_config. "
+        "Model architecture may not be supported."
+    )
+
+
 def get_hidden_dim(
     module_name: str,
     config: AutoConfig,
@@ -75,6 +113,10 @@ def get_hidden_dim(
         Please implement the function in the model class if it is not.
         You can reference this function in llama.py.
         """
+        # Resolve primary config for multimodal models (e.g. Qwen 3.5 Moe)
+        if hasattr(config, "text_config") and config.text_config is not None:
+            config = config.text_config
+
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )

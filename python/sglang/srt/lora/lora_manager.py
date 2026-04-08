@@ -38,6 +38,7 @@ from sglang.srt.lora.utils import (
     LoRAType,
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
+    get_num_layers,
     get_target_module_name,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
@@ -692,8 +693,9 @@ class LoRAManager:
 
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
+        num_layers = get_num_layers(self.base_hf_config)
         self.lora_modules: List[Dict[str, BaseLayerWithLoRA]] = [
-            {} for _ in range(self.base_hf_config.num_hidden_layers)
+            {} for _ in range(num_layers)
         ]
 
         self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
