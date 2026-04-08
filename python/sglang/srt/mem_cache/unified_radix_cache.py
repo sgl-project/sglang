@@ -217,6 +217,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.components: dict[ComponentType, TreeComponent] = {
             ct: COMPONENT_REGISTRY[ct](self, params) for ct in self.tree_components
         }
+        self._components_tuple: tuple[TreeComponent, ...] = tuple(
+            self.components.values()
+        )
         if self.is_eagle:
             self.key_convert_fn = convert_to_bigram_key
         else:
@@ -275,7 +278,7 @@ class UnifiedRadixCache(BasePrefixCache):
         start_time = time.perf_counter()
         tracker = {ct: 0 for ct in self.tree_components}
 
-        for component in self.components.values():
+        for component in self._components_tuple:
             component.drive_eviction(params=params, tracker=tracker)
 
         self.update_eviction_metrics(sum(tracker.values()), start_time)
@@ -289,7 +292,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return IncLockRefResult()
         result = IncLockRefResult()
-        for component in self.components.values():
+        for component in self._components_tuple:
             result = component.acquire_component_lock(node=node, result=result)
         return result
 
@@ -298,7 +301,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> DecLockRefResult:
         if self.disable:
             return DecLockRefResult()
-        for component in self.components.values():
+        for component in self._components_tuple:
             component.release_component_lock(node=node, params=params)
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
@@ -311,7 +314,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            for comp in self.components.values():
+            for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
@@ -328,7 +331,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
-            for comp in self.components.values():
+            for comp in self._components_tuple:
                 cl = comp.prepare_for_caching_req(
                     req=req,
                     insert_params=insert_params,
@@ -367,7 +370,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # cleanup
-        for comp in self.components.values():
+        for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
@@ -389,7 +392,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(prev_prefix_len=req.cache_protected_len)
         effective_cache_len = len(token_ids)
-        for comp in self.components.values():
+        for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
                 req=req,
                 insert_params=insert_params,
@@ -401,7 +404,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
-            for comp in self.components.values():
+            for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
                     req, is_finished=False, insert_params=insert_params
                 )
@@ -454,7 +457,7 @@ class UnifiedRadixCache(BasePrefixCache):
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
 
         # cleanup
-        for comp in self.components.values():
+        for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req,
                 is_finished=False,
@@ -476,14 +479,13 @@ class UnifiedRadixCache(BasePrefixCache):
         value: list[torch.Tensor] = []
         best_value_len = 0
         best_node = node
-        validators = {
-            ct: component.create_match_validator()
-            for ct, component in self.components.items()
-        }
+        validators = tuple(
+            comp.create_match_validator() for comp in self._components_tuple
+        )
 
         def _update_best_if_valid(node):
             nonlocal best_value_len, best_node
-            if all(validators[ct](node) for ct in self.components):
+            if all(v(node) for v in validators):
                 best_value_len = len(value)
                 best_node = node
 
@@ -509,14 +511,13 @@ class UnifiedRadixCache(BasePrefixCache):
         value: list[torch.Tensor] = []
         best_value_len = 0
         best_node = node
-        validators = {
-            ct: component.create_match_validator()
-            for ct, component in self.components.items()
-        }
+        validators = tuple(
+            comp.create_match_validator() for comp in self._components_tuple
+        )
 
         def _update_best_if_valid(node):
             nonlocal best_value_len, best_node
-            if all(validators[ct](node) for ct in self.components):
+            if all(v(node) for v in validators):
                 best_value_len = len(value)
                 best_node = node
 
@@ -544,9 +545,9 @@ class UnifiedRadixCache(BasePrefixCache):
         best_value_len: int,
     ) -> MatchResult:
         node_update = last_node
-        for ct, component in self.components.items():
-            self.lru_lists[ct].reset_node_and_parents_mru(
-                node_update, self.root_node, component.node_has_component_data
+        for comp in self._components_tuple:
+            self.lru_lists[comp.component_type].reset_node_and_parents_mru(
+                node_update, self.root_node, comp.node_has_component_data
             )
         cur_time = get_and_increase_time_counter()
         while node_update:
@@ -564,7 +565,7 @@ class UnifiedRadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-        for component in self.components.values():
+        for component in self._components_tuple:
             result = component.finalize_match_result(
                 result=result,
                 params=params,
@@ -592,7 +593,7 @@ class UnifiedRadixCache(BasePrefixCache):
             child.component_data[BASE_COMPONENT_TYPE].value[split_len:].clone()
         )
 
-        for component in self.components.values():
+        for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
@@ -644,7 +645,7 @@ class UnifiedRadixCache(BasePrefixCache):
             value_slice = value[:prefix_len]
             consumed_from = prefix_len
             # Let each component claim ownership of overlapping KV slots
-            for component in self.components.values():
+            for component in self._components_tuple:
                 comp_consumed_from = component.update_component_on_insert_overlap(
                     node=node,
                     prefix_len=prefix_len,
@@ -675,7 +676,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     key_len=len(key),
                     params=params,
                 )
-                for comp in self.components.values()
+                for comp in self._components_tuple
             ):
                 # TODO: When leaf creation is skipped, We should release all component
                 # resources here or propagate a flag so that
@@ -690,7 +691,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
         result = InsertResult(prefix_len=total_prefix_length)
-        for component in self.components.values():
+        for component in self._components_tuple:
             component.commit_insert_component_data(
                 node=target_node,
                 is_new_leaf=is_new_leaf,
@@ -714,7 +715,7 @@ class UnifiedRadixCache(BasePrefixCache):
         is_leaf = len(node.children) == 0
         trigger_priority = trigger.eviction_priority(is_leaf)
 
-        for comp in self.components.values():
+        for comp in self._components_tuple:
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node):
                     assert node.component_data[comp.component_type].lock_ref == 0
@@ -775,8 +776,8 @@ class UnifiedRadixCache(BasePrefixCache):
             cur = cur.parent
 
     def _for_each_component_lru(self, node: UnifiedTreeNode, lru_op):
-        for ct, component in self.components.items():
-            if component.node_has_component_data(node):
+        for ct in self.tree_components:
+            if node.component_data[ct].value is not None:
                 lru_op(self.lru_lists[ct], node)
 
     # ---- Query / Inspection APIs ----
