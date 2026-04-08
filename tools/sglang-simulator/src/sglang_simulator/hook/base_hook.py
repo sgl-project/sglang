@@ -27,9 +27,9 @@ def _register_hooks(HOOKS: List[BaseHook], hooks: Union[List[BaseHook], BaseHook
             if not issubclass(hook, BaseHook):
                 raise TypeError("The hook should inherit from BaseHook.")
             HOOKS.append(hook)
-    elif issubclass(hooks, BaseHook):
+    elif isinstance(hooks, type) and issubclass(hooks, BaseHook):
         HOOKS.append(hooks)
     else:
-        logger.error(
+        raise TypeError(
             "The type of registered hook should be a list of BaseHook or a single BaseHook."
         )

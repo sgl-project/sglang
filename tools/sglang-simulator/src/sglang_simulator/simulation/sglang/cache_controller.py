@@ -1,4 +1,5 @@
 from queue import Empty
+from typing import Optional
 
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
@@ -9,9 +10,9 @@ class C_HiCacheController(BaseHook):
     HOOK_CLASS_NAME = "HiCacheController"
     HOOK_MODULE_NAME = "sglang.srt.managers.cache_controller"
 
-    KV_CACHE_BYTES: int = None
-    DISK_READ_BANDWIDTH_BYTES: float = None
-    DISK_WRITE_BANDWIDTH_BYTES: float = None
+    KV_CACHE_BYTES: Optional[int] = None
+    DISK_READ_BANDWIDTH_BYTES: Optional[float] = None
+    DISK_WRITE_BANDWIDTH_BYTES: Optional[float] = None
 
     @staticmethod
     def calc_prefetch_pages(

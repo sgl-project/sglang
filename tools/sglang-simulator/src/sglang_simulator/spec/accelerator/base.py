@@ -93,8 +93,8 @@ class AcceleratorInfo:
             value = self.find_by_hw_name(value)
 
         if isinstance(value, AcceleratorInfo):
-            return _acc_alias.get(
-                value.device_name, value.device_name
-            ) == _acc_alias.get(self.device_name, self.device_name)
+            return _acc_alias.get(value.name, value.name.upper()) == _acc_alias.get(
+                self.name, self.name.upper()
+            )
 
         return False

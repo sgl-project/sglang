@@ -34,7 +34,11 @@ class HookLoader(importlib.abc.Loader):
                 resource = parts[-1] + ".py"
 
                 try:
-                    module_code = importlib.resources.read_text(package, resource)
+                    module_code = (
+                        importlib.resources.files(package)
+                        .joinpath(resource)
+                        .read_text()
+                    )
                     exec(module_code, module.__dict__)
                     logger.debug(
                         f"Hooking Module: {hook.__name__} into {module.__name__}"

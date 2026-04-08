@@ -45,7 +45,7 @@ sglang_simulator_hook.install_class_hooks(
 
 
 SGLANG_SIMULATOR_OUTPUT_DIR = "/tmp/sglang_simulator/output"
-HISIM_METRICS_PATH = f"{SGLANG_SIMULATOR_OUTPUT_DIR}/metrics.json"
+SIMULATION_METRICS_PATH = f"{SGLANG_SIMULATOR_OUTPUT_DIR}/metrics.json"
 os.environ["SGLANG_SIMULATOR_OUTPUT_DIR"] = SGLANG_SIMULATOR_OUTPUT_DIR
 
 if os.getenv("HISIM_SIMULATION_MODE") is None:
@@ -66,8 +66,6 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
         server_args.disable_cuda_graph = True
         self.server_args = server_args
         self.engine = Engine(**asdict(server_args))
-
-        self._tokenizer: AutoTokenizer = None
 
     def flush_cache(self):
         self.engine.flush_cache()
@@ -103,8 +101,8 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
     ):
         await self.engine.tokenizer_manager.start_profile(profile_prefix="reset")
 
-        if os.path.exists(HISIM_METRICS_PATH):
-            with open(HISIM_METRICS_PATH, "w") as f:
+        if os.path.exists(SIMULATION_METRICS_PATH):
+            with open(SIMULATION_METRICS_PATH, "w") as f:
                 # clear data
                 pass
 
@@ -136,12 +134,12 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
         # dump result
         await self.engine.tokenizer_manager.start_profile()
 
-        if os.path.exists(HISIM_METRICS_PATH):
-            with open(HISIM_METRICS_PATH, "r") as f:
-                metrics = json.loads(f.readline())
+        if os.path.exists(SIMULATION_METRICS_PATH):
+            with open(SIMULATION_METRICS_PATH, "r") as f:
+                metrics = json.load(f)
         else:
             logger.error(
-                f"Failed to load metrics from serving backend. The metrics file should be loaded from {HISIM_METRICS_PATH}."
+                f"Failed to load metrics from serving backend. The metrics file should be loaded from {SIMULATION_METRICS_PATH}."
             )
             return None
 

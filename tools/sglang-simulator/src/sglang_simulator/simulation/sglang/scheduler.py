@@ -296,13 +296,11 @@ class C_SchedulerHook(BaseHook):
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
-                        now = time.time()
                         time.sleep(abs(predicted_latency))
                         now = time.time()
                         forward_latency = now - C_SchedulerHook.LAST_CPU_TS
                         C_SchedulerHook.LAST_CPU_TS = now
                     else:
-                        now = time.time()
                         forward_latency = predicted_latency
 
                     StateManager.set_current_inference_dur(forward_latency)

@@ -1,7 +1,7 @@
 import logging
 
 
-def get_logger(name: str = "sgl_simulator") -> logging.Logger:
+def get_logger(name: str = "sglang_simulator") -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
         logger.setLevel(logging.INFO)

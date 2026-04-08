@@ -42,7 +42,7 @@ def install_aiohttp_json_hijack(
     _ORIG_AIOHTTP_REQUEST = aiohttp.ClientSession._request
 
     async def _patched_request(self, method, url, **kwargs):
-        if pattern.search(url):
+        if pattern is not None and pattern.search(url):
             payload = kwargs.get("json", None)
             if isinstance(payload, dict) and "simulation" in payload:
                 if "sampling_params" not in payload:
@@ -160,7 +160,7 @@ original_run_benchmark = bench_serving.run_benchmark
 
 def wrapped_run_benchmark(args_: argparse.Namespace):
     # The profile API has been hooked and is used as a trigger to start or stop the simulation.
-    args.profile = True
+    args_.profile = True
     return original_run_benchmark(args_)
 
 
