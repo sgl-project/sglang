@@ -624,39 +624,48 @@ class LTX2AVDenoisingStage(DenoisingStage):
 
                         batch_size = int(latent_model_input.shape[0])
                         video_num_tokens = int(latent_model_input.shape[1])
+                        is_ltx23_variant = is_ltx23_native_variant(
+                            server_args.pipeline_config.vae_config.arch_config
+                        )
                         timestep = t_device.expand(batch_size)
                         if do_ti2v and denoise_mask is not None:
                             timestep_video = timestep.unsqueeze(
                                 -1
                             ) * denoise_mask.squeeze(-1)
-                        else:
+                        elif is_ltx23_variant:
                             timestep_video = timestep.view(batch_size, 1).expand(
                                 batch_size, video_num_tokens
                             )
+                        else:
+                            timestep_video = timestep
 
-                        if audio_latent_model_input.ndim == 3:
+                        if is_ltx23_variant and audio_latent_model_input.ndim == 3:
                             audio_num_tokens = int(audio_latent_model_input.shape[1])
                             timestep_audio = timestep.view(batch_size, 1).expand(
                                 batch_size, audio_num_tokens
                             )
                         else:
                             timestep_audio = timestep
-                        timestep_scale_multiplier = float(
-                            getattr(current_model, "timestep_scale_multiplier", 1000)
-                        )
-                        prompt_timestep_video = (
-                            sigma.to(
-                                device=latent_model_input.device, dtype=torch.float32
+                        prompt_timestep_video = None
+                        prompt_timestep_audio = None
+                        if is_ltx23_variant:
+                            timestep_scale_multiplier = float(
+                                getattr(current_model, "timestep_scale_multiplier", 1000)
                             )
-                            * timestep_scale_multiplier
-                        ).expand(batch_size)
-                        prompt_timestep_audio = (
-                            sigma.to(
-                                device=audio_latent_model_input.device,
-                                dtype=torch.float32,
-                            )
-                            * timestep_scale_multiplier
-                        ).expand(batch_size)
+                            prompt_timestep_video = (
+                                sigma.to(
+                                    device=latent_model_input.device,
+                                    dtype=torch.float32,
+                                )
+                                * timestep_scale_multiplier
+                            ).expand(batch_size)
+                            prompt_timestep_audio = (
+                                sigma.to(
+                                    device=audio_latent_model_input.device,
+                                    dtype=torch.float32,
+                                )
+                                * timestep_scale_multiplier
+                            ).expand(batch_size)
 
                         use_official_cfg_path = stage1_guider_params is None
                         if use_official_cfg_path:
@@ -698,12 +707,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 timestep_audio = self._repeat_batch_dim(
                                     timestep_audio, cfg_batch_size
                                 )
-                                prompt_timestep_video = self._repeat_batch_dim(
-                                    prompt_timestep_video, cfg_batch_size
-                                )
-                                prompt_timestep_audio = self._repeat_batch_dim(
-                                    prompt_timestep_audio, cfg_batch_size
-                                )
+                                if prompt_timestep_video is not None:
+                                    prompt_timestep_video = self._repeat_batch_dim(
+                                        prompt_timestep_video, cfg_batch_size
+                                    )
+                                if prompt_timestep_audio is not None:
+                                    prompt_timestep_audio = self._repeat_batch_dim(
+                                        prompt_timestep_audio, cfg_batch_size
+                                    )
 
                             with set_forward_context(
                                 current_timestep=i, attn_metadata=attn_metadata
