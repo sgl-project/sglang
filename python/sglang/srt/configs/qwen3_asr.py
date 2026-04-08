@@ -101,7 +101,6 @@ class Qwen3ASRProcessor(ProcessorMixin):
         return inputs
 
 
-
 class Qwen3ASRThinkerConfig(PretrainedConfig):
     model_type = "qwen3_asr_thinker"
     sub_configs = {
@@ -128,6 +127,7 @@ class Qwen3ASRThinkerConfig(PretrainedConfig):
         from transformers.models.qwen3.configuration_qwen3 import (
             Qwen3Config as HFQwen3Config,
         )
+
         if isinstance(text_config, dict):
             text_config = HFQwen3Config(**text_config)
         elif text_config is None:
