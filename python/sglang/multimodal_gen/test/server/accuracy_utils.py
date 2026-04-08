@@ -728,6 +728,8 @@ def _run_staged_native_component_accuracy_case(
 
         del sgl_call
         del sgl_raw
+        if component == ComponentType.TRANSFORMER:
+            engine_cls.prepare_component_for_release(sgl)
         del sgl
         sgl = None
         engine_cls.clear_memory()
@@ -758,6 +760,8 @@ def _run_staged_native_component_accuracy_case(
         )
     finally:
         if sgl is not None:
+            if component == ComponentType.TRANSFORMER:
+                engine_cls.prepare_component_for_release(sgl)
             del sgl
         if ref is not None:
             del ref
