@@ -1442,28 +1442,14 @@ class MooncakeKVManager(CommonKVManager):
                     page_start = int(msg[3].decode("ascii"))
                     num_pages = int(msg[4].decode("ascii"))
                     session_id = msg[5].decode("ascii")
-                    self._chunk_writer_counts[room][chunk_idx].append(
-                        (page_start, num_pages, session_id)
-                    )
                     handler = self._staging_handler
                     assert (
                         handler is not None
                     ), "CHUNK_READY received before staging handler initialized"
-                    writers_arrived = len(self._chunk_writer_counts[room][chunk_idx])
-                    decode_req = handler._room_to_decode_req.get(room)
-                    if decode_req is None:
-                        logger.warning(
-                            "CHUNK_READY received for unregistered room=%s chunk=%d, skipping",
-                            room,
-                            chunk_idx,
-                        )
-                        continue
-                    num_writers = handler.num_writers_for(decode_req)
-                    if writers_arrived >= num_writers:
-                        handler.submit_chunk_scatter(
-                            room, chunk_idx, page_start, num_pages
-                        )
-                        del self._chunk_writer_counts[room][chunk_idx]
+                    handler.handle_chunk_arrived(
+                        room, chunk_idx, page_start, num_pages,
+                        session_id, self._chunk_writer_counts,
+                    )
                     continue
 
                 # Staging: prefill pre-requests staging allocation before forward

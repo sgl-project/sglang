@@ -186,6 +186,40 @@ class DecodeStagingHandler:
         """Check if a room is registered for staging scatter."""
         return room in self._room_to_decode_req
 
+    def handle_chunk_arrived(
+        self,
+        room: int,
+        chunk_idx: int,
+        page_start: int,
+        num_pages: int,
+        writer_id: str,
+        chunk_writer_counts: dict,
+    ) -> bool:
+        """Process a staging chunk arrival from any transport (NIXL RDMA notif or ZMQ CHUNK_READY).
+
+        Accumulates writer arrivals in *chunk_writer_counts* and submits scatter
+        once all writers for this chunk have reported in. Returns True if scatter
+        was submitted.
+        """
+        chunk_writer_counts[room][chunk_idx].append(
+            (page_start, num_pages, writer_id)
+        )
+        decode_req = self._room_to_decode_req.get(room)
+        if decode_req is None:
+            logger.warning(
+                "Staging chunk arrived for unregistered room=%s chunk=%d, skipping",
+                room,
+                chunk_idx,
+            )
+            return False
+        writers_arrived = len(chunk_writer_counts[room][chunk_idx])
+        num_writers = self.num_writers_for(decode_req)
+        if writers_arrived >= num_writers:
+            self.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
+            del chunk_writer_counts[room][chunk_idx]
+            return True
+        return False
+
     def submit_last_scatter_async(self, room: int) -> bool:
         """Submit scatter for the last chunk when all ranks report Success.
 

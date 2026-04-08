@@ -888,6 +888,55 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
 
+    def _get_staging_strategy(self, staging_buffer):
+        """Lazily create or return cached PrefillStagingStrategy."""
+        if not hasattr(self, "_staging_strategy") or self._staging_strategy is None:
+            from sglang.srt.disaggregation.common.staging_handler import (
+                PrefillStagingStrategy,
+            )
+
+            self._staging_strategy = PrefillStagingStrategy(self, staging_buffer)
+        return self._staging_strategy
+
+    def _do_staging_transfer(
+        self,
+        req,
+        kv_indices: npt.NDArray[np.int32],
+        index_slice: slice,
+        chunk_id: int,
+        is_last: bool,
+        dst_info: KVArgsRegisterInfo,
+        staging_buffer,
+    ):
+        """Attempt staging transfer for one request. Returns xfer_handle or None on fallback."""
+        strategy = self._get_staging_strategy(staging_buffer)
+        page_start = index_slice.start
+        num_pages = len(kv_indices)
+
+        ready, chunk_idx, c_offset, _, _ = strategy.check_ready(
+            req, page_start, num_pages, session_id=req.agent_name
+        )
+        if not ready:
+            return None
+
+        notif_tag = (
+            f"{req.room}_stg_{chunk_id}_{int(is_last)}"
+            f"_{self.kv_args.engine_rank}_{chunk_idx}"
+            f"_{page_start}_{num_pages}_{req.agent_name}"
+        )
+        return self.send_kvcache_staged(
+            req.agent_name,
+            kv_indices,
+            dst_info.staging.base_ptr + c_offset,
+            dst_info.staging.total_size - c_offset,
+            dst_info.gpu_id,
+            dst_info.decode_tp_rank,
+            dst_info.decode_tp_size,
+            dst_info.dst_kv_item_len,
+            notif_tag,
+            staging_buffer=staging_buffer,
+        )
+
     def send_aux(
         self,
         peer_name: str,
@@ -1138,55 +1187,6 @@ class NixlKVManager(CommonKVManager):
                 )
             return None
 
-    def _get_staging_strategy(self, staging_buffer):
-        """Lazily create or return cached PrefillStagingStrategy."""
-        if not hasattr(self, "_staging_strategy") or self._staging_strategy is None:
-            from sglang.srt.disaggregation.common.staging_handler import (
-                PrefillStagingStrategy,
-            )
-
-            self._staging_strategy = PrefillStagingStrategy(self, staging_buffer)
-        return self._staging_strategy
-
-    def _do_staging_transfer(
-        self,
-        req,
-        kv_indices: npt.NDArray[np.int32],
-        index_slice: slice,
-        chunk_id: int,
-        is_last: bool,
-        dst_info: KVArgsRegisterInfo,
-        staging_buffer,
-    ):
-        """Attempt staging transfer for one request. Returns xfer_handle or None on fallback."""
-        strategy = self._get_staging_strategy(staging_buffer)
-        page_start = index_slice.start
-        num_pages = len(kv_indices)
-
-        ready, chunk_idx, c_offset, _, _ = strategy.check_ready(
-            req, page_start, num_pages, session_id=req.agent_name
-        )
-        if not ready:
-            return None
-
-        notif_tag = (
-            f"{req.room}_stg_{chunk_id}_{int(is_last)}"
-            f"_{self.kv_args.engine_rank}_{chunk_idx}"
-            f"_{page_start}_{num_pages}_{req.agent_name}"
-        )
-        return self.send_kvcache_staged(
-            req.agent_name,
-            kv_indices,
-            dst_info.staging.base_ptr + c_offset,
-            dst_info.staging.total_size - c_offset,
-            dst_info.gpu_id,
-            dst_info.decode_tp_rank,
-            dst_info.decode_tp_size,
-            dst_info.dst_kv_item_len,
-            notif_tag,
-            staging_buffer=staging_buffer,
-        )
-
     def _send_kv_for_req(
         self,
         req,
@@ -1372,25 +1372,13 @@ class NixlKVManager(CommonKVManager):
         agent_name: str,
     ):
         """Process a staging chunk arrival via RDMA notification."""
-        self._chunk_writer_counts[room][chunk_idx].append(
-            (page_start, num_pages, agent_name)
-        )
         handler = self._staging_handler
         if handler is None:
             return
-        decode_req = handler._room_to_decode_req.get(room)
-        if decode_req is None:
-            logger.warning(
-                "stg notification for unregistered room=%s chunk=%d, skipping",
-                room,
-                chunk_idx,
-            )
-            return
-        writers_arrived = len(self._chunk_writer_counts[room][chunk_idx])
-        num_writers = handler.num_writers_for(decode_req)
-        if writers_arrived >= num_writers:
-            handler.submit_chunk_scatter(room, chunk_idx, page_start, num_pages)
-            del self._chunk_writer_counts[room][chunk_idx]
+        handler.handle_chunk_arrived(
+            room, chunk_idx, page_start, num_pages,
+            agent_name, self._chunk_writer_counts,
+        )
 
     def _maybe_submit_last_scatter(self, room: int):
         """Check if all kv+aux transfers are done and submit last scatter if so."""
@@ -1410,11 +1398,6 @@ class NixlKVManager(CommonKVManager):
         if handler is not None and handler.is_staging_room(room):
             handler.submit_last_scatter_async(room)
             self._chunk_writer_counts.pop(room, None)
-
-    def check_transfer_done(self, room: int):
-        if room not in self.transfer_statuses:
-            return False
-        return self.transfer_statuses[room].is_done()
 
     def _handle_watermark_msg(self, msg_parts):
         wm_round = int(msg_parts[1].decode("ascii"))
@@ -1455,6 +1438,11 @@ class NixlKVManager(CommonKVManager):
                 stg_chunk_idx,
                 stg_session,
             )
+
+    def check_transfer_done(self, room: int):
+        if room not in self.transfer_statuses:
+            return False
+        return self.transfer_statuses[room].is_done()
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
