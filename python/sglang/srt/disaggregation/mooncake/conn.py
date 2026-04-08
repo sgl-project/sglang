@@ -1356,47 +1356,19 @@ class MooncakeKVManager(CommonKVManager):
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
-                    wm_round = int(waiting_req_bytes[1].decode("ascii"))
-                    wm_tail = int(waiting_req_bytes[2].decode("ascii"))
-                    wm_session = (
-                        waiting_req_bytes[3].decode("ascii")
-                        if len(waiting_req_bytes) > 3
-                        else ""
+                    from sglang.srt.disaggregation.common.staging_handler import (
+                        handle_watermark_msg,
                     )
-                    with self._staging_ctx.watermark_cv:
-                        prev = self._staging_ctx.remote_watermarks.get(
-                            wm_session, (0, 0)
-                        )
-                        if (wm_round, wm_tail) > prev:
-                            self._staging_ctx.remote_watermarks[wm_session] = (
-                                wm_round,
-                                wm_tail,
-                            )
-                            self._staging_ctx.watermark_cv.notify_all()
+
+                    handle_watermark_msg(self._staging_ctx, waiting_req_bytes)
                     continue
                 # Staging: decode replies with allocated staging offset
                 if room == "STAGING_RSP":
-                    stg_room = int(waiting_req_bytes[1].decode("ascii"))
-                    stg_chunk_idx = int(waiting_req_bytes[2].decode("ascii"))
-                    stg_offset = int(waiting_req_bytes[3].decode("ascii"))
-                    stg_round = int(waiting_req_bytes[4].decode("ascii"))
-                    stg_end = int(waiting_req_bytes[5].decode("ascii"))
-                    stg_session = waiting_req_bytes[6].decode("ascii")
-                    room_infos = self.transfer_infos.get(stg_room, {})
-                    tinfo = room_infos.get(stg_session)
-                    if tinfo is not None:
-                        if tinfo.staging is None:
-                            tinfo.staging = StagingTransferInfo()
-                        tinfo.staging.set_chunk(
-                            stg_chunk_idx, stg_offset, stg_round, stg_end
-                        )
-                    else:
-                        logger.warning(
-                            "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
-                            stg_room,
-                            stg_chunk_idx,
-                            stg_session,
-                        )
+                    from sglang.srt.disaggregation.common.staging_handler import (
+                        handle_staging_rsp,
+                    )
+
+                    handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":

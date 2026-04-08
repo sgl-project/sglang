@@ -1421,44 +1421,18 @@ class NixlKVManager(CommonKVManager):
             self._chunk_writer_counts.pop(room, None)
 
     def _handle_watermark_msg(self, msg_parts):
-        wm_round = int(msg_parts[1].decode("ascii"))
-        wm_tail = int(msg_parts[2].decode("ascii"))
-        wm_session = (
-            msg_parts[3].decode("ascii") if len(msg_parts) > 3 else ""
+        from sglang.srt.disaggregation.common.staging_handler import (
+            handle_watermark_msg,
         )
-        with self._staging_ctx.watermark_cv:
-            prev = self._staging_ctx.remote_watermarks.get(wm_session, (0, 0))
-            if (wm_round, wm_tail) > prev:
-                self._staging_ctx.remote_watermarks[wm_session] = (
-                    wm_round,
-                    wm_tail,
-                )
-            self._staging_ctx.watermark_cv.notify_all()
+
+        handle_watermark_msg(self._staging_ctx, msg_parts)
 
     def _handle_staging_rsp(self, msg_parts):
         from sglang.srt.disaggregation.common.staging_handler import (
-            StagingTransferInfo,
+            handle_staging_rsp,
         )
 
-        stg_room = int(msg_parts[1].decode("ascii"))
-        stg_chunk_idx = int(msg_parts[2].decode("ascii"))
-        stg_offset = int(msg_parts[3].decode("ascii"))
-        stg_round = int(msg_parts[4].decode("ascii"))
-        stg_end = int(msg_parts[5].decode("ascii"))
-        stg_session = msg_parts[6].decode("ascii")
-        room_infos = self.transfer_infos.get(stg_room, {})
-        tinfo = room_infos.get(stg_session)
-        if tinfo is not None:
-            if tinfo.staging is None:
-                tinfo.staging = StagingTransferInfo()
-            tinfo.staging.set_chunk(stg_chunk_idx, stg_offset, stg_round, stg_end)
-        else:
-            logger.warning(
-                "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
-                stg_room,
-                stg_chunk_idx,
-                stg_session,
-            )
+        handle_staging_rsp(msg_parts, self.transfer_infos)
 
     def check_transfer_done(self, room: int):
         if room not in self.transfer_statuses:

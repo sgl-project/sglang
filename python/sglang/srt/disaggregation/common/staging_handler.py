@@ -401,6 +401,46 @@ def is_watermark_ready(
     return prev_round < wm_round or (prev_round == wm_round and alloc_end <= wm_tail)
 
 
+def handle_watermark_msg(staging_ctx, msg_parts) -> None:
+    """Process a WATERMARK message and update remote watermark tracking."""
+    wm_round = int(msg_parts[1].decode("ascii"))
+    wm_tail = int(msg_parts[2].decode("ascii"))
+    wm_session = (
+        msg_parts[3].decode("ascii") if len(msg_parts) > 3 else ""
+    )
+    with staging_ctx.watermark_cv:
+        prev = staging_ctx.remote_watermarks.get(wm_session, (0, 0))
+        if (wm_round, wm_tail) > prev:
+            staging_ctx.remote_watermarks[wm_session] = (
+                wm_round,
+                wm_tail,
+            )
+        staging_ctx.watermark_cv.notify_all()
+
+
+def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
+    """Process a STAGING_RSP message and update transfer info with allocation."""
+    stg_room = int(msg_parts[1].decode("ascii"))
+    stg_chunk_idx = int(msg_parts[2].decode("ascii"))
+    stg_offset = int(msg_parts[3].decode("ascii"))
+    stg_round = int(msg_parts[4].decode("ascii"))
+    stg_end = int(msg_parts[5].decode("ascii"))
+    stg_session = msg_parts[6].decode("ascii")
+    room_infos = transfer_infos.get(stg_room, {})
+    tinfo = room_infos.get(stg_session)
+    if tinfo is not None:
+        if tinfo.staging is None:
+            tinfo.staging = StagingTransferInfo()
+        tinfo.staging.set_chunk(stg_chunk_idx, stg_offset, stg_round, stg_end)
+    else:
+        logger.warning(
+            "STAGING_RSP RECV but tinfo=None room=%s chunk=%d session=%s",
+            stg_room,
+            stg_chunk_idx,
+            stg_session,
+        )
+
+
 # ======================================================================
 # Staging data structures and protocol utilities
 # ======================================================================
