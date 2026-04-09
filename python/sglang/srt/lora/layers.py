@@ -752,26 +752,26 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_b_weights = down_lora_b_weights
 
     def _get_lora_info(self):
-        """
-        Build LoRAInfo for the current batch.
-
-        Returns None if LoRA is not enabled or weights are not set.
-        """
+        """Build LoRAInfo for the current batch."""
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
 
-        # Get LoRA batch info from backend
         batch_info = self.lora_backend.batch_info
-        lora_ranks = batch_info.lora_ranks  # [num_loras]
+        lora_ranks = batch_info.lora_ranks
 
         max_lora_rank = self.down_lora_a_weights.shape[2]
 
-        # Create adapter_enabled tensor for the current batch
-        # Only enable LoRA adapters that are actually used in this batch
-        # TODO: Jonahbernard: check that this doesn't slow down inference for this batch
-        adapter_enabled = torch.zeros(
-            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
-        )
-        adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
+        cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
+        if cg_buffers is not None and batch_info.use_cuda_graph:
+            adapter_enabled = cg_buffers["adapter_enabled"]
+            adapter_enabled.zero_()
+            idx_buf = cg_buffers["weight_indices_long"]
+            idx_buf[: batch_info.bs] = batch_info.weight_indices[: batch_info.bs]
+            adapter_enabled.index_fill_(0, idx_buf[: batch_info.bs], 1)
+        else:
+            adapter_enabled = torch.zeros(
+                len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
+            )
+            adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
@@ -785,6 +785,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             max_lora_rank=max_lora_rank,
             num_experts=self.base_layer.num_experts,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
+            cg_buffers=cg_buffers,
+            has_active_lora=batch_info.has_active_lora,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),

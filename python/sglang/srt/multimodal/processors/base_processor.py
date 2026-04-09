@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputFormat,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -363,14 +364,14 @@ class BaseMultimodalProcessor(ABC):
                 )
             )
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.IM_TOKEN_ID,
-            "video_token_id": getattr(self, "VIDEO_TOKEN_ID", None),
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            im_token_id=self.IM_TOKEN_ID,
+            video_token_id=getattr(self, "VIDEO_TOKEN_ID", None),
+        )
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -385,8 +386,10 @@ class BaseMultimodalProcessor(ABC):
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
+                "Gemma4Processor",
                 "GlmAsrProcessor",
                 "Qwen2AudioProcessor",
+                "Qwen3ASRProcessor",
                 "Qwen3OmniMoeProcessor",
             }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
