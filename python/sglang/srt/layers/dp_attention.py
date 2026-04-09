@@ -319,19 +319,23 @@ def is_allocation_symmetric() -> bool:
 def is_allreduce_allocation_symmetric() -> bool:
     """Whether to use symmetric memory for tensors that flow into all-reduce.
 
-    When custom AR is active during CUDA graph capture, the input tensors
-    must be from cudaMalloc (not ncclMemAlloc) so that register_graph_buffers()
-    can IPC-register them via cudaIpcGetMemHandle. In eager mode (prefill),
-    symm-mem allocation is fine because custom AR uses the unregistered path
-    which does not require IPC on input tensors.
+    When SGLANG_ENABLE_CA_WITH_SYMM=1 and custom AR is active during CUDA
+    graph capture, the input tensors must be from cudaMalloc (not ncclMemAlloc)
+    so that register_graph_buffers() can IPC-register them via
+    cudaIpcGetMemHandle. In eager mode (prefill), symm-mem allocation is fine.
 
-    Returns False only during graph capture with custom AR enabled.
+    Returns False only during graph capture with CA-with-symm enabled.
     """
+    import os
+
     import torch
 
     from sglang.srt.distributed.parallel_state import get_tp_group
 
-    if torch.cuda.is_current_stream_capturing():
+    if (
+        os.environ.get("SGLANG_ENABLE_CA_WITH_SYMM", "0") == "1"
+        and torch.cuda.is_current_stream_capturing()
+    ):
         tp_group = get_tp_group()
         if tp_group and tp_group.ca_comm and not tp_group.ca_comm.disabled:
             return False

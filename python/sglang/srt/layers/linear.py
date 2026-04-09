@@ -25,6 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
+    is_allocation_symmetric,
     is_allreduce_allocation_symmetric,
 )
 from sglang.srt.layers.parameter import (
