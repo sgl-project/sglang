@@ -3282,10 +3282,6 @@ class ServerArgs:
 
             # NOTE: overlap schedule is always enabled for ngram spec
             self.disable_overlap_schedule = False
-            logger.info(f"Overlap schedule is forcefully enabled for ngram spec.")
-            if not self.disable_overlap_schedule:
-                logger.warning("The page size is set to 1 for ngram spec v2.")
-                self.page_size = 1
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
