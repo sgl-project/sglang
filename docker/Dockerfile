@@ -763,8 +763,8 @@ COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-
 COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
 
 # Copy cache for kernels from kernels community
-COPY --from=framework /root/.cache/huggingface /root/.cache/huggingface
-COPY --from=framework /root/.cache/sglang /root/.cache/sglang
+COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
+COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
