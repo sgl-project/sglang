@@ -87,6 +87,32 @@ def _resolve_qwen_edit_per_prompt_images(prompt_list, image_list):
     return [[image] for image in image_list]
 
 
+def _shard_qwen_edit_img_cache_for_sp(
+    img_cache: torch.Tensor, noisy_img_seq_len: int, device: torch.device
+) -> torch.Tensor:
+    noisy_img_cache = shard_rotary_emb_for_sp(img_cache[:noisy_img_seq_len, :])
+    condition_img_cache = shard_rotary_emb_for_sp(img_cache[noisy_img_seq_len:, :])
+    return torch.cat([noisy_img_cache, condition_img_cache], dim=0).to(device=device)
+
+
+def _shard_qwen_edit_freqs_cis_for_sp(freqs_cis, noisy_img_seq_len, device):
+    if isinstance(freqs_cis[0], torch.Tensor) and freqs_cis[0].dim() == 2:
+        img_cache, txt_cache = freqs_cis
+        return (
+            _shard_qwen_edit_img_cache_for_sp(img_cache, noisy_img_seq_len, device),
+            txt_cache,
+        )
+
+    (img_cos, img_sin), (txt_cos, txt_sin) = freqs_cis
+    return (
+        (
+            _shard_qwen_edit_img_cache_for_sp(img_cos, noisy_img_seq_len, device),
+            _shard_qwen_edit_img_cache_for_sp(img_sin, noisy_img_seq_len, device),
+        ),
+        (txt_cos, txt_sin),
+    )
+
+
 # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._pack_latents
 def _pack_latents(latents, batch_size, num_channels_latents, height, width):
     latents = latents.view(
@@ -144,12 +170,40 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
 
+    def get_classifier_free_guidance_scale(self, batch, guidance_scale: float) -> float:
+        if batch.true_cfg_scale is not None:
+            return batch.true_cfg_scale
+        return guidance_scale
+
+    def postprocess_cfg_noise(
+        self,
+        batch,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        # Qwen-Image follows the official diffusers true-CFG behavior:
+        # after combining cond/uncond with true_cfg_scale, match the per-token norm
+        # back to the conditional branch.
+        if (
+            batch.true_cfg_scale is None
+            or batch.true_cfg_scale <= 1.0
+            or not batch.do_classifier_free_guidance
+        ):
+            return noise_pred
+
+        cond_norm = torch.norm(noise_pred_cond, dim=-1, keepdim=True)
+        noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True).clamp_min(1e-12)
+        return noise_pred * (cond_norm / noise_norm)
+
     def prepare_image_processor_kwargs(self, batch, neg=False):
         prompt = batch.prompt if not neg else batch.negative_prompt
         if prompt:
             prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
-            txt = prompt_template_encode.format(batch.prompt)
-            return dict(text=[txt], padding=True)
+            prompt_list = _normalize_prompt_list(prompt)
+            txt = [
+                prompt_template_encode.format(cur_prompt) for cur_prompt in prompt_list
+            ]
+            return dict(text=txt, padding=True)
         else:
             return {}
 
@@ -310,11 +364,9 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
         )
 
-        img_cache, txt_cache = freqs_cis
-        noisy_img_cache = shard_rotary_emb_for_sp(img_cache[:noisy_img_seq_len, :])
-        img_cache = torch.cat(
-            [noisy_img_cache, img_cache[noisy_img_seq_len:, :]], dim=0
-        ).to(device=device)
+        img_cache, txt_cache = _shard_qwen_edit_freqs_cis_for_sp(
+            freqs_cis, noisy_img_seq_len, device
+        )
         return {
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": (img_cache, txt_cache),
@@ -500,33 +552,11 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
         )
 
-        if isinstance(freqs_cis[0], torch.Tensor) and freqs_cis[0].dim() == 2:
-            img_cache, txt_cache = freqs_cis
-            noisy_img_cache = shard_rotary_emb_for_sp(img_cache[:noisy_img_seq_len, :])
-            img_cache = torch.cat(
-                [noisy_img_cache, img_cache[noisy_img_seq_len:, :]], dim=0
-            ).to(device=device)
-            return {
-                "txt_seq_lens": txt_seq_lens,
-                "freqs_cis": (img_cache, txt_cache),
-                "img_shapes": img_shapes,
-            }
-
-        (img_cos, img_sin), (txt_cos, txt_sin) = freqs_cis
-        noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
-        noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
-
-        # concat back the img_cos for input image (since it is not sp-shared later)
-        img_cos = torch.cat([noisy_img_cos, img_cos[noisy_img_seq_len:, :]], dim=0).to(
-            device=device
-        )
-        img_sin = torch.cat([noisy_img_sin, img_sin[noisy_img_seq_len:, :]], dim=0).to(
-            device=device
-        )
-
         return {
             "txt_seq_lens": txt_seq_lens,
-            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
+            "freqs_cis": _shard_qwen_edit_freqs_cis_for_sp(
+                freqs_cis, noisy_img_seq_len, device
+            ),
             "img_shapes": img_shapes,
         }
 

@@ -21,9 +21,14 @@ from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    FluxPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
@@ -73,12 +78,19 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
+)
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
+from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
 
@@ -128,6 +140,43 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
+    def _maybe_prepare_rollout(self, batch: Req):
+        """Prepare denoising loop for rollout."""
+        if not isinstance(self.scheduler, SchedulerRLMixin):
+            if batch.rollout:
+                raise ValueError(
+                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                )
+            return
+
+        self.scheduler.release_rollout_resources(batch)
+        if batch.rollout:
+            self.scheduler.prepare_rollout(
+                batch=batch,
+                pipeline_config=self.server_args.pipeline_config,
+            )
+
+    def _maybe_collect_rollout_log_probs(self, batch: Req):
+        """Get rollout log probs and store into batch for reward calculation."""
+        if not isinstance(self.scheduler, SchedulerRLMixin):
+            if batch.rollout:
+                raise ValueError(
+                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                )
+            return
+
+        if batch.rollout:
+            if batch.rollout_trajectory_data is None:
+                batch.rollout_trajectory_data = RolloutTrajectoryData()
+            batch.rollout_trajectory_data.rollout_log_probs = (
+                self.scheduler.collect_rollout_log_probs(batch)
+            )
+            if getattr(batch, "rollout_debug_mode", False):
+                batch.rollout_trajectory_data.rollout_debug_tensors = (
+                    self.scheduler.collect_rollout_debug_tensors(batch)
+                )
+            self.scheduler.release_rollout_resources(batch)
+
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
@@ -137,16 +186,28 @@ class DenoisingStage(PipelineStage):
             module, nn.Module
         ):
             return
-        try:
-            import torch._inductor.config as _inductor_cfg
+        compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
 
-            _inductor_cfg.reorder_for_compute_comm_overlap = True
-        except ImportError:
-            pass
-        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
-        logger.info(f"Compiling transformer with mode: {mode}")
+        if current_platform.is_npu():
+            backend = get_compiler_backend()
+            compile_kwargs["backend"] = backend
+            compile_kwargs["dynamic"] = False
+            logger.info("Compiling transformer with torchair backend on NPU")
+        else:
+            try:
+                import torch._inductor.config as _inductor_cfg
+
+                _inductor_cfg.reorder_for_compute_comm_overlap = True
+            except ImportError:
+                pass
+            mode = os.environ.get(
+                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            )
+            compile_kwargs["mode"] = mode
+            logger.info(f"Compiling transformer with mode: {mode}")
+
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(mode=mode, fullgraph=False, dynamic=None)
+        module.compile(**compile_kwargs)
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -339,14 +400,15 @@ class DenoisingStage(PipelineStage):
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
         """Builds a guidance tensor. This method is cached."""
-        return (
-            torch.full(
-                (batch_size,),
-                guidance_val,
-                dtype=target_dtype,
-                device=device,
-            )
-            * 1000.0
+        if isinstance(
+            self.server_args.pipeline_config, FluxPipelineConfig
+        ) and not isinstance(self.server_args.pipeline_config, Flux2PipelineConfig):
+            guidance_val = guidance_val * 1000.0
+        return torch.full(
+            (batch_size,),
+            guidance_val,
+            dtype=target_dtype,
+            device=device,
         )
 
     def get_or_build_guidance(self, bsz: int, dtype, device):
@@ -544,10 +606,13 @@ class DenoisingStage(PipelineStage):
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 
+        if batch.rollout:
+            self._maybe_prepare_rollout(batch)
+
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta},
+            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
         )
 
         # Setup precision and autocast settings
@@ -696,6 +761,8 @@ class DenoisingStage(PipelineStage):
         trajectory_timesteps: list,
         server_args: ServerArgs,
         is_warmup: bool = False,
+        *args,
+        **kwargs,
     ):
         # Gather results if using sequence parallelism
         if trajectory_latents:
@@ -704,6 +771,10 @@ class DenoisingStage(PipelineStage):
         else:
             trajectory_tensor = None
             trajectory_timesteps_tensor = None
+
+        # Gather log probs for rollout
+        if batch.rollout:
+            self._maybe_collect_rollout_log_probs(batch)
 
         # Gather results if using sequence parallelism
         latents, trajectory_tensor = self._postprocess_sp_latents(
@@ -719,13 +790,9 @@ class DenoisingStage(PipelineStage):
             and hasattr(batch, "noise_pred")
             and batch.noise_pred is not None
         ):
-            batch.noise_pred = server_args.pipeline_config.gather_latents_for_sp(
-                batch.noise_pred
+            batch.noise_pred = server_args.pipeline_config.gather_noise_pred_for_sp(
+                batch, batch.noise_pred
             )
-            if hasattr(batch, "raw_latent_shape"):
-                orig_s = batch.raw_latent_shape[1]
-                if batch.noise_pred.shape[1] > orig_s:
-                    batch.noise_pred = batch.noise_pred[:, :orig_s, :]
 
         if trajectory_tensor is not None and trajectory_timesteps_tensor is not None:
             batch.trajectory_timesteps = trajectory_timesteps_tensor.cpu()
@@ -800,20 +867,29 @@ class DenoisingStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
         if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
-            latents = self.server_args.pipeline_config.gather_latents_for_sp(latents)
+            latents = self.server_args.pipeline_config.gather_latents_for_sp(
+                latents, batch=batch
+            )
             if trajectory_tensor is not None:
                 # trajectory_tensor shapes:
                 # - video: [b, num_steps, c, t_local, h, w] -> gather on dim=3
                 # - image: [b, num_steps, s_local, d] -> gather on dim=2
                 trajectory_tensor = trajectory_tensor.to(get_local_torch_device())
-                gather_dim = 3 if trajectory_tensor.dim() >= 5 else 2
-                trajectory_tensor = sequence_model_parallel_all_gather(
-                    trajectory_tensor, dim=gather_dim
-                )
-                if gather_dim == 2 and hasattr(batch, "raw_latent_shape"):
-                    orig_s = batch.raw_latent_shape[1]
-                    if trajectory_tensor.shape[2] > orig_s:
-                        trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
+                if isinstance(self.server_args.pipeline_config, ZImagePipelineConfig):
+                    trajectory_tensor = (
+                        self.server_args.pipeline_config.gather_latents_for_sp(
+                            trajectory_tensor, batch=batch
+                        )
+                    )
+                else:
+                    gather_dim = 3 if trajectory_tensor.dim() >= 5 else 2
+                    trajectory_tensor = sequence_model_parallel_all_gather(
+                        trajectory_tensor, dim=gather_dim
+                    )
+                    if gather_dim == 2 and hasattr(batch, "raw_latent_shape"):
+                        orig_s = batch.raw_latent_shape[1]
+                        if trajectory_tensor.shape[2] > orig_s:
+                            trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
 
     def step_profile(self):
@@ -1006,6 +1082,7 @@ class DenoisingStage(PipelineStage):
                         logger=logger,
                         metrics=batch.metrics,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
+                        record_as_step=True,
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
@@ -1066,7 +1143,6 @@ class DenoisingStage(PipelineStage):
                             guidance=guidance,
                             latents=latents,
                         )
-
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
                         if server_args.comfyui_mode:
                             batch.noise_pred = noise_pred
@@ -1153,7 +1229,7 @@ class DenoisingStage(PipelineStage):
         disable = local_rank != 0
         return tqdm(iterable=iterable, total=total, disable=disable)
 
-    def rescale_noise_cfg(
+    def _rescale_noise_cfg(
         self, noise_cfg, noise_pred_text, guidance_rescale=0.0
     ) -> torch.Tensor:
         """
@@ -1181,6 +1257,163 @@ class DenoisingStage(PipelineStage):
             guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
         )
         return noise_cfg
+
+    def _apply_cfg_normalization(
+        self,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor,
+        cfg_normalization: float,
+    ) -> torch.Tensor:
+        factor = float(cfg_normalization)
+        cond_f = noise_pred_cond.float()
+        pred_f = noise_pred.float()
+        ori_norm = torch.linalg.vector_norm(cond_f)
+        new_norm = torch.linalg.vector_norm(pred_f)
+        max_norm = ori_norm * factor
+
+        if new_norm > max_norm:
+            noise_pred = noise_pred * (max_norm / new_norm)
+        return noise_pred
+
+    def _apply_cfg_normalization_parallel(
+        self,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor | None,
+        cfg_normalization: float,
+        cfg_rank: int,
+    ) -> torch.Tensor:
+        # In cfg-parallel mode, only rank 0 has the conditional branch locally,
+        # so the reference norm has to be broadcast to the other ranks
+        factor = float(cfg_normalization)
+        pred_f = noise_pred.float()
+        new_norm = torch.linalg.vector_norm(pred_f)
+        if cfg_rank == 0:
+            assert noise_pred_cond is not None
+            ori_norm = torch.linalg.vector_norm(noise_pred_cond.float())
+        else:
+            ori_norm = torch.empty_like(new_norm)
+        ori_norm = get_cfg_group().broadcast(ori_norm, src=0)
+        max_norm = ori_norm * factor
+
+        if new_norm > max_norm:
+            noise_pred = noise_pred * (max_norm / new_norm)
+        return noise_pred
+
+    def _apply_guidance_rescale_parallel(
+        self,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor | None,
+        guidance_rescale: float,
+        cfg_rank: int,
+    ) -> torch.Tensor:
+        # Guidance rescale is still defined against the conditional branch, so
+        # cfg-parallel needs to broadcast that statistic to every rank
+        std_cfg = noise_pred.std(dim=list(range(1, noise_pred.ndim)), keepdim=True)
+        if cfg_rank == 0:
+            assert noise_pred_cond is not None
+            std_text = noise_pred_cond.std(
+                dim=list(range(1, noise_pred_cond.ndim)), keepdim=True
+            )
+        else:
+            std_text = torch.empty_like(std_cfg)
+        std_text = get_cfg_group().broadcast(std_text, src=0)
+        noise_pred_rescaled = noise_pred * (std_text / std_cfg)
+        return (
+            guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_pred
+        )
+
+    def _apply_model_specific_cfg_postprocess(
+        self,
+        batch: Req,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor | None,
+        cfg_rank: int,
+    ) -> torch.Tensor:
+        # keep model-specific CFG behavior out of the main denoising loop
+        # for cfg-parallel, broadcast cond noise first so the hook sees the same
+        # inputs as the serial path.
+        if cfg_rank == 0:
+            assert noise_pred_cond is not None
+            cond_noise = noise_pred_cond
+        else:
+            # TODO: cache this?
+            cond_noise = torch.empty_like(noise_pred)
+        cond_noise = get_cfg_group().broadcast(cond_noise, src=0)
+
+        # qwen-image uses true_cfg_scale, match the per-token norm back to the conditional branch
+        return self.server_args.pipeline_config.postprocess_cfg_noise(
+            batch, noise_pred, cond_noise
+        )
+
+    def _combine_cfg_parallel(
+        self,
+        batch: Req,
+        noise_pred_cond: torch.Tensor | None,
+        noise_pred_uncond: torch.Tensor | None,
+        cfg_scale: float,
+        cfg_rank: int,
+    ) -> torch.Tensor:
+        # cfg-parallel splits cond / uncond across ranks and reconstructs the
+        # final CFG result with an all-reduce.
+        if cfg_rank == 0:
+            assert noise_pred_cond is not None
+            partial = cfg_scale * noise_pred_cond
+        else:
+            assert noise_pred_uncond is not None
+            partial = (1 - cfg_scale) * noise_pred_uncond
+
+        noise_pred = cfg_model_parallel_all_reduce(partial)
+
+        if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
+            noise_pred = self._apply_cfg_normalization_parallel(
+                noise_pred,
+                noise_pred_cond,
+                batch.cfg_normalization,
+                cfg_rank,
+            )
+
+        if batch.guidance_rescale > 0.0:
+            noise_pred = self._apply_guidance_rescale_parallel(
+                noise_pred,
+                noise_pred_cond,
+                batch.guidance_rescale,
+                cfg_rank,
+            )
+
+        return self._apply_model_specific_cfg_postprocess(
+            batch, noise_pred, noise_pred_cond, cfg_rank
+        )
+
+    def _combine_cfg_serial(
+        self,
+        batch: Req,
+        noise_pred_cond: torch.Tensor,
+        noise_pred_uncond: torch.Tensor,
+        cfg_scale: float,
+    ) -> torch.Tensor:
+        # Serial CFG keeps both branches local and is the reference path that
+        # model-specific postprocessing hooks should match.
+        noise_pred = noise_pred_uncond + cfg_scale * (
+            noise_pred_cond - noise_pred_uncond
+        )
+
+        if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
+            noise_pred = self._apply_cfg_normalization(
+                noise_pred,
+                noise_pred_cond,
+                batch.cfg_normalization,
+            )
+
+        if batch.guidance_rescale > 0.0:
+            noise_pred = self._rescale_noise_cfg(
+                noise_pred,
+                noise_pred_cond,
+                guidance_rescale=batch.guidance_rescale,
+            )
+
+        return self.server_args.pipeline_config.postprocess_cfg_noise(
+            batch, noise_pred, noise_pred_cond
+        )
 
     def _build_attn_metadata(
         self,
@@ -1400,7 +1633,6 @@ class DenoisingStage(PipelineStage):
                     noise_pred_cond, latents
                 )
         if not batch.do_classifier_free_guidance:
-            # If CFG is disabled, we are done. Return the conditional prediction.
             return noise_pred_cond
 
         # negative pass
@@ -1423,80 +1655,26 @@ class DenoisingStage(PipelineStage):
                 noise_pred_uncond = server_args.pipeline_config.slice_noise_pred(
                     noise_pred_uncond, latents
                 )
+        cfg_scale = server_args.pipeline_config.get_classifier_free_guidance_scale(
+            batch, current_guidance_scale
+        )
 
-        # Combine predictions
         if server_args.enable_cfg_parallel:
-            # Each rank computes its partial contribution and we sum via all-reduce:
-            #   final = s*cond + (1-s)*uncond
-            if cfg_rank == 0:
-                assert noise_pred_cond is not None
-                partial = current_guidance_scale * noise_pred_cond
-            else:
-                assert noise_pred_uncond is not None
-                partial = (1 - current_guidance_scale) * noise_pred_uncond
-
-            noise_pred = cfg_model_parallel_all_reduce(partial)
-
-            if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
-                factor = float(batch.cfg_normalization)
-                pred_f = noise_pred.float()
-                new_norm = torch.linalg.vector_norm(pred_f)
-                if cfg_rank == 0:
-                    cond_f = noise_pred_cond.float()
-                    ori_norm = torch.linalg.vector_norm(cond_f)
-                else:
-                    ori_norm = torch.empty_like(new_norm)
-                ori_norm = get_cfg_group().broadcast(ori_norm, src=0)
-                max_norm = ori_norm * factor
-
-                if new_norm > max_norm:
-                    noise_pred = noise_pred * (max_norm / new_norm)
-
-            # Guidance rescale: broadcast std(cond) from rank 0, compute std(cfg) locally
-            if batch.guidance_rescale > 0.0:
-                std_cfg = noise_pred.std(
-                    dim=list(range(1, noise_pred.ndim)), keepdim=True
-                )
-                if cfg_rank == 0:
-                    assert noise_pred_cond is not None
-                    std_text = noise_pred_cond.std(
-                        dim=list(range(1, noise_pred_cond.ndim)), keepdim=True
-                    )
-                else:
-                    std_text = torch.empty_like(std_cfg)
-                # Broadcast std_text from local src=0 to all ranks in CFG group
-                std_text = get_cfg_group().broadcast(std_text, src=0)
-                noise_pred_rescaled = noise_pred * (std_text / std_cfg)
-                noise_pred = (
-                    batch.guidance_rescale * noise_pred_rescaled
-                    + (1 - batch.guidance_rescale) * noise_pred
-                )
-            return noise_pred
-        else:
-            # Serial CFG: both cond and uncond are available locally
-            assert noise_pred_cond is not None and noise_pred_uncond is not None
-            noise_pred = noise_pred_uncond + current_guidance_scale * (
-                noise_pred_cond - noise_pred_uncond
+            return self._combine_cfg_parallel(
+                batch,
+                noise_pred_cond,
+                noise_pred_uncond,
+                cfg_scale,
+                cfg_rank,
             )
 
-            if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
-                factor = float(batch.cfg_normalization)
-                cond_f = noise_pred_cond.float()
-                pred_f = noise_pred.float()
-                ori_norm = torch.linalg.vector_norm(cond_f)
-                new_norm = torch.linalg.vector_norm(pred_f)
-                max_norm = ori_norm * factor
-
-                if new_norm > max_norm:
-                    noise_pred = noise_pred * (max_norm / new_norm)
-
-            if batch.guidance_rescale > 0.0:
-                noise_pred = self.rescale_noise_cfg(
-                    noise_pred,
-                    noise_pred_cond,
-                    guidance_rescale=batch.guidance_rescale,
-                )
-            return noise_pred
+        assert noise_pred_cond is not None and noise_pred_uncond is not None
+        return self._combine_cfg_serial(
+            batch,
+            noise_pred_cond,
+            noise_pred_uncond,
+            cfg_scale,
+        )
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """

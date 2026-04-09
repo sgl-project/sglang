@@ -702,6 +702,30 @@ class SchedulerMetricsCollector:
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
+        self.estimated_flops_per_gpu_total = Counter(
+            name="sglang:estimated_flops_per_gpu_total",
+            documentation=(
+                "Estimated number of floating point operations per GPU "
+                "(for Model FLOPs Utilization calculations)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.estimated_read_bytes_per_gpu_total = Counter(
+            name="sglang:estimated_read_bytes_per_gpu_total",
+            documentation=(
+                "Estimated number of bytes read from memory per GPU "
+                "(for Model FLOPs Utilization calculations)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.estimated_write_bytes_per_gpu_total = Counter(
+            name="sglang:estimated_write_bytes_per_gpu_total",
+            documentation=(
+                "Estimated number of bytes written to memory per GPU "
+                "(for Model FLOPs Utilization calculations)."
+            ),
+            labelnames=labels.keys(),
+        )
 
         self.dp_cooperation_realtime_tokens_total = Counter(
             name="sglang:dp_cooperation_realtime_tokens_total",
@@ -927,6 +951,25 @@ class SchedulerMetricsCollector:
                 category=category,
                 **dp_cooperation_info.to_labels(),
             ).inc(t)
+
+    def increment_estimated_perf(
+        self,
+        num_flops_per_gpu: float = 0.0,
+        num_read_bytes_per_gpu: float = 0.0,
+        num_write_bytes_per_gpu: float = 0.0,
+    ) -> None:
+        if num_flops_per_gpu > 0:
+            self.estimated_flops_per_gpu_total.labels(**self.labels).inc(
+                num_flops_per_gpu
+            )
+        if num_read_bytes_per_gpu > 0:
+            self.estimated_read_bytes_per_gpu_total.labels(**self.labels).inc(
+                num_read_bytes_per_gpu
+            )
+        if num_write_bytes_per_gpu > 0:
+            self.estimated_write_bytes_per_gpu_total.labels(**self.labels).inc(
+                num_write_bytes_per_gpu
+            )
 
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)

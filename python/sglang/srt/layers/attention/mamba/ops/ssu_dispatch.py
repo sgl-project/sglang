@@ -198,7 +198,7 @@ def initialize_mamba_selective_state_update_backend(server_args: ServerArgs) -> 
             f"--mamba-backend value."
         )
 
-    logger.info(
+    logger.debug(
         "Mamba selective_state_update backend initialized: %s",
         _mamba_ssu_backend.name,
     )

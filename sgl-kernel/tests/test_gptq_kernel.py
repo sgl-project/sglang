@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel import gptq_gemm
@@ -128,4 +130,4 @@ def test_gptq_gemm(M, N, K, bit, group_size, use_shuffle, dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))

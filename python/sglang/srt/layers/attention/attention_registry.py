@@ -1,6 +1,11 @@
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.configs.linear_attn_model_registry import (
+    get_linear_attn_config,
+    import_backend_class,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -210,7 +215,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     runner.server_args.attention_backend == "triton"
                     or runner.server_args.attention_backend == "trtllm_mha"
                     or runner.server_args.attention_backend == "fa4"
-                ), "triton or trtllm_mha or fa4 backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend triton or --attention-backend trtllm_mha to specify the backend."
+                    or runner.server_args.attention_backend == "flashinfer"
+                ), "triton, trtllm_mha, fa4, or flashinfer backend are the only supported backends on Blackwell GPUs for hybrid GDN models, use --attention-backend to specify the backend."
             if is_npu():
                 assert (
                     runner.server_args.attention_backend == "ascend"
@@ -224,9 +230,17 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.hybrid_lightning_config is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
-            raise ValueError(
-                "Expected hybrid GDN or NemotronH models, but got unknown model."
-            )
+            spec_result = get_linear_attn_config(runner.model_config.hf_config)
+            if spec_result is not None:
+                spec, _ = spec_result
+                BackendClass = import_backend_class(spec.backend_class_name)
+                linear_attn_backend = BackendClass(runner)
+            else:
+                raise ValueError(
+                    "Expected hybrid GDN or NemotronH models, but got unknown model. "
+                    "If this is a custom hybrid model, use register_linear_attn_model() "
+                    "from sglang.srt.configs.linear_attn_model_registry."
+                )
         full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(
             full_attn_backend, linear_attn_backend, full_attn_layers
