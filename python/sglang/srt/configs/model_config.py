@@ -21,8 +21,6 @@ from pathlib import Path
 from typing import Any, List, Optional, Set, Union
 
 import torch
-from transformers import PretrainedConfig
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -36,6 +34,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +360,12 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Exaone4_5_ForConditionalGeneration"
+        ):
+            self.hf_config.architectures[0] = "Exaone4_5_MTP"
 
         if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
@@ -730,7 +735,6 @@ class ModelConfig:
             if not is_local:
                 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
                 if envs.SGLANG_USE_MODELSCOPE.get():
-
                     from modelscope import HubApi, model_file_download
 
                     hf_api = HubApi()
@@ -1443,8 +1447,7 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
     if "factor" not in rope_scaling:
         logger.warning(
-            "rope_scaling missing 'factor', defaulting to 1.0. "
-            "Check model accuracy.",
+            "rope_scaling missing 'factor', defaulting to 1.0. Check model accuracy.",
         )
     scaling_factor = rope_scaling.get("factor", 1.0)
     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
