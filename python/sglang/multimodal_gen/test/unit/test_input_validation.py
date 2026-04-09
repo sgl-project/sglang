@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from PIL import Image
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -38,6 +39,28 @@ def _make_server_args(pipeline_config):
     sa = MagicMock()
     sa.pipeline_config = pipeline_config
     return sa
+
+
+class _DummyTI2IConfig:
+    task_type = ModelTaskType.TI2I
+
+    def __init__(self):
+        self.vae_config = MagicMock()
+        self.vae_config.get_vae_scale_factor.return_value = 8
+
+    def preprocess_vae_image(self, batch, vae_image_processor):
+        return None
+
+    def calculate_condition_image_size(self, image, width, height):
+        return None
+
+    def preprocess_condition_image(
+        self, image, target_width, target_height, vae_image_processor
+    ):
+        return image, (target_width, target_height)
+
+    def prepare_calculated_size(self, image):
+        return image.size
 
 
 class TestCalculateDimensionsFromArea(unittest.TestCase):
@@ -158,6 +181,41 @@ class TestPreprocessConditionImageResolution(unittest.TestCase):
         self.stage.preprocess_condition_image(batch, server_args, 1920, 1080)
         self.assertIsInstance(batch.condition_image, Image.Image)
         self.assertEqual((batch.width, batch.height), (1280, 720))
+
+
+class TestFlux2TI2ISizeResolution(unittest.TestCase):
+    def setUp(self):
+        with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock()):
+            self.stage = InputValidationStage()
+        self.config = _DummyTI2IConfig()
+
+    def test_uses_condition_image_size_when_width_height_not_explicit(self):
+        image = Image.new("RGB", (1255, 833), color="red")
+        batch = _make_batch(image)
+        batch.extra = {}
+
+        self.stage.preprocess_condition_image(
+            batch,
+            _make_server_args(self.config),
+            image.width,
+            image.height,
+        )
+
+        self.assertEqual((batch.width, batch.height), (1248, 832))
+
+    def test_preserves_explicit_width_height_for_ti2i(self):
+        image = Image.new("RGB", (1255, 833), color="red")
+        batch = _make_batch(image, width=768, height=512)
+        batch.extra = {"explicit_fields": ["width", "height"]}
+
+        self.stage.preprocess_condition_image(
+            batch,
+            _make_server_args(self.config),
+            image.width,
+            image.height,
+        )
+
+        self.assertEqual((batch.width, batch.height), (768, 512))
 
 
 if __name__ == "__main__":
