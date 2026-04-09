@@ -9,7 +9,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
 )
 
 
-def test_ltx23_sp_audio_replication_uses_request_level_ti2v():
+def test_ltx23_sp_audio_replication_stays_off_for_one_stage():
     batch = SimpleNamespace(
         image_latent=torch.randn(1, 8, 16),
         ltx2_num_image_tokens=8,
@@ -30,7 +30,7 @@ def test_ltx23_sp_audio_replication_uses_request_level_ti2v():
                 server_args,
                 is_ltx23_variant=True,
             )
-            is True
+            is False
         )
 
 

@@ -333,16 +333,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
         *,
         is_ltx23_variant: bool,
     ) -> bool:
-        is_ti2v_request = (
-            batch.image_latent is not None
-            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
-        )
-        return (
-            get_sp_world_size() > 1
-            and is_ltx23_variant
-            and is_ti2v_request
-            and server_args.pipeline_class_name != "LTX2TwoStagePipeline"
-        )
+        return False
 
     def _get_condition_image_encoder(
         self,
