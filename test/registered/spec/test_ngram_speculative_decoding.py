@@ -111,7 +111,7 @@ class TestNgramSpeculativeDecodingFlashinfer(TestNgramSpeculativeDecodingBase):
             return outputs
 
         def get_accept_length():
-            info = requests.get(self.base_url + "/get_server_info").json()
+            info = requests.get(self.base_url + "/server_info").json()
             return info["internal_states"][0]["avg_spec_accept_length"]
 
         # Phase 1: baseline — no SAM corpus loaded, only trie
