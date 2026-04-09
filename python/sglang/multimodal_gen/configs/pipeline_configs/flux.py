@@ -548,6 +548,18 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         image_latents = _patchify_latents(image_latents)
         return image_latents
 
+    def normalize_vae_encode(self, image_latents, vae):
+        if not self._check_vae_has_bn(vae):
+            return None
+
+        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(
+            image_latents.device, image_latents.dtype
+        )
+        latents_bn_std = torch.sqrt(
+            vae.bn.running_var.view(1, -1, 1, 1) + self.vae_config.arch_config.batch_norm_eps
+        ).to(image_latents.device, image_latents.dtype)
+        return (image_latents - latents_bn_mean) / latents_bn_std
+
     def _check_vae_has_bn(self, vae):
         """Check if VAE has bn attribute (cached check to avoid repeated hasattr calls)."""
         if not hasattr(self, "_vae_has_bn_cache"):
