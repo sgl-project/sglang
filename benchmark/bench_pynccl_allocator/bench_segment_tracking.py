@@ -1,6 +1,6 @@
 """
 Benchmark for comparing CPU overhead of segment tracking methods:
-1. _get_tracked_segments() - Custom C++ tracking via unordered_map
+1. nccl_allocator_register_segments_with_comm() - C++ registration with index tracking
 2. torch.cuda.memory.memory_snapshot() - PyTorch memory snapshot
 
 Usage:
@@ -9,8 +9,6 @@ Usage:
 
 import argparse
 import time
-
-# Suppress warnings for cleaner output
 import warnings
 from typing import List
 
@@ -55,25 +53,35 @@ def setup_segments(num_segments: int, segment_size: int = 1024 * 1024):
     return tensors, mem_pool
 
 
-def bench_get_tracked_segments(num_iters: int = 10000) -> float:
+def bench_register_segments_with_comm(
+    nccl_lib, comm_ptr: int, num_iters: int = 10000
+) -> float:
     """
-    Benchmark _get_tracked_segments() function.
+    Benchmark nccl_allocator_register_segments_with_comm() function.
+
+    Args:
+        nccl_lib: The loaded NCCL allocator library
+        comm_ptr: The communicator pointer value
+        num_iters: Number of iterations
 
     Returns:
         Average time per call in microseconds.
     """
-    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-        _get_tracked_segments,
-    )
+    import ctypes
+
+    # Setup the C function signature
+    register_func = nccl_lib.nccl_allocator_register_segments_with_comm
+    register_func.restype = ctypes.c_int
+    register_func.argtypes = [ctypes.c_uint64]
 
     # Warmup
     for _ in range(100):
-        _get_tracked_segments()
+        register_func(comm_ptr)
 
     # Benchmark
     start = time.perf_counter()
     for _ in range(num_iters):
-        segments = _get_tracked_segments()
+        register_func(comm_ptr)
     end = time.perf_counter()
 
     avg_us = (end - start) / num_iters * 1e6
@@ -96,7 +104,7 @@ def bench_mempool_snapshot(
     # Benchmark
     start = time.perf_counter()
     for _ in range(num_iters):
-        snapshot = mem_pool.snapshot()
+        mem_pool.snapshot()
     end = time.perf_counter()
 
     avg_us = (end - start) / num_iters * 1e6
@@ -111,53 +119,50 @@ def bench_with_various_segment_counts(
     """
     Run benchmarks with various numbers of tracked segments.
     """
-    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-        _get_tracked_segments,
-    )
+    import gc
 
     print("=" * 80)
-    print("Benchmark: Segment Tracking CPU Overhead")
+    print("Benchmark: Segment Registration CPU Overhead")
     print("=" * 80)
     print(f"Segment size: {segment_size / 1024 / 1024:.2f} MB")
     print(f"Iterations per measurement: {num_iters}")
     print()
     print(
-        f"{'Segments':<12} {'_get_tracked_segments (µs)':<30} {'snapshot (µs)':<20} {'Speedup':<10}"
+        f"{'Segments':<12} {'register_segments (µs)':<30} {'snapshot (µs)':<20} {'Speedup':<10}"
     )
     print("-" * 80)
 
     all_tensors = []  # Keep all tensors alive
+    comm_ptr = 0  # Use dummy comm_ptr for benchmarking (no actual NCCL registration)
 
     for num_segments in segment_counts:
         # Clean up previous segments
         all_tensors = []
 
         # Force garbage collection to free previous segments
-        import gc
-
         gc.collect()
-        torch.cuda.empty_cache()
 
-        # Allocate segments
+        # Allocate segments (this initializes _nccl_allocator_lib via get_nccl_mem_pool)
         tensors, mem_pool = setup_segments(num_segments, segment_size)
         all_tensors.extend(tensors)
 
         # Sync to ensure allocations are complete
         torch.cuda.synchronize()
 
-        # Verify segment count
-        segments = _get_tracked_segments()
-        actual_count = len(segments)
+        # Import _nccl_allocator_lib after setup_segments (ensures library is loaded)
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            _nccl_allocator_lib,
+        )
 
         # Run benchmarks
-        time_tracked = bench_get_tracked_segments(num_iters)
+        time_register = bench_register_segments_with_comm(
+            _nccl_allocator_lib, comm_ptr, num_iters
+        )
         time_snapshot = bench_mempool_snapshot(mem_pool, num_iters)
 
-        speedup = time_snapshot / time_tracked if time_tracked > 0 else float("inf")
+        speedup = time_snapshot / time_register if time_register > 0 else float("inf")
 
-        print(
-            f"{actual_count:<12} {time_tracked:<30.3f} {time_snapshot:<20.3f} {speedup:<10.2f}x"
-        )
+        print(f"{num_segments:<12} {time_register:<30.3f} {time_snapshot:<20.3f} {speedup:<10.2f}x")
 
     print("-" * 80)
     print()

@@ -2,7 +2,6 @@ import ctypes
 import os
 import tempfile
 from contextlib import nullcontext
-from typing import Dict, Set
 
 import torch
 from torch.cuda.memory import CUDAPluggableAllocator
@@ -19,13 +18,16 @@ after_2_8_0 = torch_release >= (2, 8)
 #    (ptr, size). Does NOT register with any comm at allocation time.
 # 2. nccl_free_plug: Frees memory via ncclMemFree and UNTRACKS the segment.
 #    Each segment is tracked only during its lifetime (from alloc to free).
-# 3. Segment tracking uses a thread-safe std::vector to preserve insertion order.
-# 4. Python layer handles registration at context exit time using pynccl API.
+# 3. Segment tracking uses thread-safe std::vector + unordered_map for O(1) operations.
+# 4. Registration via nccl_allocator_register_segments_with_comm: Registers all
+#    tracked segments with a given comm, using index-based tracking to avoid
+#    re-registration. Registration state is maintained per-communicator in C++.
 nccl_allocator_source = """
 
 #include <cuda_runtime.h>
 #include <mutex>
 #include <vector>
+#include <unordered_map>
 #include <utility>
 
 extern "C" {
@@ -41,8 +43,15 @@ typedef enum { ncclSuccess                 =  0,
                ncclInProgress              =  7,
                ncclNumResults              =  8 } ncclResult_t;
 
+// NCCL symmetric memory window flags
+#define NCCL_WIN_COLL_SYMMETRIC 0x01
+
+typedef struct ncclComm* ncclComm_t;
+typedef struct ncclWindow_vidmem* ncclWindow_t;
+
 ncclResult_t  ncclMemAlloc(void** ptr, size_t size);
 ncclResult_t  ncclMemFree(void *ptr);
+ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
 const char*  ncclGetErrorString(ncclResult_t result);
 
 #define NCCLCHECK(cmd) do {                                               \
@@ -54,27 +63,54 @@ const char*  ncclGetErrorString(ncclResult_t result);
   }                                                                       \
 } while(0)
 
-// Thread-safe segment tracking using std::vector for FIFO order
-// Segments are tracked during their lifetime (from alloc to free).
+// Segment information structure
+struct Segment {
+    void* ptr;
+    size_t size;
+    Segment(void* p, size_t s) : ptr(p), size(s) {}
+};
+
+// Thread-safe segment tracking
+// Segment tracking using std::vector for FIFO order.
 // g_segments is maintained in insertion order (oldest first).
-static std::vector<std::pair<void*, size_t>> g_segments;
+// g_ptr_to_index provides O(1) lookup for untrack operations.
+static std::vector<Segment> g_segments;
+static std::unordered_map<void*, size_t> g_ptr_to_index;
 static std::mutex g_segment_mutex;
 
-// Add a segment to the tracking vector (appends to end, maintaining FIFO order)
+// Track which segments have been registered with each communicator.
+// Key: comm_ptr, Value: the next segment index to register for this comm.
+static std::unordered_map<uintptr_t, size_t> g_comm_registration_index;
+
+// Add a segment to the tracking (appends to end, maintaining FIFO order)
 static void track_segment(void* ptr, size_t size) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
+    size_t index = g_segments.size();
     g_segments.emplace_back(ptr, size);
+    g_ptr_to_index[ptr] = index;
 }
 
-// Remove a segment from the tracking vector
+// Remove a segment from the tracking (O(1) using swap-and-pop)
 static void untrack_segment(void* ptr) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
-    for (auto it = g_segments.begin(); it != g_segments.end(); ++it) {
-        if (it->first == ptr) {
-            g_segments.erase(it);
-            break;
-        }
+    auto it = g_ptr_to_index.find(ptr);
+    if (it == g_ptr_to_index.end()) {
+        return;
     }
+    size_t index = it->second;
+    size_t last_index = g_segments.size() - 1;
+
+    // If not the last element, swap with the last element
+    if (index != last_index) {
+        // Swap the segment at index with the last segment
+        g_segments[index] = g_segments[last_index];
+        // Update the index map for the swapped segment's pointer
+        g_ptr_to_index[g_segments[index].ptr] = index;
+    }
+
+    // Remove the last element
+    g_segments.pop_back();
+    g_ptr_to_index.erase(it);
 }
 
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
@@ -82,7 +118,7 @@ void* nccl_alloc_plug(size_t size, int device, void* stream) {
     NCCLCHECK(ncclMemAlloc(&ptr, size));
 
     // Track the segment but do NOT register with any comm
-    // Registration will be done at context exit in Python
+    // Registration will be done at context exit via register_segments_with_comm
     track_segment(ptr, size);
 
     return ptr;
@@ -94,27 +130,35 @@ void nccl_free_plug(void* ptr, size_t size, int device, void* stream) {
     ncclResult_t err = ncclMemFree(ptr);
 }
 
-// C API for Python to query tracked segments in FIFO order
-// out_ptrs: output array for pointers (must have max_segments elements)
-// out_sizes: output array for sizes (must have max_segments elements)
-// max_segments: maximum number of segments to return
-// Returns: actual number of segments returned
-extern "C" int nccl_allocator_get_segments(void** out_ptrs, size_t* out_sizes, int max_segments) {
+// Register all tracked segments with a communicator.
+// Uses an index-based approach to avoid re-registering already-registered segments.
+// Returns 0 on success, non-zero on failure.
+int nccl_allocator_register_segments_with_comm(uintptr_t comm_ptr) {
     std::lock_guard<std::mutex> lock(g_segment_mutex);
-    int count = 0;
-    // Iterate in FIFO order (oldest first, as insertion order is preserved)
-    for (const auto& seg : g_segments) {
-        if (count >= max_segments) break;
-        out_ptrs[count] = seg.first;
-        out_sizes[count] = seg.second;
-        count++;
-    }
-    return count;
-}
 
-extern "C" int nccl_allocator_get_segment_count() {
-    std::lock_guard<std::mutex> lock(g_segment_mutex);
-    return (int)g_segments.size();
+    ncclComm_t comm = reinterpret_cast<ncclComm_t>(comm_ptr);
+
+    // Get the starting index for this communicator
+    size_t start_index = 0;
+    auto it = g_comm_registration_index.find(comm_ptr);
+    if (it != g_comm_registration_index.end()) {
+        start_index = it->second;
+    }
+
+    // Register all segments from start_index to the current end
+    for (size_t i = start_index; i < g_segments.size(); ++i) {
+        const Segment& seg = g_segments[i];
+        ncclWindow_t win;
+        ncclResult_t res = ncclCommWindowRegister(comm, seg.ptr, seg.size, &win, NCCL_WIN_COLL_SYMMETRIC);
+        if (res != ncclSuccess) {
+            return res;
+        }
+    }
+
+    // Update the registration index for this communicator
+    g_comm_registration_index[comm_ptr] = g_segments.size();
+
+    return ncclSuccess;
 }
 
 }
@@ -128,11 +172,6 @@ _active_symmetric_memory_context = None
 
 # Reference to the loaded library
 _nccl_allocator_lib = None
-
-# Global registry for tracking registrations
-# Key: ptr (int), Value: set of comm_ptr (int) that have registered this ptr
-# This allows the same memory to be registered with multiple communicators
-_ptr_to_registered_comms: Dict[int, Set[int]] = {}
 
 
 def is_symmetric_memory_enabled():
@@ -204,48 +243,6 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     return _shared_mem_pool
 
 
-def _get_tracked_segments() -> list:
-    """
-    Get all tracked segments from C++ as a list of (ptr, size) tuples.
-
-    Returns:
-        List of (ptr_int, size) tuples representing all tracked segments.
-    """
-    # Get segment count first
-    count_func = _nccl_allocator_lib.nccl_allocator_get_segment_count
-    count_func.restype = ctypes.c_int
-    count_func.argtypes = []
-
-    max_segments = count_func()
-    if max_segments == 0:
-        return []
-
-    # Allocate buffers for results
-    ptrs = (ctypes.c_uint64 * max_segments)()
-    sizes = (ctypes.c_size_t * max_segments)()
-
-    # Get segments
-    get_segments_func = _nccl_allocator_lib.nccl_allocator_get_segments
-    get_segments_func.restype = ctypes.c_int
-    get_segments_func.argtypes = [
-        ctypes.POINTER(ctypes.c_uint64),
-        ctypes.POINTER(ctypes.c_size_t),
-        ctypes.c_int,
-    ]
-
-    actual_count = get_segments_func(ptrs, sizes, max_segments)
-
-    # Convert to Python list of tuples
-    segments = []
-    for i in range(actual_count):
-        ptr_int = ptrs[i]
-        size = sizes[i]
-        if ptr_int != 0:
-            segments.append((ptr_int, size))
-
-    return segments
-
-
 class SymmetricMemoryContext:
     """
     Context manager for using symmetric memory with pynccl.
@@ -258,11 +255,10 @@ class SymmetricMemoryContext:
     Key design:
     - All groups share a single MemPool to avoid memory fragmentation.
     - At allocation time, ptrs are tracked but NOT registered with any comm.
-    - At context exit time, we iterate over segments and register unregistered ptrs
-      with the current comm using pynccl.register_comm_window_raw.
-      This handles both:
-      1. Newly allocated memory (never registered)
-      2. Memory reused from pool (may need registration for different comm)
+    - At context exit time, nccl_allocator_register_segments_with_comm is called
+      to register all tracked segments with the current comm. The C++ layer
+      tracks per-comm registration state using index-based tracking to avoid
+      re-registration of already-registered segments.
     """
 
     def __init__(
@@ -328,37 +324,25 @@ class SymmetricMemoryContext:
 
     def _register_segments_for_comm(self):
         """
-        Register all tracked segments with the current comm if not already registered.
+        Register all tracked segments with the current comm.
 
-        This handles two scenarios:
-        1. Newly allocated memory: needs registration
-        2. Memory reused from pool: may need registration for different comm
+        Delegates to C++ layer which handles:
+        1. Tracking which segments have been registered with each comm
+        2. Only registering new segments (avoiding re-registration)
+        3. Thread-safe access to the segment registry
         """
-        global _ptr_to_registered_comms
+        global _nccl_allocator_lib
 
-        comm_ptr = self._comm_ptr
-        pynccl_comm = self.group_coordinator.pynccl_comm
+        # Setup the C function signature
+        register_func = _nccl_allocator_lib.nccl_allocator_register_segments_with_comm
+        register_func.restype = ctypes.c_int
+        register_func.argtypes = [ctypes.c_uint64]
 
-        # Get all tracked segments from C++
-        segments = _get_tracked_segments()
-        if not segments:
-            return
-
-        # Register segments that are not yet registered with this comm
-        for ptr_int, size in segments:
-            # Check if this ptr is already registered with this comm
-            if ptr_int not in _ptr_to_registered_comms:
-                _ptr_to_registered_comms[ptr_int] = set()
-
-            if comm_ptr in _ptr_to_registered_comms[ptr_int]:
-                # Already registered with this comm, skip
-                continue
-
-            # Register this ptr with the current comm using pynccl API
-            pynccl_comm.register_comm_window_raw(ptr_int, size)
-
-            # Track the registration
-            _ptr_to_registered_comms[ptr_int].add(comm_ptr)
+        # Call C++ API to register all segments with this comm
+        # C++ layer tracks per-comm registration state internally
+        result = register_func(self._comm_ptr)
+        if result != 0:
+            raise RuntimeError(f"ncclCommWindowRegister failed with error code {result}")
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
