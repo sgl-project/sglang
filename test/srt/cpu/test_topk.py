@@ -121,7 +121,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
             for bias_dtype in [torch.float32, torch.bfloat16]:
                 for gating_dtype in [torch.float32, torch.bfloat16]:
                     for routed_scaling_factor in [None, 1.125]:
-                        for E_num in [192, 256]:
+                        for E_num in [128, 192, 256, 384]:
                             self._run_single_test(
                                 34,
                                 E_num,
