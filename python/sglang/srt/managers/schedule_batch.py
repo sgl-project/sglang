@@ -2515,8 +2515,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), "cache_protected_len must be page aligned"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
+        # Subtract an extra page_size to prevent over-eviction when page_size > sliding_window_size.
+        # Without this, the eviction frontier can reach the insert boundary (page_floor(seq_len)),
+        # causing _insert_helper to encounter a fully-evicted key with no valid non-tombstone tail.
         new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen, pre_len - sliding_window_size
+            req.swa_evicted_seqlen,
+            pre_len - sliding_window_size - self.tree_cache.page_size,
         )
 
         if self.tree_cache.page_size > 1:
