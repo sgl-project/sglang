@@ -12,7 +12,7 @@ from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import _get_folding_tp_group
 from sglang.multimodal_gen.runtime.layers.activation import GeluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -23,6 +23,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rope
+from sglang.multimodal_gen.runtime.layers.utils import get_group_size
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
@@ -59,14 +63,18 @@ class Gemma3MLP(nn.Module):
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        tp_group=None,
     ) -> None:
         super().__init__()
+        if tp_group is None:
+            raise ValueError("Gemma3MLP requires tp_group.")
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            tp_group=tp_group,
         )
         self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
@@ -74,6 +82,7 @@ class Gemma3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
+            tp_group=tp_group,
         )
         if hidden_act != "gelu_pytorch_tanh":
             raise ValueError(
@@ -109,7 +118,8 @@ class Gemma3Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        tp_size = get_tp_world_size()
+        tp_group = _get_folding_tp_group(config)
+        tp_size = get_group_size(tp_group)
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -136,6 +146,7 @@ class Gemma3Attention(nn.Module):
             bias=config.text_config.attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            tp_group=tp_group,
         )
 
         self.o_proj = RowParallelLinear(
@@ -144,6 +155,7 @@ class Gemma3Attention(nn.Module):
             bias=config.text_config.attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            tp_group=tp_group,
         )
 
         self.layer_type = (
@@ -347,6 +359,7 @@ class Gemma3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.text_config.hidden_size
+        tp_group = _get_folding_tp_group(config)
         self.self_attn = Gemma3Attention(
             layer_id=layer_id,
             config=config,
@@ -366,6 +379,7 @@ class Gemma3DecoderLayer(nn.Module):
             hidden_act=config.text_config.hidden_activation,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            tp_group=tp_group,
         )
         self.input_layernorm = Gemma3RMSNorm(
             config.text_config.hidden_size, eps=config.text_config.rms_norm_eps
@@ -487,11 +501,13 @@ class SiglipMLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        tp_group = _get_folding_tp_group(config)
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
+            tp_group=tp_group,
         )
         self.act = act_layer()
         self.fc2 = RowParallelLinear(
@@ -499,6 +515,7 @@ class SiglipMLP(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("fc2", prefix),
+            tp_group=tp_group,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -515,13 +532,16 @@ class SiglipAttention(nn.Module):
         num_heads: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        tp_group=None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        tp_size = get_tp_world_size()
+        if tp_group is None:
+            raise ValueError("SiglipAttention requires tp_group.")
+        self.tp_size = get_group_size(tp_group)
         self.head_dim = hidden_size // num_heads
-        self.num_heads_per_partition = num_heads // tp_size
+        self.num_heads_per_partition = num_heads // self.tp_size
         self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
@@ -532,6 +552,7 @@ class SiglipAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+            tp_group=tp_group,
         )
 
         self.out_proj = RowParallelLinear(
@@ -540,6 +561,7 @@ class SiglipAttention(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("out_proj", prefix),
+            tp_group=tp_group,
         )
 
         self.attn = LocalAttention(
@@ -552,7 +574,7 @@ class SiglipAttention(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.hidden_size // get_tp_world_size()] * 3, dim=-1)
+        q, k, v = qkv.split([self.hidden_size // self.tp_size] * 3, dim=-1)
 
         batch_size, seq_len, _ = q.shape
         q = q.view(batch_size, seq_len, self.num_heads_per_partition, self.head_dim)
@@ -562,7 +584,7 @@ class SiglipAttention(nn.Module):
         attn_output = self.attn(q, k, v)
 
         attn_output = attn_output.reshape(
-            batch_size, seq_len, self.hidden_size // get_tp_world_size()
+            batch_size, seq_len, self.hidden_size // self.tp_size
         )
 
         output, _ = self.out_proj(attn_output)
@@ -583,11 +605,13 @@ class SiglipEncoderLayer(nn.Module):
             norm_layer = partial(nn.LayerNorm, eps=config.layer_norm_eps)
         self.layer_norm1 = norm_layer(config.hidden_size)
         self.layer_norm2 = norm_layer(config.hidden_size)
+        tp_group = _get_folding_tp_group(config)
         self.self_attn = SiglipAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            tp_group=tp_group,
         )
         self.mlp = SiglipMLP(
             config,
@@ -749,13 +773,9 @@ class Gemma3TextModel(nn.Module):
     def __init__(self, config: Gemma3Config):
         super().__init__()
         self.config = config
+        tp_group = _get_folding_tp_group(config)
         # TODO(yinfan.1024) support text encoding model quant later
         self.quant_config = None
-
-        # Use VocabParallelEmbedding
-        from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
-            VocabParallelEmbedding,
-        )
 
         self.vocab_size = config.text_config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
@@ -763,6 +783,7 @@ class Gemma3TextModel(nn.Module):
             config.text_config.hidden_size,
             org_num_embeddings=config.text_config.vocab_size,
             quant_config=self.quant_config,
+            tp_group=tp_group,
         )
         self.embed_scale = config.text_config.hidden_size**0.5
 
