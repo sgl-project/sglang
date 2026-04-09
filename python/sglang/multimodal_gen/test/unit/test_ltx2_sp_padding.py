@@ -5,6 +5,50 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import LTX2Attention
+
+
+class _FakeColumnParallelLinear(torch.nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        gather_output: bool = False,
+        quant_config=None,
+    ) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor):
+        return self.linear(x), None
+
+
+class _FakeRowParallelLinear(torch.nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        input_is_parallel: bool = False,
+        quant_config=None,
+    ) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor):
+        return self.linear(x), None
+
+
+class _CapturingUSPAttention(torch.nn.Module):
+    last_attn_mask = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__()
+
+    def forward(self, q, k, v, attn_mask=None, **kwargs):
+        _CapturingUSPAttention.last_attn_mask = attn_mask
+        return v
 
 
 class TestLTX2SequenceParallelPadding(unittest.TestCase):
@@ -51,6 +95,35 @@ class TestLTX2SequenceParallelPadding(unittest.TestCase):
         self.assertEqual(batch.sp_audio_latent_num_frames, 2)
         self.assertEqual(batch.sp_audio_start_frame, 2)
         self.assertEqual(batch.sp_audio_valid_token_count, 1)
+
+    def test_ltx2_attention_passes_mask_to_usp_attention(self):
+        x = torch.randn(1, 4, 8)
+        mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]], dtype=torch.float32)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.models.dits.ltx_2.get_tp_world_size",
+            return_value=1,
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.ltx_2.ColumnParallelLinear",
+            _FakeColumnParallelLinear,
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.ltx_2.RowParallelLinear",
+            _FakeRowParallelLinear,
+        ), patch(
+            "sglang.multimodal_gen.runtime.models.dits.ltx_2.USPAttention",
+            _CapturingUSPAttention,
+        ):
+            attn = LTX2Attention(
+                query_dim=8,
+                heads=2,
+                dim_head=4,
+                qk_norm=False,
+                use_local_attention=False,
+            )
+            _CapturingUSPAttention.last_attn_mask = None
+            _ = attn(x, mask=mask)
+
+        self.assertIs(_CapturingUSPAttention.last_attn_mask, mask)
 
 
 if __name__ == "__main__":

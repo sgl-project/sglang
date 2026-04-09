@@ -623,7 +623,7 @@ class LTX2Attention(nn.Module):
             if self.use_local_attention:
                 out = self.attn(q, k, v, attn_mask=mask)
             else:
-                out = self.attn(q, k, v)
+                out = self.attn(q, k, v, attn_mask=mask)
 
             if perturbation_mask is not None:
                 out = out * perturbation_mask + v * (1 - perturbation_mask)

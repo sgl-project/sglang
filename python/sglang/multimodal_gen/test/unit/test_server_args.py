@@ -203,5 +203,51 @@ class TestLTX23ParallelismSelection(unittest.TestCase):
         self.assertEqual(args.ring_degree, 1)
 
 
+class TestLTX23AttentionBackendSelection(unittest.TestCase):
+    def _from_dict_without_model_resolution(self, kwargs):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            return ServerArgs.from_dict(kwargs)
+
+    def _from_cli_without_model_resolution(self, argv):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            with patch.object(sys, "argv", ["sglang"] + argv):
+                args, unknown_args = parser.parse_known_args(argv)
+                return ServerArgs.from_cli_args(args, unknown_args)
+
+    def test_ltx23_one_stage_single_gpu_prefers_torch_sdpa(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 1,
+            }
+        )
+
+        self.assertEqual(args.attention_backend, "torch_sdpa")
+
+    def test_cli_ltx23_one_stage_single_gpu_prefers_torch_sdpa(self):
+        args = self._from_cli_without_model_resolution(
+            ["--model-path", "Lightricks/LTX-2.3", "--num-gpus", "1"]
+        )
+
+        self.assertEqual(args.attention_backend, "torch_sdpa")
+
+    def test_explicit_attention_backend_is_not_overridden(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "Lightricks/LTX-2.3",
+                "num_gpus": 1,
+                "attention_backend": "fa",
+            }
+        )
+
+        self.assertEqual(args.attention_backend, "fa")
+
+
 if __name__ == "__main__":
     unittest.main()
