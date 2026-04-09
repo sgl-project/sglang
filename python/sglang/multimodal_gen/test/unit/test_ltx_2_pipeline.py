@@ -5,12 +5,14 @@ import torch
 
 pytest.importorskip("pybase64")
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages import denoising as denoising_mod
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import LTX2VideoTransformer3DModel
 from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
     LTX2TwoStagePipeline,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    denoising as denoising_mod,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 
 
 def _make_server_args(ltx_variant: str):
@@ -55,6 +57,44 @@ def test_ltx2_av_ca_gate_timestep_factor_preserves_legacy_scaling():
     model.av_ca_timestep_scale_multiplier = 1
     model.timestep_scale_multiplier = 1000
     assert model._get_av_ca_gate_timestep_factor() == 1.0
+
+
+def test_ltx23_av_ca_uses_scalar_prompt_sigmas():
+    model = object.__new__(LTX2VideoTransformer3DModel)
+    model.config = SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2_3"))
+
+    timestep = torch.tensor([[0.0, 100.0, 100.0]])
+    audio_timestep = torch.tensor([[100.0, 100.0, 100.0]])
+    prompt_timestep = torch.tensor([100.0])
+    audio_prompt_timestep = torch.tensor([100.0])
+
+    video_timestep, audio_timestep_for_ca = model._get_av_ca_timesteps(
+        timestep,
+        audio_timestep,
+        prompt_timestep,
+        audio_prompt_timestep,
+    )
+
+    assert torch.equal(video_timestep, prompt_timestep)
+    assert torch.equal(audio_timestep_for_ca, audio_prompt_timestep)
+
+
+def test_ltx2_av_ca_preserves_legacy_per_token_timesteps():
+    model = object.__new__(LTX2VideoTransformer3DModel)
+    model.config = SimpleNamespace(arch_config=SimpleNamespace(ltx_variant="ltx_2"))
+
+    timestep = torch.tensor([[0.0, 100.0, 100.0]])
+    audio_timestep = torch.tensor([[100.0, 100.0, 100.0]])
+
+    video_timestep, audio_timestep_for_ca = model._get_av_ca_timesteps(
+        timestep,
+        audio_timestep,
+        None,
+        None,
+    )
+
+    assert torch.equal(video_timestep, timestep)
+    assert torch.equal(audio_timestep_for_ca, audio_timestep)
 
 
 def test_sp_sharding_image_latent_keeps_main_video_metadata(monkeypatch):

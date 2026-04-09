@@ -1473,6 +1473,29 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             return self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
         return float(self.av_ca_timestep_scale_multiplier)
 
+    def _get_av_ca_timesteps(
+        self,
+        timestep: torch.Tensor,
+        audio_timestep: torch.Tensor,
+        prompt_timestep: torch.Tensor | None,
+        audio_prompt_timestep: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ltx_variant = str(getattr(self.config.arch_config, "ltx_variant", "ltx_2"))
+        if ltx_variant != "ltx_2_3":
+            return timestep, audio_timestep
+
+        video_timestep = (
+            self._collapse_prompt_timestep(timestep)
+            if prompt_timestep is None
+            else prompt_timestep
+        )
+        audio_timestep_for_ca = (
+            self._collapse_prompt_timestep(audio_timestep)
+            if audio_prompt_timestep is None
+            else audio_prompt_timestep
+        )
+        return video_timestep, audio_timestep_for_ca
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1610,8 +1633,14 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         # 3.2. Prepare global modality cross attention modulation parameters
         hidden_dtype = hidden_states.dtype
+        av_ca_video_timestep, av_ca_audio_timestep = self._get_av_ca_timesteps(
+            timestep,
+            audio_timestep,
+            prompt_timestep,
+            audio_prompt_timestep,
+        )
         temb_ca_scale_shift, _ = self.av_ca_video_scale_shift_adaln_single(
-            timestep.flatten(), hidden_dtype=hidden_dtype
+            av_ca_video_timestep.flatten(), hidden_dtype=hidden_dtype
         )
         temb_ca_scale_shift = temb_ca_scale_shift.view(
             batch_size, -1, temb_ca_scale_shift.shape[-1]
@@ -1619,20 +1648,20 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         av_ca_gate_factor = self._get_av_ca_gate_timestep_factor()
         temb_ca_gate, _ = self.av_ca_a2v_gate_adaln_single(
-            timestep.flatten() * av_ca_gate_factor,
+            av_ca_video_timestep.flatten() * av_ca_gate_factor,
             hidden_dtype=hidden_dtype,
         )
         temb_ca_gate = temb_ca_gate.view(batch_size, -1, temb_ca_gate.shape[-1])
 
         temb_ca_audio_scale_shift, _ = self.av_ca_audio_scale_shift_adaln_single(
-            audio_timestep.flatten(), hidden_dtype=audio_hidden_states.dtype
+            av_ca_audio_timestep.flatten(), hidden_dtype=audio_hidden_states.dtype
         )
         temb_ca_audio_scale_shift = temb_ca_audio_scale_shift.view(
             batch_size, -1, temb_ca_audio_scale_shift.shape[-1]
         )
 
         temb_ca_audio_gate, _ = self.av_ca_v2a_gate_adaln_single(
-            audio_timestep.flatten() * av_ca_gate_factor,
+            av_ca_audio_timestep.flatten() * av_ca_gate_factor,
             hidden_dtype=audio_hidden_states.dtype,
         )
         temb_ca_audio_gate = temb_ca_audio_gate.view(
