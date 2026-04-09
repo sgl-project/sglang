@@ -590,29 +590,93 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_int4_weight_packed_with_c
   return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales), std::move(blocked_qzeros));
 }
 
-std::tuple<at::Tensor, at::Tensor> autoawq_to_int4pack(
+std::tuple<at::Tensor, at::Tensor> unpack_4bit_to_32bit_signed(const at::Tensor& qweight, const at::Tensor& qzeros) {
+  TORCH_CHECK(qweight.scalar_type() == at::kByte, "qweight must be uint8");
+  TORCH_CHECK(qzeros.scalar_type() == at::kByte, "qzeros must be uint8");
+  TORCH_CHECK(qweight.is_cpu() && qzeros.is_cpu(), "CPU version only");
+
+  const auto W0 = qweight.size(0);
+  const auto W1 = qweight.size(1);
+  const auto Z0 = qzeros.size(0);
+  const auto Z1 = qzeros.size(1);
+
+  // unpacked_weights: (W0 * 8, W1), int8
+  auto unpacked_weights = at::zeros({W0 * 8, W1}, at::TensorOptions().dtype(at::kChar).device(qweight.device()));
+
+  // unpacked_zeros: (Z0, Z1 * 8), int8
+  auto unpacked_zeros = at::zeros({Z0, Z1 * 8}, at::TensorOptions().dtype(at::kChar).device(qzeros.device()));
+
+  const uint8_t* qw_ptr = qweight.data_ptr<uint8_t>();
+  const uint8_t* qz_ptr = qzeros.data_ptr<uint8_t>();
+  int8_t* uw_ptr = unpacked_weights.data_ptr<int8_t>();
+  int8_t* uz_ptr = unpacked_zeros.data_ptr<int8_t>();
+
+  // unpack weights
+  for (int64_t row = 0; row < W0 * 8; ++row) {
+    int i = row & 7;         // row % 8
+    int src_row = row >> 3;  // row / 8
+    int shift = 4 * i;
+
+    for (int64_t col = 0; col < W1; ++col) {
+      uint8_t v = qw_ptr[src_row * W1 + col];
+      uw_ptr[row * W1 + col] = static_cast<int8_t>((v >> shift) & 0xF);
+    }
+  }
+
+  // unpack zeros
+  for (int64_t col = 0; col < Z1 * 8; ++col) {
+    int i = col & 7;
+    int src_col = col >> 3;
+    int shift = 4 * i;
+
+    for (int64_t row = 0; row < Z0; ++row) {
+      uint8_t v = qz_ptr[row * Z1 + src_col];
+      uz_ptr[row * (Z1 * 8) + col] = static_cast<int8_t>((v >> shift) & 0xF);
+    }
+  }
+
+  return std::make_tuple(unpacked_weights, unpacked_zeros + 1);
+}
+
+std::tuple<at::Tensor, at::Tensor> int4pack(
     at::Tensor qweight,  // (*, K, N / 8), int32
-    at::Tensor qzeros)   // (*, K / group_size, N / 8), int32
+    at::Tensor qzeros,
+    int64_t quant_method_4bit)  // (*, K / group_size, N / 8), int32
 {
-  qweight = qweight.contiguous();
-  qzeros = qzeros.contiguous();
-  // bitshifts: [0, 4, 1, 5, 2, 6, 3, 7] * 4
-  auto bitshifts = at::tensor({0, 4, 1, 5, 2, 6, 3, 7}, at::kInt) * 4;
-  auto qweight_unsq = qweight.unsqueeze(-1);  // [..., K, N/8, 1]
-  auto unpacked = (at::bitwise_right_shift(qweight_unsq, bitshifts) & 0xF).contiguous();
-  auto qweight_final = unpacked.flatten(-2).transpose(-1, -2).to(at::kByte).clone();
-  auto qzeros_unsq = qzeros.unsqueeze(-1);
-  auto qzeros_unpacked = (at::bitwise_right_shift(qzeros_unsq, bitshifts) & 0xF).contiguous();
-  auto qzeros_final = qzeros_unpacked.flatten(-2).to(at::kByte).clone();
-  return std::make_tuple(qweight_final, qzeros_final);
+  if (quant_method_4bit == 0) {
+    qweight = qweight.contiguous();
+    qzeros = qzeros.contiguous();
+    // bitshifts: [0, 4, 1, 5, 2, 6, 3, 7] * 4
+    auto bitshifts = at::tensor({0, 4, 1, 5, 2, 6, 3, 7}, at::kInt) * 4;
+    auto qweight_unsq = qweight.unsqueeze(-1);  // [..., K, N/8, 1]
+    auto unpacked = (at::bitwise_right_shift(qweight_unsq, bitshifts) & 0xF).contiguous();
+    auto qweight_final = unpacked.flatten(-2).transpose(-1, -2).to(at::kByte).clone();
+    auto qzeros_unsq = qzeros.unsqueeze(-1);
+    auto qzeros_unpacked = (at::bitwise_right_shift(qzeros_unsq, bitshifts) & 0xF).contiguous();
+    auto qzeros_final = qzeros_unpacked.flatten(-2).to(at::kByte).clone();
+    return std::make_tuple(qweight_final, qzeros_final);
+  } else {
+    auto outputs = unpack_4bit_to_32bit_signed(qweight, qzeros);
+
+    at::Tensor unpacked_qweight = std::get<0>(outputs);
+    at::Tensor unpacked_qzeros = std::get<1>(outputs);
+
+    // qweight = unpacked_qweight.T.to(uint8)
+    at::Tensor packed_qweight = unpacked_qweight.transpose(0, 1).contiguous().to(at::kByte);
+
+    // qzeros = unpacked_qzeros.to(uint8)
+    at::Tensor packed_qzeros = unpacked_qzeros.contiguous().to(at::kByte);
+
+    return std::make_tuple(packed_qweight, packed_qzeros);
+  }
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
     at::Tensor qweight,  // (*, K, N / 8), int32
     at::Tensor qzeros,   // (*, K / group_size, N / 8), int32
-    at::Tensor scales    // (*, K / group_size, N), bfloat16
-) {
-  auto res = autoawq_to_int4pack(qweight, qzeros);
+    at::Tensor scales,   // (*, K / group_size, N), bfloat16
+    int64_t quant_method_4bit) {
+  auto res = int4pack(qweight, qzeros, quant_method_4bit);
   auto _qweight = std::get<0>(res);
   auto _qzeros = std::get<1>(res);
   auto _scales = scales;

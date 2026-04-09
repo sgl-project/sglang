@@ -93,6 +93,8 @@ CPU_QUANTIZATIPON_METHODS = {
     "w8a8_int8": W8A8Int8Config,
     "compressed-tensors": CompressedTensorsConfig,
     "awq": AWQConfig,
+    "gptq": GPTQConfig,
+    "gptq_marlin": GPTQMarlinConfig,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}

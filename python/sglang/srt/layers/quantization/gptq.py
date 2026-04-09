@@ -52,7 +52,7 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
-from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -75,6 +75,13 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
+
+_is_cpu = is_cpu()
+if _is_cpu:
+    from sglang.srt.layers.amx_utils import (
+        CPUQuantMethod,
+        _amx_process_weight_after_loading,
+    )
 
 
 def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
@@ -565,6 +572,11 @@ class GPTQLinearMethod(LinearMethodBase):
         layer.g_idx = torch.nn.Parameter(layer.g_idx.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
+        if _is_cpu:
+            _amx_process_weight_after_loading(
+                layer, ["qweight", "qzeros", "scales"], None, "gptq"
+            )
+            return
         # exllama needs to shuffle the weight after the weight is loaded
         # here we do the shuffle on first forward pass
         if self.use_shuffle:
@@ -1436,7 +1448,14 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_g_idx_sort_indices, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-
+        if _is_cpu:
+            _amx_process_weight_after_loading(
+                layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "gptq"
+            )
+            _amx_process_weight_after_loading(
+                layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "gptq"
+            )
+            return
         # Process act_order
         if self.quant_config.desc_act:
             # Get sorting based on g_idx
@@ -1528,6 +1547,33 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if _is_cpu:
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            assert (
+                self.moe_runner_config.activation == "silu"
+            ), "Only SiLU activation is supported."
+
+            x = dispatch_output.hidden_states
+            topk_output = dispatch_output.topk_output
+            topk_weights, topk_ids, _ = topk_output
+            output = torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_qweight,
+                layer.w2_qweight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                CPUQuantMethod.INT4_W4A8,
+                layer.w13_scales,  # w1_scale
+                layer.w2_scales,  # w2_scale
+                layer.w13_qzeros,
+                layer.w2_qzeros,
+                None,  # block_size
+                True,  # is_vnni
+            )
+            return StandardCombineInput(hidden_states=output)
+
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_qweight,
             w2_qweight=layer.w2_qweight,

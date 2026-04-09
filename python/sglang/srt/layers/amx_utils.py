@@ -121,12 +121,15 @@ def _amx_process_weight_after_loading(
                 weight_tensor = weight_tensor.view(-1, weight_tensor.size(-1))
                 weight_tensor.copy_(packed_weight)
     else:
-        assert qweight_packed_method in ["awq"]  # TODO: add GPTQ, etc.
+        assert qweight_packed_method in ["awq", "gptq"]
         qweight_tensor = getattr(module, weight_names[0])
         qzeros_tensor = getattr(module, weight_names[1])
         scales_tensor = getattr(module, weight_names[2])
         qweight, qzeros, scales = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-            qweight_tensor, qzeros_tensor, scales_tensor
+            qweight_tensor,
+            qzeros_tensor,
+            scales_tensor,
+            0 if qweight_packed_method is "awq" else 1,
         )
         packed_qweight = torch.nn.Parameter(
             qweight.detach(),
