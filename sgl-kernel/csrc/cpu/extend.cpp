@@ -207,6 +207,14 @@ void extend_attention_kernel_impl(
         if (num_keys - n <= BLOCK_N) {
           for (int row = 0; row < m_size; ++row) {
             int last_col = m + row - n;
+            // Clamp to -1: when n > m + row every key in this block is a future
+            // key, so the entire row should be masked.  Without this clamp,
+            // last_col+1 <= 0 and fill_stub would write before row_ptr.
+            // Example: 
+            //  For max_len_extend > 4096 → selects BLOCK_M=512, BLOCK_N=768
+            //  m + BLOCK_M = 512 + 512 = 1024 > BLOCK_N = 768, this means we can have a a second n-block at n=768.
+            //  For m = 512, row = 0, n = 768, last_col = 512 + 0 - 768 = -256 → out of bounds write in fill_stub
+            last_col = std::max(last_col, -1);            
             // fill [last_col + 1, n_size) to -inf
             float* row_ptr = s_i + row * BLOCK_N;
             fill_stub(row_ptr + last_col + 1, -std::numeric_limits<float>::infinity(), n_size - last_col - 1);
