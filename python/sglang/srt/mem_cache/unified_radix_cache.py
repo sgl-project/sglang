@@ -49,20 +49,6 @@ if TYPE_CHECKING:
 class UnifiedTreeNode:
     counter = 0
 
-    __slots__ = (
-        "children",
-        "parent",
-        "key",
-        "tree_components",
-        "component_data",
-        "last_access_time",
-        "host_value",
-        "hit_count",
-        "lru_prev",
-        "lru_next",
-        "id",
-    )
-
     def __init__(self, tree_components: tuple[ComponentType, ...]):
         self.children = defaultdict(partial(UnifiedTreeNode, tree_components))
         self.parent: UnifiedTreeNode | None = None
