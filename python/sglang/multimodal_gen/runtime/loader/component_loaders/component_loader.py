@@ -298,7 +298,7 @@ class TokenizerLoader(ComponentLoader):
         # Flux.2 aligns to the tokenizer defaults from the original baseline.
         # TODO: abstract this
         if isinstance(server_args.pipeline_config, Flux2PipelineConfig):
-            return AutoTokenizer.from_pretrained(component_model_path)
+            return AutoProcessor.from_pretrained(component_model_path)
 
         return AutoTokenizer.from_pretrained(
             component_model_path,

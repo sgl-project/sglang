@@ -422,7 +422,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 audio_seq_lens = (audio_seq_lens - 2) // 2 + 1
 
         if (
-            self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+            self.model_type in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
             and video_timestamps is not None
         ):
             input_ids, offsets, modality_list = self.build_input_ids_with_timestamps(

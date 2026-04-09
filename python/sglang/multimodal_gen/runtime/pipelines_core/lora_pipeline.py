@@ -506,16 +506,25 @@ class LoRAPipeline(ComposedPipelineBase):
             return bool(self.cur_adapter_name)
         return target in self.cur_adapter_name
 
-    def load_lora_adapter(self, lora_path: str, lora_nickname: str, rank: int):
+    def load_lora_adapter(
+        self,
+        lora_path: str,
+        lora_nickname: str,
+        rank: int,
+        weight_name: str | None = None,
+    ):
         """
         Load the LoRA, and setup the lora_adapters for later weight replacement
         """
         assert lora_path is not None
 
+        if weight_name is None and lora_path == self.server_args.lora_path:
+            weight_name = self.server_args.lora_weight_name
+
         # Only rank 0 downloads to avoid race conditions where other ranks
         # try to load incomplete downloads
         if rank == 0:
-            lora_local_path = maybe_download_lora(lora_path)
+            lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
         else:
             lora_local_path = None
 
@@ -525,7 +534,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
         # Non-rank-0 workers now download (will hit cache since rank 0 completed)
         if rank != 0:
-            lora_local_path = maybe_download_lora(lora_path)
+            lora_local_path = maybe_download_lora(lora_path, weight_name=weight_name)
 
         raw_state_dict = load_file(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)

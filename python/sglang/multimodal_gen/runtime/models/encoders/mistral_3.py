@@ -259,7 +259,7 @@ class MistralModel(nn.Module):
         mask_function = create_causal_mask
         causal_mask = mask_function(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,
@@ -269,8 +269,10 @@ class MistralModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        hidden_states_pool = []
+        hidden_states_pool = [] if output_hidden_states else None
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if output_hidden_states:
+                hidden_states_pool.append(hidden_states)
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -281,8 +283,6 @@ class MistralModel(nn.Module):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-            if output_hidden_states:
-                hidden_states_pool.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:

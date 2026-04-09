@@ -529,7 +529,7 @@ class Phi4MMForCausalLM(nn.Module):
                 param = params_dict.get(name)
                 if param is None:
                     if "lora" not in name:
-                        logger.warning("Warning: {name} not found in model parameters")
+                        logger.warning(f"Warning: {name} not found in model parameters")
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

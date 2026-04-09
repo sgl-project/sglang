@@ -292,6 +292,10 @@ class WhisperEncoder(torch.nn.Module):
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        device = self.conv1.weight.device
+        input_features = input_features.to(device=device)
+        position_ids = position_ids.to(device=device)
+
         inputs_embeds = torch.nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
 
