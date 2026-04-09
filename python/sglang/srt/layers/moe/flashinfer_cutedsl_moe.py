@@ -1,11 +1,18 @@
 from typing import Optional
 
+import cutlass.torch as cutlass_torch
 import torch
+import torch.distributed._symmetric_memory as torch_symmetric_memory
 from flashinfer import (
     scaled_fp4_grouped_quantize,
     silu_and_mul_scaled_nvfp4_experts_quantize,
 )
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
+
+from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.environ import envs
+
+_SYMMETRIC_BARRIER_TENSORS = (None, None)
 
 
 def get_cute_dtype(input: torch.Tensor) -> str:
@@ -30,9 +37,14 @@ def flashinfer_cutedsl_moe_masked(
     w2_blockscale: torch.Tensor,
     w2_alpha,
     masked_m: torch.Tensor,
+    topk_weights: Optional[torch.Tensor] = None,
+    recv_rank_info: Optional[torch.Tensor] = None,
+    recv_idx_info: Optional[torch.Tensor] = None,
     down_sm_count: Optional[int] = None,
     down_signals: Optional[torch.Tensor] = None,
     down_start_event: Optional[torch.cuda.Event] = None,
+    combine_out: Optional[torch.Tensor] = None,
+    combine_out_ptrs: Optional[torch.Tensor] = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -145,6 +157,7 @@ def flashinfer_cutedsl_moe_masked(
         sf_vec_size=sf_vec_size,
         alpha=w1_alpha.view(1, 1, num_experts),
         alpha_dtype=get_cute_dtype(w1_alpha),
+        is_swap_ab=True,
     )  # in logical [m, n, l]
 
     # SILU and quantization
@@ -158,8 +171,45 @@ def flashinfer_cutedsl_moe_masked(
         down_start_event.record()
 
     # Gemm2
-    out = torch.empty((num_experts, m, k), dtype=torch.bfloat16, device=a_q.device)
-    out = out.permute(1, 2, 0)  # requirement of kernel
+    is_combine_fusion = combine_out is not None
+    if is_combine_fusion:
+        group = get_tp_group().device_group
+        num_ranks = group.size()
+        global _SYMMETRIC_BARRIER_TENSORS
+        if _SYMMETRIC_BARRIER_TENSORS[0] is None:
+            num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+            barrier_flag_local = torch_symmetric_memory.empty(
+                (num_sms,),
+                device=a_q.device,
+                dtype=torch.int32,
+            )
+            barrier_flag_local.fill_(0)
+            barrier_flag_local_handle = torch_symmetric_memory.rendezvous(
+                barrier_flag_local, group=group
+            )
+            barrier_flag_multicast = cutlass_torch.as_tensor(
+                barrier_flag_local_handle.multicast_ptr,
+                barrier_flag_local.shape,
+                barrier_flag_local.dtype,
+            )
+            _SYMMETRIC_BARRIER_TENSORS = (
+                barrier_flag_local,
+                barrier_flag_multicast,
+            )
+        else:
+            barrier_flag_local, barrier_flag_multicast = _SYMMETRIC_BARRIER_TENSORS
+
+        # Modify c_dtype based on fused grouped gemm + combine precision
+        c_dtype = "bfloat16" if combine_out.dtype == torch.bfloat16 else "float32"
+        out = combine_out
+    else:
+        num_ranks = 0
+        barrier_flag_local = None
+        barrier_flag_multicast = None
+        recv_idx_info = None
+        out = torch.empty((num_experts, m, k), dtype=torch.bfloat16, device=a_q.device)
+        out = out.permute(1, 2, 0)  # requirement of kernel
+
     grouped_gemm_nt_masked(
         (diq, diq_sf),
         (w2.permute(1, 2, 0), w2_blockscale),
@@ -179,5 +229,21 @@ def flashinfer_cutedsl_moe_masked(
             if down_sm_count is not None or down_signals is not None
             else {}
         ),
-    )  # in logical [m, k, l]
-    return out.permute(2, 0, 1)
+        is_swap_ab=True,
+        is_combine_fusion=is_combine_fusion,
+        topk_weights=topk_weights,
+        idx_src_info=recv_idx_info,
+        rank_src_info=recv_rank_info,
+        out_ptrs=combine_out_ptrs,
+        num_ranks=num_ranks,
+        barrier_flag_local=barrier_flag_local,
+        barrier_flag_multicast=barrier_flag_multicast,
+    )
+
+    if envs.SGLANG_FUSED_GROUPED_GEMM_COMBINE_FP32.get():
+        combine_out = combine_out.to(torch.bfloat16)
+
+    if not is_combine_fusion:
+        # in logical [m, k, l]
+        out = out.permute(2, 0, 1)
+    return out

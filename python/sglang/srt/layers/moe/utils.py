@@ -163,6 +163,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
     global IS_SBO_ENABLED
+    global IS_FUSED_GROUPED_GEMM_COMBINE
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global MOE_QUANTIZATION
@@ -183,6 +184,7 @@ def initialize_moe_config(server_args: ServerArgs):
     DEEPEP_CONFIG = server_args.deepep_config or ""
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
+    IS_FUSED_GROUPED_GEMM_COMBINE = server_args.enable_fused_grouped_gemm_combine
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
@@ -252,6 +254,13 @@ def is_sbo_enabled() -> bool:
     if IS_SBO_ENABLED is None:
         IS_SBO_ENABLED = False
     return IS_SBO_ENABLED
+
+
+def is_fused_grouped_gemm_combine_enabled() -> bool:
+    global IS_FUSED_GROUPED_GEMM_COMBINE
+    if IS_FUSED_GROUPED_GEMM_COMBINE is None:
+        IS_FUSED_GROUPED_GEMM_COMBINE = False
+    return IS_FUSED_GROUPED_GEMM_COMBINE
 
 
 def get_tbo_token_distribution_threshold() -> float:
