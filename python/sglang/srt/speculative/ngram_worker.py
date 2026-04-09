@@ -11,9 +11,6 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.cpp_ngram.external_corpus import (
-    iter_external_corpus_chunks,
-)
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -61,20 +58,40 @@ class NGRAMWorker:
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
         )
         if server_args.speculative_ngram_external_corpus_path is not None:
-            loaded_token_count = self.ngram_corpus.load_external_corpus(
+            from sglang.srt.speculative.cpp_ngram.external_corpus import (
+                iter_external_corpus_chunks,
+            )
+
+            corpus_path = server_args.speculative_ngram_external_corpus_path
+            chunks = list(
                 iter_external_corpus_chunks(
-                    server_args.speculative_ngram_external_corpus_path,
+                    corpus_path,
                     target_worker.tokenizer,
                     server_args.speculative_ngram_external_corpus_max_tokens,
                 )
             )
+            loaded = self.add_external_corpus(corpus_path, chunks)
+            self.commit_corpus_load(corpus_path, loaded)
             logger.info(
-                "Loaded external ngram corpus (%d tokens) for SAM speculative decoding.",
-                loaded_token_count,
+                "Loaded external ngram corpus '%s' (%d tokens).",
+                corpus_path,
+                loaded,
             )
 
     def clear_cache_pool(self):
         self.ngram_corpus.reset()
+
+    def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
+        return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
+
+    def commit_corpus_load(self, corpus_id: str, loaded_token_count: int) -> None:
+        self.ngram_corpus.commit_external_corpus_load(corpus_id, loaded_token_count)
+
+    def remove_external_corpus(self, corpus_id: str) -> None:
+        self.ngram_corpus.remove_external_corpus(corpus_id)
+
+    def list_external_corpora(self) -> list[str]:
+        return self.ngram_corpus.list_external_corpora()
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)

@@ -19,12 +19,16 @@ namespace ngram {
 
 class Ngram {
   std::unique_ptr<Trie> trie_;
-  std::unique_ptr<SuffixAutomaton> sam_;
+  std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
+  // FIXME: single staging slot — only one corpus can be loaded at a time.
+  // To support concurrent loads, move staging into a per-load local variable.
+  std::unique_ptr<SuffixAutomaton> staging_sam_;
   Param param_;
 
-  // NOTE: protects trie_ and pending_count_. Ensures batchMatch never reads
-  // trie_ while insertWorker is writing. After synchronize(), no pending
-  // inserts remain so mutex_ contention is effectively zero.
+  // NOTE: protects trie_, sams_, and pending_count_. staging_sam_ is NOT
+  // protected by mutex_ — it is only accessed from the corpus loading thread.
+  // finishExternalCorpusLoad briefly acquires mutex_ to move the completed
+  // SAM into sams_.
   mutable std::mutex mutex_;
   mutable std::condition_variable sync_cv_;
   // NOTE: tracks inserts from enqueue through trie_->insert() completion,
@@ -46,9 +50,16 @@ class Ngram {
 
   void appendExternalCorpusTokens(const std::vector<int32_t>& tokens);
 
-  void finishExternalCorpusLoad();
+  // Publishes the staged corpus. Duplicate corpus_id is rejected.
+  void finishExternalCorpusLoad(const std::string& corpus_id);
+
+  void removeExternalCorpus(const std::string& corpus_id);
+
+  void resetStagingSam();
 
   void clearExternalCorpus();
+
+  std::vector<std::string> listExternalCorpora() const;
 
   Result batchMatch(const std::vector<std::vector<int32_t>>& tokens);
 
@@ -59,6 +70,9 @@ class Ngram {
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 
+  // Resets the online trie and match state but preserves external corpora
+  // (sams_). External corpora are user-managed via add/remove APIs and
+  // should not be affected by cache flushes.
   void reset() {
     std::unique_lock<std::mutex> lock(mutex_);
     if (trie_) {

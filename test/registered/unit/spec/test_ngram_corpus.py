@@ -17,6 +17,7 @@ register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
 
 def _make_corpus(match_type="BFS", **kwargs):
+    external_corpus_documents = kwargs.pop("external_corpus_documents", None)
     defaults = dict(
         max_trie_depth=12,
         min_bfs_breadth=1,
@@ -25,11 +26,24 @@ def _make_corpus(match_type="BFS", **kwargs):
         capacity=100000,
         external_sam_budget=0,
         external_corpus_max_tokens=10000000,
-        external_corpus_documents=None,
     )
     defaults.update(kwargs)
     defaults["match_type"] = match_type
-    return NgramCorpus(**defaults)
+    corpus = NgramCorpus(**defaults)
+    if external_corpus_documents is not None:
+        from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
+
+        chunks = []
+        has_prev = False
+        for doc in external_corpus_documents:
+            if has_prev:
+                chunks.append([SEPARATOR_TOKEN] + list(doc))
+            else:
+                chunks.append(list(doc))
+            has_prev = True
+        loaded_token_count = corpus.load_external_corpus_named("test_corpus", chunks)
+        corpus.commit_external_corpus_load("test_corpus", loaded_token_count)
+    return corpus
 
 
 def _batch_get(
@@ -707,9 +721,11 @@ class TestNgramCorpusExternalSam(CustomTestCase):
             path = f.name
         self.addCleanup(os.remove, path)
 
-        loaded_token_count = corpus.load_external_corpus(
-            iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=8)
+        loaded_token_count = corpus.load_external_corpus_named(
+            path,
+            iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=8),
         )
+        corpus.commit_external_corpus_load(path, loaded_token_count)
         # 5 doc tokens + 1 separator + 2 doc tokens = 8
         self.assertEqual(loaded_token_count, 8)
 
@@ -733,17 +749,9 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         self.addCleanup(os.remove, path)
 
         with self.assertRaisesRegex(ValueError, "token limit"):
-            corpus.load_external_corpus(
-                iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=4)
-            )
-
-    def test_external_sam_documents_reject_oversized_corpus(self):
-        with self.assertRaisesRegex(ValueError, "token limit"):
-            _make_corpus(
-                "BFS",
-                external_sam_budget=2,
-                external_corpus_max_tokens=4,
-                external_corpus_documents=[[1, 2, 3], [4, 5]],
+            corpus.load_external_corpus_named(
+                path,
+                iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=4),
             )
 
     def test_external_sam_only_chain(self):
@@ -904,6 +912,247 @@ class TestNgramCorpusMatchBenchmark(CustomTestCase):
             f"Incremental ({incremental_us:.1f} us) should not be slower than "
             f"rebuild ({rebuild_us:.1f} us)",
         )
+
+
+class TestNgramCorpusMultiSam(CustomTestCase):
+    """Verify multi-SAM add/remove/list and budget splitting."""
+
+    def test_add_and_list(self):
+        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
+        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+        corpus.commit_external_corpus_load("a", loaded_token_count)
+        loaded_token_count = corpus.load_external_corpus_named(
+            "b", [[10, 20, 30, 40, 50]]
+        )
+        corpus.commit_external_corpus_load("b", loaded_token_count)
+        ids = corpus.list_external_corpora()
+        self.assertEqual(sorted(ids), ["a", "b"])
+
+    def test_remove(self):
+        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
+        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+        corpus.commit_external_corpus_load("a", loaded_token_count)
+        loaded_token_count = corpus.load_external_corpus_named(
+            "b", [[10, 20, 30, 40, 50]]
+        )
+        corpus.commit_external_corpus_load("b", loaded_token_count)
+        corpus.remove_external_corpus("a")
+        self.assertEqual(corpus.list_external_corpora(), ["b"])
+
+    def test_remove_nonexistent_is_noop(self):
+        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
+        corpus.remove_external_corpus("nonexistent")
+        self.assertEqual(corpus.list_external_corpora(), [])
+
+    def test_multi_sam_candidates(self):
+        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
+        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
+        corpus.commit_external_corpus_load("a", loaded_token_count)
+        loaded_token_count = corpus.load_external_corpus_named("b", [[1, 2, 3, 20, 21]])
+        corpus.commit_external_corpus_load("b", loaded_token_count)
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(6, 6).tolist()
+        )
+        # Both SAMs should contribute candidates
+        self.assertIn([3, 10, 11], leaf_paths)
+        self.assertIn([3, 20, 21], leaf_paths)
+
+    def test_remove_reduces_candidates(self):
+        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
+        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
+        corpus.commit_external_corpus_load("a", loaded_token_count)
+        loaded_token_count = corpus.load_external_corpus_named("b", [[1, 2, 3, 20, 21]])
+        corpus.commit_external_corpus_load("b", loaded_token_count)
+
+        corpus.remove_external_corpus("b")
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(6, 6).tolist()
+        )
+        self.assertIn([3, 10, 11], leaf_paths)
+        self.assertNotIn([3, 20, 21], leaf_paths)
+
+    def test_make_corpus_with_documents(self):
+        """_make_corpus helper loads documents as a named corpus."""
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_documents=[[1, 2, 3, 4, 5]],
+        )
+        ids = corpus.list_external_corpora()
+        self.assertIn("test_corpus", ids)
+
+    def test_remove_frees_token_budget(self):
+        """Removing a corpus should free its tokens from the total budget."""
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_max_tokens=10,
+        )
+        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+        corpus.commit_external_corpus_load("a", loaded_token_count)
+        loaded_token_count = corpus.load_external_corpus_named(
+            "b", [[10, 20, 30, 40, 50]]
+        )
+        corpus.commit_external_corpus_load("b", loaded_token_count)
+        self.assertEqual(corpus.remaining_token_budget, 0)
+
+        corpus.remove_external_corpus("a")
+        self.assertEqual(corpus.remaining_token_budget, 5)
+
+        # Now there's room for a new corpus.
+        loaded_token_count = corpus.load_external_corpus_named("c", [[100, 200, 300]])
+        corpus.commit_external_corpus_load("c", loaded_token_count)
+        self.assertEqual(sorted(corpus.list_external_corpora()), ["b", "c"])
+
+    def test_duplicate_corpus_id_is_rejected(self):
+        """Adding a duplicate corpus_id should fail without replacing the original corpus."""
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_max_tokens=10,
+        )
+        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+        corpus.commit_external_corpus_load("a", loaded_token_count)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            corpus.load_external_corpus_named("a", [[10, 20, 30]])
+
+        self.assertEqual(corpus.remaining_token_budget, 5)
+        self.assertEqual(corpus.list_external_corpora(), ["a"])
+
+        # The original corpus must still be usable for matching.
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(4, 4).tolist()
+        )
+        self.assertTrue(
+            any(4 in path or 5 in path for path in leaf_paths),
+            f"Expected tokens from corpus 'a' in {leaf_paths}",
+        )
+
+    def test_error_on_load_preserves_existing_corpora(self):
+        """A failed load must not wipe previously loaded corpora (staging-only cleanup)."""
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=4,
+            external_sam_budget=3,
+            external_corpus_max_tokens=10,
+        )
+        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
+        corpus.commit_external_corpus_load("a", loaded_token_count)
+
+        # Force an error by exceeding the budget.
+        with self.assertRaises(ValueError):
+            corpus.load_external_corpus_named("b", [[10, 20, 30, 40, 50, 60]])
+
+        self.assertEqual(corpus.list_external_corpora(), ["a"])
+        self.assertEqual(corpus.remaining_token_budget, 5)
+
+        # "a" must still be usable for matching.
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(4, 4).tolist()
+        )
+        # Should still find continuations from corpus "a".
+        self.assertTrue(
+            any(4 in path or 5 in path for path in leaf_paths),
+            f"Expected tokens from corpus 'a' in {leaf_paths}",
+        )
+
+
+class TestMultiSamHttpMock(CustomTestCase):
+    """Test HTTP endpoints for multi-SAM management with a mocked backend."""
+
+    @classmethod
+    def setUpClass(cls):
+        from unittest.mock import AsyncMock, MagicMock
+
+        try:
+            from starlette.testclient import TestClient
+
+            from sglang.srt.entrypoints.http_server import app, set_global_state
+        except (ImportError, OSError):
+            raise unittest.SkipTest(
+                "http_server import requires CUDA libraries not available on CPU"
+            )
+        from sglang.srt.managers.io_struct import (
+            AddExternalCorpusReqOutput,
+            ListExternalCorporaReqOutput,
+            RemoveExternalCorpusReqOutput,
+        )
+
+        mock_state = MagicMock()
+        tm = mock_state.tokenizer_manager
+
+        # Wire up async methods that the HTTP handlers call
+        tm.add_external_corpus = AsyncMock(
+            return_value=AddExternalCorpusReqOutput(
+                success=True,
+                corpus_id="test-id",
+                message="Loaded corpus 'test-id' with 100 tokens.",
+                loaded_token_count=100,
+            )
+        )
+        tm.remove_external_corpus = AsyncMock(
+            return_value=RemoveExternalCorpusReqOutput(
+                success=True, message="Removed corpus 'test-id'."
+            )
+        )
+        tm.list_external_corpora = AsyncMock(
+            return_value=ListExternalCorporaReqOutput(
+                success=True, corpus_ids=["a", "b"]
+            )
+        )
+        set_global_state(mock_state)
+        cls.client = TestClient(app)
+        cls.mock_tm = tm
+
+    def test_add_corpus(self):
+        resp = self.client.post(
+            "/add_external_corpus",
+            json={"corpus_id": "my-corpus", "documents": ["hello world"]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["corpus_id"], "test-id")
+        self.assertEqual(data["loaded_token_count"], 100)
+
+    def test_add_corpus_auto_id(self):
+        resp = self.client.post(
+            "/add_external_corpus",
+            json={"documents": ["hello world"]},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
+
+    def test_remove_corpus(self):
+        resp = self.client.post(
+            "/remove_external_corpus",
+            json={"corpus_id": "test-id"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
+
+    def test_remove_corpus_missing_id(self):
+        resp = self.client.post(
+            "/remove_external_corpus",
+            json={},
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_list_corpora(self):
+        resp = self.client.get("/list_external_corpora")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["success"])
+        self.assertEqual(sorted(data["corpus_ids"]), ["a", "b"])
 
 
 if __name__ == "__main__":

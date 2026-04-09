@@ -220,6 +220,7 @@ def _export_static_state(model):
 
 
 def _import_static_state(model, static_params):
-    self_named_buffers = dict(model.named_buffers())
-    for name, tensor in static_params["buffers"]:
-        self_named_buffers[name][...] = tensor
+    with torch.inference_mode():
+        self_named_buffers = dict(model.named_buffers())
+        for name, tensor in static_params["buffers"]:
+            self_named_buffers[name][...] = tensor
