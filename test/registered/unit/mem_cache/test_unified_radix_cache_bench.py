@@ -1,6 +1,6 @@
 """Large-scale benchmark + fuzz correctness tests for UnifiedRadixCache.
 
-Measures insert / match_prefix / evict / lock-unlock / mixed-workload throughput
+Measures insert / match_prefix / evict / lock-unlock / cache_finished throughput
 (tokens/s, ops/s, p50/p99 latency) with randomly generated prefix-sharing
 sequences at million-token scale.
 
@@ -10,6 +10,7 @@ Usage (standalone):
 """
 
 import argparse
+import gc
 import logging
 import random
 import statistics
@@ -300,11 +301,10 @@ class BenchResult:
         tok_str = (
             f"{self.tokens_per_sec:>12,.0f} tok/s"
             if self.total_tokens > 0
-            else " " * 18
+            else f"{'N/A':>12s} tok/s"
         )
         return (
-            f"[bench] {self.name:<20s} | {self.num_ops:>7,d} ops | "
-            f"{self.total_tokens:>10,d} tokens | "
+            f"  {self.name:<18s} | "
             f"{tok_str} | {self.ops_per_sec:>10,.0f} ops/s | "
             f"p50={self.p50_us:>8,.0f}us  p99={self.p99_us:>8,.0f}us"
         )
@@ -320,13 +320,18 @@ def bench_api(
 ) -> BenchResult:
     """Time *op_fn(item)* for each item from *setup_fn()*, report throughput."""
     items = setup_fn()
-    assert len(items) >= num_ops + warmup, (
-        f"setup_fn returned {len(items)} items, need {num_ops + warmup}"
-    )
+    assert (
+        len(items) >= num_ops + warmup
+    ), f"setup_fn returned {len(items)} items, need {num_ops + warmup}"
 
     # Warmup
     for i in range(warmup):
         op_fn(items[i])
+
+    # Suppress GC during measurement to avoid random latency spikes
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
 
     latencies: list[float] = []
     t0 = time.perf_counter()
@@ -335,6 +340,9 @@ def bench_api(
         op_fn(items[i])
         latencies.append((time.perf_counter() - t_start) * 1e6)
     elapsed = time.perf_counter() - t0
+
+    if gc_was_enabled:
+        gc.enable()
 
     total_tokens = tokens_per_op * num_ops if tokens_per_op > 0 else 0
     return BenchResult(
@@ -700,9 +708,9 @@ def bench_lock_unlock(
 
         if verify and lock_count[0] % 500 == 0:
             evictable_after = _full_evictable(tree)
-            assert evictable_before == evictable_after, (
-                f"Lock/unlock asymmetry: evictable {evictable_before} -> {evictable_after}"
-            )
+            assert (
+                evictable_before == evictable_after
+            ), f"Lock/unlock asymmetry: evictable {evictable_before} -> {evictable_after}"
             verify_pool_consistency(tree, alloc, f"lock#{lock_count[0]}")
 
     warmup = min(20, num_pairs // 10)
@@ -717,7 +725,7 @@ def bench_lock_unlock(
     return result
 
 
-def bench_mixed_workload(
+def bench_cache_finished(
     num_seqs: int = 5000,
     chunk_len: int = 256,
     kv_size: int = 500_000,
@@ -725,7 +733,10 @@ def bench_mixed_workload(
     verify: bool = False,
     tree_cls=None,
 ) -> BenchResult:
-    """4e. Mixed workload — simulates scheduler: insert, match, lock, unlock, evict."""
+    """4e. cache_finished_req throughput — full request lifecycle via high-level API.
+
+    Simulates: match_prefix → inc_lock_ref → populate req_to_token → cache_finished_req.
+    """
     if components is None:
         components = _default_components()
     has_mamba = ComponentType.MAMBA in components
@@ -742,71 +753,78 @@ def bench_mixed_workload(
             tree_cls=tree_cls,
         )
 
-    rng = random.Random(77)
+    # Pre-build request objects with token IDs filled into req_to_token
+    req_items: list = []
+    for seq in seqs:
+        key = RadixKey(seq)
 
-    # Each "op" is one full request lifecycle:
-    #   match -> lock -> insert(if new) -> unlock -> maybe evict
-    items = list(range(len(seqs)))
+        # Match existing prefix
+        match_result = tree.match_prefix(MatchPrefixParams(key=key))
+        matched_len = len(match_result.device_indices)
+        node = match_result.last_device_node
+
+        # Lock the matched node
+        lock_result = tree.inc_lock_ref(node)
+
+        # Allocate remaining KV
+        remaining = len(seq) - matched_len
+        if remaining > 0:
+            v = alloc.alloc(remaining)
+            if v is None:
+                tree.evict(EvictParams(num_tokens=remaining * 2, mamba_num=2))
+                v = alloc.alloc(remaining)
+            if v is None:
+                # Cannot allocate — unlock and skip
+                tree.dec_lock_ref(
+                    node,
+                    DecLockRefParams(
+                        swa_uuid_for_lock=getattr(
+                            lock_result, "swa_uuid_for_lock", None
+                        )
+                    ),
+                )
+                continue
+            kv_indices = torch.cat([match_result.device_indices, v])
+        else:
+            kv_indices = match_result.device_indices
+
+        # Build a Req object that mimics what the scheduler provides
+        req = make_req()
+        req.origin_input_ids = list(seq)
+        req.output_ids = []
+        req.fill_ids = list(seq)
+        req.last_node = node
+        req.cache_protected_len = matched_len
+        req.kv_committed_len = len(seq)
+        req.kv_committed_freed = False
+        if hasattr(lock_result, "swa_uuid_for_lock"):
+            req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
+
+        # Fill req_to_token
+        rtp.req_to_token[req.req_pool_idx, : len(kv_indices)] = kv_indices
+
+        req_items.append(req)
+
+    num_available = len(req_items)
+    if num_available == 0:
+        print("[bench] cache_finished    | SKIPPED (no requests built)")
+        return BenchResult("cache_finished", 0, 0, 0, [])
 
     def setup_fn():
-        return items
+        return req_items
 
     op_count = [0]
 
-    def op_fn(idx):
-        seq = seqs[idx % len(seqs)]
-        key = RadixKey(seq)
-
-        # 1. Match prefix
-        match_result = tree.match_prefix(MatchPrefixParams(key=key))
-        node = match_result.last_device_node
-        matched_len = len(match_result.device_indices)
-
-        # 2. Lock
-        lock_result = tree.inc_lock_ref(node)
-
-        # 3. Insert remaining (simulate new KV)
-        if matched_len < len(seq):
-            remaining = len(seq) - matched_len
-            v = alloc.alloc(remaining)
-            if v is None:
-                # Keep node locked so it is not evicted itself
-                tree.evict(EvictParams(num_tokens=remaining * 2, mamba_num=2))
-                v = alloc.alloc(remaining)
-            if v is not None:
-                mamba_val = None
-                if has_mamba:
-                    req = make_req()
-                    mamba_val = req.mamba_pool_idx.unsqueeze(0)
-                tree.insert(
-                    InsertParams(
-                        key=key,
-                        value=torch.cat([match_result.device_indices, v]),
-                        mamba_value=mamba_val,
-                        prev_prefix_len=matched_len,
-                    )
-                )
-
-        # 4. Unlock (exactly once)
-        tree.dec_lock_ref(
-            node,
-            DecLockRefParams(
-                swa_uuid_for_lock=getattr(lock_result, "swa_uuid_for_lock", None)
-            ),
-        )
-
-        # 5. Occasional evict (simulate memory pressure)
-        if rng.random() < 0.1:
-            tree.evict(EvictParams(num_tokens=100, mamba_num=1))
-
+    def op_fn(req):
+        tree.cache_finished_req(req, is_insert=True)
         op_count[0] += 1
         if verify and op_count[0] % 500 == 0:
-            verify_pool_consistency(tree, alloc, f"mixed#{op_count[0]}")
+            verify_pool_consistency(tree, alloc, f"cache_finished#{op_count[0]}")
 
-    warmup = min(20, len(seqs) // 10)
-    num_ops = len(seqs) - warmup
+    warmup = min(20, num_available // 10)
+    num_ops = num_available - warmup
     result = bench_api(
-        name="mixed_workload",
+        name="cache_finished",
         setup_fn=setup_fn,
         op_fn=op_fn,
         num_ops=num_ops,
@@ -824,7 +842,7 @@ ALL_BENCHMARKS = {
     "match": bench_match_prefix,
     "evict": bench_evict,
     "lock": bench_lock_unlock,
-    "mixed": bench_mixed_workload,
+    "cache_finished": bench_cache_finished,
 }
 
 
@@ -932,8 +950,8 @@ class TestUnifiedRadixCacheBench(unittest.TestCase):
         )
         self.assertGreater(result.num_ops, 0)
 
-    def test_bench_mixed_workload(self):
-        result = bench_mixed_workload(
+    def test_bench_cache_finished(self):
+        result = bench_cache_finished(
             num_seqs=_BENCH_NUM_SEQS,
             kv_size=_BENCH_KV_SIZE,
             chunk_len=_BENCH_CHUNK_LEN,
@@ -978,7 +996,7 @@ if __name__ == "__main__":
         "--benchmarks",
         nargs="+",
         default=["all"],
-        help="Benchmarks to run: insert match evict lock mixed all",
+        help="Benchmarks to run: insert match evict lock cache_finished all",
     )
     args = parser.parse_args()
 
@@ -993,4 +1011,3 @@ if __name__ == "__main__":
             benchmarks=args.benchmarks,
             tree_cls=tree_cls,
         )
-

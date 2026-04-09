@@ -110,7 +110,9 @@ class SWAComponent(TreeComponent):
                 node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
             )
             self.cache._split_node(node.key, node, start_idx)
-            node.component_data[BASE_COMPONENT_TYPE].value = value_slice[start_idx:].clone()
+            node.component_data[BASE_COMPONENT_TYPE].value = value_slice[
+                start_idx:
+            ].clone()
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
@@ -179,9 +181,9 @@ class SWAComponent(TreeComponent):
             new_parent.component_data[self.component_type].value = None
 
         # parent inherits the swa_uuid from child for swa lock ref
-        new_parent.component_data[self.component_type].metadata["uuid"] = child.component_data[
-            self.component_type
-        ].metadata.get("uuid")
+        new_parent.component_data[self.component_type].metadata["uuid"] = (
+            child.component_data[self.component_type].metadata.get("uuid")
+        )
         child.component_data[self.component_type].metadata.pop("uuid", None)
 
     def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:

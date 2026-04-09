@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.radix_cache import (
     page_align_keys,
 )
 from sglang.srt.mem_cache.unified_cache_components import (
+    _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
     ComponentData,
     ComponentType,
@@ -36,7 +37,6 @@ from sglang.srt.mem_cache.unified_cache_components import (
     MambaComponent,
     SWAComponent,
     TreeComponent,
-    _NUM_COMPONENT_TYPES,
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
@@ -75,12 +75,8 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.host_value = None
         self.hit_count = 0
-        self.lru_prev: list[UnifiedTreeNode | None] = [
-            None
-        ] * _NUM_COMPONENT_TYPES
-        self.lru_next: list[UnifiedTreeNode | None] = [
-            None
-        ] * _NUM_COMPONENT_TYPES
+        self.lru_prev: list[UnifiedTreeNode | None] = [None] * _NUM_COMPONENT_TYPES
+        self.lru_next: list[UnifiedTreeNode | None] = [None] * _NUM_COMPONENT_TYPES
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
 
