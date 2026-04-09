@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -168,25 +167,27 @@ def unified_attention_with_output(
     if sinks is not None:
         kwargs["sinks"] = sinks
 
-    attn_forward_batch = replace(
-        forward_batch,
-        out_cache_loc=forward_batch.out_cache_loc[:real_num_tokens],
-        out_cache_loc_swa=(
-            forward_batch.out_cache_loc_swa[:real_num_tokens]
-            if forward_batch.out_cache_loc_swa is not None
-            else None
-        ),
-    )
+    original_out_cache_loc = forward_batch.out_cache_loc
+    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
+    # Keep the original ForwardBatch object so backend/model state mutations still land
+    # on the caller-visible batch; try/finally guarantees cache loc restoration on errors.
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if original_out_cache_loc_swa is not None:
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
 
-    ret = forward_batch.attn_backend.forward(
-        query,
-        key,
-        value,
-        attention_layer,
-        attn_forward_batch,
-        save_kv_cache,
-        **kwargs,
-    )
+    try:
+        ret = forward_batch.attn_backend.forward(
+            query,
+            key,
+            value,
+            attention_layer,
+            forward_batch,
+            save_kv_cache,
+            **kwargs,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
     return

@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
@@ -120,23 +119,25 @@ def unified_linear_attention_with_output(
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
 
-    attn_forward_batch = replace(
-        forward_batch,
-        out_cache_loc=forward_batch.out_cache_loc[:real_num_tokens],
-        out_cache_loc_swa=(
-            forward_batch.out_cache_loc_swa[:real_num_tokens]
-            if forward_batch.out_cache_loc_swa is not None
-            else None
-        ),
-    )
+    original_out_cache_loc = forward_batch.out_cache_loc
+    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
+    # Keep the original ForwardBatch object so backend/model state mutations still land
+    # on the caller-visible batch; try/finally guarantees cache loc restoration on errors.
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if original_out_cache_loc_swa is not None:
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
 
-    ret = forward_batch.attn_backend.forward(
-        layer=attention_layer,
-        forward_batch=attn_forward_batch,
-        mixed_qkv=mixed_qkv[:real_num_tokens],
-        a=a[:real_num_tokens],
-        b=b[:real_num_tokens],
-    )
+    try:
+        ret = forward_batch.attn_backend.forward(
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv[:real_num_tokens],
+            a=a[:real_num_tokens],
+            b=b[:real_num_tokens],
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
 
     output[:, :real_num_tokens].copy_(ret)
     return
