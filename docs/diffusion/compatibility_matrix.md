@@ -57,6 +57,160 @@ default parameters when initializing and generating videos.
 | Qwen Image Edit      | `Qwen/Qwen-Image-Edit`              |
 | Qwen Image Edit 2511 | `Qwen/Qwen-Image-Edit-2511`         |
 
+## Supported Components
+
+SGLang Diffusion supports overriding individual pipeline components with
+`--<component>-path`. The value can be either a Hugging Face repo ID or a local
+component directory.
+
+The same overrides can also be provided in config files through
+`component_paths.<component>`.
+
+### Common Syntax
+
+CLI:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --vae-path black-forest-labs/FLUX.2-small-decoder
+```
+
+Config file:
+
+```yaml
+model_path: black-forest-labs/FLUX.2-dev
+component_paths:
+  vae: black-forest-labs/FLUX.2-small-decoder
+```
+
+### VAE Components
+
+Supported keys:
+
+- `vae`
+- `video_vae`
+- `audio_vae`
+
+Typical usage:
+
+- Use `--vae-path` for image pipelines such as FLUX, Qwen-Image, and GLM-Image.
+- Use `--video-vae-path` for video pipelines with a distinct video VAE.
+- Use `--audio-vae-path` for multimodal video pipelines that carry a separate
+  audio VAE.
+
+Examples:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --vae-path black-forest-labs/FLUX.2-small-decoder \
+  --prompt "A curious raccoon" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.3 \
+  --video-vae-path /models/ltx23/video_vae \
+  --audio-vae-path /models/ltx23/audio_vae \
+  --prompt "Ocean waves at sunrise"
+```
+
+### Transformer / DiT Components
+
+Supported keys:
+
+- `transformer`
+- `video_dit`
+- `audio_dit`
+
+Typical usage:
+
+- Use `--transformer-path` to replace the main denoising transformer component.
+- Prefer `--transformer-path` or `--transformer-weights-path` for quantized or
+  custom transformer checkpoints; see `quantization.md` for the quantized flow.
+- Use `--video-dit-path` or `--audio-dit-path` when a pipeline splits denoisers
+  by modality.
+
+Example:
+
+```bash
+sglang generate \
+  --model-path Tongyi-MAI/Z-Image-Turbo \
+  --transformer-path /models/zimage/transformer \
+  --prompt "A red tram in heavy rain"
+```
+
+### Text Encoder Components
+
+Supported keys:
+
+- `text_encoder`
+- `text_encoder_2`
+- `tokenizer`
+- `processor`
+- `image_processor`
+
+Typical usage:
+
+- Use `--text-encoder-path` when swapping the primary text encoder.
+- Use `--text-encoder-2-path` for dual-encoder pipelines such as FLUX-family
+  pipelines.
+- Use `--tokenizer-path`, `--processor-path`, or `--image-processor-path` when
+  the replacement encoder requires matching preprocessing assets.
+
+Example:
+
+```bash
+sglang serve \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --text-encoder-2-path /models/flux2/text_encoder_2 \
+  --tokenizer-path /models/flux2/tokenizer
+```
+
+### Auxiliary Components
+
+Supported keys:
+
+- `scheduler`
+- `spatial_upsampler`
+- `vocoder`
+- `connectors`
+- `dual_tower_bridge`
+- `image_encoder`
+- `vision_language_encoder`
+
+Typical usage:
+
+- Use `--scheduler-path` when a pipeline needs a custom scheduler config.
+- Use `--spatial-upsampler-path` for two-stage pipelines such as
+  `LTX2TwoStagePipeline`.
+- Use `--vocoder-path` for pipelines with a separate waveform decoder.
+- Use `--connectors-path`, `--dual-tower-bridge-path`, `--image-encoder-path`,
+  or `--vision-language-encoder-path` only when the target pipeline exposes
+  those components.
+
+Example:
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.3 \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --spatial-upsampler-path /models/ltx23/spatial_upsampler \
+  --distilled-lora-path /models/ltx23/distilled_lora.safetensors \
+  --prompt "A neon-lit alley after the rain"
+```
+
+Notes:
+
+1. Component overrides are only valid when the target pipeline actually uses
+   that component.
+2. The override key should match the component name in the pipeline's
+   `model_index.json` or the native pipeline's registered module name.
+3. `distilled_lora` is not a general component loader key, but it is accepted as
+   a path override for `LTX2TwoStagePipeline`.
+
 ## Verified LoRA Examples
 
 This section lists example LoRAs that have been explicitly tested and verified with each base model in the **SGLang Diffusion** pipeline.
