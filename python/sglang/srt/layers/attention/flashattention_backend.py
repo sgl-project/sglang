@@ -214,6 +214,16 @@ class FlashAttentionBackend(AttentionBackend):
             else 0
         )
 
+        # In embedding mode with no chunked prefill and radix cache disabled,
+        # skip KV cache write and use flash_attn_varlen_func with raw K/V
+        # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
+        server_args = model_runner.server_args
+        self.fa_skip_kv_cache = (
+            server_args.is_embedding
+            and server_args.chunked_prefill_size == -1
+            and server_args.disable_radix_cache
+        )
+
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
@@ -239,15 +249,6 @@ class FlashAttentionBackend(AttentionBackend):
             causal=True,
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
-
-        # In embedding mode with no chunked prefill and radix cache disabled,
-        # skip KV cache write and use flash_attn_varlen_func with raw K/V
-        # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
-        server_args = model_runner.server_args
-        self.fa_skip_kv_cache = (
-            server_args.is_embedding
-            and server_args.chunked_prefill_size == -1
-            and server_args.disable_radix_cache
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -779,6 +780,10 @@ class FlashAttentionBackend(AttentionBackend):
                 # also skipped (guarded above). This eliminates store_kvcache
                 # and prepare_varlen_num_blocks overhead per layer.
                 assert k is not None, "fa_skip_kv_cache requires k to be provided"
+                assert k_descale is None and v_descale is None, (
+                    "fa_skip_kv_cache uses raw K/V tensors, "
+                    "FP8 KV cache descaling is not supported in this mode"
+                )
                 result = flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -791,6 +796,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    num_splits=self.num_splits,
                     **kwargs,
                 )
             else:
