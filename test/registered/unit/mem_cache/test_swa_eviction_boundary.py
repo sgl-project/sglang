@@ -92,8 +92,11 @@ class TestSWAEvictionBoundary(unittest.TestCase):
 
         Before the fix, this case fell through to _add_new_node(swa_tombstone=False),
         inflating swa_evictable_size_ and causing a potential double-free.
+
+        Note: page_size=1 here because the boundary case is controlled by the
+        swa_evicted_seqlen parameter, not the allocator's page handling.
         """
-        page_size = 4
+        page_size = 1
         window = 2
         tree, allocator = _build_swa_tree(
             page_size=page_size,
@@ -134,7 +137,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         swa_evicted_seqlen falls in the middle of the key -> split into
         tombstone + non-tombstone nodes.
         """
-        page_size = 4
+        page_size = 1
         window = 2
         tree, allocator = _build_swa_tree(
             page_size=page_size,
@@ -169,7 +172,7 @@ class TestSWAEvictionBoundary(unittest.TestCase):
 
     def test_insert_no_eviction(self):
         """Regression: case 1 (swa_evicted <= total_prefix_length) works normally."""
-        page_size = 4
+        page_size = 1
         window = 2
         tree, allocator = _build_swa_tree(
             page_size=page_size,
