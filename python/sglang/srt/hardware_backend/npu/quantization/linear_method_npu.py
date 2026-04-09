@@ -29,7 +29,7 @@ def fp8_matmul_npu(
     input_2d = input.reshape(-1, k).contiguous()
  
     if _is_npu_before_atlas_a5:
-        output_2d = torch.ops.npu.fp8_w8a16_matmul(input_2d, weight, weight_scale, "bf16")
+        output_2d = torch.ops.npu.softfp8_w8a16_matmul(input_2d, weight, weight_scale, "bf16")
     else:
         group_sizes = (1, 128, 128)
 

@@ -227,7 +227,7 @@ def fp8_gmm_npu(
  
         if group_list_type == 1:
             group_list = group_list.cumsum(dim=0).to(torch.int64)
-        output = torch.ops.npu.fp8_w8a16_grouped_matmul(
+        output = torch.ops.npu.softfp8_w8a16_grouped_matmul(
             input, weight, weight_scale, group_list, "bf16"
         )
     else:
