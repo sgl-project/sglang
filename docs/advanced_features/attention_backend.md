@@ -117,7 +117,7 @@ Internally, the NSA backend dispatches to different sub-backends for prefill and
 |-----------------------|-------------|------------|-----------------------------------------------|
 | **flashmla_sparse**   | ✅          | ✅         | Default prefill on Hopper and Blackwell (bf16) |
 | **flashmla_kv**       | ✅          | ✅         | Default decode for FP8 on Blackwell with DP   |
-| **flashmla_auto**     | ✅          | ❌         | Auto-selects flashmla_sparse or flashmla_kv based on kv_cache_dtype |
+| **flashmla_auto**     | ✅          | ❌         | Auto-selects flashmla_sparse or flashmla_kv based on kv_cache_dtype. On Hopper (SM90), unconditionally resolves to flashmla_kv. |
 | **fa3**               | ✅          | ✅         | Default decode on Hopper (bf16)               |
 | **trtllm**            | ✅          | ✅         | Default decode on Blackwell (bf16); default for both on Blackwell without DP |
 | **tilelang**          | ✅          | ✅         | Default on AMD (ROCm)                         |
