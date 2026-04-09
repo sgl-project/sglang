@@ -233,17 +233,7 @@ For the non-matching input, trace where it was produced and repeat: hash its inp
 
 ## Step 6: Verify the Fix
 
-Run the failing test multiple times to confirm the fix is stable:
-
-```bash
-for i in $(seq 1 10); do
-    echo "=== Run $i ==="
-    python3 -m pytest test_file.py -x -k test_name 2>&1 | tail -5
-    if [ $? -ne 0 ]; then echo "FAILED at run $i"; break; fi
-done
-```
-
-Intermittent hangs require many runs. A test that hung ~30% of the time needs at least 10 clean passes to be confident.
+Run the failing test multiple times to confirm the fix is stable. Intermittent hangs require many runs. A test that hung ~30% of the time needs at least 10 clean passes to be confident.
 
 ## Quick Reference
 
