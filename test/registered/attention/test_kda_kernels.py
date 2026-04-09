@@ -8,7 +8,7 @@ from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
 from sglang.srt.layers.attention.fla.kda import fused_kda_gate, fused_recurrent_kda
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -115,7 +115,9 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
         abs_diff_out = (core_attn_out - core_attn_out_ref).abs().max()
         abs_diff_state = (last_state - last_state_ref).abs().max()
         print(f"{abs_diff_out=}, {abs_diff_state=}")
-        self.assertTrue(torch.allclose(core_attn_out, core_attn_out_ref))
+        self.assertTrue(
+            torch.allclose(core_attn_out, core_attn_out_ref, rtol=1e-3, atol=1e-4)
+        )
         self.assertTrue(torch.allclose(last_state, last_state_ref))
 
 

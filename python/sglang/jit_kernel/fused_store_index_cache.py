@@ -19,6 +19,7 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -64,6 +65,7 @@ def can_use_nsa_fused_store(
         return False
 
 
+@debug_kernel_api
 def fused_store_index_k_cache(
     key: torch.Tensor,
     index_k_with_scale: torch.Tensor,

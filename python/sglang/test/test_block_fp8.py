@@ -19,7 +19,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     triton_mxfp8_blockscaled_linear,
 )
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported, is_sm120_supported
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
@@ -452,8 +452,8 @@ class TestMXFP8DenseLinear(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
-        if not is_sm100_supported():
-            raise unittest.SkipTest("MXFP8 requires Blackwell (SM100+)")
+        if not (is_sm100_supported() or is_sm120_supported()):
+            raise unittest.SkipTest("MXFP8 requires Blackwell (SM100/SM120)")
         torch.set_default_device("cuda")
 
     def _mxfp8_dense_linear(self, M, NK, dtype, seed):

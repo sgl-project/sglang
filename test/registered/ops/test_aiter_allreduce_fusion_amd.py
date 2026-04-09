@@ -10,8 +10,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-# Dedicated AMD 8-GPU suite for AITER fused allreduce+rmsnorm validation.
-register_amd_ci(est_time=240, suite="stage-c-test-aiter-fusion-8-gpu-amd")
+register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd")
 
 
 class TestAiterAllreduceFusionAmd(unittest.TestCase):

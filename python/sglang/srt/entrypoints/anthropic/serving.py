@@ -92,6 +92,73 @@ class AnthropicServing:
         """Convert an Anthropic Messages request to an OpenAI ChatCompletion request."""
         openai_messages = []
 
+        def _convert_anthropic_image_source_to_openai_part(
+            source: Optional[dict],
+        ) -> Optional[dict]:
+            if not isinstance(source, dict):
+                return None
+
+            source_type = source.get("type")
+            if source_type == "base64":
+                media_type = source.get("media_type", "image/png")
+                data = source.get("data", "")
+                if not data:
+                    return None
+                return {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media_type};base64,{data}",
+                    },
+                }
+
+            url = source.get("url")
+            if url:
+                return {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": url,
+                    },
+                }
+
+            return None
+
+        def _convert_tool_result_content(
+            content: Optional[str | list[dict]],
+        ) -> tuple[str | list[dict], str]:
+            if isinstance(content, list):
+                tool_content_parts = []
+                tool_text_parts = []
+
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+
+                    item_type = item.get("type")
+                    if item_type == "text":
+                        text = item.get("text", "")
+                        if text:
+                            tool_text_parts.append(text)
+                            tool_content_parts.append({"type": "text", "text": text})
+                    elif item_type == "image":
+                        image_part = _convert_anthropic_image_source_to_openai_part(
+                            item.get("source")
+                        )
+                        if image_part is not None:
+                            tool_content_parts.append(image_part)
+
+                tool_text = "\n".join(tool_text_parts)
+                if (
+                    len(tool_content_parts) == 1
+                    and tool_content_parts[0]["type"] == "text"
+                ):
+                    return tool_content_parts[0]["text"], tool_text
+                if tool_content_parts:
+                    return tool_content_parts, tool_text
+                return "", tool_text
+
+            tool_text = str(content) if content else ""
+            return tool_text, tool_text
+
         # Add system message if provided
         if anthropic_request.system:
             if isinstance(anthropic_request.system, str):
@@ -122,16 +189,11 @@ class AnthropicServing:
                     content_parts.append({"type": "text", "text": block.text})
 
                 elif block.type == "image" and block.source:
-                    media_type = block.source.get("media_type", "image/png")
-                    data = block.source.get("data", "")
-                    content_parts.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{data}",
-                            },
-                        }
+                    image_part = _convert_anthropic_image_source_to_openai_part(
+                        block.source
                     )
+                    if image_part is not None:
+                        content_parts.append(image_part)
 
                 elif block.type == "tool_use":
                     tool_call = {
@@ -145,15 +207,9 @@ class AnthropicServing:
                     tool_calls.append(tool_call)
 
                 elif block.type == "tool_result":
-                    # Extract text content from list or string
-                    if isinstance(block.content, list):
-                        tool_content = "\n".join(
-                            item.get("text", "")
-                            for item in block.content
-                            if isinstance(item, dict) and item.get("type") == "text"
-                        )
-                    else:
-                        tool_content = str(block.content) if block.content else ""
+                    tool_content, tool_text = _convert_tool_result_content(
+                        block.content
+                    )
 
                     # Use tool_use_id (per spec) with fallback to id
                     tool_call_id = block.tool_use_id or block.id or ""
@@ -171,7 +227,7 @@ class AnthropicServing:
                         content_parts.append(
                             {
                                 "type": "text",
-                                "text": f"Tool result: {tool_content}",
+                                "text": f"Tool result: {tool_text}",
                             }
                         )
 

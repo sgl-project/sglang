@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAECon
 @dataclass
 class LTXAudioVAEArchConfig(VAEArchConfig):
     # Architecture params
+    temporal_compression_ratio: int = 4
     causality_axis: str = "height"
     attn_resolutions: Optional[Tuple[int, ...]] = None
     base_channels: int = 128
@@ -20,6 +21,7 @@ class LTXAudioVAEArchConfig(VAEArchConfig):
     mid_block_add_attention: bool = False
     sample_rate: int = 16000
     mel_hop_length: int = 160
+    mel_compression_ratio: int = 4
     is_causal: bool = True
     mel_bins: Optional[int] = 64
     double_z: bool = True

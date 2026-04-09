@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -73,4 +75,4 @@ def test_reconstruct_indices_from_tree_mask():
 
 if __name__ == "__main__":
     test_reconstruct_indices_from_tree_mask()
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

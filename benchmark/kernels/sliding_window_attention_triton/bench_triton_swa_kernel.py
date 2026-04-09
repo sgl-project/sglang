@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 import triton.testing as tt
 
+from sglang.benchmark.bench_utils import run_bench
 from sglang.srt.layers.attention.triton_ops.extend_attention import extend_attention_fwd
 
 
@@ -270,9 +271,19 @@ def bench(
             raise AssertionError("Mismatch between triton and torch reference.")
 
     if provider == "triton":
-        ms = tt.do_bench(lambda: _run_triton(inputs), warmup=warmup, rep=rep)
+        ms = run_bench(
+            lambda: _run_triton(inputs),
+            quantiles=None,
+            warmup_ms=warmup,
+            rep_ms=rep,
+        )[0]
     elif provider == "torch":
-        ms = tt.do_bench(lambda: _run_torch_ref(inputs), warmup=warmup, rep=rep)
+        ms = run_bench(
+            lambda: _run_torch_ref(inputs),
+            quantiles=None,
+            warmup_ms=warmup,
+            rep_ms=rep,
+        )[0]
     else:
         raise ValueError(provider)
 

@@ -4,17 +4,22 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
+import json
 import unittest
+from http import HTTPStatus
 from typing import Optional
 from unittest.mock import AsyncMock, Mock
+
+from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class _MockTemplateManager:
@@ -49,6 +54,7 @@ class ServingCompletionTestCase(unittest.TestCase):
 
         self.template_manager = _MockTemplateManager()
         self.sc = OpenAIServingCompletion(tm, self.template_manager)
+        self.fastapi_request = Mock(spec=Request)
 
     # ---------- prompt-handling ----------
     def test_single_string_prompt(self):
@@ -180,6 +186,72 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(len(response.choices), 1)
         self.assertEqual(response.choices[0].text, " world")
         self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
+
+    def test_streaming_abort_yields_error(self):
+        """Test that an abort finish reason during streaming correctly yields an error and stops."""
+        err_msg = "Aborted by scheduler"
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+
+        async def _mock_generate_abort(*args, **kwargs):
+            yield {
+                "text": "Partial ",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                    },
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate_abort
+
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            stream=True,
+        )
+
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def run_stream():
+            chunks = []
+            try:
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, req, self.fastapi_request
+                ):
+                    chunks.append(chunk)
+            except Exception as e:
+                print(f"Error during stream iteration: {e}")
+            return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(run_stream())
+
+        error_chunk_data = None
+        for c in chunks:
+            if "error" in c:
+                error_chunk_data = json.loads(c[len("data: ") :])
+                break
+        self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
+        self.assertEqual(error_chunk_data["error"]["message"], err_msg)
+        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+
+        # Ensure the stream stops after the abort error
+        # The last chunk should be "data: [DONE]\n\n"
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+        # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertIn("error", chunks[0])
 
 
 if __name__ == "__main__":

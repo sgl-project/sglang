@@ -8,7 +8,7 @@ VLMs tested here:
 - Qwen VL series (Qwen2-VL-7B, Qwen2.5-VL-7B, Qwen3-VL-30B)
 - InternVL2 series (InternVL2_5-2B)
 - MiniCPM series (MiniCPM-v-2_6, MiniCPM-o-2_6)
-- DeepSeek VL series (deepseek-vl2-small, Janus-Pro-7B)
+- DeepSeek VL series (deepseek-vl2-small, Janus-Pro-7B, DeepSeek-OCR-2)
 - Kimi VL (Kimi-VL-A3B-Instruct)
 - MiMo VL (MiMo-VL-7B-RL)
 - GLM VL (GLM-4.1V-9B-Thinking)
@@ -116,13 +116,28 @@ AMD_VLM_MODELS = [
         "accuracy_threshold": 0.27,
         "extra_args": ["--trust-remote-code"],
     },
+    # DeepSeek-OCR-2 - last to avoid memory pressure on subsequent models
+    {
+        "model_path": "deepseek-ai/DeepSeek-OCR-2",
+        "tp_size": 1,
+        "accuracy_threshold": 0.25,
+        "extra_args": [
+            "--trust-remote-code",
+            "--disable-cuda-graph",
+            "--mem-fraction-static",
+            "0.70",
+            "--max-total-tokens",
+            "16384",
+        ],
+    },
 ]
 
-# Models that need special handling on AMD (MoE models)
+# Models that need triton attention on AMD (aiter pa_ragged JIT compilation OOMs)
 TRITON_ATTENTION_MODELS = {
     # "deepseek-ai/deepseek-vl2-small",
     # "Qwen/Qwen3-VL-30B-A3B-Instruct",
     # "moonshotai/Kimi-VL-A3B-Instruct",
+    "deepseek-ai/DeepSeek-OCR-2",
 }
 
 # Models known to fail on AMD - exclude from testing

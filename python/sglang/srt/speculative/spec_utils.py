@@ -17,7 +17,6 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -689,11 +688,30 @@ def generate_token_bitmask(
 
 def load_token_map(token_map_path: str) -> List[int]:
     if not os.path.exists(token_map_path):
-        cache_dir = snapshot_download(
-            os.path.dirname(token_map_path),
-            ignore_patterns=["*.bin", "*.safetensors"],
-        )
-        token_map_path = os.path.join(cache_dir, os.path.basename(token_map_path))
+        repo_id = os.path.dirname(token_map_path)
+        file_name = os.path.basename(token_map_path)
+
+        cache_dir = None
+        if envs.SGLANG_USE_MODELSCOPE.get():
+            from modelscope.utils.file_utils import get_model_cache_root
+
+            cached_repo_path = os.path.join(get_model_cache_root(), repo_id)
+            if os.path.exists(cached_repo_path):
+                cache_dir = cached_repo_path
+
+        if cache_dir is None:
+            if envs.SGLANG_USE_MODELSCOPE.get():
+                from modelscope.hub.snapshot_download import (
+                    snapshot_download as download_func,
+                )
+            else:
+                download_func = snapshot_download
+            cache_dir = download_func(
+                repo_id,
+                ignore_patterns=["*.bin", "*.safetensors"],
+            )
+
+        token_map_path = os.path.join(cache_dir, file_name)
     hot_token_id = torch.load(token_map_path, weights_only=True)
     return torch.tensor(hot_token_id, dtype=torch.int64)
 
@@ -706,11 +724,23 @@ def draft_tp_context(tp_group: GroupCoordinator):
         yield
 
 
-def detect_nan(logits_output: LogitsProcessorOutput):
-    logits = logits_output.next_token_logits
-    if torch.any(torch.isnan(logits)):
-        logger.error("Detected errors during sampling! NaN in the logits.")
-        raise ValueError("Detected errors during sampling! NaN in the logits.")
+def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):
+    """Async NaN check — no GPU-CPU sync, error surfaces at next sync point."""
+    if not envs.SGLANG_SPEC_NAN_DETECTION.get():
+        return
+    torch._assert_async(~torch.any(torch.isnan(tensor)), f"NaN detected! {msg}")
+
+
+def maybe_detect_oob(indices: torch.Tensor, low: int, high: int, msg: str):
+    """Async OOB check — no GPU-CPU sync, error surfaces at next sync point."""
+    if not envs.SGLANG_SPEC_OOB_DETECTION.get():
+        return
+    if indices.numel() == 0:
+        return
+    torch._assert_async(
+        (indices.min() >= low) & (indices.max() < high),
+        f"OOB indices not in [{low}, {high}): {msg}",
+    )
 
 
 # Disable torch.compile for this function because it will be
