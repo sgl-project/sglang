@@ -89,13 +89,12 @@ component_paths:
 Use the component name from the pipeline's `model_index.json` or the native
 pipeline's registered module name:
 
-- `vae`, `video_vae`, `audio_vae`
-- `transformer`, `video_dit`, `audio_dit`
-- `text_encoder`, `text_encoder_2`
-- `tokenizer`, `processor`, `image_processor`
-- `scheduler`, `spatial_upsampler`, `vocoder`
-- `connectors`, `dual_tower_bridge`
-- `image_encoder`, `vision_language_encoder`
+| Component Type | Supported Keys | Notes |
+|:---------------|:---------------|:------|
+| VAE | `vae`, `video_vae`, `audio_vae` | `vae` is the common image-generation override |
+| Transformer / DiT | `transformer`, `video_dit`, `audio_dit` | `transformer` is the standard override for the main denoiser |
+| Text / Preprocess | `text_encoder`, `text_encoder_2`, `tokenizer`, `processor`, `image_processor` | Replacement encoders often need matching preprocessing assets |
+| Auxiliary | `scheduler`, `spatial_upsampler`, `vocoder`, `connectors`, `dual_tower_bridge`, `image_encoder`, `vision_language_encoder` | Only valid for pipelines that expose these components |
 
 ### VAE
 
@@ -112,6 +111,12 @@ pipeline's registered module name:
 
 - `--text-encoder-path` and `--text-encoder-2-path` override primary and secondary text encoders.
 - `--tokenizer-path`, `--processor-path`, and `--image-processor-path` are useful when the replacement encoder requires matching preprocessing assets.
+
+### Auxiliary Components
+
+- `--scheduler-path` is only relevant when the pipeline exposes a scheduler component.
+- `--spatial-upsampler-path` is mainly for two-stage pipelines such as `LTX2TwoStagePipeline`.
+- `--vocoder-path`, `--connectors-path`, `--dual-tower-bridge-path`, `--image-encoder-path`, and `--vision-language-encoder-path` are only valid for pipelines that expose those components.
 
 
 ### Notes
