@@ -220,7 +220,7 @@ class TestLTX23AttentionBackendSelection(unittest.TestCase):
                 args, unknown_args = parser.parse_known_args(argv)
                 return ServerArgs.from_cli_args(args, unknown_args)
 
-    def test_ltx23_one_stage_single_gpu_prefers_torch_sdpa(self):
+    def test_ltx23_one_stage_single_gpu_keeps_backend_auto(self):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "Lightricks/LTX-2.3",
@@ -228,14 +228,14 @@ class TestLTX23AttentionBackendSelection(unittest.TestCase):
             }
         )
 
-        self.assertEqual(args.attention_backend, "torch_sdpa")
+        self.assertIsNone(args.attention_backend)
 
-    def test_cli_ltx23_one_stage_single_gpu_prefers_torch_sdpa(self):
+    def test_cli_ltx23_one_stage_single_gpu_keeps_backend_auto(self):
         args = self._from_cli_without_model_resolution(
             ["--model-path", "Lightricks/LTX-2.3", "--num-gpus", "1"]
         )
 
-        self.assertEqual(args.attention_backend, "torch_sdpa")
+        self.assertIsNone(args.attention_backend)
 
     def test_explicit_attention_backend_is_not_overridden(self):
         args = self._from_dict_without_model_resolution(
