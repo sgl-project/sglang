@@ -217,11 +217,19 @@ class CommonKVManager(BaseKVManager):
 
         # Sanity checks
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
-            raise RuntimeError(
-                f"Page size mismatch: prefill server has page_size={info.page_size}, "
-                f"but decode server has page_size={self.kv_args.page_size}. "
-                f"Both servers must use the same --page-size value."
-            )
+            if self.server_args.enable_hisparse:
+                # HiSparse: decode host pool page_size=1, prefill device pool page_size >= 1.
+                # Transfer will use send_kvcache_hisparse with per-token item_lens.
+                logger.info(
+                    f"HiSparse PD transfer mode: prefill page_size={info.page_size}, "
+                    f"decode host page_size={self.kv_args.page_size}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Page size mismatch: prefill server has page_size={info.page_size}, "
+                    f"but decode server has page_size={self.kv_args.page_size}. "
+                    f"Both servers must use the same --page-size value."
+                )
 
         if (
             info.kv_cache_dtype is not None

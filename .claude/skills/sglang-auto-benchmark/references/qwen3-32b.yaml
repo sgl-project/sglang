@@ -1,0 +1,62 @@
+server:
+  launch: true
+  host: 127.0.0.1
+  port: 30000
+  env:
+    CUDA_VISIBLE_DEVICES: "0"
+  # Optional parallel search sugar:
+  # parallel:
+  #   # dp_size is auto-derived as visible_gpus / (tp_size * pp_size).
+  #   tp: [4, 2]
+  #   # pp_size: [1, 2]
+  base_flags:
+    # Replace with a local model path if you have one.
+    model_path: Qwen/Qwen3-32B
+    tp_size: 1
+    trust_remote_code: true
+    # Keep the baseline close to a pure-TP launch command.
+    mem_fraction_static: 0.82
+    schedule_policy: lpm
+  # Keep CUDA graph enabled for normal performance tuning.
+  search_space:
+    prefill_attention_backend: [fa3, flashinfer]
+    decode_attention_backend: [fa3, flashinfer]
+    chunked_prefill_size: [4096, 8192]
+    max_running_requests: [64, 96, 128]
+dataset:
+  kind: random
+  num_prompts: 80
+  scenario_names: [chat, summarization]
+  input_len: [1000, 8000]
+  output_len: [1000, 1000]
+
+benchmark:
+  backend: auto
+  # Replace with a local tokenizer/model path if you have one.
+  tokenizer: Qwen/Qwen3-32B
+  max_concurrency: [null, 16, 32]
+  extra_request_body:
+    temperature: 0.0
+  qps:
+    lower: 1.0
+    upper: 12.0
+    tolerance: 0.1
+  sla:
+    max_ttft_ms: 1500
+    max_tpot_ms: 30
+  output_dir: ./auto_benchmark_results/qwen3-32b
+
+search:
+  tier: 2
+  max_candidates: 8  # Cap search breadth so full searches stay tractable.
+  resume: true
+
+speculative:
+  enabled: false
+  algorithm: EAGLE
+  # Fill this only if you explicitly want a second-stage speculative search.
+  draft_model_path: ""
+  search_space:
+    speculative_num_steps: [3, 5]
+    speculative_eagle_topk: [1, 4]
+    speculative_num_draft_tokens: [4, 8]

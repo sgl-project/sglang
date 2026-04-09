@@ -1,9 +1,10 @@
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.utils import get_device_capability, is_musa
-
-_is_musa = is_musa()
+from sglang.srt.configs.linear_attn_model_registry import (
+    get_linear_attn_config,
+    import_backend_class,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,19 +130,14 @@ def create_flashmla_backend(runner):
 
 @register_attention_backend("fa3")
 def create_flashattention_v3_backend(runner):
+    import torch
 
-    major, minor = get_device_capability()
-    if not _is_musa:
-        assert (major == 8 and not runner.use_mla_backend) or major == 9, (
-            "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
-            "Please use `--attention-backend flashinfer`."
-        )
-    else:
-        assert major >= 3 and minor >= 1, (
-            "FlashAttention v3 Backend requires MP>=31. "
-            "Please use `--attention-backend triton`."
-        )
-
+    assert (
+        torch.cuda.get_device_capability()[0] == 8 and not runner.use_mla_backend
+    ) or torch.cuda.get_device_capability()[0] == 9, (
+        "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
+        "Please use `--attention-backend flashinfer`."
+    )
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
     return FlashAttentionBackend(runner)
@@ -234,9 +230,17 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.hybrid_lightning_config is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
-            raise ValueError(
-                "Expected hybrid GDN or NemotronH models, but got unknown model."
-            )
+            spec_result = get_linear_attn_config(runner.model_config.hf_config)
+            if spec_result is not None:
+                spec, _ = spec_result
+                BackendClass = import_backend_class(spec.backend_class_name)
+                linear_attn_backend = BackendClass(runner)
+            else:
+                raise ValueError(
+                    "Expected hybrid GDN or NemotronH models, but got unknown model. "
+                    "If this is a custom hybrid model, use register_linear_attn_model() "
+                    "from sglang.srt.configs.linear_attn_model_registry."
+                )
         full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(
             full_attn_backend, linear_attn_backend, full_attn_layers

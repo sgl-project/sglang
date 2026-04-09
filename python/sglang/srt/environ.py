@@ -331,15 +331,11 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
 
-    # MTHREADS & MUSA
-    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
-
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
-    SGLANG_FORCE_NVFP4_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
@@ -410,6 +406,9 @@ class Envs:
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
+    # Flash Attention
+    SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
+
     # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
@@ -467,9 +466,6 @@ class Envs:
     SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
-    # MM splitting behavior control
-    SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
-
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
@@ -495,6 +491,9 @@ class Envs:
 
     # HTTP Server
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
+
+    # HTTP/2 Server
+    SGLANG_GRANIAN_PARENT_PID = EnvInt(None)
 
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
@@ -525,6 +524,7 @@ class Envs:
 
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
+    SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
@@ -537,6 +537,9 @@ class Envs:
 
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
+
+    # Sglang Cache Dir
+    SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
 
 
 envs = Envs()

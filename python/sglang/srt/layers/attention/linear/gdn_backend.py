@@ -256,6 +256,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if self.forward_metadata.has_mamba_track_mask:
+            self.forward_metadata.mamba_track_mask_indices = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            )
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[
+                    self.forward_metadata.mamba_track_mask_indices
+                ]
+            )
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -394,16 +406,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
-                conv_dst = forward_batch.mamba_track_indices
+            if forward_metadata.has_mamba_track_mask:
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
+                conv_states[forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track
+                )
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv,

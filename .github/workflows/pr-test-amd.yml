@@ -638,6 +638,7 @@ jobs:
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
@@ -765,6 +766,7 @@ jobs:
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \

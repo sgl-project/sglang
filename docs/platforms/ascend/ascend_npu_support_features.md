@@ -104,7 +104,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--base-gpu-id`                                    | `0`      | Type: int                 |      A2, A3      |
 | `--gpu-id-step`                                    | `1`      | Type: int                 |      A2, A3      |
 | `--sleep-on-idle`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
-| `--custom-sigquit-handler`                         | `None`   | Optional[Callable]        |      A2, A3      |
 
 ## Logging
 
