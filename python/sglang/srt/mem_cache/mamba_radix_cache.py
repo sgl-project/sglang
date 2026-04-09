@@ -561,7 +561,7 @@ class MambaRadixCache(BasePrefixCache):
             # insert the token_ids and kv_indices into the radix tree
             if self.enable_mamba_extra_buffer:
                 if req.pending_radix_mamba_slot is not None:
-                    mamba_value = req.pending_radix_mamba_slot.unsqueeze(-1).clone()
+                    mamba_value = req.pending_radix_mamba_slot.clone()
                     req.pending_radix_mamba_slot = None
                     result = self.insert(
                         InsertParams(
@@ -659,7 +659,7 @@ class MambaRadixCache(BasePrefixCache):
             )
             # Data is already in the pending radix slot (written by track kernel).
             # Transfer ownership directly to the radix tree — no fork needed.
-            mamba_value = req.pending_radix_mamba_slot.unsqueeze(-1).clone()
+            mamba_value = req.pending_radix_mamba_slot.clone()
             req.pending_radix_mamba_slot = None
         else:
             mamba_value = self.req_to_token_pool.get_mamba_indices(
