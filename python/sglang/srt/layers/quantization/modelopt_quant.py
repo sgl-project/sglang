@@ -1959,7 +1959,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
-        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        if not moe_runner_backend.is_flashinfer_cutlass():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply(
         self,
