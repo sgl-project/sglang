@@ -99,7 +99,7 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         config_path = os.path.join(tokenizer_path, "tokenizer_config.json")
         if os.path.exists(config_path):
             try:
-                with open(config_path) as f:
+                with open(config_path, encoding="utf-8") as f:
                     config = json.load(f)
                 val = config.get("model_max_length")
                 if val is not None:
