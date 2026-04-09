@@ -446,7 +446,22 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def preprocess_condition_image(
         self, image, target_width, target_height, vae_image_processor: VaeImageProcessor
     ):
-        img = image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+        target_area = 1024 * 1024
+        img = image
+        if image.width * image.height > target_area:
+            resize_to_target_area = getattr(
+                vae_image_processor, "_resize_to_target_area", None
+            )
+            if callable(resize_to_target_area):
+                img = resize_to_target_area(image, target_area)
+            else:
+                scale = math.sqrt(target_area / (image.width * image.height))
+                resized_width = int(image.width * scale)
+                resized_height = int(image.height * scale)
+                img = image.resize(
+                    (resized_width, resized_height), PIL.Image.Resampling.LANCZOS
+                )
+
         image_width, image_height = img.size
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
         multiple_of = vae_scale_factor * 2

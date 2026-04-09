@@ -3,9 +3,12 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import torch
+from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -181,6 +184,34 @@ class TestPreprocessConditionImageResolution(unittest.TestCase):
         self.stage.preprocess_condition_image(batch, server_args, 1920, 1080)
         self.assertIsInstance(batch.condition_image, Image.Image)
         self.assertEqual((batch.width, batch.height), (1280, 720))
+
+
+class TestFlux2ConditionImagePreprocess(unittest.TestCase):
+    def test_matches_official_flux2_image_processor(self):
+        config = Flux2PipelineConfig()
+        config.vae_config.arch_config.vae_scale_factor = 8
+        processor = Flux2ImageProcessor(vae_scale_factor=16)
+        image = Image.new("RGB", (1792, 1216), color="red")
+
+        size = config.calculate_condition_image_size(image, image.width, image.height)
+        self.assertEqual(size, (1232, 832))
+
+        processed, processed_size = config.preprocess_condition_image(
+            image, size[0], size[1], processor
+        )
+
+        official_image = processor._resize_to_target_area(image, 1024 * 1024)
+        expected_width = (official_image.width // 16) * 16
+        expected_height = (official_image.height // 16) * 16
+        expected = processor.preprocess(
+            official_image,
+            height=expected_height,
+            width=expected_width,
+            resize_mode="crop",
+        )
+
+        self.assertEqual(processed_size, (expected_width, expected_height))
+        self.assertTrue(torch.equal(processed, expected))
 
 
 class TestFlux2TI2ISizeResolution(unittest.TestCase):
