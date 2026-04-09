@@ -200,7 +200,7 @@ class RocmPlatform(Platform):
           decode).
         - Replace nn.GroupNorm with AITer GroupNorm when available.
         """
-        if envs.SGLANG_ROCM_CUDNN_BENCHMARK and not torch.backends.cudnn.benchmark:
+        if envs.SGLANG_USE_ROCM_CUDNN_BENCHMARK and not torch.backends.cudnn.benchmark:
             torch.backends.cudnn.benchmark = True
             logger.info(
                 "Enabled cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers"
