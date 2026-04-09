@@ -73,7 +73,7 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
                     filename=tokenizer_config_subpath,
                     local_dir=tmp_dir,
                 )
-                with open(config_path) as f:
+                with open(config_path, encoding="utf-8") as f:
                     config = json.load(f)
                 return config.get("model_max_length")
         except Exception as e:
