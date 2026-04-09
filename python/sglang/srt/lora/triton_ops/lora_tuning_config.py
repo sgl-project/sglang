@@ -110,8 +110,8 @@ def get_lora_configs(
 
 
 # Default block sizes (current hardcoded values)
-DEFAULT_SHRINK_CONFIG = {"BLOCK_N": 16, "BLOCK_K": 256, "num_warps": 4, "num_stages": 2}
-DEFAULT_EXPAND_CONFIG = {"BLOCK_N": 64, "BLOCK_K": 16, "num_warps": 4, "num_stages": 2}
+DEFAULT_SHRINK_CONFIG = {"BLOCK_N": 16, "BLOCK_K": 256}
+DEFAULT_EXPAND_CONFIG = {"BLOCK_N": 64, "BLOCK_K": 16}
 
 # Track which configs have been logged to avoid spamming on every forward pass
 _logged_configs: set = set()
