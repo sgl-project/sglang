@@ -760,7 +760,7 @@ class TestUnifiedRadixCacheSWAMamba(unittest.TestCase):
         self.assertIsNotNone(req2.mamba_pool_idx)
 
         # Verify the copy matches
-        src_value = m.last_device_node.component_value(ComponentType.MAMBA)
+        src_value = m.last_device_node.component_data[ComponentType.MAMBA].value
         self.assertTrue(
             torch.all(
                 mamba_pool.mamba_cache.conv[0][:, req2.mamba_pool_idx]

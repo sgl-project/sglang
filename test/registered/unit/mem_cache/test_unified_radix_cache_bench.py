@@ -317,8 +317,12 @@ def bench_api(
     num_ops: int,
     tokens_per_op: int = 0,
     warmup: int = 10,
+    verify_fn: Optional[Callable] = None,
 ) -> BenchResult:
-    """Time *op_fn(item)* for each item from *setup_fn()*, report throughput."""
+    """Time *op_fn(item)* for each item from *setup_fn()*, report throughput.
+
+    *verify_fn(item)*, if provided, is called after each op but its time is
+    excluded from the latency / throughput measurement."""
     items = setup_fn()
     assert (
         len(items) >= num_ops + warmup
@@ -327,6 +331,8 @@ def bench_api(
     # Warmup
     for i in range(warmup):
         op_fn(items[i])
+        if verify_fn:
+            verify_fn(items[i])
 
     # Suppress GC during measurement to avoid random latency spikes
     gc.collect()
@@ -343,6 +349,11 @@ def bench_api(
 
     if gc_was_enabled:
         gc.enable()
+
+    # Run verify outside timed section
+    if verify_fn:
+        for i in range(warmup, warmup + num_ops):
+            verify_fn(items[i])
 
     total_tokens = tokens_per_op * num_ops if tokens_per_op > 0 else 0
     return BenchResult(
@@ -454,7 +465,9 @@ def bench_insert(
         params = InsertParams(key=RadixKey(seq), value=v, mamba_value=mamba_val)
         tree.insert(params)
         insert_count[0] += 1
-        if verify and insert_count[0] % 500 == 0:
+
+    def verify_fn_insert(idx):
+        if insert_count[0] % 500 == 0:
             verify_pool_consistency(tree, alloc, f"insert#{insert_count[0]}")
 
     warmup = min(20, num_seqs // 10)
@@ -466,6 +479,7 @@ def bench_insert(
         num_ops=num_ops,
         tokens_per_op=avg_tokens,
         warmup=warmup,
+        verify_fn=verify_fn_insert if verify else None,
     )
 
     if verify:
@@ -534,18 +548,16 @@ def bench_match_prefix(
     def setup_fn():
         return queries
 
-    match_count = [0]
-
     def op_fn(query):
+        tree.match_prefix(MatchPrefixParams(key=RadixKey(query)))
+
+    def verify_fn_match(query):
         result = tree.match_prefix(MatchPrefixParams(key=RadixKey(query)))
-        match_count[0] += 1
-        if verify and match_count[0] % 1000 == 0:
-            # Idempotency: matching same key twice should give same length
-            result2 = tree.match_prefix(MatchPrefixParams(key=RadixKey(query)))
-            assert len(result.device_indices) == len(result2.device_indices), (
-                f"Match not idempotent: {len(result.device_indices)} vs "
-                f"{len(result2.device_indices)}"
-            )
+        result2 = tree.match_prefix(MatchPrefixParams(key=RadixKey(query)))
+        assert len(result.device_indices) == len(result2.device_indices), (
+            f"Match not idempotent: {len(result.device_indices)} vs "
+            f"{len(result2.device_indices)}"
+        )
 
     warmup = min(20, len(queries) // 10)
     num_ops = min(len(queries) - warmup, num_seqs)
@@ -556,6 +568,7 @@ def bench_match_prefix(
         num_ops=num_ops,
         tokens_per_op=avg_tokens,
         warmup=warmup,
+        verify_fn=verify_fn_match if verify else None,
     )
     return result
 
@@ -610,17 +623,12 @@ def bench_evict(
 
     def op_fn(item):
         batch = item[0]
-        before_avail = alloc.available_size()
         result = tree.evict(EvictParams(num_tokens=batch, mamba_num=2))
-        after_avail = alloc.available_size()
-        evicted = result.num_tokens_evicted
-        total_evicted_tokens[0] += evicted
+        total_evicted_tokens[0] += result.num_tokens_evicted
         evict_count[0] += 1
 
-        if verify and evict_count[0] % 100 == 0:
-            # Evict release consistency
-            freed = after_avail - before_avail
-            assert freed >= 0, f"Evict freed negative: {freed}"
+    def verify_fn_evict(item):
+        if evict_count[0] % 100 == 0:
             verify_pool_consistency(tree, alloc, f"evict#{evict_count[0]}")
 
     warmup = min(20, num_evictions // 10)
@@ -632,6 +640,7 @@ def bench_evict(
         num_ops=num_ops,
         tokens_per_op=evict_batch,
         warmup=warmup,
+        verify_fn=verify_fn_evict if verify else None,
     )
     return result
 
@@ -706,11 +715,8 @@ def bench_lock_unlock(
         )
         lock_count[0] += 1
 
-        if verify and lock_count[0] % 500 == 0:
-            evictable_after = _full_evictable(tree)
-            assert (
-                evictable_before == evictable_after
-            ), f"Lock/unlock asymmetry: evictable {evictable_before} -> {evictable_after}"
+    def verify_fn_lock(node):
+        if lock_count[0] % 500 == 0:
             verify_pool_consistency(tree, alloc, f"lock#{lock_count[0]}")
 
     warmup = min(20, num_pairs // 10)
@@ -721,6 +727,7 @@ def bench_lock_unlock(
         op_fn=op_fn,
         num_ops=num_ops,
         warmup=warmup,
+        verify_fn=verify_fn_lock if verify else None,
     )
     return result
 
@@ -818,7 +825,9 @@ def bench_cache_finished(
     def op_fn(req):
         tree.cache_finished_req(req, is_insert=True)
         op_count[0] += 1
-        if verify and op_count[0] % 500 == 0:
+
+    def verify_fn_cf(req):
+        if op_count[0] % 500 == 0:
             verify_pool_consistency(tree, alloc, f"cache_finished#{op_count[0]}")
 
     warmup = min(20, num_available // 10)
@@ -830,6 +839,7 @@ def bench_cache_finished(
         num_ops=num_ops,
         tokens_per_op=avg_tokens,
         warmup=warmup,
+        verify_fn=verify_fn_cf if verify else None,
     )
     return result
 

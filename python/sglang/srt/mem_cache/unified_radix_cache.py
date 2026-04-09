@@ -885,10 +885,87 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return "\n".join(lines) + "\n"
 
+    def _collect_all_nodes(self) -> list[UnifiedTreeNode]:
+        nodes = []
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            nodes.append(node)
+            stack.extend(node.children.values())
+        return nodes
+
     def sanity_check(self):
-        for ct in self.tree_components:
-            assert self.component_evictable_size_[ct] >= 0
-            assert self.component_protected_size_[ct] >= 0
+        """Thorough sanity check: verify LRU membership, lock state, linked-list
+        integrity, and evictable sizes for every component.
+        Expensive — use only in tests or idle checks."""
+        try:
+            # 1. Collect all nodes from tree
+            all_nodes = self._collect_all_nodes()
+
+            for ct in self.tree_components:
+                # 2. Basic size invariants
+                assert (
+                    self.component_evictable_size_[ct] >= 0
+                ), f"component_evictable_size_[{ct}] = {self.component_evictable_size_[ct]} < 0"
+                assert (
+                    self.component_protected_size_[ct] >= 0
+                ), f"component_protected_size_[{ct}] = {self.component_protected_size_[ct]} < 0"
+
+                # 3. Verify LRU membership: tree nodes with data == LRU cache entries
+                lru = self.lru_lists[ct]
+                tree_ids = {
+                    n.id
+                    for n in all_nodes
+                    if n != self.root_node and n.component_data[ct].value is not None
+                }
+                lru_ids = set(lru.cache.keys())
+                assert tree_ids == lru_ids, (
+                    f"[{ct}] LRU membership mismatch: "
+                    f"in_tree_not_lru={tree_ids - lru_ids}, "
+                    f"in_lru_not_tree={lru_ids - tree_ids}"
+                )
+
+                # 4. Walk LRU doubly-linked list: verify structural integrity
+                #    and that all nodes are unlocked (idle check)
+                visited = set()
+                x = lru.head.lru_next[ct]
+                prev = lru.head
+                while x != lru.tail:
+                    assert (
+                        x.lru_prev[ct] == prev
+                    ), f"[{ct}] broken prev link at node {x.id}"
+                    assert (
+                        x.id in lru.cache
+                    ), f"[{ct}] node {x.id} in linked list but not in cache dict"
+                    assert x.id not in visited, f"[{ct}] cycle detected at node {x.id}"
+                    assert x.component_data[ct].lock_ref == 0, (
+                        f"[{ct}] node {x.id} should not be locked when idle, "
+                        f"lock_ref={x.component_data[ct].lock_ref}"
+                    )
+                    visited.add(x.id)
+                    prev = x
+                    x = x.lru_next[ct]
+                assert len(visited) == len(lru.cache), (
+                    f"[{ct}] linked list has {len(visited)} nodes, "
+                    f"cache dict has {len(lru.cache)}"
+                )
+
+                # 5. Verify evictable size by walking unlocked LRU nodes
+                recomputed = 0
+                x = lru.get_lru_no_lock()
+                while lru.in_list(x):
+                    v = x.component_data[ct].value
+                    recomputed += len(v) if v is not None else 0
+                    x = lru.get_prev_no_lock(x)
+                assert self.component_evictable_size_[ct] == recomputed, (
+                    f"[{ct}] evictable_size_={self.component_evictable_size_[ct]} "
+                    f"!= recomputed={recomputed}"
+                )
+
+        except Exception as e:
+            logger.error(f"Unified RadixTree sanity check failed: {e}")
+            self.pretty_print()
+            raise
 
     def pretty_print(self) -> None:
         stack = [(self.root_node, 0)]
