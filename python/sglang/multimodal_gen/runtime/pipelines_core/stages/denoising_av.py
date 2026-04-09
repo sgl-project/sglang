@@ -520,10 +520,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
         # Disable cache-dit for image-conditioned requests (TI2V-style) for correctness/debuggability.
         self._disable_cache_dit_for_request = batch.image_path is not None
 
-        # Prepare TI2V conditioning before SP sharding so `_preprocess_sp_latents()`
-        # can shard `image_latent` consistently with packed video latents.
-        self._prepare_ltx2_image_latent(batch, server_args)
-
         # Prepare variables for the denoising loop
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
         target_dtype = prepared_vars["target_dtype"]
@@ -538,6 +534,8 @@ class LTX2AVDenoisingStage(DenoisingStage):
         stage = batch.extra.get("ltx2_phase", "stage1")
         audio_latents = batch.audio_latents
         audio_scheduler = copy.deepcopy(self.scheduler)
+
+        self._prepare_ltx2_image_latent(batch, server_args)
 
         is_ltx23_variant = is_ltx23_native_variant(
             server_args.pipeline_config.vae_config.arch_config
