@@ -26,7 +26,6 @@ except ImportError:
 
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    cleanup_dist_env_and_memory,
     destroy_model_parallel,
     get_local_torch_device,
     get_tensor_model_parallel_rank,
@@ -298,8 +297,7 @@ class AccuracyEngine:
     def reset_parallel_runtime() -> None:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
-            cleanup_dist_env_and_memory()
-        elif model_parallel_is_initialized():
+        if model_parallel_is_initialized():
             destroy_model_parallel()
         gc.collect()
         if torch.cuda.is_available():
