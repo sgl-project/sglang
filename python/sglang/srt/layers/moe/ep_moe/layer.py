@@ -795,24 +795,4 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
 
-    if get_moe_runner_backend().is_flashinfer_trtllm():
-        # NEW: Direct FP4 detection (bypasses EP requirements)
-        # Check for FP4 quantization with TRTLLM flag, regardless of EP
-        # FlashInferFP4MoE must be paired with ModelOptNvFp4FusedMoEMethod.
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFP4MoE
-
-            return FlashInferFP4MoE
-        elif (
-            quant_config is None
-            or quant_config.get_name() == "fp8"
-            or quant_config.get_name() == "mxfp8"
-            or quant_config.get_name() == "modelopt_fp8"
-            or quant_config.get_name() == "compressed_tensors"
-        ):
-            # FlashInferFusedMoE supports bf16, fp8, mxfp8 and compressed_tensors
-            return FusedMoE
-
-    if get_moe_runner_backend().is_flashinfer_cutlass():
-        return FusedMoE
     return FusedMoE

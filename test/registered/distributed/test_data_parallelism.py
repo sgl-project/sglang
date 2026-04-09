@@ -57,13 +57,13 @@ class TestDataParallelism(CustomTestCase, GSM8KMixin):
         assert response.status_code == 200
 
     def test_get_memory_pool_size(self):
-        # use `get_server_info` instead since `get_memory_pool_size` is merged into `get_server_info`
-        response = requests.get(self.base_url + "/get_server_info")
+        # use `server_info` instead since `get_memory_pool_size` is merged into `server_info`
+        response = requests.get(self.base_url + "/server_info")
         assert response.status_code == 200
 
         time.sleep(1)
 
-        response = requests.get(self.base_url + "/get_server_info")
+        response = requests.get(self.base_url + "/server_info")
         assert response.status_code == 200
 
 

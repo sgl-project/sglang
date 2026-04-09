@@ -1273,7 +1273,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             layer,
             prefix,
             Linear=ModelOptFp4LinearMethod,
-            Moe=ModelOptNvFp4FusedMoEMethod,  # FlashInferFP4MoE needs the same quantization method but with compatible attribute handling
+            Moe=ModelOptNvFp4FusedMoEMethod,
         )
 
 
@@ -1534,6 +1534,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
         self.enable_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self._cache_permute_indices = {}
 
@@ -1903,6 +1904,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if get_moe_runner_backend().is_flashinfer_trtllm():
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
+            )
+        elif get_moe_runner_backend().is_flashinfer_trtllm_routed():
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED, moe_runner_config
             )
 
     def apply(

@@ -269,6 +269,7 @@ class Qwen2Model(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
 
@@ -576,7 +577,9 @@ class Qwen2ForCausalLM(nn.Module):
                 continue
 
             if name == "model.embed_tokens.weight":
-                if self.pp_group.is_last_rank and self.config.tie_word_embeddings:
+                if (
+                    not hasattr(self, "pp_group") or self.pp_group.is_last_rank
+                ) and self.config.tie_word_embeddings:
                     if "lm_head.weight" in params_dict:
                         param = params_dict["lm_head.weight"]
                         weight_loader = getattr(
