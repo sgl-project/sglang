@@ -556,7 +556,8 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             image_latents.device, image_latents.dtype
         )
         latents_bn_std = torch.sqrt(
-            vae.bn.running_var.view(1, -1, 1, 1) + self.vae_config.arch_config.batch_norm_eps
+            vae.bn.running_var.view(1, -1, 1, 1)
+            + self.vae_config.arch_config.batch_norm_eps
         ).to(image_latents.device, image_latents.dtype)
         return (image_latents - latents_bn_mean) / latents_bn_std
 
