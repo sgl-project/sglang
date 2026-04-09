@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     denoising as denoising_mod,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_av import (
+    LTX2AVDenoisingStage,
+)
 
 
 def _make_server_args(ltx_variant: str):
@@ -130,3 +133,15 @@ def test_sp_sharding_image_latent_keeps_main_video_metadata(monkeypatch):
     assert batch.sp_video_latent_num_frames == 2
     assert batch.sp_video_start_frame == 8
     assert batch.sp_video_tokens_per_frame == 4096
+
+
+def test_ltx23_one_stage_does_not_consume_stage1_guider_params():
+    stage = object.__new__(LTX2AVDenoisingStage)
+    batch = SimpleNamespace(extra={"ltx2_stage1_guider_params": {"video_cfg_scale": 3.0}})
+
+    assert (
+        LTX2AVDenoisingStage._get_ltx2_stage1_guider_params(
+            stage, batch, _make_server_args("ltx_2_3"), "one_stage"
+        )
+        is None
+    )

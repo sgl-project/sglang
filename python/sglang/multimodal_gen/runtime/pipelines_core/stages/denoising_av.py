@@ -539,7 +539,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
         boundary_timestep = prepared_vars["boundary_timestep"]
         z = prepared_vars["z"]
         reserved_frames_mask = prepared_vars["reserved_frames_mask"]
-        stage = batch.extra.get("ltx2_phase", "stage1")
+        stage = batch.extra.get("ltx2_phase", "one_stage")
         audio_latents = batch.audio_latents
         audio_scheduler = copy.deepcopy(self.scheduler)
 
