@@ -136,9 +136,10 @@ class EagleDraftInputV2Mixin:
             bs,
         )
 
-        # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
+        if not batch.spec_algorithm.is_ngram():
+            # FIXME(lsyin): make this sync optional
+            batch.seq_lens_cpu = batch.seq_lens.cpu()
+            batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(
         self: EagleDraftInput,
