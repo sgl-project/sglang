@@ -296,6 +296,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
+        if hidden_states.shape[0] == 0:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+            return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
