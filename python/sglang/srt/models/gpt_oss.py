@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
+    moe_tensor_model_parallel_all_reduce,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -602,6 +603,22 @@ class GptOssModel(nn.Module):
 
         self.layers_to_capture = []
 
+    @staticmethod
+    def _materialize_capture_hidden_states(
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # EAGLE3 capture should observe the decoder-layer boundary state after any
+        # deferred TP all-reduce has been materialized.
+        if residual is not None and getattr(
+            hidden_states, "_sglang_needs_allreduce_fusion", False
+        ):
+            hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+        captured_hidden_states = (
+            hidden_states if residual is None else hidden_states + residual
+        )
+        return hidden_states, captured_hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -625,7 +642,12 @@ class GptOssModel(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
+                    hidden_states, captured_hidden_states = (
+                        self._materialize_capture_hidden_states(
+                            hidden_states, residual
+                        )
+                    )
+                    aux_hidden_states.append(captured_hidden_states)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual

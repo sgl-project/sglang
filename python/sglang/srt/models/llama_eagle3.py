@@ -135,11 +135,20 @@ class LlamaModel(nn.Module):
         else:
             self.hidden_size_in = config.hidden_size
 
+        eagle_config = getattr(config, "eagle_config", {}) or {}
+        self.norm_before_fc = bool(
+            eagle_config.get("norm_before_fc", getattr(config, "norm_before_fc", False))
+        )
+
         self.fc = torch.nn.Linear(
             self.hidden_size_in * 3,
             config.hidden_size,
             bias=getattr(config, "bias", False),
         )
+        if self.norm_before_fc:
+            self.input_norm = RMSNorm(self.hidden_size_in * 3, eps=config.rms_norm_eps)
+        else:
+            self.input_norm = None
 
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
@@ -174,6 +183,8 @@ class LlamaModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.input_norm is not None:
+                hidden_states = self.input_norm(hidden_states)
             hidden_states = self.fc(hidden_states)
 
         # idle batch
@@ -260,6 +271,11 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
             if "t2d" in name:
                 continue
+
+            # NVIDIA Eagle3 checkpoints use "layers.0.*" for the single draft
+            # layer, while SGLang stores it under "midlayer.*".
+            if name.startswith("layers.0."):
+                name = "midlayer." + name[len("layers.0.") :]
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
