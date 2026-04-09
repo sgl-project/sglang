@@ -584,6 +584,7 @@ class LTX2Attention(nn.Module):
         all_perturbed: bool = False,
         skip_sequence_parallel_override: bool = False,
         gather_context_kv_for_sp: bool = False,
+        exact_sp_attention_override: bool = False,
     ) -> torch.Tensor:
         gate_input = x
         context_ = x if context is None else context
@@ -623,7 +624,28 @@ class LTX2Attention(nn.Module):
             q = q.view(*q.shape[:-1], self.local_heads, self.dim_head)
             k = k.view(*k.shape[:-1], self.local_heads, self.dim_head)
 
-            if gather_context_kv_for_sp:
+            if (
+                exact_sp_attention_override
+                and not self.use_local_attention
+                and mask is None
+                and not gather_context_kv_for_sp
+                and not skip_sequence_parallel_override
+                and get_sp_world_size() > 1
+            ):
+                q_local_len = int(q.shape[1])
+                q_full = sequence_model_parallel_all_gather(q.contiguous(), dim=1)
+                k_full = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
+                v_full = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
+                out_full = self.attn(
+                    q_full,
+                    k_full,
+                    v_full,
+                    skip_sequence_parallel_override=True,
+                )
+                sp_rank = get_sp_parallel_rank()
+                start = sp_rank * q_local_len
+                out = out_full[:, start : start + q_local_len]
+            elif gather_context_kv_for_sp:
                 k_full = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
                 v_full = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
                 gathered_mask = None
@@ -919,6 +941,8 @@ class LTX2TransformerBlock(nn.Module):
         skip_a2v_cross_attn: bool = False,
         skip_v2a_cross_attn: bool = False,
         audio_replicated_for_sp: bool = False,
+        exact_video_self_attn_for_sp: bool = False,
+        exact_audio_self_attn_for_sp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         batch_size = hidden_states.size(0)
@@ -936,6 +960,7 @@ class LTX2TransformerBlock(nn.Module):
             pe=video_rotary_emb,
             all_perturbed=skip_video_self_attn,
             gather_context_kv_for_sp=audio_replicated_for_sp,
+            exact_sp_attention_override=exact_video_self_attn_for_sp,
         )
         hidden_states = hidden_states + attn_hidden_states * vgate_msa
 
@@ -951,6 +976,7 @@ class LTX2TransformerBlock(nn.Module):
             pe=audio_rotary_emb,
             all_perturbed=skip_audio_self_attn,
             skip_sequence_parallel_override=audio_replicated_for_sp,
+            exact_sp_attention_override=exact_audio_self_attn_for_sp,
         )
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * agate_msa
         # 2. Prompt Cross-Attention
@@ -1518,6 +1544,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         disable_a2v_cross_attn: bool = False,
         disable_v2a_cross_attn: bool = False,
         audio_replicated_for_sp: bool = False,
+        exact_ltx23_sp_self_attention: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
 
@@ -1704,6 +1731,8 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 skip_a2v_cross_attn=disable_a2v_cross_attn,
                 skip_v2a_cross_attn=disable_v2a_cross_attn,
                 audio_replicated_for_sp=audio_replicated_for_sp,
+                exact_video_self_attn_for_sp=exact_ltx23_sp_self_attention,
+                exact_audio_self_attn_for_sp=exact_ltx23_sp_self_attention,
             )
 
         # 6. Output layers
