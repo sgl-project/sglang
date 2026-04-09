@@ -128,11 +128,11 @@ class TestDPAttentionDP2PP2(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_en(self):
+    def test_gsm8k(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="mgsm_en",
+            eval_name="gsm8k",
             num_examples=None,
             num_threads=1024,
         )

@@ -19,7 +19,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.7.post2
+ARG FLASHINFER_VERSION=0.6.7.post3
 ARG MOONCAKE_VERSION=0.3.9
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
@@ -218,9 +218,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
-    && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
-    && kernels download python
-    && kernels lock python
+    && kernels lock python \
+    && ( success=0; for i in 1 2 3; do \
+        echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
+        kernels download python && \
+        success=1 && break; \
+        echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
+    done; [ "$success" = "1" ] ) \
     && mv python/kernels.lock /root/.cache/sglang
 
 # DeepEP
@@ -453,7 +457,24 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
         ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
+# Fix Trivy-reported CVEs
+# pip:             urllib3 (CVE-2025-43859), pillow (CVE-2026-25990)
+# binutils family: CVE-2025-{1147,1148,3198,5244,5245,7545,7546,8225,11082,11083,11412,11413,11414,11494,11839,11840}
+# libgnutls30t64:  CVE-2025-{9820,14831}
+# libpam:          CVE-2024-10963
+# libsqlite3-0:    CVE-2025-{6965,7709}
+# libtasn1-6:      CVE-2025-13151
+# dpkg:            CVE-2025-6297
 RUN python3 -m pip install --upgrade "urllib3>=2.6.3" "pillow>=12.1.1"
+RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
+    apt-get update && apt-get install -y --only-upgrade \
+    binutils binutils-common binutils-x86-64-linux-gnu libbinutils \
+    libctf0 libctf-nobfd0 libgprofng0 libsframe1 \
+    libgnutls30t64 \
+    libpam-modules libpam-modules-bin libpam-runtime libpam0g \
+    libsqlite3-0 libtasn1-6 \
+    dpkg dpkg-dev libdpkg-perl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
@@ -557,6 +578,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends locales \
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
+
+# Fix Trivy-reported CVEs (see framework stage for full CVE list)
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
+    apt-get update && apt-get install -y --only-upgrade \
+    binutils binutils-common binutils-x86-64-linux-gnu libbinutils \
+    libctf0 libctf-nobfd0 libgprofng0 libsframe1 \
+    libgnutls30t64 \
+    libpam-modules libpam-modules-bin libpam-runtime libpam0g \
+    libsqlite3-0 libtasn1-6 \
+    dpkg dpkg-dev libdpkg-perl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy Python site-packages from framework (contains all built packages)
 COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
