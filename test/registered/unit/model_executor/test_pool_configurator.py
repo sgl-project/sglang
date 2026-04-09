@@ -5,6 +5,7 @@ verifying tokens are correct, constraints are respected, and memory
 invariants hold (tokens * per_token_cost <= available_bytes).
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -12,6 +13,19 @@ from unittest.mock import MagicMock, patch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+
+
+@contextlib.contextmanager
+def mock_cpu_env(kv_size=2, tp_size=1):
+    """Mock GPU-dependent functions for CPU-only testing."""
+    with (
+        patch("torch._utils._element_size", return_value=kv_size),
+        patch(
+            "sglang.srt.model_executor.pool_configurator.get_attention_tp_size",
+            return_value=tp_size,
+        ),
+    ):
+        yield
 
 
 def _make_model_runner(
@@ -104,7 +118,7 @@ class TestDefaultConfigurator(unittest.TestCase):
 
     def _run(self, available_bytes, page_size=1, **kwargs):
         mr = _make_model_runner(page_size=page_size, **kwargs)
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
@@ -129,13 +143,13 @@ class TestDefaultConfigurator(unittest.TestCase):
     def test_constraint_respected(self):
         """calculate_pool_sizes_from_max_tokens respects the limit."""
         mr, cfg, config = self._run(10_000_000)
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             constrained = cfg.calculate_pool_sizes_from_max_tokens(100, page_size=1)
         self.assertEqual(constrained.max_total_num_tokens, 100)
 
     def test_constraint_page_aligned(self):
         mr, cfg, _ = self._run(10_000_000, page_size=128)
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             constrained = cfg.calculate_pool_sizes_from_max_tokens(1000, page_size=128)
         self.assertEqual(constrained.max_total_num_tokens, 896)  # 1000 // 128 * 128
 
@@ -160,7 +174,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
 
     def _run(self, available_bytes, **kwargs):
         mr = self._make_swa_runner(**kwargs)
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
@@ -204,7 +218,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
     def test_constraint_respected(self):
         """full_tokens = constrained value after re-run"""
         mr, cfg, _ = self._run(10_000_000, page_size=1)
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             config = cfg.calculate_pool_sizes_from_max_tokens(200, page_size=1)
         self.assertEqual(config.full_max_total_num_tokens, 200)
         self.assertEqual(config.swa_max_total_num_tokens, 100)
@@ -214,7 +228,7 @@ class TestHybridSWAConfigurator(unittest.TestCase):
         available = 10_000_000
         mr, cfg, original = self._run(available, page_size=1)
         user_limit = original.full_max_total_num_tokens // 2
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             config = cfg.calculate_pool_sizes_from_max_tokens(
                 user_limit, mr.server_args.page_size
             )
@@ -248,7 +262,7 @@ class TestAllSWAConfigurator(unittest.TestCase):
             swa_full_tokens_ratio=ratio,
             page_size=page_size,
         )
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 create_memory_pool_configurator,
             )
@@ -277,7 +291,7 @@ class TestAllSWAConfigurator(unittest.TestCase):
 
     def test_constraint_respected(self):
         mr, cfg, _ = self._run(10_000_000, page_size=1)
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             config = cfg.calculate_pool_sizes_from_max_tokens(500, page_size=1)
         self.assertEqual(config.max_total_num_tokens, 500)
         self.assertEqual(config.swa_max_total_num_tokens, 500)
@@ -286,7 +300,7 @@ class TestAllSWAConfigurator(unittest.TestCase):
 class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(is_hybrid_swa=False)
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 DefaultPoolConfigurator,
                 create_memory_pool_configurator,
@@ -302,7 +316,7 @@ class TestFactory(unittest.TestCase):
             swa_attention_layer_ids=list(range(16, 32)),
             swa_num_kv_heads=4,
         )
-        with patch("torch._utils._element_size", return_value=KV_SIZE):
+        with mock_cpu_env():
             from sglang.srt.model_executor.pool_configurator import (
                 HybridSWAPoolConfigurator,
                 create_memory_pool_configurator,
