@@ -133,7 +133,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     std::string result;
     for (size_t i = 0; i < entries.size(); ++i) {
       if (i > 0) result += "\n";
-      result += entries[i].first + "\t" + std::to_string(entries[i].second);
+      result += entries[i].first + "," + std::to_string(entries[i].second);
     }
     return result;
   }
