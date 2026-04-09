@@ -814,17 +814,15 @@ struct DeviceGemmFp8RowwiseSm100 {
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
   using ElementComputeEpilogue = float;
-  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
+  using ScaleA = Sm90ColOrScalarBroadcast<
       0,
       TileShape,
-      ElementComputeEpilogue,
       ElementComputeEpilogue,
       cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
 
-  using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
+  using ScaleB = Sm90RowOrScalarBroadcast<
       0,
       TileShape,
-      ElementComputeEpilogue,
       ElementComputeEpilogue,
       cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
@@ -910,7 +908,12 @@ struct DeviceGemmFp8RowwiseSm100 {
     auto* data_ptr = static_cast<T*>(tensor.data_ptr());
     static_assert(
         std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB> || std::is_same_v<Descriptor, Bias>);
-    return Arguments{data_ptr};
+    if constexpr (std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB>) {
+      // OrScalar broadcast: {ptr, is_vector}
+      return Arguments{data_ptr, tensor.numel() != 1};
+    } else {
+      return Arguments{data_ptr};
+    }
   }
 
  public:
@@ -1189,17 +1192,15 @@ struct DeviceGemmFp8RowwiseSm120 {
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
   using ElementComputeEpilogue = float;
-  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
+  using ScaleA = Sm90ColOrScalarBroadcast<
       0,
       TileShape,
-      ElementComputeEpilogue,
       ElementComputeEpilogue,
       cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
 
-  using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
+  using ScaleB = Sm90RowOrScalarBroadcast<
       0,
       TileShape,
-      ElementComputeEpilogue,
       ElementComputeEpilogue,
       cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
 
@@ -1285,7 +1286,12 @@ struct DeviceGemmFp8RowwiseSm120 {
     auto* data_ptr = static_cast<T*>(tensor.data_ptr());
     static_assert(
         std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB> || std::is_same_v<Descriptor, Bias>);
-    return Arguments{data_ptr};
+    if constexpr (std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB>) {
+      // OrScalar broadcast: {ptr, is_vector}
+      return Arguments{data_ptr, tensor.numel() != 1};
+    } else {
+      return Arguments{data_ptr};
+    }
   }
 
  public:
@@ -1511,8 +1517,6 @@ torch::Tensor fp8_scaled_mm(
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
   if (sm_version >= 120) {
-    TORCH_CHECK(scales_a.numel() == mat_a.size(0), "SM120 path requires per-row scales_a, got scalar. Use SM90 for scalar scale support.");
-    TORCH_CHECK(scales_b.numel() == mat_b.size(1), "SM120 path requires per-col scales_b, got scalar. Use SM90 for scalar scale support.");
     if (out_dtype == torch::kBFloat16) {
       sm120_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
@@ -1520,8 +1524,6 @@ torch::Tensor fp8_scaled_mm(
     }
     return out;
   } else if (sm_version >= 100) {
-    TORCH_CHECK(scales_a.numel() == mat_a.size(0), "SM100 path requires per-row scales_a, got scalar. Use SM90 for scalar scale support.");
-    TORCH_CHECK(scales_b.numel() == mat_b.size(1), "SM100 path requires per-col scales_b, got scalar. Use SM90 for scalar scale support.");
     if (out_dtype == torch::kBFloat16) {
       sm100_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
