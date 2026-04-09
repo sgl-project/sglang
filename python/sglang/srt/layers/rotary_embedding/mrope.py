@@ -52,12 +52,14 @@ class MRotaryEmbedding(RotaryEmbedding):
         dtype: torch.dtype,
         mrope_section: Optional[List[int]] = None,
         mrope_interleaved: bool = False,
+        mrope_interleaved_glm: bool = False,
     ) -> None:
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
         self.mrope_section = mrope_section
         self.mrope_interleaved = mrope_interleaved
+        self.mrope_interleaved_glm = mrope_interleaved_glm
         if self.mrope_section:
             expected_sum = rotary_dim // 2
             actual_sum = sum(self.mrope_section)
@@ -86,6 +88,37 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
+        # MRoPE axis_map interleaving pattern depends on mrope_section sizes.
+        # The algorithm cycles through axes [0(T), 1(H), 2(W)] round-robin,
+        # skipping any axis that has exhausted its allocated pairs.
+        #
+        # For GLM-V (mrope_section=[8,12,12]):
+        #   T(8) < H(12) = W(12), so T exhausts first at pair 24.
+        #   Result: [0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 0,1,2, 1,1,2, 1,1,2, 2,2]
+        #   After T runs out, only H and W fill the remaining slots.
+        #
+        # For Qwen3-VL (mrope_section=[24,20,20]):
+        #   T(24) > H(20) = W(20), so H and W exhaust first near the tail.
+        #   Result: [0,1,2, 0,1,2, ...repeated evenly..., 0,1, 0,1, 0,0]
+        #   After H/W run out, T fills the remaining slots.
+
+        if self.mrope_interleaved_glm:
+            num_pairs = rotary_dim // 2
+            axis_map = torch.empty(num_pairs, dtype=torch.long)
+            assert sum(self.mrope_section) == num_pairs
+            counts = [0, 0, 0]
+            current_ax = 0
+
+            for i in range(num_pairs):
+                current_ax = i % 3
+                while counts[current_ax] >= self.mrope_section[current_ax]:
+                    current_ax = (current_ax + 1) % 3
+
+                axis_map[i] = current_ax
+                counts[current_ax] += 1
+            self.register_buffer("axis_map", axis_map, persistent=False)
+        else:
+            self.axis_map = None
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
 
@@ -214,7 +247,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.head_size,
             self.rotary_dim,
             self.mrope_interleaved,
+            self.mrope_interleaved_glm,
             self.is_neox_style,
+            self.axis_map,
         )
         return query, key
 

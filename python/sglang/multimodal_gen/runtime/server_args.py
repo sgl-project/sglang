@@ -22,7 +22,7 @@ import yaml
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.quantization import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -48,7 +48,6 @@ from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
     expand_path_fields,
-    expand_path_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -150,6 +149,7 @@ class ServerArgs:
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
     lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
+    lora_weight_name: str | None = None
 
     # Component path overrides (key = model_index.json component name, value = path)
     component_paths: dict[str, str] = field(default_factory=dict)
@@ -189,8 +189,7 @@ class ServerArgs:
     )
 
     # Master port for distributed inference
-    # TODO: do not hard code
-    master_port: int | None = None
+    master_port: int = 30005
 
     # http server endpoint config
     host: str | None = "127.0.0.1"
@@ -201,6 +200,9 @@ class ServerArgs:
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+
+    # Strict port mode: fail if requested port is unavailable instead of auto-selecting
+    strict_ports: bool = False
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
@@ -230,6 +232,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     @property
     def broker_port(self) -> int:
@@ -275,27 +278,20 @@ class ServerArgs:
             self.input_save_path = None
 
     def _adjust_quant_config(self):
-        """validate and adjust"""
+        """
+        resolve, validate and adjust quantization config
 
-        # nunchaku
+        handles only nunchaku for now
+        """
+
         ncfg = self.nunchaku_config
         if ncfg is None or isinstance(ncfg, NunchakuConfig):
             return
-        ncfg.validate()
 
-        # propagate the path to server_args
-        if ncfg.transformer_weights_path:
-            self.transformer_weights_path = ncfg.transformer_weights_path
-
-        if not ncfg.enable_svdquant or not ncfg.transformer_weights_path:
-            self.nunchaku_config = None
-        else:
-            self.nunchaku_config = NunchakuConfig(
-                precision=self.nunchaku_config.quantization_precision,
-                rank=self.nunchaku_config.quantization_rank,
-                act_unsigned=self.nunchaku_config.quantization_act_unsigned,
-                transformer_weights_path=self.nunchaku_config.transformer_weights_path,
-            )
+        resolution = ncfg.resolve_runtime_config()
+        if resolution.transformer_weights_path:
+            self.transformer_weights_path = resolution.transformer_weights_path
+        self.nunchaku_config = resolution.nunchaku_config
 
     def adjust_pipeline_config(self):
         # enable parallel folding when SP is enabled
@@ -390,18 +386,27 @@ class ServerArgs:
                 "Warmup enabled, the launch time is expected to be longer than usual"
             )
 
+    @staticmethod
+    def _require_port(port: int, name: str) -> None:
+        """Raise if *port* is occupied (used under ``--strict-ports``)."""
+        if not is_port_available(port):
+            raise RuntimeError(
+                f"{name} port {port} is unavailable and --strict-ports is enabled. "
+                f"Either use a different port or disable --strict-ports."
+            )
+
     def _adjust_network_ports(self):
-        self.port = self.settle_port(self.port)
-        initial_scheduler_port = self.scheduler_port + (
-            random.randint(0, 100) if self.scheduler_port == 5555 else 0
-        )
-        self.scheduler_port = self.settle_port(initial_scheduler_port)
-        initial_master_port = (
-            self.master_port
-            if self.master_port is not None
-            else (30005 + random.randint(0, 100))
-        )
-        self.master_port = self.settle_port(initial_master_port, 37)
+        if self.strict_ports:
+            self._require_port(self.port, "HTTP")
+            self._require_port(self.scheduler_port, "Scheduler")
+            self._require_port(self.master_port, "Master")
+        else:
+            self.port = self.settle_port(self.port)
+            initial_scheduler_port = self.scheduler_port + (
+                random.randint(0, 100) if self.scheduler_port == 5555 else 0
+            )
+            self.scheduler_port = self.settle_port(initial_scheduler_port)
+            self.master_port = self.settle_port(self.master_port, 37)
 
     def _adjust_parallelism(self):
         if self.tp_size is None:
@@ -556,6 +561,15 @@ class ServerArgs:
                 "Useful when --model-path is a local directory whose name does not match "
                 "any registered HF repo name. Should be the repo name portion of the HF ID "
                 "(e.g. 'Qwen-Image' for 'Qwen/Qwen-Image')."
+            ),
+        )
+        parser.add_argument(
+            "--pipeline-class-name",
+            type=str,
+            default=ServerArgs.pipeline_class_name,
+            help=(
+                "Override pipeline class selection from model_index.json. "
+                "Must match a registered pipeline_name."
             ),
         )
         # attention
@@ -786,6 +800,12 @@ class ServerArgs:
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--strict-ports",
+            action=StoreBoolean,
+            default=ServerArgs.strict_ports,
+            help="If enabled, fail when requested ports are unavailable instead of auto-selecting.",
+        )
+        parser.add_argument(
             "--webui",
             action=StoreBoolean,
             default=ServerArgs.webui,
@@ -830,6 +850,12 @@ class ServerArgs:
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
         )
+        parser.add_argument(
+            "--lora-weight-name",
+            type=str,
+            default=ServerArgs.lora_weight_name,
+            help="Specific safetensors filename to load from a multi-file LoRA repo",
+        )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
 
@@ -839,6 +865,15 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+        parser.add_argument(
+            "--uvicorn-access-log-exclude-prefixes",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Exclude uvicorn access logs whose request path starts with any of these prefixes. "
+            "Defaults to empty (disabled). "
+            "Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
         )
         parser.add_argument(
             "--backend",
@@ -906,7 +941,11 @@ class ServerArgs:
         unknown_args: list[str],
     ) -> tuple[dict[str, str], list[str]]:
         """
-        Extract dynamic ``--<component>-path`` args from unrecognised CLI args.
+        Extract dynamic component path args from unrecognised CLI args.
+
+        Supported forms:
+        - ``--<component>-path /path/to/component``
+        - ``--component-paths.<component> /path/to/component`` (expanded from config)
         """
         component_paths: dict[str, str] = {}
         remaining: list[str] = []
@@ -914,8 +953,15 @@ class ServerArgs:
         while i < len(unknown_args):
             arg = unknown_args[i]
             key_part = arg.split("=", 1)[0] if "=" in arg else arg
-            if key_part.startswith("--") and key_part.endswith("-path"):
+            component = None
+            if key_part.startswith("--component-paths."):
+                component = key_part[len("--component-paths.") :].replace("-", "_")
+            elif key_part.startswith("--component_paths."):
+                component = key_part[len("--component_paths.") :].replace("-", "_")
+            elif key_part.startswith("--") and key_part.endswith("-path"):
                 component = key_part[2:-5].replace("-", "_")
+
+            if component is not None:
                 if "=" in arg:
                     component_paths[component] = arg.split("=", 1)[1]
                 elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
@@ -967,7 +1013,6 @@ class ServerArgs:
     @classmethod
     def from_dict(cls, kwargs: dict[str, Any]) -> "ServerArgs":
         """Create a ServerArgs object from a dictionary."""
-        kwargs = expand_path_kwargs(dict(kwargs))
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         server_args_kwargs: dict[str, Any] = {}
 

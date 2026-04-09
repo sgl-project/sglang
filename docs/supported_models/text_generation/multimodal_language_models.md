@@ -51,7 +51,37 @@ in the GitHub search bar.
 | **Ernie4.5-VL** | `baidu/ERNIE-4.5-VL-28B-A3B-PT`              | Baidu's vision-language models(28B,424B). Support image and video comprehension, and also support thinking.                                                                     |  |
 | **JetVLM** |  | JetVLM is an vision-language model designed for high-performance multimodal understanding and generation tasks built upon Jet-Nemotron. | Coming soon |
 | **Step3-VL** (10B) | `stepfun-ai/Step3-VL-10B` | StepFun's lightweight open-source 10B parameter VLM for multimodal intelligence, excelling in visual perception, complex reasoning, and human alignment. |  |
+| **Qwen3-ASR** (0.6B, 1.7B) | `Qwen/Qwen3-ASR-1.7B` | Alibaba's automatic speech recognition models supporting 52 languages. Served via the `/v1/audio/transcriptions` endpoint. |  |
 | **Qwen3-Omni** | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |  Alibaba's omni-modal MoE model. Currently supports the **Thinker** component (multimodal understanding for text, images, audio, and video), while the **Talker** component (audio generation) is not yet supported. |  |
+| **LFM2-VL** | `LiquidAI/LFM2.5-VL-1.6B` | Liquid AI's vision-language model combining a SigLip2 vision encoder (NaFlex variable-resolution) with the LFM2 hybrid attention + short convolution language model. Supports multi-image inputs. |  |
+
+## Audio Transcription
+
+SGLang supports audio-only ASR models via the OpenAI-compatible `/v1/audio/transcriptions` endpoint. Upload an audio file and receive a transcription.
+
+### Launch Command
+
+```shell
+sglang serve \
+  --model-path Qwen/Qwen3-ASR-1.7B \
+  --served-model-name qwen3-asr \
+  --trust-remote-code \
+  --host 0.0.0.0 --port 30000
+```
+
+### Example Request
+
+```bash
+curl http://localhost:30000/v1/audio/transcriptions \
+  -F file=@audio.wav \
+  -F model=qwen3-asr \
+  -F response_format=verbose_json
+```
+
+| Model Family | Example Identifier | Notes |
+|--------------|--------------------|-------|
+| **Whisper** | `openai/whisper-large-v3` | OpenAI's speech recognition model. |
+| **Qwen3-ASR** (0.6B, 1.7B) | `Qwen/Qwen3-ASR-1.7B` | Use `--trust-remote-code`. Supports 52 languages. |
 
 ## Video Input Support
 

@@ -7,12 +7,12 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_EAGLE,
-    DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=283, suite="stage-b-test-1-gpu-small")
 
 
-class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
+class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
     max_running_requests = 64
     attention_backend = "triton"
     spec_steps = 5
@@ -30,18 +30,21 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     spec_draft_tokens = 6
     page_size = 1
     other_launch_args = []
-    model = DEFAULT_TARGET_MODEL_EAGLE
-    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         launch_args = [
             "--trust-remote-code",
+            "--dtype=float16",
+            "--chunked-prefill-size",
+            "1024",
             "--attention-backend",
             cls.attention_backend,
             "--speculative-algorithm",
-            "EAGLE",
+            "EAGLE3",
             "--speculative-draft-model",
             cls.draft_model,
             "--speculative-num-steps",
@@ -68,6 +71,8 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
             True
         ), envs.SGLANG_SPEC_OOB_DETECTION.override(
             True
+        ), envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(
+            True
         ):
             cls.process = popen_launch_server(
                 cls.model,
@@ -86,19 +91,17 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=1000,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=1000,
+            num_threads=128,
         )
         metrics = run_eval(args)
-        print(f"TestEagleLargeBS -- {metrics=}")
-        self.assertGreater(
-            metrics["accuracy"], 0.23
-        )  # 0.3333 for 60 questions; 0.234 for 1319 questions
+        print(f"TestEagle3LargeBS -- {metrics=}")
+        self.assertGreater(metrics["score"], 0.7)
         assert self.process.poll() is None
 
     def test_logprob_spec_v2_match(self):
@@ -241,7 +244,7 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
                 self.assertIn("text", res, f"Server error: {res}")
 
 
-class TestEagleServerPage(TestEagleServerBase):
+class TestEagle3ServerPage(TestEagle3ServerBase):
     other_launch_args = ["--page-size", "64"]
 
 

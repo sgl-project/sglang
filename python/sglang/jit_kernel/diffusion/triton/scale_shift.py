@@ -71,41 +71,28 @@ def _fused_layernorm_scale_shift_gate_select01_kernel(
     seq_idx = row % seq_len
     idx = tl.load(index_ptr + batch_idx * stride_i_b + seq_idx * stride_i_l).to(tl.int1)
 
-    scale0 = tl.load(
-        scale0_ptr + batch_idx * stride_s0_b + cols * stride_s0_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    shift0 = tl.load(
-        shift0_ptr + batch_idx * stride_sh0_b + cols * stride_sh0_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    gate0 = tl.load(
-        gate0_ptr + batch_idx * stride_g0_b + cols * stride_g0_c,
-        mask=mask,
-        other=0.0,
-    )
+    scale0_ptrs = scale0_ptr + batch_idx * stride_s0_b + cols * stride_s0_c
+    shift0_ptrs = shift0_ptr + batch_idx * stride_sh0_b + cols * stride_sh0_c
+    gate0_ptrs = gate0_ptr + batch_idx * stride_g0_b + cols * stride_g0_c
 
-    scale1 = tl.load(
-        scale1_ptr + batch_idx * stride_s1_b + cols * stride_s1_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    shift1 = tl.load(
-        shift1_ptr + batch_idx * stride_sh1_b + cols * stride_sh1_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    gate1 = tl.load(
-        gate1_ptr + batch_idx * stride_g1_b + cols * stride_g1_c,
-        mask=mask,
-        other=0.0,
-    )
+    scale1_ptrs = scale1_ptr + batch_idx * stride_s1_b + cols * stride_s1_c
+    shift1_ptrs = shift1_ptr + batch_idx * stride_sh1_b + cols * stride_sh1_c
+    gate1_ptrs = gate1_ptr + batch_idx * stride_g1_b + cols * stride_g1_c
 
-    scale = tl.where(idx, scale1, scale0)
-    shift = tl.where(idx, shift1, shift0)
-    gate = tl.where(idx, gate1, gate0)
+    # Branch on scalar idx instead of using tl.where on pointers.
+    # tl.where on pointers triggers an assertion in AMD Triton's
+    # CanonicalizePointers pass (ConvertArithSelectOp) on gfx950.
+    # This keeps it at 3 loads (not 6), avoids the pointer-level
+    # tl.where entirely, and since idx is uniform across all threads
+    # the branch has no divergence cost.
+    if idx:
+        scale = tl.load(scale1_ptrs, mask=mask, other=0.0).to(tl.float32)
+        shift = tl.load(shift1_ptrs, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(gate1_ptrs, mask=mask, other=0.0)
+    else:
+        scale = tl.load(scale0_ptrs, mask=mask, other=0.0).to(tl.float32)
+        shift = tl.load(shift0_ptrs, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(gate0_ptrs, mask=mask, other=0.0)
     y = x_hat * (1.0 + scale) + shift
 
     tl.store(out_row_ptr + cols, y, mask=mask)
@@ -192,41 +179,28 @@ def _fused_residual_layernorm_scale_shift_gate_select01_kernel(
     seq_idx = row % seq_len
     idx = tl.load(index_ptr + batch_idx * stride_i_b + seq_idx * stride_i_l).to(tl.int1)
 
-    scale0 = tl.load(
-        scale0_ptr + batch_idx * stride_s0_b + cols * stride_s0_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    shift0 = tl.load(
-        shift0_ptr + batch_idx * stride_sh0_b + cols * stride_sh0_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    gate0 = tl.load(
-        gate0_ptr + batch_idx * stride_g0_b + cols * stride_g0_c,
-        mask=mask,
-        other=0.0,
-    )
+    scale0_ptrs = scale0_ptr + batch_idx * stride_s0_b + cols * stride_s0_c
+    shift0_ptrs = shift0_ptr + batch_idx * stride_sh0_b + cols * stride_sh0_c
+    gate0_ptrs = gate0_ptr + batch_idx * stride_g0_b + cols * stride_g0_c
 
-    scale1 = tl.load(
-        scale1_ptr + batch_idx * stride_s1_b + cols * stride_s1_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    shift1 = tl.load(
-        shift1_ptr + batch_idx * stride_sh1_b + cols * stride_sh1_c,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    gate1 = tl.load(
-        gate1_ptr + batch_idx * stride_g1_b + cols * stride_g1_c,
-        mask=mask,
-        other=0.0,
-    )
+    scale1_ptrs = scale1_ptr + batch_idx * stride_s1_b + cols * stride_s1_c
+    shift1_ptrs = shift1_ptr + batch_idx * stride_sh1_b + cols * stride_sh1_c
+    gate1_ptrs = gate1_ptr + batch_idx * stride_g1_b + cols * stride_g1_c
 
-    scale = tl.where(idx, scale1, scale0)
-    shift = tl.where(idx, shift1, shift0)
-    gate = tl.where(idx, gate1, gate0)
+    # Branch on scalar idx instead of using tl.where on pointers.
+    # tl.where on pointers triggers an assertion in AMD Triton's
+    # CanonicalizePointers pass (ConvertArithSelectOp) on gfx950.
+    # This keeps it at 3 loads (not 6), avoids the pointer-level
+    # tl.where entirely, and since idx is uniform across all threads
+    # the branch has no divergence cost.
+    if idx:
+        scale = tl.load(scale1_ptrs, mask=mask, other=0.0).to(tl.float32)
+        shift = tl.load(shift1_ptrs, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(gate1_ptrs, mask=mask, other=0.0)
+    else:
+        scale = tl.load(scale0_ptrs, mask=mask, other=0.0).to(tl.float32)
+        shift = tl.load(shift0_ptrs, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(gate0_ptrs, mask=mask, other=0.0)
     y = x_hat * (1.0 + scale) + shift
 
     tl.store(out_row_ptr + cols, y, mask=mask)
@@ -523,6 +497,7 @@ def fuse_layernorm_scale_shift_gate_select01_kernel(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(C))
     if C > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    num_warps, num_stages = 4, 4
 
     grid = (B * L,)
     _fused_layernorm_scale_shift_gate_select01_kernel[grid](
@@ -563,6 +538,8 @@ def fuse_layernorm_scale_shift_gate_select01_kernel(
         HAS_WEIGHT=weight is not x_2d,
         HAS_BIAS=bias is not x_2d,
         BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output, gate_out
 
@@ -624,6 +601,7 @@ def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(C))
     if C > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    num_warps, num_stages = 4, 4
 
     grid = (B * L,)
     _fused_residual_layernorm_scale_shift_gate_select01_kernel[grid](
@@ -670,6 +648,8 @@ def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
         HAS_WEIGHT=weight is not x_2d,
         HAS_BIAS=bias is not x_2d,
         BLOCK_N=BLOCK_N,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output, residual_out, gate_out
 

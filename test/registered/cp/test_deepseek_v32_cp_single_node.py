@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=360, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=640, suite="stage-c-test-deepep-8-gpu-h200")
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
@@ -68,23 +68,24 @@ class TestDeepseekV32CPInSeqSplit(CustomTestCase):
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=500,
+            num_threads=32,
             num_shots=20,
-            data_path=None,
-            num_questions=500,
-            parallel=32,
-            max_new_tokens=512,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
             write_github_step_summary(
                 f"### test_a_gsm8k (deepseek-v32-cp-in-seq-split)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
+                f'{metrics["score"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+            self.assertGreater(metrics["score"], 0.935)
 
 
 class TestDeepseekV32CPRoundRobinSplit(CustomTestCase):
@@ -134,23 +135,24 @@ class TestDeepseekV32CPRoundRobinSplit(CustomTestCase):
         self,
     ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
         args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=500,
+            num_threads=32,
             num_shots=20,
-            data_path=None,
-            num_questions=500,
-            parallel=32,
-            max_new_tokens=512,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
 
         if is_in_ci():
             write_github_step_summary(
                 f"### test_a_gsm8k (deepseek-v32-cp-in-seq-split)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
+                f'{metrics["score"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.935)
+            self.assertGreater(metrics["score"], 0.935)
 
 
 if __name__ == "__main__":

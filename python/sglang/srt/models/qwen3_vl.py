@@ -15,7 +15,6 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 
 import logging
-import math
 import re
 from collections import defaultdict
 from functools import lru_cache, partial
@@ -73,7 +72,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu, round_up
+from sglang.srt.utils import add_prefix, is_npu, round_up
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
@@ -1131,6 +1130,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     def separate_deepstack_embeds(self, embedding):
         assert (
             embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
@@ -1140,6 +1142,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_embeds = embedding[:, :separate_index]
         input_deepstack_embeds = embedding[:, separate_index:]
         return input_embeds, input_deepstack_embeds
+
+    @property
+    def start_layer(self) -> int:
+        return getattr(getattr(self, "model", None), "start_layer", 0)
+
+    @property
+    def end_layer(self) -> int:
+        model = getattr(self, "model", None)
+        end_layer = getattr(model, "end_layer", None)
+        if end_layer is not None:
+            return end_layer
+        cfg = getattr(model, "config", None)
+        return int(getattr(cfg, "num_hidden_layers", 0))
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -1154,114 +1169,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
 
-        max_patches_per_call = get_int_env_var("SGLANG_VLM_MAX_PATCHES_PER_VIT", 0)
-        max_images_per_call = get_int_env_var("SGLANG_VLM_MAX_IMAGES_PER_VIT", 0)
-
-        if max_patches_per_call == 0 and max_images_per_call == 0:
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual,
-                    pixel_values,
-                    image_grid_thw.tolist(),
-                    rope_type="rope_3d",
-                )
-            else:
-                return self.visual(pixel_values, grid_thw=image_grid_thw)
-
-        # compute the number of patches per image and the slice positions in pixel_values
-        grid_thw_list = (
-            image_grid_thw.tolist()
-        )  # List[List[int]], each is [T, H, W] or similar
-        patches_per_image = [int(math.prod(g)) for g in grid_thw_list]
-        num_images = len(patches_per_image)
-
-        # cumulative sum used to slice pixel_values along the image dimension
-        cum_patches = [0]
-        for p in patches_per_image:
-            cum_patches.append(cum_patches[-1] + p)
-        total_patches = cum_patches[-1]
-
-        assert pixel_values.size(0) == total_patches, (
-            f"pixel_values rows ({pixel_values.size(0)}) "
-            f"!= total patches ({total_patches})"
-        )
-
-        # split into chunks in image order, each chunk obeys the patch/image limits
-        all_chunk_embeds: List[torch.Tensor] = []
-        img_start = 0
-
-        while img_start < num_images:
-            img_end = img_start
-            patches_in_chunk = 0
-            images_in_chunk = 0
-
-            # try to pack more images into the current chunk until some limit would be exceeded
-            while img_end < num_images:
-                next_patches = patches_per_image[img_end]
-
-                # if adding this image would exceed the patch limit, stop
-                if (
-                    max_patches_per_call > 0
-                    and patches_in_chunk + next_patches > max_patches_per_call
-                ):
-                    break
-
-                # if adding this image would exceed the image-count limit, also stop
-                if (
-                    max_images_per_call > 0
-                    and images_in_chunk + 1 > max_images_per_call
-                ):
-                    break
-
-                patches_in_chunk += next_patches
-                images_in_chunk += 1
-                img_end += 1
-
-            # extreme case: the first image alone exceeds the patch limit -> at least ensure img_end > img_start
-            if img_end == img_start:
-                img_end = img_start + 1
-                patches_in_chunk = patches_per_image[img_start]
-                images_in_chunk = 1
-
-            # slice pixel_values and grid_thw according to [img_start:img_end]
-            patch_start = cum_patches[img_start]
-            patch_end = cum_patches[img_end]
-            pixel_chunk = pixel_values[patch_start:patch_end]
-            grid_chunk = image_grid_thw[img_start:img_end]
-
-            # run ViT once on this chunk without extra padding
-            if self.use_data_parallel:
-                chunk_embeds = run_dp_sharded_mrope_vision_model(
-                    self.visual,
-                    pixel_chunk,
-                    grid_chunk.tolist(),
-                    rope_type="rope_3d",
-                )
-            else:
-                chunk_embeds = self.visual(pixel_chunk, grid_thw=grid_chunk)
-
-            # chunk_embeds: (sum_patches_after_merge_this_chunk, hidden)
-            all_chunk_embeds.append(chunk_embeds)
-
-            # next batch
-            img_start = img_end
-
-        # concatenate back the full image embedding sequence
-        return torch.cat(all_chunk_embeds, dim=0)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual,
+                pixel_values,
+                image_grid_thw.tolist(),
+                rope_type="rope_3d",
+            )
+        else:
+            return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        for item in items:
-            item.feature = item.feature.to(self.visual.device)
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
-        # Memory optimization for item.feature:
-        # 1. item.feature is released when request finished
-        # 2. High concurrency may cause device OOM due to delayed release
-        # 3. Fix: Offload item.feature to CPU, move to device only when needed
-        for item in items:
-            item.feature = item.feature.to("cpu")
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
@@ -1327,6 +1249,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
@@ -1334,6 +1260,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     hidden_states,
                     self.lm_head,
                     forward_batch,
+                    aux_hidden_states,
                 )
             else:
                 return self.pooler(hidden_states, forward_batch)
@@ -1424,6 +1351,22 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        self.model.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Qwen3VLForConditionalGeneration
