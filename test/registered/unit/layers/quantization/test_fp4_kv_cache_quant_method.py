@@ -62,7 +62,9 @@ class TestNVFP4KVMethod(CustomTestCase):
     """Test NVFP4KVMethod buffer creation and properties."""
 
     def test_properties(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import NVFP4KVMethod
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVMethod,
+        )
 
         m = NVFP4KVMethod(num_layers=4, device="cpu", sm_version=120)
         self.assertEqual(m.name, "nvfp4")
@@ -71,7 +73,9 @@ class TestNVFP4KVMethod(CustomTestCase):
         self.assertTrue(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import NVFP4KVMethod
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVMethod,
+        )
 
         m = NVFP4KVMethod(num_layers=4, device="cpu", sm_version=120)
         size, heads, dim, layers = 64, 8, 128, 4
@@ -92,7 +96,9 @@ class TestNVFP4KVMethod(CustomTestCase):
         self.assertEqual(bufs["store_dtype"], torch.uint8)
 
     def test_compute_cell_size(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import NVFP4KVMethod
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVMethod,
+        )
 
         m = NVFP4KVMethod(num_layers=4, device="cpu")
         cell = m.compute_cell_size(head_num=8, head_dim=128, num_layers=4, kv_size=1)
@@ -100,7 +106,9 @@ class TestNVFP4KVMethod(CustomTestCase):
         self.assertEqual(cell, 4096 + 512 + 2048)
 
     def test_scales_init(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import NVFP4KVMethod
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVMethod,
+        )
 
         m = NVFP4KVMethod(num_layers=4, device="cpu")
         # Default scales should be 1.0
@@ -111,7 +119,9 @@ class TestNVFP4KVMethod(CustomTestCase):
     @skip_if_no_cuda
     def test_quantize_dequantize_roundtrip(self):
         """Test NVFP4 quantize→dequantize roundtrip on CUDA."""
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import NVFP4KVMethod
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            NVFP4KVMethod,
+        )
 
         m = NVFP4KVMethod(num_layers=1, device="cuda", sm_version=120)
         size, heads, dim = 32, 8, 128
@@ -159,7 +169,9 @@ class TestBlockFP4KVMethod(CustomTestCase):
     """Test BlockFP4KVMethod buffer creation and roundtrip."""
 
     def test_properties(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import BlockFP4KVMethod
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            BlockFP4KVMethod,
+        )
 
         m = BlockFP4KVMethod()
         self.assertEqual(m.name, "blockfp4")
@@ -167,7 +179,9 @@ class TestBlockFP4KVMethod(CustomTestCase):
         self.assertFalse(m.needs_global_scale())
 
     def test_create_buffers_shapes(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import BlockFP4KVMethod
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            BlockFP4KVMethod,
+        )
 
         m = BlockFP4KVMethod()
         size, heads, dim, layers = 64, 8, 128, 4
@@ -180,7 +194,9 @@ class TestBlockFP4KVMethod(CustomTestCase):
 
     def test_quantize_dequantize_roundtrip_cpu(self):
         """Test MXFP4 quantize→dequantize roundtrip on CPU."""
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import BlockFP4KVMethod
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            BlockFP4KVMethod,
+        )
 
         m = BlockFP4KVMethod()
         size, heads, dim = 32, 8, 128
