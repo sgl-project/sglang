@@ -42,10 +42,10 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
-    get_attention_tp_group,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -77,10 +77,10 @@ from sglang.srt.utils import (
     add_prefix,
     get_compiler_backend,
     is_non_idle_and_non_empty,
+    is_npu,
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
-from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
@@ -685,7 +685,7 @@ class MiniMaxM2Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
-    
+
     def forward_prepare_npu(
         self,
         positions: torch.Tensor,
@@ -696,9 +696,7 @@ class MiniMaxM2Attention(nn.Module):
         if self.use_qk_norm:
             # q = self.q_norm(q.contiguous())
             # k = self.k_norm(k.contiguous())
-            cos_sin = self.rotary_emb.cos_sin_cache.index_select(
-                0, positions.flatten()
-            )
+            cos_sin = self.rotary_emb.cos_sin_cache.index_select(0, positions.flatten())
             cos, sin = cos_sin.chunk(2, dim=-1)
             q, k, v = split_qkv_tp_rmsnorm_rope(
                 input=qkv,
@@ -721,7 +719,6 @@ class MiniMaxM2Attention(nn.Module):
 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
-
 
     def forward_core(self, intermediate_state):
         _, _, inner_state = intermediate_state
