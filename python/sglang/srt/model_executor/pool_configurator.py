@@ -216,12 +216,18 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
-        # Bytes per full_token (accounts for SWA ratio).
-        # full_tokens * _cell_size = total memory consumed by both pools.
-        self._cell_size = (
-            self._full_per_token * self._full_layers_num
-            + self._swa_full_tokens_ratio * self._swa_per_token * self._swa_layers_num
-        )
+        # Bytes per max_total_num_token.
+        # For hybrid (full_layers > 0): full_tokens * _cell_size = total memory for both pools.
+        # For all-SWA (full_layers == 0): swa_tokens * _cell_size = total SWA memory.
+        if self._full_layers_num == 0:
+            self._cell_size = self._swa_per_token * self._swa_layers_num
+        else:
+            self._cell_size = (
+                self._full_per_token * self._full_layers_num
+                + self._swa_full_tokens_ratio
+                * self._swa_per_token
+                * self._swa_layers_num
+            )
 
     def _solve_pool_sizes(
         self, max_total_num_tokens: int, page_size: int
