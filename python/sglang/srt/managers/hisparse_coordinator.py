@@ -56,7 +56,7 @@ class HiSparseCoordinator:
             override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
         )
 
-        max_num_reqs = req_to_token_pool.size
+        max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
 
         # to have an extra page for new tokens
@@ -78,8 +78,11 @@ class HiSparseCoordinator:
         )
 
         self.write_staging_stream = device_module.Stream()
+        self.decode_backup_stream = device_module.Stream()
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
+        self._backup_done_event = device_module.Event()
+        self._has_pending_backup = False
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -160,6 +163,53 @@ class HiSparseCoordinator:
                 device_indices.record_stream(self.write_staging_stream)
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
+
+    def admit_request_direct(self, req: Req) -> None:
+        """Direct-to-host path: KV data already resides in host pool via RDMA.
+
+        Skips staging DMA entirely. Only allocates a small device buffer
+        (4KB) for decode-time swap-in, then marks the request as ready.
+        Host indices were already written to req_to_host_pool.
+
+        Metadata fixups after alloc_device_buffer():
+        - alloc_device_buffer() sets device_buffer_tokens = [0, 1, ..., buf_size-1],
+          which tells the swap-in kernel that those tokens are cached in the device
+          buffer.  In the staging path this is correct (prefill filled the buffer),
+          but here the buffer is empty.
+        """
+        self.alloc_device_buffer(req)
+
+        if req.kv_allocated_len <= self.device_buffer_size:
+            # Short sequences (seq_len <= device_buffer_size): the kernel fast path
+            # returns device_buffer_locs directly without any host loading, so we
+            # must preload all tokens from host pool into the device buffer
+            # TODO(hzh0425): Optimize this.
+            self._preload_to_device_buffer(req)
+        else:
+            # Long sequence: reset device_buffer_tokens to -1 so the kernel
+            # sees all slots as empty → every top-k lookup is a miss → host load.
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, : self.device_buffer_size
+            ] = -1
+
+        req.staging = False
+        self._skip_first_backup[req.req_pool_idx] = True
+        logger.debug("HiSparse: admitting request %s directly", req.rid)
+
+    def _preload_to_device_buffer(self, req: Req) -> None:
+        """Preload all tokens from host pool into the device buffer."""
+        n = req.kv_allocated_len
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
+        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_locs,
+                layer_id,
+                io_backend="kernel",
+            )
 
     def alloc_device_buffer(self, req: Req) -> None:
         allocated_indices = self.req_to_token_pool.req_to_token[
@@ -344,9 +394,6 @@ class HiSparseCoordinator:
         The only exception is the first decode step right after staging: all
         prefill tokens were already backed up during staging, so there is nothing new to save yet.
         """
-        if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
-
         # Build the list of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up).
         backup_indices = []
@@ -384,12 +431,36 @@ class HiSparseCoordinator:
         host_locs = host_locs.to(device=self.device)
         self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
 
-        self.mem_pool_host.backup_from_device_all_layer(
-            self.mem_pool_device,
-            host_locs,
-            device_locs.contiguous(),
-            io_backend="kernel",
-        )
+        if self._has_pending_backup:
+            self._backup_done_event.wait(device_module.current_stream())
+            self._has_pending_backup = False
+        schedule_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(schedule_stream)
+            if self.decode_producer_stream is not None:
+                self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs,
+                io_backend="kernel",
+            )
+            self._backup_done_event.record()
+            if host_locs.is_cuda:
+                host_locs.record_stream(self.decode_backup_stream)
+            if backup_req_indices.is_cuda:
+                backup_req_indices.record_stream(self.decode_backup_stream)
+            if actual_token_pos.is_cuda:
+                actual_token_pos.record_stream(self.decode_backup_stream)
+            if device_locs.is_cuda:
+                device_locs.record_stream(self.decode_backup_stream)
+        self._has_pending_backup = True
+
+    def wait_for_pending_backup(self) -> None:
+        if not self._has_pending_backup:
+            return
+        self._backup_done_event.wait(device_module.current_stream())
+        self._has_pending_backup = False
 
     def get_front_topk_tokens(
         self,
@@ -522,6 +593,9 @@ class HiSparseCoordinator:
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
+        if self._has_pending_backup:
+            self._backup_done_event.wait(device_module.current_stream())
+            self._has_pending_backup = False
 
         # release memory — only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])

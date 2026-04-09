@@ -33,23 +33,29 @@ default parameters when initializing and generating videos.
 | TurboWan2.1 T2V 14B          | `IPostYellow/TurboWan2.1-T2V-14B-Diffusers`       | 480p                |    ✅     |         ❌         |     ❌     |              ❌               |              ✅               |              ✅               |    ⭕     |
 | TurboWan2.1 T2V 14B 720P     | `IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers`  | 720p                |    ✅     |         ❌         |     ❌     |              ❌               |              ✅               |              ✅               |    ⭕     |
 | TurboWan2.2 I2V A14B         | `IPostYellow/TurboWan2.2-I2V-A14B-Diffusers`      | 720p                |    ✅     |         ❌         |     ❌     |              ❌               |              ✅               |              ✅               |    ⭕     |
+| LTX-2                        | `Lightricks/LTX-2`                                | 768×512<br>1536×1024 |    ❌     |         ❌         |     ❌     |              ❌               |              ❌               |              ❌               |    ❌     |
+| LTX-2.3                      | `Lightricks/LTX-2.3`                              | 768×512<br>1536×1024 |    ❌     |         ❌         |     ❌     |              ❌               |              ❌               |              ❌               |    ❌     |
 
 **Note**:
-1.Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.
-2.SageSLA Based on SpargeAttn. Install it first with `pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation`
+1. Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.
+2. SageSLA is based on SpargeAttn. Install it first with `pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation`
+3. LTX-2 two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline`. The spatial upsampler and distilled LoRA are auto-resolved from the model snapshot by default, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
+4. `Lightricks/LTX-2.3` is supported through the bundled native overlay materialization path. One-stage generation uses the default `LTX2Pipeline`; two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline`.
+5. For LTX models, the `Resolutions` column uses output video `width×height` semantics, matching `sglang generate --width ... --height ...`. One-stage generation is validated at `768×512`; two-stage generation is validated at `1536×1024`.
 
 ### Image Generation Models
 
-| Model Name       | HuggingFace Model ID                    | Resolutions    |
-|:-----------------|:----------------------------------------|:---------------|
-| FLUX.1-dev       | `black-forest-labs/FLUX.1-dev`          | Any resolution |
-| FLUX.2-dev       | `black-forest-labs/FLUX.2-dev`          | Any resolution |
-| FLUX.2-Klein     | `black-forest-labs/FLUX.2-klein-4B`     | Any resolution |
-| Z-Image-Turbo    | `Tongyi-MAI/Z-Image-Turbo`              | Any resolution |
-| GLM-Image        | `zai-org/GLM-Image`                     | Any resolution |
-| Qwen Image       | `Qwen/Qwen-Image`                       | Any resolution |
-| Qwen Image 2512  | `Qwen/Qwen-Image-2512`                  | Any resolution |
-| Qwen Image Edit  | `Qwen/Qwen-Image-Edit`                  | Any resolution |
+| Model Name           | HuggingFace Model ID                |
+|:---------------------|:------------------------------------|
+| FLUX.1-dev           | `black-forest-labs/FLUX.1-dev`      |
+| FLUX.2-dev           | `black-forest-labs/FLUX.2-dev`      |
+| FLUX.2-Klein         | `black-forest-labs/FLUX.2-klein-4B` |
+| Z-Image-Turbo        | `Tongyi-MAI/Z-Image-Turbo`          |
+| GLM-Image            | `zai-org/GLM-Image`                 |
+| Qwen Image           | `Qwen/Qwen-Image`                   |
+| Qwen Image 2512      | `Qwen/Qwen-Image-2512`              |
+| Qwen Image Edit      | `Qwen/Qwen-Image-Edit`              |
+| Qwen Image Edit 2511 | `Qwen/Qwen-Image-Edit-2511`         |
 
 ## Verified LoRA Examples
 
