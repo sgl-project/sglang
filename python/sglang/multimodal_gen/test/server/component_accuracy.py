@@ -26,6 +26,7 @@ except ImportError:
 
 import sglang.multimodal_gen.runtime.managers.forward_context as fc_mod
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
     destroy_model_parallel,
     get_local_torch_device,
     get_tensor_model_parallel_rank,
@@ -274,30 +275,11 @@ def _load_reference_component(
 # Public accuracy engine
 class AccuracyEngine:
     @staticmethod
-    def prepare_component_for_release(module: nn.Module) -> None:
-        for submodule in module.modules():
-            reset_teacache_state = getattr(submodule, "reset_teacache_state", None)
-            if callable(reset_teacache_state):
-                reset_teacache_state()
-
-            seen_names: set[str] = set()
-            for cls in type(submodule).__mro__:
-                for name in cls.__dict__:
-                    if name in seen_names:
-                        continue
-                    seen_names.add(name)
-
-                    cache_clear = getattr(
-                        getattr(submodule, name, None), "cache_clear", None
-                    )
-                    if callable(cache_clear):
-                        cache_clear()
-
-    @staticmethod
     def reset_parallel_runtime() -> None:
         if torch.distributed.is_initialized():
-            torch.distributed.barrier()
-        if model_parallel_is_initialized():
+            if torch.distributed.get_world_size() == 1:
+                cleanup_dist_env_and_memory()
+        elif model_parallel_is_initialized():
             destroy_model_parallel()
         gc.collect()
         if torch.cuda.is_available():
