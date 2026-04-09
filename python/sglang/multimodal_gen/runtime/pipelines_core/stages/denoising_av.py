@@ -529,11 +529,23 @@ class LTX2AVDenoisingStage(DenoisingStage):
 
         # Prepare TI2V conditioning once (encode image -> patchify tokens).
         self._prepare_ltx2_image_latent(batch, server_args)
+        is_ltx23_variant = is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        )
+        do_ti2v = self._should_apply_ltx2_ti2v(batch)
+        replicate_audio_for_sp = (
+            get_sp_world_size() > 1
+            and is_ltx23_variant
+            and do_ti2v
+            and server_args.pipeline_class_name != "LTX2TwoStagePipeline"
+        )
+        batch.ltx23_audio_replicated_for_sp = bool(replicate_audio_for_sp)
 
         if (
             get_sp_world_size() > 1
             and isinstance(batch.audio_latents, torch.Tensor)
             and hasattr(server_args.pipeline_config, "shard_audio_latents_for_sp")
+            and not replicate_audio_for_sp
         ):
             batch.audio_latents, batch.did_sp_shard_audio_latents = (
                 server_args.pipeline_config.shard_audio_latents_for_sp(
@@ -574,7 +586,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
 
-        do_ti2v = self._should_apply_ltx2_ti2v(batch)
         num_img_tokens = int(getattr(batch, "ltx2_num_image_tokens", 0))
         denoise_mask = None
         clean_latent = None
@@ -822,6 +833,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     audio_num_frames=audio_num_frames_latent,
                                     video_coords=video_coords,
                                     audio_coords=audio_coords,
+                                    audio_replicated_for_sp=replicate_audio_for_sp,
                                     return_latents=False,
                                     return_dict=False,
                                 )
@@ -905,6 +917,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     audio_num_frames=audio_num_frames_latent,
                                     video_coords=video_coords,
                                     audio_coords=audio_coords,
+                                    audio_replicated_for_sp=replicate_audio_for_sp,
                                     return_latents=False,
                                     return_dict=False,
                                 )
@@ -945,6 +958,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         audio_num_frames=audio_num_frames_latent,
                                         video_coords=video_coords,
                                         audio_coords=audio_coords,
+                                        audio_replicated_for_sp=replicate_audio_for_sp,
                                         return_latents=False,
                                         return_dict=False,
                                     )
@@ -1032,6 +1046,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         audio_num_frames=audio_num_frames_latent,
                                         video_coords=video_coords,
                                         audio_coords=audio_coords,
+                                        audio_replicated_for_sp=replicate_audio_for_sp,
                                         return_latents=False,
                                         return_dict=False,
                                         skip_video_self_attn_blocks=tuple(
@@ -1080,6 +1095,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         audio_num_frames=audio_num_frames_latent,
                                         video_coords=video_coords,
                                         audio_coords=audio_coords,
+                                        audio_replicated_for_sp=replicate_audio_for_sp,
                                         return_latents=False,
                                         return_dict=False,
                                         disable_a2v_cross_attn=True,

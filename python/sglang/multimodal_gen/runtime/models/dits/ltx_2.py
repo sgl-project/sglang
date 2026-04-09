@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    sequence_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
@@ -581,6 +582,8 @@ class LTX2Attention(nn.Module):
         k_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         perturbation_mask: torch.Tensor | None = None,
         all_perturbed: bool = False,
+        skip_sequence_parallel_override: bool = False,
+        gather_context_kv_for_sp: bool = False,
     ) -> torch.Tensor:
         gate_input = x
         context_ = x if context is None else context
@@ -620,10 +623,41 @@ class LTX2Attention(nn.Module):
             q = q.view(*q.shape[:-1], self.local_heads, self.dim_head)
             k = k.view(*k.shape[:-1], self.local_heads, self.dim_head)
 
-            if self.use_local_attention:
+            if gather_context_kv_for_sp:
+                q_ = q.transpose(1, 2)
+                k_full = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
+                v_full = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
+                k_ = k_full.transpose(1, 2)
+                v_ = v_full.transpose(1, 2)
+                attn_mask = None
+                if mask is not None:
+                    gathered_mask = sequence_model_parallel_all_gather(
+                        mask.contiguous(), dim=1
+                    )
+                    attn_mask = gathered_mask.to(dtype=q_.dtype, device=q_.device)
+                    if attn_mask.dim() == 2:
+                        attn_mask = attn_mask[:, None, None, :]
+                    elif attn_mask.dim() == 3:
+                        attn_mask = attn_mask[:, None, :, :]
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=attn_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.dim_head**-0.5,
+                ).transpose(1, 2)
+            elif self.use_local_attention:
                 out = self.attn(q, k, v, attn_mask=mask)
             else:
-                out = self.attn(q, k, v, attn_mask=mask)
+                out = self.attn(
+                    q,
+                    k,
+                    v,
+                    attn_mask=mask,
+                    skip_sequence_parallel_override=skip_sequence_parallel_override,
+                )
 
             if perturbation_mask is not None:
                 out = out * perturbation_mask + v * (1 - perturbation_mask)
@@ -891,6 +925,7 @@ class LTX2TransformerBlock(nn.Module):
         skip_audio_self_attn: bool = False,
         skip_a2v_cross_attn: bool = False,
         skip_v2a_cross_attn: bool = False,
+        audio_replicated_for_sp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         batch_size = hidden_states.size(0)
@@ -921,6 +956,7 @@ class LTX2TransformerBlock(nn.Module):
             mask=audio_self_attention_mask,
             pe=audio_rotary_emb,
             all_perturbed=skip_audio_self_attn,
+            skip_sequence_parallel_override=audio_replicated_for_sp,
         )
         audio_hidden_states = audio_hidden_states + attn_audio_hidden_states * agate_msa
         # 2. Prompt Cross-Attention
@@ -1065,6 +1101,7 @@ class LTX2TransformerBlock(nn.Module):
                 pe=ca_video_rotary_emb,
                 k_pe=ca_audio_rotary_emb,
                 mask=a2v_cross_attention_mask,
+                skip_sequence_parallel_override=audio_replicated_for_sp,
             )
             hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
 
@@ -1083,6 +1120,7 @@ class LTX2TransformerBlock(nn.Module):
                 pe=ca_audio_rotary_emb,
                 k_pe=ca_video_rotary_emb,
                 mask=v2a_cross_attention_mask,
+                gather_context_kv_for_sp=audio_replicated_for_sp,
             )
             audio_hidden_states = (
                 audio_hidden_states + v2a_gate * v2a_attn_hidden_states
@@ -1462,6 +1500,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         skip_audio_self_attn_blocks: Optional[tuple[int, ...]] = None,
         disable_a2v_cross_attn: bool = False,
         disable_v2a_cross_attn: bool = False,
+        audio_replicated_for_sp: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
 
@@ -1641,6 +1680,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 skip_audio_self_attn=block.idx in skip_audio_self_attn_blocks,
                 skip_a2v_cross_attn=disable_a2v_cross_attn,
                 skip_v2a_cross_attn=disable_v2a_cross_attn,
+                audio_replicated_for_sp=audio_replicated_for_sp,
             )
 
         # 6. Output layers

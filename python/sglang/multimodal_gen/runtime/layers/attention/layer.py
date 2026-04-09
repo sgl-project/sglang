@@ -401,6 +401,7 @@ class USPAttention(nn.Module):
         attn_mask: torch.Tensor | None = None,
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
+        skip_sequence_parallel_override: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -422,6 +423,7 @@ class USPAttention(nn.Module):
         """
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+        effective_skip_sp = self.skip_sequence_parallel or skip_sequence_parallel_override
         if attn_mask is not None:
             def _prepare_sdpa_mask(
                 mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
@@ -443,7 +445,7 @@ class USPAttention(nn.Module):
                 return (mask - 1.0) * torch.finfo(dtype).max
 
             sp_world_size = get_sequence_parallel_world_size()
-            if self.skip_sequence_parallel or sp_world_size == 1:
+            if effective_skip_sp or sp_world_size == 1:
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
@@ -497,7 +499,7 @@ class USPAttention(nn.Module):
                 out = _usp_output_all_to_all(out, head_dim=2)
             return out
 
-        if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
+        if effective_skip_sp or get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
             return out
