@@ -553,6 +553,17 @@ def _prepare_transformer_reference_call(module: nn.Module, inputs: Inputs) -> Ho
     return _prepare_transformer_hook_call(module, inputs, side="reference")
 
 
+def _normalize_transformer_reference_output(output: Any) -> torch.Tensor:
+    sample = getattr(output, "sample", None)
+    if (
+        isinstance(sample, (list, tuple))
+        and sample
+        and all(isinstance(item, torch.Tensor) for item in sample)
+    ):
+        return torch.stack(list(sample), dim=0)
+    return extract_output_tensor(output)
+
+
 class _VAEDecodeModule(nn.Module):
     def __init__(self, vae: nn.Module):
         super().__init__()
@@ -624,6 +635,7 @@ TRANSFORMER_NATIVE_PROFILE = NativeHookProfile(
     build_inputs=_build_transformer_hook_inputs,
     prepare_sglang_call=_prepare_transformer_sglang_call,
     prepare_reference_call=_prepare_transformer_reference_call,
+    normalize_reference_output=_normalize_transformer_reference_output,
 )
 
 VAE_NATIVE_PROFILE = NativeHookProfile(

@@ -22,6 +22,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.model_overlay import (
+    load_overlay_manifest_if_present,
+    resolve_model_overlay_target,
+)
 from sglang.multimodal_gen.test.server.accuracy_config import (
     DEFAULT_TEXT_ENCODER_VOCAB_SIZE,
     I2V_TEXT_ENCODER_DIM,
@@ -208,7 +212,13 @@ def select_component_source(
     model_index_keys: Tuple[str, ...],
 ) -> ComponentSelection:
     component_paths = extract_component_path_overrides(extra_args)
-    base_model_root = maybe_download_model(model_id, force_diffusers_model=True)
+    force_diffusers_model = resolve_model_overlay_target(model_id) is not None or (
+        os.path.exists(model_id)
+        and load_overlay_manifest_if_present(model_id) is not None
+    )
+    base_model_root = maybe_download_model(
+        model_id, force_diffusers_model=force_diffusers_model
+    )
     search_keys = [component.value]
     for key in model_index_keys:
         if key not in search_keys:
@@ -728,6 +738,8 @@ def _run_staged_native_component_accuracy_case(
 
         del sgl_call
         del sgl_raw
+        if component == ComponentType.TRANSFORMER and num_gpus == 1:
+            engine_cls.prepare_component_for_release(sgl)
         del sgl
         sgl = None
         engine_cls.clear_memory()
@@ -758,6 +770,8 @@ def _run_staged_native_component_accuracy_case(
         )
     finally:
         if sgl is not None:
+            if component == ComponentType.TRANSFORMER and num_gpus == 1:
+                engine_cls.prepare_component_for_release(sgl)
             del sgl
         if ref is not None:
             del ref
