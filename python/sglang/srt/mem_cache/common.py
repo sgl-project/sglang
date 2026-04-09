@@ -480,7 +480,21 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # Streaming sessions transfer req_pool ownership into SessionSlot objects.
     # Trim any speculative tail before that transfer, otherwise later turns
     # restore only the committed prefix and can strand unreachable KV pages.
-    if isinstance(tree_cache, SessionAwareCache) and getattr(req, "session", None) is not None:
+    #
+    # Aborted streaming-session requests (e.g. input too long) skip the
+    # streaming path entirely.  match_prefix did not restore the slot's KV
+    # state, so the request has a fresh pool slot that should be freed by
+    # cache_finished_req below (which also sets req_pool_idx = None).
+    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+    is_streaming_session = (
+        isinstance(tree_cache, SessionAwareCache)
+        and getattr(req, "session", None) is not None
+    )
+    is_aborted_streaming = is_streaming_session and isinstance(
+        getattr(req, "finished_reason", None), FINISH_ABORT
+    )
+    if is_streaming_session and not is_aborted_streaming:
         start_p, end_p = req.pop_overallocated_kv_cache()
         page_size = get_global_server_args().page_size
         if page_size > 1:

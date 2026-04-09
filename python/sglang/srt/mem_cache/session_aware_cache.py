@@ -183,6 +183,16 @@ class SessionAwareCache(BasePrefixCache):
         if slot is None or slot.req_pool_idx is None:
             return self.inner.match_prefix(params)
 
+        # If the request is destined for abort (e.g. input too long),
+        # do NOT restore the slot's KV state.  set_finish_with_abort
+        # truncates origin_input_ids to [0], so alloc_for_extend would
+        # overwrite the slot's req_to_token row with a 1-token prefix,
+        # destroying the session's accumulated KV mapping.  By skipping
+        # restore, the request gets a fresh pool slot from alloc_for_extend
+        # and the session slot remains untouched.
+        if req.to_finish is not None:
+            return self.inner.match_prefix(params)
+
         slot.restore_to_req(req)
 
         # logprob_start_len is already forced to -1 for streaming sessions
@@ -204,9 +214,29 @@ class SessionAwareCache(BasePrefixCache):
         if not _is_streaming(req):
             return self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
 
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
         session_id = req.session.session_id
         slot = self.slots.get(session_id)
         is_first = slot is None
+
+        # When an aborted streaming-session request was scheduled (e.g.
+        # input too long), match_prefix skipped restore_to_req so the
+        # request got a fresh pool slot from alloc_for_extend.  Don't
+        # overwrite the session slot -- free the transient KV and pool slot.
+        if not is_first and isinstance(req.finished_reason, FINISH_ABORT):
+            if req.req_pool_idx is not None:
+                # Free all KV pages allocated for this aborted request.
+                end = req.kv_allocated_len
+                if end > 0:
+                    kv_indices = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :end
+                    ]
+                    self.token_to_kv_pool_allocator.free(kv_indices)
+                self.req_to_token_pool.free_slots.append(req.req_pool_idx)
+                req.req_pool_idx = None
+            return
+
         if is_first:
             slot = SessionSlot()
             self.slots[session_id] = slot
