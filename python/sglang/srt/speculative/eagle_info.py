@@ -38,6 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
     get_src_tgt_cache_loc,
     get_target_cache_loc,
+    maybe_detect_nan,
     maybe_detect_oob,
 )
 from sglang.srt.utils import is_cuda, next_power_of_2
@@ -279,12 +280,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # NOTE: retrive_index are the indices of the requests that are kept.
             sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
 
+        maybe_detect_oob(
+            candidates,
+            0,
+            logits_output.next_token_logits.shape[-1],
+            f"verify: draft candidates OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+        )
+
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(
                 logits_output.next_token_logits,
                 sampling_info,
                 num_tokens_in_batch=self.draft_token_num,
+            )
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                "verify: logits after custom logit processor, before penalty",
             )
 
         # Apply penalty
@@ -303,11 +315,21 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     )
                 )
 
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                "verify: logits after penalty, before grammar mask",
+            )
+
         # Apply grammar mask
         if vocab_mask is not None:
             assert self.grammar is not None
             self.grammar.apply_vocab_mask(
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
+            )
+
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                "verify: logits after grammar mask, before sampling",
             )
 
         # Sample tokens. Force greedy sampling on AMD
