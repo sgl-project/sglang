@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
@@ -369,6 +370,14 @@ class EagleVerifyInputV2Mixin:
                 threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
             )
+
+            # Sync predict across TP ranks: different GPUs may produce
+            # slightly different target_probs due to floating-point
+            # non-determinism in softmax/top_k/top_p, causing different
+            # sampled tokens. Broadcast from rank 0 to ensure consistency.
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation

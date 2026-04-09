@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -376,6 +377,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
             )
+
+            # Sync predict across TP ranks: different GPUs may produce
+            # slightly different target_probs due to floating-point
+            # non-determinism in softmax/top_k/top_p, causing different
+            # sampled tokens. Broadcast from rank 0 to ensure consistency.
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
 
         if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
