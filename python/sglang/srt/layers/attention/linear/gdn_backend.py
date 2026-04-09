@@ -376,13 +376,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            batch_size = seq_len // draft_token_num
             intermediate_state_indices = self.verify_intermediate_state_indices
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
         if is_target_verify:
+            batch_size = seq_len // forward_batch.spec_info.draft_token_num
+            draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
