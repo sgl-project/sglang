@@ -14,6 +14,11 @@ Hangs in distributed inference happen when ranks diverge in state, causing colle
 - **Cascading state drift**: a small non-determinism (e.g., floating-point) propagates into different batch structures
 - **Resource exhaustion**: one rank OOMs or crashes, others wait forever
 
+## Prerequisites
+
+- **py-spy**: `pip install py-spy` or system package. Requires root or `CAP_SYS_PTRACE` to attach to running processes.
+- **cuda-gdb**: Ships with the CUDA toolkit. Ensure it's on your `PATH`.
+
 ## Step 1: Confirm and Locate the Hang
 
 ### 1a. Watchdog / py-spy
@@ -21,7 +26,7 @@ Hangs in distributed inference happen when ranks diverge in state, causing colle
 SGLang's watchdog automatically dumps py-spy traces on timeout. Look for:
 
 ```
-[TP0] Scheduler watchdog timeout (self.watchdog_timeout=300)
+Scheduler watchdog timeout (self.watchdog_timeout=300, self.soft=False)
 ```
 
 The py-spy dump shows the stack trace of each thread. The hanging thread is typically blocked in a CUDA synchronize or NCCL collective:
@@ -32,6 +37,10 @@ Thread (active): "MainThread"
     ...
     forward_extend (model_runner.py)
 ```
+
+SGLang has two watchdog modes (see `python/sglang/srt/utils/watchdog.py`):
+- **Hard watchdog** (`soft=False`, default): dumps py-spy traces then sends `SIGQUIT` to kill the parent process.
+- **Soft watchdog** (`soft=True`): only logs the timeout without killing the process, giving you more time to manually attach debuggers or collect coredumps.
 
 If the watchdog doesn't trigger, manually dump:
 
@@ -66,6 +75,8 @@ While the process is hanging, find the pipe via `/proc/<pid>/fd/` and write to i
 ls /proc/<pid>/fd/ -la 2>/dev/null | grep cuda_pipe
 dd if=/dev/zero bs=1M count=1 > /tmp/cuda_pipe_<hostname>_<pid>
 ```
+
+Alternatively, if you don't need to keep the process alive, `kill -SIGABRT <pid>` also triggers a CUDA coredump (but terminates the process).
 
 Then open with `cuda-gdb --batch -ex "target cudacore <coredump_file>"`. On load, it immediately shows which kernel is stuck. For example:
 
@@ -103,7 +114,7 @@ def get_debug_file(rank):
     return _debug_files[key]
 ```
 
-Gate logging behind an env var to avoid overhead in production:
+Gate logging behind an env var to avoid overhead in production. `SGLANG_DEBUG_HANG` is not a built-in SGLang env var — you need to add this check yourself in the code you're instrumenting:
 
 ```python
 if os.environ.get("SGLANG_DEBUG_HANG"):
@@ -213,6 +224,12 @@ For the non-matching input, trace where it was produced and repeat: hash its inp
 **Symptom**: A condition (e.g., memory check, queue length) evaluates differently on different ranks, causing one rank to enter a collective while another skips it.
 
 **Fix**: Synchronize the condition value before branching, or restructure to ensure all ranks take the same path.
+
+### Pipeline Parallel (PP) Send/Recv Mismatch
+
+**Symptom**: In PP setups, one stage issues a `send` that the next stage never `recv`s (or vice versa), causing both to block indefinitely. Unlike TP hangs (collective mismatches), PP hangs typically involve point-to-point operations.
+
+**Fix**: Ensure all stages agree on the number of microbatches and the sequence of send/recv calls for each microbatch.
 
 ## Step 6: Verify the Fix
 
