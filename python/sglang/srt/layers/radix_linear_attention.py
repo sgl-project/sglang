@@ -121,23 +121,21 @@ def unified_linear_attention_with_output(
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
-    # Keep the original ForwardBatch object so backend/model state mutations still land
-    # on the caller-visible batch; try/finally guarantees cache loc restoration on errors.
+    # Keep the original ForwardBatch object and only narrow cache locations for
+    # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
     if original_out_cache_loc_swa is not None:
         forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
 
-    try:
-        ret = forward_batch.attn_backend.forward(
-            layer=attention_layer,
-            forward_batch=forward_batch,
-            mixed_qkv=mixed_qkv[:real_num_tokens],
-            a=a[:real_num_tokens],
-            b=b[:real_num_tokens],
-        )
-    finally:
-        forward_batch.out_cache_loc = original_out_cache_loc
-        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
+    ret = forward_batch.attn_backend.forward(
+        layer=attention_layer,
+        forward_batch=forward_batch,
+        mixed_qkv=mixed_qkv[:real_num_tokens],
+        a=a[:real_num_tokens],
+        b=b[:real_num_tokens],
+    )
+    forward_batch.out_cache_loc = original_out_cache_loc
+    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
 
     output[:, :real_num_tokens].copy_(ret)
     return
