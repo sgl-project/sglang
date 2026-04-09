@@ -197,6 +197,7 @@ def _get_quantization_config(
     model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     remap_prefix = getattr(model_class, "remap_prefix", None)
+    # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
     if _is_npu:
         packed_modules_mapping.update(
             {
