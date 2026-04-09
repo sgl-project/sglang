@@ -433,7 +433,16 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """Get the main process ID"""
+    """Get the main process ID.
+
+    Supports override via SGLANG_GRANIAN_PARENT_PID for workers whose
+    multiprocessing parent PID differs from the shared-memory owner.
+    """
+    from sglang.srt.environ import envs
+
+    override = envs.SGLANG_GRANIAN_PARENT_PID.get()
+    if override is not None:
+        return override
     return multiprocessing.current_process()._parent_pid
 
 
