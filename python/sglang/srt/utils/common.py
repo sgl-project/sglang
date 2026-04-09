@@ -2944,6 +2944,15 @@ class LazyValue:
         self._creator = creator
         self._value = None
 
+    def __getattr__(self, name):
+        return getattr(self.value, name)
+
+    def __getitem__(self, key):
+        return self.value[key]
+
+    def __setitem__(self, key, value):
+        self.value[key] = value
+
     @property
     def value(self):
         if self._creator is not None:
