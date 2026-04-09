@@ -52,7 +52,6 @@ limitations under the License.
 #include "utils.h"
 
 // Custom EVT broadcast nodes that handle both per-row/col and per-tensor (scalar) scales
-#include "cutlass_extensions/epilogue/broadcast_load_epilogue_c3x.hpp"
 
 using namespace cute;
 
@@ -500,17 +499,19 @@ struct DeviceGemmFp8RowwiseSm90 {
   using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;  // Kernel to launch based on the default
                                                                          // setting in the Collective Builder
   // Implement rowwise scaling epilogue.
-  using XScale = cutlass::epilogue::fusion::Sm90ColOrScalarBroadcast<
+  using XScale = cutlass::epilogue::fusion::Sm90ColBroadcast<
       0,
       TileShape,
       ElementComputeEpilogue,
-      cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
+      ElementComputeEpilogue,
+      cute::Stride<bool, cute::Int<0>, cute::Int<0>>>;
 
-  using WScale = cutlass::epilogue::fusion::Sm90RowOrScalarBroadcast<
+  using WScale = cutlass::epilogue::fusion::Sm90RowBroadcast<
       0,
       TileShape,
       ElementComputeEpilogue,
-      cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
+      ElementComputeEpilogue,
+      cute::Stride<cute::Int<0>, bool, cute::Int<0>>>;
 
   using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<
       0,
@@ -640,14 +641,15 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
        stride_c,
        ptr_d,
        stride_d}};
+  // IsDynamicBroadcast: pass bool in stride to control vector vs scalar
   bool a_is_vector = (scales_a.numel() != 1);
   bool b_is_vector = (scales_b.numel() != 1);
 
   if constexpr (WithBias) {
     args.epilogue.thread = {
-        {ptr_scales_a, a_is_vector},
+        {ptr_scales_a, ElementComputeEpilogue(0), {a_is_vector, cute::_0{}, cute::_0{}}},
         {
-            {ptr_scales_b, b_is_vector},
+            {ptr_scales_b, ElementComputeEpilogue(0), {cute::_0{}, b_is_vector, cute::_0{}}},
             {},  // Accumulator
             {}   // Multiplies
         },
@@ -656,9 +658,9 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
     };
   } else {
     args.epilogue.thread = {
-        {ptr_scales_a, a_is_vector},
+        {ptr_scales_a, ElementComputeEpilogue(0), {a_is_vector, cute::_0{}, cute::_0{}}},
         {
-            {ptr_scales_b, b_is_vector},
+            {ptr_scales_b, ElementComputeEpilogue(0), {cute::_0{}, b_is_vector, cute::_0{}}},
             {},  // Accumulator
             {}   // Multiplies
         },
@@ -814,17 +816,19 @@ struct DeviceGemmFp8RowwiseSm100 {
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
   using ElementComputeEpilogue = float;
-  using ScaleA = Sm90ColOrScalarBroadcast<
+  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
       0,
       TileShape,
       ElementComputeEpilogue,
-      cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
+      ElementComputeEpilogue,
+      cute::Stride<bool, cute::Int<0>, cute::Int<0>>>;
 
-  using ScaleB = Sm90RowOrScalarBroadcast<
+  using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
       0,
       TileShape,
       ElementComputeEpilogue,
-      cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
+      ElementComputeEpilogue,
+      cute::Stride<cute::Int<0>, bool, cute::Int<0>>>;
 
   using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<
       0,
@@ -905,12 +909,20 @@ struct DeviceGemmFp8RowwiseSm100 {
   template <typename Descriptor, typename T>
   static auto args_from_tensor(torch::Tensor const& tensor) {
     using Arguments = typename Descriptor::Arguments;
+    using StrideMNL = typename Descriptor::StrideMNL;
     auto* data_ptr = static_cast<T*>(tensor.data_ptr());
     static_assert(
         std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB> || std::is_same_v<Descriptor, Bias>);
     if constexpr (std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB>) {
-      // OrScalar broadcast: {ptr, is_vector}
-      return Arguments{data_ptr, tensor.numel() != 1};
+      // IsDynamicBroadcast: pass bool in stride for vector vs scalar
+      bool is_vector = (tensor.numel() != 1);
+      StrideMNL stride{};
+      if constexpr (std::is_same_v<Descriptor, ScaleA>) {
+        stride = StrideMNL{is_vector, cute::_0{}, cute::_0{}};
+      } else {
+        stride = StrideMNL{cute::_0{}, is_vector, cute::_0{}};
+      }
+      return Arguments{data_ptr, T(0), stride};
     } else {
       return Arguments{data_ptr};
     }
@@ -1192,17 +1204,19 @@ struct DeviceGemmFp8RowwiseSm120 {
   using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
 
   using ElementComputeEpilogue = float;
-  using ScaleA = Sm90ColOrScalarBroadcast<
+  using ScaleA = cutlass::epilogue::fusion::Sm90ColBroadcast<
       0,
       TileShape,
       ElementComputeEpilogue,
-      cute::Stride<cute::Int<1>, cute::Int<0>, cute::Int<0>>>;
+      ElementComputeEpilogue,
+      cute::Stride<bool, cute::Int<0>, cute::Int<0>>>;
 
-  using ScaleB = Sm90RowOrScalarBroadcast<
+  using ScaleB = cutlass::epilogue::fusion::Sm90RowBroadcast<
       0,
       TileShape,
       ElementComputeEpilogue,
-      cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>>;
+      ElementComputeEpilogue,
+      cute::Stride<cute::Int<0>, bool, cute::Int<0>>>;
 
   using Bias = cutlass::epilogue::fusion::Sm90RowBroadcast<
       0,
@@ -1283,12 +1297,20 @@ struct DeviceGemmFp8RowwiseSm120 {
   template <typename Descriptor, typename T>
   static auto args_from_tensor(torch::Tensor const& tensor) {
     using Arguments = typename Descriptor::Arguments;
+    using StrideMNL = typename Descriptor::StrideMNL;
     auto* data_ptr = static_cast<T*>(tensor.data_ptr());
     static_assert(
         std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB> || std::is_same_v<Descriptor, Bias>);
     if constexpr (std::is_same_v<Descriptor, ScaleA> || std::is_same_v<Descriptor, ScaleB>) {
-      // OrScalar broadcast: {ptr, is_vector}
-      return Arguments{data_ptr, tensor.numel() != 1};
+      // IsDynamicBroadcast: pass bool in stride for vector vs scalar
+      bool is_vector = (tensor.numel() != 1);
+      StrideMNL stride{};
+      if constexpr (std::is_same_v<Descriptor, ScaleA>) {
+        stride = StrideMNL{is_vector, cute::_0{}, cute::_0{}};
+      } else {
+        stride = StrideMNL{cute::_0{}, is_vector, cute::_0{}};
+      }
+      return Arguments{data_ptr, T(0), stride};
     } else {
       return Arguments{data_ptr};
     }
