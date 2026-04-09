@@ -115,14 +115,14 @@ void Ngram::clearExternalCorpus() {
   staging_sam_.reset();
 }
 
-std::vector<std::string> Ngram::listExternalCorpora() const {
+std::vector<std::pair<std::string, int64_t>> Ngram::listExternalCorpora() const {
   std::unique_lock<std::mutex> lock(mutex_);
-  std::vector<std::string> ids;
-  ids.reserve(sams_.size());
-  for (const auto& [id, _] : sams_) {
-    ids.push_back(id);
+  std::vector<std::pair<std::string, int64_t>> entries;
+  entries.reserve(sams_.size());
+  for (const auto& [id, sam] : sams_) {
+    entries.emplace_back(id, sam->tokenCount());
   }
-  return ids;
+  return entries;
 }
 
 void Ngram::insertWorker() {

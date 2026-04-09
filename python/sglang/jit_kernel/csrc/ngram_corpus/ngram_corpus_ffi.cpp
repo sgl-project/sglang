@@ -129,11 +129,11 @@ struct NgramCorpusObj : public tvm::ffi::Object {
   }
 
   std::string list_external_corpora() {
-    auto ids = ngram_->listExternalCorpora();
+    auto entries = ngram_->listExternalCorpora();
     std::string result;
-    for (size_t i = 0; i < ids.size(); ++i) {
+    for (size_t i = 0; i < entries.size(); ++i) {
       if (i > 0) result += "\n";
-      result += ids[i];
+      result += entries[i].first + "\t" + std::to_string(entries[i].second);
     }
     return result;
   }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -144,10 +144,14 @@ def get_ngram_corpus_cls():
         def remove_corpus(self, corpus_id: str) -> None:
             self.remove_external_corpus(corpus_id)  # type: ignore
 
-        def list_corpora(self) -> List[str]:
+        def list_corpora(self) -> Dict[str, int]:
             result = self.list_external_corpora()  # type: ignore
             if not result:
-                return []
-            return result.split("\n")
+                return {}
+            out: Dict[str, int] = {}
+            for line in result.split("\n"):
+                corpus_id, token_count = line.split("\t", 1)
+                out[corpus_id] = int(token_count)
+            return out
 
     return NgramCorpusFFI

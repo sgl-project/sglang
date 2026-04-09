@@ -1232,7 +1232,7 @@ class ListExternalCorporaReqInput(BaseReq):
 @dataclass
 class ListExternalCorporaReqOutput(BaseReq):
     success: bool
-    corpus_ids: List[str] = field(default_factory=list)
+    corpus_token_counts: Dict[str, int] = field(default_factory=dict)
     message: str = ""
 
 
