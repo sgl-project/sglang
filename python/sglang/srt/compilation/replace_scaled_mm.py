@@ -27,8 +27,9 @@ def install_cutlass_scaled_mm():
         if is_fp8 and aligned:
             scale_a = kwargs.get("scale_a", args[2] if len(args) > 2 else None)
             scale_b = kwargs.get("scale_b", args[3] if len(args) > 3 else None)
-            out_dtype = kwargs.get("out_dtype", None)
-            bias = kwargs.get("bias", None)
+            # aten._scaled_mm positional: (mat_a, mat_b, scale_a, scale_b, bias, scale_result, out_dtype, use_fast_accum)
+            bias = kwargs.get("bias", args[4] if len(args) > 4 else None)
+            out_dtype = kwargs.get("out_dtype", args[6] if len(args) > 6 else None)
             out = kwargs.get("out", None)
 
             if out_dtype is not None and scale_a is not None and scale_b is not None:

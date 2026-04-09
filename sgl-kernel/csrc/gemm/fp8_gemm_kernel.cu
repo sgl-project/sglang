@@ -1511,6 +1511,8 @@ torch::Tensor fp8_scaled_mm(
 
 #if defined CUDA_VERSION && CUDA_VERSION >= 12080
   if (sm_version >= 120) {
+    TORCH_CHECK(scales_a.numel() == mat_a.size(0), "SM120 path requires per-row scales_a, got scalar. Use SM90 for scalar scale support.");
+    TORCH_CHECK(scales_b.numel() == mat_b.size(1), "SM120 path requires per-col scales_b, got scalar. Use SM90 for scalar scale support.");
     if (out_dtype == torch::kBFloat16) {
       sm120_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
@@ -1518,6 +1520,8 @@ torch::Tensor fp8_scaled_mm(
     }
     return out;
   } else if (sm_version >= 100) {
+    TORCH_CHECK(scales_a.numel() == mat_a.size(0), "SM100 path requires per-row scales_a, got scalar. Use SM90 for scalar scale support.");
+    TORCH_CHECK(scales_b.numel() == mat_b.size(1), "SM100 path requires per-col scales_b, got scalar. Use SM90 for scalar scale support.");
     if (out_dtype == torch::kBFloat16) {
       sm100_fp8_dispatch_shape<cutlass::bfloat16_t>(out, mat_a, mat_b, scales_a, scales_b, bias);
     } else {
