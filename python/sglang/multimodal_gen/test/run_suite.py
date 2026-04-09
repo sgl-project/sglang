@@ -75,7 +75,6 @@ PARAMETRIZED_CASE_GROUPS = {
     ],
 }
 
-# NOTE: This is parsed by diffusion_case_parser.py using AST.
 STANDALONE_FILES = {
     "1-gpu": [
         "../cli/test_generate_t2i_perf.py",
@@ -84,7 +83,6 @@ STANDALONE_FILES = {
     "2-gpu": [],
 }
 
-# NOTE: This is parsed by diffusion_case_parser.py using AST.
 # New standalone files may omit an estimate once to learn the real CI runtime.
 # CI will use a fallback estimate for sharding, run the test, then print a
 # measured value that must be copied into STANDALONE_FILE_EST_TIMES.

@@ -7,6 +7,7 @@ to extract test case information without requiring sglang dependencies.
 Designed to run on lightweight CI runners (ubuntu-latest).
 
 Usage:
+    # From sibling scripts in this directory:
     from diffusion_case_parser import collect_diffusion_suites
     suites = collect_diffusion_suites(testcase_config_path, run_suite_path, baseline_path)
 """

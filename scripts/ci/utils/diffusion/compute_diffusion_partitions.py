@@ -223,7 +223,7 @@ def main():
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
-    repo_root = script_dir.parent.parent
+    repo_root = script_dir.parent.parent.parent.parent
 
     testcase_config_path = repo_root / TESTCASE_CONFIG_REL_PATH
     baseline_path = repo_root / BASELINE_REL_PATH

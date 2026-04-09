@@ -6,7 +6,7 @@ This script checks that all expected test cases were executed across all partiti
 Designed to run in the CI summary job after all partition jobs complete.
 
 Usage:
-    python scripts/ci/verify_diffusion_coverage.py --reports-dir <path>
+    python scripts/ci/utils/diffusion/verify_diffusion_coverage.py --reports-dir <path>
 
 Exit codes:
     0 - All cases executed (100% coverage)
@@ -250,7 +250,7 @@ def main():
 
     # Determine repository root
     script_dir = Path(__file__).resolve().parent
-    repo_root = script_dir.parent.parent
+    repo_root = script_dir.parent.parent.parent.parent
 
     reports_dir = Path(args.reports_dir)
 
