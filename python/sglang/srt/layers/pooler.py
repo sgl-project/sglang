@@ -11,7 +11,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
 
 
 class PoolingType(IntEnum):
@@ -25,6 +24,12 @@ class EmbeddingPoolerOutput:
     # Pooler can return list[tensor] instead of tensor if the dimension of each tensor in the batch is different
     # due to different per-request matryoshka dim truncation
     embeddings: torch.Tensor | list[torch.Tensor]
+
+
+def get_global_server_args():
+    from sglang.srt.server_args import get_global_server_args as _get_global_server_args
+
+    return _get_global_server_args()
 
 
 def score_and_pool(
