@@ -17,7 +17,7 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-small")
 
 # A lightweight Qwen3 checkpoint whose backbone weights load cleanly into
 # Qwen3ForSequenceClassification (the classification head is random).
