@@ -1015,6 +1015,14 @@ class ScoringRequest(BaseModel):
     )
     apply_softmax: bool = False
     item_first: bool = False
+    return_pooled_hidden_states: bool = Field(
+        default=False,
+        description=(
+            "Whether to return the pooled transformer hidden states (before the task head) "
+            "alongside scores. Only supported for models with a task-specific head "
+            "(SequenceClassification, RewardModel). Raises an error for CausalLM models."
+        ),
+    )
     model: str = DEFAULT_MODEL_NAME
 
 
@@ -1022,6 +1030,14 @@ class ScoringResponse(BaseModel):
     scores: List[
         List[float]
     ]  # List of lists of probabilities, each in the order of label_token_ids
+    pooled_hidden_states: Optional[List[Optional[List[float]]]] = Field(
+        default=None,
+        description=(
+            "Per-item pooled hidden states from the transformer (before the task head), "
+            "shape [num_items][hidden_size]. Present only when return_pooled_hidden_states=true "
+            "and the model has a task-specific head (SequenceClassification, RewardModel)."
+        ),
+    )
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"

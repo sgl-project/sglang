@@ -1041,6 +1041,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 dimensions=obj.dimensions,
                 lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
+                return_pooled_hidden_states=obj.return_pooled_hidden_states,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
@@ -1714,6 +1715,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
+                if (
+                    recv_obj.pooled_hidden_states is not None
+                    and recv_obj.pooled_hidden_states[i] is not None
+                ):
+                    out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
 
             state.finished = recv_obj.finished_reasons[i] is not None
 

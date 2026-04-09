@@ -745,6 +745,7 @@ class PiecewiseCudaGraphRunner:
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
+            return_pooled_hidden_states=forward_batch.return_pooled_hidden_states,
         )
 
         if out_cache_loc_swa is not None:

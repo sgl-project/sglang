@@ -284,6 +284,7 @@ class SchedulerOutputProcessorMixin:
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
             embeddings = result.embeddings
+            phs = result.pooled_hidden_states
 
             if is_sparse:
                 batch_ids, token_ids = embeddings.indices()
@@ -300,12 +301,20 @@ class SchedulerOutputProcessorMixin:
                 else:
                     embeddings = [tensor.tolist() for tensor in embeddings]
 
+            if phs is not None:
+                if isinstance(phs, list):
+                    phs = [t.cpu().detach() for t in phs]
+                else:
+                    phs = phs.cpu().detach()
+
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
                 if req.is_retracted:
                     continue
 
                 req.embedding = embeddings[i]
+                if req.return_pooled_hidden_states and phs is not None:
+                    req.pooled_hidden_state = phs[i]
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
@@ -1213,6 +1222,8 @@ class SchedulerOutputProcessorMixin:
         cached_tokens_details = []  # Detailed breakdown by cache source
         time_stats = []
         retraction_counts = []
+        phs_list = []
+        has_phs = False
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
@@ -1226,6 +1237,25 @@ class SchedulerOutputProcessorMixin:
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
                 time_stats.append(req.time_stats)
                 retraction_counts.append(req.retraction_count)
+
+                phs = req.pooled_hidden_state
+                phs_list.append(phs)
+                if phs is not None:
+                    has_phs = True
+
+        # Merge individual PHS tensors into one to reduce pickle overhead
+        # from N __reduce_ex__ calls to 1 across the ZMQ IPC boundary.
+        # When all tensors share the same shape (non-MIS path) we stack into
+        # a single tensor. Variable shapes (MIS) are sent as a plain list.
+        stacked_phs = None
+        if has_phs:
+            tensors = [t for t in phs_list if t is not None]
+            if tensors:
+                if all(t.shape == tensors[0].shape for t in tensors):
+                    stacked_phs = torch.stack(tensors)
+                else:
+                    stacked_phs = tensors
+
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 rids=rids,
@@ -1239,5 +1269,6 @@ class SchedulerOutputProcessorMixin:
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
+                pooled_hidden_states=stacked_phs,
             )
         )
