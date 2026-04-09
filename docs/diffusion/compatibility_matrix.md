@@ -100,36 +100,19 @@ pipeline's registered module name:
 ### VAE
 
 - `--vae-path` is the common image-generation override.
-- `--video-vae-path` and `--audio-vae-path` are only relevant for pipelines
-  with separate video or audio VAEs.
+- `--video-vae-path` and `--audio-vae-path` are only relevant for pipelines with separate video or audio VAEs.
 
 ### Transformer / DiT
 
-- `--transformer-path` is the standard override for the main denoising
-  transformer.
-- For quantized transformers, prefer `--transformer-path` or
-  `--transformer-weights-path`; see `quantization.md`.
-- `--video-dit-path` and `--audio-dit-path` are only for pipelines that split
-  denoisers by modality.
+- `--transformer-path` is the standard override for the main denoising transformer.
+- For quantized transformers, prefer `--transformer-path` or `--transformer-weights-path`; see `quantization.md`.
+- `--video-dit-path` and `--audio-dit-path` are only for pipelines that split denoisers by modality.
 
 ### Text Encoders and Preprocessors
 
-- `--text-encoder-path` and `--text-encoder-2-path` override primary and
-  secondary text encoders.
-- `--tokenizer-path`, `--processor-path`, and `--image-processor-path` are
-  useful when the replacement encoder requires matching preprocessing assets.
+- `--text-encoder-path` and `--text-encoder-2-path` override primary and secondary text encoders.
+- `--tokenizer-path`, `--processor-path`, and `--image-processor-path` are useful when the replacement encoder requires matching preprocessing assets.
 
-### Auxiliary Components
-
-- `--scheduler-path` overrides the scheduler component when a pipeline exposes
-  one.
-- `--spatial-upsampler-path` is mainly for two-stage pipelines such as
-  `LTX2TwoStagePipeline`.
-- `--vocoder-path`, `--connectors-path`, `--dual-tower-bridge-path`,
-  `--image-encoder-path`, and `--vision-language-encoder-path` are only valid
-  for pipelines that expose those components.
-- `distilled_lora` is not a general component loader key, but it is accepted as
-  a path override for `LTX2TwoStagePipeline`.
 
 ### Notes
 
