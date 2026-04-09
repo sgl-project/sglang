@@ -405,13 +405,21 @@ class LTX2AVDenoisingStage(DenoisingStage):
             if isinstance(batch.latents, torch.Tensor)
             else torch.device("cpu")
         )
+        is_ltx23_variant = is_ltx23_native_variant(server_args.pipeline_config)
+        use_condition_image_encoder = not (
+            is_ltx23_variant and batch.extra.get("ltx2_phase") is None
+        )
         encode_dtype = batch.latents.dtype
         original_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
             original_dtype != torch.float32
         ) and not server_args.disable_autocast
-        condition_image_encoder = self._get_condition_image_encoder(
-            server_args, device=latents_device, dtype=encode_dtype
+        condition_image_encoder = (
+            self._get_condition_image_encoder(
+                server_args, device=latents_device, dtype=encode_dtype
+            )
+            if use_condition_image_encoder
+            else None
         )
         if condition_image_encoder is None:
             self.vae = self.vae.to(device=latents_device, dtype=encode_dtype)
