@@ -663,6 +663,7 @@ class ServerArgs:
     enable_custom_logit_processor: bool = False
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
+    enforce_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
@@ -5832,6 +5833,12 @@ class ServerArgs:
             "--disable-shared-experts-fusion",
             action="store_true",
             help="Disable shared experts fusion optimization for deepseek v3/r1.",
+        )
+        parser.add_argument(
+            "--enforce-shared-experts-fusion",
+            action="store_true",
+            help="Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). "
+            "Mutually exclusive with --disable-shared-experts-fusion.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
