@@ -42,7 +42,6 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 
 
 def _rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
-    """Compute rotary positional embedding frequencies."""
     assert dim % 2 == 0
     scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
@@ -60,19 +59,11 @@ class EmbedND3(nn.Module):
         self.axes_dim = list(axes_dim)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            ids: [B, S, 3] position ids for 3 axes.
-        Returns:
-            freqs: [S, B, 1, dim] rotary embedding frequencies.
-        """
         emb = torch.cat(
             [_rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(3)],
             dim=-1,
         )
-        # emb: [B, S, dim/2] -> [S, B, 1, dim/2]
         emb = emb.unsqueeze(1).permute(2, 0, 1, 3)
-        # Interleave to get [S, B, 1, dim]
         return torch.stack([emb, emb], dim=-1).reshape(*emb.shape[:-1], -1)
 
 
@@ -122,8 +113,6 @@ class ErnieImageSelfAttention(nn.Module):
             gather_output=False,
             prefix=f"{prefix}.to_v",
         )
-        # to_out is a ModuleList in diffusers (to_out[0] = Linear, to_out[1] = Dropout)
-        # We only need to_out[0] (the linear projection).
         self.to_out = nn.ModuleList([
             RowParallelLinear(
                 hidden_size, hidden_size, bias=False,
@@ -146,13 +135,6 @@ class ErnieImageSelfAttention(nn.Module):
     def forward(
         self, x: torch.Tensor, rotary_pos_emb: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            x: [B, S, H]
-            rotary_pos_emb: [S, B, 1, rot_dim]
-        Returns:
-            out: [B, S, H]
-        """
         B, S, H = x.shape
 
         q, _ = self.to_q(x)
@@ -178,12 +160,6 @@ class ErnieImageSelfAttention(nn.Module):
 
 
 class ErnieImageMLP(nn.Module):
-    """Gated MLP (SwiGLU) with module hierarchy matching safetensors:
-    mlp.gate_proj, mlp.up_proj, mlp.linear_fc2
-
-    Supports tensor parallelism: gate/up fused via MergedColumnParallelLinear
-    (output dim sharded), fc2 via RowParallelLinear (all-reduce after matmul).
-    """
 
     def __init__(
         self,
@@ -256,15 +232,6 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
 
 
 def _apply_rotary_bshd(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    """Apply rotary position embedding.
-
-    Args:
-        x: [B, S, num_heads, head_dim]
-        freqs: [S, B, 1, rot_dim] rotary frequencies
-    Returns:
-        x: [B, S, num_heads, head_dim]
-    """
-    # freqs: [S, B, 1, rot_dim] -> [B, S, 1, rot_dim]
     freqs = freqs.permute(1, 0, 2, 3)
     rot_dim = freqs.shape[-1]
     x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
@@ -280,15 +247,7 @@ def _apply_rotary_bshd(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 
 
 class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
-    """ErnieImage DiT: Single-stream transformer with Shared AdaLN.
-
-    All layers share a single adaLN_modulation module that computes
-    shift/scale/gate parameters from the timestep embedding.
-
-    Supports tensor parallelism (TP): attention and MLP weights are
-    sharded across TP ranks. Q/K/V projections use ColumnParallel,
-    output projection uses RowParallel with all-reduce.
-    """
+    """ErnieImage DiT: Single-stream transformer with Shared AdaLN."""
 
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ErnieImageSharedAdaLNBlock"]
@@ -319,8 +278,6 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         tp_size = get_tp_world_size()
 
-        # Image patch embedding (Conv2d) - matches "x_embedder.proj.weight/bias"
-        # Not TP-sharded: small parameter, runs once per forward
         self.x_embedder = nn.ModuleDict({
             "proj": nn.Conv2d(
                 arch.in_channels, self.inner_dim,
@@ -328,15 +285,11 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             ),
         })
 
-        # Text projection - matches "text_proj.weight"
-        # Not TP-sharded: small parameter, runs once per forward
         if arch.text_in_dim != self.inner_dim:
             self.text_proj = nn.Linear(arch.text_in_dim, self.inner_dim, bias=False)
         else:
             self.text_proj = None
 
-        # Timestep embedding - matches "time_embedding.linear_1/2.weight/bias"
-        # Not TP-sharded: small parameter
         self.time_proj = Timesteps(
             self.inner_dim, flip_sin_to_cos=False, downscale_freq_shift=0,
         )
@@ -344,19 +297,15 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             in_channels=self.inner_dim, time_embed_dim=self.inner_dim,
         )
 
-        # 3D RoPE (not a parameter, just computation)
         self.pos_embed = EmbedND3(
             dim=self.head_dim, theta=arch.rope_theta, axes_dim=arch.rope_axes_dim,
         )
 
-        # Shared AdaLN: matches "adaLN_modulation.0" (SiLU) + "adaLN_modulation.1.weight/bias"
-        # Not TP-sharded: small parameter, runs once per forward
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(self.inner_dim, 6 * self.inner_dim),
         )
 
-        # Transformer layers - matches "layers.{i}.*"
         self.layers = nn.ModuleList([
             ErnieImageSharedAdaLNBlock(
                 hidden_size=self.inner_dim,
@@ -370,23 +319,17 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             for i in range(self.num_layers)
         ])
 
-        # Final norm - matches "final_norm.linear.weight/bias"
-        # Not TP-sharded: small parameter
         self.final_norm = nn.ModuleDict({
             "norm": nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=arch.eps),
             "linear": nn.Linear(self.inner_dim, self.inner_dim * 2),
         })
 
-        # Output projection - matches "final_linear.weight/bias"
-        # TP-sharded: ColumnParallel with gather_output since output needs
-        # full reshape to spatial dimensions
         self.final_linear = ColumnParallelLinear(
             self.inner_dim, arch.patch_size * arch.patch_size * self.out_channels,
             bias=True, gather_output=True,
             prefix="final_linear",
         )
 
-        # For OffloadableDiTMixin
         self.layer_names = ["layers"]
 
         self.__post_init__()
@@ -414,11 +357,9 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         Hp, Wp = H // p, W // p
         N_img = Hp * Wp
 
-        # --- Patch embed image ---
         img_tokens = self.x_embedder["proj"](hidden_states)  # [B, D, Hp, Wp]
         img_tokens = img_tokens.reshape(B, self.inner_dim, N_img).transpose(1, 2)  # [B, N_img, D]
 
-        # --- Process text ---
         if isinstance(encoder_hidden_states, (list, tuple)):
             encoder_hidden_states = encoder_hidden_states[0]
         text_tokens = encoder_hidden_states  # [B, T, text_dim]
@@ -426,11 +367,8 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             text_tokens = self.text_proj(text_tokens)
         Tmax = text_tokens.shape[1]
 
-        # --- Concatenate [image, text] into single sequence ---
         x = torch.cat([img_tokens, text_tokens], dim=1)  # [B, S, D]
 
-        # --- Position IDs for 3D RoPE ---
-        # Image: (text_len_offset, row, col)
         grid_yx = torch.stack(
             torch.meshgrid(
                 torch.arange(Hp, device=device, dtype=torch.float32),
@@ -438,37 +376,33 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 indexing="ij",
             ),
             dim=-1,
-        ).reshape(-1, 2)  # [N_img, 2]
+        ).reshape(-1, 2)
 
         image_ids = torch.cat([
             torch.full((B, N_img, 1), Tmax, device=device, dtype=torch.float32),
             grid_yx.view(1, N_img, 2).expand(B, -1, -1),
-        ], dim=-1)  # [B, N_img, 3]
+        ], dim=-1)
 
-        # Text: (sequential_idx, 0, 0)
         if Tmax > 0:
             text_ids = torch.cat([
                 torch.arange(Tmax, device=device, dtype=torch.float32)
                     .view(1, Tmax, 1).expand(B, -1, -1),
                 torch.zeros((B, Tmax, 2), device=device),
-            ], dim=-1)  # [B, Tmax, 3]
+            ], dim=-1)
         else:
             text_ids = torch.zeros((B, 0, 3), device=device)
 
-        all_ids = torch.cat([image_ids, text_ids], dim=1)  # [B, S, 3]
-        rotary_pos_emb = self.pos_embed(all_ids)  # [S, B, 1, dim]
+        all_ids = torch.cat([image_ids, text_ids], dim=1)
+        rotary_pos_emb = self.pos_embed(all_ids)
 
-        # --- Timestep embedding ---
         t_emb = self.time_proj(timestep.to(dtype))
-        c = self.time_embedding(t_emb.to(dtype=dtype))  # [B, D]
+        c = self.time_embedding(t_emb.to(dtype=dtype))
 
-        # --- Shared AdaLN modulation (same params for ALL layers) ---
-        mod_params = self.adaLN_modulation(c)  # [B, 6*D]
+        mod_params = self.adaLN_modulation(c)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             t.unsqueeze(1) for t in mod_params.chunk(6, dim=-1)
-        )  # Each: [B, 1, D]
+        )
 
-        # --- Transformer blocks ---
         for layer in self.layers:
             x = layer(
                 x, rotary_pos_emb,
@@ -476,14 +410,11 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 shift_mlp, scale_mlp, gate_mlp,
             )
 
-        # --- Final norm (AdaLN Continuous) ---
         scale, shift = self.final_norm["linear"](c).chunk(2, dim=-1)
         x = self.final_norm["norm"](x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-        # --- Output projection (only image tokens) ---
-        patches, _ = self.final_linear(x[:, :N_img, :])  # [B, N_img, p*p*C_out]
+        patches, _ = self.final_linear(x[:, :N_img, :])
 
-        # Reshape to spatial: [B, C_out, H, W]
         output = patches.view(B, Hp, Wp, p, p, self.out_channels)
         output = output.permute(0, 5, 1, 3, 2, 4).contiguous()
         output = output.view(B, self.out_channels, H, W)

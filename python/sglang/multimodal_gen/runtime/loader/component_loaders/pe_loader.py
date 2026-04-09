@@ -54,8 +54,6 @@ class PEModelWrapper:
             max_new_tokens=sampling_params.get("max_new_tokens", self.model_max_length),
             do_sample=True,
         )
-        # Only pass temperature/top_p when explicitly provided;
-        # passing None would cause HuggingFace generate() to raise.
         temperature = sampling_params.get("temperature")
         top_p = sampling_params.get("top_p")
         if temperature is not None:
@@ -66,7 +64,6 @@ class PEModelWrapper:
         with torch.no_grad():
             output_ids = self.model.generate(**generate_kwargs)
 
-        # Decode only the newly generated tokens
         new_tokens = output_ids[0, input_len:]
         text = self.pe_tokenizer.decode(new_tokens, skip_special_tokens=True)
         return {"text": text}
@@ -82,15 +79,7 @@ class PEModelWrapper:
 
 
 class PELoader(ComponentLoader):
-    """Loader for prompt-enhancement causal LM (Ministral-3 based).
-
-    Loads via ``AutoModelForCausalLM`` in bf16 on GPU with
-    Flash Attention 2 (or SDPA fallback).
-
-    ``model_max_length`` is read from ``tokenizer_config.json`` in the PE
-    component directory and is used for both tokenizer truncation and the
-    ``max_new_tokens`` budget during generation.
-    """
+    """Loader for prompt-enhancement causal LM (Ministral-3 based)."""
 
     component_names = ["pe"]
     expected_library = "transformers"
@@ -100,8 +89,6 @@ class PELoader(ComponentLoader):
     ):
         logger.info("Loading PE model from %s ...", component_model_path)
 
-        # Tokenizer files may live in a sibling `pe_tokenizer/` directory instead
-        # of alongside the model weights in `pe/`.  Check that directory first.
         pe_tokenizer_dir = os.path.join(os.path.dirname(component_model_path), "pe_tokenizer")
         if not os.path.exists(os.path.join(component_model_path, "tokenizer_config.json")) and \
                 os.path.exists(os.path.join(pe_tokenizer_dir, "tokenizer_config.json")):
@@ -131,11 +118,9 @@ class PELoader(ComponentLoader):
             tokenizer_path,
             trust_remote_code=server_args.trust_remote_code,
         )
-        # Pad token required for batched generation; use eos if unset.
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        # Flash Attention 2 (fall back to SDPA)
         attn_impl = "flash_attention_2"
         try:
             model = AutoModelForCausalLM.from_pretrained(

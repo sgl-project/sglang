@@ -74,32 +74,18 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
             return None
 
     def _resolve_pe_tokenizer_path(self, model_path: str, server_args) -> str:
-        """Resolve the directory that contains the PE tokenizer files.
-
-        Priority:
-          1. ``component_paths["pe"]`` override (if set and contains tokenizer_config.json)
-          2. ``<model_path>/pe_tokenizer/``  (sibling tokenizer-only directory)
-          3. ``<model_path>/pe/``            (tokenizer co-located with model weights)
-        """
+        """Resolve the directory that contains the PE tokenizer files."""
         pe_component_path = server_args.component_paths.get(
             "pe", os.path.join(model_path, "pe")
         )
-        # If pe/ already has a tokenizer_config.json, use it directly.
         if os.path.exists(os.path.join(pe_component_path, "tokenizer_config.json")):
             return pe_component_path
-        # Otherwise check the sibling pe_tokenizer/ directory.
         pe_tokenizer_dir = os.path.join(model_path, "pe_tokenizer")
         if os.path.exists(os.path.join(pe_tokenizer_dir, "tokenizer_config.json")):
             return pe_tokenizer_dir
-        # Fall back to pe/ even if it lacks tokenizer files (will fail later with a clear error).
         return pe_component_path
 
     def _read_pe_model_max_length(self, model_path: str, server_args) -> int | None:
-        """Read model_max_length from the PE tokenizer_config.json.
-
-        Checks pe_tokenizer/ sibling directory first, then pe/ itself.
-        Returns None if the value cannot be determined.
-        """
         tokenizer_path = self._resolve_pe_tokenizer_path(model_path, server_args)
         config_path = os.path.join(tokenizer_path, "tokenizer_config.json")
         if os.path.exists(config_path):
@@ -180,8 +166,6 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         if pe_model is not None:
             pe_tokenizer = getattr(pe_model, "pe_tokenizer", None)
             if pe_tokenizer is None:
-                # Fallback: load tokenizer from the resolved PE tokenizer directory.
-                # Priority: pe_tokenizer/ sibling dir > pe/ dir itself.
                 from transformers import AutoTokenizer
 
                 pe_tokenizer_path = self._resolve_pe_tokenizer_path(
