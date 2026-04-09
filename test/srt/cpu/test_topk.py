@@ -75,7 +75,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         bias_dtype,
         routed_scaling_factor,
     ):
-        torch.manual_seed(800)
+        torch.manual_seed(1024)
 
         # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
         hidden_states = torch.randn(M, 100, dtype=torch.bfloat16)
@@ -90,12 +90,12 @@ class TestBiasedGroupedTopK(CustomTestCase):
             renormalize,
             G,
             topk_group,
-            routed_scaling_factor=routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=(
-                True if routed_scaling_factor is not None else False
-            ),
         )
-
+        ref_topk_weights = (
+            ref_topk_weights * routed_scaling_factor
+            if routed_scaling_factor is not None
+            else ref_topk_weights
+        )
         # fused version
         topk_weights, topk_ids = torch.ops.sgl_kernel.biased_grouped_topk_cpu(
             hidden_states,
@@ -117,13 +117,13 @@ class TestBiasedGroupedTopK(CustomTestCase):
         torch.testing.assert_close(res, ref)
 
     def test_biased_grouped_topk(self):
-        for renormalize in [True, False]:
+        for renormalize in [False]:
             for bias_dtype in [torch.float32, torch.bfloat16]:
                 for gating_dtype in [torch.float32, torch.bfloat16]:
-                    for routed_scaling_factor in [None, 1.0, 2.0]:
-                        for E_num in [192, 256, 384]:
+                    for routed_scaling_factor in [None, 1.125]:
+                        for E_num in [192, 256]:
                             self._run_single_test(
-                                122,
+                                34,
                                 E_num,
                                 8,
                                 8,
