@@ -560,23 +560,41 @@ class MambaRadixCache(BasePrefixCache):
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
             if self.enable_mamba_extra_buffer:
-                assert req.pending_radix_mamba_slot is not None, (
-                    "pending_radix_mamba_slot must be set for extra_buffer mode"
-                )
-                mamba_value = req.pending_radix_mamba_slot.unsqueeze(-1).clone()
-                req.pending_radix_mamba_slot = None
+                if req.pending_radix_mamba_slot is not None:
+                    mamba_value = req.pending_radix_mamba_slot.unsqueeze(-1).clone()
+                    req.pending_radix_mamba_slot = None
+                    result = self.insert(
+                        InsertParams(
+                            key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                            value=page_aligned_kv_indices,
+                            mamba_value=mamba_value,
+                            prev_prefix_len=req.cache_protected_len,
+                        )
+                    )
+                    mamba_exist = result.mamba_exist
+                else:
+                    # No pending slot: decode phase never triggered tracking
+                    # (output shorter than mamba_track_interval). The mamba
+                    # state was already inserted into the radix tree by the
+                    # last cache_unfinished_req during chunked prefill, or
+                    # no tracking was ever done (short prompt, no chunking).
+                    # In either case, free KV beyond the cached prefix and
+                    # skip mamba insert.
+                    self.token_to_kv_pool_allocator.free(
+                        kv_indices[req.cache_protected_len:]
+                    )
+                    mamba_exist = True
             else:
                 mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
-
-            result = self.insert(
-                InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
-                    value=page_aligned_kv_indices,
-                    mamba_value=mamba_value,
-                    prev_prefix_len=req.cache_protected_len,
+                result = self.insert(
+                    InsertParams(
+                        key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                        value=page_aligned_kv_indices,
+                        mamba_value=mamba_value,
+                        prev_prefix_len=req.cache_protected_len,
+                    )
                 )
-            )
-            mamba_exist = result.mamba_exist
+                mamba_exist = result.mamba_exist
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
             mamba_exist = True
