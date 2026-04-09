@@ -111,7 +111,7 @@ jobs:
           echo "All $total test(s) passed in ${total_elapsed}s"
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   rerun-test-cpu:
     if: inputs.is_cpu == 'true'

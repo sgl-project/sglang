@@ -174,12 +174,14 @@ def collect_test_items(files, filter_expr=None):
     return test_items
 
 
-def run_pytest(files, filter_expr=None):
+def run_pytest(files, filter_expr=None, exitfirst=False):
     if not files:
         print("No files to run.")
         return 0
 
     base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
+    if exitfirst:
+        base_cmd.append("-x")
 
     # Add pytest -k filter if provided
     if filter_expr:
@@ -349,7 +351,8 @@ def main():
     print(f"Running {len(my_items)} items in this shard: {', '.join(my_items)}")
 
     # 4. execute with the specific test items
-    exit_code = run_pytest(my_items)
+    # Fast-fail: stop on first failure unless --continue-on-error is set
+    exit_code = run_pytest(my_items, exitfirst=not args.continue_on_error)
 
     # Print tests again at the end for visibility
     msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
