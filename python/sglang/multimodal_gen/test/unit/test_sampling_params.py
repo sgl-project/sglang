@@ -206,7 +206,7 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         with patch.object(
             SamplingParams,
             "from_pretrained",
-            return_value=Flux2SamplingParams(),
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
         ):
             implicit_size = SamplingParams.from_user_sampling_params_args(
                 "dummy-model",
