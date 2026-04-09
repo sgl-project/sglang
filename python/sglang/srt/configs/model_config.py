@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, List, Optional, Set, Union
 
 import torch
+from transformers import PretrainedConfig
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
@@ -34,7 +36,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
-from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 

@@ -14,10 +14,14 @@
 # ==============================================================================
 """Inference-only EXAONE-4.5 MTP Speculative Decoding."""
 
+import copy
 import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -28,8 +32,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.exaone4 import Exaone4ForCausalLM, Exaone4Model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
-from torch import nn
-from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,7 @@ class Exaone4_5_MTP(Exaone4ForCausalLM):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        config = copy.deepcopy(config)
         self.config = config
         config.num_hidden_layers = 1
         self.tp_size = get_tensor_model_parallel_world_size()

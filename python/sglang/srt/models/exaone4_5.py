@@ -21,6 +21,8 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 from einops import rearrange
+from transformers import PretrainedConfig
+
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv3dLayer
@@ -49,7 +51,6 @@ from sglang.srt.models.exaone4 import (
 from sglang.srt.models.utils import WeightsMapper, compute_cu_seqlens_from_grid_numpy
 from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
-from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -286,20 +287,10 @@ class Exaone45VisionRotaryEmbedding(nn.Module):
         if seqlen > self._seq_len_cached:
             seqlen *= 2
             self._seq_len_cached = seqlen
-            self.inv_freq = 1.0 / (
-                self.theta
-                ** (
-                    torch.arange(
-                        0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device
-                    )
-                    / self.dim
-                )
-            )
             seq = torch.arange(
                 seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
             )
-            freqs = torch.outer(seq, self.inv_freq)
-            self._freqs_cached = freqs
+            self._freqs_cached = torch.outer(seq, self.inv_freq)
 
     def forward(self, seqlen: int) -> torch.Tensor:
         self.update_freqs_cache(seqlen)
@@ -521,12 +512,18 @@ class Exaone4_5_ForConditionalGeneration(nn.Module):
         model = self.language_model.model
 
         # Exaone4Model.get_input_embeddings(input_ids) takes an arg,
-        # but general_mm_embed_routine expects get_input_embeddings() -> nn.Embedding
+        # but general_mm_embed_routine expects get_input_embeddings() -> nn.Embedding.
+        # Support both signatures to avoid breaking internal calls.
         if not hasattr(self, "_lm_wrapper"):
-            wrapper = model
-            original_get_embed = model.get_input_embeddings
-            wrapper.get_input_embeddings = lambda: model.embed_tokens
-            self._lm_wrapper = wrapper
+            original_fn = model.get_input_embeddings
+
+            def flexible_get_input_embeddings(*args, **kwargs):
+                if args or kwargs:
+                    return original_fn(*args, **kwargs)
+                return model.embed_tokens
+
+            model.get_input_embeddings = flexible_get_input_embeddings
+            self._lm_wrapper = model
         return self._lm_wrapper
 
     def forward(
