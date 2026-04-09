@@ -1494,9 +1494,9 @@ class ServerArgs:
                 self.nsa_prefill_backend = "trtllm"
                 self.nsa_decode_backend = "trtllm"
             else:
-                # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
+                # Hopper FP8 defaults to flashmla_kv for both prefill and decode.
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_auto"
+                    self.nsa_prefill_backend = "flashmla_kv"
                 if not user_set_decode:
                     self.nsa_decode_backend = "flashmla_kv"
         else:
