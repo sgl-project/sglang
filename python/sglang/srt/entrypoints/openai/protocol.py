@@ -102,12 +102,38 @@ class ChoiceLogprobs(BaseModel):
     content: List[ChatCompletionTokenLogprob]
 
 
+class CachedTokensDetails(BaseModel):
+    """Detailed breakdown of cached tokens by cache source."""
+
+    device: int = 0  # Tokens from device cache (GPU)
+    host: int = 0  # Tokens from host cache (CPU memory)
+    # L3 storage fields are only present when storage backend is enabled
+    storage: Optional[int] = None  # Tokens from L3 storage backend
+    storage_backend: Optional[str] = None  # Type of storage backend used
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove None fields so they don't appear in response when L3 is disabled
+        if self.storage is None:
+            data.pop("storage", None)
+        if self.storage_backend is None:
+            data.pop("storage_backend", None)
+        return data
+
+
+class PromptTokensDetails(BaseModel):
+    """Details about prompt tokens."""
+
+    cached_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
-    # only used to return cached tokens when --enable-cache-report is set
-    prompt_tokens_details: Optional[Dict[str, int]] = None
+    # Used to return cached tokens info when --enable-cache-report is set
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
 
 
@@ -207,6 +233,20 @@ class BatchResponse(BaseModel):
     metadata: Optional[dict] = None
 
 
+def _migrate_deprecated_dp_rank(values: dict) -> dict:
+    if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
+        import warnings
+
+        warnings.warn(
+            "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if values.get("routed_dp_rank") is None:
+            values["routed_dp_rank"] = values["data_parallel_rank"]
+    return values
+
+
 class CompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -233,6 +273,7 @@ class CompletionRequest(BaseModel):
     user: Optional[str] = None
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    return_cached_tokens_details: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -258,7 +299,11 @@ class CompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
-    # For data parallel rank routing
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
     # For request id
@@ -272,6 +317,11 @@ class CompletionRequest(BaseModel):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @field_validator("max_tokens")
     @classmethod
@@ -289,6 +339,7 @@ class SglExt(BaseModel):
     """
 
     routed_experts: Optional[str] = None
+    cached_tokens_details: Optional[CachedTokensDetails] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -304,15 +355,12 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.sgl_ext is None:
-            data.pop("sgl_ext", None)
         return data
 
 
@@ -324,6 +372,14 @@ class CompletionResponse(BaseModel):
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -333,15 +389,12 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.sgl_ext is None:
-            data.pop("sgl_ext", None)
         return data
 
 
@@ -352,6 +405,14 @@ class CompletionStreamResponse(BaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):
@@ -524,14 +585,17 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     return_routed_experts: bool = False
-    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
-        default="medium",
+    return_cached_tokens_details: bool = False
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
+        default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
-        "result in faster responses and fewer tokens used on reasoning in a response. "
-        "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
+        "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
+        "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
+        "in a response. 'none' defaults thinking and enable_thinking to false in "
+        "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path.",
     )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -575,7 +639,11 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
-    # For data parallel rank routing
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
@@ -586,6 +654,11 @@ class ChatCompletionRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
@@ -601,12 +674,10 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
         r = values.get("reasoning")
-        if r is None:
-            return values
 
-        if isinstance(r, dict):
+        if r is not None and isinstance(r, dict):
             effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"low", "medium", "high"}:
+            if effort in {"none", "low", "medium", "high"}:
                 values["reasoning_effort"] = effort
 
             enabled = (
@@ -622,6 +693,17 @@ class ChatCompletionRequest(BaseModel):
                     ctk = {}
                 ctk.setdefault("thinking", True)
                 values["chat_template_kwargs"] = ctk
+
+        if values.get("reasoning_effort") == "none":
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            # different models check different keys:
+            # - "thinking" for deepseek-v3, kimi_k2
+            # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
+            ctk.setdefault("thinking", False)
+            ctk.setdefault("enable_thinking", False)
+            values["chat_template_kwargs"] = ctk
 
         return values
 
@@ -676,6 +758,13 @@ class ChatCompletionRequest(BaseModel):
                 )
             return value
 
+        # add per user request
+        spaces_between_special_tokens = (
+            True
+            if self.chat_template_kwargs is None
+            else self.chat_template_kwargs.get("spaces_between_special_tokens", True)
+        )
+
         sampling_params = {
             "temperature": get_param("temperature"),
             "max_new_tokens": self.max_completion_tokens or self.max_tokens,
@@ -698,6 +787,7 @@ class ChatCompletionRequest(BaseModel):
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,
             "sampling_seed": self.seed,
+            "spaces_between_special_tokens": spaces_between_special_tokens,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
@@ -755,15 +845,12 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.sgl_ext is None:
-            data.pop("sgl_ext", None)
         return data
 
 
@@ -775,6 +862,14 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class DeltaMessage(BaseModel):
@@ -783,15 +878,12 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
-    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.sgl_ext is None:
-            data.pop("sgl_ext", None)
         return data
 
 
@@ -814,6 +906,14 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class MultimodalEmbeddingInput(BaseModel):
@@ -840,6 +940,8 @@ class EmbeddingRequest(BaseModel):
     rid: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # LoRA adapter path(s)
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
 
 class EmbeddingObject(BaseModel):
@@ -1330,3 +1432,72 @@ class ResponseReasoningTextContent(BaseModel):
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
 ]
+
+
+# ================== Transcription API Protocol Definitions ==================
+
+
+class TranscriptionRequest(BaseModel):
+    """Request model for audio transcription (OpenAI-compatible)."""
+
+    model: str = DEFAULT_MODEL_NAME
+    language: Optional[str] = None
+    response_format: str = "json"
+    temperature: float = 0.0
+    timestamp_granularities: Optional[List[str]] = None
+    stream: bool = False
+    # Internal fields (not from API)
+    audio_data: Optional[bytes] = None
+    audio_duration_s: float = 0.0
+
+
+class TranscriptionUsage(BaseModel):
+    """Usage info for transcription response (duration-based)."""
+
+    type: Literal["duration"] = "duration"
+    seconds: int  # Audio duration in seconds (rounded up)
+
+
+class TranscriptionResponse(BaseModel):
+    """Non-streaming transcription response (OpenAI-compatible)."""
+
+    text: str
+    usage: Optional[TranscriptionUsage] = None
+
+
+class TranscriptionSegment(BaseModel):
+    """A segment with timestamp information."""
+
+    id: int
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptionVerboseResponse(BaseModel):
+    """Verbose transcription response with timestamps (OpenAI-compatible)."""
+
+    task: str = "transcribe"
+    language: Optional[str] = None
+    duration: Optional[float] = None
+    text: str
+    segments: List[TranscriptionSegment] = []
+    usage: Optional[TranscriptionUsage] = None
+
+
+class TranscriptionStreamChoice(BaseModel):
+    """Delta content for streaming transcription."""
+
+    delta: DeltaMessage
+    finish_reason: Optional[str] = None
+
+
+class TranscriptionStreamResponse(BaseModel):
+    """Streaming transcription chunk (OpenAI-compatible)."""
+
+    id: str = Field(default_factory=lambda: f"trsc-{uuid.uuid4().hex}")
+    object: Literal["transcription.chunk"] = "transcription.chunk"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[TranscriptionStreamChoice]
+    usage: Optional[UsageInfo] = None

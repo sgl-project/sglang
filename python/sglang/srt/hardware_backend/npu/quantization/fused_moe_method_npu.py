@@ -14,6 +14,92 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
+def npu_fused_experts_w4a4(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+):
+    original_shape = hidden_states.shape
+    original_dtype = hidden_states.dtype
+    scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
+    if len(original_shape) == 3:
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    num_tokens = hidden_states.shape[0]
+    num_experts = w13.shape[0]
+
+    hidden_states, expanded_row_idx, expert_tokens, _ = (
+        torch.ops.npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids,
+            active_num=num_tokens * top_k,
+            expert_num=num_experts,
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            active_expert_range=[0, num_experts],
+            quant_mode=-1,
+        )
+    )
+    expert_tokens = expert_tokens.to(torch.int64)
+
+    # gmm1: gate_up_proj
+    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(
+        hidden_states, dst_type=torch.quint4x2
+    )
+    scale_args13 = {
+        "scale": [w13_scale],
+        "per_token_scale": [pertoken_scale],
+    }
+
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w13],
+        **scale_args13,
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+    # act_fn: swiglu
+    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+
+    scale_args2 = {
+        "scale": [w2_scale.to(scale_dtype)],
+        "per_token_scale": [pertoken_scale],
+    }
+    # gmm2: down_proj
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w2],
+        **scale_args2,
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+
+    final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
+        hidden_states,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights,
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=topk_ids,
+        drop_pad_mode=2,
+    )
+    if len(original_shape) == 3:
+        final_hidden_states = final_hidden_states.view(original_shape)
+    return final_hidden_states
+
+
 def npu_fused_experts(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -76,15 +162,19 @@ def npu_fused_experts(
         output_dtype=original_dtype,
     )[0]
     # act_fn: swiglu
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     if not use_wna16:
-        hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
+        hidden_states, pertoken_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+            hidden_states,
+            activate_left=True,
+            quant_mode=1,
+        )
 
         scale_args2 = {
             "scale": [w2_scale.to(scale_dtype)],
             "per_token_scale": [pertoken_scale],
         }
     else:
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
         scale_args2 = {"antiquant_scale": [w2_scale], "antiquant_offset": [w2_offset]}
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
@@ -112,24 +202,100 @@ def npu_fused_experts(
     return final_hidden_states
 
 
+def npu_fused_experts_w8a8_decode(
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    **kwargs,
+):
+    num_tokens = hidden_states.shape[:-1].numel()
+    first_expert_idx = 0
+    last_expert_idx = w13.shape[0]
+    global_num_experts = w13.shape[0]
+    original_shape = hidden_states.shape
+    group_list_type = 1
+
+    sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
+        torch.ops.npu.npu_moe_init_routing_v2(
+            hidden_states,
+            topk_ids,
+            active_num=num_tokens * top_k,
+            expert_num=global_num_experts,
+            expert_tokens_num_type=group_list_type,
+            expert_tokens_num_flag=True,
+            active_expert_range=[first_expert_idx, last_expert_idx],
+            quant_mode=1,
+        )
+    )
+
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[sorted_hidden_states],
+        weight=[w13],
+        scale=[w13_scale],
+        per_token_scale=[pertoken_scale],
+        group_list=expert_tokens,
+        split_item=2,
+        group_type=0,
+        group_list_type=group_list_type,
+        output_dtype=torch.bfloat16,
+    )[0]
+
+    # act_fn: swiglu
+    hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
+        hidden_states, quant_mode=1, activate_left=True
+    )
+
+    output = torch.ops.npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w2],
+        scale=[w2_scale],
+        per_token_scale=[swiglu_out_scale],
+        group_list=expert_tokens,
+        split_item=2,
+        group_type=0,
+        group_list_type=group_list_type,
+        output_dtype=torch.bfloat16,
+    )[0]
+
+    assert original_shape is not None
+    final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
+        permuted_tokens=output,
+        sorted_indices=torch.abs(expanded_row_idx),
+        probs=topk_weights,
+    )
+    if len(original_shape) == 3:
+        final_hidden_states = final_hidden_states.view(original_shape)
+
+    return final_hidden_states
+
+
 def npu_fused_moe_without_routing_weights_bf16(
     layer, hidden_states, group_list_type, group_list, output_dtype
 ):
+    from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
     # gmm1: gate_up_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
-        weight=[layer.w13_weight.permute(0, 2, 1)],
+        weight=[layer.w13_weight],
         split_item=2,
         group_list_type=group_list_type,
         group_type=0,
         group_list=group_list,
         output_dtype=output_dtype,
     )[0]
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    hidden_states, _ = swiglu_quant(
+        hidden_states, group_list, group_list_type, need_quant=False
+    )
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],
-        weight=[layer.w2_weight.permute(0, 2, 1)],
+        weight=[layer.w2_weight],
         split_item=2,
         group_list_type=group_list_type,
         group_type=0,
@@ -137,6 +303,85 @@ def npu_fused_moe_without_routing_weights_bf16(
         output_dtype=output_dtype,
     )[0]
     return hidden_states
+
+
+def fused_moe_npu(
+    x,
+    w1,
+    w2,
+    topk_output,
+    moe_runner_config,
+):
+    # TODO: reuse the codes of UnquantizedFusedMoEMethod-forward_npu
+    topk_weights, topk_ids, _ = topk_output
+    original_dtype = x.dtype
+    num_tokens = x.shape[0]
+    topk_weights = topk_weights.to(x.dtype)
+    topk_ids = topk_ids.to(torch.int32)
+    num_experts = w1.shape[0]
+    top_k = topk_weights.shape[-1]
+    row_idx_len = num_tokens * top_k
+    row_idx = (
+        torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
+        .view(top_k, -1)
+        .permute(1, 0)
+        .contiguous()
+    )
+
+    hidden_states, expanded_row_idx, expanded_expert_idx = (
+        torch.ops.npu.npu_moe_init_routing(
+            x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+        )
+    )
+
+    expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
+        expanded_expert_idx, num_experts
+    )
+
+    expert_tokens = expert_tokens.to(torch.int64)
+
+    # gmm1: gate_up_proj
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w1.permute(0, 2, 1)],
+        bias=None,
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+
+    # act_fn:
+    if moe_runner_config.activation == "silu":
+        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+    else:
+        from sglang.srt.layers.activation import GeluAndMul
+
+        hidden_states = GeluAndMul()(hidden_states)
+
+    # gmm2: down_proj
+    hidden_states = torch.ops.npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w2.permute(0, 2, 1)],
+        bias=None,
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype,
+    )[0]
+
+    final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
+        hidden_states,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights,
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=topk_ids,
+    )
+    return final_hidden_states
 
 
 class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
@@ -148,43 +393,47 @@ class _NPUFusedMoEMethodBase(FusedMoEMethodBase):
         self.quant_config = quant_config
 
 
-class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
-
-    def _release_weight_cache(self, weight: torch.Tensor):
-        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
-        origin_weight = weight.data.transpose(1, 2)
-        new_weight = origin_weight.contiguous()
-        origin_weight.untyped_storage().resize_(0)
-        return new_weight
+class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight_data = self._release_weight_cache(layer.w13_weight.data)
-        layer.w13_weight = torch.nn.Parameter(weight_data, requires_grad=False)
+        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
+        layer.w13_weight.data = self._pack_to_int32(
+            layer.w13_weight.data.to(torch.int32)
+        )
 
-        weight_data = self._release_weight_cache(layer.w2_weight.data)
-        layer.w2_weight = torch.nn.Parameter(weight_data, requires_grad=False)
+        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
+
+        scale_np = layer.w13_weight_scale.data.cpu().numpy()
+        scale_np.dtype = np.uint32
+        scale_uint64_tensor = torch.from_numpy(scale_np.astype(np.int64)).npu()
 
         layer.w13_weight_scale = torch.nn.Parameter(
-            layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32),
-            requires_grad=False,
+            scale_uint64_tensor.squeeze(-1), requires_grad=False
         )
         layer.w2_weight_scale = torch.nn.Parameter(
-            layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
+            layer.w2_weight_scale.data.squeeze(-1), requires_grad=False
         )
+
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "w13_weight_offset"):
             layer.w13_weight_offset = torch.nn.Parameter(
-                layer.w13_weight_offset.data.squeeze(-1).contiguous(),
+                layer.w13_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
         if hasattr(layer, "w2_weight_offset"):
             layer.w2_weight_offset = torch.nn.Parameter(
-                layer.w2_weight_offset.data.squeeze(-1).contiguous(),
+                layer.w2_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
 
-        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
-        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
+    def _pack_to_int32(self, weight: torch.Tensor):
+        # pack 8 int4 to int32, we use a int32 to represent a int4
+        assert (
+            weight.shape[-1] % 8 == 0
+        ), "the last dim of weight needs to be divided by 8"
+        new_weight = torch.ops.npu.npu_convert_weight_to_int4pack(weight.flatten(0, 1))
+        new_weight = new_weight.view(weight.shape[0], weight.shape[1], -1)
+        return new_weight
 
     def apply(
         self,
@@ -199,7 +448,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
+        output = npu_fused_experts_w4a4(
             hidden_states=x,
             w13=layer.w13_weight,
             w13_scale=layer.w13_weight_scale,
@@ -209,6 +458,81 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
         )
+        return StandardCombineInput(hidden_states=output)
+
+
+class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight.data = npu_format_cast(layer.w13_weight.data.transpose(1, 2))
+        layer.w2_weight.data = npu_format_cast(layer.w2_weight.data.transpose(1, 2))
+        layer.w13_weight_scale = torch.nn.Parameter(
+            layer.w13_weight_scale.data.squeeze(-1), requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            layer.w2_weight_scale.data.squeeze(-1), requires_grad=False
+        )
+        layer.w13_weight_scale_bf16 = torch.nn.Parameter(
+            layer.w13_weight_scale.data.to(dtype=torch.bfloat16), requires_grad=False
+        )
+        layer.w2_weight_scale_bf16 = torch.nn.Parameter(
+            layer.w2_weight_scale.data.to(dtype=torch.bfloat16), requires_grad=False
+        )
+        # Compressed-tensors format doesn't have this field
+        if hasattr(layer, "w13_weight_offset"):
+            layer.w13_weight_offset = torch.nn.Parameter(
+                layer.w13_weight_offset.data.squeeze(-1),
+                requires_grad=False,
+            )
+        if hasattr(layer, "w2_weight_offset"):
+            layer.w2_weight_offset = torch.nn.Parameter(
+                layer.w2_weight_offset.data.squeeze(-1),
+                requires_grad=False,
+            )
+
+    def apply(
+        self,
+        layer,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        # release fp32 scale to save memory
+        layer.w13_weight_scale = None
+        layer.w2_weight_scale = None
+
+        hidden_states = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, _ = topk_output
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(hidden_states.dtype)
+
+        # prefill
+        if not torch.npu.is_current_stream_capturing():
+            output = npu_fused_experts(
+                hidden_states=hidden_states,
+                w13=layer.w13_weight,
+                w13_scale=layer.w13_weight_scale_bf16,
+                w2=layer.w2_weight,
+                w2_scale=layer.w2_weight_scale_bf16,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                top_k=topk_ids.shape[1],
+            )
+        # decode
+        else:
+            output = npu_fused_experts_w8a8_decode(
+                hidden_states=hidden_states,
+                w13=layer.w13_weight,
+                w13_scale=layer.w13_weight_scale_bf16,
+                w2=layer.w2_weight,
+                w2_scale=layer.w2_weight_scale_bf16,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                top_k=topk_ids.shape[1],
+            )
+
         return StandardCombineInput(hidden_states=output)
 
     def apply_without_routing_weights(

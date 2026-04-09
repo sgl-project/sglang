@@ -30,7 +30,8 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_nvidia_cublas_cu12_version_ge_12_9,
+    is_nvidia_cublas_version_ge_12_9,
+    is_xpu,
 )
 
 _is_hip = is_hip()
@@ -40,12 +41,13 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 
-_is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
+_is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
 
@@ -74,17 +76,19 @@ def awq_dequantize_func():
 
         return awq_dequantize
     elif _is_hip:
+        from sglang.kernel_api_logging import debug_kernel_api
         from sglang.srt.layers.quantization.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
         )
 
-        return awq_dequantize
+        return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     elif _is_npu:
+        from sglang.kernel_api_logging import debug_kernel_api
         from sglang.srt.layers.quantization.awq_triton import (
             awq_dequantize_decomposition as awq_dequantize,
         )
 
-        return awq_dequantize
+        return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     else:
         return None
 

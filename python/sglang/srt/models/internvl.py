@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -113,7 +114,7 @@ class InternVisionEmbeddings(nn.Module):
             torch.randn(1, 1, self.embed_dim),
         )
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=3,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -616,6 +617,10 @@ class InternVLChatModel(nn.Module):
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         pixel_values = torch.cat([item.feature for item in items])
+        # If already precomputed embeddings (not raw pixel values), skip vision encoder.
+        # Normal pixel_values are 4D [N, C, H, W]; precomputed embeddings are 2D or 3D.
+        if pixel_values.dim() != 4:
+            return pixel_values
         image_features = self.extract_feature(pixel_values)
         return image_features
 
@@ -623,6 +628,9 @@ class InternVLChatModel(nn.Module):
         # items: each item corresponds to one video (recommended)
         # item.feature shape: [num_frames, 3, 448, 448]  (or [num_tiles, 3, 448, 448])
         pixel_values = torch.cat([item.feature for item in items], dim=0)
+        # If already precomputed embeddings, skip vision encoder.
+        if pixel_values.dim() != 4:
+            return pixel_values
         video_features = self.extract_feature(pixel_values)
         return video_features
 

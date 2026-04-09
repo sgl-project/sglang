@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, List, Set
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -123,21 +126,25 @@ class RadixCacheCpp(BasePrefixCache):
 
         raise NotImplementedError("Host cache is not supported yet")
 
-    def dec_lock_ref(self, node: TreeNodeCpp):
+    def dec_lock_ref(
+        self, node: TreeNodeCpp, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         """
         Decrement the reference count of a node to root of the radix tree.
         Args:
             node (TreeNodeCpp): The handle of the node to decrement the reference count for.
         """
         self.tree.lock_ref(node, False)  # do not increment
+        return DecLockRefResult()
 
-    def inc_lock_ref(self, node: TreeNodeCpp):
+    def inc_lock_ref(self, node: TreeNodeCpp) -> IncLockRefResult:
         """
         Increment the reference count of from a node to root of the radix tree.
         Args:
             node (TreeNodeCpp): The handle of the node to increment the reference count for.
         """
         self.tree.lock_ref(node, True)
+        return IncLockRefResult()
 
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
@@ -198,7 +205,6 @@ class RadixCacheCpp(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
-        self.req_to_token_pool.free(req.req_pool_idx)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

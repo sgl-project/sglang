@@ -15,6 +15,7 @@ import psutil
 import torch
 from typing_extensions import ParamSpec
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -75,6 +76,10 @@ class CudaPlatformBase(Platform):
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
@@ -97,6 +102,58 @@ class CudaPlatformBase(Platform):
             )
             return False
         return True
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        try:
+            from flashinfer import fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            pass
+
+        try:
+            from sgl_kernel import scaled_fp4_quant as fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            return None
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
+        if backend is None:
+            return "cudnn" if cls.is_blackwell() else "auto"
+
+        backend = backend.lower()
+        if backend not in {"auto", "cudnn"}:
+            logger.warning(
+                "Unsupported SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r. "
+                "Falling back to %r.",
+                backend,
+                "cudnn" if cls.is_blackwell() else "auto",
+            )
+            return "cudnn" if cls.is_blackwell() else "auto"
+        return backend
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+
+            return cutlass_fp4_gemm, None
+        except ImportError:
+            pass
+
+        try:
+            from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+            return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+        except ImportError:
+            return None, None
 
     @classmethod
     def is_full_nvlink(cls, device_ids: list[int]) -> bool:
@@ -123,6 +180,9 @@ class CudaPlatformBase(Platform):
     ) -> float:
         if empty_cache:
             torch.cuda.empty_cache()
+
+        if torch.distributed.is_initialized():
+            device_id = torch.distributed.get_rank()
 
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
@@ -215,6 +275,35 @@ class CudaPlatformBase(Platform):
                 )
                 raise ImportError(
                     "Video Sparse Attention backend is not installed."
+                ) from e
+        elif selected_backend == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
+            try:
+                from svg.kernels.triton.permute import (  # noqa: F401
+                    apply_inverse_permutation_triton,
+                    permute_tensor_by_labels_triton,
+                )
+                from svg.kmeans_utils import (  # noqa: F401
+                    batch_kmeans_Euclid,
+                    density_calculation,
+                    dynamic_block_sparse_fwd_flashinfer,
+                    identify_dynamic_map,
+                )
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
+                    SparseVideoGen2AttentionBackend,
+                )
+
+                logger.info("Using Sparse Video Gen 2 (SAP) Attention backend")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import Sparse Video Gen 2 (SAP) Attention backend: %s",
+                    str(e),
+                )
+                raise ImportError(
+                    "Sparse Video Gen 2 (SAP) Attention backend is not installed. "
+                    "Please install it by following the instructions at "
+                    "https://github.com/svg-project/Sparse-VideoGen"
                 ) from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:

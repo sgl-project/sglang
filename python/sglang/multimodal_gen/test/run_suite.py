@@ -10,6 +10,7 @@ Example:
 
 import argparse
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -20,15 +21,34 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
+_UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
+_UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
+    "FLUX.2-klein-base-4B",
+    "Qwen-Image",
+)
+
+
+def _discover_unit_tests() -> list[str]:
+    """Auto-discover all test_*.py files in the unit/ directory."""
+    unit_dir = Path(__file__).resolve().parent / "unit"
+    if not unit_dir.is_dir():
+        return []
+    return sorted(
+        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
+    )
+
+
 SUITES = {
+    # no GPU required; safe to run on any CPU-only runner
+    # Auto-discovered from test/unit/test_*.py
+    "unit": _discover_unit_tests(),
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
-        "test_lora_format_adapter.py",
         # cli test
         "../cli/test_generate_t2i_perf.py",
-        # unit tests (no server needed)
-        "../test_sampling_params_validate.py",
+        "test_update_weights_from_disk.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
@@ -36,7 +56,28 @@ SUITES = {
         "test_server_2_gpu_b.py",
         # add new 2-gpu test files here
     ],
+    "1-gpu-b200": [
+        "test_server_c.py",
+    ],
 }
+
+suites_ascend = {
+    "1-npu": [
+        "ascend/test_server_1_npu.py",
+        # add new 1-npu test files here
+    ],
+    "2-npu": [
+        "ascend/test_server_2_npu.py",
+        # add new 2-npu test files here
+    ],
+    "8-npu": [
+        "ascend/test_server_8_npu.py",
+        # add new 8-npu test files here
+    ],
+}
+
+SUITES.update(suites_ascend)
+STRICT_SUITES = {"unit"}
 
 
 def parse_args():
@@ -46,7 +87,7 @@ def parse_args():
         type=str,
         required=True,
         choices=list(SUITES.keys()),
-        help="The test suite to run (e.g., 1-gpu, 2-gpu)",
+        help="The test suite to run (valid names are defined in SUITES)",
     )
     parser.add_argument(
         "--partition-id",
@@ -133,12 +174,14 @@ def collect_test_items(files, filter_expr=None):
     return test_items
 
 
-def run_pytest(files, filter_expr=None):
+def run_pytest(files, filter_expr=None, exitfirst=False):
     if not files:
         print("No files to run.")
         return 0
 
     base_cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
+    if exitfirst:
+        base_cmd.append("-x")
 
     # Add pytest -k filter if provided
     if filter_expr:
@@ -201,7 +244,9 @@ def run_pytest(files, filter_expr=None):
         )
 
         is_flaky_ci_assertion = (
-            "SafetensorError" in full_output or "FileNotFoundError" in full_output
+            "SafetensorError" in full_output
+            or "FileNotFoundError" in full_output
+            or "TimeoutError" in full_output
         )
 
         is_oom_error = (
@@ -214,6 +259,27 @@ def run_pytest(files, filter_expr=None):
 
     print(f"Max retry exceeded")
     return returncode
+
+
+def _is_in_ci() -> bool:
+    return os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("1", "true", "yes", "on")
+
+
+def _maybe_pin_update_weights_model_pair(suite_files_rel: list[str]) -> None:
+    if not _is_in_ci():
+        return
+    if _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE not in suite_files_rel:
+        return
+    if os.environ.get(_UPDATE_WEIGHTS_MODEL_PAIR_ENV):
+        print(
+            f"Using preset {_UPDATE_WEIGHTS_MODEL_PAIR_ENV}="
+            f"{os.environ[_UPDATE_WEIGHTS_MODEL_PAIR_ENV]}"
+        )
+        return
+
+    selected_pair = random.choice(_UPDATE_WEIGHTS_MODEL_PAIR_IDS)
+    os.environ[_UPDATE_WEIGHTS_MODEL_PAIR_ENV] = selected_pair
+    print(f"Selected {_UPDATE_WEIGHTS_MODEL_PAIR_ENV}={selected_pair} for this CI run")
 
 
 def main():
@@ -230,18 +296,23 @@ def main():
 
     # 2. get files from suite
     suite_files_rel = SUITES[args.suite]
+    _maybe_pin_update_weights_model_pair(suite_files_rel)
 
     suite_files_abs = []
     for f_rel in suite_files_rel:
         f_abs = target_dir / f_rel
         if not f_abs.exists():
-            print(f"Warning: Test file {f_rel} not found in {target_dir}. Skipping.")
+            msg = f"Test file {f_rel} not found in {target_dir}."
+            if args.suite in STRICT_SUITES:
+                print(f"Error: {msg}")
+                sys.exit(1)
+            print(f"Warning: {msg} Skipping.")
             continue
         suite_files_abs.append(str(f_abs))
 
     if not suite_files_abs:
         print(f"No valid test files found for suite '{args.suite}'.")
-        sys.exit(0)
+        sys.exit(1 if args.suite in STRICT_SUITES else 0)
 
     # 3. collect all test items and partition by items (not files)
     all_test_items = collect_test_items(suite_files_abs, filter_expr=args.filter)
@@ -280,7 +351,8 @@ def main():
     print(f"Running {len(my_items)} items in this shard: {', '.join(my_items)}")
 
     # 4. execute with the specific test items
-    exit_code = run_pytest(my_items)
+    # Fast-fail: stop on first failure unless --continue-on-error is set
+    exit_code = run_pytest(my_items, exitfirst=not args.continue_on_error)
 
     # Print tests again at the end for visibility
     msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"

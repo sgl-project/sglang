@@ -46,7 +46,6 @@ class LoRALayer(nn.Module):
 
 
 class LoRAAdapter(nn.Module):
-
     def __init__(
         self,
         uid: str,
@@ -102,13 +101,24 @@ class LoRAAdapter(nn.Module):
             self.config.target_modules
         )
 
+        # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
+        # recognized and loaded into the correct buffer.
+        if "unembed_tokens" in name:
+            name = name.replace("unembed_tokens", "lm_head")
+
         layer_id = get_layer_id(name)
         if layer_id is not None:
             self.layers[layer_id].weights[name] = loaded_weight.cpu()
         elif "embed_tokens" in name or "lm_head" in name:
-            # Check if this module is declared in target_modules before loading
+            # Check if this module is declared in target_modules before loading.
+            # When normalized_target_modules is {"all"} (e.g. target_modules was
+            # "all-linear"), we allow loading since the server-level
+            # --lora-target-modules will govern which modules are active.
             module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
-            if module_name in normalized_target_modules:
+            if (
+                "all" in normalized_target_modules
+                or module_name in normalized_target_modules
+            ):
                 self.embedding_layers[name] = loaded_weight.cpu()
             else:
                 logger.debug(
@@ -118,8 +128,8 @@ class LoRAAdapter(nn.Module):
             # added/extra token emb
             self.added_tokens_embeddings[name] = loaded_weight.cpu()
             assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
-                f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
-                f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+                f"LoRA adapter {self.uid} has lora_added_tokens_size {self.config.lora_added_tokens_size} specified in the config, "
+                f"but the loaded weight '{name}' has shape {loaded_weight.shape[0]} in first dimension"
             )
 
     def _normalize_weights(self):
@@ -127,6 +137,8 @@ class LoRAAdapter(nn.Module):
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
+            self._rename_expert_w_to_proj(layer.weights)
+            weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
 
     def normalize_qkv_proj(
@@ -182,6 +194,23 @@ class LoRAAdapter(nn.Module):
                     weights[qkv_name] = weights[qkv_name].repeat(3, 1)
                 # else: no-op as LoRA B weight is already stacked.
 
+    def _rename_expert_w_to_proj(self, weights: Dict[str, torch.Tensor]):
+        """Rename w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj so that
+        normalize_gate_up_proj can stack them into gate_up_proj."""
+        renames = {}
+        for name in list(weights.keys()):
+            new_name = name
+            if ".w1." in name:
+                new_name = name.replace(".w1.", ".gate_proj.")
+            elif ".w3." in name:
+                new_name = name.replace(".w3.", ".up_proj.")
+            elif ".w2." in name:
+                new_name = name.replace(".w2.", ".down_proj.")
+            if new_name != name:
+                renames[name] = new_name
+        for old_name, new_name in renames.items():
+            weights[new_name] = weights.pop(old_name)
+
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
@@ -196,8 +225,9 @@ class LoRAAdapter(nn.Module):
                         f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
                         f"or consider implementing custom initialization logic for other backends."
                     )
+                cat_dim = weights[weight_name].dim() - 2
                 weights[gate_up_name] = torch.cat(
-                    (weights[weight_name], weights[up_name]), 0
+                    (weights[weight_name], weights[up_name]), cat_dim
                 )
                 weights.pop(weight_name)
                 if up_name in weights:
@@ -206,7 +236,10 @@ class LoRAAdapter(nn.Module):
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
                 gate_up_name = weight_name
                 if "lora_A" in weight_name:
-                    weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                    ndim = weights[gate_up_name].dim()
+                    repeat_dims = [1] * ndim
+                    repeat_dims[ndim - 2] = 2
+                    weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
                 # else: no-op as LoRA B weight is already stacked.
 
     def pin_weights_in_cpu(self):

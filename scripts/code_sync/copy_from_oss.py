@@ -31,43 +31,17 @@ import datetime
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 
-# --- Configuration Begin ---
-# List of folders and files to copy from the OSS repo.
-# Changes outside these paths will be ignored.
-folder_names = [
-    "3rdparty",
-    "assets",
-    "benchmark",
-    "docker",
-    "docs",
-    "examples",
-    "python/sglang/lang",
-    "python/sglang/jit_kernel",
-    "python/sglang/srt",
-    "python/sglang/test",
-    "python/sglang/utils.py",
-    "python/sglang/README.md",
-    "sgl-kernel",
-    "test/manual",
-    "test/registered",
-    "test/srt",
-    "test/README.md",
-    "test/run_suite.py",
-    "README.md",
-]
+# Allow sibling imports regardless of the working directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from utils import FOLDER_NAMES, write_github_step_summary  # noqa: E402
+
+# --- Configuration Begin ---
 private_repo = "your-org/sglang-private-repo"
 # --- Configuration End ---
-
-
-def write_github_step_summary(content):
-    if not os.environ.get("GITHUB_STEP_SUMMARY"):
-        return
-
-    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-        f.write(content)
 
 
 def check_dependencies():
@@ -145,10 +119,10 @@ def get_source_folder(args):
     return oss_root, temp_dir, commit_hash
 
 
-def sync_directories(oss_root, folder_names, dry_run):
+def sync_directories(oss_root, sync_paths, dry_run):
     """Sync specified directories from oss_root to current working directory."""
     rsync_commands = []
-    for folder_name in folder_names:
+    for folder_name in sync_paths:
         target_name = f"{oss_root}/{folder_name}"
         src_name = "./" + "/".join(folder_name.split("/")[:-1])
         cmd = f"rsync -r --delete {target_name} {src_name}"
@@ -259,7 +233,7 @@ def main():
 
     try:
         # Sync directories
-        sync_directories(oss_root, folder_names, args.dry_run)
+        sync_directories(oss_root, FOLDER_NAMES, args.dry_run)
 
         # Check for changes and create PR if necessary
         if not check_for_changes():

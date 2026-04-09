@@ -7,63 +7,14 @@ import tabulate
 from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
+# NOTE: per-commit-4-gpu, per-commit-8-gpu-h200, per-commit-8-gpu-h20, per-commit-4-gpu-b200,
+# per-commit-4-gpu-gb200, per-commit-4-gpu-deepep, and per-commit-8-gpu-h200-deepep suites
+# have been migrated to stage-c suites in test/registered/ using the CI registry system.
 suites = {
-    "per-commit-4-gpu": [
-        TestFile("models/test_qwen3_next_models.py", 350),
-        TestFile("models/test_qwen3_next_models_mtp.py", 500),
-        TestFile("test_gpt_oss_4gpu.py", 300),
-        TestFile("test_multi_instance_release_memory_occupation.py", 64),
-        TestFile("test_pp_single_node.py", 500),
-        TestFile("test_epd_disaggregation.py", 150),
-    ],
-    "per-commit-8-gpu-h200": [
-        TestFile("test_deepseek_v3_basic.py", 275),
-        TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_hybrid_attention.py", 400),
-        TestFile("models/test_kimi_k2_models.py", 200),
-        TestFile("test_deepseek_v32_basic.py", 360),
-        TestFile("test_deepseek_v32_mtp.py", 360),
-        TestFile("models/test_mimo_models.py", 200),
-    ],
-    "per-commit-8-gpu-h20": [
-        TestFile("quant/test_w4a8_deepseek_v3.py", 520),
-        TestFile("test_disaggregation_different_tp.py", 600),
-        TestFile("test_disaggregation_pp.py", 180),
-        TestFile("test_disaggregation_dp_attention.py", 155),
-    ],
-    "per-commit-4-gpu-b200": [
-        TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
-        TestFile("test_fp8_blockwise_gemm.py", 280),
-        TestFile("test_gpt_oss_4gpu.py", 300),
-        TestFile("test_nvfp4_gemm.py", 360),
-        TestFile("test_deepseek_v32_fp4_4gpu.py", 600),
-    ],
-    # "per-commit-8-gpu-b200": [
-    #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
-    # ],
-    "per-commit-4-gpu-gb200": [
-        TestFile("test_deepseek_v3_cutedsl_4gpu.py", 1800),
-        TestFile("test_disaggregation_aarch64.py", 300),
-    ],
-    "per-commit-4-gpu-deepep": [
-        TestFile("ep/test_deepep_small.py", 531),
-        TestFile("ep/test_mooncake_ep_small.py", 660),
-    ],
-    "per-commit-8-gpu-h200-deepep": [
-        TestFile("ep/test_deepep_large.py", 563),
-    ],
     # quantization_test suite migrated to test/registered/quant/
+    # All CUDA tests migrated to test/registered/
     "__not_in_ci__": [
-        TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
-        TestFile("models/test_dummy_grok_models.py"),
-        TestFile("test_profile_v2.py"),
-        TestFile("models/test_ministral3_models.py"),
-        TestFile("test_mistral_large3_basic.py"),
-        TestFile("test_prefill_delayer.py"),
-        TestFile("test_fla_layernorm_guard.py"),
-        TestFile(
-            "models/test_qwen3_next_models_pcg.py"
-        ),  # Disabled: intermittent failures, see #17039
+        TestFile("ascend/test_embed_interpolate_unittest.py"),
     ],
 }
 
@@ -88,9 +39,8 @@ suite_amd = {
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         # The time estimation for `test_int4fp8_moe.py` assumes `mistralai/Mixtral-8x7B-Instruct-v0.1` is already cached (running on 1xMI300X).
     ],
-    "per-commit-4-gpu-amd": [
-        TestFile("test_pp_single_node.py", 150),
-    ],
+    # per-commit-4-gpu-amd migrated to test/registered/distributed/ using the CI registry system
+    "per-commit-4-gpu-amd": [],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
     # by test/run_suite.py using the registry system.
@@ -101,10 +51,12 @@ suite_xeon = {
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
         TestFile("cpu/test_binding.py"),
+        TestFile("cpu/test_bmm.py"),
         TestFile("cpu/test_causal_conv1d.py"),
         TestFile("cpu/test_cpu_graph.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
+        TestFile("cpu/test_flash_attn.py"),
         TestFile("cpu/test_gemm.py"),
         TestFile("cpu/test_intel_amx_attention_backend_a.py"),
         TestFile("cpu/test_intel_amx_attention_backend_b.py"),
@@ -122,47 +74,18 @@ suite_xeon = {
 }
 
 # Add Intel XPU tests
+# NOTE: please sort the test cases alphabetically by the test file name
 suite_xpu = {
     "per-commit-xpu": [
+        TestFile("xpu/test_deepseek_ocr.py", 360),
+        TestFile("xpu/test_deepseek_ocr_triton.py", 360),
+        # TestFile("xpu/test_internvl.py"),
         TestFile("xpu/test_intel_xpu_backend.py"),
-    ],
-}
-
-# Add Ascend NPU tests
-# TODO: Set accurate estimate time
-# NOTE: please sort the test cases alphabetically by the test file name
-suite_ascend = {
-    "per-commit-1-npu-a2": [
-        TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
-        TestFile("ascend/test_ascend_hicache_mha.py", 400),
-        TestFile("ascend/test_ascend_sampling_backend.py", 400),
-        TestFile("ascend/test_ascend_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
-        TestFile("test_embed_interpolate_unittest.py", 400),
-    ],
-    "per-commit-2-npu-a2": [
-        TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
-    ],
-    "per-commit-4-npu-a2": [
-        TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_hicache_mla.py", 400),
-        TestFile("ascend/test_ascend_tp4_bf16.py", 400),
-    ],
-    "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 3600),
-        # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
-        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
 }
 
 suites.update(suite_amd)
 suites.update(suite_xeon)
-suites.update(suite_ascend)
 suites.update(suite_xpu)
 
 
@@ -370,4 +293,9 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATION NOTICE: The folder `test/srt` should be deprecated as soon as possible. "
+        "Migrate tests to the new CI registry system described in `test/README.md`.",
+        flush=True,
+    )
     main()

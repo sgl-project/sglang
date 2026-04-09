@@ -30,6 +30,8 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
+    MoriEPDispatcher,
+    NixlEPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -415,8 +417,10 @@ class TboDPAttentionPreparer:
         return local_can_run_tbo, local_forward_mode
 
     def compute_output(self, partial_global_info):
-        local_can_run_tbo_aggregated = min(partial_global_info[:, 0].tolist())
-        forward_modes = partial_global_info[:, 1].tolist()
+        # Perform only one Device-to-Host (D2H) memory copy
+        cpu_data = partial_global_info[:, :2].cpu()
+        local_can_run_tbo_aggregated = min(cpu_data[:, 0].tolist())
+        forward_modes = cpu_data[:, 1].tolist()
 
         global_forward_mode, forward_mode_agree = self._compute_global_forward_mode(
             forward_modes
@@ -440,18 +444,23 @@ class TboDPAttentionPreparer:
 
     @staticmethod
     def _compute_global_forward_mode(forward_modes):
-        forward_modes_excluding_idle = [
-            x for x in forward_modes if x != ForwardMode.IDLE.value
+        forward_modes_excluding_idle_and_prebuilt = [
+            x
+            for x in forward_modes
+            if x != ForwardMode.IDLE.value and x != ForwardMode.PREBUILT.value
         ]
 
-        if not forward_modes_excluding_idle:
+        if not forward_modes_excluding_idle_and_prebuilt:
             return ForwardMode.IDLE, False
 
         forward_mode_agree = TboDPAttentionPreparer._is_all_same(
-            forward_modes_excluding_idle
+            forward_modes_excluding_idle_and_prebuilt
         )
+
         global_forward_mode = (
-            ForwardMode(forward_modes_excluding_idle[0]) if forward_mode_agree else None
+            ForwardMode(forward_modes_excluding_idle_and_prebuilt[0])
+            if forward_mode_agree
+            else None
         )
         return global_forward_mode, forward_mode_agree
 
@@ -647,6 +656,7 @@ class TboForwardBatchPreparer:
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
             "lora_ids",
+            "rids",
         ]:
             old_value = getattr(batch, key)
             if old_value is None:
@@ -678,6 +688,7 @@ class TboForwardBatchPreparer:
         for key in [
             "forward_mode",
             "is_extend_in_batch",
+            "all_extend_in_batch",
             "return_logprob",
             "req_to_token_pool",
             "token_to_kv_pool",
@@ -1021,6 +1032,15 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [
                 MooncakeEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_mori():
+            self._inners = [
+                MoriEPDispatcher(instance_id=i, **kwargs)
+                for i in range(num_inner_dispatchers)
+            ]
+        elif get_moe_a2a_backend().is_nixl():
+            self._inners = [
+                NixlEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
             ]
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):

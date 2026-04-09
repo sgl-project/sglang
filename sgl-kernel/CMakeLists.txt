@@ -56,7 +56,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        54f99a8af537b3c6eb4819b69907ccbe2b600792
+    GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -92,7 +92,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        f866ec34002250e74c8bbcbcffa0e1ae71300b2d
+    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
@@ -105,15 +105,6 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-mscclpp)
-
-# fast-hadamard-transform
-FetchContent_Declare(
-    repo-fast-hadamard-transform
-    GIT_REPOSITORY https://github.com/sgl-project/fast-hadamard-transform.git
-    GIT_TAG 48f3c13764dc2ec662ade842a4696a90a137f1bc
-    GIT_SHALLOW OFF
-)
-FetchContent_Populate(repo-fast-hadamard-transform)
 
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
@@ -269,20 +260,16 @@ endif()
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/allreduce/mscclpp_allreduce.cu"
-    "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
     "csrc/elementwise/activation.cu"
-    "csrc/elementwise/cast.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
-    "csrc/elementwise/rope.cu"
     "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
-    "csrc/sgl_diffusion/elementwise/timestep_embedding.cu"
     "csrc/expert_specialization/es_fp8_blockwise.cu"
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
     "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
@@ -296,32 +283,21 @@ set(SOURCES
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
-    "csrc/gemm/nvfp4_expert_quant.cu"
-    "csrc/gemm/nvfp4_quant_entry.cu"
-    "csrc/gemm/nvfp4_quant_kernels.cu"
-    "csrc/gemm/nvfp4_scaled_mm_entry.cu"
-    "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
-    "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_group_quant_8bit_v2.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
     "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
-    "csrc/gemm/marlin/gptq_marlin.cu"
-    "csrc/gemm/marlin/gptq_marlin_repack.cu"
-    "csrc/gemm/marlin/awq_marlin_repack.cu"
     "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
     "csrc/kvcacheio/transfer.cu"
     "csrc/mamba/causal_conv1d.cu"
-    "csrc/memory/store.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
-    "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/fused_qknorm_rope_kernel.cu"
@@ -330,7 +306,6 @@ set(SOURCES
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/moe_topk_sigmoid_kernels.cu"
-    "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
@@ -342,10 +317,6 @@ set(SOURCES
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
-    "${repo-flashinfer_SOURCE_DIR}/csrc/sampling.cu"
-
-    "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform_cuda.cu"
-    "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform.cpp"
 
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
     "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
@@ -457,6 +428,8 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-DCUTLASS_TEST_LEVEL=0"
         "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90"  # For PDL
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"  # Necessary for the WGMMA shapes that we use
         "--expt-relaxed-constexpr"
         "--expt-extended-lambda"
         "--use_fast_math"
@@ -475,21 +448,21 @@ if (SGL_KERNEL_ENABLE_FA3)
     endif()
 
     file(GLOB FA3_BF16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_bf16*_sm90.cu")
     file(GLOB FA3_BF16_GEN_SRCS_
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
     list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
 
-    # FP16 source files
+    # FP16 source files - use individual hdim files instead of hdimall to avoid ptxas crash
     file(GLOB FA3_FP16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_fp16*_sm90.cu")
     file(GLOB FA3_FP16_GEN_SRCS_
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
     list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
 
     # FP8 source files
     file(GLOB FA3_FP8_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
+        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_e4m3*_sm90.cu")
     file(GLOB FA3_FP8_GEN_SRCS_
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
@@ -592,44 +565,3 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
-
-# ============================ Extra Install: FA4 ============================= #
-# TODO: find a better install condition.
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-
-    set(FLASH_ATTN_CUTE_SRC "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute")
-    set(FLASH_ATTN_CUTE_DST "${CMAKE_CURRENT_BINARY_DIR}/flash_attn_origin/cute")
-
-    file(MAKE_DIRECTORY "${FLASH_ATTN_CUTE_DST}")
-
-    file(COPY "${FLASH_ATTN_CUTE_SRC}/"
-         DESTINATION "${FLASH_ATTN_CUTE_DST}"
-         PATTERN ".git*" EXCLUDE
-         PATTERN "__pycache__" EXCLUDE)
-
-    file(GLOB_RECURSE FLASH_ATTN_CUTE_DST_PY
-         "${FLASH_ATTN_CUTE_DST}/*.py")
-
-    foreach(FILE_PATH IN LISTS FLASH_ATTN_CUTE_DST_PY)
-        file(READ "${FILE_PATH}" FILE_CONTENT)
-
-        set(MODIFIED_CONTENT "${FILE_CONTENT}")
-
-        # The main goal is to avoid using "flash_attn" so that other libraries (such as transformers) do not mistakenly assume that "flash_attn" is already installed.
-
-        string(REPLACE "flash_attn.cute"
-                       "flash_attn_origin.cute"
-                       MODIFIED_CONTENT "${MODIFIED_CONTENT}")
-
-        if (NOT FILE_CONTENT STREQUAL MODIFIED_CONTENT)
-            file(WRITE "${FILE_PATH}" "${MODIFIED_CONTENT}")
-            message(STATUS "  - [FA4 Patch] Patched: ${FILE_PATH}")
-        endif()
-    endforeach()
-
-    install(DIRECTORY "${FLASH_ATTN_CUTE_DST}/"
-            DESTINATION "flash_attn_origin/cute"
-            PATTERN ".git*" EXCLUDE
-            PATTERN "__pycache__" EXCLUDE)
-
-endif()

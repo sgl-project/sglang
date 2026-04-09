@@ -4,9 +4,12 @@
 """
 Latent preparation stage for diffusion pipelines.
 """
+
 from diffusers.utils.torch_utils import randn_tensor
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -34,6 +37,15 @@ class LatentPreparationStage(PipelineStage):
         self.scheduler = scheduler
         self.transformer = transformer
 
+    def _get_latent_dtype(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ):
+        return server_args.pipeline_config.get_latent_dtype(
+            batch.prompt_embeds[0].dtype
+        )
+
     def forward(
         self,
         batch: Req,
@@ -48,15 +60,13 @@ class LatentPreparationStage(PipelineStage):
             The batch with prepared latent variables.
         """
 
-        latent_num_frames = None
         # Adjust video length based on VAE version if needed
-        if hasattr(self, "adjust_video_length"):
-            latent_num_frames = self.adjust_video_length(batch, server_args)
+        latent_num_frames = self.adjust_video_length(batch, server_args)
 
         batch_size = batch.batch_size
 
         # Get required parameters
-        dtype = batch.prompt_embeds[0].dtype
+        dtype = self._get_latent_dtype(batch, server_args)
         device = get_local_torch_device()
         generator = batch.generator
         latents = batch.latents
@@ -108,14 +118,10 @@ class LatentPreparationStage(PipelineStage):
     def adjust_video_length(self, batch: Req, server_args: ServerArgs) -> int:
         """
         Adjust video length based on VAE version.
-
-
-
-        Returns:
-            The batch with adjusted video length.
         """
 
         video_length = batch.num_frames
+        latent_num_frames = video_length
         use_temporal_scaling_frames = (
             server_args.pipeline_config.vae_config.use_temporal_scaling_frames
         )

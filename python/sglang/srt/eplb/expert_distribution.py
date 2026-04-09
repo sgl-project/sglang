@@ -29,8 +29,8 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
-from sglang.srt.metrics.collector import ExpertDispatchCollector
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.observability.metrics_collector import ExpertDispatchCollector
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable, get_int_env_var
 

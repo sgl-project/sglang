@@ -4,7 +4,7 @@ from typing import Any, Callable, List, Tuple, Type
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.utils import TypeBasedDispatcher
 
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TypeBasedDispatcherList:
@@ -198,17 +198,17 @@ def test_edge_case():
     assert result1 == result2
     print("Pass for normal test")
 
-    class UnkownType:
+    class UnknownType:
         pass
 
     try:
-        list_dispatcher(UnkownType())
+        list_dispatcher(UnknownType())
         print("exception was thrown from list version as expected")
     except ValueError:
         print("exception thrown from list version was processed...")
 
     try:
-        dict_dispatcher(UnkownType())
+        dict_dispatcher(UnknownType())
         print("exception was thrown from dict version as expected")
     except ValueError:
         print("exception thrown from dict version was processed...")

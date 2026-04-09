@@ -24,12 +24,14 @@ from sglang.test.test_utils import CustomTestCase
 # ==============================================================================
 
 
-register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=132, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=103, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=132, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
 
 MODELS = [
     ("LxzGordon/URM-LLaMa-3.1-8B", 1, 4e-2),
     ("Skywork/Skywork-Reward-Llama-3.1-8B-v0.2", 1, 4e-2),
+    # Qwen3-based reward model (uses Qwen3ForSequenceClassification)
+    ("Skywork/Skywork-Reward-V2-Qwen3-0.6B", 1, 1.5e-1),
 ]
 TORCH_DTYPES = [torch.float16]
 

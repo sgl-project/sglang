@@ -6,13 +6,15 @@
 #include "utils.h"
 
 static constexpr int kWarpSize = 32;
+static constexpr int DEFAULT_SHARED_MEM_THRESHOLD_KB = 48;  // Default shared memory quota in KB
 
 // ---------------------------------------------------------------------------
-// 1. Warp‑local, no shared memory
+// 1. Warp‑local with configurable shared memory
 //    • One warp handles one token.
 //    • Eight tokens per 256‑thread CTA.
+//    • Shared memory usage is configurable via template parameter.
 // ---------------------------------------------------------------------------
-template <typename T, typename DST_DTYPE, int kTokensPerCTA = 8, int kVecSize = 16>
+template <typename T, typename DST_DTYPE, int kTokensPerCTA = 8, int kVecSize = 16, bool USE_SMEM = true>
 __global__ void per_token_quant_fp8_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
@@ -29,8 +31,14 @@ __global__ void per_token_quant_fp8_kernel(
   DST_DTYPE* token_output = output_q + token_id * hidden_dim;
   float* token_scale = output_s + token_id;
 
+  extern __shared__ char smem_buffer[];
+  const int smem_padding = 32;  // Pad to bank boundary (32 banks * 4 bytes = 128 bytes)
+  const int warp_smem_stride = (hidden_dim * sizeof(T) + smem_padding - 1) / smem_padding * smem_padding;
+  const int warp_smem_offset = warp_id * warp_smem_stride;
+  T* shared_input = reinterpret_cast<T*>(smem_buffer + warp_smem_offset);
+
   //
-  // Pass-1: Perform a warp reduce to find the max_value of a token's hidden_dim
+  // Pass-1: Load data and compute max_value
   //
   float max_value = 0.f;
   using vec_t = flashinfer::vec_t<T, kVecSize>;
@@ -40,10 +48,24 @@ __global__ void per_token_quant_fp8_kernel(
     vec_t input_vec;
     input_vec.cast_load(token_input + i * kVecSize);
 
+    // Store to shared memory if USE_SMEM=true
+    if constexpr (USE_SMEM) {
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        shared_input[i * kVecSize + j] = input_vec[j];
+      }
+    }
+
+    // Compute max value in parallel
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
       max_value = fmaxf(max_value, fabsf(static_cast<float>(input_vec[j])));
     }
+  }
+
+  // Ensure all threads in the warp have finished writing to shared memory
+  if constexpr (USE_SMEM) {
+    __syncwarp();
   }
 
   float warp_max = warpReduceMax(max_value);
@@ -58,11 +80,22 @@ __global__ void per_token_quant_fp8_kernel(
   const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
 
   //
-  // Pass-2: quantize and write back
+  // Pass-2: Quantize and write back
   //
   for (int i = lane_id; i < num_vec_elems; i += kWarpSize) {
     vec_t input_vec;
-    input_vec.cast_load(token_input + i * kVecSize);
+
+    if constexpr (USE_SMEM) {
+      // Load from shared memory
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        input_vec[j] = shared_input[i * kVecSize + j];
+      }
+    } else {
+      // Reload from global memory
+      input_vec.cast_load(token_input + i * kVecSize);
+    }
+
     DST_DTYPE output_arr[kVecSize];
 #pragma unroll
     for (uint32_t j = 0; j < kVecSize; ++j) {
@@ -164,6 +197,48 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   }
 }
 
+template <bool USE_SMEM, typename scalar_t, int TOKENS_PER_CTA>
+static inline void launch_per_token_quant_fp8_warp_kernel(
+    const dim3& grid,
+    const dim3& block,
+    size_t dynamicSmemSz,
+    cudaStream_t stream,
+    bool use_vec16,
+    bool use_vec8,
+    torch::Tensor input,
+    torch::Tensor output_q,
+    torch::Tensor output_s,
+    const int64_t hidden_dim,
+    const int64_t num_tokens) {
+  const size_t smem_size = USE_SMEM ? dynamicSmemSz : 0;
+
+  if (use_vec16) {
+    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16, USE_SMEM>
+        <<<grid, block, smem_size, stream>>>(
+            static_cast<const scalar_t*>(input.data_ptr()),
+            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<float*>(output_s.data_ptr()),
+            hidden_dim,
+            num_tokens);
+  } else if (use_vec8) {
+    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8, USE_SMEM>
+        <<<grid, block, smem_size, stream>>>(
+            static_cast<const scalar_t*>(input.data_ptr()),
+            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<float*>(output_s.data_ptr()),
+            hidden_dim,
+            num_tokens);
+  } else {
+    per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4, USE_SMEM>
+        <<<grid, block, smem_size, stream>>>(
+            static_cast<const scalar_t*>(input.data_ptr()),
+            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<float*>(output_s.data_ptr()),
+            hidden_dim,
+            num_tokens);
+  }
+}
+
 void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
@@ -180,34 +255,30 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   const bool use_vec16 = (hidden_dim % 16 == 0);
   const bool use_vec8 = (hidden_dim % 8 == 0);
 
+  const int sizeof_T = input.scalar_type() == torch::kFloat16 ? 2 : (input.scalar_type() == torch::kBFloat16 ? 2 : 4);
+  const int smem_padding = 32;  // Pad to bank boundary to avoid conflicts
+  const int warp_smem_stride = (hidden_dim * sizeof_T + smem_padding - 1) / smem_padding * smem_padding;
+  const size_t dynamicSmemSz = warp_smem_stride * TOKENS_PER_CTA;
+
+  bool use_smem = (hidden_dim < 2048);
+
+  if (dynamicSmemSz >= DEFAULT_SHARED_MEM_THRESHOLD_KB) {
+    use_smem = false;  // Disable shared memory if >= 48KB to avoid allocation failures
+  }
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
     if (use_warp_kernel) {
       // -------- warp‑local ---------------------------------------------------
-      constexpr int THREADS = TOKENS_PER_CTA * kWarpSize;  // 256
+      constexpr int THREADS = TOKENS_PER_CTA * kWarpSize;
       dim3 grid((num_tokens + TOKENS_PER_CTA - 1) / TOKENS_PER_CTA);
       dim3 block(THREADS);
 
-      if (use_vec16) {
-        per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 16><<<grid, block, 0, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
-            hidden_dim,
-            num_tokens);
-      } else if (use_vec8) {
-        per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8><<<grid, block, 0, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
-            hidden_dim,
-            num_tokens);
+      if (use_smem) {
+        launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/true, scalar_t, TOKENS_PER_CTA>(
+            grid, block, dynamicSmemSz, stream, use_vec16, use_vec8, input, output_q, output_s, hidden_dim, num_tokens);
       } else {
-        per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4><<<grid, block, 0, stream>>>(
-            static_cast<const scalar_t*>(input.data_ptr()),
-            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
-            static_cast<float*>(output_s.data_ptr()),
-            hidden_dim,
-            num_tokens);
+        launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/false, scalar_t, TOKENS_PER_CTA>(
+            grid, block, dynamicSmemSz, stream, use_vec16, use_vec8, input, output_q, output_s, hidden_dim, num_tokens);
       }
     } else {
       // -------- baseline -----------------------------------------------------

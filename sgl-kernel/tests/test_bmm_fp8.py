@@ -1,5 +1,7 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/tests/test_bmm_fp8.py
 
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -40,4 +42,4 @@ def test_bmm_fp8(input_dtype, mat2_dtype, res_dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

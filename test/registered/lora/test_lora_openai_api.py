@@ -142,44 +142,6 @@ class TestResolveLoraPath(unittest.TestCase):
         self.assertEqual(result, "adapter-name")
 
 
-class TestValidateLoraEnabled(unittest.TestCase):
-    """Test _validate_lora_enabled method."""
-
-    def test_validation_passes_when_lora_enabled(self):
-        """Test validation passes when LoRA is enabled."""
-        tokenizer_manager = MockTokenizerManager(enable_lora=True)
-        serving = ConcreteServingBase(tokenizer_manager)
-
-        # Should not raise
-        try:
-            serving._validate_lora_enabled("sql-expert")
-        except ValueError:
-            self.fail("_validate_lora_enabled raised ValueError unexpectedly")
-
-    def test_validation_fails_when_lora_disabled(self):
-        """Test validation fails with helpful message when LoRA is disabled."""
-        tokenizer_manager = MockTokenizerManager(enable_lora=False)
-        serving = ConcreteServingBase(tokenizer_manager)
-
-        with self.assertRaises(ValueError) as context:
-            serving._validate_lora_enabled("sql-expert")
-
-        error_message = str(context.exception)
-        self.assertIn("sql-expert", error_message)
-        self.assertIn("--enable-lora", error_message)
-        self.assertIn("not enabled", error_message)
-
-    def test_validation_error_mentions_adapter_name(self):
-        """Test that error message includes the requested adapter name."""
-        tokenizer_manager = MockTokenizerManager(enable_lora=False)
-        serving = ConcreteServingBase(tokenizer_manager)
-
-        with self.assertRaises(ValueError) as context:
-            serving._validate_lora_enabled("my-custom-adapter")
-
-        self.assertIn("my-custom-adapter", str(context.exception))
-
-
 class TestIntegrationScenarios(unittest.TestCase):
     """Integration tests for common usage scenarios."""
 
@@ -196,9 +158,6 @@ class TestIntegrationScenarios(unittest.TestCase):
         lora_path = self.serving._resolve_lora_path(model, explicit_lora)
         self.assertEqual(lora_path, "sql-expert")
 
-        # Validation should pass
-        self.serving._validate_lora_enabled(lora_path)
-
     def test_backward_compatible_usage(self):
         """Test backward-compatible usage with explicit lora_path."""
         model = "meta-llama/Llama-3.1-8B"
@@ -206,9 +165,6 @@ class TestIntegrationScenarios(unittest.TestCase):
 
         lora_path = self.serving._resolve_lora_path(model, explicit_lora)
         self.assertEqual(lora_path, "sql-expert")
-
-        # Validation should pass
-        self.serving._validate_lora_enabled(lora_path)
 
     def test_base_model_usage(self):
         """Test using base model without any adapter."""
@@ -228,10 +184,6 @@ class TestIntegrationScenarios(unittest.TestCase):
         lora_path = self.serving._resolve_lora_path(model, explicit_lora)
         self.assertEqual(lora_path, explicit_lora)
 
-        # Validate first adapter in list
-        if isinstance(lora_path, list) and lora_path[0]:
-            self.serving._validate_lora_enabled(lora_path[0])
-
     def test_adapter_in_model_overrides_batch_list(self):
         """Test that adapter in model parameter overrides batch list."""
         model = "meta-llama/Llama-3.1-8B:preferred-adapter"
@@ -239,24 +191,6 @@ class TestIntegrationScenarios(unittest.TestCase):
 
         lora_path = self.serving._resolve_lora_path(model, explicit_lora)
         self.assertEqual(lora_path, "preferred-adapter")
-
-    def test_error_when_lora_not_enabled(self):
-        """Test comprehensive error flow when LoRA is not enabled."""
-        # Setup server without LoRA enabled
-        tokenizer_manager = MockTokenizerManager(enable_lora=False)
-        serving = ConcreteServingBase(tokenizer_manager)
-
-        # User tries to use adapter
-        model = "meta-llama/Llama-3.1-8B:sql-expert"
-        lora_path = serving._resolve_lora_path(model, None)
-
-        # Should get helpful error
-        with self.assertRaises(ValueError) as context:
-            serving._validate_lora_enabled(lora_path)
-
-        error = str(context.exception)
-        self.assertIn("--enable-lora", error)
-        self.assertIn("sql-expert", error)
 
 
 class TestEdgeCases(unittest.TestCase):
@@ -317,14 +251,6 @@ class TestEdgeCases(unittest.TestCase):
         """Test empty string as explicit lora_path."""
         result = self.serving._resolve_lora_path("model-name", "")
         self.assertEqual(result, "")
-
-    def test_validation_with_empty_adapter_name(self):
-        """Test validation with empty adapter name still raises error."""
-        tokenizer_manager = MockTokenizerManager(enable_lora=False)
-        serving = ConcreteServingBase(tokenizer_manager)
-
-        with self.assertRaises(ValueError):
-            serving._validate_lora_enabled("")
 
 
 if __name__ == "__main__":

@@ -84,7 +84,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--tokenizer-mode` | Tokenizer mode. 'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer. | `auto` | `auto`, `slow` |
 | `--tokenizer-worker-num` | The worker num of the tokenizer manager. | `1` | Type: int |
 | `--skip-tokenizer-init` | If set, skip init tokenizer and pass input_ids in generate request. | `False` | bool flag (set to enable) |
-| `--load-format` | The format of the model weights to load. "auto" will try to load the weights in the safetensors format and fall back to the pytorch bin format if safetensors format is not available. "pt" will load the weights in the pytorch bin format. "safetensors" will load the weights in the safetensors format. "npcache" will load the weights in pytorch format and store a numpy cache to speed up the loading. "dummy" will initialize the weights with random values, which is mainly for profiling."gguf" will load the weights in the gguf format. "bitsandbytes" will load the weights using bitsandbytes quantization."layered" loads weights layer by layer so that one can quantize a layer before loading another to make the peak memory envelope smaller. "flash_rl" will load the weights in flash_rl format. "fastsafetensors" and "private" are also supported. | `auto` | `auto`, `pt`, `safetensors`, `npcache`, `dummy`, `sharded_state`, `gguf`, `bitsandbytes`, `layered`, `flash_rl`, `remote`, `remote_instance`, `fastsafetensors`, `private` |
+| `--load-format` | The format of the model weights to load. "auto" will try to load the weights in the safetensors format and fall back to the pytorch bin format if safetensors format is not available. "pt" will load the weights in the pytorch bin format. "safetensors" will load the weights in the safetensors format. "npcache" will load the weights in pytorch format and store a numpy cache to speed up the loading. "dummy" will initialize the weights with random values, which is mainly for profiling."gguf" will load the weights in the gguf format. "bitsandbytes" will load the weights using bitsandbytes quantization."layered" loads weights layer by layer so that one can quantize a layer before loading another to make the peak memory envelope smaller. "flash_rl" will load the weights in flash_rl format. "fastsafetensors" and "private" are also supported. "runai_streamer" enables direct model loading from object storage and shared file systems.| `auto` | `auto`, `pt`, `safetensors`, `npcache`, `dummy`, `sharded_state`, `gguf`, `bitsandbytes`, `layered`, `flash_rl`, `remote`, `remote_instance`, `fastsafetensors`, `private`, `runai_streamer` |
 | `--model-loader-extra-config` | Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format. | `{}` | Type: str |
 | `--trust-remote-code` | Whether or not to allow for custom models defined on the Hub in their own modeling files. | `False` | bool flag (set to enable) |
 | `--context-length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). | `None` | Type: int |
@@ -109,7 +109,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--dtype` | Data type for model weights and activations. * "auto" will use FP16 precision for FP32 and FP16 models, and BF16 precision for BF16 models. * "half" for FP16. Recommended for AWQ quantization. * "float16" is the same as "half". * "bfloat16" for a balance between precision and range. * "float" is shorthand for FP32 precision. * "float32" for FP32 precision. | `auto` | `auto`, `half`, `float16`, `bfloat16`, `float`, `float32` |
-| `--quantization` | The quantization method. | `None` | `awq`, `fp8`, `gptq`, `marlin`, `gptq_marlin`, `awq_marlin`, `bitsandbytes`, `gguf`, `modelopt`, `modelopt_fp8`, `modelopt_fp4`, `petit_nvfp4`, `w8a8_int8`, `w8a8_fp8`, `moe_wna16`, `qoq`, `w4afp8`, `mxfp4`, `auto-round`, `compressed-tensors`, `modelslim`, `quark_int4fp8_moe` |
+| `--quantization` | The quantization method. | `None` | `awq`, `fp8`, `gptq`, `marlin`, `gptq_marlin`, `awq_marlin`, `bitsandbytes`, `gguf`, `modelopt`, `modelopt_fp8`, `modelopt_fp4`, `petit_nvfp4`, `w8a8_int8`, `w8a8_fp8`, `moe_wna16`, `qoq`, `w4afp8`, `mxfp4`, `mxfp8`, `auto-round`, `compressed-tensors`, `modelslim`, `quark_int4fp8_moe` |
 | `--quantization-param-path` | Path to the JSON file containing the KV cache scaling factors. This should generally be supplied, when KV cache dtype is FP8. Otherwise, KV cache scaling factors default to 1.0, which may cause accuracy issues. | `None` | Type: Optional[str] |
 | `--kv-cache-dtype` | Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+ | `auto` | `auto`, `fp8_e5m2`, `fp8_e4m3`, `bf16`, `bfloat16`, `fp4_e2m1` |
 | `--enable-fp32-lm-head` | If set, the LM head outputs (logits) are in FP32. | `False` | bool flag (set to enable) |
@@ -153,10 +153,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--device` | The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified. | `None` | Type: str |
 | `--tensor-parallel-size`<br>`--tp-size` | The tensor parallelism size. | `1` | Type: int |
 | `--pipeline-parallel-size`<br>`--pp-size` | The pipeline parallelism size. | `1` | Type: int |
+| `--attention-context-parallel-size`<br>`--attn-cp-size`| The attention context parallelism size. | `1` | Type: int|
+| `--moe-data-parallel-size`<br>`--moe-dp-size`| The moe data parallelism size. | `1` | Type: int|
 | `--pp-max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | `None` | Type: int |
 | `--pp-async-batch-depth` | The async batch depth of pipeline parallelism. | `0` | Type: int |
 | `--stream-interval` | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher | `1` | Type: int |
-| `--stream-output` | Whether to output as a sequence of disjoint segments. | `False` | bool flag (set to enable) |
+| `--incremental-streaming-output` | Whether to output as a sequence of disjoint segments. | `False` | bool flag (set to enable) |
 | `--random-seed` | The random seed. | `None` | Type: int |
 | `--constrained-json-whitespace-pattern` | (outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model to generate consecutive whitespaces, set the pattern to [\n\t ]* | `None` | Type: str |
 | `--constrained-json-disable-any-whitespace` | (xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output. | `False` | bool flag (set to enable) |
@@ -183,6 +185,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--crash-dump-folder` | Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled. | `None` | Type: str |
 | `--show-time-cost` | Show time cost of custom marks. | `False` | bool flag (set to enable) |
 | `--enable-metrics` | Enable log prometheus metrics. | `False` | bool flag (set to enable) |
+| `--enable-mfu-metrics` | Enable estimated MFU-related prometheus metrics. | `False` | bool flag (set to enable) |
 | `--enable-metrics-for-all-schedulers` | Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) to record request metrics separately. This is especially useful when dp_attention is enabled, as otherwise all metrics appear to come from TP 0. | `False` | bool flag (set to enable) |
 | `--tokenizer-metrics-custom-labels-header` | Specify the HTTP header for passing custom labels for tokenizer metrics. | `x-custom-labels` | Type: str |
 | `--tokenizer-metrics-allowed-custom-labels` | The custom labels allowed for tokenizer metrics. The labels are specified via a dict in '--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': 'value2'} is allowed if '--tokenizer-metrics-allowed-custom-labels label1 label2' is set. | `None` | List[str] |
@@ -209,16 +212,16 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--api-key` | Set API key of the server. It is also used in the OpenAI API compatible server. | `None` | Type: str |
-| `--admin-api-key` | Set **admin API key** for administrative/control endpoints (e.g., weights update, cache flush, `/get_server_info`). Endpoints marked as admin-only require `Authorization: Bearer <admin_api_key>` when this is set. | `None` | Type: str |
+| `--admin-api-key` | Set **admin API key** for administrative/control endpoints (e.g., weights update, cache flush, `/server_info`). Endpoints marked as admin-only require `Authorization: Bearer <admin_api_key>` when this is set. | `None` | Type: str |
 | `--served-model-name` | Override the model name returned by the v1/models endpoint in OpenAI API server. | `None` | Type: str |
 | `--weight-version` | Version identifier for the model weights. Defaults to 'default' if not specified. | `default` | Type: str |
-| `--chat-template` | The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | `None` | Type: str |
+| `--chat-template` | The builtin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | `None` | Type: str |
 | `--hf-chat-template-name` | When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used. | `None` | Type: str |
-| `--completion-template` | The buliltin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently. | `None` | Type: str |
+| `--completion-template` | The builtin completion template name or the path of the completion template file. This is only used for OpenAI-compatible API server. only for code completion currently. | `None` | Type: str |
 | `--file-storage-path` | The path of the file storage in backend. | `sglang_storage` | Type: str |
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | `False` | bool flag (set to enable) |
 | `--reasoning-parser` | Specify the parser for reasoning models. Supported parsers: [deepseek-r1, deepseek-v3, glm45, gpt-oss, kimi, qwen3, qwen3-thinking, step3]. | `None` | `deepseek-r1`, `deepseek-v3`, `glm45`, `gpt-oss`, `kimi`, `qwen3`, `qwen3-thinking`, `step3` |
-| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Supported parsers: [deepseekv3, deepseekv31, glm, glm45, glm47, gpt-oss, kimi_k2, llama3, mistral, pythonic, qwen, qwen25, qwen3_coder, step3]. | `None` | `deepseekv3`, `deepseekv31`, `glm`, `glm45`, `glm47`, `gpt-oss`, `kimi_k2`, `llama3`, `mistral`, `pythonic`, `qwen`, `qwen25`, `qwen3_coder`, `step3` |
+| `--tool-call-parser` | Specify the parser for handling tool-call interactions. Supported parsers: [deepseekv3, deepseekv31, glm, glm45, glm47, gpt-oss, kimi_k2, llama3, mistral, pythonic, qwen, qwen25, qwen3_coder, step3]. | `None` | `deepseekv3`, `deepseekv31`, `glm`, `glm45`, `glm47`, `gpt-oss`, `kimi_k2`, `llama3`, `mistral`, `pythonic`, `qwen`, `qwen25`, `qwen3_coder`, `step3`, `gigachat3` |
 | `--tool-server` | Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used. | `None` | Type: str |
 | `--sampling-defaults` | Where to get default sampling parameters. 'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). 'model' uses the model's generation_config.json to get the recommended sampling parameters if available. Default is 'model'. | `model` | `openai`, `model` |
 
@@ -264,10 +267,10 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--sampling-backend` | Choose the kernels for sampling layers. | `None` | `flashinfer`, `pytorch`, `ascend` |
 | `--grammar-backend` | Choose the backend for grammar-guided decoding. | `None` | `xgrammar`, `outlines`, `llguidance`, `none` |
 | `--mm-attention-backend` | Set multimodal attention backend. | `None` | `sdpa`, `fa3`, `fa4`, `triton_attn`, `ascend_attn`, `aiter_attn` |
-| `--nsa-prefill-backend` | Choose the NSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek NSA-style attention). | `flashmla_sparse` | `flashmla_sparse`, `flashmla_kv`, `flashmla_auto`, `fa3`, `tilelang`, `aiter` |
-| `--nsa-decode-backend` | Choose the NSA backend for the decode stage when running DeepSeek NSA-style attention. Overrides `--attention-backend` for decoding. | `fa3` | `flashmla_sparse`, `flashmla_kv`, `fa3`, `tilelang`, `aiter` |
-| `--fp8-gemm-backend` | Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). **NOTE**: This replaces the deprecated environment variables SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8. | `auto` | `auto`, `deep_gemm`, `flashinfer_trtllm`, `cutlass`, `triton`, `aiter` |
-| `--fp4-gemm-backend` | Choose the runner backend for NVFP4 GEMM operations. Options: 'auto' (default, auto-selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_cutlass' (FlashInfer CUTLASS backend, optimal on CUDA 12), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). All backends are from FlashInfer; when FlashInfer is unavailable, sgl-kernel CUTLASS is used as an automatic fallback. **NOTE**: This replaces the deprecated environment variable SGLANG_FLASHINFER_FP4_GEMM_BACKEND. | `auto` | `auto`, `flashinfer_cudnn`, `flashinfer_cutlass`, `flashinfer_trtllm` |
+| `--nsa-prefill-backend` | Choose the NSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek NSA-style attention). | `flashmla_sparse` | `flashmla_sparse`, `flashmla_kv`, `flashmla_auto`, `fa3`, `tilelang`, `aiter`, `trtllm` |
+| `--nsa-decode-backend` | Choose the NSA backend for the decode stage when running DeepSeek NSA-style attention. Overrides `--attention-backend` for decoding. | `fa3` | `flashmla_sparse`, `flashmla_kv`, `fa3`, `tilelang`, `aiter`, `trtllm` |
+| `--fp8-gemm-backend` | Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (FlashInfer TRTLLM backend; SM100/SM103 only), 'flashinfer_cutlass' (FlashInfer CUTLASS backend, SM120 only), 'flashinfer_deepgemm' (Hopper SM90 only, uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), 'triton' (fallback, widely compatible), 'aiter' (ROCm only).| `auto` | `auto`, `deep_gemm`, `flashinfer_trtllm`, `flashinfer_cutlass`, `flashinfer_deepgemm`, `cutlass`, `triton`, `aiter` |
+| `--fp4-gemm-backend` | Choose the runner backend for NVFP4 GEMM operations. Options: 'flashinfer_cutlass' (default), 'auto' (auto-selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). All backends are from FlashInfer; when FlashInfer is unavailable, sgl-kernel CUTLASS is used as an automatic fallback.| `flashinfer_cutlass` | `auto`, `flashinfer_cudnn`, `flashinfer_cutlass`, `flashinfer_trtllm` |
 | `--disable-flashinfer-autotune` | Flashinfer autotune is enabled by default. Set this flag to disable the autotune. | `False` | bool flag (set to enable) |
 
 ## Speculative decoding
@@ -292,12 +295,10 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Ngram speculative decoding
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--speculative-ngram-min-match-window-size` | The minimum window size for pattern matching in ngram speculative decoding. | `1` | Type: int |
-| `--speculative-ngram-max-match-window-size` | The maximum window size for pattern matching in ngram speculative decoding. | `12` | Type: int |
 | `--speculative-ngram-min-bfs-breadth` | The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding. | `1` | Type: int |
 | `--speculative-ngram-max-bfs-breadth` | The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding. | `10` | Type: int |
-| `--speculative-ngram-match-type` | The match type for cache tree. | `BFS` | `BFS`, `PROB` |
-| `--speculative-ngram-branch-length` | The branch length for ngram speculative decoding. | `18` | Type: int |
+| `--speculative-ngram-match-type` | Ngram tree-building mode. `BFS` selects recency-based expansion and `PROB` selects frequency-based expansion. This setting is forwarded to the ngram cache implementation. | `BFS` | `BFS`, `PROB` |
+| `--speculative-ngram-max-trie-depth` | Maximum suffix length stored and matched by the ngram trie. | `18` | Type: int |
 | `--speculative-ngram-capacity` | The cache capacity for ngram speculative decoding. | `10000000` | Type: int |
 
 ## Multi-layer Eagle speculative decoding
@@ -309,10 +310,11 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--expert-parallel-size`<br>`--ep-size`<br>`--ep` | The expert parallelism size. | `1` | Type: int |
-| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | `none` | `none`, `deepep`, `mooncake`, `ascend_fuseep`|
-| `--moe-runner-backend` | Choose the runner backend for MoE. | `auto` | `auto`, `deep_gemm`, `triton`, `triton_kernel`, `flashinfer_trtllm`, `flashinfer_cutlass`, `flashinfer_mxfp4`, `flashinfer_cutedsl`, `cutlass` |
+| `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | `none` | `none`, `deepep`, `mooncake`, `mori`, `nixl`, `ascend_fuseep`|
+| `--moe-runner-backend` | Choose the runner backend for MoE. | `auto` | `auto`, `deep_gemm`, `triton`, `triton_kernel`, `flashinfer_trtllm`, `flashinfer_trtllm_routed`, `flashinfer_cutlass`, `flashinfer_mxfp4`, `flashinfer_cutedsl`, `cutlass` |
 | `--flashinfer-mxfp4-moe-precision` | Choose the computation precision of flashinfer mxfp4 moe | `default` | `default`, `bf16` |
 | `--enable-flashinfer-allreduce-fusion` | Enable FlashInfer allreduce fusion with Residual RMSNorm. | `False` | bool flag (set to enable) |
+| `--enable-aiter-allreduce-fusion` | Enable aiter allreduce fusion with Residual RMSNorm. | `False` | bool flag (set to enable) |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | `auto` | `normal`, `low_latency`, `auto` |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | `0` | Type: int |
 | `--ep-dispatch-algorithm` | The algorithm to choose ranks for redundant experts in expert parallel. | `None` | Type: str |
@@ -328,13 +330,14 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--deepep-config` | Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path. | `None` | Type: str |
 | `--moe-dense-tp-size` | TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports. | `None` | Type: int |
 | `--elastic-ep-backend` | Specify the collective communication backend for elastic EP. Currently supports 'mooncake'. | `none` | `none`, `mooncake` |
+| `--enable-elastic-expert-backup` | Enable elastic EP backend to backup expert weights in DRAM feature. Currently supports 'mooncake'.| `False` | bool flag (set to enable) |
 | `--mooncake-ib-device` | The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled. | `None` | Type: str |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--max-mamba-cache-size` | The maximum size of the mamba cache. | `None` | Type: int |
-| `--mamba-ssm-dtype` | The data type of the SSM states in mamba cache. | `float32` | `float32`, `bfloat16` |
+| `--mamba-ssm-dtype` | The data type of the SSM states in mamba cache. | `float32` | `float32`, `bfloat16`, `float16` |
 | `--mamba-full-memory-ratio` | The ratio of mamba state memory to full kv cache memory. | `0.9` | Type: float |
 | `--mamba-scheduler-strategy` | The strategy to use for mamba scheduler. `auto` currently defaults to `no_buffer`. 1. `no_buffer` does not support overlap scheduler due to not allocating extra mamba state buffers. Branching point caching support is feasible but not implemented. 2. `extra_buffer` supports overlap schedule by allocating extra mamba state buffers to track mamba state for caching (mamba state usage per running req becomes `2x` for non-spec; `1+(1/(2+speculative_num_draft_tokens))x` for spec dec (e.g. 1.16x if speculative_num_draft_tokens==4)). 2a. `extra_buffer` is strictly better for non-KV-cache-bound cases; for KV-cache-bound cases, the tradeoff depends on whether enabling overlap outweighs reduced max running requests. 2b. mamba caching at radix cache branching point is strictly better than non-branch but requires kernel support (currently only FLA backend), currently only extra_buffer supports branching. | `auto` | `auto`, `no_buffer`, `extra_buffer` |
 | `--mamba-track-interval` | The interval (in tokens) to track the mamba state during decode. Only used when `--mamba-scheduler-strategy` is `extra_buffer`. Must be divisible by page_size if set, and must be >= speculative_num_draft_tokens when using speculative decoding. | `256` | Type: int |
@@ -373,6 +376,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--kt-max-deferred-experts-per-token` | [ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0. | `None` | Type: int |
 
 ## Diffusion LLM
+
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--dllm-algorithm` | The diffusion LLM algorithm, such as LowConfidence. | `None` | Type: str |
@@ -431,7 +435,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--tbo-token-distribution-threshold` | The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap. | `0.48` | Type: float |
 | `--enable-torch-compile` | Optimize the model with torch.compile. Experimental feature. | `False` | bool flag (set to enable) |
 | `--enable-torch-compile-debug-mode` | Enable debug mode for torch compile. | `False` | bool flag (set to enable) |
-| `--enable-piecewise-cuda-graph` | Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature. | `False` | bool flag (set to enable) |
+| `--disable-piecewise-cuda-graph` | Disable piecewise cuda graph for extend/prefill. PCG is enabled by default. | `False` | bool flag (set to disable) |
+| `--enforce-piecewise-cuda-graph` | Enforce piecewise cuda graph, skipping all auto-disable conditions. For testing only. | `False` | bool flag (set to enable) |
 | `--piecewise-cuda-graph-tokens` | Set the list of tokens when using piecewise cuda graph. | `None` | Type: JSON list |
 | `--piecewise-cuda-graph-compiler` | Set the compiler for piecewise cuda graph. Choices are: eager, inductor. | `eager` | `eager`, `inductor` |
 | `--torch-compile-max-bs` | Set the maximum batch size when using torch compile. | `32` | Type: int |
@@ -462,7 +467,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--rl-on-policy-target` | The training system that SGLang needs to match for true on-policy. | `None` | `fsdp` |
 | `--enable-attn-tp-input-scattered` | Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent. | `False` | bool flag (set to enable) |
 | `--enable-nsa-prefill-context-parallel` | Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2. | `False` | bool flag (set to enable) |
-| `--nsa-prefill-cp-mode` | Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: `in-seq-split` (default), `round-robin-split`. `round-robin-split` distributes tokens across ranks based on `token_idx % cp_size`. It supports multi-batch prefill, fused MoE, and FP8 KV cache. | `in-seq-split` | `in-seq-split`, `round-robin-split` |
+| `--nsa-prefill-cp-mode` | Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: `round-robin-split`(default),`in-seq-split`. `round-robin-split` distributes tokens across ranks based on `token_idx % cp_size`. It supports multi-batch prefill, fused MoE, and FP8 KV cache. | `in-seq-split` | `in-seq-split`, `round-robin-split` |
 | `--enable-fused-qk-norm-rope` | Enable fused qk normalization and rope rotary embedding. | `False` | bool flag (set to enable) |
 | `--enable-precise-embedding-interpolation` | Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values. | `False` | bool flag (set to enable) |
 
@@ -487,12 +492,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disaggregation-mode` | Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated | `null` | `null`, `prefill`, `decode` |
 | `--disaggregation-transfer-backend` | The backend for disaggregation transfer. Default is mooncake. | `mooncake` | `mooncake`, `nixl`, `ascend`, `fake` |
 | `--disaggregation-bootstrap-port` | Bootstrap server port on the prefill server. Default is 8998. | `8998` | Type: int |
-| `--disaggregation-decode-tp` | Decode tp size. If not set, it matches the tp size of the current engine. This is only set on the prefill server. | `None` | Type: int |
-| `--disaggregation-decode-dp` | Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server. | `None` | Type: int |
-| `--disaggregation-prefill-pp` | Prefill pp size. If not set, it is default to 1. This is only set on the decode server. | `1` | Type: int |
 | `--disaggregation-ib-device` | The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when mooncake backend is enabled. | `None` | Type: str |
 | `--disaggregation-decode-enable-offload-kvcache` | Enable async KV cache offloading on decode server (PD mode). | `False` | bool flag (set to enable) |
-| `--disaggregation-decode-enable-fake-auto` | Auto enable FAKE mode for decode node testing, no need to pass bootstrap_host and bootstrap_room in request. | `False` | bool flag (set to enable) |
 | `--num-reserved-decode-tokens` | Number of decode tokens that will have memory reserved when adding new request to the running batch. | `512` | Type: int |
 | `--disaggregation-decode-polling-interval` | The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this. | `1` | Type: int |
 
@@ -536,6 +537,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--mm-process-config` | Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`. | `{}` | Type: JSON / Dict |
 | `--mm-enable-dp-encoder` | Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically. | `False` | bool flag (set to enable) |
 | `--limit-mm-data-per-request` | Limit the number of multimodal inputs per request. e.g. '{"image": 1, "video": 1, "audio": 1}' | `None` | Type: JSON / Dict |
+| `--enable-mm-global-cache` | Enable Mooncake-backed global multimodal embedding cache on encoder servers so repeated images can reuse cached ViT embeddings instead of recomputing them. | `False` | bool flag (set to enable) |
 
 ## For checkpoint decryption
 | Argument | Description | Defaults | Options |

@@ -32,7 +32,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         self.heavy_token_num = model_runner.server_args.ds_heavy_token_num
 
         self.sorted_channels = model_runner.sorted_channels
-        self.sparse_decode_thresold = (
+        self.sparse_decode_threshold = (
             model_runner.server_args.ds_sparse_decode_threshold
         )
         self.att_out_approx: torch.Tensor = None
@@ -210,7 +210,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         #            and set a minimum value for sparse_decode
         if (
             min_seq_len < self.heavy_token_num
-            or max_seq_len < self.sparse_decode_thresold
+            or max_seq_len < self.sparse_decode_threshold
         ):
             self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

@@ -1,8 +1,9 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 """
-    Common generate cli test, one test for image and video each
+Common generate cli test, one test for image and video each
 """
+
 import dataclasses
 import os
 import shlex
@@ -56,6 +57,24 @@ class CLIBase(unittest.TestCase):
     width: int = 720
     height: int = 720
     output_path: str = "test_outputs"
+
+    def setUp(self):
+        super().setUp()
+        if not os.path.exists(self.output_path):
+            os.makedirs(self.output_path, exist_ok=True)
+        if os.path.exists(self.output_path):
+            for f in os.listdir(self.output_path):
+                path = os.path.join(self.output_path, f)
+                if os.path.isfile(path):
+                    os.remove(path)
+
+    def tearDown(self):
+        super().tearDown()
+        if os.path.exists(self.output_path):
+            for f in os.listdir(self.output_path):
+                path = os.path.join(self.output_path, f)
+                if os.path.isfile(path):
+                    os.remove(path)
 
     def get_base_command(self):
         return [

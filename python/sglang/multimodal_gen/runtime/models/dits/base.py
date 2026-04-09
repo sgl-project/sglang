@@ -73,6 +73,10 @@ class BaseDiT(nn.Module, ABC):
                     f"Subclasses of BaseDiT must define '{attr}' instance variable"
                 )
 
+    def post_load_weights(self) -> None:
+        """Run model-specific post-load weight fixups after all parameters are materialized."""
+        return None
+
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends
@@ -107,3 +111,17 @@ class CachableDiT(TeaCacheMixin, BaseDiT):
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
         self._init_teacache_state()
+
+    @classmethod
+    def get_nunchaku_quant_rules(cls) -> dict[str, dict[str, Any]]:
+        """
+        Get quantization rules for Nunchaku quantization.
+
+        Returns a dict mapping layer name patterns to quantization configs:
+        {
+            "skip": [list of patterns to skip quantization],
+            "svdq_w4a4": [list of patterns for SVDQ W4A4],
+            "awq_w4a16": [list of patterns for AWQ W4A16],
+        }
+        """
+        return {}

@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import subprocess
+import tarfile
 import time
 
 import numpy as np
@@ -12,6 +14,8 @@ from sglang.test.test_utils import (
     dump_bench_raw_result,
     select_sglang_backend,
 )
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 choices = ["A", "B", "C", "D"]
 
@@ -46,6 +50,28 @@ def gen_prompt(train_df, subject, k=-1):
     for i in range(k):
         prompt += format_example(train_df, i)
     return prompt
+
+
+def download_data(data_dir):
+    """Download and extract MMLU data if it doesn't exist."""
+    if os.path.isdir(os.path.join(data_dir, "test")):
+        return
+    print(f"Data not found at {data_dir}. Downloading...")
+    os.makedirs(data_dir, exist_ok=True)
+    tar_path = os.path.join(data_dir, "data.tar")
+    subprocess.check_call(
+        ["wget", "-O", tar_path, "https://people.eecs.berkeley.edu/~hendrycks/data.tar"]
+    )
+    with tarfile.open(tar_path) as tar:
+        tar.extractall(path=data_dir, filter="data")
+    # The tarball extracts into a "data/" subdirectory; move contents up if needed
+    nested = os.path.join(data_dir, "data")
+    if os.path.isdir(nested):
+        for item in os.listdir(nested):
+            os.rename(os.path.join(nested, item), os.path.join(data_dir, item))
+        os.rmdir(nested)
+    os.remove(tar_path)
+    print("Download complete.")
 
 
 def main(args):
@@ -174,8 +200,11 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ntrain", "-k", type=int, default=5)
-    parser.add_argument("--data_dir", "-d", type=str, default="data")
+    parser.add_argument(
+        "--data_dir", "-d", type=str, default=os.path.join(SCRIPT_DIR, "data")
+    )
     parser.add_argument("--save_dir", "-s", type=str, default="results")
     parser.add_argument("--nsub", type=int, default=60)
     args = add_common_sglang_args_and_parse(parser)
+    download_data(args.data_dir)
     main(args)

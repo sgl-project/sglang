@@ -33,8 +33,9 @@ struct QKNormParams {
 constexpr uint32_t kWarpsPerBlock = 4;
 constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
 
+// Warp-level kernel for head_dim <= 256
 template <int64_t kHeadDim, bool kUsePDL, typename Float>
-__global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
+__global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
   using namespace device;
   using Storage = norm::StorageType<Float, kHeadDim>;
 
@@ -66,11 +67,47 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
 
+// For CTA level, used for head_dim > 256 (512,1024)
+template <int64_t kHeadDim, bool kUsePDL, typename Float>
+__global__ void fused_qknorm_cta(const QKNormParams __grid_constant__ params) {
+  using namespace device;
+  using Storage = norm::StorageType<Float, kHeadDim>;
+
+  constexpr auto kNumThreads = host::norm::get_cta_threads<Float, kHeadDim>();
+  constexpr auto kNumWarps = kNumThreads / kWarpThreads;
+
+  static_assert(sizeof(Float) == 2, "Only support FP16/BF16");
+  const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
+
+  const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
+  const auto num_works = num_q_and_k_heads * num_tokens;
+  const auto gmem = tile::Memory<Storage>::cta(kNumThreads);
+  __shared__ float smem[norm::kSmemBufferSize];
+
+  PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
+
+  for (auto idx = blockIdx.x; idx < num_works; idx += gridDim.x) {
+    const int64_t token_id = idx / num_q_and_k_heads;
+    const int64_t head_id = idx % num_q_and_k_heads;
+    const auto load_q = head_id < num_qo_heads;
+    const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * kHeadDim))
+                              : pointer::offset(k, 2 * (token_id * k_stride + head_id * kHeadDim));
+    const auto weight = load_q ? q_weight : k_weight;
+    const auto input_vec = gmem.load(input);
+    const auto weight_vec = gmem.load(weight);
+    const auto output_vec = norm::apply_norm_cta<kHeadDim>(input_vec, weight_vec, eps, smem, kNumWarps);
+    gmem.store(input, output_vec);
+  }
+
+  PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
+}
+
+// Warp-level kernel struct for head_dim <= 256
 template <int64_t kHeadDim, bool kUsePDL, typename DType>
-struct QKNormKernel {
+struct QKNormKernelWarp {
   static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);
-  static_assert(!host::norm::should_use_cta<DType, kHeadDim>(), "Head dim too large for QKNorm");
-  static constexpr auto kernel = fused_qknorm<kHeadDim, kUsePDL, DType>;
+  static_assert(!host::norm::should_use_cta<DType, kHeadDim>(), "Use QKNormKernelCTA for head_dim > 256");
+  static constexpr auto kernel = fused_qknorm_warp<kHeadDim, kUsePDL, DType>;
 
   static void
   run(const tvm::ffi::TensorView q,
@@ -137,5 +174,84 @@ struct QKNormKernel {
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
+
+// This goes with fused_qknorm_cta
+template <int64_t kHeadDim, bool kUsePDL, typename DType>
+struct QKNormKernelCTA {
+  static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);
+  static_assert(host::norm::should_use_cta<DType, kHeadDim>(), "Use QKNormKernelWarp for head_dim <= 256");
+  static constexpr auto kernel = fused_qknorm_cta<kHeadDim, kUsePDL, DType>;
+  static constexpr auto kNumThreads = host::norm::get_cta_threads<DType, kHeadDim>();
+
+  static void
+  run(const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView k,
+      const tvm::ffi::TensorView q_weight,
+      const tvm::ffi::TensorView k_weight,
+      float eps) {
+    using namespace host;
+
+    auto N = SymbolicSize{"num_tokens"};
+    auto Q = SymbolicSize{"num_qo_heads"};
+    auto K = SymbolicSize{"num_kv_heads"};
+    auto D = SymbolicSize{"head_dim"};
+    auto Sq = SymbolicSize{"q_stride"};
+    auto Sk = SymbolicSize{"k_stride"};
+    auto device = SymbolicDevice{};
+    D.set_value(kHeadDim);
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, Q, D})  // q input
+        .with_strides({Sq, D, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(q);
+    TensorMatcher({N, K, D})  // k input
+        .with_strides({Sk, D, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(k);
+    TensorMatcher({D})  // weight
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(q_weight)
+        .verify(k_weight);
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
+    const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
+
+    // NOTE: we offset the k here to reduce computation cost in the kernel
+    const auto params = QKNormParams{
+        .q = q.data_ptr(),
+        .k = pointer::offset(k.data_ptr(), -2 * static_cast<int64_t>(num_qo_heads) * kHeadDim),
+        .q_stride = static_cast<int64_t>(Sq.unwrap()),
+        .k_stride = static_cast<int64_t>(Sk.unwrap()),
+        .num_qo_heads = num_qo_heads,
+        .num_kv_heads = num_kv_heads,
+        .eps = eps,
+        .q_weight = q_weight.data_ptr(),
+        .k_weight = k_weight.data_ptr(),
+        .num_tokens = num_tokens,
+    };
+
+    static const uint32_t max_occupancy = runtime::get_blocks_per_sm(kernel, kNumThreads);
+    static const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
+
+    const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
+
+    // we use persistent kernel, which limit the number of blocks to reduce overhead
+    const auto num_blocks = std::min<uint32_t>(num_works, max_occupancy * kNumSM);
+    LaunchKernel(num_blocks, kNumThreads, device.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+// Unified dispatch: select warp or CTA kernel based on head_dim
+template <int64_t kHeadDim, bool kUsePDL, typename DType>
+using QKNormKernel = std::conditional_t<
+    host::norm::should_use_cta<DType, kHeadDim>(),
+    QKNormKernelCTA<kHeadDim, kUsePDL, DType>,
+    QKNormKernelWarp<kHeadDim, kUsePDL, DType>>;
 
 }  // namespace

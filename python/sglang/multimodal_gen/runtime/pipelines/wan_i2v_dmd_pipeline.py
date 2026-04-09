@@ -8,30 +8,16 @@ This module contains an implementation of the Wan video diffusion pipeline
 using the modular pipeline architecture.
 """
 
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.stages import DmdDenoisingStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-# isort: off
-from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    ImageEncodingStage,
-    ConditioningStage,
-    DecodingStage,
-    DmdDenoisingStage,
-    ImageVAEEncodingStage,
-    InputValidationStage,
-    LatentPreparationStage,
-    TextEncodingStage,
-    TimestepPreparationStage,
-)
-
-# isort: on
-from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
-    FlowMatchEulerDiscreteScheduler,
-)
 
 logger = init_logger(__name__)
 
@@ -55,62 +41,13 @@ class WanImageToVideoDmdPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        """Set up pipeline stages with proper dependency injection."""
-
-        self.add_stage(
-            stage_name="input_validation_stage", stage=InputValidationStage()
-        )
-
-        self.add_stage(
-            stage_name="prompt_encoding_stage",
-            stage=TextEncodingStage(
-                text_encoders=[self.get_module("text_encoder")],
-                tokenizers=[self.get_module("tokenizer")],
-            ),
-        )
-        if (
-            self.get_module("image_encoder") is not None
-            and self.get_module("image_processor") is not None
-        ):
-            self.add_stage(
-                stage_name="image_encoding_stage",
-                stage=ImageEncodingStage(
-                    image_encoder=self.get_module("image_encoder"),
-                    image_processor=self.get_module("image_processor"),
-                ),
-            )
-
-        self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
-
-        self.add_stage(
-            stage_name="timestep_preparation_stage",
-            stage=TimestepPreparationStage(scheduler=self.get_module("scheduler")),
-        )
-
-        self.add_stage(
-            stage_name="latent_preparation_stage",
-            stage=LatentPreparationStage(
-                scheduler=self.get_module("scheduler"),
-                transformer=self.get_module("transformer"),
-            ),
-        )
-
-        self.add_stage(
-            stage_name="image_latent_preparation_stage",
-            stage=ImageVAEEncodingStage(vae=self.get_module("vae")),
-        )
-
-        self.add_stage(
-            stage_name="denoising_stage",
-            stage=DmdDenoisingStage(
+        self.add_standard_ti2v_stages(
+            image_vae_encoding_position="after_latent",
+            denoising_stage_factory=lambda: DmdDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
                 transformer_2=self.get_module("transformer_2"),
             ),
-        )
-
-        self.add_stage(
-            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
         )
 
 

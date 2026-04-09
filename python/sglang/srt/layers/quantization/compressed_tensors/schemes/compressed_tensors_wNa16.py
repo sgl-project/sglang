@@ -19,7 +19,7 @@ from sglang.srt.layers.parameter import (
     permute_param_layout_,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.marlin_utils import (
     MarlinLinearLayerConfig,
@@ -43,7 +43,7 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import gptq_marlin_repack
+    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
 
 
 ScalarType, scalar_types = get_scalar_types()
@@ -59,7 +59,7 @@ WNA16_ZP_SUPPORTED_TYPES_MAP = {4: scalar_types.uint4, 8: scalar_types.uint8}
 WNA16_SUPPORTED_BITS = list(WNA16_SUPPORTED_TYPES_MAP.keys())
 
 
-class CompressedTensorsWNA16(CompressedTensorsScheme):
+class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
     _kernel_backends_being_used: set[str] = set()
 
     def __init__(self,

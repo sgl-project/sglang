@@ -16,8 +16,12 @@ use axum::{
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use smg_mesh::{
+    rate_limit_window::RateLimitWindow, MeshServerConfig, MeshServerHandler, MeshSyncManager,
+};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
+use wfaas::LoggingSubscriber;
 
 use crate::{
     app_context::AppContext,
@@ -28,16 +32,6 @@ use crate::{
         worker::WorkerType,
         worker_manager::WorkerManager,
         Job,
-    },
-    mesh::{
-        endpoints::{
-            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
-            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
-            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
-        },
-        rate_limit_window::RateLimitWindow,
-        service::{MeshServerConfig, MeshServerHandler},
-        sync::MeshSyncManager,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -58,11 +52,20 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
+    routers::{
+        conversations,
+        mesh::{
+            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
+            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
+            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
+        },
+        parse,
+        router_manager::RouterManager,
+        tokenize, RouterTrait,
+    },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::TokenizerRegistry,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    workflow::LoggingSubscriber,
 };
 #[derive(Clone)]
 pub struct AppState {
@@ -530,6 +533,7 @@ pub struct ServerConfig {
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
+    pub json_log: bool,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
@@ -606,6 +610,8 @@ pub fn build_app(
         .route("/engine_metrics", get(engine_metrics))
         .route("/v1/models", get(v1_models))
         .route("/get_model_info", get(get_model_info))
+        .route("/server_info", get(get_server_info))
+        // TODO: Remove `/get_server_info` alias after one release-cycle deprecation window.
         .route("/get_server_info", get(get_server_info));
 
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
@@ -719,7 +725,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                         }
                     })
                     .unwrap_or(Level::INFO),
-                json_format: false,
+                json_format: config.json_log,
                 log_dir: config.log_dir.clone(),
                 colorize: true,
                 log_file_name: "smg".to_string(),
@@ -735,62 +741,61 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         metrics::start_prometheus(prometheus_config.clone());
     }
 
-    let (mesh_handler, mesh_sync_manager) =
-        if let Some(mesh_server_config) = &config.mesh_server_config {
-            // Create HA sync manager with stores first
-            use crate::mesh::{
-                partition::PartitionDetector, stores::StateStores, sync::MeshSyncManager,
-            };
-            let stores = Arc::new(StateStores::with_self_name(
-                mesh_server_config.self_name.clone(),
-            ));
-            let sync_manager = Arc::new(MeshSyncManager::new(
-                stores.clone(),
-                mesh_server_config.self_name.clone(),
-            ));
+    let (mesh_handler, mesh_sync_manager) = if let Some(mesh_server_config) =
+        &config.mesh_server_config
+    {
+        // Create HA sync manager with stores first
+        use smg_mesh::{partition::PartitionDetector, stores::StateStores, sync::MeshSyncManager};
+        let stores = Arc::new(StateStores::with_self_name(
+            mesh_server_config.self_name.clone(),
+        ));
+        let sync_manager = Arc::new(MeshSyncManager::new(
+            stores.clone(),
+            mesh_server_config.self_name.clone(),
+        ));
 
-            // Create partition detector
-            let partition_detector = Arc::new(PartitionDetector::default());
+        // Create partition detector
+        let partition_detector = Arc::new(PartitionDetector::default());
 
-            // Initialize rate-limit hash ring with current membership
-            sync_manager.update_rate_limit_membership();
+        // Initialize rate-limit hash ring with current membership
+        sync_manager.update_rate_limit_membership();
 
-            // Start rate limit window reset task
-            let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // Reset every 1 second
-            spawn(async move {
-                window_manager.start_reset_task().await;
-            });
+        // Start rate limit window reset task
+        let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // Reset every 1 second
+        spawn(async move {
+            window_manager.start_reset_task().await;
+        });
 
-            // Create mesh server builder and build with stores
-            use crate::mesh::service::MeshServerBuilder;
-            let builder = MeshServerBuilder::new(
-                mesh_server_config.self_name.clone(),
-                mesh_server_config.self_addr,
-                mesh_server_config.init_peer,
-            );
-            let (mesh_server, handler) = builder.build_with_stores(Some(stores.clone()));
+        // Create mesh server builder and build with stores
+        use smg_mesh::service::MeshServerBuilder;
+        let builder = MeshServerBuilder::new(
+            mesh_server_config.self_name.clone(),
+            mesh_server_config.self_addr,
+            mesh_server_config.init_peer,
+        );
+        let (mesh_server, handler) = builder.build_with_stores(Some(stores.clone()));
 
-            // Spawn the mesh server with stores and partition detector
-            let stores_for_server = stores.clone();
-            let sync_manager_for_server = sync_manager.clone();
-            let partition_detector_for_server = partition_detector.clone();
-            spawn(async move {
-                if let Err(e) = mesh_server
-                    .start_serve_with_stores(
-                        Some(stores_for_server),
-                        Some(sync_manager_for_server),
-                        Some(partition_detector_for_server),
-                    )
-                    .await
-                {
-                    tracing::error!("Mesh server failed: {}", e);
-                }
-            });
+        // Spawn the mesh server with stores and partition detector
+        let stores_for_server = stores.clone();
+        let sync_manager_for_server = sync_manager.clone();
+        let partition_detector_for_server = partition_detector.clone();
+        spawn(async move {
+            if let Err(e) = mesh_server
+                .start_serve_with_stores(
+                    Some(stores_for_server),
+                    Some(sync_manager_for_server),
+                    Some(partition_detector_for_server),
+                )
+                .await
+            {
+                tracing::error!("Mesh server failed: {}", e);
+            }
+        });
 
-            (Some(Arc::new(handler)), Some(sync_manager))
-        } else {
-            (None, None)
-        };
+        (Some(Arc::new(handler)), Some(sync_manager))
+    } else {
+        (None, None)
+    };
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",

@@ -21,17 +21,40 @@ if python3 -c "import deep_ep" >/dev/null 2>&1; then
 fi
 
 # Install system dependencies
-apt install -y curl wget git sudo rdma-core infiniband-diags openssh-server perftest libibumad3 libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils libnl-3-200 libnl-route-3-200 librdmacm1 build-essential cmake
+# Use fallback logic in case apt fails due to unrelated broken packages on the runner
+DEEPEP_SYSTEM_DEPS="curl wget git sudo rdma-core infiniband-diags openssh-server perftest libibumad3 libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils libnl-3-200 libnl-route-3-200 librdmacm1 build-essential cmake"
+apt-get install -y --no-install-recommends $DEEPEP_SYSTEM_DEPS || {
+    echo "Warning: apt-get install failed, checking if required packages are available..."
+    for pkg in $DEEPEP_SYSTEM_DEPS; do
+        if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+            echo "ERROR: Required package $pkg is not installed and apt-get failed"
+            exit 1
+        fi
+    done
+    echo "All required packages are already installed, continuing..."
+}
 
 # Install GDRCopy
 rm -rf /opt/gdrcopy && mkdir -p /opt/gdrcopy
 cd /opt/gdrcopy
 git clone https://github.com/NVIDIA/gdrcopy.git .
 git checkout v2.5.1
-apt update
-apt install -y nvidia-dkms-580
-apt install -y build-essential devscripts debhelper fakeroot pkg-config dkms
-apt install -y check libsubunit0 libsubunit-dev python3-venv
+apt-get update || true  # May fail due to unrelated broken packages
+GDRCOPY_DEPS_1="nvidia-dkms-580"
+GDRCOPY_DEPS_2="build-essential devscripts debhelper fakeroot pkg-config dkms"
+GDRCOPY_DEPS_3="check libsubunit0 libsubunit-dev python3-venv"
+for deps_group in "$GDRCOPY_DEPS_1" "$GDRCOPY_DEPS_2" "$GDRCOPY_DEPS_3"; do
+    apt-get install -y --no-install-recommends $deps_group || {
+        echo "Warning: apt-get install failed for '$deps_group', checking if packages are available..."
+        for pkg in $deps_group; do
+            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+                echo "ERROR: Required package $pkg is not installed and apt-get failed"
+                exit 1
+            fi
+        done
+        echo "All required packages from '$deps_group' are already installed, continuing..."
+    }
+done
 cd packages
 CUDA=/usr/local/cuda ./build-deb-packages.sh
 dpkg -i gdrdrv-dkms_*.deb
@@ -44,7 +67,14 @@ LIB_PATH="/usr/lib/$ARCH-linux-gnu"
 if [ ! -e "$LIB_PATH/libmlx5.so" ]; then
     ln -s $LIB_PATH/libmlx5.so.1 $LIB_PATH/libmlx5.so
 fi
-apt-get update && apt-get install -y libfabric-dev
+apt-get update || true
+apt-get install -y --no-install-recommends libfabric-dev || {
+    if ! dpkg -l libfabric-dev 2>/dev/null | grep -q "^ii"; then
+        echo "ERROR: Required package libfabric-dev is not installed and apt-get failed"
+        exit 1
+    fi
+    echo "libfabric-dev is already installed, continuing..."
+}
 
 # Install DeepEP
 DEEPEP_DIR=/root/.cache/deepep

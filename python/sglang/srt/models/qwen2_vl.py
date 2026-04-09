@@ -22,6 +22,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
+
 import logging
 from functools import lru_cache, partial
 from typing import Iterable, List, Optional, Tuple, Type, TypedDict
@@ -34,6 +35,7 @@ from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionCon
 
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -189,7 +191,7 @@ class Qwen2VisionPatchEmbed(nn.Module):
         self.embed_dim = embed_dim
 
         kernel_size = [temporal_patch_size, patch_size, patch_size]
-        self.proj = nn.Conv3d(
+        self.proj = Conv3dLayer(
             in_chans, embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=False
         )
 

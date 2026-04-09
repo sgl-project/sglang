@@ -332,7 +332,7 @@ python3 -m sglang.bench_serving \
 python3 -m sglang.bench_serving \
   --backend sglang \
   --host 127.0.0.1 --port 30000 \
-  --model mode-name \
+  --model model-name \
   --dataset-name mooncake \
   --mooncake-slowdown-factor 1.0 \
   --mooncake-num-rounds 1000 \
@@ -352,4 +352,4 @@ python3 -m sglang.bench_serving \
 ### Notes
 
 - The script raises the file descriptor soft limit (`RLIMIT_NOFILE`) to help with many concurrent connections.
-- For sglang, `/get_server_info` is queried post-run to report speculative decoding accept length when available.
+- For sglang, `/server_info` is queried post-run to report speculative decoding accept length when available.

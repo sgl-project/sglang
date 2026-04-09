@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3 text encoder configuration for SGLang diffusion models."""
+
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.encoders.base import (

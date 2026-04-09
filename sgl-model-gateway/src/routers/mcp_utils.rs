@@ -5,12 +5,10 @@
 
 use std::sync::Arc;
 
+use smg_mcp::{McpManager, McpServerConfig, McpTransport};
 use tracing::warn;
 
-use crate::{
-    mcp::{McpManager, McpServerConfig, McpTransport},
-    protocols::responses::{ResponseTool, ResponseToolType},
-};
+use crate::protocols::responses::{ResponseTool, ResponseToolType};
 
 // ============================================================================
 // Constants

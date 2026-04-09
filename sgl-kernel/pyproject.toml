@@ -7,10 +7,10 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "sgl-kernel"
-version = "0.3.21"
+name = "sglang-kernel"
+version = "0.4.1"
 authors = [
-  { name="Yineng Zhang", email="me@zhyncs.com" },
+  { name="SGLang Kernel Team", email="sglang@lmsys.org" },
 ]
 description = "Kernel Library for SGLang"
 readme = "README.md"

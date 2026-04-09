@@ -4,20 +4,27 @@
 import asyncio
 import os
 import pickle
+import tempfile
 from collections import deque
-from copy import deepcopy
 from typing import Any, List
 
 import zmq
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    _parse_size,
+    save_image_to_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    GetWeightsChecksumReqInput,
+    UpdateWeightFromDiskReqInput,
+)
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
+    ShutdownReq,
     UnmergeLoraWeightsReq,
-    _parse_size,
-    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -87,6 +94,9 @@ class Scheduler:
             Req: self._handle_generation,
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
+            ShutdownReq: self._handle_shutdown,
+            UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+            GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 
         # FIFO, new reqs are appended
@@ -122,6 +132,29 @@ class Scheduler:
 
     def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
         return self.worker.list_loras()
+
+    def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
+        self._running = False
+        return OutputBatch()
+
+    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+        """Handle update_weights_from_disk request for RL workflows."""
+        req = reqs[0]
+        success, message = self.worker.update_weights_from_disk(
+            model_path=req.model_path,
+            flush_cache=req.flush_cache,
+            target_modules=req.target_modules,
+        )
+        return OutputBatch(
+            output={"success": success, "message": message},
+            error=None if success else message,
+        )
+
+    def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
+        """Handle get_weights_checksum request."""
+        req = reqs[0]
+        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
+        return OutputBatch(output=checksums)
 
     def _handle_generation(self, reqs: List[Req]):
         warmup_reqs = [req for req in reqs if req.is_warmup]
@@ -166,33 +199,24 @@ class Scheduler:
             # insert warmup reqs constructed with each warmup-resolution
             self._warmup_total = len(self.server_args.warmup_resolutions)
             self._warmup_processed = 0
+            task_type = self.server_args.pipeline_config.task_type
+
+            requires_warmup_image = task_type.accepts_image_input()
+            warmup_input_path = None
+            if requires_warmup_image:
+                warmup_input_path = self._prepare_shared_warmup_image_path()
 
             for resolution in self.server_args.warmup_resolutions:
                 width, height = _parse_size(resolution)
-                task_type = self.server_args.pipeline_config.task_type
 
-                if task_type in (
-                    ModelTaskType.I2I,
-                    ModelTaskType.TI2I,
-                    ModelTaskType.I2V,
-                    ModelTaskType.TI2V,
-                ):
-                    uploads_dir = os.path.join("outputs", "uploads")
-                    os.makedirs(uploads_dir, exist_ok=True)
-                    input_path = asyncio.run(
-                        save_image_to_path(
-                            MINIMUM_PICTURE_BASE64_FOR_WARMUP,
-                            os.path.join(uploads_dir, "warmup_image.jpg"),
-                        )
-                    )
+                if requires_warmup_image:
                     req = Req(
                         data_type=task_type.data_type(),
                         width=width,
                         height=height,
                         prompt="",
                         negative_prompt="",
-                        image_path=[input_path],
-                        is_warmup=True,
+                        image_path=[warmup_input_path],
                     )
                 else:
                     req = Req(
@@ -200,11 +224,58 @@ class Scheduler:
                         width=width,
                         height=height,
                         prompt="",
-                        is_warmup=True,
                     )
+                req.set_as_warmup(self.server_args.warmup_steps)
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
+
+    def _prepare_shared_warmup_image_path(self) -> str:
+        world_group = get_world_group()
+        src_rank = world_group.ranks[0]
+
+        warmup_sync: dict[str, str | None]
+        if world_group.rank == src_rank:
+            try:
+                if self.server_args.input_save_path is not None:
+                    uploads_dir = self.server_args.input_save_path
+                    os.makedirs(uploads_dir, exist_ok=True)
+                else:
+                    uploads_dir = tempfile.mkdtemp(prefix="sglang_input_")
+                warmup_image_base = os.path.join(uploads_dir, "warmup_image")
+                input_path = asyncio.run(
+                    save_image_to_path(
+                        MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+                        warmup_image_base,
+                    )
+                )
+                warmup_sync = {"input_path": input_path, "error": None}
+            except Exception as e:
+                warmup_sync = {"input_path": None, "error": str(e)}
+        else:
+            warmup_sync = {}
+
+        # Sync rank 0's warmup-image write result (path or error) to all ranks.
+        warmup_sync = broadcast_pyobj(
+            warmup_sync,
+            world_group.rank,
+            world_group.cpu_group,
+            src=src_rank,
+        )
+        if not isinstance(warmup_sync, dict):
+            raise RuntimeError("Invalid warmup sync payload received across ranks")
+
+        error = warmup_sync.get("error")
+        if error is not None:
+            raise RuntimeError(
+                f"Warmup image preparation failed on rank {src_rank}: {error}"
+            )
+
+        input_path = warmup_sync.get("input_path")
+        if not isinstance(input_path, str) or not input_path:
+            raise RuntimeError("Warmup image preparation returned empty input path")
+
+        return input_path
 
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: List[tuple[bytes, Any]]
@@ -221,8 +292,7 @@ class Scheduler:
         # only the very first req through server's lifetime will be warmed up
         identity, req = recv_reqs[0]
         if isinstance(req, Req):
-            warmup_req = deepcopy(req)
-            warmup_req.set_as_warmup()
+            warmup_req = req.copy_as_warmup(self.server_args.warmup_steps)
             recv_reqs.insert(0, (identity, warmup_req))
             self._warmup_total = 1
             self._warmup_processed = 0
@@ -236,9 +306,13 @@ class Scheduler:
         if self.receiver is not None:
             try:
                 try:
-                    identity, _, payload = self.receiver.recv_multipart(zmq.NOBLOCK)
-                    recv_reqs = pickle.loads(payload)
-                except zmq.Again:
+                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
+                    parts = self.receiver.recv_multipart(zmq.NOBLOCK)
+                    identity, payload = parts[0], parts[-1]
+
+                    # Ignore malformed probes or non-pickle data
+                    recv_reqs = pickle.loads(payload) if len(parts) > 2 else []
+                except (zmq.Again, pickle.UnpicklingError, IndexError, EOFError):
                     recv_reqs = []
             except zmq.ZMQError:
                 # re-raise or handle appropriately to let the outer loop continue
@@ -359,12 +433,12 @@ class Scheduler:
                         if self._warmup_total > 0:
                             logger.info(
                                 f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.timings.total_duration_s,
+                                output_batch.metrics.total_duration_s,
                             )
                         else:
                             logger.info(
                                 f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
-                                output_batch.timings.total_duration_s,
+                                output_batch.metrics.total_duration_s,
                             )
                     else:
                         if self._warmup_total > 0:
@@ -372,7 +446,7 @@ class Scheduler:
                                 f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processing failed"
                             )
                         else:
-                            logger.info(f"Warmup req processing failed")
+                            logger.info("Warmup req processing failed")
 
                 # TODO: Support sending back to multiple identities if batched
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
@@ -381,10 +455,9 @@ class Scheduler:
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
 
-        logger.info("Scheduler event loop terminated.")
         if self.receiver is not None:
             self.receiver.close()
-        self.context.term()
+        self.context.destroy(linger=0)
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:
         """Broadcast a task to all slave worker processes."""

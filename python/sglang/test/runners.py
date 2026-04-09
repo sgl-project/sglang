@@ -15,6 +15,7 @@
 import json
 import multiprocessing as mp
 import os
+import queue as queue_mod
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
@@ -25,14 +26,14 @@ from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
-    AutoModelForVision2Seq,
+    AutoModelForImageTextToText,
     AutoProcessor,
     GenerationConfig,
 )
 
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
-from sglang.srt.utils import is_npu, load_image
+from sglang.srt.utils import get_device, is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
 
@@ -104,16 +105,35 @@ def _get_sentence_transformer_embedding_model(
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
 
+    from sglang.srt.utils.hf_transformers_utils import _fix_v5_add_bos_eos_token
+
     if is_sentence_transformer_model(model_path):
         model = SentenceTransformer(
             model_path,
             model_kwargs={"torch_dtype": torch_dtype},
+            # Force causal attention to match SGLang's RadixAttention behavior.
+            # In transformers v5, models with config.is_causal=false use
+            # bidirectional attention, but SGLang always uses causal attention.
+            config_kwargs={"is_causal": True},
             truncate_dim=matryoshka_dim,
         )
+        # Apply the same tokenizer fix as SGLang's get_tokenizer() so that
+        # BOS/EOS behavior matches between the HF reference and SRT.
+        _fix_v5_add_bos_eos_token(model.tokenizer, model_path)
     else:  # if no pre-trained sentence-transformers model
         from sentence_transformers import models
 
         word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        # In transformers v5, composite configs (e.g. Qwen2VLConfig) may not
+        # expose hidden_size at the top level.  Patch it from the text sub-config
+        # so sentence_transformers' get_word_embedding_dimension() works.
+        _cfg = word_embedding_model.auto_model.config
+        if not hasattr(_cfg, "hidden_size"):
+            for _sub_attr in ("text_config", "language_config", "llm_config"):
+                _sub = getattr(_cfg, _sub_attr, None)
+                if _sub and hasattr(_sub, "hidden_size"):
+                    _cfg.hidden_size = _sub.hidden_size
+                    break
         pooling_model = models.Pooling(
             word_embedding_model.get_word_embedding_dimension(),
             pooling_mode="lasttoken",
@@ -122,7 +142,7 @@ def _get_sentence_transformer_embedding_model(
             modules=[word_embedding_model, pooling_model], truncate_dim=matryoshka_dim
         )
 
-    return model.cuda()
+    return model.to(get_device())
 
 
 @dataclass
@@ -271,18 +291,18 @@ class HFRunner:
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.trust_remote_code,
                 low_cpu_mem_usage=True,
-            ).cuda()
+            ).to(get_device())
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
-                self.model = AutoModelForVision2Seq.from_pretrained(
+                self.model = AutoModelForImageTextToText.from_pretrained(
                     model_path,
                     torch_dtype=torch_dtype,
                     trust_remote_code=False,
                     low_cpu_mem_usage=True,
-                ).cuda()
+                ).to(get_device())
                 self.processor = AutoProcessor.from_pretrained(model_path)
             elif "clip" in model_path.lower():
-                self.model = AutoModel.from_pretrained(model_path).cuda()
+                self.model = AutoModel.from_pretrained(model_path).to(get_device())
                 self.processor = AutoProcessor.from_pretrained(model_path)
             else:
                 self.model = _get_sentence_transformer_embedding_model(
@@ -295,7 +315,7 @@ class HFRunner:
                 model_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.needs_trust_remote_code(model_path),
-            ).cuda()
+            ).to(get_device())
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
         self.tokenizer = get_tokenizer(
@@ -339,7 +359,8 @@ class HFRunner:
                             )
                             logits = self.model.get_image_features(
                                 pixel_values=inputs.data["pixel_values"].cuda(),
-                            ).tolist()
+                                return_dict=True,
+                            ).pooler_output.tolist()
                         else:
                             inputs = self.tokenizer(
                                 prompts, padding=True, return_tensors="pt"
@@ -347,14 +368,15 @@ class HFRunner:
                             logits = self.model.get_text_features(
                                 input_ids=inputs.data["input_ids"].cuda(),
                                 attention_mask=inputs.data["attention_mask"].cuda(),
-                            ).tolist()
+                                return_dict=True,
+                            ).pooler_output.tolist()
                     else:
                         logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
                 elif self.model_type == "cross_encoder":
                     inputs = self.tokenizer(
                         prompts, padding=True, return_tensors="pt"
-                    ).to("cuda")
+                    ).to(get_device())
                     scores = self.model(**inputs).logits
                     scores = scores.squeeze().tolist()
                     if not isinstance(scores, list):
@@ -369,7 +391,7 @@ class HFRunner:
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
-                        ).to("cuda")
+                        ).to(get_device())
                         scores.append(
                             float(self.model(**conv_tokenized).logits[0][0].item())
                         )
@@ -390,7 +412,16 @@ class HFRunner:
         self.in_queue.put(
             (prompts, image_data, max_new_tokens, lora_paths, token_ids_logprob)
         )
-        return self.out_queue.get()
+        while True:
+            try:
+                return self.out_queue.get(timeout=5)
+            except queue_mod.Empty:
+                if not self.model_proc.is_alive() and self.out_queue.empty():
+                    exitcode = self.model_proc.exitcode
+                    raise RuntimeError(
+                        f"HFRunner subprocess died with exit code {exitcode} "
+                        f"before producing output"
+                    )
 
     def terminate(self):
         self.model_proc.terminate()
@@ -426,9 +457,9 @@ class HFRunner:
 
         for i, p in enumerate(prompts):
             if isinstance(p, str):
-                input_ids = tokenizer.encode(p, return_tensors="pt").cuda()
+                input_ids = tokenizer.encode(p, return_tensors="pt").to(get_device())
             else:
-                input_ids = torch.tensor([p], device="cuda")
+                input_ids = torch.tensor([p], device=get_device())
 
             if lora_paths is not None and lora_paths[i] is not None:
                 from peft import PeftModel
@@ -518,6 +549,7 @@ class SRTRunner:
         torch_dtype: torch.dtype,
         model_type: str,
         tp_size: int = 1,
+        ep_size: int = 1,
         model_impl: str = "auto",
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
         lora_paths: Optional[Union[List[str], List[dict[str, str]]]] = None,
@@ -542,8 +574,6 @@ class SRTRunner:
         speculative_num_steps: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
-        speculative_ngram_min_match_window_size: Optional[int] = None,
-        speculative_ngram_max_match_window_size: Optional[int] = None,
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
         torchao_config: Optional[str] = None,
@@ -574,16 +604,12 @@ class SRTRunner:
             spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
         elif speculative_algorithm == "NGRAM":
             spec_kwargs["speculative_algorithm"] = speculative_algorithm
-            spec_kwargs["speculative_ngram_min_match_window_size"] = (
-                speculative_ngram_min_match_window_size
-            )
-            spec_kwargs["speculative_ngram_max_match_window_size"] = (
-                speculative_ngram_max_match_window_size
-            )
+            spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
 
         self.engine = Engine(
             model_path=model_path,
             tp_size=tp_size,
+            ep_size=ep_size,
             dtype=get_dtype_str(torch_dtype),
             port=port,
             model_impl=model_impl,
