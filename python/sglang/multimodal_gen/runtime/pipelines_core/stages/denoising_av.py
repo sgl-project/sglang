@@ -533,10 +533,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         )
         do_ti2v = self._should_apply_ltx2_ti2v(batch)
+        is_ti2v_request = (
+            batch.image_latent is not None
+            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
+        )
         replicate_audio_for_sp = (
             get_sp_world_size() > 1
             and is_ltx23_variant
-            and do_ti2v
+            and is_ti2v_request
             and server_args.pipeline_class_name != "LTX2TwoStagePipeline"
         )
         batch.ltx23_audio_replicated_for_sp = bool(replicate_audio_for_sp)
