@@ -69,7 +69,10 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
-_PREFETCH_BLOCK_SIZE = 16 * 1024 * 1024  # 16 MB
+# Tunable via SGLANG_PREFETCH_BLOCK_SIZE_MB environment variable.
+_PREFETCH_BLOCK_SIZE = (
+    int(os.environ.get("SGLANG_PREFETCH_BLOCK_SIZE_MB", "16")) * 1024 * 1024
+)
 
 
 # use system-level temp directory for file locks, so that multiple users
@@ -747,15 +750,15 @@ def _prefetch_all_checkpoints(
     my_files = sorted_files[rank::world_size]
     total_for_rank = len(my_files)
 
-    if rank == 0:
-        logger.info(
-            "Prefetching %d/%d checkpoint shards into page cache "
-            "(background, %d ranks sharing the work, %d threads per rank)...",
-            total_for_rank,
-            len(sorted_files),
-            world_size,
-            num_threads,
-        )
+    logger.info(
+        "Rank %d: prefetching %d/%d checkpoint shards into page cache "
+        "(background, %d ranks sharing the work, %d threads per rank)...",
+        rank,
+        total_for_rank,
+        len(sorted_files),
+        world_size,
+        num_threads,
+    )
 
     async def _prefetch_all() -> None:
         semaphore = asyncio.Semaphore(num_threads)
@@ -768,11 +771,12 @@ def _prefetch_all_checkpoints(
                 async with semaphore:
                     await asyncio.to_thread(_prefetch_checkpoint_file, path)
                 completed += 1
-                if rank == 0 and total_for_rank > 0 and next_log_pct <= 100:
+                if total_for_rank > 0 and next_log_pct <= 100:
                     pct = 100 * completed / total_for_rank
                     if pct >= next_log_pct:
                         logger.info(
-                            "Prefetching checkpoint files: %d%% (%d/%d)",
+                            "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
+                            rank,
                             next_log_pct,
                             completed,
                             total_for_rank,
@@ -791,11 +795,12 @@ def _prefetch_all_checkpoints(
         start = time.perf_counter()
         asyncio.run(_prefetch_all())
         elapsed = time.perf_counter() - start
-        if rank == 0:
-            logger.info(
-                "Prefetching checkpoint files into page cache " "finished in %.2fs",
-                elapsed,
-            )
+        logger.info(
+            "Rank %d: prefetching checkpoint files into page cache "
+            "finished in %.2fs",
+            rank,
+            elapsed,
+        )
 
     threading.Thread(target=_run_prefetch, daemon=True).start()
 

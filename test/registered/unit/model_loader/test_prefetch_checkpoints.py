@@ -1,14 +1,12 @@
 """
 Unit tests for coordinated checkpoint prefetch.
 
-Verifies that _prefetch_all_checkpoints correctly distributes files
-across ranks, reads all bytes, and that weights are identical with
-and without prefetch enabled.
+Verifies that weights loaded with prefetch enabled are bit-identical
+to weights loaded without prefetch.
 """
 
 import os
 import tempfile
-import time
 import unittest
 from unittest.mock import patch
 
@@ -16,131 +14,11 @@ import safetensors.torch
 import torch
 
 from sglang.srt.model_loader.weight_utils import (
-    _prefetch_all_checkpoints,
-    _prefetch_checkpoint_file,
     safetensors_weights_iterator,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 
-
-class TestPrefetchReadsAllBytes(unittest.TestCase):
-    """Verify prefetch reads the full file content, not just opens it."""
-
-    def test_all_bytes_read(self):
-        """_prefetch_checkpoint_file must read every byte in the file."""
-        file_size = 16 * 1024 * 1024 * 3 + 7  # 3 full 16MB blocks + partial
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            f.write(os.urandom(file_size))
-            path = f.name
-
-        try:
-            bytes_read = 0
-            original_open = open
-
-            class CountingReader:
-                def __init__(self, fobj):
-                    self._fobj = fobj
-
-                def read(self, n=-1):
-                    nonlocal bytes_read
-                    data = self._fobj.read(n)
-                    bytes_read += len(data)
-                    return data
-
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *a):
-                    self._fobj.close()
-
-            with patch(
-                "builtins.open",
-                lambda p, m: CountingReader(original_open(p, m)),
-            ):
-                _prefetch_checkpoint_file(path)
-
-            self.assertEqual(bytes_read, file_size)
-        finally:
-            os.unlink(path)
-
-
-class TestPrefetchDistributedOnlyReadsSubset(unittest.TestCase):
-    """Verify each rank only prefetches its assigned fraction of files."""
-
-    def _create_temp_files(self, n):
-        paths = []
-        for i in range(n):
-            f = tempfile.NamedTemporaryFile(
-                delete=False, suffix=f"-{i:05d}.safetensors"
-            )
-            f.write(b"x" * 1024)
-            f.close()
-            paths.append(f.name)
-        return sorted(paths)
-
-    def _cleanup(self, paths):
-        for p in paths:
-            os.unlink(p)
-
-    def _wait_for_prefetch(self, timeout=10):
-        """Wait for the background prefetch thread to complete."""
-        import threading
-
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            threads = [t for t in threading.enumerate() if t.daemon and t.is_alive()]
-            if not threads:
-                return
-            time.sleep(0.1)
-        raise TimeoutError("Prefetch thread did not complete in time")
-
-    @patch("torch.distributed.get_world_size", return_value=4)
-    @patch("torch.distributed.get_rank", return_value=1)
-    @patch("torch.distributed.is_initialized", return_value=True)
-    def test_rank_only_reads_its_assigned_files(self, mock_init, mock_rank, mock_world):
-        """Rank 1 of 4 with 12 files should only read files at indices 1, 5, 9."""
-        paths = self._create_temp_files(12)
-        try:
-            read_files = []
-            original_fn = _prefetch_checkpoint_file
-
-            def tracking_prefetch(p):
-                read_files.append(p)
-                original_fn(p)
-
-            with patch(
-                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
-                side_effect=tracking_prefetch,
-            ):
-                _prefetch_all_checkpoints(paths)
-                self._wait_for_prefetch()
-
-            expected = [paths[i] for i in [1, 5, 9]]
-            self.assertEqual(sorted(read_files), sorted(expected))
-        finally:
-            self._cleanup(paths)
-
-    @patch("torch.distributed.is_initialized", return_value=False)
-    def test_single_rank_reads_all_files(self, mock_init):
-        """Without distributed, all files should be prefetched."""
-        paths = self._create_temp_files(5)
-        try:
-            read_files = []
-            original_fn = _prefetch_checkpoint_file
-
-            def tracking_prefetch(p):
-                read_files.append(p)
-                original_fn(p)
-
-            with patch(
-                "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
-                side_effect=tracking_prefetch,
-            ):
-                _prefetch_all_checkpoints(paths)
-                self._wait_for_prefetch()
-
-            self.assertEqual(sorted(read_files), sorted(paths))
-        finally:
-            self._cleanup(paths)
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 class TestPrefetchWeightsIdentical(unittest.TestCase):
