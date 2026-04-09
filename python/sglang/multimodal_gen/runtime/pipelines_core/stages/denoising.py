@@ -811,6 +811,7 @@ class DenoisingStage(PipelineStage):
                     "sp_video_latent_num_frames",
                     "sp_video_start_frame",
                     "sp_video_tokens_per_frame",
+                    "sp_video_valid_token_count",
                 )
                 if hasattr(batch, name)
             }

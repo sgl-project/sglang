@@ -6,6 +6,9 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import LTX2Attention
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 
 
 class _FakeColumnParallelLinear(torch.nn.Module):
@@ -124,6 +127,41 @@ class TestLTX2SequenceParallelPadding(unittest.TestCase):
             _ = attn(x, mask=mask)
 
         self.assertIs(_CapturingUSPAttention.last_attn_mask, mask)
+
+    def test_image_latent_sp_shard_does_not_override_video_valid_token_count(self):
+        stage = object.__new__(DenoisingStage)
+        batch = SimpleNamespace(
+            latents=torch.randn(1, 6, 4),
+            image_latent=torch.randn(1, 2, 4),
+        )
+
+        class _FakePipelineConfig:
+            def shard_latents_for_sp(self, batch, latents):
+                if latents.shape[1] == 6:
+                    batch.sp_video_latent_num_frames = 3
+                    batch.sp_video_start_frame = 3
+                    batch.sp_video_tokens_per_frame = 2
+                    batch.sp_video_valid_token_count = 6
+                else:
+                    batch.sp_video_latent_num_frames = 1
+                    batch.sp_video_start_frame = 0
+                    batch.sp_video_tokens_per_frame = 2
+                    batch.sp_video_valid_token_count = 2
+                return latents, True
+
+        server_args = SimpleNamespace(pipeline_config=_FakePipelineConfig())
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising.get_sp_world_size",
+            return_value=2,
+        ):
+            stage._preprocess_sp_latents(batch, server_args)
+
+        self.assertTrue(batch.did_sp_shard_latents)
+        self.assertEqual(batch.sp_video_latent_num_frames, 3)
+        self.assertEqual(batch.sp_video_start_frame, 3)
+        self.assertEqual(batch.sp_video_tokens_per_frame, 2)
+        self.assertEqual(batch.sp_video_valid_token_count, 6)
 
 
 if __name__ == "__main__":
