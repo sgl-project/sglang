@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 
 logger = logging.getLogger(__name__)
@@ -294,6 +295,181 @@ class TokenizerManagerScoreMixin:
 
         return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
 
+    # ------------------------------------------------------------------
+    # Embed override position resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_overrides_for_sequence(
+        self,
+        token_ids: List[int],
+        embeds: Optional[List[torch.Tensor]],
+        embed_override_token_id: int,
+        position_offset: int = 0,
+        label: str = "input",
+    ) -> Tuple[List[torch.Tensor], List[int]]:
+        """Scan token_ids for placeholder occurrences and pair with embeddings.
+
+        Args:
+            token_ids: The token sequence to scan.
+            embeds: Embedding tensors to place at placeholder positions (None = skip).
+            embed_override_token_id: The placeholder token ID.
+            position_offset: Added to each found position (for absolute coordinates).
+            label: Label for error messages (e.g. "query", "items[2]").
+
+        Returns:
+            (embeds, positions) lists. Empty lists if embeds is None.
+        """
+        if embeds is None:
+            return [], []
+        positions = [
+            idx + position_offset
+            for idx, tok in enumerate(token_ids)
+            if tok == embed_override_token_id
+        ]
+        if len(positions) != len(embeds):
+            raise ValueError(
+                f"{label} contains {len(positions)} occurrences of "
+                f"embed_override_token_id={embed_override_token_id}, "
+                f"but {len(embeds)} override embeddings were provided."
+            )
+        return embeds, positions
+
+    def _resolve_embed_overrides_for_request(
+        self,
+        query: List[int],
+        item: List[int],
+        embed_override_token_id: int,
+        query_embed_overrides: Optional[List[torch.Tensor]],
+        item_embeds: Optional[List[torch.Tensor]],
+        item_position_offset: int,
+        item_label: str,
+    ) -> Optional[PositionalEmbeds]:
+        """Resolve embed overrides for a single query+item pair.
+
+        Returns PositionalEmbeds if any overrides exist, None otherwise.
+        """
+        q_embeds, q_positions = self._resolve_overrides_for_sequence(
+            query,
+            query_embed_overrides,
+            embed_override_token_id,
+            position_offset=0,
+            label="query",
+        )
+        i_embeds, i_positions = self._resolve_overrides_for_sequence(
+            item,
+            item_embeds,
+            embed_override_token_id,
+            position_offset=item_position_offset,
+            label=item_label,
+        )
+        all_embeds = q_embeds + i_embeds
+        all_positions = q_positions + i_positions
+        if not all_embeds:
+            return None
+        return PositionalEmbeds(embeds=all_embeds, positions=all_positions)
+
+    # ------------------------------------------------------------------
+    # Input preparation (tokenization + input_ids construction)
+    # ------------------------------------------------------------------
+
+    def _build_token_id_inputs(
+        self,
+        query: List[int],
+        items: List[List[int]],
+        item_first: bool,
+        use_multi_item_scoring: bool,
+        embed_override_token_id: Optional[int],
+        query_embed_overrides: Optional[List[torch.Tensor]],
+        item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]],
+    ) -> Tuple[None, List[List[int]], Optional[list]]:
+        """Build input_ids and resolve embed overrides for token-ID inputs.
+
+        Works identically for multi-item-scoring and single-item modes — the only difference is
+        how input_ids are assembled and what position offset each item gets.
+        """
+        # Both query and items are token IDs
+        has_embeds = (
+            query_embed_overrides is not None or item_embed_overrides is not None
+        )
+
+        if use_multi_item_scoring:
+            # Multi-item scoring: concatenate with delimiter token ID
+            # Format: query<delimiter_token_id>item1<delimiter_token_id>item2<delimiter_token_id>item3<delimiter_token_id>
+            delimiter_token_id = self.server_args.multi_item_scoring_delimiter
+            combined_input_ids = self._build_multi_item_token_sequence(
+                query, items, delimiter_token_id
+            )
+            input_ids = [combined_input_ids]
+
+            if not has_embeds:
+                return None, input_ids, None
+
+            # Resolve embed overrides across the combined multi-item-scoring sequence
+            all_embeds: List[torch.Tensor] = []
+            all_positions: List[int] = []
+            current_offset = len(query) + 1  # +1 for first delimiter
+            for i, item in enumerate(items):
+                item_embs = item_embed_overrides[i] if item_embed_overrides else None
+                pe = self._resolve_embed_overrides_for_request(
+                    query if i == 0 else [],  # only resolve query overrides once
+                    item,
+                    embed_override_token_id,
+                    query_embed_overrides if i == 0 else None,
+                    item_embs,
+                    current_offset,
+                    f"items[{i}]",
+                )
+                if pe is not None:
+                    # pe.embeds is a stacked tensor after PositionalEmbeds.__post_init__
+                    all_embeds.append(pe.embeds)
+                    all_positions.extend(pe.positions)
+                current_offset += len(item) + 1  # +1 for delimiter
+
+            if all_embeds:
+                injection = [
+                    PositionalEmbeds(
+                        embeds=torch.cat(all_embeds, dim=0),
+                        positions=all_positions,
+                    )
+                ]
+            else:
+                injection = None
+            return None, input_ids, injection
+
+        else:
+            # Single-item scoring: process each item separately
+            if item_first:
+                input_ids = [item + query for item in items]
+            else:
+                input_ids = [query + item for item in items]
+
+            if not has_embeds:
+                return None, input_ids, None
+
+            injection = []
+            for i, item in enumerate(items):
+                item_embs = item_embed_overrides[i] if item_embed_overrides else None
+                pe = self._resolve_embed_overrides_for_request(
+                    query,
+                    item,
+                    embed_override_token_id,
+                    query_embed_overrides,
+                    item_embs,
+                    item_position_offset=len(query),
+                    item_label=f"items[{i}]",
+                )
+                injection.append(pe)
+
+            return (
+                None,
+                input_ids,
+                injection if any(pe is not None for pe in injection) else None,
+            )
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
     async def score_request(
         self,
         query: Optional[Union[str, List[int]]] = None,
@@ -301,6 +477,9 @@ class TokenizerManagerScoreMixin:
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
+        embed_override_token_id: Optional[int] = None,
+        query_embed_overrides: Optional[List[torch.Tensor]] = None,
+        item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         request: Optional[Any] = None,
     ) -> ScoreResult:
         """
@@ -327,6 +506,9 @@ class TokenizerManagerScoreMixin:
             label_token_ids: List of token IDs to compute probabilities for
             apply_softmax: Whether to normalize probabilities using softmax
             item_first: If True, prepend items to query. Ignored for multi-item scoring.
+            embed_override_token_id: Placeholder token ID for embedding override positions.
+            query_embed_overrides: Embedding vectors replacing placeholder tokens in query.
+            item_embed_overrides: Per-item embedding vectors replacing placeholder tokens in items.
             request: Optional FastAPI request object
 
         Returns:
@@ -340,12 +522,26 @@ class TokenizerManagerScoreMixin:
             raise ValueError(
                 "label_token_ids is required for generation (CausalLM) models."
             )
-
         if items is None:
             raise ValueError("items must be provided")
         if not items:
             return ScoreResult(scores=[], prompt_tokens=0)
 
+        has_embeds = (
+            query_embed_overrides is not None or item_embed_overrides is not None
+        )
+        if has_embeds and embed_override_token_id is None:
+            raise ValueError(
+                "embed_override_token_id is required when query_embed_overrides "
+                "or item_embed_overrides are supplied."
+            )
+        if item_first and has_embeds:
+            raise ValueError("item_first is not supported when embeddings are supplied")
+        if item_embed_overrides is not None and len(item_embed_overrides) != len(items):
+            raise ValueError(
+                f"item_embed_overrides length ({len(item_embed_overrides)}) "
+                f"must match items length ({len(items)})."
+            )
         if self.tokenizer is not None and label_token_ids is not None:
             vocab_size = self.tokenizer.vocab_size
             for token_id in label_token_ids:
@@ -362,15 +558,13 @@ class TokenizerManagerScoreMixin:
 
         input_ids = None
         text_prompts = None
+        positional_embed_overrides = None
 
-        # Handle string or tokenized query/items
-        if isinstance(query, str) and (
-            isinstance(items, str)
-            or (isinstance(items, list) and (not items or isinstance(items[0], str)))
-        ):
+        use_text_prompts = isinstance(query, str) and not has_embeds
+
+        if use_text_prompts:
             # Both query and items are text
             items_list = [items] if isinstance(items, str) else items
-
             if use_multi_item_scoring:
                 # Multi-item scoring: tokenize separately then combine at token level
                 # to ensure the delimiter token ID is inserted exactly once per boundary
@@ -396,21 +590,29 @@ class TokenizerManagerScoreMixin:
             and items
             and isinstance(items[0], list)
         ):
-            # Both query and items are token IDs
-            if use_multi_item_scoring:
-                # Multi-item scoring: concatenate with delimiter token ID
-                # Format: query<delimiter_token_id>item1<delimiter_token_id>item2<delimiter_token_id>item3<delimiter_token_id>
-                delimiter_token_id = self.server_args.multi_item_scoring_delimiter
-                combined_input_ids = self._build_multi_item_token_sequence(
-                    query, items, delimiter_token_id
-                )
-                input_ids = [combined_input_ids]
-            else:
-                # Single-item scoring: process each item separately
-                if item_first:
-                    input_ids = [item + query for item in items]
-                else:
-                    input_ids = [query + item for item in items]
+            # Both query and items are token IDs — tokenize text inputs if needed for embed overrides
+            query_ids, items_ids = query, items
+            _, input_ids, positional_embed_overrides = self._build_token_id_inputs(
+                query_ids,
+                items_ids,
+                item_first,
+                use_multi_item_scoring,
+                embed_override_token_id,
+                query_embed_overrides,
+                item_embed_overrides,
+            )
+        elif has_embeds:
+            # Text inputs with embed overrides — need to tokenize first to resolve positions
+            query_ids, items_ids = self._batch_tokenize_query_and_items(query, items)
+            _, input_ids, positional_embed_overrides = self._build_token_id_inputs(
+                query_ids,
+                items_ids,
+                item_first,
+                use_multi_item_scoring,
+                embed_override_token_id,
+                query_embed_overrides,
+                item_embed_overrides,
+            )
         else:
             raise ValueError(
                 "Invalid combination of query/items types for score_request."
@@ -427,11 +629,13 @@ class TokenizerManagerScoreMixin:
                 logprob_start_len=0 if use_multi_item_scoring else -1,
                 stream=False,
                 sampling_params={"max_new_tokens": 0},
+                positional_embed_overrides=positional_embed_overrides,
             )
         else:
             batch_request = EmbeddingReqInput(
                 text=text_prompts,
                 input_ids=input_ids,
+                positional_embed_overrides=positional_embed_overrides,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()

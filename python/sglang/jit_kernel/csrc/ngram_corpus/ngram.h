@@ -50,9 +50,12 @@ class Ngram {
 
   void appendExternalCorpusTokens(const std::vector<int32_t>& tokens);
 
+  // Publishes the staged corpus. Duplicate corpus_id is rejected.
   void finishExternalCorpusLoad(const std::string& corpus_id);
 
   void removeExternalCorpus(const std::string& corpus_id);
+
+  void resetStagingSam();
 
   void clearExternalCorpus();
 
@@ -67,6 +70,9 @@ class Ngram {
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 
+  // Resets the online trie and match state but preserves external corpora
+  // (sams_). External corpora are user-managed via add/remove APIs and
+  // should not be affected by cache flushes.
   void reset() {
     std::unique_lock<std::mutex> lock(mutex_);
     if (trie_) {
