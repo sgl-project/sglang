@@ -41,6 +41,18 @@ def _jit_sparse_module(
     )
 
 
+@functools.cache
+def _jit_hisparse_utils_module() -> Module:
+    return load_jit(
+        "hisparse_utils",
+        cuda_files=["hisparse_utils.cuh"],
+        cuda_wrappers=[
+            ("gather_variable_length", "gather_variable_length<256>"),
+            ("finalize_accepted", "finalize_accepted<256>"),
+        ],
+    )
+
+
 def prepare_swap_mla(
     top_k_tokens: torch.Tensor,
     device_buffer_tokens: torch.Tensor,
@@ -129,4 +141,40 @@ def execute_h2d_copy_mla(
         num_real_reqs,
         num_top_k,
         item_size_bytes,
+    )
+
+
+def gather_variable_length(
+    buffer: torch.Tensor,
+    req_indices: torch.Tensor,
+    counts: torch.Tensor,
+    offsets: torch.Tensor,
+    output: torch.Tensor,
+    start_col: int,
+) -> None:
+    module = _jit_hisparse_utils_module()
+    module.gather_variable_length(
+        buffer, req_indices, counts, offsets, output, start_col,
+    )
+
+
+def finalize_accepted(
+    req_to_host_pool: torch.Tensor,
+    device_mapping: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    host_locs: torch.Tensor,
+    accepted_locs: torch.Tensor,
+    device_locs: torch.Tensor,
+    newest_phys: torch.Tensor,
+    cumsum: torch.Tensor,
+    needs_move: torch.Tensor,
+    last_accepted_out: torch.Tensor,
+    newest_slot_out: torch.Tensor,
+) -> None:
+    module = _jit_hisparse_utils_module()
+    module.finalize_accepted(
+        req_to_host_pool, device_mapping, req_pool_indices, seq_lens,
+        host_locs, accepted_locs, device_locs, newest_phys, cumsum,
+        needs_move, last_accepted_out, newest_slot_out,
     )

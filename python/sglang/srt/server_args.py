@@ -6435,11 +6435,33 @@ class ServerArgs:
                 ("nsa_decode_backend", "decode"),
             ]:
                 backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
+                if backend is not None and backend not in ("flashmla_sparse", "flashmla_kv"):
                     raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                        f"HiSparse requires flashmla_sparse or flashmla_kv NSA {label} backend, "
                         f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                        f"Please use --nsa-{label}-backend=flashmla_kv or omit it."
+                    )
+            if self.speculative_algorithm is not None:
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                hisparse_cfg = parse_hisparse_config(self)
+                hisparse_page_size = getattr(hisparse_cfg, "page_size", 64)
+                max_draft = self.speculative_num_draft_tokens
+                if max_draft > 0 and max_draft >= hisparse_page_size:
+                    raise ValueError(
+                        f"hiSparse extra page capacity ({hisparse_page_size - 1} slots) "
+                        f"is insufficient for speculative_num_draft_tokens={max_draft}. "
+                        f"Reduce draft tokens or increase hiSparse page_size."
+                    )
+                if (
+                    self.speculative_eagle_topk is not None
+                    and self.speculative_eagle_topk > 1
+                    and self.page_size > 1
+                ):
+                    raise ValueError(
+                        "HiSparse + EAGLE topk > 1 + page_size > 1 is not yet supported: "
+                        "move_kv_cache needs hisparse-aware loc translation. "
+                        "Use speculative_eagle_topk=1 or page_size=1."
                     )
 
         assert (

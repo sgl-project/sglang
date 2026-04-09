@@ -1553,6 +1553,22 @@ class NativeSparseAttnBackend(
                 # Dual-attention: async H2D overlaps hit-attention
                 coord.execute_h2d_async(miss_src_locs, miss_dst_locs, hit_count, layer.layer_id)
 
+                # Speculative decoding: draft tokens live in the extra page,
+                # outside the swap-in kernel's scope. Append their device locs
+                # to the hit list so the sparse attention kernel sees them.
+                # forward_decode is only dispatched for DECODE mode, so these checks
+                # are currently unreachable. They serve as defensive guards in case
+                # future dispatch changes route verify/extend through this path.
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                ) and forward_batch.spec_info is not None:
+                    draft_locs = self._get_draft_device_locs(forward_batch, layer)
+                    if draft_locs is not None:
+                        hit_device_locs = torch.cat(
+                            [hit_device_locs, draft_locs], dim=-1
+                        )
+
                 if q_rope is not None:
                     q_all = concat_mla_absorb_q_general(q_nope, q_rope)
                 return self._forward_flashmla_sparse_dual(
@@ -1728,6 +1744,57 @@ class NativeSparseAttnBackend(
 
         return o
 
+    def _get_draft_device_locs(self, forward_batch, layer):
+        """Get device buffer locations for draft tokens in the extra page.
+
+        During speculative decoding (TARGET_VERIFY / DRAFT_EXTEND), draft tokens'
+        KV lives in the extra page.  The swap-in kernel only manages the main
+        buffer [0, device_buffer_size), so draft tokens are invisible to hit/miss
+        classification.
+
+        Returns (num_reqs, num_draft_per_req) int32 tensor matching the per-request
+        convention of hit_device_locs, or None if not applicable.
+        """
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        if out_cache_loc is None or out_cache_loc.numel() == 0:
+            return None
+
+        device_locs = forward_batch.token_to_kv_pool._translate_loc_to_hisparse_device(
+            out_cache_loc
+        )
+
+        num_reqs = forward_batch.req_pool_indices.shape[0]
+        total = device_locs.numel()
+        if num_reqs == 0 or total == 0:
+            return None
+
+        # out_cache_loc is flat across the batch.  Reshape to per-request.
+        num_draft_per_req = total // num_reqs
+        if total != num_reqs * num_draft_per_req:
+            # Uneven distribution: scatter into padded 2D tensor using cumsum offsets
+            extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+            if extend_lens is not None:
+                counts = torch.tensor(extend_lens, dtype=torch.int32, device=device_locs.device)
+            else:
+                # Fallback: assume uniform truncated to total
+                counts = torch.full((num_reqs,), num_draft_per_req, dtype=torch.int32, device=device_locs.device)
+            max_per_req = int(counts.max().item())
+            padded = torch.full(
+                (num_reqs, max_per_req), -1, dtype=torch.int32, device=device_locs.device
+            )
+            offsets = torch.zeros(num_reqs + 1, dtype=torch.int64, device=device_locs.device)
+            offsets[1:] = torch.cumsum(counts.to(torch.int64), dim=0)
+            # Vectorized scatter: build flat indices into padded, then scatter
+            col_offsets = torch.arange(max_per_req, device=device_locs.device)
+            # mask[i, j] = (j < counts[i])
+            mask = col_offsets.unsqueeze(0) < counts.unsqueeze(1)
+            # flat_src_idx[i, j] = offsets[i] + j (valid only where mask is True)
+            flat_src_idx = offsets[:num_reqs].unsqueeze(1) + col_offsets.unsqueeze(0)
+            padded[mask] = device_locs[flat_src_idx[mask].long()].to(torch.int32)
+            return padded
+
+        return device_locs.to(torch.int32).reshape(num_reqs, num_draft_per_req)
+
     def _forward_flashmla_sparse_dual(
         self,
         q_all: torch.Tensor,
@@ -1741,59 +1808,64 @@ class NativeSparseAttnBackend(
         metadata: "NSAMetadata",
     ) -> torch.Tensor:
         """Dual-attention: hit attn overlaps H2D, then miss attn, then combine."""
+        import torch.cuda.nvtx as nvtx
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
         from sglang.srt.layers.attention.merge_state import merge_state
 
-        num_tokens = q_all.shape[0]
+        with nvtx.range("hisparse::dual_attn"):
+            num_tokens = q_all.shape[0]
 
-        q = q_all.view(num_tokens, 1, layer.tp_q_head_num, layer.head_dim)
-        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+            q = q_all.view(num_tokens, 1, layer.tp_q_head_num, layer.head_dim)
+            kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
 
-        if not self.nsa_kv_cache_store_fp8:
-            kv_cache = quantize_k_cache(kv_cache)
+            if not self.nsa_kv_cache_store_fp8:
+                kv_cache = quantize_k_cache(kv_cache)
 
-        cache_seqlens = metadata.nsa_cache_seqlens_int32
-        tile_meta = metadata.flashmla_metadata.flashmla_metadata
-        num_splits = metadata.flashmla_metadata.num_splits
-        block_table = torch.empty(
-            (num_tokens, 0), dtype=torch.int32, device=q.device
-        )
+            cache_seqlens = metadata.nsa_cache_seqlens_int32
+            tile_meta = metadata.flashmla_metadata.flashmla_metadata
+            num_splits = metadata.flashmla_metadata.num_splits
+            block_table = torch.empty(
+                (num_tokens, 0), dtype=torch.int32, device=q.device
+            )
 
-        # Hit attention (overlaps with H2D on transfer stream)
-        hit_indices = hit_device_locs.unsqueeze(1)  # (num_reqs, 1, topk)
-        o_hit, lse_hit = flash_mla_with_kvcache(
-            q=q, k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=v_head_dim,
-            tile_scheduler_metadata=tile_meta,
-            num_splits=num_splits,
-            softmax_scale=sm_scale,
-            block_table=block_table,
-            is_fp8_kvcache=True,
-            indices=hit_indices,
-        )
+            # Hit attention (overlaps with H2D on transfer stream)
+            with nvtx.range("hisparse::hit_attn"):
+                hit_indices = hit_device_locs.unsqueeze(1)  # (num_reqs, 1, topk)
+                o_hit, lse_hit = flash_mla_with_kvcache(
+                    q=q, k_cache=kv_cache,
+                    cache_seqlens=cache_seqlens,
+                    head_dim_v=v_head_dim,
+                    tile_scheduler_metadata=tile_meta,
+                    num_splits=num_splits,
+                    softmax_scale=sm_scale,
+                    block_table=block_table,
+                    is_fp8_kvcache=True,
+                    indices=hit_indices,
+                )
 
-        hisparse_coordinator.wait_h2d()
+            hisparse_coordinator.wait_h2d()
 
-        # Miss attention: -1 indices → lse=-inf, merge_state gives zero weight
-        miss_indices = miss_device_locs.unsqueeze(1)  # (num_reqs, 1, topk)
-        o_miss, lse_miss = flash_mla_with_kvcache(
-            q=q, k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=v_head_dim,
-            tile_scheduler_metadata=tile_meta,
-            num_splits=num_splits,
-            softmax_scale=sm_scale,
-            block_table=block_table,
-            is_fp8_kvcache=True,
-            indices=miss_indices,
-        )
+            # Miss attention: -1 indices → lse=-inf, merge_state gives zero weight
+            with nvtx.range("hisparse::miss_attn"):
+                miss_indices = miss_device_locs.unsqueeze(1)  # (num_reqs, 1, topk)
+                o_miss, lse_miss = flash_mla_with_kvcache(
+                    q=q, k_cache=kv_cache,
+                    cache_seqlens=cache_seqlens,
+                    head_dim_v=v_head_dim,
+                    tile_scheduler_metadata=tile_meta,
+                    num_splits=num_splits,
+                    softmax_scale=sm_scale,
+                    block_table=block_table,
+                    is_fp8_kvcache=True,
+                    indices=miss_indices,
+                )
 
-        # flash_mla_with_kvcache returns natural-log lse; merge_state expects the same
-        o, _ = merge_state(
-            o_hit.squeeze(1), lse_hit.squeeze(-1),
-            o_miss.squeeze(1), lse_miss.squeeze(-1),
-        )
+            # flash_mla_with_kvcache returns natural-log lse; merge_state expects the same
+            with nvtx.range("hisparse::merge_state"):
+                o, _ = merge_state(
+                    o_hit.squeeze(1), lse_hit.squeeze(-1),
+                    o_miss.squeeze(1), lse_miss.squeeze(-1),
+                )
         # Restore seq_len_q dim to match _forward_flashmla_kv output shape
         return o.unsqueeze(1)
 

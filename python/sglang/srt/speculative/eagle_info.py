@@ -124,15 +124,25 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 batch.req_pool_indices,
                 prefix_lens,
             )
-            batch.out_cache_loc = alloc_paged_token_slots_extend(
-                batch.tree_cache,
-                prefix_lens,
-                prefix_lens_cpu,
-                end_offset,
-                end_offset_cpu,
-                last_loc,
-                len(batch.input_ids),
-            )
+            if batch.hisparse_coordinator is not None:
+                allocator = batch.tree_cache.token_to_kv_pool_allocator
+                device_slots = batch.hisparse_coordinator.get_draft_device_slots(
+                    batch.req_pool_indices, self.draft_token_num,
+                )
+                batch.out_cache_loc = allocator.alloc_extend_with_device_mapping(
+                    prefix_lens, prefix_lens_cpu, end_offset, end_offset_cpu,
+                    last_loc, len(batch.input_ids), device_slots,
+                )
+            else:
+                batch.out_cache_loc = alloc_paged_token_slots_extend(
+                    batch.tree_cache,
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    len(batch.input_ids),
+                )
             self.last_loc = last_loc
 
         bs = batch.batch_size()
@@ -449,6 +459,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # try to unify the tensor representation and list representation
         accept_length_list = accept_length_cpu.tolist()
 
+        hisparse_coordinator = getattr(batch, "hisparse_coordinator", None)
+
+        # HiSparse: finalize accepted tokens FIRST (reads device mapping for D2H backup),
+        # then clear rejected mappings, then free. Non-hisparse: free immediately.
+        if hisparse_coordinator is not None:
+            hisparse_coordinator.finalize_accepted_tokens(
+                batch.req_pool_indices,
+                batch.out_cache_loc[accept_index],
+                accept_length,
+                batch.seq_lens + accept_length + 1,  # post-accept seq_lens
+            )
+            # Clear mapping for rejected tokens so free_hisparse() won't corrupt allocator.
+            # Accepted tokens' mapping was already set by finalize (last→newest, rest→0).
+            token_to_kv_pool_allocator.clear_device_mapping(
+                batch.out_cache_loc[evict_mask]
+            )
+
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
@@ -504,11 +531,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 token_to_kv_pool_allocator.free(to_free_slots)
 
                 # Copy the kv cache
+                if hisparse_coordinator is not None:
+                    raise NotImplementedError(
+                        "HiSparse + EAGLE topk > 1 + page_size > 1: move_kv_cache "
+                        "needs hisparse-aware loc translation (not yet implemented)"
+                    )
                 batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                     tgt_cache_loc, src_cache_loc
                 )
 
-        # Construct EagleVerifyOutput
         if not has_finished:
             if page_size == 1 or self.topk == 1:
                 batch.out_cache_loc = batch.out_cache_loc[accept_index]
@@ -656,6 +687,45 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
+    @staticmethod
+    def _slice_tensor(
+        value: Optional[torch.Tensor], idx: int
+    ) -> Optional[torch.Tensor]:
+        """Slice a single element from a tensor, preserving batch dimension."""
+        if value is None:
+            return None
+        if value.ndim == 0:
+            return value.clone()
+        return value[idx : idx + 1].clone()
+
+    def slice_single(self, batch_index: int) -> "EagleDraftInput":
+        """Create a new EagleDraftInput with a single request sliced from this batch."""
+        return EagleDraftInput(
+            topk_p=self._slice_tensor(self.topk_p, batch_index),
+            topk_index=self._slice_tensor(self.topk_index, batch_index),
+            hidden_states=self._slice_tensor(self.hidden_states, batch_index),
+            capture_hidden_mode=self.capture_hidden_mode,
+            verified_id=self._slice_tensor(self.verified_id, batch_index),
+            accept_length=self._slice_tensor(self.accept_length, batch_index),
+            accept_length_cpu=(
+                None
+                if self.accept_length_cpu is None
+                else [self.accept_length_cpu[batch_index]]
+            ),
+            seq_lens_for_draft_extend=self._slice_tensor(
+                self.seq_lens_for_draft_extend, batch_index
+            ),
+            seq_lens_for_draft_extend_cpu=self._slice_tensor(
+                self.seq_lens_for_draft_extend_cpu, batch_index
+            ),
+            req_pool_indices_for_draft_extend=self._slice_tensor(
+                self.req_pool_indices_for_draft_extend, batch_index
+            ),
+            num_tokens_per_req=self.num_tokens_per_req,
+            num_tokens_for_logprob_per_req=self.num_tokens_for_logprob_per_req,
+            new_seq_lens=self._slice_tensor(self.new_seq_lens, batch_index),
+        )
+
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
@@ -709,6 +779,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
+        batch.prefix_lens = batch.seq_lens_cpu.tolist()
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
         batch.return_logprob = False
         batch.return_hidden_states = False
@@ -786,7 +857,29 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
 
+    @staticmethod
+    def _merge_tensor(
+        a: Optional[torch.Tensor], b: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """Merge two optional tensors by concatenation."""
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return torch.cat([a, b], dim=0)
+
+    @staticmethod
+    def _merge_list(a: Optional[List], b: Optional[List]) -> Optional[List]:
+        """Merge two optional lists by concatenation."""
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a + b
+
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        if spec_info is None:
+            return
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = FutureIndices(
@@ -801,15 +894,43 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.accept_length = spec_info.accept_length
+            self.accept_length_cpu = spec_info.accept_length_cpu
+            self.seq_lens_for_draft_extend = spec_info.seq_lens_for_draft_extend
+            self.seq_lens_for_draft_extend_cpu = spec_info.seq_lens_for_draft_extend_cpu
+            self.req_pool_indices_for_draft_extend = (
+                spec_info.req_pool_indices_for_draft_extend
+            )
+            self.new_seq_lens = spec_info.new_seq_lens
             return
         if spec_info.hidden_states is None:
             return
+
         self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
+            [self.hidden_states, spec_info.hidden_states], dim=0
         )
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
-        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
+        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p], dim=0)
+        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index], dim=0)
+        self.accept_length = self._merge_tensor(
+            self.accept_length, spec_info.accept_length
+        )
+        self.accept_length_cpu = self._merge_list(
+            self.accept_length_cpu, spec_info.accept_length_cpu
+        )
+        self.seq_lens_for_draft_extend = self._merge_tensor(
+            self.seq_lens_for_draft_extend, spec_info.seq_lens_for_draft_extend
+        )
+        self.seq_lens_for_draft_extend_cpu = self._merge_tensor(
+            self.seq_lens_for_draft_extend_cpu, spec_info.seq_lens_for_draft_extend_cpu
+        )
+        self.req_pool_indices_for_draft_extend = self._merge_tensor(
+            self.req_pool_indices_for_draft_extend,
+            spec_info.req_pool_indices_for_draft_extend,
+        )
+        self.new_seq_lens = self._merge_tensor(
+            self.new_seq_lens, spec_info.new_seq_lens
+        )
 
 
 @dataclass
