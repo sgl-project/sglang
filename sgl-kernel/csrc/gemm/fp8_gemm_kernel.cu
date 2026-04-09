@@ -1482,8 +1482,6 @@ torch::Tensor fp8_scaled_mm(
   TORCH_CHECK(scales_a.scalar_type() == torch::kFloat32, "scales_a must be Float32");
   TORCH_CHECK(scales_b.scalar_type() == torch::kFloat32, "scales_b must be Float32");
 
-
-
   if (bias) {
     TORCH_CHECK(bias->numel() == mat_b.size(1), "size of bias is not matched");
     TORCH_CHECK(bias->is_contiguous(), "bias must be contiguous");
@@ -1495,8 +1493,13 @@ torch::Tensor fp8_scaled_mm(
     out = out_opt.value();
     TORCH_CHECK(out.is_cuda(), "out must be a CUDA tensor");
     TORCH_CHECK(out.dim() == 2, "out must be a 2D tensor");
-    TORCH_CHECK(out.size(0) == mat_a.size(0) && out.size(1) == mat_b.size(1),
-                "out shape must be [", mat_a.size(0), ", ", mat_b.size(1), "]");
+    TORCH_CHECK(
+        out.size(0) == mat_a.size(0) && out.size(1) == mat_b.size(1),
+        "out shape must be [",
+        mat_a.size(0),
+        ", ",
+        mat_b.size(1),
+        "]");
     TORCH_CHECK(out.dtype() == out_dtype, "out dtype must match out_dtype");
     TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
   } else {
