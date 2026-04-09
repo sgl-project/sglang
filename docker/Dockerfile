@@ -163,6 +163,7 @@ ENV LANG=en_US.UTF-8 \
 #     |                  \-> flashinfer_cache (needs flashinfer)
 #     |
 #     +-- devtools_builder (independent)
+#     +-- gateway_builder  (independent, only needs gateway source)
 #     |
 #     v
 #   framework (combines all artifacts)
@@ -224,7 +225,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
-    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} . \
+    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
@@ -304,6 +305,7 @@ ARG FLASHINFER_VERSION
 ARG BUILD_AND_DOWNLOAD_PARALLEL
 
 # Download flashinfer cubins
+# Stage jit-cache artifacts into /flashinfer_jit_output for clean COPY later
 RUN --mount=type=cache,target=/root/.cache/pip \
     case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
@@ -312,8 +314,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         13.0.1) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
+    && mkdir -p /flashinfer_jit_output \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} \
+        && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache /flashinfer_jit_output/ \
+        && cp -r /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache-*.dist-info /flashinfer_jit_output/ ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
@@ -326,42 +331,10 @@ ARG GITHUB_ARTIFACTORY
 
 WORKDIR /tools
 
-# Install development apt packages
+# Minimal apt deps needed for oh-my-zsh install in this stage
+# Full dev apt packages (gdb, vim, tmux, nsight, etc.) are installed in the framework stage
 RUN --mount=type=cache,target=/var/cache/apt,id=devtools-apt \
-    apt-get update && apt-get install -y --no-install-recommends \
-    gdb \
-    ninja-build \
-    vim \
-    tmux \
-    htop \
-    zsh \
-    tree \
-    silversearcher-ag \
-    cloc \
-    pkg-config \
-    bear \
-    less \
-    rdma-core \
-    openssh-server \
-    gnuplot \
-    infiniband-diags \
-    perftest \
-    ibverbs-providers \
-    libibumad3 \
-    libibverbs1 \
-    libnl-3-200 \
-    libnl-route-3-200 \
-    librdmacm1 \
-    gnupg \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-# Install NVIDIA development tools
-RUN --mount=type=cache,target=/var/cache/apt,id=devtools-apt \
-    echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
-    && apt update -y \
-    && apt install -y --no-install-recommends nsight-systems-cli \
+    apt-get update && apt-get install -y --no-install-recommends zsh git \
     && rm -rf /var/lib/apt/lists/*
 
 # Download CLI tools (each in its own layer for parallel downloads)
@@ -400,6 +373,35 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
 ########################################################
+# PARALLEL STAGE 5: Gateway Builder (starts from base)
+########################################################
+# Builds sgl-model-gateway in isolation so Python-only changes
+# don't trigger a full Rust recompilation.
+FROM base AS gateway_builder
+
+ARG GITHUB_ARTIFACTORY
+ARG BRANCH_TYPE
+ARG SGL_VERSION
+ARG USE_LATEST_SGLANG
+
+WORKDIR /build
+
+# Copy ONLY the gateway source (not the full repo)
+COPY sgl-model-gateway /build/sgl-model-gateway
+
+# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
+RUN --mount=type=cache,target=/root/.cache/pip \
+    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && export PATH="/root/.cargo/bin:${PATH}" \
+    && python3 -m pip install maturin \
+    && cd /build/sgl-model-gateway/bindings/python \
+    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
+    && cd /build/sgl-model-gateway \
+    && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
+    && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
+    && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
+
+########################################################
 ########## Final Framework Image ######################
 ########################################################
 #
@@ -429,8 +431,9 @@ COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
-# Copy flashinfer cache
+# Copy flashinfer cache and jit-cache package (if installed)
 COPY --from=flashinfer_cache /root/.cache/flashinfer /root/.cache/flashinfer
+COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
 # Copy dev tools
 COPY --from=devtools_builder /tools/diff-so-fancy /usr/local/bin/
@@ -596,26 +599,17 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
-    && python3 -m pip install --no-deps -e "python" \
+    && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true \
     && find /usr/local/lib/python3.12/dist-packages -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true \
     && find /usr/local/lib/python3.12/dist-packages -name "*.pyc" -delete 2>/dev/null || true
 
-# Build and install sgl-model-gateway (install Rust, build, then remove Rust toolchain)
-# Cleanup runs unconditionally via trap to ensure Rust artifacts don't bloat the layer
+# Install pre-built gateway artifacts from parallel builder
+COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway
+COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
 RUN --mount=type=cache,target=/root/.cache/pip \
-    cleanup() { rm -rf /root/.cargo /root/.rustup /sgl-workspace/sglang/sgl-model-gateway/target /sgl-workspace/sglang/sgl-model-gateway/bindings/python/target /sgl-workspace/sglang/sgl-model-gateway/bindings/python/dist; sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null; } \
-    && trap cleanup EXIT \
-    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && export PATH="/root/.cargo/bin:${PATH}" \
-    && rustc --version && cargo --version \
-    && python3 -m pip install maturin \
-    && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
-    && python3 -m pip install --force-reinstall dist/*.whl \
-    && cd /sgl-workspace/sglang/sgl-model-gateway \
-    && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
-    && cp target/release/sgl-model-gateway /usr/local/bin/sgl-model-gateway
+    python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
+    && rm -rf /tmp/gateway_wheels
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
