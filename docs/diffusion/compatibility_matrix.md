@@ -73,121 +73,70 @@ CLI:
 ```bash
 sglang generate \
   --model-path black-forest-labs/FLUX.2-dev \
-  --vae-path black-forest-labs/FLUX.2-small-decoder
-```
-
-### VAE Components
-
-Supported keys:
-
-- `vae`
-- `video_vae`
-- `audio_vae`
-
-Examples:
-
-```bash
-sglang generate \
-  --model-path black-forest-labs/FLUX.2-dev \
   --vae-path black-forest-labs/FLUX.2-small-decoder \
-  --prompt "A curious raccoon" \
-  --save-output
+  --transformer-path /models/flux2/transformer
 ```
 
+Config file:
 
-### Transformer / DiT Components
-
-Supported keys:
-
-- `transformer`
-- `video_dit`
-- `audio_dit`
-
-Typical usage:
-
-- Use `--transformer-path` to replace the main denoising transformer component.
-- Prefer `--transformer-path` or `--transformer-weights-path` for quantized or
-  custom transformer checkpoints; see `quantization.md` for the quantized flow.
-- Use `--video-dit-path` or `--audio-dit-path` when a pipeline splits denoisers
-  by modality.
-
-Example:
-
-```bash
-sglang generate \
-  --model-path Tongyi-MAI/Z-Image-Turbo \
-  --transformer-path /models/zimage/transformer \
-  --prompt "A red tram in heavy rain"
+```yaml
+model_path: black-forest-labs/FLUX.2-dev
+component_paths:
+  vae: black-forest-labs/FLUX.2-small-decoder
+  transformer: /models/flux2/transformer
 ```
 
-### Text Encoder Components
+Use the component name from the pipeline's `model_index.json` or the native
+pipeline's registered module name:
 
-Supported keys:
+- `vae`, `video_vae`, `audio_vae`
+- `transformer`, `video_dit`, `audio_dit`
+- `text_encoder`, `text_encoder_2`
+- `tokenizer`, `processor`, `image_processor`
+- `scheduler`, `spatial_upsampler`, `vocoder`
+- `connectors`, `dual_tower_bridge`
+- `image_encoder`, `vision_language_encoder`
 
-- `text_encoder`
-- `text_encoder_2`
-- `tokenizer`
-- `processor`
-- `image_processor`
+### VAE
 
-Typical usage:
+- `--vae-path` is the common image-generation override.
+- `--video-vae-path` and `--audio-vae-path` are only relevant for pipelines
+  with separate video or audio VAEs.
 
-- Use `--text-encoder-path` when swapping the primary text encoder.
-- Use `--text-encoder-2-path` for dual-encoder pipelines such as FLUX-family
-  pipelines.
-- Use `--tokenizer-path`, `--processor-path`, or `--image-processor-path` when
-  the replacement encoder requires matching preprocessing assets.
+### Transformer / DiT
 
-Example:
+- `--transformer-path` is the standard override for the main denoising
+  transformer.
+- For quantized transformers, prefer `--transformer-path` or
+  `--transformer-weights-path`; see `quantization.md`.
+- `--video-dit-path` and `--audio-dit-path` are only for pipelines that split
+  denoisers by modality.
 
-```bash
-sglang serve \
-  --model-path black-forest-labs/FLUX.2-dev \
-  --text-encoder-2-path /models/flux2/text_encoder_2 \
-  --tokenizer-path /models/flux2/tokenizer
-```
+### Text Encoders and Preprocessors
+
+- `--text-encoder-path` and `--text-encoder-2-path` override primary and
+  secondary text encoders.
+- `--tokenizer-path`, `--processor-path`, and `--image-processor-path` are
+  useful when the replacement encoder requires matching preprocessing assets.
 
 ### Auxiliary Components
 
-Supported keys:
-
-- `scheduler`
-- `spatial_upsampler`
-- `vocoder`
-- `connectors`
-- `dual_tower_bridge`
-- `image_encoder`
-- `vision_language_encoder`
-
-Typical usage:
-
-- Use `--scheduler-path` when a pipeline needs a custom scheduler config.
-- Use `--spatial-upsampler-path` for two-stage pipelines such as
+- `--scheduler-path` overrides the scheduler component when a pipeline exposes
+  one.
+- `--spatial-upsampler-path` is mainly for two-stage pipelines such as
   `LTX2TwoStagePipeline`.
-- Use `--vocoder-path` for pipelines with a separate waveform decoder.
-- Use `--connectors-path`, `--dual-tower-bridge-path`, `--image-encoder-path`,
-  or `--vision-language-encoder-path` only when the target pipeline exposes
-  those components.
+- `--vocoder-path`, `--connectors-path`, `--dual-tower-bridge-path`,
+  `--image-encoder-path`, and `--vision-language-encoder-path` are only valid
+  for pipelines that expose those components.
+- `distilled_lora` is not a general component loader key, but it is accepted as
+  a path override for `LTX2TwoStagePipeline`.
 
-Example:
-
-```bash
-sglang generate \
-  --model-path Lightricks/LTX-2.3 \
-  --pipeline-class-name LTX2TwoStagePipeline \
-  --spatial-upsampler-path /models/ltx23/spatial_upsampler \
-  --distilled-lora-path /models/ltx23/distilled_lora.safetensors \
-  --prompt "A neon-lit alley after the rain"
-```
-
-Notes:
+### Notes
 
 1. Component overrides are only valid when the target pipeline actually uses
    that component.
 2. The override key should match the component name in the pipeline's
    `model_index.json` or the native pipeline's registered module name.
-3. `distilled_lora` is not a general component loader key, but it is accepted as
-   a path override for `LTX2TwoStagePipeline`.
 
 ## Verified LoRA Examples
 
