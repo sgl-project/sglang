@@ -6,9 +6,10 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
+# Runs on both H200 and B200 via nightly-8-gpu-common suite
+register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
-MODEL_PATH = "zai-org/GLM-5.1-FP8"
+GLM_51_FP8_MODEL_PATH = "zai-org/GLM-5.1-FP8"
 
 COMMON_ARGS = [
     "--trust-remote-code",
@@ -26,30 +27,30 @@ MTP_ARGS = [
 ]
 
 
-class TestGlm5Fp8(unittest.TestCase):
-    """GLM-5.1 FP8 on GB300 (4x B200 NVL4, tp=4)."""
+class TestGlm51Fp8(unittest.TestCase):
+    """GLM-5.1 FP8 on H200/B200 (8-GPU, tp=8)."""
 
-    def test_glm5_fp8(self):
+    def test_glm51_fp8(self):
+        dp_args = ["--dp=8", "--enable-dp-attention"]
+
         variants = [
             ModelLaunchSettings(
-                MODEL_PATH,
-                tp_size=4,
+                GLM_51_FP8_MODEL_PATH,
+                tp_size=8,
                 extra_args=COMMON_ARGS,
-                variant="TP4",
+                variant="TP8",
             ),
             ModelLaunchSettings(
-                MODEL_PATH,
-                tp_size=4,
-                extra_args=COMMON_ARGS + ["--dp-size=4", "--enable-dp-attention"],
-                variant="TP4+DP4+DPA",
+                GLM_51_FP8_MODEL_PATH,
+                tp_size=8,
+                extra_args=COMMON_ARGS + dp_args,
+                variant="TP8+DP8",
             ),
             ModelLaunchSettings(
-                MODEL_PATH,
-                tp_size=4,
-                extra_args=COMMON_ARGS
-                + ["--dp-size=4", "--enable-dp-attention"]
-                + MTP_ARGS,
-                variant="TP4+DP4+DPA+MTP",
+                GLM_51_FP8_MODEL_PATH,
+                tp_size=8,
+                extra_args=COMMON_ARGS + dp_args + MTP_ARGS,
+                variant="TP8+DP8+MTP",
                 env={"SGLANG_ENABLE_SPEC_V2": "1"},
             ),
         ]
@@ -59,7 +60,7 @@ class TestGlm5Fp8(unittest.TestCase):
             test_name="GLM-5.1-FP8",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gb300",
+                profile_dir="performance_profiles_glm_51_fp8",
             ),
         )
 
