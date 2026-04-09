@@ -254,12 +254,19 @@ class EagleVerifyInputV2Mixin:
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
-                batch.mamba_track_indices = torch.stack(
-                    [
-                        req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
-                        for req in batch.reqs
-                    ]
-                ).to(torch.int64)
+                track_indices = []
+                for req in batch.reqs:
+                    if req.pending_radix_mamba_slot is not None:
+                        req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
+                    radix_slot = req_to_token_pool.mamba_pool.alloc(1)
+                    assert radix_slot is not None, (
+                        "Not enough space for mamba radix slot in eagle v2 verify"
+                    )
+                    req.pending_radix_mamba_slot = radix_slot
+                    track_indices.append(radix_slot[0].item())
+                batch.mamba_track_indices = torch.tensor(
+                    track_indices, dtype=torch.int64, device=device
+                )
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 

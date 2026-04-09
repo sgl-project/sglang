@@ -570,32 +570,20 @@ class SchedulerOutputProcessorMixin:
         i: int,
     ) -> None:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-        if req.mamba_ping_pong_track_buffer is not None:
+        if get_global_server_args().enable_mamba_extra_buffer():
             mamba_track_interval = get_global_server_args().mamba_track_interval
             if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
-                # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
-                req.mamba_next_track_idx = (
-                    batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
-                )
                 req.mamba_last_track_seqlen = seq_len
             elif (
                 not batch.spec_algorithm.is_none()
                 and result.accept_length_per_req_cpu is not None
             ):
-                # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
                 actual_seq_len = req.seqlen - 1
                 if (
                     actual_seq_len // mamba_track_interval
                     != (actual_seq_len - result.accept_length_per_req_cpu[i])
                     // mamba_track_interval
                 ):
-                    req.mamba_next_track_idx = (
-                        batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                            req.mamba_next_track_idx
-                        )
-                    )
                     req.mamba_last_track_seqlen = (
                         actual_seq_len // mamba_track_interval * mamba_track_interval
                     )

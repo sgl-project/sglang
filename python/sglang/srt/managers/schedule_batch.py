@@ -667,13 +667,12 @@ class Req(ReqDllmMixin):
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
-        self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
-        self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
+        self.pending_radix_mamba_slot: Optional[torch.Tensor] = None  # shape (1), pre-allocated radix target slot
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
         # the branching point seqlen to track mamba state. If set, given by prefix match,
-        # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
+        # it will be the tracked seqlen for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
 
         # Check finish
@@ -1211,8 +1210,7 @@ class Req(ReqDllmMixin):
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
         self.mamba_pool_idx = None
-        self.mamba_ping_pong_track_buffer = None
-        self.mamba_next_track_idx = None
+        self.pending_radix_mamba_slot = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
@@ -1856,10 +1854,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
         mask = req.extend_input_len >= mamba_cache_chunk_size
+
+        if mask:
+            # Pre-allocate a radix slot as the direct target for the track kernel
+            if req.pending_radix_mamba_slot is not None:
+                self.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
+            radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
+            assert radix_slot is not None, (
+                "Not enough space for mamba radix slot during extend prepare, "
+                "try to increase --mamba-full-memory-ratio."
+            )
+            req.pending_radix_mamba_slot = radix_slot
+            track_index = radix_slot[0].item()
+        else:
+            track_index = 0  # placeholder, won't be used when mask=False
+
         mamba_track_mask_cpu.append(mask)
-        mamba_track_indices_cpu.append(
-            req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
-        )
+        mamba_track_indices_cpu.append(track_index)
+
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -1888,18 +1900,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
-                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            req.mamba_next_track_idx = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-            )
             if req.mamba_branching_seqlen is not None:
-                # track branching point in this forward if the branching point
-                # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
                     req.mamba_branching_seqlen - len(req.prefix_indices)
                 ) % mamba_cache_chunk_size == 0
@@ -1908,9 +1911,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     and req.mamba_branching_seqlen < mamba_track_seqlen
                     and branching_seqlen_aligned_mask
                 ):
-                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                    # See _force_track_h() for more details.
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
@@ -2197,34 +2197,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():
+            mamba_track_interval = get_global_server_args().mamba_track_interval
+
+            # Compute track mask first (which reqs need tracking this iteration)
+            self.mamba_track_mask = (
+                (self.seq_lens_cpu % mamba_track_interval == 0)
+                .pin_memory()
+                .to(device=self.device, non_blocking=True)
+            )
+
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
             else:
-                # already on device
-                all_buffers = torch.stack(
-                    [req.mamba_ping_pong_track_buffer for req in self.reqs]
-                )
-                idx = (
-                    torch.tensor(
-                        [req.mamba_next_track_idx for req in self.reqs],
-                        dtype=torch.int64,
-                        pin_memory=True,
-                    )
-                    .unsqueeze(1)
-                    .to(device=all_buffers.device, non_blocking=True)
-                )
+                track_indices_cpu = []
+                for i, req in enumerate(self.reqs):
+                    need_track = (self.seq_lens_cpu[i].item() % mamba_track_interval == 0)
+                    if need_track:
+                        # Free old pending slot to avoid leak
+                        if req.pending_radix_mamba_slot is not None:
+                            self.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
+                        radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
+                        assert radix_slot is not None, (
+                            "Not enough space for mamba radix slot during decode prepare, "
+                            "try to increase --mamba-full-memory-ratio."
+                        )
+                        req.pending_radix_mamba_slot = radix_slot
+                        track_indices_cpu.append(radix_slot[0].item())
+                    else:
+                        track_indices_cpu.append(0)  # placeholder
                 self.mamba_track_indices = (
-                    torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+                    torch.tensor(track_indices_cpu, dtype=torch.int64, pin_memory=True)
+                    .to(device=self.device, non_blocking=True)
                 )
-
-            # async H2D
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
-            )
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
