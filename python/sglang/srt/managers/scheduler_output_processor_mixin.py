@@ -1243,18 +1243,21 @@ class SchedulerOutputProcessorMixin:
                 if phs is not None:
                     has_phs = True
 
-        # Merge individual PHS tensors into one to reduce pickle overhead
-        # from N __reduce_ex__ calls to 1 across the ZMQ IPC boundary.
-        # When all tensors share the same shape (non-MIS path) we stack into
-        # a single tensor. Variable shapes (MIS) are sent as a plain list.
+        # Optimize PHS for pickle: torch.stack reduces N __reduce_ex__
+        # calls to 1 across the ZMQ IPC boundary.  We can only stack when
+        # *every* entry is non-None (homogeneous batch); mixed batches
+        # (some requests want PHS, others don't) keep the raw list so
+        # positional indexing on the receiver side stays correct.
         stacked_phs = None
         if has_phs:
-            tensors = [t for t in phs_list if t is not None]
-            if tensors:
-                if all(t.shape == tensors[0].shape for t in tensors):
-                    stacked_phs = torch.stack(tensors)
+            all_have_phs = all(t is not None for t in phs_list)
+            if all_have_phs:
+                if all(t.shape == phs_list[0].shape for t in phs_list):
+                    stacked_phs = torch.stack(phs_list)
                 else:
-                    stacked_phs = tensors
+                    stacked_phs = phs_list
+            else:
+                stacked_phs = phs_list
 
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
