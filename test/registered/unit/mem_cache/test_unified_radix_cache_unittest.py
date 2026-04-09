@@ -699,6 +699,12 @@ class TestUnifiedRadixCacheSWAMamba(unittest.TestCase):
         self.assertGreater(len(req.prefix_indices), 0)
         self.assertEqual(req.cache_protected_len, len(req.prefix_indices))
         self.assertIsNotNone(req.last_node)
+
+        # Release the lock acquired by cache_unfinished_req before idle check
+        tree.dec_lock_ref(
+            req.last_node,
+            DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
+        )
         tree.sanity_check()
 
     # ------- evict empty tree → no crash -------

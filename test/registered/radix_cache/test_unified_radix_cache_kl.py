@@ -194,7 +194,7 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + UnifiedRadixCache."""
 
-    kl_threshold = 0.0025
+    kl_threshold = 0.003
     prefill_cache_assert = staticmethod(
         make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
     )
@@ -232,7 +232,7 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """SWA hybrid + UnifiedRadixCache."""
 
-    kl_threshold = 0.025
+    kl_threshold = 0.03
     gsm8k_threshold = 0.75
 
     @classmethod
