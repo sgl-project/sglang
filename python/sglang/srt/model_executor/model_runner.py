@@ -1803,7 +1803,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _init_lora_cuda_graph_moe_buffers(self):
         """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
 
-        Must be called before init_memory_pool() so that profile_max_num_token()
+        Must be called before init_memory_pool() so that memory profiling
         sees the reduced available memory and sizes KV cache correctly.
         All MoE LoRA layers share one set of buffers (managed by the
         lora_backend) since they execute sequentially during forward.
