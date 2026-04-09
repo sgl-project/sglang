@@ -162,7 +162,9 @@ def bench_with_various_segment_counts(
 
         speedup = time_snapshot / time_register if time_register > 0 else float("inf")
 
-        print(f"{num_segments:<12} {time_register:<30.3f} {time_snapshot:<20.3f} {speedup:<10.2f}x")
+        print(
+            f"{num_segments:<12} {time_register:<30.3f} {time_snapshot:<20.3f} {speedup:<10.2f}x"
+        )
 
     print("-" * 80)
     print()

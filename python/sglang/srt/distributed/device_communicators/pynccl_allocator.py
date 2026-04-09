@@ -343,9 +343,7 @@ class SymmetricMemoryContext:
 
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
-        result = register_func(self._comm_ptr)
-        if result != 0:
-            raise RuntimeError(f"ncclCommWindowRegister failed with error code {result}")
+        register_func(self._comm_ptr)
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
@@ -366,12 +364,12 @@ _debug_seen_traces: set = set()
 def is_tensor_in_symmetric_mempool(tensor: torch.Tensor) -> bool:
     """Check if a tensor's storage is allocated in the NCCL symmetric memory pool."""
 
-    if _mem_pool is None:
+    if _shared_mem_pool is None:
         return False  # Pool not initialized
 
     data_ptr = tensor.untyped_storage().data_ptr()
 
-    for segment in _mem_pool.snapshot():
+    for segment in _shared_mem_pool.snapshot():
         for block in segment["blocks"]:
             if block["address"] == data_ptr:
                 return True
