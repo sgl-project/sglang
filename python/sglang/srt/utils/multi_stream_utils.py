@@ -3,7 +3,7 @@
 import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
-from common import is_npu
+from sglang.srt.utils import is_npu
 
 import torch
 

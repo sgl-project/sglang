@@ -164,31 +164,44 @@ def forward_mla_prepare_npu(
 ):
     if is_mla_preprocess_enabled():
         if not hasattr(m, "mla_preprocess"):
-            if is_longcat_mla_preprocess_enabled():
-                (
-                    q_pe,
-                    k_pe,
-                    q_nope_out,
-                    k_nope,
-                    q_lora,
-                    forward_batch,
-                    positions,
-                ) = m.mla_preprocess.forward(
-                    positions, hidden_states, forward_batch, zero_allocator
-                )
-            else:
-                (
-                    q_pe,
-                    k_pe,
-                    q_nope_out,
-                    k_nope,
-                    forward_batch,
-                    zero_allocator,
-                    positions,
-                ) = m.mla_preprocess.forward(
-                    positions, hidden_states, forward_batch, zero_allocator
-                )
-            topk_indices = None
+            m.mla_preprocess = NPUFusedMLAPreprocess(
+                m.fused_qkv_a_proj_with_mqa,
+                m.q_a_layernorm,
+                m.kv_a_layernorm,
+                m.q_b_proj,
+                m.w_kc,
+                m.rotary_emb,
+                m.layer_id,
+                m.num_local_heads,
+                m.qk_nope_head_dim,
+                m.qk_rope_head_dim,
+                m.quant_config,
+            )
+        if is_longcat_mla_preprocess_enabled():
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                q_lora,
+                forward_batch,
+                positions,
+            ) = m.mla_preprocess.forward(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        else:
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                forward_batch,
+                zero_allocator,
+                positions,
+            ) = m.mla_preprocess.forward(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
+        topk_indices = None
     else:
         q_lora = None
         if m.q_lora_rank is not None:
@@ -293,8 +306,15 @@ def forward_mla_core_npu(
         device=attn_output.device,
     )
 
-    attn_output = attn_output.contiguous()
-    torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    # attn_output = attn_output.contiguous()
+    # torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    torch.bmm(
+        attn_output.transpose(0, 1),
+        m.w_vc,
+        out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
+            0, 1
+        ),
+    )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_bmm_output)

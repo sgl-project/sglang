@@ -1,13 +1,18 @@
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-from sglang.python.sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.common import get_bool_env_var
 import torch
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 from sglang.srt.utils import is_npu, is_npu_before_atlas_a5
+
+_is_npu = is_npu()
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
+if _is_npu:
+    import torch_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
