@@ -604,15 +604,10 @@ class PiecewiseCudaGraphRunner:
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
         self.raw_num_tokens = num_tokens
-        real_num_tokens = forward_batch.num_token_non_padded_cpu
-        use_runtime_out_cache_loc = (
-            real_num_tokens is not None and real_num_tokens < static_num_tokens
-        )
         if static_num_tokens != num_tokens:
-            if not use_runtime_out_cache_loc:
-                buffers.out_cache_loc.zero_()
-                if buffers.out_cache_loc_swa is not None:
-                    buffers.out_cache_loc_swa.zero_()
+            buffers.out_cache_loc.zero_()
+            if buffers.out_cache_loc_swa is not None:
+                buffers.out_cache_loc_swa.zero_()
             buffers.input_ids[num_tokens:static_num_tokens].zero_()
             buffers.positions[num_tokens:static_num_tokens].zero_()
             if self.is_multimodal:
@@ -624,7 +619,7 @@ class PiecewiseCudaGraphRunner:
 
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
-        if not use_runtime_out_cache_loc:
+        if static_num_tokens != num_tokens:
             buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
             if buffers.out_cache_loc_swa is not None:
                 translated_out_cache_loc_swa = self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -653,23 +648,19 @@ class PiecewiseCudaGraphRunner:
         input_ids = buffers.input_ids[:static_num_tokens]
         positions = buffers.positions[:static_num_tokens]
         out_cache_loc = (
-            forward_batch.out_cache_loc[:real_num_tokens]
-            if use_runtime_out_cache_loc
-            else buffers.out_cache_loc[:static_num_tokens]
+            buffers.out_cache_loc[:static_num_tokens]
+            if static_num_tokens != num_tokens
+            else forward_batch.out_cache_loc
         )
 
         out_cache_loc_swa = (
             (
-                forward_batch.out_cache_loc_swa[:real_num_tokens]
-                if forward_batch.out_cache_loc_swa is not None
-                else None
-            )
-            if use_runtime_out_cache_loc
-            else (
                 buffers.out_cache_loc_swa[:static_num_tokens]
                 if buffers.out_cache_loc_swa is not None
                 else None
             )
+            if static_num_tokens != num_tokens
+            else forward_batch.out_cache_loc_swa
         )
 
         mamba_track_indices = (
