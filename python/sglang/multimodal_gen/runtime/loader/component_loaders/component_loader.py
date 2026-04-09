@@ -11,9 +11,6 @@ from typing import Any, Type
 
 import torch
 from diffusers import AutoModel
-from torch import nn
-from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
-
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -25,6 +22,8 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from torch import nn
+from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
 logger = init_logger(__name__)
 
@@ -208,24 +207,7 @@ class ComponentLoader(ABC):
         cls._loaders_registered = True
 
     @classmethod
-    def for_component_type(
-        cls,
-        component_name: str,
-        transformers_or_diffusers: str,
-        component_architecture: str | None = None,
-    ) -> "ComponentLoader":
-        """
-        Factory method to create a component loader for a specific component type.
-
-        Args:
-            component_name: Type of component (e.g., "vae", "text_encoder", "transformer", "scheduler")
-            transformers_or_diffusers: Whether the component is from transformers or diffusers
-        """
-        cls._ensure_loaders_registered()
-
-        # Map of component types to their loader classes and expected library
-        component_name = _normalize_component_type(component_name)
-
+    def resolve_transformers_or_diffusers(self, transformers_or_diffusers: str, component_name: str) -> str:
         # NOTE(FlamingoPg): special for LTX-2 models
         if component_name == "vocoder" or component_name == "connectors":
             transformers_or_diffusers = "diffusers"
@@ -246,6 +228,29 @@ class ComponentLoader(ABC):
         ):
             transformers_or_diffusers = "diffusers"
 
+        return transformers_or_diffusers
+
+    @classmethod
+    def for_component_type(
+        cls,
+        component_name: str,
+        transformers_or_diffusers: str,
+        component_architecture: str | None = None,
+    ) -> "ComponentLoader":
+        """
+        Factory method to create a component loader for a specific component type.
+
+        Args:
+            component_name: Type of component (e.g., "vae", "text_encoder", "transformer", "scheduler")
+            transformers_or_diffusers: Whether the component is from transformers or diffusers
+        """
+        cls._ensure_loaders_registered()
+
+        # Map of component types to their loader classes and expected library
+        component_name = _normalize_component_type(component_name)
+
+        transformers_or_diffusers = cls.resolve_transformers_or_diffusers(transformers_or_diffusers, component_name)
+
         if component_name in component_name_to_loader_cls:
             loader_cls: Type[ComponentLoader] = component_name_to_loader_cls[
                 component_name
@@ -255,7 +260,9 @@ class ComponentLoader(ABC):
             assert (
                 transformers_or_diffusers == expected_library
             ), f"{component_name} must be loaded from {expected_library}, got {transformers_or_diffusers}"
-            return loader_cls()
+            loader = loader_cls()
+            loader.component_architecture = component_architecture
+            return loader
 
         # For unknown component types, use a generic loader
         logger.warning(

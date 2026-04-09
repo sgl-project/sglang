@@ -15,6 +15,9 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
+    Flux2Mistral3TextEncoder,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -133,6 +136,13 @@ class TextEncodingStage(PipelineStage):
         tok_kwargs = tokenizer_kwargs | kwargs
 
         return tok_kwargs
+
+    def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
+        if isinstance(text_encoder, Flux2Mistral3TextEncoder):
+            return text_encoder(**encoder_forward_kwargs)
+
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            return text_encoder(**encoder_forward_kwargs)
 
     @torch.no_grad()
     def encode_text(
@@ -269,8 +279,9 @@ class TextEncodingStage(PipelineStage):
                 encoder_forward_kwargs["attention_mask"] = attention_mask
             if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                 encoder_forward_kwargs["use_cache"] = False
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs: BaseEncoderOutput = text_encoder(**encoder_forward_kwargs)
+            outputs: BaseEncoderOutput = self._forward_text_encoder(
+                text_encoder, encoder_forward_kwargs
+            )
             postprocess_sig = inspect.signature(postprocess_func)
 
             postprocess_kwargs = {}
@@ -279,14 +290,16 @@ class TextEncodingStage(PipelineStage):
                 postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
             prompt_embeds = postprocess_func(outputs, text_inputs, **postprocess_kwargs)
             if dtype is not None:
-                prompt_embeds = prompt_embeds.to(dtype=dtype)
+                prompt_embeds = prompt_embeds.to(device=target_device, dtype=dtype)
+            else:
+                prompt_embeds = prompt_embeds.to(device=target_device)
 
             embeds_list.append(prompt_embeds)
             if is_flux_v1:
-                pooled_embeds_list.append(outputs.pooler_output)
+                pooled_embeds_list.append(outputs.pooler_output.to(device=target_device))
             if return_attention_mask:
                 mask_to_store = (
-                    attention_mask
+                    attention_mask.to(device=target_device)
                     if attention_mask is not None
                     else torch.ones(input_ids.shape[:2], device=target_device)
                 )

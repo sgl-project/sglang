@@ -2,14 +2,19 @@ import dataclasses
 import glob
 import os
 from collections.abc import Generator, Iterable
+from contextlib import nullcontext
 from typing import Generator, Iterable, cast
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.distributed import init_device_mesh
 from transformers import AutoModel
+from transformers.models.mistral3.modeling_mistral3 import (
+    Mistral3ForConditionalGeneration,
+)
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
@@ -43,6 +48,42 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
+
+
+class Flux2Mistral3TextEncoder(nn.Module):
+    """Wrap the HF FLUX.2 text encoder so the generic stage can stay simple."""
+
+    def __init__(
+        self,
+        model: Mistral3ForConditionalGeneration,
+        execution_device: torch.device,
+        storage_device: torch.device,
+    ) -> None:
+        super().__init__()
+        self.model = model.to(storage_device)
+        self.execution_device = execution_device
+        self.storage_device = storage_device
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        if self.storage_device != self.execution_device:
+            self.model.to(self.execution_device)
+
+        forward_kwargs = dict(kwargs)
+        forward_kwargs["input_ids"] = input_ids.to(self.execution_device)
+        if attention_mask is not None:
+            forward_kwargs["attention_mask"] = attention_mask.to(self.execution_device)
+
+        sdpa_context = (
+            sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
+            if self.execution_device.type == "cuda"
+            else nullcontext()
+        )
+        try:
+            with sdpa_context:
+                return self.model(**forward_kwargs)
+        finally:
+            if self.storage_device != self.execution_device:
+                self.model.to(self.storage_device)
 
 
 class TextEncoderLoader(ComponentLoader):
@@ -212,6 +253,32 @@ class TextEncoderLoader(ComponentLoader):
         cpu_offload_flag: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
+        if self.component_architecture == "Mistral3ForConditionalGeneration":
+            # FLUX.2 declares a Mistral3 text encoder in model_index.json. The
+            # current custom encoder drifts from the official transformers hidden
+            # states and breaks prompt_embeds alignment. Flux2Pipeline uses the
+            # full Mistral3 conditional-generation module here, not AutoModel.
+            encoder_idx = (
+                1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
+            )
+            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
+            model = Mistral3ForConditionalGeneration.from_pretrained(
+                component_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                torch_dtype=PRECISION_TO_TYPE[encoder_dtype],
+            )
+            should_offload = server_args.text_encoder_cpu_offload
+            execution_device = get_local_torch_device()
+            storage_device = (
+                self.target_device(True) if should_offload else execution_device
+            )
+            return Flux2Mistral3TextEncoder(
+                model=model,
+                execution_device=execution_device,
+                storage_device=storage_device,
+            )
+
         diffusers_pretrained_config = get_config(
             component_model_path, trust_remote_code=True
         )
