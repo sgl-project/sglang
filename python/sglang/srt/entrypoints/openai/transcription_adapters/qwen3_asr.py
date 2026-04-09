@@ -9,7 +9,7 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
     TranscriptionAdapter,
     register_transcription_adapter,
 )
-from sglang.srt.multimodal.processors.qwen3_asr import _DEFAULT_ASR_PROMPT
+from sglang.srt.multimodal.processors.qwen3_asr import DEFAULT_ASR_PROMPT
 
 
 @register_transcription_adapter("Qwen3ASR")
@@ -33,7 +33,7 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
 
     @property
     def prompt_template(self) -> str:
-        return _DEFAULT_ASR_PROMPT
+        return DEFAULT_ASR_PROMPT
 
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         temperature = request.temperature
