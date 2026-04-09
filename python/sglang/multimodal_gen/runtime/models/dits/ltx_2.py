@@ -1122,6 +1122,7 @@ class LTX2TransformerBlock(nn.Module):
                 k_pe=ca_audio_rotary_emb,
                 mask=a2v_cross_attention_mask,
                 skip_sequence_parallel_override=audio_replicated_for_sp,
+                exact_sp_attention_override=exact_video_self_attn_for_sp,
             )
             hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
 
@@ -1141,6 +1142,7 @@ class LTX2TransformerBlock(nn.Module):
                 k_pe=ca_video_rotary_emb,
                 mask=v2a_cross_attention_mask,
                 gather_context_kv_for_sp=audio_replicated_for_sp,
+                exact_sp_attention_override=exact_audio_self_attn_for_sp,
             )
             audio_hidden_states = (
                 audio_hidden_states + v2a_gate * v2a_attn_hidden_states
