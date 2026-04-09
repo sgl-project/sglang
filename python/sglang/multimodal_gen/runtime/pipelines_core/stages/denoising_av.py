@@ -3,6 +3,7 @@ import json
 import math
 import os
 import time
+from collections import OrderedDict
 from io import BytesIO
 
 import av
@@ -16,6 +17,11 @@ from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
+)
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
@@ -57,6 +63,71 @@ class LTX2AVDenoisingStage(DenoisingStage):
         self.audio_vae = audio_vae
         self._condition_image_encoder = None
         self._condition_image_encoder_dir = None
+        self._ltx2_coords_cache: OrderedDict[
+            tuple, tuple[torch.Tensor, torch.Tensor]
+        ] = OrderedDict()
+        self._ltx2_coords_cache_max_entries = 4
+
+    def _get_ltx2_coords(
+        self,
+        current_model,
+        batch: Req,
+        latent_num_frames_for_model: int,
+        latent_height: int,
+        latent_width: int,
+        audio_num_frames_latent: int,
+        latent_model_input: torch.Tensor,
+        audio_latent_model_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if model_parallel_is_initialized():
+            sp_world_size = get_sp_world_size()
+            sp_rank = get_sp_parallel_rank()
+        else:
+            sp_world_size = 1
+            sp_rank = 0
+
+        key = (
+            id(current_model),
+            latent_model_input.device,
+            audio_latent_model_input.device,
+            int(latent_model_input.shape[0]),
+            int(audio_latent_model_input.shape[0]),
+            int(latent_num_frames_for_model),
+            int(latent_height),
+            int(latent_width),
+            float(batch.fps),
+            int(audio_num_frames_latent),
+            int(sp_rank),
+            int(sp_world_size),
+        )
+        cached = self._ltx2_coords_cache.get(key)
+        if cached is not None:
+            self._ltx2_coords_cache.move_to_end(key)
+            return cached
+
+        video_shift = (
+            int(sp_rank) * int(latent_num_frames_for_model) if sp_world_size > 1 else 0
+        )
+        video_coords = current_model.rope.prepare_video_coords(
+            batch_size=int(latent_model_input.shape[0]),
+            num_frames=latent_num_frames_for_model,
+            height=latent_height,
+            width=latent_width,
+            device=latent_model_input.device,
+            fps=batch.fps,
+            start_frame=video_shift,
+        )
+        audio_coords = current_model.audio_rope.prepare_audio_coords(
+            batch_size=int(audio_latent_model_input.shape[0]),
+            num_frames=audio_num_frames_latent,
+            device=audio_latent_model_input.device,
+        )
+
+        self._ltx2_coords_cache[key] = (video_coords, audio_coords)
+        self._ltx2_coords_cache.move_to_end(key)
+        if len(self._ltx2_coords_cache) > self._ltx2_coords_cache_max_entries:
+            self._ltx2_coords_cache.popitem(last=False)
+        return video_coords, audio_coords
 
     @staticmethod
     def _get_video_latent_num_frames_for_model(
@@ -395,7 +466,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
             dtype=encode_dtype,
             apply_codec_compression=False,
         )
-
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=original_dtype,
@@ -618,10 +688,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 f"Unexpected audio latents rank: {audio_latent_model_input.ndim}, shape={tuple(audio_latent_model_input.shape)}"
                             )
 
-                        # LTX-2 model can generate coords internally.
-                        video_coords = None
-                        audio_coords = None
-
                         timestep = t_device.expand(int(latent_model_input.shape[0]))
                         if do_ti2v and denoise_mask is not None:
                             timestep_video = timestep.unsqueeze(
@@ -672,6 +738,16 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     timestep_audio, cfg_batch_size
                                 )
 
+                            video_coords, audio_coords = self._get_ltx2_coords(
+                                current_model,
+                                batch,
+                                latent_num_frames_for_model,
+                                latent_height,
+                                latent_width,
+                                audio_num_frames_latent,
+                                latent_model_input,
+                                audio_latent_model_input,
+                            )
                             with set_forward_context(
                                 current_timestep=i, attn_metadata=attn_metadata
                             ):
@@ -749,6 +825,16 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             encoder_hidden_states = batch.prompt_embeds[0]
                             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
                             encoder_attention_mask = batch.prompt_attention_mask
+                            video_coords, audio_coords = self._get_ltx2_coords(
+                                current_model,
+                                batch,
+                                latent_num_frames_for_model,
+                                latent_height,
+                                latent_width,
+                                audio_num_frames_latent,
+                                latent_model_input,
+                                audio_latent_model_input,
+                            )
                             with set_forward_context(
                                 current_timestep=i, attn_metadata=attn_metadata
                             ):
