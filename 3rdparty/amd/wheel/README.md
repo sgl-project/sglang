@@ -32,6 +32,29 @@ pip install "amd-sglang[all-hip,rocm720]" -i https://pypi.amd.com/rocm-7.2.0/sim
 
 Note: You must resolve the two dependencies, AITER and triton, below.  Others are optional depending on your applications.
 
+## JIT Kernel Support
+
+The amd-sglang wheel includes JIT (Just-In-Time) kernel compilation support. JIT kernels allow for dynamic compilation of optimized CUDA/HIP kernels at runtime.
+
+### Requirements
+
+JIT kernel compilation requires:
+1. **apache-tvm-ffi** - Included in the `runtime_common` dependencies (installed with `amd-sglang[all-hip,...]`)
+2. **System compiler toolchain** - A C++ compiler compatible with your ROCm installation
+   - For ROCm environments, this is typically provided by the ROCm installation
+   - Ensure `hipcc` is available in your PATH
+
+The JIT kernel source files (`.cuh`, `.cu` headers) are bundled with the wheel and will be available at runtime for compilation.
+
+### Verification
+
+To verify JIT kernel support is working:
+```python
+from sglang.jit_kernel.utils import KERNEL_PATH
+print(f"JIT kernel path: {KERNEL_PATH}")
+# Should print the path to site-packages/sglang/jit_kernel
+```
+
 ## Manual Dependency Resolution
 
 ### Resolving AITER
