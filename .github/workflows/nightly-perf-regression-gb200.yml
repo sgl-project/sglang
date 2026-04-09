@@ -6,10 +6,6 @@ name: Nightly Perf Regression (GB200)
 on:
   schedule:
     - cron: '0 2 * * *'  # 2 AM UTC daily (offset from other nightly runs)
-  workflow_dispatch:  # manual trigger for testing; remove once nightly is validated
-  push:
-    branches:
-      - sahithi/sa-nightly-pipeline
 
 concurrency:
   group: nightly-test-gb200
@@ -24,7 +20,7 @@ env:
 jobs:
   # ---------------------------------------------------------------------------
   # Reads scripts/ci/slurm/nightly-configs.yaml and generates one matrix entry
-  # per recipe YAML. Each job runs the full concurrency sweep defined in the 
+  # per recipe YAML. Each job runs the full concurrency sweep defined in the
   # recipe as a single Slurm job.
   # To add/remove configs, edit nightly-configs.yaml only.
   # ---------------------------------------------------------------------------

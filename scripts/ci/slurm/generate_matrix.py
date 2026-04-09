@@ -23,6 +23,7 @@ import yaml
 def seq_len_str(isl, osl):
     def fmt(n):
         return f"{n // 1024}k" if n % 1024 == 0 else str(n)
+
     return f"{fmt(isl)}{fmt(osl)}"
 
 

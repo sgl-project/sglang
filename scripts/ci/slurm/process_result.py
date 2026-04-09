@@ -18,6 +18,7 @@ Optional env vars:
     RECIPE_FILE       - path to the srt-slurm recipe YAML; if set, topology
                         fields (TP, EP, DP, workers) are parsed from it
 """
+
 import json
 import os
 import sys
@@ -53,6 +54,7 @@ prefill_num_workers = decode_tp = decode_ep = decode_dp_attn = decode_num_worker
 recipe_file = os.environ.get("RECIPE_FILE")
 if recipe_file and Path(recipe_file).exists():
     import yaml
+
     with open(recipe_file) as f:
         recipe = yaml.safe_load(f)
 
@@ -96,7 +98,10 @@ data = {
     "decode_dp_attention": decode_dp_attn,
     "tput_per_gpu": float(raw["total_token_throughput"]) / total_gpus,
     "output_tput_per_gpu": float(raw["output_throughput"]) / decode_gpus,
-    "input_tput_per_gpu": (float(raw["total_token_throughput"]) - float(raw["output_throughput"])) / prefill_gpus,
+    "input_tput_per_gpu": (
+        float(raw["total_token_throughput"]) - float(raw["output_throughput"])
+    )
+    / prefill_gpus,
 }
 
 for key, value in raw.items():
