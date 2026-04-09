@@ -326,6 +326,24 @@ class LTX2AVDenoisingStage(DenoisingStage):
             return True
         return int(getattr(batch, "sp_video_start_frame", 0)) == 0
 
+    @staticmethod
+    def _should_replicate_ltx23_audio_for_sp(
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        is_ltx23_variant: bool,
+    ) -> bool:
+        is_ti2v_request = (
+            batch.image_latent is not None
+            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
+        )
+        return (
+            get_sp_world_size() > 1
+            and is_ltx23_variant
+            and is_ti2v_request
+            and server_args.pipeline_class_name != "LTX2TwoStagePipeline"
+        )
+
     def _get_condition_image_encoder(
         self,
         server_args: ServerArgs,
@@ -533,15 +551,10 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         )
         do_ti2v = self._should_apply_ltx2_ti2v(batch)
-        is_ti2v_request = (
-            batch.image_latent is not None
-            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
-        )
-        replicate_audio_for_sp = (
-            get_sp_world_size() > 1
-            and is_ltx23_variant
-            and is_ti2v_request
-            and server_args.pipeline_class_name != "LTX2TwoStagePipeline"
+        replicate_audio_for_sp = self._should_replicate_ltx23_audio_for_sp(
+            batch,
+            server_args,
+            is_ltx23_variant=is_ltx23_variant,
         )
         batch.ltx23_audio_replicated_for_sp = bool(replicate_audio_for_sp)
 
