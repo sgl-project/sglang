@@ -9,8 +9,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch import nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.distributed import init_device_mesh
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModel
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3ForConditionalGeneration,
@@ -261,7 +261,9 @@ class TextEncoderLoader(ComponentLoader):
             encoder_idx = (
                 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
             )
-            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
+            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
+                encoder_idx
+            ]
             model = Mistral3ForConditionalGeneration.from_pretrained(
                 component_model_path,
                 trust_remote_code=server_args.trust_remote_code,

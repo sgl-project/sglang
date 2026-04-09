@@ -296,7 +296,9 @@ class TextEncodingStage(PipelineStage):
 
             embeds_list.append(prompt_embeds)
             if is_flux_v1:
-                pooled_embeds_list.append(outputs.pooler_output.to(device=target_device))
+                pooled_embeds_list.append(
+                    outputs.pooler_output.to(device=target_device)
+                )
             if return_attention_mask:
                 mask_to_store = (
                     attention_mask.to(device=target_device)

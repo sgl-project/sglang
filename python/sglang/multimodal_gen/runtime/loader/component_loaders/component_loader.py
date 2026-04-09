@@ -11,6 +11,9 @@ from typing import Any, Type
 
 import torch
 from diffusers import AutoModel
+from torch import nn
+from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
+
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -22,8 +25,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from torch import nn
-from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
 logger = init_logger(__name__)
 
@@ -207,7 +208,9 @@ class ComponentLoader(ABC):
         cls._loaders_registered = True
 
     @classmethod
-    def resolve_transformers_or_diffusers(self, transformers_or_diffusers: str, component_name: str) -> str:
+    def resolve_transformers_or_diffusers(
+        self, transformers_or_diffusers: str, component_name: str
+    ) -> str:
         # NOTE(FlamingoPg): special for LTX-2 models
         if component_name == "vocoder" or component_name == "connectors":
             transformers_or_diffusers = "diffusers"
@@ -249,7 +252,9 @@ class ComponentLoader(ABC):
         # Map of component types to their loader classes and expected library
         component_name = _normalize_component_type(component_name)
 
-        transformers_or_diffusers = cls.resolve_transformers_or_diffusers(transformers_or_diffusers, component_name)
+        transformers_or_diffusers = cls.resolve_transformers_or_diffusers(
+            transformers_or_diffusers, component_name
+        )
 
         if component_name in component_name_to_loader_cls:
             loader_cls: Type[ComponentLoader] = component_name_to_loader_cls[
