@@ -680,9 +680,23 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 f"Unexpected audio latents rank: {audio_latent_model_input.ndim}, shape={tuple(audio_latent_model_input.shape)}"
                             )
 
-                        # LTX-2 model can generate coords internally.
                         video_coords = None
                         audio_coords = None
+                        if (
+                            getattr(batch, "did_sp_shard_latents", False)
+                            and hasattr(current_model, "rope")
+                        ):
+                            video_coords = current_model.rope.prepare_video_coords(
+                                batch_size=int(latent_model_input.shape[0]),
+                                num_frames=latent_num_frames,
+                                height=latent_height,
+                                width=latent_width,
+                                device=latent_model_input.device,
+                                fps=batch.fps,
+                                start_frame=int(
+                                    getattr(batch, "sp_video_start_frame", 0)
+                                ),
+                            )
                         if (
                             getattr(batch, "did_sp_shard_audio_latents", False)
                             and hasattr(current_model, "audio_rope")
