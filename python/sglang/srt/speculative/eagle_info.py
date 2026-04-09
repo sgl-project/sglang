@@ -378,13 +378,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 deterministic=True,
             )
 
-            # Sync predict across TP ranks: different GPUs may produce
-            # slightly different target_probs due to floating-point
+            # Sync sampling results across TP ranks: different GPUs may
+            # produce slightly different target_probs due to floating-point
             # non-determinism in softmax/top_k/top_p, causing different
             # sampled tokens. Broadcast from rank 0 to ensure consistency.
             tp_group = get_tp_group()
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(accept_length, src=0)
 
         if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
