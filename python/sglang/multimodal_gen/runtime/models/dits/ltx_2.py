@@ -624,30 +624,23 @@ class LTX2Attention(nn.Module):
             k = k.view(*k.shape[:-1], self.local_heads, self.dim_head)
 
             if gather_context_kv_for_sp:
-                q_ = q.transpose(1, 2)
                 k_full = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
                 v_full = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
-                k_ = k_full.transpose(1, 2)
-                v_ = v_full.transpose(1, 2)
-                attn_mask = None
+                gathered_mask = None
                 if mask is not None:
                     gathered_mask = sequence_model_parallel_all_gather(
                         mask.contiguous(), dim=1
                     )
-                    attn_mask = gathered_mask.to(dtype=q_.dtype, device=q_.device)
-                    if attn_mask.dim() == 2:
-                        attn_mask = attn_mask[:, None, None, :]
-                    elif attn_mask.dim() == 3:
-                        attn_mask = attn_mask[:, None, :, :]
-                out = torch.nn.functional.scaled_dot_product_attention(
-                    q_,
-                    k_,
-                    v_,
-                    attn_mask=attn_mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=self.dim_head**-0.5,
-                ).transpose(1, 2)
+                if self.use_local_attention:
+                    out = self.attn(q, k_full, v_full, attn_mask=gathered_mask)
+                else:
+                    out = self.attn(
+                        q,
+                        k_full,
+                        v_full,
+                        attn_mask=gathered_mask,
+                        skip_sequence_parallel_override=True,
+                    )
             elif self.use_local_attention:
                 out = self.attn(q, k, v, attn_mask=mask)
             else:
@@ -942,6 +935,7 @@ class LTX2TransformerBlock(nn.Module):
             mask=video_self_attention_mask,
             pe=video_rotary_emb,
             all_perturbed=skip_video_self_attn,
+            gather_context_kv_for_sp=audio_replicated_for_sp,
         )
         hidden_states = hidden_states + attn_hidden_states * vgate_msa
 
