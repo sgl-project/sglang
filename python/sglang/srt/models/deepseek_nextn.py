@@ -185,7 +185,7 @@ class DeepseekModelNextN(nn.Module):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
-            hidden_states, residual = self.decoder(
+            hidden_states, residual, topk_indices = self.decoder(
                 positions,
                 hidden_states,
                 forward_batch,

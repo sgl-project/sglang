@@ -324,7 +324,7 @@ class NightlyBenchmarkRunner:
             The average speculative decoding accept length, or None if not available.
         """
         try:
-            response = requests.get(f"{self.base_url}/get_server_info", timeout=10)
+            response = requests.get(f"{self.base_url}/server_info", timeout=10)
             if response.status_code == 200:
                 server_info = response.json()
                 internal_states = server_info.get("internal_states", [])

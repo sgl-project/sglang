@@ -140,6 +140,7 @@ def load_jit(
     extra_include_paths: List[str] | None = None,
     extra_dependencies: List[str] | None = None,
     build_directory: str | None = None,
+    header_only: bool = True,
 ) -> Module:
     """
     Loading a JIT module from C++/CUDA source files.
@@ -169,47 +170,64 @@ def load_jit(
     :type extra_dependencies: List[str] | None
     :param build_directory: The build directory for JIT compilation.
     :type build_directory: str | None
+    :param header_only: Whether the module is header-only.
+                        If true, apply the wrappers to export given class/functions.
+                        Otherwise, we must export from C++/CUDA side.
     :return: A just-in-time(JIT) compiled module.
     :rtype: Module
     """
 
-    from tvm_ffi.cpp import load_inline
+    from tvm_ffi.cpp import load, load_inline
 
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
-    cpp_wrappers = cpp_wrappers or []
-    cuda_wrappers = cuda_wrappers or []
     extra_cflags = extra_cflags or []
     extra_cuda_cflags = extra_cuda_cflags or []
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
+
+    cpp_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cpp_files]
+    cuda_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cuda_files]
 
     for dep in set(extra_dependencies or []):
         if dep not in _REGISTERED_DEPENDENCIES:
             raise ValueError(f"Dependency {dep} is not registered.")
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
-    # include cpp files
-    cpp_paths = [(KERNEL_PATH / "csrc" / f).resolve() for f in cpp_files]
-    cpp_sources = [f'#include "{path}"' for path in cpp_paths]
-    cpp_sources += [_make_wrapper(tup) for tup in cpp_wrappers]
+    module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    if header_only:
+        cpp_wrappers = cpp_wrappers or []
+        cuda_wrappers = cuda_wrappers or []
+        cpp_sources = [f'#include "{path}"' for path in cpp_files]
+        cpp_sources += [_make_wrapper(tup) for tup in cpp_wrappers]
 
-    # include cuda files
-    cuda_paths = [(KERNEL_PATH / "csrc" / f).resolve() for f in cuda_files]
-    cuda_sources = [f'#include "{path}"' for path in cuda_paths]
-    cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
-
-    with _jit_compile_context():
-        return load_inline(
-            "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
-            cpp_sources=cpp_sources,
-            cuda_sources=cuda_sources,
-            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-            extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
-            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
-            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
-            build_directory=build_directory,
-        )
+        # include cuda files
+        cuda_sources = [f'#include "{path}"' for path in cuda_files]
+        cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
+        with _jit_compile_context():
+            return load_inline(
+                module_name,
+                cpp_sources=cpp_sources,
+                cuda_sources=cuda_sources,
+                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+                build_directory=build_directory,
+            )
+    else:
+        assert cpp_wrappers is None and cuda_wrappers is None
+        with _jit_compile_context():
+            return load(
+                module_name,
+                cpp_files=cpp_files,
+                cuda_files=cuda_files,
+                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+                build_directory=build_directory,
+            )
 
 
 @dataclass

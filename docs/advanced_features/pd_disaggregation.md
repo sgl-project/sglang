@@ -157,6 +157,58 @@ Please be aware that this setting will cause prefill instances to take a longer 
 If a greater mean TTFT is acceptable, you can `export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600` (10 minutes) to relax the timeout condition.
 
 
+## Heterogeneous TP with GPU Staging Buffer
+
+When prefill and decode use different tensor parallelism (TP) sizes (e.g., prefill TP=4, decode DP attention with TP=1), the KV cache memory layout differs between the two sides. The **GPU staging buffer** solves this by gathering KV head slices into a contiguous buffer on the prefill side, performing bulk RDMA transfer, then scattering into the correct KV cache pages on the decode side. This provides **2–5x throughput improvement** over the default per-token slice approach at high concurrency and matches homogeneous TP baselines within ~5%.
+
+Enable the staging buffer when prefill and decode use **different TP sizes** with the **Mooncake** transfer backend. When both sides use the same TP size, staging is automatically bypassed even if enabled.
+
+> **Note:** The staging buffer is designed for non-MLA models (e.g. GQA, MHA). MLA models (e.g. DeepSeek-V2/V3) should not enable this flag.
+
+### Environment Variables
+
+| Variable | Description | Default |
+|:---------|:------------|:-------:|
+| **`SGLANG_DISAGG_STAGING_BUFFER`** | Enable GPU staging buffer for heterogeneous TP KV transfer | `False` |
+| **`SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB`** | Prefill-side per-worker staging buffer size in MB | `64` |
+| **`SGLANG_DISAGG_STAGING_POOL_SIZE_MB`** | Decode-side ring buffer pool total size in MB | `4096` |
+
+### Usage Example
+
+```bash
+# Set staging buffer environment variables on BOTH prefill and decode
+export SGLANG_DISAGG_STAGING_BUFFER=1
+export SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB=64
+export SGLANG_DISAGG_STAGING_POOL_SIZE_MB=4096
+
+# Prefill with TP=4
+python -m sglang.launch_server \
+  --model-path $MODEL_PATH \
+  --disaggregation-mode prefill \
+  --port 30000 \
+  --tp 4 \
+  --trust-remote-code \
+  --disaggregation-ib-device mlx5_1,mlx5_2
+
+# Decode with TP=1 (or DP attention with effective attention TP=1)
+python -m sglang.launch_server \
+  --model-path $MODEL_PATH \
+  --disaggregation-mode decode \
+  --port 30001 \
+  --tp 4 \
+  --dp 4 \
+  --enable-dp-attention \
+  --trust-remote-code \
+  --disaggregation-ib-device mlx5_3,mlx5_4
+
+# Router
+python -m sglang_router.launch_router \
+  --pd-disaggregation \
+  --prefill http://127.0.0.1:30000 \
+  --decode http://127.0.0.1:30001 \
+  --host 0.0.0.0 --port 8000
+```
+
 ## NIXL
 ### Requirements
 

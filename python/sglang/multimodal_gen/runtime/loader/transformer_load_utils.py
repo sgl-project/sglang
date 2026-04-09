@@ -8,6 +8,7 @@ are handled here behind a small helper/adapter layer.
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Callable, Optional
@@ -20,7 +21,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     _patch_nunchaku_scales,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -36,6 +36,10 @@ from sglang.srt.layers.quantization import QuantizationConfig
 logger = init_logger(__name__)
 
 PostLoadHook = Callable[[nn.Module], None]
+
+_PRECISION_VARIANT_SUFFIX_RE = re.compile(
+    r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
+)
 
 
 @dataclass
@@ -134,14 +138,6 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         if quant_name != "modelopt_fp4":
             return
 
-        use_best_perf_kit = getattr(
-            current_platform,
-            "should_use_modelopt_fp4_best_performance_kit",
-            None,
-        )
-        if callable(use_best_perf_kit) and use_best_perf_kit():
-            return
-
         weights_path = os.path.basename(server_args.transformer_weights_path or "")
         if not weights_path.endswith("-mixed.safetensors") or server_args.tp_size <= 1:
             return
@@ -150,10 +146,10 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
             server_args.dit_cpu_offload = False
             server_args.text_encoder_cpu_offload = False
             logger.warning(
-                "FLUX.2 mixed NVFP4 is using the generic ModelOpt FP4 fallback with "
-                "tp_size=%d; disabling dit/text-encoder CPU offload to avoid TP "
-                "all-gather launch failures. Override the offload flags explicitly if "
-                "you need the old behavior.",
+                "FLUX.2 mixed NVFP4 is using the ModelOpt FP4 path with tp_size=%d; "
+                "disabling dit/text-encoder CPU offload to avoid TP all-gather "
+                "launch failures. Override the offload flags explicitly if you need "
+                "the old behavior.",
                 server_args.tp_size,
             )
 
@@ -181,12 +177,56 @@ def resolve_transformer_safetensors_to_load(
     else:
         safetensors_list = _list_safetensors_files(component_model_path)
 
+    safetensors_list = _filter_duplicate_precision_variant_safetensors(safetensors_list)
+
     if not safetensors_list:
         raise ValueError(
             f"no safetensors files found in {quantized_path or component_model_path}"
         )
 
     return safetensors_list
+
+
+def _filter_duplicate_precision_variant_safetensors(
+    safetensors_list: list[str],
+) -> list[str]:
+    """Drop precision-specific duplicates when a canonical file is present.
+
+    Diffusers checkpoints sometimes ship both `foo.safetensors` and
+    `foo.fp16.safetensors` (and their sharded variants) in the same directory.
+    Loading both is unsafe because duplicate parameter names race and whichever
+    tensor arrives last wins, leading to non-deterministic behavior
+
+    If a canonical unsuffixed (non bf16|fp32) file exists, prefer it and drop the precision
+    variant from the same family. Precision-only families are left untouched.
+    """
+    canonical_paths = set(safetensors_list)
+    filtered: list[str] = []
+    removed: list[str] = []
+
+    for path in safetensors_list:
+        match = _PRECISION_VARIANT_SUFFIX_RE.match(path)
+        if match is None:
+            filtered.append(path)
+            continue
+
+        canonical_path = (
+            f"{match.group('stem')}{match.group('shard') or ''}{match.group('ext')}"
+        )
+        if canonical_path in canonical_paths:
+            removed.append(path)
+            continue
+
+        filtered.append(path)
+
+    if removed:
+        logger.info(
+            "Filtered %d duplicate transformer precision variant file(s): %s",
+            len(removed),
+            removed,
+        )
+
+    return filtered
 
 
 def resolve_transformer_quant_load_spec(

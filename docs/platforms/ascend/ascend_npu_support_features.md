@@ -86,7 +86,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 |----------------------------------------------------|----------|---------------------------|:----------------:|
 | `--device`                                         | `None`   | Type: str                 |      A2, A3      |
 | `--tensor-parallel-size`<br/>`--tp-size`           | `1`      | Type: int                 |      A2, A3      |
-| `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Type: int                 |      A2, A3      |
+| `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Type: int; Currently `2` not supported |      A2, A3      |
 | `--attention-context-parallel-size`<br/>`--attn-cp-size`  | `1` | Type: int               |      A2, A3      |
 | `--moe-data-parallel-size`<br/>`--moe-dp-size`     | `1`      | Type: int                 |      A2, A3      |
 | `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
@@ -104,7 +104,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--base-gpu-id`                                    | `0`      | Type: int                 |      A2, A3      |
 | `--gpu-id-step`                                    | `1`      | Type: int                 |      A2, A3      |
 | `--sleep-on-idle`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
-| `--custom-sigquit-handler`                         | `None`   | Optional[Callable]        |      A2, A3      |
 
 ## Logging
 
@@ -185,6 +184,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | Argument                 | Defaults | Options                             | Server supported |
 |--------------------------|----------|-------------------------------------|:----------------:|
 | `--enable-lora`          | `False`  | Bool flag <br/>(set to enable)      |      A2, A3      |
+| `--enable-lora-overlap-loading` | `False`  | Bool flag <br/>(set to enable)      |      A2, A3      |
 | `--max-lora-rank`        | `None`   | Type: int                           |      A2, A3      |
 | `--lora-target-modules`  | `None`   | `all`                               |      A2, A3      |
 | `--lora-paths`           | `None`   | Type: List[str] /<br/> JSON objects |      A2, A3      |
@@ -253,16 +253,17 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`   |      A2, A3      |
 | `--deepep-config`                                     | `None`    | Type: str                                   | Special for GPU  |
 | `--ep-num-redundant-experts`                          | `0`       | Type: int                                   |      A2, A3      |
-| `--ep-dispatch-algorithm`                             | `None`    | Type: str                                   |      A2, A3      |
+| `--ep-dispatch-algorithm`                             | `None`    | `static`,<br/> `dynamic`,<br/> `fake`       |      A2, A3      |
 | `--init-expert-location`                              | `trivial` | Type: str                                   |      A2, A3      |
 | `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              |      A2, A3      |
-| `--eplb-algorithm`                                    | `auto`    | Type: str                                   |      A2, A3      |
+| `--eplb-algorithm`                                    | `deepseek`| Type: str                                   |      A2, A3      |
+| `--eplb-rebalance-num-iterations`                     | `1000`    | Type: int                                   |      A2, A3      |
 | `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   |      A2, A3      |
 | `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 |      A2, A3      |
-| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | Type: str                                   |      A2, A3      |
+| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | `stat`,<br/> `stat_approx`,<br/> `per_pass`,<br/> `per_token` |      A2, A3      |
 | `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                   |      A2, A3      |
 | `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag (set to enable)                   |      A2, A3      |
-| `--moe-dense-tp-size`                                 | `None`    | Type: int                                   |      A2, A3      |
+| `--moe-dense-tp-size`                                 | `None`    | `1`                                         |      A2, A3      |
 | `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                          | Special for GPU  |
 | `--mooncake-ib-device`                                | `None`    | Type: str                                   | Special for GPU  |
 
@@ -358,8 +359,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--allow-auto-truncate`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--enable-custom-`<br/>`logit-processor`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--flashinfer-mla-`<br/>`disable-ragged`                | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--disable-shared-`<br/>`experts-fusion`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-chunked-`<br/>`prefix-cache`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-shared-`<br/>`experts-fusion`                | `True`   | bool flag<br/> (set to enable) |      A2, A3      |
+| `--disable-chunked-`<br/>`prefix-cache`                 | `True`   | bool flag<br/> (set to enable) |      A2, A3      |
 | `--disable-fast-`<br/>`image-processor`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--keep-mm-feature-`<br/>`on-device`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--enable-return-`<br/>`hidden-states`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
