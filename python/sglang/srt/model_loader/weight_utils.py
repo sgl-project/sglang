@@ -39,6 +39,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_world_group,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
@@ -740,23 +741,27 @@ def _prefetch_all_checkpoints(
     import threading
     import time
 
+    # Use node-local rank so that each node independently prefetches the
+    # full checkpoint into its own page cache. Global rank would split files
+    # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
+        world_group = get_world_group()
+        local_rank = world_group.local_rank
+        local_world_size = world_group.local_size or world_group.world_size
     else:
-        rank = 0
-        world_size = 1
+        local_rank = 0
+        local_world_size = 1
 
-    my_files = sorted_files[rank::world_size]
+    my_files = sorted_files[local_rank::local_world_size]
     total_for_rank = len(my_files)
 
     logger.info(
         "Rank %d: prefetching %d/%d checkpoint shards into page cache "
-        "(background, %d ranks sharing the work, %d threads per rank)...",
-        rank,
+        "(background, %d local ranks sharing the work, %d threads per rank)...",
+        local_rank,
         total_for_rank,
         len(sorted_files),
-        world_size,
+        local_world_size,
         num_threads,
     )
 
@@ -776,7 +781,7 @@ def _prefetch_all_checkpoints(
                     if pct >= next_log_pct:
                         logger.info(
                             "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
-                            rank,
+                            local_rank,
                             next_log_pct,
                             completed,
                             total_for_rank,
@@ -798,7 +803,7 @@ def _prefetch_all_checkpoints(
         logger.info(
             "Rank %d: prefetching checkpoint files into page cache "
             "finished in %.2fs",
-            rank,
+            local_rank,
             elapsed,
         )
 
@@ -943,10 +948,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
+    sorted_files = sorted(hf_weights_files)
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
-            sorted(hf_weights_files), num_threads=prefetch_num_threads
-        )
+        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -964,7 +968,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     buffer_size = max_workers + 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        file_iter = iter(hf_weights_files)
+        file_iter = iter(sorted_files)
         pending: collections.deque = collections.deque()
 
         # Seed the buffer.
