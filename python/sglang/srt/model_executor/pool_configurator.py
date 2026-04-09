@@ -216,38 +216,26 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             * kv_size
         )
 
-        # Profiling cell_size: weighted sum across all layers
-        # Used to convert between bytes and tokens for the constraint path.
+        # Bytes per full_token (accounts for SWA ratio).
+        # full_tokens * _cell_size = total memory consumed by both pools.
         self._cell_size = (
             self._full_per_token * self._full_layers_num
-            + self._swa_per_token * self._swa_layers_num
+            + self._swa_full_tokens_ratio * self._swa_per_token * self._swa_layers_num
         )
 
-    def _solve_pool_sizes(self, total_memory: int, page_size: int) -> MemoryPoolConfig:
-        """Core computation: split total_memory into full/swa pool sizes."""
+    def _solve_pool_sizes(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        """Core computation: split max_total_num_tokens into full/swa pool sizes."""
 
         def align_page_size(x: int) -> int:
             return (x // page_size) * page_size
 
-        # Solve:
-        #   full_tokens * F * n_full + swa_tokens * S * n_swa = total_memory
-        #   swa_tokens = full_tokens * r
-        # => full_tokens = total_memory / (F * n_full + r * S * n_swa)
-        # When full_layers_num == 0, denominator = r * S * n_swa, formula still works.
-        denominator = (
-            self._full_per_token * self._full_layers_num
-            + self._swa_full_tokens_ratio * self._swa_per_token * self._swa_layers_num
-        )
-        assert denominator > 0, (
-            f"Invalid denominator={denominator}. "
-            f"full_per_token={self._full_per_token}, full_layers={self._full_layers_num}, "
-            f"swa_per_token={self._swa_per_token}, swa_layers={self._swa_layers_num}, "
-            f"ratio={self._swa_full_tokens_ratio}"
-        )
-
-        full_tokens = align_page_size(int(total_memory / denominator))
+        # full_tokens = max_total_num_tokens (page aligned)
+        # swa_tokens = full_tokens * ratio (page aligned)
+        # When full_layers_num == 0, max_total_num_tokens is swa_tokens.
+        full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
-        max_total_num_tokens = full_tokens if self._full_layers_num > 0 else swa_tokens
 
         logger.info(
             f"Use sliding window memory pool. "
@@ -255,7 +243,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         )
 
         return MemoryPoolConfig(
-            max_total_num_tokens=max_total_num_tokens,
+            max_total_num_tokens=(
+                full_tokens if self._full_layers_num > 0 else swa_tokens
+            ),
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
         )
@@ -263,14 +253,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        return self._solve_pool_sizes(available_bytes, page_size)
+        max_total_num_tokens = available_bytes // self._cell_size
+        return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        # Reconstruct total memory from constrained max_tokens
-        total_memory = max_total_num_tokens * self._cell_size
-        return self._solve_pool_sizes(total_memory, page_size)
+        return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
 def create_memory_pool_configurator(
