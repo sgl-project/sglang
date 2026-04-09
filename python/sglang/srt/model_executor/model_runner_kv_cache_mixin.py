@@ -54,9 +54,7 @@ _is_hip = is_hip()
 
 class ModelRunnerKVCacheMixin:
 
-    def _profile_available_bytes(
-        self: ModelRunner, pre_model_load_memory: int
-    ) -> float:
+    def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         post_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
@@ -70,7 +68,7 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
-        return rest_memory * (1 << 30)  # return in bytes
+        return int(rest_memory * (1 << 30))  # return in bytes
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config

@@ -79,8 +79,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, mr: ModelRunner):
-        self._use_mla_backend = mr.use_mla_backend
-
         # Determine effective number of layers for KV cache
         if mambaish := mr.mambaish_config:
             effective_layer_ids = [
@@ -121,7 +119,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_attention_tp_size()
 
-        if self._use_mla_backend:
+        if mr.use_mla_backend:
             cell_size = (
                 (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                 * num_layers
@@ -172,7 +170,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = int(available_bytes) // self._cell_size
+        max_total_num_tokens = available_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
@@ -265,7 +263,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        return self._solve_pool_sizes(int(available_bytes), page_size)
+        return self._solve_pool_sizes(available_bytes, page_size)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
