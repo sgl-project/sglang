@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
-from typing import Callable, List
+from typing import Callable
 
 import torch
 
@@ -59,9 +59,7 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
         default_factory=lambda: (Mistral3EncoderConfig(),)
     )
 
-    text_encoder_precisions: tuple[str, ...] = field(
-        default_factory=lambda: ("bf16",)
-    )
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (None,)
@@ -120,7 +118,7 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
         return latents
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        if hasattr(vae, 'bn') and vae.bn is not None:
+        if hasattr(vae, "bn") and vae.bn is not None:
             bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype)
             bn_var = vae.bn.running_var.view(1, -1, 1, 1).to(device, dtype)
             bn_std = torch.sqrt(bn_var + 1e-5)

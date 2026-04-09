@@ -50,7 +50,9 @@ class PromptEnhancementStage(PipelineStage):
 
         enhanced = []
         for p in prompts:
-            enhanced_p = self._enhance_single_prompt(p, width, height, max_new_tokens=max_new_tokens)
+            enhanced_p = self._enhance_single_prompt(
+                p, width, height, max_new_tokens=max_new_tokens
+            )
             enhanced.append(enhanced_p)
 
         if isinstance(batch.prompt, str):

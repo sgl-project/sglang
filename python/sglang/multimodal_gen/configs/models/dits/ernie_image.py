@@ -27,10 +27,12 @@ class ErnieImageArchConfig(DiTArchConfig):
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 
-    param_names_mapping: dict = field(default_factory=lambda: {
-        r"(.*)\.mlp\.gate_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 0, 2),
-        r"(.*)\.mlp\.up_proj\.(.*)":   (r"\1.mlp.gate_up_proj.\2", 1, 2),
-    })
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"(.*)\.mlp\.gate_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 0, 2),
+            r"(.*)\.mlp\.up_proj\.(.*)": (r"\1.mlp.gate_up_proj.\2", 1, 2),
+        }
+    )
 
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [_is_transformer_layer]

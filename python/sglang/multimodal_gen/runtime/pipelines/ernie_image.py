@@ -8,12 +8,18 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
-from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import InputValidationStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    InputValidationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ernie_image_pe import (
     PromptEnhancementStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import TextEncodingStage
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model_index
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    maybe_download_model_index,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -57,8 +63,9 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
         # Remote HuggingFace Hub model ID
         try:
-            from huggingface_hub import hf_hub_download
             import tempfile
+
+            from huggingface_hub import hf_hub_download
 
             with tempfile.TemporaryDirectory() as tmp_dir:
                 config_path = hf_hub_download(
@@ -70,7 +77,9 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
                     config = json.load(f)
                 return config.get("model_max_length")
         except Exception as e:
-            logger.warning("Failed to read tokenizer_config.json from %s: %s", model_path, e)
+            logger.warning(
+                "Failed to read tokenizer_config.json from %s: %s", model_path, e
+            )
             return None
 
     def _resolve_pe_tokenizer_path(self, model_path: str, server_args) -> str:
@@ -113,7 +122,9 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         pipeline_config = server_args.pipeline_config
 
         # --- Text encoder max_length ---
-        text_model_max_length = self._read_tokenizer_model_max_length(server_args.model_path)
+        text_model_max_length = self._read_tokenizer_model_max_length(
+            server_args.model_path
+        )
         if text_model_max_length is not None:
             # 1. Update arch_config.text_len so the model knows the true sequence length
             if (
@@ -128,7 +139,9 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 hasattr(pipeline_config, "text_encoder_extra_args")
                 and pipeline_config.text_encoder_extra_args
             ):
-                pipeline_config.text_encoder_extra_args[0]["max_length"] = text_model_max_length
+                pipeline_config.text_encoder_extra_args[0][
+                    "max_length"
+                ] = text_model_max_length
             logger.info(
                 "Set text encoder model_max_length=%d from tokenizer/tokenizer_config.json",
                 text_model_max_length,

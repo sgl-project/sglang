@@ -89,9 +89,12 @@ class PELoader(ComponentLoader):
     ):
         logger.info("Loading PE model from %s ...", component_model_path)
 
-        pe_tokenizer_dir = os.path.join(os.path.dirname(component_model_path), "pe_tokenizer")
-        if not os.path.exists(os.path.join(component_model_path, "tokenizer_config.json")) and \
-                os.path.exists(os.path.join(pe_tokenizer_dir, "tokenizer_config.json")):
+        pe_tokenizer_dir = os.path.join(
+            os.path.dirname(component_model_path), "pe_tokenizer"
+        )
+        if not os.path.exists(
+            os.path.join(component_model_path, "tokenizer_config.json")
+        ) and os.path.exists(os.path.join(pe_tokenizer_dir, "tokenizer_config.json")):
             tokenizer_path = pe_tokenizer_dir
             logger.info(
                 "PE tokenizer files not found in %s, using %s",
@@ -131,9 +134,7 @@ class PELoader(ComponentLoader):
             )
             logger.info("PE model: using Flash Attention 2")
         except (ValueError, ImportError):
-            logger.warning(
-                "Flash Attention 2 not available, falling back to SDPA"
-            )
+            logger.warning("Flash Attention 2 not available, falling back to SDPA")
             attn_impl = "sdpa"
             model = AutoModelForCausalLM.from_pretrained(
                 component_model_path,

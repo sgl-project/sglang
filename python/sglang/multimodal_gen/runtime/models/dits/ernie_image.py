@@ -12,28 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.embeddings import Timesteps, TimestepEmbedding
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 
 from sglang.multimodal_gen.configs.models.dits.ernie_image import (
-    ErnieImageArchConfig,
     ErnieImageDitConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
-    tensor_model_parallel_all_gather,
 )
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
@@ -94,32 +90,42 @@ class ErnieImageSelfAttention(nn.Module):
 
         tp_size = get_tp_world_size()
         self.num_local_heads = num_heads // tp_size
-        assert num_heads % tp_size == 0, (
-            f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
-        )
+        assert (
+            num_heads % tp_size == 0
+        ), f"num_heads ({num_heads}) must be divisible by tp_size ({tp_size})"
 
         self.to_q = ColumnParallelLinear(
-            hidden_size, hidden_size, bias=False,
+            hidden_size,
+            hidden_size,
+            bias=False,
             gather_output=False,
             prefix=f"{prefix}.to_q",
         )
         self.to_k = ColumnParallelLinear(
-            hidden_size, hidden_size, bias=False,
+            hidden_size,
+            hidden_size,
+            bias=False,
             gather_output=False,
             prefix=f"{prefix}.to_k",
         )
         self.to_v = ColumnParallelLinear(
-            hidden_size, hidden_size, bias=False,
+            hidden_size,
+            hidden_size,
+            bias=False,
             gather_output=False,
             prefix=f"{prefix}.to_v",
         )
-        self.to_out = nn.ModuleList([
-            RowParallelLinear(
-                hidden_size, hidden_size, bias=False,
-                input_is_parallel=True,
-                prefix=f"{prefix}.to_out.0",
-            ),
-        ])
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(
+                    hidden_size,
+                    hidden_size,
+                    bias=False,
+                    input_is_parallel=True,
+                    prefix=f"{prefix}.to_out.0",
+                ),
+            ]
+        )
 
         self.qk_layernorm = qk_layernorm
         if qk_layernorm:
@@ -133,7 +139,9 @@ class ErnieImageSelfAttention(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, rotary_pos_emb: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
     ) -> torch.Tensor:
         B, S, H = x.shape
 
@@ -147,7 +155,11 @@ class ErnieImageSelfAttention(nn.Module):
 
         if self.qk_layernorm:
             q, k = apply_qk_norm(
-                q, k, self.norm_q, self.norm_k, self.head_dim,
+                q,
+                k,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
             )
 
         q = _apply_rotary_bshd(q, rotary_pos_emb)
@@ -169,12 +181,16 @@ class ErnieImageMLP(nn.Module):
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [ffn_hidden_size, ffn_hidden_size], bias=False,
+            hidden_size,
+            [ffn_hidden_size, ffn_hidden_size],
+            bias=False,
             gather_output=False,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.linear_fc2 = RowParallelLinear(
-            ffn_hidden_size, hidden_size, bias=False,
+            ffn_hidden_size,
+            hidden_size,
+            bias=False,
             input_is_parallel=True,
             prefix=f"{prefix}.linear_fc2",
         )
@@ -203,7 +219,11 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         super().__init__()
         self.adaLN_sa_ln = RMSNorm(hidden_size, eps=eps)
         self.self_attention = ErnieImageSelfAttention(
-            hidden_size, num_heads, head_dim, eps, qk_layernorm,
+            hidden_size,
+            num_heads,
+            head_dim,
+            eps,
+            qk_layernorm,
             prefix=f"{prefix}.self_attention",
         )
         self.adaLN_mlp_ln = RMSNorm(hidden_size, eps=eps)
@@ -278,12 +298,17 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         tp_size = get_tp_world_size()
 
-        self.x_embedder = nn.ModuleDict({
-            "proj": nn.Conv2d(
-                arch.in_channels, self.inner_dim,
-                kernel_size=arch.patch_size, stride=arch.patch_size, bias=True,
-            ),
-        })
+        self.x_embedder = nn.ModuleDict(
+            {
+                "proj": nn.Conv2d(
+                    arch.in_channels,
+                    self.inner_dim,
+                    kernel_size=arch.patch_size,
+                    stride=arch.patch_size,
+                    bias=True,
+                ),
+            }
+        )
 
         if arch.text_in_dim != self.inner_dim:
             self.text_proj = nn.Linear(arch.text_in_dim, self.inner_dim, bias=False)
@@ -291,14 +316,19 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             self.text_proj = None
 
         self.time_proj = Timesteps(
-            self.inner_dim, flip_sin_to_cos=False, downscale_freq_shift=0,
+            self.inner_dim,
+            flip_sin_to_cos=False,
+            downscale_freq_shift=0,
         )
         self.time_embedding = TimestepEmbedding(
-            in_channels=self.inner_dim, time_embed_dim=self.inner_dim,
+            in_channels=self.inner_dim,
+            time_embed_dim=self.inner_dim,
         )
 
         self.pos_embed = EmbedND3(
-            dim=self.head_dim, theta=arch.rope_theta, axes_dim=arch.rope_axes_dim,
+            dim=self.head_dim,
+            theta=arch.rope_theta,
+            axes_dim=arch.rope_axes_dim,
         )
 
         self.adaLN_modulation = nn.Sequential(
@@ -306,27 +336,35 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             nn.Linear(self.inner_dim, 6 * self.inner_dim),
         )
 
-        self.layers = nn.ModuleList([
-            ErnieImageSharedAdaLNBlock(
-                hidden_size=self.inner_dim,
-                num_heads=self.num_attention_heads,
-                head_dim=self.head_dim,
-                ffn_hidden_size=arch.ffn_hidden_size,
-                eps=arch.eps,
-                qk_layernorm=arch.qk_layernorm,
-                prefix=f"layers.{i}",
-            )
-            for i in range(self.num_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                ErnieImageSharedAdaLNBlock(
+                    hidden_size=self.inner_dim,
+                    num_heads=self.num_attention_heads,
+                    head_dim=self.head_dim,
+                    ffn_hidden_size=arch.ffn_hidden_size,
+                    eps=arch.eps,
+                    qk_layernorm=arch.qk_layernorm,
+                    prefix=f"layers.{i}",
+                )
+                for i in range(self.num_layers)
+            ]
+        )
 
-        self.final_norm = nn.ModuleDict({
-            "norm": nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=arch.eps),
-            "linear": nn.Linear(self.inner_dim, self.inner_dim * 2),
-        })
+        self.final_norm = nn.ModuleDict(
+            {
+                "norm": nn.LayerNorm(
+                    self.inner_dim, elementwise_affine=False, eps=arch.eps
+                ),
+                "linear": nn.Linear(self.inner_dim, self.inner_dim * 2),
+            }
+        )
 
         self.final_linear = ColumnParallelLinear(
-            self.inner_dim, arch.patch_size * arch.patch_size * self.out_channels,
-            bias=True, gather_output=True,
+            self.inner_dim,
+            arch.patch_size * arch.patch_size * self.out_channels,
+            bias=True,
+            gather_output=True,
             prefix="final_linear",
         )
 
@@ -358,7 +396,9 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         N_img = Hp * Wp
 
         img_tokens = self.x_embedder["proj"](hidden_states)  # [B, D, Hp, Wp]
-        img_tokens = img_tokens.reshape(B, self.inner_dim, N_img).transpose(1, 2)  # [B, N_img, D]
+        img_tokens = img_tokens.reshape(B, self.inner_dim, N_img).transpose(
+            1, 2
+        )  # [B, N_img, D]
 
         if isinstance(encoder_hidden_states, (list, tuple)):
             encoder_hidden_states = encoder_hidden_states[0]
@@ -378,17 +418,24 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             dim=-1,
         ).reshape(-1, 2)
 
-        image_ids = torch.cat([
-            torch.full((B, N_img, 1), Tmax, device=device, dtype=torch.float32),
-            grid_yx.view(1, N_img, 2).expand(B, -1, -1),
-        ], dim=-1)
+        image_ids = torch.cat(
+            [
+                torch.full((B, N_img, 1), Tmax, device=device, dtype=torch.float32),
+                grid_yx.view(1, N_img, 2).expand(B, -1, -1),
+            ],
+            dim=-1,
+        )
 
         if Tmax > 0:
-            text_ids = torch.cat([
-                torch.arange(Tmax, device=device, dtype=torch.float32)
-                    .view(1, Tmax, 1).expand(B, -1, -1),
-                torch.zeros((B, Tmax, 2), device=device),
-            ], dim=-1)
+            text_ids = torch.cat(
+                [
+                    torch.arange(Tmax, device=device, dtype=torch.float32)
+                    .view(1, Tmax, 1)
+                    .expand(B, -1, -1),
+                    torch.zeros((B, Tmax, 2), device=device),
+                ],
+                dim=-1,
+            )
         else:
             text_ids = torch.zeros((B, 0, 3), device=device)
 
@@ -405,9 +452,14 @@ class ErnieImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         for layer in self.layers:
             x = layer(
-                x, rotary_pos_emb,
-                shift_msa, scale_msa, gate_msa,
-                shift_mlp, scale_mlp, gate_mlp,
+                x,
+                rotary_pos_emb,
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
             )
 
         scale, shift = self.final_norm["linear"](c).chunk(2, dim=-1)
