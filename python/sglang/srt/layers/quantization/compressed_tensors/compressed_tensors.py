@@ -201,6 +201,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             return
         self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
+        self.target_scheme_map["DeepEPMoE"] = self.target_scheme_map["Linear"]
 
     @property
     def weight_block_size(self) -> Optional[List[int]]:

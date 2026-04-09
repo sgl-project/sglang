@@ -15,7 +15,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=50, suite="stage-b-test-large-2-gpu")
+register_cuda_ci(est_time=50, suite="stage-b-test-2-gpu-large")
 
 NUM_GPUS = 2
 
@@ -40,7 +40,9 @@ def test_mixer2_gated_norm_multi_gpu(
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
 
-    assert torch.cuda.device_count() == NUM_GPUS
+    assert (
+        torch.cuda.device_count() >= NUM_GPUS
+    ), f"This test requires at least {NUM_GPUS} GPUs, but only {torch.cuda.device_count()} available"
 
     hidden_size, n_groups = hidden_size_n_groups
     num_processes = NUM_GPUS

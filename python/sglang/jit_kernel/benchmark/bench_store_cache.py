@@ -4,7 +4,6 @@ from typing import Tuple
 import torch
 import triton
 import triton.testing
-from sgl_kernel import set_kv_buffer_kernel
 
 from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
@@ -13,16 +12,9 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
 )
 from sglang.jit_kernel.kvcache import store_cache
+from sglang.test.ci.ci_register import register_cuda_ci
 
-
-def sglang_aot_store_cache(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    indices: torch.Tensor,
-) -> None:
-    set_kv_buffer_kernel(k_cache, v_cache, indices, k, v)
+register_cuda_ci(est_time=9, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 
 def sglang_jit_store_cache(
@@ -77,9 +69,9 @@ ITEM_SIZE = get_benchmark_range(
     ci_range=[1024],
 )
 
-LINE_VALS = ["aot", "jit", "torch_compile", "torch_streams"]
-LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch Compile", "PyTorch 2 Stream"]
-STYLES = [("orange", "-"), ("blue", "--"), ("red", ":"), ("green", "-.")]
+LINE_VALS = ["jit", "torch_compile", "torch_streams"]
+LINE_NAMES = ["SGL JIT Kernel", "PyTorch Compile", "PyTorch 2 Stream"]
+STYLES = [("blue", "--"), ("red", ":"), ("green", "-.")]
 X_NAMES = ["item_size", "batch_size"]
 CONFIGS = list(itertools.product(ITEM_SIZE, BS_RANGE))
 
@@ -116,7 +108,6 @@ def benchmark(
     torch.cuda.synchronize()
 
     FN_MAP = {
-        "aot": sglang_aot_store_cache,
         "jit": sglang_jit_store_cache,
         "torch_compile": torch_compile_store_cache,
         "torch_streams": torch_streams_store_cache,

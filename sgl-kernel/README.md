@@ -1,22 +1,22 @@
-# sgl-kernel
+# sglang-kernel (prior sgl-kernel)
 
 [Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for LLM inference engines
 
 <div align="center">
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://github.com/sgl-project/sglang/blob/main/LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
+[![PyPI](https://img.shields.io/pypi/v/sglang-kernel)](https://pypi.org/project/sglang-kernel)
 
 </div>
 
-sgl-kernel provides optimized compute primitives for LLM inference engines, enabling efficient inference for large language models and vision-language models through custom kernel operations. It has been used by [LightLLM](https://github.com/ModelTC/LightLLM), [SGLang](https://github.com/sgl-project/sglang) and so on.
+`sglang-kernel` provides optimized compute primitives for LLM inference engines, enabling efficient inference for large language models and vision-language models through custom kernel operations. The source tree remains under the `sgl-kernel/` directory and the Python import path remains `sgl_kernel`.
 
 ## Installation
 Requires torch == 2.9.1
 
 ```bash
 # Latest version
-pip3 install sgl-kernel --upgrade
+pip3 install sglang-kernel --upgrade
 ```
 
 ## Building from Source
@@ -26,7 +26,7 @@ Requires
 - scikit-build-core
 - ninja(optional)
 
-### Use Makefile to build sgl-kernel
+### Use Makefile to build from the sgl-kernel source tree
 
 ```bash
 make build
@@ -125,10 +125,10 @@ This tool requires `cubloaty` (install with `pip install cubloaty`) to work.
 pip install cubloaty
 
 # Analyze a wheel file
-python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl
+python analyze_whl_kernel_sizes.py path/to/sglang_kernel-*.whl
 
 # Custom output file
-python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl --output my_analysis.txt
+python analyze_whl_kernel_sizes.py path/to/sglang_kernel-*.whl --output my_analysis.txt
 ```
 
 The tool generates:

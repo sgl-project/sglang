@@ -20,10 +20,16 @@ class SchedulerStatusLogger:
         self.rank = dist.get_rank() if dist.is_initialized() else 0
 
     @staticmethod
-    def maybe_create() -> Optional["SchedulerStatusLogger"]:
+    def maybe_create(enable_metrics: bool) -> Optional["SchedulerStatusLogger"]:
         target = envs.SGLANG_LOG_SCHEDULER_STATUS_TARGET.get()
         if not target:
             return None
+
+        if not enable_metrics:
+            raise ValueError(
+                "SGLANG_LOG_SCHEDULER_STATUS_TARGET is set but --enable-metrics "
+                "is not active. Status dumps require --enable-metrics to work."
+            )
 
         return SchedulerStatusLogger(
             targets=[t.strip() for t in target.split(",") if t.strip()],

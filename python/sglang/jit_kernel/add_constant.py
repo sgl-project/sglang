@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_add_constant_module(constant: int) -> Module:
-    args = make_cpp_args(constant)  # pass all the template argument
+    args = make_cpp_args(constant)
     return load_jit(
         "add_constant",
         *args,

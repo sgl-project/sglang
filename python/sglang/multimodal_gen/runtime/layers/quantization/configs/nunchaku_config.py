@@ -22,6 +22,7 @@ def is_nunchaku_available() -> bool:
     try:
         import nunchaku  # noqa
 
+        logger.debug("Nunchaku package detected")
         return True
     except Exception:
         return False
@@ -39,7 +40,7 @@ class NunchakuConfig(QuantizationConfig):
         rank: SVD low-rank dimension for absorbing outliers
         group_size: Quantization group size (automatically set based on precision)
         act_unsigned: Use unsigned activation quantization
-        quantized_model_path: Path to pre-quantized model weights (.safetensors)
+        transformer_weights_path: Path to pre-quantized transformer weights (.safetensors)
         model_cls: DiT model class that provides quantization rules via get_nunchaku_quant_rules()
     """
 
@@ -47,7 +48,7 @@ class NunchakuConfig(QuantizationConfig):
     rank: int = 32
     group_size: Optional[int] = None
     act_unsigned: bool = False
-    quantized_model_path: Optional[str] = None
+    transformer_weights_path: Optional[str] = None
     model_cls: Optional[type] = None
 
     @classmethod
@@ -74,7 +75,7 @@ class NunchakuConfig(QuantizationConfig):
             rank=int(config.get("rank", 32)),
             group_size=config.get("group_size"),
             act_unsigned=bool(config.get("act_unsigned", False)),
-            quantized_model_path=config.get("quantized_model_path"),
+            transformer_weights_path=config.get("transformer_weights_path"),
         )
 
     def get_quant_method(
@@ -157,7 +158,7 @@ class NunchakuConfig(QuantizationConfig):
             "rank": self.rank,
             "group_size": self.group_size,
             "act_unsigned": self.act_unsigned,
-            "quantized_model_path": self.quantized_model_path,
+            "transformer_weights_path": self.transformer_weights_path,
         }
 
     @classmethod

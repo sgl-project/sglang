@@ -45,3 +45,4 @@ class AsyncDictStore:
 # [request_id, dict]
 VIDEO_STORE = AsyncDictStore()
 IMAGE_STORE = AsyncDictStore()
+MESH_STORE = AsyncDictStore()

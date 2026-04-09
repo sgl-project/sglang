@@ -1,6 +1,7 @@
+import sys
+
 import pytest
 import torch
-from sgl_kernel import gptq_marlin_repack as aot_gptq_marlin_repack
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
@@ -9,7 +10,11 @@ from sglang.srt.layers.quantization.utils import (
     pack_rows,
     sort_weights,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import get_weight_perm, marlin_weights
+
+register_cuda_ci(est_time=16, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 
 MARLIN_K_CHUNKS = [128]
 MARLIN_N_CHUNKS = [64, 256]
@@ -81,21 +86,11 @@ def test_gptq_marlin_repack(
         q_w_gptq, sort_indices, size_k, size_n, quant_type.size_bits
     )
 
-    # Run AOT repack kernel
-    aot_output = aot_gptq_marlin_repack(
-        q_w_gptq, sort_indices, size_k, size_n, quant_type.size_bits
-    )
-
     torch.cuda.synchronize()
 
     # JIT should match the reference (computed from CPU marlin_weights)
     torch.testing.assert_close(jit_output, q_w_marlin_ref)
 
-    # JIT should produce bitwise identical results to AOT
-    torch.testing.assert_close(jit_output, aot_output, rtol=0, atol=0)
-
 
 if __name__ == "__main__":
-    import subprocess
-
-    subprocess.call(["pytest", "--tb=short", str(__file__)])
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

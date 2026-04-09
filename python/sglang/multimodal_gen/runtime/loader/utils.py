@@ -18,6 +18,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_QUANTIZED_DTYPES = {
+    torch.uint8,
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+    torch.int8,
+}
+
 
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype):
@@ -135,6 +142,25 @@ def hf_to_custom_state_dict(
                 del to_merge_params[target_param_name]
             else:
                 continue
+        existing_tensor = custom_param_sd.get(target_param_name)
+        if existing_tensor is not None and existing_tensor.dtype != full_tensor.dtype:
+            existing_is_quantized = existing_tensor.dtype in _QUANTIZED_DTYPES
+            current_is_quantized = full_tensor.dtype in _QUANTIZED_DTYPES
+            if existing_is_quantized and not current_is_quantized:
+                logger.debug(
+                    "Keeping quantized duplicate for %s: existing=%s new=%s",
+                    target_param_name,
+                    existing_tensor.dtype,
+                    full_tensor.dtype,
+                )
+                continue
+            if current_is_quantized and not existing_is_quantized:
+                logger.debug(
+                    "Replacing non-quantized duplicate for %s: existing=%s new=%s",
+                    target_param_name,
+                    existing_tensor.dtype,
+                    full_tensor.dtype,
+                )
         custom_param_sd[target_param_name] = full_tensor
     return custom_param_sd, reverse_param_names_mapping
 
@@ -178,6 +204,26 @@ def _list_safetensors_files(model_path: str) -> list[str]:
 
 
 BYTES_PER_GB = 1024**3
+
+
+def get_memory_usage_of_component(module) -> float | None:
+    """
+    returned value is in GB, rounded to 2 decimal digits
+    """
+    if not isinstance(module, nn.Module):
+        return None
+    if hasattr(module, "get_memory_footprint"):
+        usage = module.get_memory_footprint() / BYTES_PER_GB
+    else:
+        # manually
+        param_size = sum(p.numel() * p.element_size() for p in module.parameters())
+        buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
+
+        total_size_bytes = param_size + buffer_size
+        usage = total_size_bytes / (1024**3)
+
+    return round(usage, 2)
+
 
 # component name ->  ComponentLoader class
 component_name_to_loader_cls: Dict[str, Type[Any]] = {}

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -21,6 +22,7 @@ def _jit_timestep_embedding_module(dtype: torch.dtype) -> Module:
     )
 
 
+@debug_kernel_api
 def timestep_embedding(
     t: torch.Tensor,
     dim: int,

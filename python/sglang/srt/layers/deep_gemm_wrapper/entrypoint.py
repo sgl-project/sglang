@@ -102,13 +102,27 @@ def gemm_nt_f8f8bf16(
         )
 
 
+def gemm_nt_bf16bf16f32(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+):
+    m, k = lhs.shape
+    n, _ = rhs.shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_BF16BF16F32
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.bf16_gemm_nt(lhs, rhs, out)
+
+
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
-    if num_sms is None:
+    if num_sms is None or not ENABLE_JIT_DEEPGEMM:
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()

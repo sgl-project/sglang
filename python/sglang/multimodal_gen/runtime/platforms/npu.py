@@ -116,6 +116,10 @@ class NPUPlatformBase(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
+        if selected_backend == AttentionBackendEnum.FA:
+            logger.info("Using Ascend Flash Attention backend.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
+
         logger.info("Using Torch SDPA backend.")
         return (
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -124,3 +128,8 @@ class NPUPlatformBase(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
+
+    @classmethod
+    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
+        """The performance of the layerwise_offload feature depends on the device's memory size and the memory size occupied by the model. Use --dit-layerwise-offload True if it suitable for your case."""
+        return False
