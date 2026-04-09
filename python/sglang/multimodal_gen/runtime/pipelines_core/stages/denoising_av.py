@@ -546,12 +546,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args,
             is_ltx23_variant=is_ltx23_variant,
         )
-        exact_ltx23_sp_self_attention = (
-            is_ltx23_variant
-            and batch.image_path is not None
-            and get_sp_world_size() > 1
-            and server_args.pipeline_class_name != "LTX2TwoStagePipeline"
-        )
         batch.ltx23_audio_replicated_for_sp = bool(replicate_audio_for_sp)
 
         if (
@@ -856,7 +850,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     video_coords=video_coords,
                                     audio_coords=audio_coords,
                                     audio_replicated_for_sp=replicate_audio_for_sp,
-                                    exact_ltx23_sp_self_attention=exact_ltx23_sp_self_attention,
                                     return_latents=False,
                                     return_dict=False,
                                 )
@@ -941,7 +934,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     video_coords=video_coords,
                                     audio_coords=audio_coords,
                                     audio_replicated_for_sp=replicate_audio_for_sp,
-                                    exact_ltx23_sp_self_attention=exact_ltx23_sp_self_attention,
                                     return_latents=False,
                                     return_dict=False,
                                 )
@@ -981,7 +973,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         video_coords=video_coords,
                                         audio_coords=audio_coords,
                                         audio_replicated_for_sp=replicate_audio_for_sp,
-                                        exact_ltx23_sp_self_attention=exact_ltx23_sp_self_attention,
                                         return_latents=False,
                                         return_dict=False,
                                     )
@@ -1070,7 +1061,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         video_coords=video_coords,
                                         audio_coords=audio_coords,
                                         audio_replicated_for_sp=replicate_audio_for_sp,
-                                        exact_ltx23_sp_self_attention=exact_ltx23_sp_self_attention,
                                         return_latents=False,
                                         return_dict=False,
                                         skip_video_self_attn_blocks=tuple(
@@ -1120,7 +1110,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         video_coords=video_coords,
                                         audio_coords=audio_coords,
                                         audio_replicated_for_sp=replicate_audio_for_sp,
-                                        exact_ltx23_sp_self_attention=exact_ltx23_sp_self_attention,
                                         return_latents=False,
                                         return_dict=False,
                                         disable_a2v_cross_attn=True,
