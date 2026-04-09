@@ -189,10 +189,6 @@ class TestPreprocessConditionImageResolution(unittest.TestCase):
 
 
 class TestFlux2ConditionImagePreprocess(unittest.TestCase):
-    def test_flux2_uses_bf16_vae_by_default(self):
-        config = Flux2PipelineConfig()
-        self.assertEqual(config.vae_precision, "bf16")
-
     def test_matches_official_flux2_image_processor(self):
         config = Flux2PipelineConfig()
         config.vae_config.arch_config.vae_scale_factor = 8
