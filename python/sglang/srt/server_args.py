@@ -26,6 +26,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -325,6 +326,7 @@ class ServerArgs:
     ssl_ca_certs: Optional[str] = None
     ssl_keyfile_password: Optional[str] = None
     enable_ssl_refresh: bool = False
+    enable_http2: bool = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -497,6 +499,8 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
+    speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -921,6 +925,26 @@ class ServerArgs:
                 "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
                 "to be specified."
             )
+
+        if self.enable_http2:
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
+            if self.enable_ssl_refresh:
+                raise ValueError(
+                    "--enable-ssl-refresh is not supported with --enable-http2. "
+                    "Granian does not support SSL certificate hot-reloading. "
+                    "Use Uvicorn (the default) or handle certificate rotation externally."
+                )
+            if self.tokenizer_worker_num > 1:
+                raise ValueError(
+                    "--enable-http2 does not yet support --tokenizer-worker-num > 1. "
+                    "Multi-worker HTTP/2 support will be added in a future release."
+                )
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -1500,6 +1524,14 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        _hybrid_spec = get_linear_attn_spec_by_arch(model_arch)
+        if _hybrid_spec is not None:
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=_hybrid_spec.support_mamba_cache,
+                support_mamba_cache_extra_buffer=_hybrid_spec.support_mamba_cache_extra_buffer,
+            )
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
@@ -2156,19 +2188,6 @@ class ServerArgs:
                 not self.enable_mamba_extra_buffer()
             ), f"mamba extra_buffer is not supported for {model_arch} model"
 
-        # FlashInfer GDN decode is incompatible with no_buffer scheduling.
-        # See https://github.com/sgl-project/sglang/issues/20791
-        if (
-            self.linear_attn_decode_backend == "flashinfer"
-            and self.mamba_scheduler_strategy == "no_buffer"
-        ):
-            raise ValueError(
-                "FlashInfer GDN decode (--linear-attn-decode-backend flashinfer) is not "
-                "compatible with --mamba-scheduler-strategy no_buffer. "
-                "Please use --mamba-scheduler-strategy extra_buffer instead. "
-                "See https://github.com/sgl-project/sglang/issues/20791"
-            )
-
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
                 raise ValueError(
@@ -2195,6 +2214,13 @@ class ServerArgs:
                     == 0
                 ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
         elif not self.disable_radix_cache:  # no_buffer
+            if self.page_size is not None and self.page_size != 1:
+                logger.warning(
+                    f"{model_arch} with radix cache requires page_size=1 in the current "
+                    f"Mamba scheduling mode (no_buffer), but got {self.page_size}. "
+                    "Automatically setting page_size=1."
+                )
+                self.page_size = 1
             if self.speculative_algorithm is None:
                 logger.warning(
                     "Disabling overlap schedule since mamba no_buffer is not compatible with "
@@ -2588,9 +2614,27 @@ class ServerArgs:
                 )
 
     def _handle_linear_attn_backend(self):
-        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         import torch
 
+        # SM100+: default to FlashInfer GDN decode when the user hasn't
+        # explicitly chosen a decode backend and mamba-ssm-dtype is bf16
+        # (required by FlashInfer GDN on SM100+).
+        # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
+        # Excluded when MTP speculative decoding is enabled because
+        # FlashInfer GDN MTP verify is not yet supported on SM100+.
+        if (
+            self.linear_attn_decode_backend is None
+            and is_sm100_supported()
+            and self.mamba_ssm_dtype == "bfloat16"
+            and self.speculative_algorithm is None
+        ):
+            self.linear_attn_decode_backend = "flashinfer"
+            logger.info(
+                "SM100+ detected with mamba-ssm-dtype=bfloat16, "
+                "defaulting --linear-attn-decode-backend to flashinfer."
+            )
+
+        # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
         decode = self.linear_attn_decode_backend or self.linear_attn_backend
         if (
             decode == "flashinfer"
@@ -2989,6 +3033,134 @@ class ServerArgs:
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
+
+        if self.speculative_algorithm == "DFLASH":
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "Currently DFLASH speculative decoding does not support dp attention."
+                )
+
+            if self.pp_size != 1:
+                raise ValueError(
+                    "Currently DFLASH speculative decoding only supports pp_size == 1."
+                )
+
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DFLASH speculative decoding requires setting --speculative-draft-model-path."
+                )
+
+            # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
+            # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
+            # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
+            #
+            # For DFlash, the natural unit is `block_size` (verify window length).
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = 1
+            elif int(self.speculative_num_steps) != 1:
+                logger.warning(
+                    "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+                    self.speculative_num_steps,
+                )
+                self.speculative_num_steps = 1
+
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 1
+            elif int(self.speculative_eagle_topk) != 1:
+                logger.warning(
+                    "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+                    self.speculative_eagle_topk,
+                )
+                self.speculative_eagle_topk = 1
+
+            if self.speculative_dflash_block_size is not None:
+                if int(self.speculative_dflash_block_size) <= 0:
+                    raise ValueError(
+                        "DFLASH requires --speculative-dflash-block-size to be positive, "
+                        f"got {self.speculative_dflash_block_size}."
+                    )
+                if self.speculative_num_draft_tokens is not None and int(
+                    self.speculative_num_draft_tokens
+                ) != int(self.speculative_dflash_block_size):
+                    raise ValueError(
+                        "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
+                        "but they differ. For DFLASH they must match. "
+                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
+                        f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
+                    )
+                self.speculative_num_draft_tokens = int(
+                    self.speculative_dflash_block_size
+                )
+
+            window_size = None
+            if self.speculative_dflash_draft_window_size is not None:
+                window_size = int(self.speculative_dflash_draft_window_size)
+                if window_size <= 0:
+                    raise ValueError(
+                        "DFLASH requires --speculative-dflash-draft-window-size "
+                        f"to be positive, got {window_size}."
+                    )
+                self.speculative_dflash_draft_window_size = window_size
+
+            if self.speculative_num_draft_tokens is None:
+                from sglang.srt.speculative.dflash_utils import (
+                    parse_dflash_draft_config,
+                )
+
+                model_override_args = json.loads(self.json_model_override_args)
+                inferred_block_size = None
+                try:
+                    from sglang.srt.utils.hf_transformers_utils import get_config
+
+                    draft_hf_config = get_config(
+                        self.speculative_draft_model_path,
+                        trust_remote_code=self.trust_remote_code,
+                        revision=self.speculative_draft_model_revision,
+                        model_override_args=model_override_args,
+                    )
+                    inferred_block_size = parse_dflash_draft_config(
+                        draft_hf_config=draft_hf_config
+                    ).resolve_block_size(default=None)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to infer DFLASH block_size from draft model config; "
+                        "defaulting speculative_num_draft_tokens to 16. Error: %s",
+                        e,
+                    )
+
+                if inferred_block_size is None:
+                    inferred_block_size = 16
+                    logger.warning(
+                        "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
+                        inferred_block_size,
+                    )
+                self.speculative_num_draft_tokens = inferred_block_size
+
+            if window_size is not None:
+                draft_tokens = int(self.speculative_num_draft_tokens)
+                if window_size < draft_tokens:
+                    raise ValueError(
+                        "DFLASH --speculative-dflash-draft-window-size must be >= "
+                        "--speculative-num-draft-tokens (block_size). "
+                        f"window_size={window_size}, block_size={draft_tokens}."
+                    )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+                )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
@@ -3848,6 +4020,14 @@ class ServerArgs:
             default=ServerArgs.enable_ssl_refresh,
             help="Enable automatic SSL certificate hot-reloading when cert/key "
             "files change on disk. Requires --ssl-certfile and --ssl-keyfile.",
+        )
+        parser.add_argument(
+            "--enable-http2",
+            action="store_true",
+            default=ServerArgs.enable_http2,
+            help="Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and "
+            "HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. "
+            "Requires 'pip install sglang[http2]'.",
         )
 
         # Quantization and data type
@@ -4787,7 +4967,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4830,6 +5010,21 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-dflash-block-size",
+            type=int,
+            help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+            default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-draft-window-size",
+            type=int,
+            help="DFLASH only. Sliding window size for the draft-model KV cache. "
+            "When set, the draft worker keeps a recent target-token window in its "
+            "local cache (paged backends may retain up to one extra page on the left "
+            "for alignment). Default is full context.",
+            default=ServerArgs.speculative_dflash_draft_window_size,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
