@@ -292,7 +292,9 @@ class TextEncodingStage(PipelineStage):
                 prompt_embeds = prompt_embeds.to(device=target_device)
 
             embeds_list.append(prompt_embeds)
-            if is_flux_v1:
+            if is_flux_v1 and outputs.pooler_output is not None:
+                # FLUX.1 only consumes the pooled CLIP projection. The T5
+                # encoder in the same pipeline has no pooler output.
                 pooled_embeds_list.append(
                     outputs.pooler_output.to(device=target_device)
                 )
