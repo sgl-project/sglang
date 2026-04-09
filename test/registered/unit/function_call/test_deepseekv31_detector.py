@@ -14,7 +14,7 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
+from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -134,9 +134,7 @@ class TestDeepSeekV31DetectorDetectAndParse(CustomTestCase):
         names = [c.name for c in result.calls]
         self.assertEqual(names, ["get_weather", "search_web"])
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
-        self.assertEqual(
-            json.loads(result.calls[1].parameters), {"query": "hotels"}
-        )
+        self.assertEqual(json.loads(result.calls[1].parameters), {"query": "hotels"})
         # Indices must match positions in the tools list, not the call order.
         self.assertEqual(result.calls[0].tool_index, 0)
         self.assertEqual(result.calls[1].tool_index, 1)
@@ -159,14 +157,10 @@ class TestDeepSeekV31DetectorDetectAndParse(CustomTestCase):
 
     def test_unicode_arguments_preserved(self):
         # JSON preserves non-ASCII content through the parse round-trip.
-        text = _wrap_single(
-            "search_web", '{"query": "东京 天气"}'
-        )
+        text = _wrap_single("search_web", '{"query": "东京 天气"}')
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
-        self.assertEqual(
-            json.loads(result.calls[0].parameters), {"query": "东京 天气"}
-        )
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "东京 天气"})
 
 
 class TestDeepSeekV31DetectorStreaming(CustomTestCase):
@@ -271,12 +265,8 @@ class TestDeepSeekV31DetectorStreaming(CustomTestCase):
             for c in calls
             if c.name is None and c.tool_index == 1 and c.parameters
         ]
-        self.assertEqual(
-            json.loads("".join(first_arg_diffs)), {"city": "Tokyo"}
-        )
-        self.assertEqual(
-            json.loads("".join(second_arg_diffs)), {"query": "sushi"}
-        )
+        self.assertEqual(json.loads("".join(first_arg_diffs)), {"city": "Tokyo"})
+        self.assertEqual(json.loads("".join(second_arg_diffs)), {"query": "sushi"})
 
     def test_streaming_argument_diffs_are_incremental(self):
         # Diffs must be strict suffixes of what's been streamed so far, never
