@@ -29,7 +29,7 @@ import re
 import shutil
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import torch
 from safetensors import safe_open
@@ -57,9 +57,7 @@ def _resolve_transformer_dir(path: str) -> str:
     transformer_dir = candidate / "transformer"
     if (transformer_dir / "config.json").is_file():
         return str(transformer_dir)
-    raise FileNotFoundError(
-        f"Could not resolve a transformer directory from: {path}"
-    )
+    raise FileNotFoundError(f"Could not resolve a transformer directory from: {path}")
 
 
 def _resolve_backbone_ckpt(path: str) -> str:
@@ -94,7 +92,9 @@ def _load_weight_map(model_dir: str) -> tuple[dict[str, str], str | None]:
         return dict(index_data["weight_map"]), index_filename
 
     safetensors_files = sorted(
-        filename for filename in os.listdir(model_dir) if filename.endswith(".safetensors")
+        filename
+        for filename in os.listdir(model_dir)
+        if filename.endswith(".safetensors")
     )
     if len(safetensors_files) != 1:
         raise ValueError(
@@ -103,7 +103,9 @@ def _load_weight_map(model_dir: str) -> tuple[dict[str, str], str | None]:
         )
 
     shard_name = safetensors_files[0]
-    with safe_open(os.path.join(model_dir, shard_name), framework="pt", device="cpu") as f:
+    with safe_open(
+        os.path.join(model_dir, shard_name), framework="pt", device="cpu"
+    ) as f:
         weight_map = {key: shard_name for key in f.keys()}
     index_filename = f"{Path(shard_name).stem}.safetensors.index.json"
     return weight_map, index_filename
@@ -242,15 +244,20 @@ def convert_modelopt_fp8_checkpoint(
 ) -> dict[str, int]:
     source_dir = _resolve_transformer_dir(modelopt_hf_dir)
     backbone_ckpt_path = _resolve_backbone_ckpt(modelopt_backbone_ckpt)
-    base_dir = _resolve_transformer_dir(base_transformer_dir) if base_transformer_dir else None
+    base_dir = (
+        _resolve_transformer_dir(base_transformer_dir) if base_transformer_dir else None
+    )
 
     config = _load_config(source_dir)
     quant_config = config.get("quantization_config")
     if not isinstance(quant_config, dict):
-        raise ValueError("Expected a flat quantization_config dict in the ModelOpt export.")
-    if quant_config.get("quant_method") != "modelopt" or "FP8" not in str(
-        quant_config.get("quant_algo", "")
-    ).upper():
+        raise ValueError(
+            "Expected a flat quantization_config dict in the ModelOpt export."
+        )
+    if (
+        quant_config.get("quant_method") != "modelopt"
+        or "FP8" not in str(quant_config.get("quant_algo", "")).upper()
+    ):
         raise ValueError(
             "This tool only supports ModelOpt diffusers FP8 exports "
             "(quant_method=modelopt, quant_algo=FP8)."
@@ -284,7 +291,9 @@ def convert_modelopt_fp8_checkpoint(
     if base_dir is not None:
         base_weight_map, _ = _load_weight_map(base_dir)
 
-    backbone_state = torch.load(backbone_ckpt_path, map_location="cpu")["model_state_dict"]
+    backbone_state = torch.load(backbone_ckpt_path, map_location="cpu")[
+        "model_state_dict"
+    ]
     fp8_scale_map = build_fp8_scale_map(backbone_state, maxbound=maxbound)
     serialized_quant_config = json.dumps(quant_config, sort_keys=True)
 
@@ -320,17 +329,25 @@ def convert_modelopt_fp8_checkpoint(
         metadata["_quantization_metadata"] = serialized_quant_config
 
         for name in list(shard_tensors.keys()):
-            if name.endswith(".weight") and is_ignored_by_modelopt(name, ignore_patterns):
+            if name.endswith(".weight") and is_ignored_by_modelopt(
+                name, ignore_patterns
+            ):
                 preserved_ignored_weight_count += 1
                 continue
             if name in fallback_tensors:
                 shard_tensors[name] = fallback_tensors[name]
-            if name.endswith(".weight") and name in fp8_scale_map and name not in fallback_tensors:
+            if (
+                name.endswith(".weight")
+                and name in fp8_scale_map
+                and name not in fallback_tensors
+            ):
                 scale_tensors = fp8_scale_map[name]
                 shard_tensors[name] = quantize_fp8_weight(
                     shard_tensors[name], scale_tensors["weight_scale"]
                 )
-                shard_tensors[name[:-7] + ".weight_scale"] = scale_tensors["weight_scale"]
+                shard_tensors[name[:-7] + ".weight_scale"] = scale_tensors[
+                    "weight_scale"
+                ]
                 shard_tensors[name[:-7] + ".input_scale"] = scale_tensors["input_scale"]
                 added_scale_count += 2
 

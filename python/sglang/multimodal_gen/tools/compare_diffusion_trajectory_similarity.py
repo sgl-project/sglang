@@ -26,7 +26,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, Sequence
+from typing import Any, Sequence
 
 import imageio.v3 as iio
 import numpy as np
@@ -184,7 +184,9 @@ def summarize_output_frame_metrics(
 
     frame0_metrics = compute_uint8_frame_metrics(ref_stack[0], cand_stack[0])
     mid_index = len(reference_frames) // 2
-    mid_metrics = compute_uint8_frame_metrics(ref_stack[mid_index], cand_stack[mid_index])
+    mid_metrics = compute_uint8_frame_metrics(
+        ref_stack[mid_index], cand_stack[mid_index]
+    )
     all_metrics = compute_uint8_frame_metrics(ref_stack, cand_stack)
 
     return {

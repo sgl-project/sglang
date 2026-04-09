@@ -822,11 +822,11 @@ class Flux2PosEmbed(nn.Module):
             repeat_interleave_real=False,
             dtype=(
                 torch.float64
-        if (
-            current_platform.is_float64_supported()
-            if hasattr(current_platform, "is_float64_supported")
-            else True
-        )
+                if (
+                    current_platform.is_float64_supported()
+                    if hasattr(current_platform, "is_float64_supported")
+                    else True
+                )
                 else torch.float32
             ),
         )

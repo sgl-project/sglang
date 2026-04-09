@@ -326,7 +326,9 @@ def _resolve_quant_config(
     """
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:
-        override_quantized_path = maybe_download_model(server_args.transformer_weights_path)
+        override_quantized_path = maybe_download_model(
+            server_args.transformer_weights_path
+        )
         override_config_path = (
             os.path.join(override_quantized_path, "config.json")
             if os.path.isdir(override_quantized_path)
