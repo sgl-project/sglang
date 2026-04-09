@@ -10,6 +10,10 @@ from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
@@ -382,7 +386,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             # produce slightly different target_probs due to floating-point
             # non-determinism in softmax/top_k/top_p, causing different
             # sampled tokens. Broadcast from rank 0 to ensure consistency.
-            tp_group = get_tp_group()
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
