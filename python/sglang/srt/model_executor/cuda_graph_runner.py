@@ -675,6 +675,9 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        # Disable for token embedding overrides (dynamic per-request)
+        if forward_batch.replace_embeds is not None:
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
