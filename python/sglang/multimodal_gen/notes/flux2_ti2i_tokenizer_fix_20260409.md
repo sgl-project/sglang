@@ -102,3 +102,58 @@
 - FLUX.2 tokenizer special-case 应恢复为：
   - `AutoProcessor.from_pretrained(component_model_path)`
 - 之前“tokenizer 已完全对齐”的结论作废，需要以新的官方 stage probe 为准继续推进。
+
+## 2026-04-09 17:40 CST 补充：image_latent 对齐完成
+
+这轮新的 stage probe 结论：
+- 在修正 tokenizer 之后，`input_ids / attention_mask / prompt_embeds / condition_image_latent_ids` 已经对齐；
+- 唯一剩下的不对齐 stage 是 `image_latent`。
+
+排查过程与结论：
+- 先用独立 `vae_probe` 把官方 VAE 和 SGLang VAE 拆开对拍：
+  - `state_dict` 251 个 key 全量一致；
+  - 在同一份 preprocessed image 输入下，`raw_latent / patchify / BN normalize` 都能做到逐元素一致；
+  - 说明 `AutoencoderKLFlux2` 本体和权重不是问题。
+- 随后发现真正的问题有三层：
+  1. `runtime/pipelines/flux_2.py` 用的是通用 `VaeImageProcessor`，不是官方 `Flux2ImageProcessor`
+  2. `Flux2PipelineConfig.preprocess_condition_image(...)` 之前直接把图缩到最终 `target_width/target_height`，没有走官方的
+     “先 `_resize_to_target_area(1024*1024)`，再 `resize_mode=\"crop\"`” 路径
+  3. `ImageVAEEncodingStage` 的 generic `shift + reciprocal(scale)` 写法，在 `bf16` 下会留下微小舍入误差；
+     官方 FLUX.2 encode 用的是直接 `(latents - mean) / std`
+
+这次修复：
+- `runtime/pipelines/flux_2.py`
+  - 改为实例化官方 `Flux2ImageProcessor`
+- `configs/pipeline_configs/flux.py`
+  - `Flux2PipelineConfig.vae_precision` 改为 `bf16`，和官方 diffusers 示例一致
+  - `preprocess_condition_image(...)` 改成官方 FLUX.2 的 preprocess 语义
+  - 新增 `normalize_vae_encode(...)`，对 FLUX.2 condition image latent 走官方同形 BN normalize
+- `configs/pipeline_configs/base.py`
+  - 增加 `normalize_vae_encode(...)` hook
+- `runtime/pipelines_core/stages/image_encoding.py`
+  - VAE encode 后优先走 `pipeline_config.normalize_vae_encode(...)`；
+    没有 override 时再回退到原来的 generic scale/shift 路径
+
+新增/更新回归测试：
+- `test/unit/test_input_validation.py`
+  - 钉住 `Flux2PipelineConfig.vae_precision == "bf16"`
+  - 钉住 `Flux2Pipeline` runtime 入口确实使用 `Flux2ImageProcessor`
+  - 钉住 `Flux2PipelineConfig.preprocess_condition_image(...)` 和官方 `Flux2ImageProcessor` 行为一致
+
+远端最终 probe 结果（默认路径，不额外 override 参数）：
+- `same_input_ids_sha256=true`
+- `same_attention_mask_sha256=true`
+- `same_prompt_embeds_sha256=true`
+- `same_condition_image_latent_ids_sha256=true`
+- `same_image_latent_sha256=true`
+
+当前精度对齐进度（更新）：
+- 已完全对齐到 `image_latent` stage。
+- 即：
+  - `tokenizer`
+  - `prompt_embeds`
+  - `condition image preprocess`
+  - `VAE encode -> patchify -> BN normalize -> image_latent`
+  这一整段都已和官方 diffusers 默认路径对齐。
+- 还没有在本记录里完成新的最终图片复拍；如果继续往后追，只需要再看
+  `one-step noise_pred / full denoise / final image`。
