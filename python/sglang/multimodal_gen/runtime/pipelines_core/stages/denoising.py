@@ -78,6 +78,12 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutTrajectoryData,
+)
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -133,6 +139,43 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+
+    def _maybe_prepare_rollout(self, batch: Req):
+        """Prepare denoising loop for rollout."""
+        if not isinstance(self.scheduler, SchedulerRLMixin):
+            if batch.rollout:
+                raise ValueError(
+                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                )
+            return
+
+        self.scheduler.release_rollout_resources(batch)
+        if batch.rollout:
+            self.scheduler.prepare_rollout(
+                batch=batch,
+                pipeline_config=self.server_args.pipeline_config,
+            )
+
+    def _maybe_collect_rollout_log_probs(self, batch: Req):
+        """Get rollout log probs and store into batch for reward calculation."""
+        if not isinstance(self.scheduler, SchedulerRLMixin):
+            if batch.rollout:
+                raise ValueError(
+                    f"Scheduler {type(self.scheduler)} does not support rollout"
+                )
+            return
+
+        if batch.rollout:
+            if batch.rollout_trajectory_data is None:
+                batch.rollout_trajectory_data = RolloutTrajectoryData()
+            batch.rollout_trajectory_data.rollout_log_probs = (
+                self.scheduler.collect_rollout_log_probs(batch)
+            )
+            if getattr(batch, "rollout_debug_mode", False):
+                batch.rollout_trajectory_data.rollout_debug_tensors = (
+                    self.scheduler.collect_rollout_debug_tensors(batch)
+                )
+            self.scheduler.release_rollout_resources(batch)
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -563,10 +606,13 @@ class DenoisingStage(PipelineStage):
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 
+        if batch.rollout:
+            self._maybe_prepare_rollout(batch)
+
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta},
+            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
         )
 
         # Setup precision and autocast settings
@@ -725,6 +771,10 @@ class DenoisingStage(PipelineStage):
         else:
             trajectory_tensor = None
             trajectory_timesteps_tensor = None
+
+        # Gather log probs for rollout
+        if batch.rollout:
+            self._maybe_collect_rollout_log_probs(batch)
 
         # Gather results if using sequence parallelism
         latents, trajectory_tensor = self._postprocess_sp_latents(
@@ -1093,7 +1143,6 @@ class DenoisingStage(PipelineStage):
                             guidance=guidance,
                             latents=latents,
                         )
-
                         # Save noise_pred to batch for external access (e.g., ComfyUI)
                         if server_args.comfyui_mode:
                             batch.noise_pred = noise_pred
