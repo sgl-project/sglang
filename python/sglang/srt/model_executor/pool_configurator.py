@@ -54,7 +54,7 @@ class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
     Subclasses compute pool sizes for their architecture via coeff+bias model.
-    Both entry points return MemoryPoolConfig (with max_running_requests=0,
+    Both entry points return MemoryPoolConfig (with max_running_requests=None,
     to be filled by the consumer).
     """
 
