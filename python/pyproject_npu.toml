@@ -26,6 +26,8 @@ dependencies = [
   "einops",
   "fastapi",
   "gguf",
+  "hf_transfer",
+  "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
@@ -144,4 +146,4 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]

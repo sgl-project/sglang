@@ -74,11 +74,12 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
 | Backend | Hardware | Description |
 |---------|----------|-------------|
 | `auto` | SM100/120 | Auto-selects: `flashinfer_cudnn` on SM120; `flashinfer_cutlass` on SM100 |
+| `cutlass` | SM100/120 | SGLang CUTLASS kernel |
 | `flashinfer_cutlass` | SM100/120 | FlashInfer CUTLASS backend |
 | `flashinfer_cudnn` | SM100/120 (CUDA 13+, cuDNN 9.15+) | FlashInfer cuDNN backend; used on SM120 for performance |
 | `flashinfer_trtllm` | SM100 | FlashInfer TensorRT-LLM backend |
 
-When FlashInfer is unavailable for NVFP4, sgl-kernel CUTLASS is used as an automatic fallback.
+When FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback.
 
 ## Offline Quantization
 

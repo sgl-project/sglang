@@ -331,9 +331,6 @@ class DeepEPMoE(FusedMoE):
     ):
         assert self.moe_runner_config.activation == "silu"
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
-        assert (
-            envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
-        ), "W4AFP8 does not support FP8 normal dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
         return self.quant_method.apply_deepep_normal(
             layer=self,
             dispatch_output=dispatch_output,
@@ -345,6 +342,9 @@ class DeepEPMoE(FusedMoE):
     ):
         assert self.moe_runner_config.activation == "silu"
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
+        assert (
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
         return self.quant_method.apply_deepep_ll(
             layer=self,
             dispatch_output=dispatch_output,
@@ -795,24 +795,4 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_ascend_fuseep():
         return NpuFuseEPMoE
 
-    if get_moe_runner_backend().is_flashinfer_trtllm():
-        # NEW: Direct FP4 detection (bypasses EP requirements)
-        # Check for FP4 quantization with TRTLLM flag, regardless of EP
-        # FlashInferFP4MoE must be paired with ModelOptNvFp4FusedMoEMethod.
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFP4MoE
-
-            return FlashInferFP4MoE
-        elif (
-            quant_config is None
-            or quant_config.get_name() == "fp8"
-            or quant_config.get_name() == "mxfp8"
-            or quant_config.get_name() == "modelopt_fp8"
-            or quant_config.get_name() == "compressed_tensors"
-        ):
-            # FlashInferFusedMoE supports bf16, fp8, mxfp8 and compressed_tensors
-            return FusedMoE
-
-    if get_moe_runner_backend().is_flashinfer_cutlass():
-        return FusedMoE
     return FusedMoE

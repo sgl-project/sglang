@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.testing
-from sgl_kernel import downcast_fp8 as downcast_fp8_aot
 
 from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DEVICE,
@@ -31,9 +30,9 @@ HEAD_DIM_LIST = get_benchmark_range(
 
 CONFIGS = [(sl, h, d, sl * 2) for sl in SL_LIST for h, d in HEAD_DIM_LIST]
 
-LINE_VALS = ["aot", "jit"]
-LINE_NAMES = ["AOT (sgl-kernel)", "JIT (cast.cuh, 256 threads, 2D grid)"]
-STYLES = [("blue", "--"), ("orange", "-")]
+LINE_VALS = ["jit"]
+LINE_NAMES = ["JIT (cast.cuh, 256 threads, 2D grid)"]
+STYLES = [("orange", "-")]
 
 
 # ── Perf report ────────────────────────────────────────────────────────────────
@@ -48,7 +47,7 @@ STYLES = [("blue", "--"), ("orange", "-")]
         line_names=LINE_NAMES,
         styles=STYLES,
         ylabel="us",
-        plot_name="downcast-fp8-aot-vs-jit",
+        plot_name="downcast-fp8-jit",
         args={},
     )
 )
@@ -61,10 +60,7 @@ def benchmark(input_sl, head, dim, out_sl, provider):
     v_scale = torch.tensor([1.0], dtype=torch.float32, device=DEVICE)
     loc = torch.arange(input_sl, dtype=torch.int64, device=DEVICE)
 
-    if provider == "aot":
-        fn = lambda: downcast_fp8_aot(k, v, k_out, v_out, k_scale, v_scale, loc)
-    else:
-        fn = lambda: downcast_fp8_jit(k, v, k_out, v_out, k_scale, v_scale, loc)
+    fn = lambda: downcast_fp8_jit(k, v, k_out, v_out, k_scale, v_scale, loc)
 
     return run_benchmark(fn)
 
@@ -84,26 +80,19 @@ def _report_bandwidth(input_sl, head, dim, dtype):
     v_scale = torch.tensor([1.0], dtype=torch.float32, device=DEVICE)
     loc = torch.arange(input_sl, dtype=torch.int64, device=DEVICE)
 
-    aot_fn = lambda: downcast_fp8_aot(k, v, k_out, v_out, k_scale, v_scale, loc)
     jit_fn = lambda: downcast_fp8_jit(k, v, k_out, v_out, k_scale, v_scale, loc)
 
-    aot_ms, _, _ = triton.testing.do_bench(aot_fn, quantiles=[0.5, 0.2, 0.8])
     jit_ms, _, _ = triton.testing.do_bench(jit_fn, quantiles=[0.5, 0.2, 0.8])
 
     def fmt(ms):
         return f"{ms*1000:6.2f}us {total_bytes/(ms*1e-3)/1e9:6.0f}GB/s"
 
-    print(
-        f"  sl={input_sl:5d}  h={head:2d}  d={dim:4d}"
-        f"  |  aot {fmt(aot_ms)}"
-        f"  |  jit {fmt(jit_ms)}"
-        f"  |  speedup {aot_ms/jit_ms:.2f}x"
-    )
+    print(f"  sl={input_sl:5d}  h={head:2d}  d={dim:4d}" f"  |  jit {fmt(jit_ms)}")
 
 
 def report_bandwidth():
     print(f"\n{'='*95}")
-    print("  AOT (sgl-kernel) vs JIT (cast.cuh, 256 threads, 2D grid)")
+    print("  JIT (cast.cuh, 256 threads, 2D grid)")
     print(f"  dtype={DTYPE}, device={DEVICE}")
     print(f"{'='*95}")
     for sl in [64, 256, 1024, 2048]:
