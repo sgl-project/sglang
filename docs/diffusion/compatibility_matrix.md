@@ -86,8 +86,7 @@ component_paths:
   transformer: /models/flux2/transformer
 ```
 
-Use the component name from the pipeline's `model_index.json` or the native
-pipeline's registered module name:
+Use the component name from the pipeline's `model_index.json` or the native pipeline's registered module name:
 
 | Component Type | Supported Keys | Notes |
 |:---------------|:---------------|:------|
@@ -95,6 +94,18 @@ pipeline's registered module name:
 | Transformer / DiT | `transformer`, `video_dit`, `audio_dit` | `transformer` is the standard override for the main denoiser |
 | Text / Preprocess | `text_encoder`, `text_encoder_2`, `tokenizer`, `processor`, `image_processor` | Replacement encoders often need matching preprocessing assets |
 | Auxiliary | `scheduler`, `spatial_upsampler`, `vocoder`, `connectors`, `dual_tower_bridge`, `image_encoder`, `vision_language_encoder` | Only valid for pipelines that expose these components |
+
+### Known Component Repos
+
+The table below lists concrete Hugging Face component repos that are already
+used in SGLang Diffusion docs or tests. It is not an exhaustive catalog of all
+compatible component repos.
+
+| Base Model | Override Key | Example Repo | Notes |
+|:-----------|:-------------|:-------------|:------|
+| `black-forest-labs/FLUX.2-dev` | `vae` | `black-forest-labs/FLUX.2-small-decoder` | Decoder-only FLUX.2 VAE override |
+| `black-forest-labs/FLUX.2-dev` | `vae` | `fal/FLUX.2-Tiny-AutoEncoder` | Existing tested custom VAE path |
+| `Tongyi-MAI/Z-Image-Turbo` | `transformer` | `MickJ/Z-Image-Turbo-fp8` | Existing tested FP8 transformer component |
 
 ### VAE
 
