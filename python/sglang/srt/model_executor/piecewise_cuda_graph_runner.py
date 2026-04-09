@@ -417,6 +417,9 @@ class PiecewiseCudaGraphRunner:
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
             return False
+        # Disable for token embedding overrides (dynamic per-request)
+        if forward_batch.replace_embeds is not None:
+            return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean, expand_path_fields
 
@@ -177,6 +178,13 @@ class SamplingParams:
     # Misc
     save_output: bool = True
     return_frames: bool = False
+    rollout: bool = False
+    rollout_sde_type: str = "sde"
+    rollout_noise_level: float = 0.7
+    rollout_log_prob_no_const: bool = False  # exclude constants in rollout logprob
+    rollout_debug_mode: bool = (
+        False  # return rollout debug tensors (intermediate states)
+    )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
     # if True, disallow user params to override subclass-defined protected fields
@@ -357,6 +365,8 @@ class SamplingParams:
                 raise ValueError(
                     f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
                 )
+
+        RLRolloutArgs.validate_sampling_params(self)
 
     def check_sampling_param(self):
         # Keep backward-compatibility for old call sites.
@@ -820,6 +830,10 @@ class SamplingParams:
             action="store_true",
             help="Whether to return the trajectory",
         )
+
+        # Rollout arguments
+        RLRolloutArgs.add_cli_args(parser, add_argument=add_argument)
+
         add_argument(
             "--return-trajectory-decoded",
             action="store_true",
