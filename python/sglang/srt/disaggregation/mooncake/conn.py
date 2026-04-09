@@ -1259,6 +1259,7 @@ class MooncakeKVManager(CommonKVManager):
                                     target_rank_registration_info.dst_kv_ptrs,
                                     chunked_dst_kv_indice,
                                     executor,
+                                    dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 )
                         elif (
                             self.enable_staging
