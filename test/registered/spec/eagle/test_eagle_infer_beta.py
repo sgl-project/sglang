@@ -243,6 +243,41 @@ class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
                 res = f.result()
                 self.assertIn("text", res, f"Server error: {res}")
 
+    def test_penalty(self):
+        """Verify spec v2 handles penalty parameters without crashing."""
+        import concurrent.futures
+
+        args = [
+            {"max_new_tokens": 32},
+            {"max_new_tokens": 16, "frequency_penalty": 2},
+            {"max_new_tokens": 48, "presence_penalty": 1},
+            {"max_new_tokens": 8, "frequency_penalty": 0.4, "presence_penalty": 0.8},
+            {"max_new_tokens": 64, "frequency_penalty": -0.5, "presence_penalty": 0.3},
+            {"max_new_tokens": 24, "min_new_tokens": 8, "frequency_penalty": 0.4},
+            {"max_new_tokens": 32, "repetition_penalty": 1.5},
+        ]
+
+        def run_decode(sampling_params):
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": sampling_params,
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            res = response.json()
+            self.assertIn("text", res, f"Server error: {res}")
+            self.assertIsInstance(
+                res["text"],
+                str,
+                f"Expected 'text' to be str, got {type(res['text']).__name__}: {res}",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(run_decode, args * 3))
+        assert self.process.poll() is None
+
 
 class TestEagle3ServerPage(TestEagle3ServerBase):
     other_launch_args = ["--page-size", "64"]
