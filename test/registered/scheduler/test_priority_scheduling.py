@@ -41,8 +41,6 @@ class TestPriorityScheduling(CustomTestCase):
                 "--max-queued-requests",  # Enforce max queued request number is 3
                 "3",
                 "--enable-priority-scheduling",  # Enable priority scheduling
-                # Disable PCG to avoid padding in flashinfer backend. Ref: https://github.com/sgl-project/sglang/pull/21452
-                "--disable-piecewise-cuda-graph",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -249,7 +247,6 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
                 "--max-queued-requests",  # Enforce max queued request number is 3
                 "3",
                 "--enable-priority-scheduling",  # Enable priority scheduling
-                "--disable-piecewise-cuda-graph",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )

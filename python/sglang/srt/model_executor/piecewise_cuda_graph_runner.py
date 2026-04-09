@@ -619,15 +619,13 @@ class PiecewiseCudaGraphRunner:
 
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
-        if static_num_tokens != num_tokens:
-            buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-            if buffers.out_cache_loc_swa is not None:
-                translated_out_cache_loc_swa = self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+        buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        if buffers.out_cache_loc_swa is not None:
+            buffers.out_cache_loc_swa[: self.raw_num_tokens].copy_(
+                self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
-                buffers.out_cache_loc_swa[: self.raw_num_tokens].copy_(
-                    translated_out_cache_loc_swa
-                )
+            )
 
         if (
             buffers.mamba_track_indices is not None
@@ -647,20 +645,12 @@ class PiecewiseCudaGraphRunner:
 
         input_ids = buffers.input_ids[:static_num_tokens]
         positions = buffers.positions[:static_num_tokens]
-        out_cache_loc = (
-            buffers.out_cache_loc[:static_num_tokens]
-            if static_num_tokens != num_tokens
-            else forward_batch.out_cache_loc
-        )
+        out_cache_loc = buffers.out_cache_loc[:static_num_tokens]
 
         out_cache_loc_swa = (
-            (
-                buffers.out_cache_loc_swa[:static_num_tokens]
-                if buffers.out_cache_loc_swa is not None
-                else None
-            )
-            if static_num_tokens != num_tokens
-            else forward_batch.out_cache_loc_swa
+            buffers.out_cache_loc_swa[:static_num_tokens]
+            if buffers.out_cache_loc_swa is not None
+            else None
         )
 
         mamba_track_indices = (
