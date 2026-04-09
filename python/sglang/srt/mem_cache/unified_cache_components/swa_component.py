@@ -230,23 +230,22 @@ class SWAComponent(TreeComponent):
     def acquire_component_lock(
         self, node: UnifiedTreeNode, result: IncLockRefResult
     ) -> IncLockRefResult:
+        ct = self.component_type
+        root = self.cache.root_node
         sliding_window_size = self.sliding_window_size
         swa_lock_size = 0
         swa_uuid_for_lock = None
 
         cur = node
-        while cur != self.cache.root_node and swa_lock_size < sliding_window_size:
+        while cur != root and swa_lock_size < sliding_window_size:
             assert (
-                cur.component_data[self.component_type].value is not None
-            ), f"acquire_component_lock({self.component_type}) on tombstoned node {cur.id}"
-            comp = cur.component_data[self.component_type]
+                cur.component_data[ct].value is not None
+            ), f"acquire_component_lock({ct}) on tombstoned node {cur.id}"
+            comp = cur.component_data[ct]
             if comp.lock_ref == 0:
-                self.cache.component_evictable_size_[self.component_type] -= len(
-                    cur.key
-                )
-                self.cache.component_protected_size_[self.component_type] += len(
-                    cur.key
-                )
+                key_len = len(cur.key)
+                self.cache.component_evictable_size_[ct] -= key_len
+                self.cache.component_protected_size_[ct] += key_len
             comp.lock_ref += 1
             swa_lock_size += len(cur.key)
             if swa_lock_size >= sliding_window_size:
@@ -261,25 +260,24 @@ class SWAComponent(TreeComponent):
     def release_component_lock(
         self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
     ) -> None:
+        ct = self.component_type
+        root = self.cache.root_node
         swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
         dec_swa = True
 
         cur = node
-        while cur != self.cache.root_node and dec_swa:
+        while cur != root and dec_swa:
             assert (
-                cur.component_data[self.component_type].value is not None
-            ), f"release_component_lock({self.component_type}) on tombstoned node {cur.id}"
-            comp = cur.component_data[self.component_type]
+                cur.component_data[ct].value is not None
+            ), f"release_component_lock({ct}) on tombstoned node {cur.id}"
+            comp = cur.component_data[ct]
             assert (
                 comp.lock_ref > 0
-            ), f"release_component_lock({self.component_type}) on node with lock_ref=0, node {cur.id}"
+            ), f"release_component_lock({ct}) on node with lock_ref=0, node {cur.id}"
             if comp.lock_ref == 1:
-                self.cache.component_evictable_size_[self.component_type] += len(
-                    cur.key
-                )
-                self.cache.component_protected_size_[self.component_type] -= len(
-                    cur.key
-                )
+                key_len = len(cur.key)
+                self.cache.component_evictable_size_[ct] += key_len
+                self.cache.component_protected_size_[ct] -= key_len
             comp.lock_ref -= 1
             if swa_uuid_for_lock and comp.metadata.get("uuid") == swa_uuid_for_lock:
                 dec_swa = False

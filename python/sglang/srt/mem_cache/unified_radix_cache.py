@@ -153,9 +153,10 @@ class UnifiedLRUList:
     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache
-        x = node.lru_prev[self.component_type]
-        while x.component_data[self.component_type].lock_ref > 0:
-            x = x.lru_prev[self.component_type]
+        ct = self.component_type
+        x = node.lru_prev[ct]
+        while x.component_data[ct].lock_ref > 0:
+            x = x.lru_prev[ct]
         if x == self.head:
             return None
         return x
@@ -163,9 +164,10 @@ class UnifiedLRUList:
     def get_prev_leaf_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache
-        x = node.lru_prev[self.component_type]
-        while x.component_data[self.component_type].lock_ref > 0 or len(x.children) > 0:
-            x = x.lru_prev[self.component_type]
+        ct = self.component_type
+        x = node.lru_prev[ct]
+        while x.component_data[ct].lock_ref > 0 or len(x.children) > 0:
+            x = x.lru_prev[ct]
         if x == self.head:
             return None
         return x

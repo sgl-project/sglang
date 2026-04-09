@@ -72,16 +72,15 @@ class FullComponent(TreeComponent):
     def acquire_component_lock(
         self, node: UnifiedTreeNode, result: IncLockRefResult
     ) -> IncLockRefResult:
+        ct = self.component_type
+        root = self.cache.root_node
         cur = node
-        while cur != self.cache.root_node:
-            cd = cur.component_data[self.component_type]
+        while cur != root:
+            cd = cur.component_data[ct]
             if cd.lock_ref == 0:
-                self.cache.component_evictable_size_[self.component_type] -= len(
-                    cd.value
-                )
-                self.cache.component_protected_size_[self.component_type] += len(
-                    cd.value
-                )
+                key_len = len(cd.value)
+                self.cache.component_evictable_size_[ct] -= key_len
+                self.cache.component_protected_size_[ct] += key_len
             cd.lock_ref += 1
             cur = cur.parent
         return result
@@ -89,16 +88,15 @@ class FullComponent(TreeComponent):
     def release_component_lock(
         self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
     ) -> None:
+        ct = self.component_type
+        root = self.cache.root_node
         cur = node
-        while cur != self.cache.root_node:
-            cd = cur.component_data[self.component_type]
+        while cur != root:
+            cd = cur.component_data[ct]
             assert cd.lock_ref > 0
             if cd.lock_ref == 1:
-                self.cache.component_evictable_size_[self.component_type] += len(
-                    cd.value
-                )
-                self.cache.component_protected_size_[self.component_type] -= len(
-                    cd.value
-                )
+                key_len = len(cd.value)
+                self.cache.component_evictable_size_[ct] += key_len
+                self.cache.component_protected_size_[ct] -= key_len
             cd.lock_ref -= 1
             cur = cur.parent

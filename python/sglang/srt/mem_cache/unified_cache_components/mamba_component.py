@@ -161,24 +161,30 @@ class MambaComponent(TreeComponent):
     def acquire_component_lock(
         self, node: UnifiedTreeNode, result: IncLockRefResult
     ) -> IncLockRefResult:
-        value = node.component_data[self.component_type].value
+        ct = self.component_type
+        cd = node.component_data[ct]
+        value = cd.value
         if value is not None:
-            if node.component_data[self.component_type].lock_ref == 0:
-                self.cache.component_evictable_size_[self.component_type] -= len(value)
-                self.cache.component_protected_size_[self.component_type] += len(value)
-            node.component_data[self.component_type].lock_ref += 1
+            if cd.lock_ref == 0:
+                vlen = len(value)
+                self.cache.component_evictable_size_[ct] -= vlen
+                self.cache.component_protected_size_[ct] += vlen
+            cd.lock_ref += 1
         return result
 
     def release_component_lock(
         self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
     ) -> None:
-        value = node.component_data[self.component_type].value
+        ct = self.component_type
+        cd = node.component_data[ct]
+        value = cd.value
         if value is not None:
-            assert node.component_data[self.component_type].lock_ref > 0
-            if node.component_data[self.component_type].lock_ref == 1:
-                self.cache.component_evictable_size_[self.component_type] += len(value)
-                self.cache.component_protected_size_[self.component_type] -= len(value)
-            node.component_data[self.component_type].lock_ref -= 1
+            assert cd.lock_ref > 0
+            if cd.lock_ref == 1:
+                vlen = len(value)
+                self.cache.component_evictable_size_[ct] += vlen
+                self.cache.component_protected_size_[ct] -= vlen
+            cd.lock_ref -= 1
 
     def prepare_for_caching_req(
         self,
