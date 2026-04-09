@@ -201,7 +201,7 @@ struct Sm90RowOrScalarBroadcast {
 
     CUTLASS_DEVICE void
     begin_loop(int epi_m, int epi_n) {
-      if (epi_m == 0) { // Assumes M-major subtile loop
+      if (epi_m == 0) { // Assumes M-major sub-tile loop
         if (!params.row_broadcast) return; // Do not issue LDS when row is scalar
         cute::Tensor tSR_sRow_flt = filter_zeros(tSR_sRow(_,_,_,epi_m,epi_n));
         cute::Tensor tSR_rRow_flt = filter_zeros(tSR_rRow);
