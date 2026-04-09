@@ -1490,38 +1490,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
         return video_timestep, audio_timestep_for_ca
 
-    def _prepare_cross_attn_anchor_coords(
-        self,
-        *,
-        batch_size: int,
-        height: int,
-        width: int,
-        fps: float,
-        hidden_device: torch.device,
-        hidden_dtype: torch.dtype,
-        audio_device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cross_video_coords = self.rope.prepare_video_coords(
-            batch_size=batch_size,
-            num_frames=1,
-            height=height,
-            width=width,
-            device=hidden_device,
-            fps=fps,
-            start_frame=0,
-        )
-        cross_video_coords = cross_video_coords[:, :, 0:1, :]
-        cross_video_coords = self._maybe_quantize_video_rope_coords(
-            cross_video_coords, hidden_device, hidden_dtype
-        )
-        cross_audio_coords = self.audio_rope.prepare_audio_coords(
-            batch_size=batch_size,
-            num_frames=1,
-            device=audio_device,
-            start_frame=0,
-        )[:, :, 0:1, :].to(device=audio_device)
-        return cross_video_coords, cross_audio_coords
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1602,20 +1570,11 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         audio_rotary_emb = self.audio_rope(
             audio_coords, device=audio_hidden_states.device
         )
-        cross_video_coords, cross_audio_coords = self._prepare_cross_attn_anchor_coords(
-            batch_size=batch_size,
-            height=height,
-            width=width,
-            fps=fps,
-            hidden_device=hidden_states.device,
-            hidden_dtype=hidden_states.dtype,
-            audio_device=audio_hidden_states.device,
-        )
         ca_video_rotary_emb = self.cross_attn_rope(
-            cross_video_coords, device=hidden_states.device
+            video_coords[:, 0:1, :], device=hidden_states.device
         )
         ca_audio_rotary_emb = self.cross_attn_audio_rope(
-            cross_audio_coords, device=audio_hidden_states.device
+            audio_coords[:, 0:1, :], device=audio_hidden_states.device
         )
 
         # 2. Patchify input projections
