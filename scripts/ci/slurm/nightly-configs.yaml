@@ -21,36 +21,13 @@ dsr1-fp8-gb200-dynamo-sglang:
     - isl: 1024
       osl: 1024
       search-space:
-#       - conc-list: [4, 8]
-#         # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp8/1k1k/low-latency.yaml
-#         config_file: recipes/gb200-fp8/1k1k/low-latency.yaml
-
-#         - conc-list: [1024, 2048, 4096]
-#           # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp8/1k1k/mid-curve.yaml
-#           config_file: recipes/gb200-fp8/1k1k/mid-curve.yaml
-
         - conc-list: [1024, 2048, 4096, 6144]
-          # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp8/1k1k/max-tpt.yaml
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp8/1k1k/max-tpt.yaml
           config_file: recipes/gb200-fp8/1k1k/max-tpt.yaml
 
         - conc-list: [4096]
-          # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp8/1k1k/ultra-tpt.yaml
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp8/1k1k/ultra-tpt.yaml
           config_file: recipes/gb200-fp8/1k1k/ultra-tpt.yaml
-
-    # - isl: 8192
-    #   osl: 1024
-    #   search-space:
-#       - conc-list: [4, 8, 16]
-#         # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp8/8k1k/low-latency.yaml
-#         config_file: recipes/gb200-fp8/8k1k/low-latency.yaml
-
-#         - conc-list: [512, 1024, 2048, 6144]
-#           # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp8/8k1k/mid-curve.yaml
-#           config_file: recipes/gb200-fp8/8k1k/mid-curve.yaml
-
-#         - conc-list: [2048, 4096, 6144]
-#           # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp8/8k1k/max_tpt.yaml
-#           config_file: recipes/gb200-fp8/8k1k/max_tpt.yaml
 
 dsr1-fp4-gb200-dynamo-sglang:
   model: nvidia/DeepSeek-R1-0528-NVFP4-v2
@@ -64,29 +41,6 @@ dsr1-fp4-gb200-dynamo-sglang:
     - isl: 1024
       osl: 1024
       search-space:
-#       - conc-list: [4, 8, 32]
-#         # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp4/1k1k/low-latency.yaml
-#         config_file: recipes/gb200-fp4/1k1k/low-latency.yaml
-
         - conc-list: [512, 2048, 4096, 8192]
-          # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp4/1k1k/mid-curve.yaml
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp4/1k1k/mid-curve.yaml
           config_file: recipes/gb200-fp4/1k1k/mid-curve.yaml
-
-    #     - conc-list: [2048, 4096]
-    #       # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp4/1k1k/max-tpt.yaml
-    #       config_file: recipes/gb200-fp4/1k1k/max-tpt.yaml
-
-    # - isl: 8192
-    #   osl: 1024
-    #   search-space:
-#       - conc-list: [4, 8]
-#         # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp4/8k1k/low-latency.yaml
-#         config_file: recipes/gb200-fp4/8k1k/low-latency.yaml
-
-    #     - conc-list: [512, 2048, 4096]
-    #       # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp4/8k1k/mid-curve.yaml
-    #       config_file: recipes/gb200-fp4/8k1k/mid-curve.yaml
-
-    #     - conc-list: [2048]
-    #       # https://github.com/ishandhanani/srt-slurm/blob/sa-submission-q1-2026/recipes/gb200-fp4/8k1k/max-tpt.yaml
-    #       config_file: recipes/gb200-fp4/8k1k/max-tpt.yaml

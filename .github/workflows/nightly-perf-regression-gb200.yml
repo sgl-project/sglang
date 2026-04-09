@@ -13,19 +13,19 @@ on:
 
 concurrency:
   group: nightly-test-gb200
-  cancel-in-progress: false  # Never cancel a running nightly on shared cluster
+  cancel-in-progress: false
 
 env:
   SGLANG_IS_IN_CI: true
-  SRT_SLURM_BRANCH: sync-from-origin-v2
+  SRT_SLURM_BRANCH: sglang-nightly-regression
   SLURM_PARTITION: batch
   SLURM_ACCOUNT: sglang
 
 jobs:
   # ---------------------------------------------------------------------------
   # Reads scripts/ci/slurm/nightly-configs.yaml and generates one matrix entry
-  # per recipe YAML, matching InferenceX's multi-node approach. Each job runs
-  # the full concurrency sweep defined in the recipe as a single Slurm job.
+  # per recipe YAML. Each job runs the full concurrency sweep defined in the 
+  # recipe as a single Slurm job.
   # To add/remove configs, edit nightly-configs.yaml only.
   # ---------------------------------------------------------------------------
   setup:

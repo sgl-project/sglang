@@ -1,10 +1,8 @@
 """
 Reads nightly-configs.yaml and generates one matrix entry per recipe YAML,
-matching InferenceX's multi-node approach where each srt-slurm recipe runs
-its full concurrency sweep as a single Slurm job.
+where each srt-slurm recipe runs its full concurrency sweep as a single Slurm job.
 
-conc-list in the config is documentation only (mirrors InferenceX nvidia-master.yaml)
-and is not used to split jobs.
+conc-list in the config is documentation only and is not used to split jobs.
 
 Output: JSON array written to stdout, consumed by the workflow setup job as
 a dynamic matrix via fromJson(needs.setup.outputs.matrix).

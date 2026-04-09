@@ -1,4 +1,4 @@
-"""Print a markdown summary table from processed GB200 benchmark results.
+"""Print a markdown summary table from processed benchmark results.
 
 Usage:
     python3 summarize.py <results_dir>

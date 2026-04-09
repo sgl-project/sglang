@@ -38,7 +38,7 @@ set -x
 
 SLURM_PARTITION="${SLURM_PARTITION:-batch}"
 SLURM_ACCOUNT="${SLURM_ACCOUNT:-sglang}"
-SRT_SLURM_BRANCH="${SRT_SLURM_BRANCH:-sync-from-origin-v2}"
+SRT_SLURM_BRANCH="${SRT_SLURM_BRANCH:-sglang-nightly-regression}"
 
 # ---------------------------------------------------------------------------
 # Resolve local model paths on Lustre (avoids re-downloading on each run)
@@ -66,13 +66,8 @@ mkdir -p "$LUSTRE_WORKSPACE"
 # Clone and set up srt-slurm
 # ---------------------------------------------------------------------------
 SRT_REPO_DIR="$LUSTRE_WORKSPACE/srt-slurm"
-# SRT_REPO_DIR="$GITHUB_WORKSPACE/srt-slurm"
 
-# if [ -d "$SRT_REPO_DIR" ]; then
-#     rm -rf "$SRT_REPO_DIR"
-# fi
-
-git clone https://github.com/csahithi/nv-srt-slurm.git "$SRT_REPO_DIR"
+git clone https://github.com/NVIDIA/srt-slurm.git "$SRT_REPO_DIR"
 cd "$SRT_REPO_DIR"
 git checkout "$SRT_SLURM_BRANCH"
 echo "--- srt-slurm last commit ---"
