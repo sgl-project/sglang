@@ -334,6 +334,7 @@ class GroupCoordinator:
             PyNcclCommunicator,
         )
         from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            debug_check_symmetric_mempool,
             is_symmetric_memory_enabled,
             use_symmetric_memory,
         )
@@ -345,6 +346,7 @@ class GroupCoordinator:
         self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
         self.use_symmetric_memory = use_symmetric_memory
         self.is_allocation_symmetric = is_allocation_symmetric
+        self.debug_check_symmetric_mempool = debug_check_symmetric_mempool
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
                 QuickAllReduce,
@@ -577,6 +579,7 @@ class GroupCoordinator:
             return self.npu_communicator.all_reduce(input_)
 
         if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
+            self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
@@ -718,6 +721,9 @@ class GroupCoordinator:
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
         ):
+            self.debug_check_symmetric_mempool(
+                self, {"output": output, "input": input}, "reduce_scatter_tensor"
+            )
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
         else:
@@ -779,6 +785,9 @@ class GroupCoordinator:
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
         ):
+            self.debug_check_symmetric_mempool(
+                self, {"output": output}, "all_gather_into_tensor"
+            )
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.all_gather(output, input)
         else:
