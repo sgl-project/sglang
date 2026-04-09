@@ -1554,4 +1554,3 @@ def resolve_trace_source(
         events=events,
         pid=pid,
     )
-

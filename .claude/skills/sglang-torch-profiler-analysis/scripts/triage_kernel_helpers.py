@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from profile_common import (
@@ -19,6 +21,7 @@ from profile_common import (
     looks_like_python_scope_name,
     normalize_repo_relative_path,
     normalize_text,
+    parse_stage,
     select_heaviest_pid,
 )
 
@@ -404,8 +407,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="In-place QK RMSNorm",
         candidate_path=(
-            "python/sglang/srt/models/utils.py"
-            "<br>python/sglang/jit_kernel/norm.py"
+            "python/sglang/srt/models/utils.py" "<br>python/sglang/jit_kernel/norm.py"
         ),
         active_keywords=("fused_inplace_qknorm", "minimaxm2rmsnormtp"),
         split_groups=(("apply_qk_norm", "q_norm", "k_norm", "qknorm"),),
@@ -454,8 +456,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     FusionPatternSpec(
         pattern="Fused RoPE + KV cache store",
         candidate_path=(
-            "python/sglang/jit_kernel/rope.py"
-            "<br>python/sglang/srt/models/utils.py"
+            "python/sglang/jit_kernel/rope.py" "<br>python/sglang/srt/models/utils.py"
         ),
         active_keywords=("fused_set_kv_buffer",),
         split_groups=(
@@ -472,9 +473,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     ),
     FusionPatternSpec(
         pattern="Fused decode metadata setup",
-        candidate_path=(
-            "python/sglang/srt/layers/attention/flashattention_backend.py"
-        ),
+        candidate_path=("python/sglang/srt/layers/attention/flashattention_backend.py"),
         active_keywords=(
             "normal_decode_set_metadata",
             "cache_seqlens_int32",
@@ -497,8 +496,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
             "fused_flashmla_metadata",
         ),
         rationale_hint=(
-            "NSA replay metadata copies are already fused into one-kernel"
-            " families."
+            "NSA replay metadata copies are already fused into one-kernel" " families."
         ),
         min_share=0.02,
         likely_share=0.2,
@@ -615,9 +613,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     ),
     FusionPatternSpec(
         pattern="Fused MoE sum + all-reduce",
-        candidate_path=(
-            "python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py"
-        ),
+        candidate_path=("python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py"),
         active_keywords=("fuse_sum_all_reduce", "enable_fused_moe_sum_all_reduce"),
         split_groups=(
             ("fused_moe", "expert", "moe"),
@@ -722,8 +718,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
             ("softmax", "sampling"),
         ),
         rationale_hint=(
-            "Decode-time sampling already has fused temperature and softmax"
-            " kernels."
+            "Decode-time sampling already has fused temperature and softmax" " kernels."
         ),
         min_share=0.05,
         likely_share=0.5,
@@ -854,8 +849,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
             ("quant", "fp8", "fp4", "block_quant"),
         ),
         rationale_hint=(
-            "vLLM already treats activation-plus-quant as a reusable fusion"
-            " family."
+            "vLLM already treats activation-plus-quant as a reusable fusion" " family."
         ),
         origin="upstream",
         min_share=0.3,
@@ -926,10 +920,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     ),
     FusionPatternSpec(
         pattern="PR #37045 MiniMax allreduce_rms kernels",
-        candidate_path=(
-            "PR #37045"
-            "<br>vllm/model_executor/models/minimax_m2.py"
-        ),
+        candidate_path=("PR #37045" "<br>vllm/model_executor/models/minimax_m2.py"),
         active_keywords=("minimax_allreduce_rms", "minimax_allreduce_rmsnorm"),
         split_groups=(
             ("q_norm", "k_norm", "rmsnorm", "minimax"),
@@ -1590,10 +1581,9 @@ def relaxed_kernel_entry_lookup(
         if prefix_len < 64 or prefix_len < int(shorter_len * 0.4):
             continue
         score = prefix_len
-        if (
-            lowered_compact.startswith("voidcutlassdevicekernelflash")
-            and candidate_compact.startswith("voidcutlassdevicekernelflash")
-        ):
+        if lowered_compact.startswith(
+            "voidcutlassdevicekernelflash"
+        ) and candidate_compact.startswith("voidcutlassdevicekernelflash"):
             score += 32
         if score > best_score:
             best_key = candidate_key
@@ -1811,7 +1801,9 @@ def merge_kernel_rows(*groups: Sequence[KernelRow]) -> List[KernelRow]:
 
 
 def pattern_model_matches(spec: FusionPatternSpec, model_path: str) -> bool:
-    if spec.model_include and not any(token in model_path for token in spec.model_include):
+    if spec.model_include and not any(
+        token in model_path for token in spec.model_include
+    ):
         return False
     if spec.model_exclude and any(token in model_path for token in spec.model_exclude):
         return False
@@ -1909,9 +1901,7 @@ def detect_pattern_match(
         related_us=related_us,
         evidence=summarize_evidence(related_rows, total_us),
         current_locations=summarize_locations(
-            location
-            for row in related_rows
-            for location in kernel_row_locations(row)
+            location for row in related_rows for location in kernel_row_locations(row)
         ),
         candidate_path=spec.candidate_path,
         rationale=build_pattern_rationale(
@@ -1961,7 +1951,9 @@ def detect_fusion_opportunities(
     for opportunity in raw_matches:
         if opportunity.pattern in blocked_patterns:
             continue
-        if any(row_key in consumed_row_keys for row_key in opportunity.covered_row_keys):
+        if any(
+            row_key in consumed_row_keys for row_key in opportunity.covered_row_keys
+        ):
             continue
         opportunities.append(opportunity)
         consumed_row_keys.update(opportunity.covered_row_keys)
