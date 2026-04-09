@@ -60,8 +60,14 @@ def _make_model_runner(
     mc.head_dim = head_dim
     mc.v_head_dim = v_head_dim
     mc.is_hybrid_swa = is_hybrid_swa
-    mc.full_attention_layer_ids = full_attention_layer_ids or list(range(num_layers))
-    mc.swa_attention_layer_ids = swa_attention_layer_ids or []
+    mc.full_attention_layer_ids = (
+        full_attention_layer_ids
+        if full_attention_layer_ids is not None
+        else list(range(num_layers))
+    )
+    mc.swa_attention_layer_ids = (
+        swa_attention_layer_ids if swa_attention_layer_ids is not None else []
+    )
     mc.swa_head_dim = swa_head_dim or head_dim
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
     mc.get_num_kv_heads = lambda tp_size: num_kv_heads
