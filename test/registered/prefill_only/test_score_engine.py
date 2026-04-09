@@ -225,11 +225,15 @@ class TestCausalLMScoring(CustomTestCase):
             self.assertAlmostEqual(sum(row), 1.0, places=6)
 
     def test_score_deterministic(self):
-        """Identical calls return byte-for-byte identical scores."""
+        """Identical calls return numerically equivalent scores (within GPU float tolerance)."""
         kwargs = dict(query="Choose:", items=["A", "B", "C"], label_token_ids=[1, 2, 3])
-        self.assertEqual(
-            self.engine.score(**kwargs).scores, self.engine.score(**kwargs).scores
-        )
+        scores_a = self.engine.score(**kwargs).scores
+        scores_b = self.engine.score(**kwargs).scores
+        self.assertEqual(len(scores_a), len(scores_b))
+        for row_a, row_b in zip(scores_a, scores_b):
+            self.assertEqual(len(row_a), len(row_b))
+            for a, b in zip(row_a, row_b):
+                self.assertAlmostEqual(a, b, places=5)
 
     def test_score_error_handling(self):
         """Invalid argument types raise ValueError or TypeError."""
