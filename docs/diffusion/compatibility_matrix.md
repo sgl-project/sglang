@@ -76,14 +76,6 @@ sglang generate \
   --vae-path black-forest-labs/FLUX.2-small-decoder
 ```
 
-Config file:
-
-```yaml
-model_path: black-forest-labs/FLUX.2-dev
-component_paths:
-  vae: black-forest-labs/FLUX.2-small-decoder
-```
-
 ### VAE Components
 
 Supported keys:
@@ -91,13 +83,6 @@ Supported keys:
 - `vae`
 - `video_vae`
 - `audio_vae`
-
-Typical usage:
-
-- Use `--vae-path` for image pipelines such as FLUX, Qwen-Image, and GLM-Image.
-- Use `--video-vae-path` for video pipelines with a distinct video VAE.
-- Use `--audio-vae-path` for multimodal video pipelines that carry a separate
-  audio VAE.
 
 Examples:
 
@@ -109,13 +94,6 @@ sglang generate \
   --save-output
 ```
 
-```bash
-sglang generate \
-  --model-path Lightricks/LTX-2.3 \
-  --video-vae-path /models/ltx23/video_vae \
-  --audio-vae-path /models/ltx23/audio_vae \
-  --prompt "Ocean waves at sunrise"
-```
 
 ### Transformer / DiT Components
 
