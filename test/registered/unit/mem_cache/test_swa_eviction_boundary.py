@@ -26,6 +26,35 @@ register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
+def _swa_alloc(allocator, need_size):
+    """Allocate from SWA allocator for any page_size.
+
+    SWATokenToKVPoolAllocator.alloc() asserts page_size == 1. For page_size > 1,
+    allocate from the underlying paged allocators directly and set up the mapping.
+    """
+    if allocator.page_size == 1:
+        return allocator.alloc(need_size)
+
+    full_indices = allocator.full_attn_allocator.alloc(need_size)
+    swa_indices = allocator.swa_attn_allocator.alloc(need_size)
+    assert full_indices is not None and swa_indices is not None
+    allocator.full_to_swa_index_mapping[full_indices] = swa_indices
+    return full_indices
+
+
+def _compute_swa_evicted(pre_len, sliding_window_size, page_size, use_fix):
+    """Reproduce the _evict_swa formula (old or new)."""
+    if use_fix:
+        raw = pre_len - sliding_window_size - page_size
+    else:
+        raw = pre_len - sliding_window_size
+
+    evicted = max(0, raw)
+    if page_size > 1:
+        evicted = (evicted // page_size) * page_size
+    return evicted
+
+
 def _build_swa_tree(
     page_size,
     sliding_window_size,
@@ -86,158 +115,195 @@ def _build_swa_tree(
 class TestSWAEvictionBoundary(unittest.TestCase):
     """Test the _insert_helper boundary case where swa_evicted_seqlen == total_length."""
 
-    def test_insert_all_evicted_boundary(self):
-        """When swa_evicted_seqlen == total_prefix_length + len(key), the insert
-        should free the value and return without creating a non-tombstone node.
+    def test_old_formula_hits_boundary(self):
+        """Demonstrate that the OLD eviction formula (without -page_size) produces
+        swa_evicted_seqlen == insert_length when page_size > sliding_window_size.
 
-        Before the fix, this case fell through to _add_new_node(swa_tombstone=False),
-        inflating swa_evictable_size_ and causing a potential double-free.
-
-        Note: page_size=1 here because the boundary case is controlled by the
-        swa_evicted_seqlen parameter, not the allocator's page handling.
-        """
-        page_size = 1
-        window = 2
-        tree, allocator = _build_swa_tree(
-            page_size=page_size,
-            sliding_window_size=window,
-            kv_size=128,
-            kv_size_swa=64,
-        )
-
-        full_before = allocator.full_available_size()
-        swa_before = allocator.swa_available_size()
-        swa_evictable_before = tree.swa_evictable_size_
-
-        # Insert 8 tokens (2 pages) with swa_evicted_seqlen == 8 (all evicted)
-        key_len = page_size * 2
-        token_ids = list(range(key_len))
-        kv_indices = allocator.alloc(key_len)
-
-        result = tree.insert(
-            InsertParams(
-                key=RadixKey(token_ids),
-                value=kv_indices,
-                swa_evicted_seqlen=key_len,  # all tokens evicted
-            )
-        )
-
-        # prefix_len should be 0 (nothing was inserted as non-tombstone)
-        self.assertEqual(result.prefix_len, 0)
-
-        # swa_evictable_size_ must not increase (no non-tombstone node created)
-        self.assertEqual(tree.swa_evictable_size_, swa_evictable_before)
-
-        # full pool: value was freed back, so full_available should recover
-        self.assertEqual(allocator.full_available_size(), full_before)
-
-    def test_insert_partial_evicted_still_works(self):
-        """Regression: case 2 (partial tombstone) must still work correctly.
-
-        swa_evicted_seqlen falls in the middle of the key -> split into
-        tombstone + non-tombstone nodes.
-        """
-        page_size = 1
-        window = 2
-        tree, allocator = _build_swa_tree(
-            page_size=page_size,
-            sliding_window_size=window,
-            kv_size=128,
-            kv_size_swa=64,
-        )
-
-        swa_evictable_before = tree.swa_evictable_size_
-
-        # Insert 8 tokens with swa_evicted_seqlen == 4 (first page evicted)
-        key_len = page_size * 2
-        token_ids = list(range(key_len))
-        kv_indices = allocator.alloc(key_len)
-        evicted = page_size  # first 4 tokens evicted
-
-        result = tree.insert(
-            InsertParams(
-                key=RadixKey(token_ids),
-                value=kv_indices,
-                swa_evicted_seqlen=evicted,
-            )
-        )
-
-        # Non-tombstone tail (4 tokens) should be evictable
-        self.assertEqual(
-            tree.swa_evictable_size_, swa_evictable_before + (key_len - evicted)
-        )
-
-        # Sanity check
-        tree.sanity_check()
-
-    def test_insert_no_eviction(self):
-        """Regression: case 1 (swa_evicted <= total_prefix_length) works normally."""
-        page_size = 1
-        window = 2
-        tree, allocator = _build_swa_tree(
-            page_size=page_size,
-            sliding_window_size=window,
-            kv_size=128,
-            kv_size_swa=64,
-        )
-
-        swa_evictable_before = tree.swa_evictable_size_
-
-        key_len = page_size * 2
-        token_ids = list(range(key_len))
-        kv_indices = allocator.alloc(key_len)
-
-        result = tree.insert(
-            InsertParams(
-                key=RadixKey(token_ids),
-                value=kv_indices,
-                swa_evicted_seqlen=0,  # nothing evicted
-            )
-        )
-
-        # All 8 tokens should be non-tombstone evictable
-        self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + key_len)
-
-        tree.sanity_check()
-
-    def test_eviction_formula_large_page_size(self):
-        """Verify the eviction formula does not over-evict when page_size > window.
-
-        With page_size=8 and window=2, the old formula (pre_len - window) could
-        floor-align to the insert boundary. The fix (- page_size) prevents this.
+        Example: page_size=8, window=2, seq_len=11
+          insert_length = floor(11/8)*8 = 8
+          old_evicted = floor((10-2)/8)*8 = floor(8/8)*8 = 8  == insert_length!
         """
         page_size = 8
         window = 2
 
-        # Simulate the eviction formula for various seq_lens
+        # Find a seq_len where the old formula hits the boundary
+        found_boundary = False
         for seq_len in range(page_size + 1, page_size * 10):
-            pre_len = seq_len - 1  # decode: pre_len = seq_len - 1
+            pre_len = seq_len - 1
             insert_length = (seq_len // page_size) * page_size
-
-            # New formula with the fix
-            raw_evicted = pre_len - window - page_size
-            evicted = max(0, (raw_evicted // page_size) * page_size)
-
-            # The eviction frontier must never reach the insert boundary
-            self.assertLess(
-                evicted,
-                insert_length,
-                f"Over-eviction at seq_len={seq_len}: "
-                f"evicted={evicted} >= insert_length={insert_length}",
+            if insert_length == 0:
+                continue
+            old_evicted = _compute_swa_evicted(
+                pre_len, window, page_size, use_fix=False
             )
+            if old_evicted == insert_length:
+                found_boundary = True
+                # The new formula must NOT hit the boundary
+                new_evicted = _compute_swa_evicted(
+                    pre_len, window, page_size, use_fix=True
+                )
+                self.assertLess(
+                    new_evicted,
+                    insert_length,
+                    f"New formula still hits boundary at seq_len={seq_len}",
+                )
+                break
 
-    def test_eviction_formula_degenerates_for_page_size_1(self):
-        """When page_size=1, the extra -page_size just subtracts 1, which is
-        equivalent to the old decode behavior (pre_len = seq_len - 1)."""
+        self.assertTrue(
+            found_boundary,
+            "Expected to find a seq_len where old formula hits boundary",
+        )
+
+    def test_new_formula_never_hits_boundary(self):
+        """The new eviction formula (with -page_size) must never produce
+        swa_evicted_seqlen >= insert_length, for any page_size > window."""
+        for page_size in [4, 8, 16, 32, 64, 128, 256]:
+            for window in [1, 2, 4, 8]:
+                if page_size <= window:
+                    continue
+                for seq_len in range(page_size + 1, page_size * 20):
+                    pre_len = seq_len - 1
+                    insert_length = (seq_len // page_size) * page_size
+                    if insert_length == 0:
+                        continue
+                    evicted = _compute_swa_evicted(
+                        pre_len, window, page_size, use_fix=True
+                    )
+                    self.assertLess(
+                        evicted,
+                        insert_length,
+                        f"Over-eviction: page_size={page_size}, window={window}, "
+                        f"seq_len={seq_len}, evicted={evicted}, "
+                        f"insert_length={insert_length}",
+                    )
+
+    def test_insert_case3_with_paged_alloc(self):
+        """End-to-end: use page_size > window, compute swa_evicted with OLD formula
+        to trigger case 3, then verify _insert_helper handles it correctly.
+
+        This tests the defensive fix in _insert_helper with real paged allocation.
+        """
+        page_size = 8
+        window = 2
+        tree, allocator = _build_swa_tree(
+            page_size=page_size,
+            sliding_window_size=window,
+            kv_size=1024,
+            kv_size_swa=512,
+        )
+
+        # Pick seq_len where old formula hits boundary
+        # seq_len=11: insert_length=8, old_evicted=8
+        seq_len = page_size + window + 1  # = 11
+        pre_len = seq_len - 1
+        insert_length = (seq_len // page_size) * page_size
+        old_evicted = _compute_swa_evicted(pre_len, window, page_size, use_fix=False)
+        self.assertEqual(
+            old_evicted, insert_length, "Precondition: old formula hits boundary"
+        )
+
+        # Allocate page-aligned tokens and insert with the buggy swa_evicted_seqlen
+        token_ids = list(range(insert_length))
+        kv_indices = _swa_alloc(allocator, insert_length)
+        swa_evictable_before = tree.swa_evictable_size_
+        full_available_before = allocator.full_available_size()
+
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(token_ids),
+                value=kv_indices,
+                swa_evicted_seqlen=old_evicted,  # == insert_length, case 3
+            )
+        )
+
+        # With the fix: early return, no non-tombstone node created
+        self.assertEqual(result.prefix_len, 0)
+        self.assertEqual(tree.swa_evictable_size_, swa_evictable_before)
+        # full pool value was freed back
+        self.assertEqual(allocator.full_available_size(), full_available_before)
+
+    def test_insert_case2_with_paged_alloc(self):
+        """Regression: case 2 (partial tombstone) with page_size > 1 still works.
+
+        Use the NEW formula which produces swa_evicted < insert_length.
+        """
+        page_size = 8
+        window = 2
+        tree, allocator = _build_swa_tree(
+            page_size=page_size,
+            sliding_window_size=window,
+            kv_size=1024,
+            kv_size_swa=512,
+        )
+
+        # seq_len=17: insert_length=16, new_evicted=floor((16-2-8)/8)*8=0
+        # seq_len=25: insert_length=24, new_evicted=floor((24-2-8)/8)*8=8
+        seq_len = page_size * 3 + 1  # = 25
+        pre_len = seq_len - 1
+        insert_length = (seq_len // page_size) * page_size  # = 24
+        new_evicted = _compute_swa_evicted(pre_len, window, page_size, use_fix=True)
+        self.assertGreater(new_evicted, 0, "Precondition: some eviction occurs")
+        self.assertLess(new_evicted, insert_length, "Precondition: partial eviction")
+
+        token_ids = list(range(insert_length))
+        kv_indices = _swa_alloc(allocator, insert_length)
+        swa_evictable_before = tree.swa_evictable_size_
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(token_ids),
+                value=kv_indices,
+                swa_evicted_seqlen=new_evicted,
+            )
+        )
+
+        # Non-tombstone tail should be evictable
+        non_tombstone_len = insert_length - new_evicted
+        self.assertEqual(
+            tree.swa_evictable_size_, swa_evictable_before + non_tombstone_len
+        )
+        tree.sanity_check()
+
+    def test_insert_case1_no_eviction(self):
+        """Regression: case 1 (no eviction) with page_size > 1 works normally."""
+        page_size = 8
+        window = 2
+        tree, allocator = _build_swa_tree(
+            page_size=page_size,
+            sliding_window_size=window,
+            kv_size=1024,
+            kv_size_swa=512,
+        )
+
+        insert_length = page_size * 2  # 16 tokens
+        token_ids = list(range(insert_length))
+        kv_indices = _swa_alloc(allocator, insert_length)
+        swa_evictable_before = tree.swa_evictable_size_
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(token_ids),
+                value=kv_indices,
+                swa_evicted_seqlen=0,
+            )
+        )
+
+        self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + insert_length)
+        tree.sanity_check()
+
+    def test_formula_degenerates_for_page_size_1(self):
+        """When page_size=1, the extra -page_size subtracts 1 -- at most 1 less
+        token evicted compared to the old formula."""
         page_size = 1
         window = 4
 
         for seq_len in range(window + 2, 100):
             pre_len = seq_len - 1
-            old_evicted = max(0, pre_len - window)
-            new_evicted = max(0, pre_len - window - page_size)
+            old_evicted = _compute_swa_evicted(
+                pre_len, window, page_size, use_fix=False
+            )
+            new_evicted = _compute_swa_evicted(pre_len, window, page_size, use_fix=True)
 
-            # New formula evicts at most 1 less token
             self.assertGreaterEqual(old_evicted, new_evicted)
             self.assertLessEqual(old_evicted - new_evicted, 1)
 
