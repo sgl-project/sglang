@@ -15,9 +15,6 @@ from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
-    Flux2Mistral3TextEncoder,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -138,7 +135,7 @@ class TextEncodingStage(PipelineStage):
         return tok_kwargs
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
-        if isinstance(text_encoder, Flux2Mistral3TextEncoder):
+        if not getattr(text_encoder, "uses_sglang_forward_context", True):
             return text_encoder(**encoder_forward_kwargs)
 
         with set_forward_context(current_timestep=0, attn_metadata=None):
