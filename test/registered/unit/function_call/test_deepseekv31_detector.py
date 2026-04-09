@@ -121,23 +121,27 @@ class TestDeepSeekV31DetectorDetectAndParse(CustomTestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
 
     def test_multiple_tool_calls(self):
+        # Call tools in REVERSE order of the tools list. This is critical:
+        # if tool_index were (buggily) assigned from call order instead of the
+        # tools-list position, indices would come out as [0, 1] and a same-order
+        # test would pass despite the bug. Reversing forces [1, 0].
         body = (
-            f"{CALL_BEGIN}get_weather{SEP}"
-            f'{{"city": "Tokyo"}}{CALL_END}'
             f"{CALL_BEGIN}search_web{SEP}"
             f'{{"query": "hotels"}}{CALL_END}'
+            f"{CALL_BEGIN}get_weather{SEP}"
+            f'{{"city": "Tokyo"}}{CALL_END}'
         )
         text = f"{BOT}{body}{EOT}"
         result = self.detector.detect_and_parse(text, self.tools)
 
         self.assertEqual(len(result.calls), 2)
-        names = [c.name for c in result.calls]
-        self.assertEqual(names, ["get_weather", "search_web"])
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
-        self.assertEqual(json.loads(result.calls[1].parameters), {"query": "hotels"})
-        # Indices must match positions in the tools list, not the call order.
-        self.assertEqual(result.calls[0].tool_index, 0)
-        self.assertEqual(result.calls[1].tool_index, 1)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls[0].name, "search_web")
+        self.assertEqual(result.calls[0].tool_index, 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "hotels"})
+        self.assertEqual(result.calls[1].name, "get_weather")
+        self.assertEqual(result.calls[1].tool_index, 0)
+        self.assertEqual(json.loads(result.calls[1].parameters), {"city": "Tokyo"})
 
     def test_invalid_json_falls_back_to_raw_text(self):
         # Malformed JSON inside the args → exception is caught and the whole
@@ -150,10 +154,12 @@ class TestDeepSeekV31DetectorDetectAndParse(CustomTestCase):
 
     def test_unknown_tool_is_skipped(self):
         # parse_base_json skips calls whose `name` is not in the tools list
-        # (default env: SGLANG_FORWARD_UNKNOWN_TOOLS is off).
+        # (default env: SGLANG_FORWARD_UNKNOWN_TOOLS is off). The raw text of
+        # the unknown call must also be swallowed — not leaked into normal_text.
         text = _wrap_single("nonexistent_tool", '{"x": 1}')
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "")
 
     def test_unicode_arguments_preserved(self):
         # JSON preserves non-ASCII content through the parse round-trip.
@@ -281,13 +287,11 @@ class TestDeepSeekV31DetectorStreaming(CustomTestCase):
         calls, _ = self._feed(chunks)
 
         arg_diffs = [c.parameters for c in calls if c.name is None and c.parameters]
-        # At least two incremental diffs expected (before and after JSON completes).
-        self.assertGreater(len(arg_diffs), 1)
-
-        running = ""
-        for diff in arg_diffs:
-            running += diff
-        self.assertEqual(json.loads(running), {"city": "Paris"})
+        # Exact diffs — one per mid-JSON chunk, with the final chunk triggering
+        # completion. Verifying the exact list (not just reconstruction) catches
+        # any off-by-one in the `startswith(_last_arguments)` prefix math.
+        self.assertEqual(arg_diffs, ['{"ci', 'ty": "Pa', 'ris"}'])
+        self.assertEqual(json.loads("".join(arg_diffs)), {"city": "Paris"})
 
 
 class TestDeepSeekV31DetectorStructureInfo(CustomTestCase):
