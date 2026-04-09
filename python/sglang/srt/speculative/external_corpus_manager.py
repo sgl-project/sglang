@@ -49,6 +49,8 @@ class ExternalCorpusManager:
         thread.join()  # formal happens-before for _load_result visibility
         result = self._load_result
         self._load_result = None
+        if result.success:
+            self._worker.commit_corpus_load(result.corpus_id, result.loaded_token_count)
         self._send_response(result, recv_req)
 
     def add(
@@ -81,6 +83,8 @@ class ExternalCorpusManager:
         thread.start()
         return None  # response sent later by check_pending_load
 
+    # FIXME(kpham-sgl): remove a corpus during a pending load is an undefined behaviour
+    # and should be explicitly prevented.
     def remove(
         self, recv_req: RemoveExternalCorpusReqInput
     ) -> RemoveExternalCorpusReqOutput:
