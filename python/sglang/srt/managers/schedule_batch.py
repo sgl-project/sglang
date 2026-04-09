@@ -1856,17 +1856,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mask = req.extend_input_len >= mamba_cache_chunk_size
 
         if mask:
-            # Pre-allocate a radix slot as the direct target for the track kernel
             if req.pending_radix_mamba_slot is not None:
                 self.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
+                req.pending_radix_mamba_slot = None
             radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
-            assert radix_slot is not None, (
-                "Not enough space for mamba radix slot during extend prepare, "
-                "try to increase --mamba-full-memory-ratio."
-            )
-            req.pending_radix_mamba_slot = radix_slot
-            track_index = radix_slot[0].item()
-        else:
+            if radix_slot is None:
+                mask = False
+            else:
+                req.pending_radix_mamba_slot = radix_slot
+                track_index = radix_slot[0].item()
+        if not mask:
             track_index = 0  # placeholder, won't be used when mask=False
 
         mamba_track_mask_cpu.append(mask)
@@ -2199,34 +2198,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_global_server_args().enable_mamba_extra_buffer():
             mamba_track_interval = get_global_server_args().mamba_track_interval
 
-            # Compute track mask first (which reqs need tracking this iteration)
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
-            )
-
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
+                self.mamba_track_mask = torch.empty(
+                    (0,), dtype=torch.bool, device=self.device
+                )
             else:
+                track_mask_cpu = []
                 track_indices_cpu = []
                 for i, req in enumerate(self.reqs):
                     need_track = (self.seq_lens_cpu[i].item() % mamba_track_interval == 0)
                     if need_track:
-                        # Free old pending slot to avoid leak
                         if req.pending_radix_mamba_slot is not None:
                             self.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
+                            req.pending_radix_mamba_slot = None
                         radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
-                        assert radix_slot is not None, (
-                            "Not enough space for mamba radix slot during decode prepare, "
-                            "try to increase --mamba-full-memory-ratio."
-                        )
-                        req.pending_radix_mamba_slot = radix_slot
-                        track_indices_cpu.append(radix_slot[0].item())
-                    else:
-                        track_indices_cpu.append(0)  # placeholder
+                        if radix_slot is None:
+                            need_track = False
+                        else:
+                            req.pending_radix_mamba_slot = radix_slot
+                            track_indices_cpu.append(radix_slot[0].item())
+                    if not need_track:
+                        track_indices_cpu.append(0)
+                    track_mask_cpu.append(need_track)
+                self.mamba_track_mask = (
+                    torch.tensor(track_mask_cpu, dtype=torch.bool, pin_memory=True)
+                    .to(device=self.device, non_blocking=True)
+                )
                 self.mamba_track_indices = (
                     torch.tensor(track_indices_cpu, dtype=torch.int64, pin_memory=True)
                     .to(device=self.device, non_blocking=True)
