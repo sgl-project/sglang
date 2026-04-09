@@ -3,6 +3,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from PIL import Image
@@ -14,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanI2V720PConfig,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
@@ -195,7 +197,10 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
         config = Flux2PipelineConfig()
         config.vae_config.arch_config.vae_scale_factor = 8
         processor = Flux2ImageProcessor(vae_scale_factor=16)
-        image = Image.new("RGB", (1792, 1216), color="red")
+        image = Image.fromarray(
+            np.arange(1792 * 1216 * 3, dtype=np.uint8).reshape(1216, 1792, 3),
+            mode="RGB",
+        )
 
         size = config.calculate_condition_image_size(image, image.width, image.height)
         self.assertEqual(size, (1232, 832))
@@ -216,6 +221,23 @@ class TestFlux2ConditionImagePreprocess(unittest.TestCase):
 
         self.assertEqual(processed_size, (expected_width, expected_height))
         self.assertTrue(torch.equal(processed, expected))
+
+    @patch.object(Flux2Pipeline, "add_standard_ti2i_stages")
+    def test_runtime_pipeline_uses_flux2_image_processor(self, mock_add_stages):
+        pipeline = object.__new__(Flux2Pipeline)
+        server_args = MagicMock()
+        server_args.pipeline_config.vae_config.arch_config.vae_scale_factor = 8
+
+        Flux2Pipeline.create_pipeline_stages(pipeline, server_args)
+
+        processor = mock_add_stages.call_args.kwargs["vae_image_processor"]
+        self.assertIsInstance(processor, Flux2ImageProcessor)
+        self.assertIs(
+            processor,
+            mock_add_stages.call_args.kwargs["image_vae_stage_kwargs"][
+                "vae_image_processor"
+            ],
+        )
 
 
 class TestFlux2TI2ISizeResolution(unittest.TestCase):
