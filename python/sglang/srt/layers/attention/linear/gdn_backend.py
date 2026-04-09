@@ -255,9 +255,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        self.max_verify_batch_size = self.req_to_token_pool.size
         self.verify_intermediate_state_indices = torch.arange(
-            self.max_verify_batch_size, dtype=torch.int32, device=model_runner.device
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -379,12 +378,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             draft_token_num = forward_batch.spec_info.draft_token_num
             batch_size = seq_len // draft_token_num
-            if batch_size > self.max_verify_batch_size:
-                raise ValueError(
-                    f"Verify batch size {batch_size} exceeds preallocated limit "
-                    f"{self.max_verify_batch_size}"
-                )
-            intermediate_state_indices = self.verify_intermediate_state_indices[:batch_size]
+            intermediate_state_indices = self.verify_intermediate_state_indices
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
