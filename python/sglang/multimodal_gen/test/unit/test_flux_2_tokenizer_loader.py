@@ -16,7 +16,7 @@ class OtherPipelineConfigStub:
 
 
 class TestFlux2TokenizerLoader(unittest.TestCase):
-    def test_flux2_uses_default_auto_tokenizer_path(self):
+    def test_flux2_uses_pixtral_processor_path(self):
         loader = TokenizerLoader()
         server_args = SimpleNamespace(pipeline_config=Flux2PipelineConfigStub())
 
@@ -24,8 +24,8 @@ class TestFlux2TokenizerLoader(unittest.TestCase):
             "sglang.multimodal_gen.runtime.loader.component_loaders.component_loader.Flux2PipelineConfig",
             Flux2PipelineConfigStub,
         ), patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders.component_loader.AutoTokenizer.from_pretrained",
-            return_value="flux2-tokenizer",
+            "sglang.multimodal_gen.runtime.loader.component_loaders.component_loader.AutoProcessor.from_pretrained",
+            return_value="flux2-processor",
         ) as mock_from_pretrained:
             tokenizer = loader.load_customized(
                 "black-forest-labs/FLUX.2-dev",
@@ -33,7 +33,7 @@ class TestFlux2TokenizerLoader(unittest.TestCase):
                 "tokenizer",
             )
 
-        self.assertEqual(tokenizer, "flux2-tokenizer")
+        self.assertEqual(tokenizer, "flux2-processor")
         mock_from_pretrained.assert_called_once_with("black-forest-labs/FLUX.2-dev")
 
     def test_non_flux2_keeps_fast_right_padded_tokenizer(self):

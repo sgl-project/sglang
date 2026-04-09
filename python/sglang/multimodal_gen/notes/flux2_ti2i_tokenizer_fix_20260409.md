@@ -80,3 +80,25 @@
 - 已完全对齐到 `text 输入 / tokenizer` stage。
 - 已修复 `TI2I 默认输出尺寸语义`，使其与官方默认路径一致。
 - 还没有完成对 `text encoder hidden states / prompt_embeds / image_latent / one-step noise_pred / 最终图片` 的新一轮默认参数复拍，所以当前最终图片精度仍视为“未对齐完成”。
+
+## 2026-04-09 16:52 CST 补充：tokenizer 结论更正
+
+之前错误结论：
+- 之前把 FLUX.2 tokenizer special-case 从 `AutoProcessor` 改到 `AutoTokenizer`，并一度以为这和官方 diffusers 对齐。
+- 这一步的对照对象拿错了，只对到了 `AutoTokenizer.apply_chat_template(...)`，没有对到官方 `Flux2Pipeline.encode_prompt()` 的真实输入路径。
+
+重新 probe 后的事实：
+- 官方 diffusers 当前真正走的是：
+  - `PixtralProcessor.apply_chat_template(...)`
+- 在远端容器中直接验证：
+  - `AutoProcessor.from_pretrained(<...>/tokenizer)` 会返回 `PixtralProcessor`
+  - 且具备 `apply_chat_template`
+- 用同一份 stage probe 对拍官方 `encode_prompt()` 与 SGLang 当前路径时：
+  - `input_ids` 不同
+  - `attention_mask` 不同
+  - `prompt_embeds` 随之不同
+
+因此本次更正：
+- FLUX.2 tokenizer special-case 应恢复为：
+  - `AutoProcessor.from_pretrained(component_model_path)`
+- 之前“tokenizer 已完全对齐”的结论作废，需要以新的官方 stage probe 为准继续推进。

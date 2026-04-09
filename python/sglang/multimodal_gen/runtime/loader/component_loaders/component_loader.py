@@ -295,10 +295,9 @@ class TokenizerLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
-        # Flux.2 aligns to the tokenizer defaults from the original baseline.
-        # TODO: abstract this
+        # Flux.2 official diffusers path loads PixtralProcessor for chat templating.
         if isinstance(server_args.pipeline_config, Flux2PipelineConfig):
-            return AutoTokenizer.from_pretrained(component_model_path)
+            return AutoProcessor.from_pretrained(component_model_path)
 
         return AutoTokenizer.from_pretrained(
             component_model_path,
