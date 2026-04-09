@@ -19,7 +19,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    sequence_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
@@ -583,7 +582,6 @@ class LTX2Attention(nn.Module):
         perturbation_mask: torch.Tensor | None = None,
         all_perturbed: bool = False,
         skip_sequence_parallel_override: bool = False,
-        gather_context_kv_for_sp: bool = False,
     ) -> torch.Tensor:
         gate_input = x
         context_ = x if context is None else context
@@ -623,32 +621,7 @@ class LTX2Attention(nn.Module):
             q = q.view(*q.shape[:-1], self.local_heads, self.dim_head)
             k = k.view(*k.shape[:-1], self.local_heads, self.dim_head)
 
-            if gather_context_kv_for_sp:
-                q_ = q.transpose(1, 2)
-                k_full = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
-                v_full = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
-                k_ = k_full.transpose(1, 2)
-                v_ = v_full.transpose(1, 2)
-                attn_mask = None
-                if mask is not None:
-                    gathered_mask = sequence_model_parallel_all_gather(
-                        mask.contiguous(), dim=1
-                    )
-                    attn_mask = gathered_mask.to(dtype=q_.dtype, device=q_.device)
-                    if attn_mask.dim() == 2:
-                        attn_mask = attn_mask[:, None, None, :]
-                    elif attn_mask.dim() == 3:
-                        attn_mask = attn_mask[:, None, :, :]
-                out = torch.nn.functional.scaled_dot_product_attention(
-                    q_,
-                    k_,
-                    v_,
-                    attn_mask=attn_mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=self.dim_head**-0.5,
-                ).transpose(1, 2)
-            elif self.use_local_attention:
+            if self.use_local_attention:
                 out = self.attn(q, k, v, attn_mask=mask)
             else:
                 out = self.attn(
@@ -1113,14 +1086,13 @@ class LTX2TransformerBlock(nn.Module):
             norm_audio_hidden_states * (1 + audio_v2a_ca_scale) + audio_v2a_ca_shift
         )
 
-        if not skip_v2a_cross_attn:
+        if not (skip_v2a_cross_attn or audio_replicated_for_sp):
             v2a_attn_hidden_states = self.video_to_audio_attn(
                 mod_norm_audio_hidden_states,
                 context=mod_norm_hidden_states,
                 pe=ca_audio_rotary_emb,
                 k_pe=ca_video_rotary_emb,
                 mask=v2a_cross_attention_mask,
-                gather_context_kv_for_sp=audio_replicated_for_sp,
             )
             audio_hidden_states = (
                 audio_hidden_states + v2a_gate * v2a_attn_hidden_states
