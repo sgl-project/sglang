@@ -17,6 +17,7 @@ from safetensors.torch import load_file as safetensors_load_file
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
+from sglang.multimodal_gen.configs.sample.ltx_2 import LTX23SamplingParams
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_3_condition_encoder import (
@@ -44,6 +45,9 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+_LTX23_ONE_STAGE_GUIDER_PARAMS = LTX23SamplingParams().build_request_extra()[
+    "ltx2_stage1_guider_params"
+]
 
 
 class LTX2AVDenoisingStage(DenoisingStage):
@@ -126,9 +130,18 @@ class LTX2AVDenoisingStage(DenoisingStage):
     def _get_ltx2_stage1_guider_params(
         self, batch: Req, server_args: ServerArgs, stage: str
     ) -> dict[str, object] | None:
-        if stage != "stage1":
+        guider_params = batch.extra.get("ltx2_stage1_guider_params")
+        if stage == "stage1":
+            return guider_params
+        if stage != "one_stage":
             return None
-        return batch.extra.get("ltx2_stage1_guider_params")
+        if guider_params is not None:
+            return guider_params
+        if not is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        ):
+            return None
+        return copy.deepcopy(_LTX23_ONE_STAGE_GUIDER_PARAMS)
 
     @staticmethod
     def _ltx2_should_skip_step(step_index: int, skip_step: int) -> bool:

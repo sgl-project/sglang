@@ -135,13 +135,33 @@ def test_sp_sharding_image_latent_keeps_main_video_metadata(monkeypatch):
     assert batch.sp_video_tokens_per_frame == 4096
 
 
-def test_ltx23_one_stage_does_not_consume_stage1_guider_params():
+def test_ltx23_one_stage_uses_official_guider_defaults_without_request_extra():
     stage = object.__new__(LTX2AVDenoisingStage)
-    batch = SimpleNamespace(extra={"ltx2_stage1_guider_params": {"video_cfg_scale": 3.0}})
+    batch = SimpleNamespace(extra={})
+    guider_params = LTX2AVDenoisingStage._get_ltx2_stage1_guider_params(
+        stage, batch, _make_server_args("ltx_2_3"), "one_stage"
+    )
+
+    assert guider_params is not None
+    assert guider_params["video_cfg_scale"] == 3.0
+    assert guider_params["video_stg_scale"] == 1.0
+    assert guider_params["video_rescale_scale"] == 0.7
+    assert guider_params["video_modality_scale"] == 3.0
+    assert guider_params["video_stg_blocks"] == [28]
+    assert guider_params["audio_cfg_scale"] == 7.0
+    assert guider_params["audio_stg_scale"] == 1.0
+    assert guider_params["audio_rescale_scale"] == 0.7
+    assert guider_params["audio_modality_scale"] == 3.0
+    assert guider_params["audio_stg_blocks"] == [28]
+
+
+def test_ltx23_two_stage_stage2_does_not_consume_stage1_guider_params():
+    stage = object.__new__(LTX2AVDenoisingStage)
+    batch = SimpleNamespace(extra={})
 
     assert (
         LTX2AVDenoisingStage._get_ltx2_stage1_guider_params(
-            stage, batch, _make_server_args("ltx_2_3"), "one_stage"
+            stage, batch, _make_server_args("ltx_2_3"), "stage2"
         )
         is None
     )
