@@ -1,5 +1,3 @@
-import json  # noqa: test lint failure
-
 try:
     from sglang._version import __version__, __version_tuple__
 except ImportError:
