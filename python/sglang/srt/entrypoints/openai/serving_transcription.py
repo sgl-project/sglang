@@ -278,6 +278,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
         model = request.model
         state = StreamingASRState(**self._adapter.chunked_streaming_config)
+        first_word = True
 
         try:
             chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
@@ -325,10 +326,11 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     delta = state.update(text)
 
                 if delta:
-                    for j, word in enumerate(delta.split(" ")):
+                    for word in delta.split(" "):
                         if not word:
                             continue
-                        content = word if j == 0 else " " + word
+                        content = word if first_word else " " + word
+                        first_word = False
                         chunk_resp = TranscriptionStreamResponse(
                             id=request_id,
                             created=created_time,
