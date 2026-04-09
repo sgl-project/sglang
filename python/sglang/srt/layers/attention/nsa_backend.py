@@ -426,7 +426,7 @@ class NativeSparseAttnBackend(
             )
             else self.nsa_prefill_impl
         )
-        use_flashmla_kv = nsa_impl_for_batch == "flashmla_kv"
+        use_flashmla_kv = (not self.use_mha) and nsa_impl_for_batch == "flashmla_kv"
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
