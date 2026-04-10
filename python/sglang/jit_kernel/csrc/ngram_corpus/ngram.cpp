@@ -14,6 +14,7 @@ namespace ngram {
 // - specificity is normalized match depth / matched_len for the best anchor
 // - confidence is normalized top-1 next-token mass at that anchor
 // - the w_* terms are normalized from the user-provided match weights below
+namespace {
 double computeSourceScore(const MatchQuality& quality, double source_prior, const Param& param) {
   if (!quality.has_match) {
     return 0.0;
@@ -27,6 +28,11 @@ double computeSourceScore(const MatchQuality& quality, double source_prior, cons
   return source_prior * (specificity_weight * quality.specificity + confidence_weight * quality.confidence);
 }
 
+double effectiveTrieSourcePrior(double source_prior) {
+  return source_prior > 0.0 ? source_prior : 1.0;
+}
+
+}  // namespace
 Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.max_trie_depth > 1)) {
     throw std::runtime_error(
@@ -239,10 +245,9 @@ Result Ngram::batchMatch(
     std::vector<RankedSourceResult> source_results;
     source_results.reserve(ordered_sams.size() + 1);
     if (trie_quality.has_match) {
-      source_results.push_back(
-          RankedSourceResult{
-              computeSourceScore(trie_quality, param_.trie_source_prior > 0.0 ? param_.trie_source_prior : 1.0, param_),
-              (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)});
+      source_results.push_back(RankedSourceResult{
+          computeSourceScore(trie_quality, effectiveTrieSourcePrior(param_.trie_source_prior), param_),
+          (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_)});
     }
 
     for (const auto& [_, sam] : ordered_sams) {
@@ -252,9 +257,8 @@ Result Ngram::batchMatch(
       if (score <= 0.0) {
         continue;
       }
-      source_results.push_back(
-          RankedSourceResult{
-              score, (sam->*sam_anchored_build_fn)(anchors, suffix.back(), total_draft_token_num, param_)});
+      source_results.push_back(RankedSourceResult{
+          score, (sam->*sam_anchored_build_fn)(anchors, suffix.back(), total_draft_token_num, param_)});
     }
 
     Result combined;
@@ -267,7 +271,8 @@ Result Ngram::batchMatch(
       });
       combined = std::move(source_results.front().result);
       for (size_t source_idx = 1; source_idx < source_results.size(); ++source_idx) {
-        combined = combineRootResults_(suffix.back(), result_token_num, combined, source_results[source_idx].result);
+        combined = combineRootResults_(
+            suffix.back(), result_token_num, combined, source_results[source_idx].result);
       }
     }
 
