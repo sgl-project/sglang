@@ -61,11 +61,8 @@ class TestGetLock(CustomTestCase):
     def test_lock_is_acquirable(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             lock = get_lock("test/model", cache_dir=tmpdir)
-            lock.acquire()
-            try:
+            with lock:
                 self.assertTrue(lock.is_locked)
-            finally:
-                lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +213,16 @@ class TestCheckIndexFilesExist(CustomTestCase):
             self.assertTrue(ok)
 
     def test_malformed_json_is_handled(self):
+        """Malformed index JSON should not block loading.
+
+        The implementation catches *all* exceptions (including JSONDecodeError),
+        logs a warning, and continues — ultimately returning ``(True, None)``.
+        This is intentional: the function only checks whether referenced weight
+        files are missing; it does not validate index-file syntax.  If the
+        index cannot be parsed, the safest behavior is to let loading proceed
+        (the loader itself will surface a clear error if the file is truly
+        unusable).
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(
                 os.path.join(tmpdir, "model.safetensors.index.json"), "w"

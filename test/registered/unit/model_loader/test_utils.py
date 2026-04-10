@@ -334,16 +334,15 @@ class TestMaybeExecutorSubmit(CustomTestCase):
         def func(val):
             result.append(val)
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        futures = []
-        maybe_executor_submit(
-            executor=executor,
-            futures=futures,
-            use_async=False,
-            func=func,
-            func_args=(42,),
-        )
-        executor.shutdown(wait=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            futures = []
+            maybe_executor_submit(
+                executor=executor,
+                futures=futures,
+                use_async=False,
+                func=func,
+                func_args=(42,),
+            )
         self.assertEqual(result, [42])
         self.assertEqual(len(futures), 0)
 
@@ -353,18 +352,17 @@ class TestMaybeExecutorSubmit(CustomTestCase):
         def func(val):
             result.append(val)
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        futures = []
-        maybe_executor_submit(
-            executor=executor,
-            futures=futures,
-            use_async=True,
-            func=func,
-            func_args=(99,),
-        )
-        # Wait for future to complete
-        concurrent.futures.wait(futures)
-        executor.shutdown(wait=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            futures = []
+            maybe_executor_submit(
+                executor=executor,
+                futures=futures,
+                use_async=True,
+                func=func,
+                func_args=(99,),
+            )
+            # Wait for future to complete
+            concurrent.futures.wait(futures)
         self.assertEqual(result, [99])
         self.assertEqual(len(futures), 1)
 
@@ -374,17 +372,16 @@ class TestMaybeExecutorSubmit(CustomTestCase):
         def func(key, value=None):
             result[key] = value
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        futures = []
-        maybe_executor_submit(
-            executor=executor,
-            futures=futures,
-            use_async=False,
-            func=func,
-            func_args=("k",),
-            func_kwargs={"value": "v"},
-        )
-        executor.shutdown(wait=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            futures = []
+            maybe_executor_submit(
+                executor=executor,
+                futures=futures,
+                use_async=False,
+                func=func,
+                func_args=("k",),
+                func_kwargs={"value": "v"},
+            )
         self.assertEqual(result, {"k": "v"})
 
     def test_async_mode_with_kwargs(self):
@@ -393,18 +390,17 @@ class TestMaybeExecutorSubmit(CustomTestCase):
         def func(key, value=None):
             result[key] = value
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        futures = []
-        maybe_executor_submit(
-            executor=executor,
-            futures=futures,
-            use_async=True,
-            func=func,
-            func_args=("k",),
-            func_kwargs={"value": "v"},
-        )
-        concurrent.futures.wait(futures)
-        executor.shutdown(wait=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            futures = []
+            maybe_executor_submit(
+                executor=executor,
+                futures=futures,
+                use_async=True,
+                func=func,
+                func_args=("k",),
+                func_kwargs={"value": "v"},
+            )
+            concurrent.futures.wait(futures)
         self.assertEqual(result, {"k": "v"})
 
     def test_default_kwargs_is_empty(self):
@@ -414,15 +410,14 @@ class TestMaybeExecutorSubmit(CustomTestCase):
         def func():
             called_with.append(True)
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        futures = []
-        maybe_executor_submit(
-            executor=executor,
-            futures=futures,
-            use_async=False,
-            func=func,
-        )
-        executor.shutdown(wait=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            futures = []
+            maybe_executor_submit(
+                executor=executor,
+                futures=futures,
+                use_async=False,
+                func=func,
+            )
         self.assertEqual(called_with, [True])
 
     def test_multiple_async_submissions(self):
@@ -431,18 +426,17 @@ class TestMaybeExecutorSubmit(CustomTestCase):
         def func(val):
             result.append(val)
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        futures = []
-        for i in range(5):
-            maybe_executor_submit(
-                executor=executor,
-                futures=futures,
-                use_async=True,
-                func=func,
-                func_args=(i,),
-            )
-        concurrent.futures.wait(futures)
-        executor.shutdown(wait=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = []
+            for i in range(5):
+                maybe_executor_submit(
+                    executor=executor,
+                    futures=futures,
+                    use_async=True,
+                    func=func,
+                    func_args=(i,),
+                )
+            concurrent.futures.wait(futures)
         self.assertEqual(sorted(result), [0, 1, 2, 3, 4])
         self.assertEqual(len(futures), 5)
 
