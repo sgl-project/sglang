@@ -23,14 +23,14 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class PoolStats:
-    is_hybrid_swa: bool = False
-    is_hybrid_ssm: bool = False
-
-    # For full pools
+    # For full pools (required)
     full_num_used: int
-    full_token_usage: int
+    full_token_usage: float
     full_available_size: int
     full_evictable_size: int
+
+    is_hybrid_swa: bool = False
+    is_hybrid_ssm: bool = False
 
     # For hybrid-swa pools
     swa_num_used: Optional[int] = None
