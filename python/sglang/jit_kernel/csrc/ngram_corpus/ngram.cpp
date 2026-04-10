@@ -85,8 +85,10 @@ void allocateLargestRemainder(size_t total_budget, std::vector<WeightedBudgetSou
       if (lhs.first != rhs.first) {
         return lhs.first > rhs.first;
       }
-      if ((*sources)[lhs.second].score != (*sources)[rhs.second].score) {
-        return (*sources)[lhs.second].score > (*sources)[rhs.second].score;
+      const auto& lhs_source = (*sources)[lhs.second];
+      const auto& rhs_source = (*sources)[rhs.second];
+      if (lhs_source.score != rhs_source.score) {
+        return lhs_source.score > rhs_source.score;
       }
       return lhs.second < rhs.second;
     });
@@ -150,7 +152,7 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
         "match_confidence_weight must be greater than or equal to 0, current value: " +
         std::to_string(param_.match_confidence_weight));
   }
-  if (!(param_.match_specificity_weight + param_.match_confidence_weight > 0.0)) {
+  if (param_.match_specificity_weight + param_.match_confidence_weight <= 0.0) {
     throw std::runtime_error("match quality weights must sum to a positive value");
   }
   for (auto config : param_.batch_draft_token_num) {
