@@ -343,9 +343,6 @@ class SchedulerMetricsMixin:
         self.last_prefill_tokens = prefill_stats.log_input_tokens
 
         pool_stats = self.get_pool_stats()
-        num_used, _ = pool_stats.get_kv_token_stats()
-        max_pool_usage = pool_stats.get_max_pool_usage()
-        full_token_usage = pool_stats.full_token_usage
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
@@ -417,13 +414,7 @@ class SchedulerMetricsMixin:
 
             self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_running_reqs_offline_batch = 0
-            self.stats.num_used_tokens = num_used
-            self.stats.token_usage = max_pool_usage
-            self.stats.full_token_usage = full_token_usage
-            if pool_stats.is_hybrid_swa:
-                self.stats.swa_token_usage = pool_stats.swa_token_usage
-            if pool_stats.is_hybrid_ssm:
-                self.stats.mamba_usage = pool_stats.mamba_usage
+            pool_stats.update_scheduler_stats(self.stats)
 
             priority_enabled = self.enable_priority_scheduling
             self.stats.num_queue_reqs = QueueCount.from_reqs(
@@ -515,9 +506,6 @@ class SchedulerMetricsMixin:
         num_running_reqs_offline_batch = 0
 
         pool_stats = self.get_pool_stats()
-        num_used, _ = pool_stats.get_kv_token_stats()
-        max_pool_usage = pool_stats.get_max_pool_usage()
-        full_token_usage = pool_stats.full_token_usage
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
 
         if RECORD_STEP_TIME:
@@ -603,15 +591,7 @@ class SchedulerMetricsMixin:
                 batch.reqs, priority_enabled
             )
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
-            self.stats.num_used_tokens = num_used
-            # maximum usage of all pools
-            self.stats.token_usage = max_pool_usage
-            # usage of full attention
-            self.stats.full_token_usage = full_token_usage
-            if pool_stats.is_hybrid_swa:
-                self.stats.swa_token_usage = pool_stats.swa_token_usage
-            if pool_stats.is_hybrid_ssm:
-                self.stats.mamba_usage = pool_stats.mamba_usage
+            pool_stats.update_scheduler_stats(self.stats)
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = QueueCount.from_reqs(
