@@ -24,6 +24,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
@@ -839,6 +840,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
+        # Build SourceIdentity for this instance
+        identity = p2p_pb2.SourceIdentity(
+            model_name=model_name,
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+            tensor_parallel_size=self.server_args.tp_size,
+            pipeline_parallel_size=self.server_args.pp_size,
+            expert_parallel_size=self.server_args.ep_size,
+            dtype=self.server_args.dtype or "",
+            quantization=self.server_args.quantization or "",
+        )
+
         # Build tensor descriptors from weight_info dict
         tensors = []
         for name, (addr, numel, element_size) in weight_info.items():
@@ -857,27 +869,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             tensors=tensors,
         )
 
+        # Generate a unique worker_id for this running instance
+        worker_id = str(uuid.uuid4())
+
         mx_client = MxClient(server_url=mx_url)
         try:
             logger.info(
                 "ModelExpress source: publishing metadata for model=%s, "
-                "tp_rank=%d, session=%s, %d tensors",
+                "tp_rank=%d, session=%s, %d tensors, worker_id=%s",
                 model_name,
                 self.tp_rank,
                 session_id,
                 len(tensors),
+                worker_id,
             )
-            mx_client.publish_metadata(model_name, [worker])
-            mx_client.publish_ready(
-                model_name,
-                worker_id=self.tp_rank,
-                session_id=mx_client.session_id,
-                metadata_hash="",
+            mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
+            mx_client.update_status(
+                mx_source_id=mx_source_id,
+                worker_id=worker_id,
+                worker_rank=self.tp_rank,
+                status=p2p_pb2.SOURCE_STATUS_READY,
             )
             logger.info(
-                "ModelExpress source: published ready for model=%s, tp_rank=%d",
+                "ModelExpress source: published ready for model=%s, "
+                "tp_rank=%d, mx_source_id=%s",
                 model_name,
                 self.tp_rank,
+                mx_source_id,
             )
         finally:
             mx_client.close()
@@ -1173,6 +1191,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             modelexpress_url=self.server_args.modelexpress_url,
             modelexpress_model_name=self.server_args.modelexpress_model_name
             or self.server_args.model_path,
+            modelexpress_tp_size=self.server_args.tp_size,
+            modelexpress_pp_size=self.server_args.pp_size,
+            modelexpress_ep_size=self.server_args.ep_size,
+            modelexpress_dtype=self.server_args.dtype,
+            modelexpress_quantization=self.server_args.quantization or "",
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
