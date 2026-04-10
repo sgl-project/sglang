@@ -23,47 +23,6 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
-    def _debug_radix_memory_state(self: Scheduler) -> str:
-        if not envs.SGLANG_STREAMING_SESSION_DEBUG_LOG.get():
-            return ""
-
-        allocator = self.token_to_kv_pool_allocator
-        page_size = getattr(allocator, "page_size", 1)
-        free_pages = set(allocator.free_pages.tolist() + allocator.release_pages.tolist())
-
-        cached_pages = set()
-        if hasattr(self.tree_cache, "all_values_flatten"):
-            try:
-                cached_values = self.tree_cache.all_values_flatten()
-            except RuntimeError:
-                cached_values = None
-            if cached_values is not None and cached_values.numel() > 0:
-                if page_size > 1:
-                    cached_pages = set(torch.unique(cached_values // page_size).tolist())
-                else:
-                    cached_pages = set(cached_values.tolist())
-
-        session_pages = set()
-        slot_summaries: list[str] = []
-        if isinstance(self.tree_cache, SessionAwareCache):
-            session_pages = self.tree_cache.held_page_ids()
-            slot_summaries = self.tree_cache.debug_slot_summaries()
-
-        expected_pages = (
-            set(range(1, allocator.size // page_size + 1))
-            if page_size > 1
-            else set(range(1, allocator.size + 1))
-        )
-        leaked_pages = expected_pages - free_pages - cached_pages - session_pages
-        slot_msg = "; ".join(slot_summaries[:8]) if slot_summaries else "none"
-        return (
-            f"page_size={page_size}, free_pages={len(free_pages)}, "
-            f"cached_pages={len(cached_pages)}, session_pages={len(session_pages)}, "
-            f"leaked_pages_count={len(leaked_pages)}, "
-            f"leaked_pages_sample={sorted(leaked_pages)[:32] if leaked_pages else None}, "
-            f"slots={slot_msg}\n"
-        )
-
     def _active_streaming_session_count(self: Scheduler) -> int:
         if not hasattr(self, "session_controller"):
             return 0
@@ -240,8 +199,6 @@ class SchedulerRuntimeCheckerMixin:
             self.max_total_num_tokens - protected_size - session_held
         )
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}\n"
-        if memory_leak:
-            token_msg += self._debug_radix_memory_state()
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:

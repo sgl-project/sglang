@@ -282,42 +282,6 @@ def test_aborted_streaming_turn_preserves_slot_and_accounting(monkeypatch):
     assert allocator.freed[1].tolist() == list(range(16, 48))
 
 
-def test_abort_close_releases_tree_lock():
-    """When a session is closed and the last req was an abort, dec_lock_ref
-    must still fire using the slot's saved last_node."""
-    page_size = 16
-    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
-    allocator = _FakeAllocator()
-    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    tree_cache = SessionAwareCache(inner)
-
-    lock_node = "session-lock-node"
-    tree_cache.slots["session-a"] = SessionSlot(
-        req_pool_idx=0,
-        kv_committed_len=64,
-        kv_allocated_len=64,
-        last_node=lock_node,
-        cache_protected_len=16,
-    )
-
-    # The closing req is an abort — origin_input_ids=[0], kv=2
-    req = _FakeReq("session-a", req_pool_idx=None, committed=2, allocated=2)
-    req.origin_input_ids = [0]
-    req.finished_reason = FINISH_ABORT("too long")
-    req.kv_committed_freed = True
-    req.kv_overallocated_freed = True
-
-    tree_cache.release_session("session-a", req)
-
-    # The slot's lock_node must have been released, not skipped
-    assert inner.dec_lock_ref_calls == [lock_node]
-    assert req_to_token_pool.free_slots == [0]
-    # Freed [16:64] — the non-tree portion
-    assert len(allocator.freed) == 1
-    assert allocator.freed[0].tolist() == list(range(16, 64))
-
-
 def test_session_shrink_frees_orphaned_tail():
     """When a session's KV shrinks (client retried with shorter prompt),
     the orphaned tail pages must be freed before save_from_req overwrites

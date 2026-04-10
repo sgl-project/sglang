@@ -7,7 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
@@ -24,17 +23,6 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
-
-
-def _streaming_debug_log(
-    tree_cache: BasePrefixCache, event: str, req: "Req", **extra
-) -> None:
-    if (
-        envs.SGLANG_STREAMING_SESSION_DEBUG_LOG.get()
-        and isinstance(tree_cache, SessionAwareCache)
-        and getattr(req, "session", None) is not None
-    ):
-        tree_cache._log_debug(event, req.session.session_id, req=req, **extra)
 
 
 @triton.jit
@@ -517,13 +505,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             ][start_p:end_p]
             tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
         req.kv_allocated_len = req.kv_committed_len
-        _streaming_debug_log(
-            tree_cache,
-            "release-kv-trim-tail",
-            req,
-            trim_start=start_p,
-            trim_end=end_p,
-        )
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
@@ -541,7 +522,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.pop_committed_kv_cache()
             if not req.kv_overallocated_freed:
                 req.pop_overallocated_kv_cache()
-            _streaming_debug_log(tree_cache, "release-kv-handoff", req)
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()
