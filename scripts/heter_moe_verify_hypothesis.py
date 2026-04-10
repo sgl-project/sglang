@@ -145,11 +145,18 @@ def bench(fn, device, warmup=WARMUP, iters=ITERS, use_cuda_graph=True):
     return times[len(times) // 2]
 
 
-def run_all(device):
+def run_all(device, use_graph=False):
     bf16_w13, bf16_w2 = make_bf16_weights(device)
     int8_w13, int8_w2, int8_s13, int8_s2 = make_int8_weights(device)
     int4_w1, int4_w2, int4_s1, int4_s2 = make_int4_weights(device)
     policy = TokenCountPolicy()
+
+    graph_label = "graph=ON" if use_graph else "graph=OFF"
+    print(f"\n{'=' * 80}")
+    print(
+        f"Running with CUDA graph: {use_graph}  (all kernels same setting for fairness)"
+    )
+    print(f"{'=' * 80}\n")
 
     rows = []
     header = ("M", "a16w16", "a16w4", "a8w8", "mix_w4_w16", "mix_w8_w16", "mix_w4_w8")
@@ -161,9 +168,10 @@ def run_all(device):
         lat_bf16 = bench(
             lambda: outplace_fused_experts(x, bf16_w13, bf16_w2, topk_w, topk_ids),
             device,
+            use_cuda_graph=use_graph,
         )
 
-        # Pure a16w4 — CUDA graph capture often fails for Marlin JIT kernel
+        # Pure a16w4
         lat_int4 = bench(
             lambda: fused_marlin_moe(
                 x,
@@ -178,7 +186,7 @@ def run_all(device):
                 is_k_full=True,
             ),
             device,
-            use_cuda_graph=False,
+            use_cuda_graph=use_graph,
         )
 
         # Pure a8w8
@@ -195,6 +203,7 @@ def run_all(device):
                 w2_scale=int8_s2,
             ),
             device,
+            use_cuda_graph=use_graph,
         )
 
         # Mixed assignments via policy
@@ -285,7 +294,8 @@ def run_all(device):
 
     # Save CSV
     os.makedirs(OUT_DIR, exist_ok=True)
-    csv_path = os.path.join(OUT_DIR, "hypothesis_verify.csv")
+    suffix = "graph_on" if use_graph else "graph_off"
+    csv_path = os.path.join(OUT_DIR, f"hypothesis_verify_{suffix}.csv")
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
@@ -317,7 +327,7 @@ def run_all(device):
             f"{m4_16:8.3f} {m8_16:8.3f} {m4_8:8.3f} | {best:>8}"
         )
     print("=" * 90)
-    print(f"(all latencies in ms, cold_ratio={COLD_RATIO})")
+    print(f"(all latencies in ms, cold_ratio={COLD_RATIO}, {graph_label})")
 
     # Plot
     try:
@@ -334,19 +344,55 @@ def run_all(device):
             ax.plot(BATCH_SIZES, vals, "o-", label=label, color=colors[i], linewidth=2)
         ax.set_xlabel("Batch Size (M)")
         ax.set_ylabel("Latency (ms)")
-        ax.set_title(
-            f"MoE Kernel Latency Comparison (E={E}, K={K}, N={N}, top_k={TOP_K})"
-        )
+        ax.set_title(f"MoE Kernel Latency ({graph_label}, E={E}, K={K}, N={N})")
         ax.set_xscale("log", base=2)
         ax.legend()
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        plot_path = os.path.join(OUT_DIR, "hypothesis_verify.png")
+        plot_path = os.path.join(OUT_DIR, f"hypothesis_verify_{suffix}.png")
         plt.savefig(plot_path, dpi=150)
         print(f"Plot: {plot_path}")
     except ImportError:
         print("matplotlib not installed, skipping plot")
 
+    return rows
+
 
 if __name__ == "__main__":
-    run_all(torch.device("cuda"))
+    device = torch.device("cuda")
+
+    # Run both modes for fair comparison
+    rows_no_graph = run_all(device, use_graph=False)
+    rows_graph = run_all(device, use_graph=True)
+
+    # Save combined summary
+    os.makedirs("/data/heter-moe/results", exist_ok=True)
+    summary_path = "/data/heter-moe/results/kernel_comparison_summary.txt"
+    with open(summary_path, "w") as f:
+        for label, rows in [
+            ("NO CUDA GRAPH (fair apples-to-apples)", rows_no_graph),
+            ("WITH CUDA GRAPH (where supported)", rows_graph),
+        ]:
+            f.write(f"\n{'=' * 90}\n{label}\n{'=' * 90}\n")
+            f.write(
+                f"{'M':>5} | {'a16w16':>8} {'a16w4':>8} {'a8w8':>8} | "
+                f"{'mix4+16':>8} {'mix8+16':>8} {'mix4+8':>8} | {'best':>8}\n"
+            )
+            f.write("-" * 90 + "\n")
+            for r in rows:
+                M, bf16, int4, int8, m4_16, m8_16, m4_8 = r
+                all_lats = {
+                    "a16w16": bf16,
+                    "a16w4": int4,
+                    "a8w8": int8,
+                    "mix4+16": m4_16,
+                    "mix8+16": m8_16,
+                    "mix4+8": m4_8,
+                }
+                best = min(all_lats, key=all_lats.get)
+                f.write(
+                    f"{M:>5} | {bf16:8.3f} {int4:8.3f} {int8:8.3f} | "
+                    f"{m4_16:8.3f} {m8_16:8.3f} {m4_8:8.3f} | {best:>8}\n"
+                )
+            f.write(f"(all latencies in ms, cold_ratio={COLD_RATIO})\n")
+    print(f"\nCombined summary: {summary_path}")
