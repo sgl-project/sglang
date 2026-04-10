@@ -1,6 +1,7 @@
 import argparse
 import math
 import unittest
+from unittest.mock import MagicMock, patch
 
 from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
@@ -195,6 +196,40 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         target._merge_with_user_params(user, explicit_fields={"negative_prompt"})
 
         self.assertEqual(target.negative_prompt, SamplingParams.negative_prompt)
+
+    def test_cli_path_tracks_explicit_width_height_fields(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: Flux2SamplingParams(),
+        ):
+            implicit_size = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+            )
+            explicit_size = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+                width=768,
+                height=512,
+            )
+
+        implicit_fields = set(implicit_size.build_request_extra()["explicit_fields"])
+        explicit_fields = set(explicit_size.build_request_extra()["explicit_fields"])
+
+        self.assertNotIn("width", implicit_fields)
+        self.assertNotIn("height", implicit_fields)
+        self.assertIn("width", explicit_fields)
+        self.assertIn("height", explicit_fields)
 
 
 if __name__ == "__main__":

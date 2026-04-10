@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
@@ -21,6 +21,7 @@ from sglang.srt.utils import (
     ceil_align,
     get_bool_env_var,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_npu,
 )
@@ -31,6 +32,8 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_gfx95_supported = is_gfx95_supported()
 if _is_cuda:
     try:
         import deep_gemm
@@ -251,7 +254,14 @@ class Indexer(MultiPlatformOp):
         else:
             yield
 
-    def _weights_proj_bf16_in_fp32_out(self, x: torch.Tensor) -> torch.Tensor:
+    def _weights_proj_bf16_in_fp32_out(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    ) -> torch.Tensor:
+        # aiter (ROCm gfx95): extract the passthrough bf16 tensor from the
+        # 3-tuple (fp8, scale, bf16) produced by fused_rms_fp8_group_quant,
+        # avoiding an expensive FP8-to-bf16 dequantization.
+        if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
+            x = x[2]
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             weight = self.weights_proj.weight
             out = torch.empty(
@@ -268,13 +278,17 @@ class Indexer(MultiPlatformOp):
         return weights.float()
 
     @torch.compile(dynamic=True)
-    def _project_and_scale_head_gates(self, x: torch.Tensor):
+    def _project_and_scale_head_gates(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    ):
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         return weights
 
     @torch.compile(dynamic=True)
-    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
+    def _get_logits_head_gate(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
+    ):
         weights = self._weights_proj_bf16_in_fp32_out(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
@@ -1133,9 +1147,18 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
 
-            # `_get_logits_head_gate` expects a Tensor. For tuple activations, dequantize
-            # to a float tensor here (callsite), keeping `_get_logits_head_gate` backend-agnostic.
-            if isinstance(x, tuple):
+            # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
+            # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
+            # which extracts the bf16 tensor via _weights_proj_bf16_in_fp32_out,
+            # completely skipping the FP8 dequantization path below.
+            if (
+                _use_aiter
+                and _is_gfx95_supported
+                and isinstance(x, tuple)
+                and len(x) == 3
+            ):
+                x_for_gate = x
+            elif isinstance(x, tuple):
                 assert len(x) in (
                     2,
                     3,
