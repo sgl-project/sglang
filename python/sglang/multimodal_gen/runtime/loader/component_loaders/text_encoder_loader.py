@@ -2,11 +2,10 @@ import dataclasses
 import glob
 import os
 from collections.abc import Generator, Iterable
-from typing import Generator, Iterable, cast
+from typing import cast
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 from torch import nn
 from torch.distributed import init_device_mesh
 from transformers import AutoModel
