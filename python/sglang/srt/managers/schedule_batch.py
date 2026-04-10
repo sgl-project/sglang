@@ -2515,8 +2515,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), "cache_protected_len must be page aligned"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
+        # Subtract an extra page_size so the eviction frontier never reaches the
+        # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
+        # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
+        # preserving cache reuse in multi-turn scenarios.
+        # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
         new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen, pre_len - sliding_window_size
+            req.swa_evicted_seqlen,
+            pre_len - sliding_window_size - self.tree_cache.page_size,
         )
 
         if self.tree_cache.page_size > 1:
