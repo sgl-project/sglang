@@ -141,7 +141,7 @@ class MistralAttention(nn.Module):
             key_states,
             value_states,
             attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
+            dropout=0.0,
             scaling=self.scaling,
             sliding_window=getattr(
                 self.config, "sliding_window", None
