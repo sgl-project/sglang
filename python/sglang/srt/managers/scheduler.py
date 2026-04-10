@@ -2585,9 +2585,11 @@ class Scheduler(
             self.running_batch.reqs,
             self.enable_priority_scheduling,
             num_pending_tokens=self._get_num_pending_tokens(
-                chunk_deduct=self.chunked_req.extend_input_len
-                if self.chunked_req is not None
-                else 0
+                chunk_deduct=(
+                    self.chunked_req.extend_input_len
+                    if self.chunked_req is not None
+                    else 0
+                )
             ),
         )
 

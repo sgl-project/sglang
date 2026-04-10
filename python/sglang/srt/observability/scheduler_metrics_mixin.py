@@ -866,9 +866,7 @@ class SchedulerMetricsMixin:
                     self.stats.token_usage / 0.9,
                 )
 
-    def _get_num_pending_tokens(
-        self: Scheduler, chunk_deduct: int = 0
-    ) -> int:
+    def _get_num_pending_tokens(self: Scheduler, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
 
         This includes tokens from waiting queue requests plus remaining tokens
@@ -885,9 +883,7 @@ class SchedulerMetricsMixin:
         num_pending_tokens = sum(req.seqlen for req in self.waiting_queue)
         if self.chunked_req is not None:
             req = self.chunked_req
-            num_pending_tokens += (
-                req.seqlen - len(req.prefix_indices) - chunk_deduct
-            )
+            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
         return num_pending_tokens
 
     def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
