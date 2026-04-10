@@ -261,7 +261,9 @@ class FlexKVConnector(BaseKVConnector):
 
         self.tp_size = server_args.tp_size
         self.rank = tp_rank
-        self.tp_cpu_group = getattr(tp_group, "cpu_group", tp_group) if tp_group is not None else None
+        self.tp_cpu_group = (
+            getattr(tp_group, "cpu_group", tp_group) if tp_group is not None else None
+        )
 
         self.k_pool = getattr(kvcache, "k_buffer", None)
         self.v_pool = getattr(kvcache, "v_buffer", None)
@@ -421,7 +423,9 @@ class FlexKVConnector(BaseKVConnector):
 
     def check_completed_load_tasks(self) -> List[int]:
         if self.rank == 0 and len(self._load_fkv_tids) >= 100:
-            self.kv_manager.try_wait(task_ids=self._load_fkv_tids)
+            self.kv_manager.try_wait(
+                task_ids=self._load_fkv_tids
+            )  # flush the load tasks
             self._load_fkv_tids.clear()
 
         for ext_tid, producer_id in list(self._ongoing_loads.items()):
@@ -567,11 +571,9 @@ class FlexKVConnector(BaseKVConnector):
         self._send_eventfds_to_worker()
         logger.info("[FlexKV] Rank %d: Initialized layerwise transfer", self.rank)
 
-    def _send_eventfds_to_worker(
-        self, retry_interval: float = 1.0
-    ):
+    def _send_eventfds_to_worker(self, retry_interval: float = 1.0):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        max_retries =self.layerwise_eventfd_connect_max_retries
+        max_retries = self.layerwise_eventfd_connect_max_retries
 
         for attempt in range(max_retries):
             try:

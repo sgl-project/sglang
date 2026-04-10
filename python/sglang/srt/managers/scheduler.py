@@ -2432,8 +2432,8 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+        if self.enable_hierarchical_cache or self.enable_kv_connector:
+            self.tree_cache.check_kv_events()
 
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -2657,7 +2657,7 @@ class Scheduler(
 
         # Eagerly release lock_ref on completed write-through nodes so they
         # become evictable, improving batch scheduling headroom.
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_kv_connector:
             self.tree_cache.flush_write_through_acks()
 
         # Check if decode out of memory

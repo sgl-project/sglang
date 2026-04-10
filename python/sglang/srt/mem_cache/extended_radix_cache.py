@@ -221,7 +221,7 @@ class ExtendedRadixCache(BasePrefixCache):
         self._load_task_id_counter += 1
 
         self._inner_radixtree.inc_lock_ref(req.last_node)
-        
+
         self._connector.start_store_kv(
             task_id=task_id,
             token_ids=token_ids,
@@ -232,6 +232,11 @@ class ExtendedRadixCache(BasePrefixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self._inner_radixtree.evict(params)
+
+    def flush_write_through_acks(self) -> None:
+        if self._connector is None:
+            return
+        self._check_store_completion()
 
     def check_kv_events(self):
         if self._connector is None:
