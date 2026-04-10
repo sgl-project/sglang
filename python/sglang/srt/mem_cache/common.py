@@ -513,6 +513,15 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     # Streaming-session specific overalloc trimming must therefore happen
     # before cache_finished_req above.
     if req.req_pool_idx is None:
+        if is_streaming_session:
+            # The request no longer owns any KV once SessionAwareCache either
+            # transfers it into the session slot or frees it on abort. Mark
+            # both bookkeeping flags so busy-time memory checks do not keep
+            # counting this finished request as uncached KV.
+            if not req.kv_committed_freed:
+                req.pop_committed_kv_cache()
+            if not req.kv_overallocated_freed:
+                req.pop_overallocated_kv_cache()
         return
 
     start_p, end_p = req.pop_overallocated_kv_cache()

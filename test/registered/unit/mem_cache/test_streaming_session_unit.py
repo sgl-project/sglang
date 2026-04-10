@@ -49,6 +49,8 @@ class _FakeReq:
         self.req_pool_idx = req_pool_idx
         self.kv_committed_len = committed
         self.kv_allocated_len = allocated
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
         self.origin_input_ids = list(range(committed))
         self.output_ids = []
         self.extra_key = None
@@ -65,8 +67,15 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
 
+    def pop_committed_kv_cache(self):
+        assert not self.kv_committed_freed
+        self.kv_committed_freed = True
+        return self.kv_committed_len
+
     def pop_overallocated_kv_cache(self):
+        assert not self.kv_overallocated_freed
         self.pop_overallocated_calls += 1
+        self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
 
@@ -87,6 +96,8 @@ def test_streaming_release_kv_cache_trims_overallocated_tail(monkeypatch):
 
     slot = tree_cache.slots["session-a"]
     assert req.pop_overallocated_calls == 1
+    assert req.kv_committed_freed is True
+    assert req.kv_overallocated_freed is True
     assert req.req_pool_idx is None
     assert slot.kv_committed_len == 17
     assert slot.kv_allocated_len == 17
@@ -249,8 +260,10 @@ def test_aborted_streaming_turn_preserves_slot_and_accounting(monkeypatch):
     assert slot.req_pool_idx == 0
     assert slot.kv_committed_len == 48
     assert slot.kv_allocated_len == 48
+    assert req.kv_committed_freed is True
+    assert req.kv_overallocated_freed is True
     assert req.req_pool_idx is None
-    assert req.pop_overallocated_calls == 0
+    assert req.pop_overallocated_calls == 1
     assert tree_cache.session_held_tokens() == 32
     assert tree_cache.session_held_full_tokens() == 32
     assert tree_cache.session_held_swa_tokens() == 32
