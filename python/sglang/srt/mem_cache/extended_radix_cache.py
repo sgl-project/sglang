@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
     EvictResult,
+    InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -130,19 +131,20 @@ class ExtendedRadixCache(BasePrefixCache):
 
     def init_load_back(
         self,
-        req: Req,
-        mem_quota: Optional[int] = None,
-    ) -> None:
+        params: InitLoadBackParams,
+    ) -> Tuple[torch.Tensor, Any]:
         if self._connector is None:
-            return
+            return torch.tensor([], dtype=torch.int32, device="cuda"), params.last_host_node
 
-        host_hit_length = req.host_hit_length
+        req = params.req
+        mem_quota = params.mem_quota
+        host_hit_length = params.host_hit_length
 
         if host_hit_length <= 0 or (
             mem_quota is not None and host_hit_length > mem_quota
         ):
             self._connector.release_load_state(req.rid)
-            return
+            return torch.tensor([], dtype=torch.int32, device="cuda"), params.last_host_node
 
         device_indices = self._inner_radixtree.token_to_kv_pool_allocator.alloc(
             host_hit_length
@@ -187,8 +189,7 @@ class ExtendedRadixCache(BasePrefixCache):
             )
         )
 
-        req.prefix_indices = torch.cat([req.prefix_indices, device_indices])
-        req.last_node = new_node
+        return device_indices, new_node
 
     def ready_to_load_host_cache(self) -> int:
         if self._connector is None or not self._load_queue:
