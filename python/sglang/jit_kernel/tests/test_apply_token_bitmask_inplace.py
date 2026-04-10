@@ -124,18 +124,17 @@ def test_with_indices(dtype):
     bm_width = (vocab_size + BITS_PER_BLOCK - 1) // BITS_PER_BLOCK
 
     logits = torch.randn(batch_size, vocab_size, dtype=dtype, device="cuda")
-    num_masks = 3
     bitmask = torch.randint(
-        -(2**31), 2**31 - 1, (num_masks, bm_width), dtype=torch.int32, device="cuda"
+        -(2**31), 2**31 - 1, (batch_size, bm_width), dtype=torch.int32, device="cuda"
     )
     indices = torch.tensor([1, 4, 7], dtype=torch.int32, device="cuda")
 
     expected = logits.clone()
-    for mask_row, batch_idx in enumerate(indices.tolist()):
+    for batch_idx in indices.tolist():
         for v in range(vocab_size):
             word = v // BITS_PER_BLOCK
             bit = v % BITS_PER_BLOCK
-            allowed = (bitmask[mask_row, word].item() >> bit) & 1
+            allowed = (bitmask[batch_idx, word].item() >> bit) & 1
             if not allowed:
                 expected[batch_idx, v] = float("-inf")
 
