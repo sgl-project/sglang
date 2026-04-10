@@ -3354,7 +3354,7 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                req.to_finish = FINISH_ABORT()
+                req.to_finish = FINISH_ABORT(status_code=HTTPStatus.BAD_REQUEST)
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
