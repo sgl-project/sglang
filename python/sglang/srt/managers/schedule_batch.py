@@ -61,7 +61,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
@@ -1861,6 +1865,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.pending_radix_mamba_slot = None
             radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
             if radix_slot is None:
+                self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
+            if radix_slot is None:
                 mask = False
             else:
                 req.pending_radix_mamba_slot = radix_slot
@@ -2215,6 +2222,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             track_indices_cpu.append(req.pending_radix_mamba_slot[0].item())
                         else:
                             radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
+                            if radix_slot is None:
+                                self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                                radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
                             if radix_slot is None:
                                 need_track = False
                             else:
