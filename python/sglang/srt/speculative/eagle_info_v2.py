@@ -253,25 +253,20 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            # Set mamba_track_indices for mamba prefix-cache state tracking
+            # Set mamba_track_indices for mamba prefix-cache state tracking.
+            # Reuse existing pending_radix_mamba_slot — the verify kernel will
+            # overwrite it, so no free+alloc needed on this hot path.
             if get_global_server_args().enable_mamba_extra_buffer():
                 track_indices = []
                 track_mask = []
                 for req in batch.reqs:
                     if req.pending_radix_mamba_slot is not None:
-                        req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
-                        req.pending_radix_mamba_slot = None
-                    radix_slot = req_to_token_pool.mamba_pool.alloc(1)
-                    if radix_slot is None:
-                        track_indices.append(0)
+                        track_indices.append(req.pending_radix_mamba_slot[0])
+                        track_mask.append(True)
+                    else:
+                        track_indices.append(torch.zeros(1, dtype=torch.int64, device=device)[0])
                         track_mask.append(False)
-                        continue
-                    req.pending_radix_mamba_slot = radix_slot
-                    track_indices.append(radix_slot[0].item())
-                    track_mask.append(True)
-                batch.mamba_track_indices = torch.tensor(
-                    track_indices, dtype=torch.int64, device=device
-                )
+                batch.mamba_track_indices = torch.stack(track_indices).to(torch.int64)
                 batch.mamba_track_mask = torch.tensor(
                     track_mask, dtype=torch.bool, device=device
                 )

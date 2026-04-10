@@ -151,26 +151,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             track_mask = []
             for req in batch.reqs:
                 if req.pending_radix_mamba_slot is not None:
-                    batch.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
-                    req.pending_radix_mamba_slot = None
-                radix_slot = batch.req_to_token_pool.mamba_pool.alloc(1)
-                if radix_slot is None:
-                    batch.tree_cache.evict(
-                        EvictParams(num_tokens=0, mamba_num=1)
-                    )
-                    radix_slot = batch.req_to_token_pool.mamba_pool.alloc(1)
-                if radix_slot is None:
-                    track_indices.append(0)
+                    track_indices.append(req.pending_radix_mamba_slot[0])
+                    track_mask.append(True)
+                else:
+                    track_indices.append(torch.zeros(1, dtype=torch.int64, device=batch.device)[0])
                     track_mask.append(False)
-                    continue
-                req.pending_radix_mamba_slot = radix_slot
-                track_indices.append(radix_slot[0].item())
-                track_mask.append(True)
-            batch.mamba_track_indices = torch.tensor(
-                track_indices,
-                dtype=torch.int64,
-                device=batch.device,
-            )
+            batch.mamba_track_indices = torch.stack(track_indices).to(torch.int64)
             batch.mamba_track_mask = torch.tensor(
                 track_mask,
                 dtype=torch.bool,
