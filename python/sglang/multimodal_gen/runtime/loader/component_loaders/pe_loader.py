@@ -5,6 +5,7 @@ import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -143,7 +144,7 @@ class PELoader(ComponentLoader):
                 attn_implementation=attn_impl,
             )
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_local_torch_device()
         model = model.to(device).eval()
 
         logger.info(

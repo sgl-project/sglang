@@ -4,7 +4,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # Image API protocol models
@@ -24,6 +24,8 @@ class ImageResponse(BaseModel):
 
 
 class ImageGenerationsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt: str
     model: Optional[str] = None
     n: Optional[int] = 1
@@ -55,8 +57,6 @@ class ImageGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
-    # Prompt enhancement (ErnieImage)
-    use_pe: Optional[bool] = None
 
 
 # Video API protocol models
