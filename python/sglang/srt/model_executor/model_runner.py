@@ -2148,6 +2148,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
             # "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
+            "flashinfer_cutedsl",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
         ]:

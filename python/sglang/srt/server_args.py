@@ -2733,6 +2733,26 @@ class ServerArgs:
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
 
+        if self.moe_runner_backend == "flashinfer_cutedsl":
+            assert self.quantization in [
+                "modelopt_fp4"
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4'."
+            assert self.ep_size in [
+                1,
+                self.tp_size,
+            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            assert self.moe_a2a_backend in [
+                "none",
+                "deepep",
+            ], (
+                f"flashinfer_cutedsl supports moe_a2a_backend='none' (standard path) "
+                f"or 'deepep' (DeepEP low-latency path), got '{self.moe_a2a_backend}'."
+            )
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert self.quantization in [
                 "modelopt_fp4",
