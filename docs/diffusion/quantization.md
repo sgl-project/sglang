@@ -81,6 +81,8 @@ sglang generate \
 - `dit_cpu_offload` and `dit_layerwise_offload` are automatically disabled for
   ModelOpt FP8 checkpoints because the runtime expects the transformed FP8
   weights to remain GPU-resident in their column-major layout.
+- To build the converted checkpoint yourself from a ModelOpt diffusers export,
+  use `python -m sglang.multimodal_gen.tools.convert_modelopt_fp8_checkpoint`.
 
 ## NVFP4
 
