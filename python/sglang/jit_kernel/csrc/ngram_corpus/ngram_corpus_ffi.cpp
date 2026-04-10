@@ -29,8 +29,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       double trie_source_prior,
       double min_trie_share,
       double match_specificity_weight,
-      double match_confidence_weight,
-      double max_per_sam_share) {
+      double match_confidence_weight) {
     ngram::Param param;
     param.enable = true;
     param.enable_router_mode = false;
@@ -45,7 +44,6 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     param.min_trie_share = min_trie_share;
     param.match_specificity_weight = match_specificity_weight;
     param.match_confidence_weight = match_confidence_weight;
-    param.max_per_sam_share = max_per_sam_share;
     ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
   }
 
@@ -164,8 +162,19 @@ void register_ngram_corpus() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<NgramCorpusObj>()
       .def(
-          refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, double, double, double,
-                     double, double>(),
+          refl::init<
+              int64_t,
+              int64_t,
+              int64_t,
+              int64_t,
+              int64_t,
+              int64_t,
+              int64_t,
+              int64_t,
+              double,
+              double,
+              double,
+              double>(),
           "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)

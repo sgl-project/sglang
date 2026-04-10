@@ -857,7 +857,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
             min_trie_share=1.0,
             match_specificity_weight=0.2,
             match_confidence_weight=0.8,
-            max_per_sam_share=0.4,
         )
         for corpus in (baseline, weighted):
             corpus.batch_put(SEED_SEQUENCES)
@@ -990,7 +989,6 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             min_trie_share=0.0,
             match_specificity_weight=1.0,
             match_confidence_weight=0.0,
-            max_per_sam_share=1.0,
         )
         loaded_token_count = corpus.load_external_corpus_named(
             "strong", [[1, 2, 3, 4, 50, 51, 52]]
@@ -1009,7 +1007,7 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         self.assertIn([4, 60], leaf_paths)
         self.assertNotIn([4, 60, 61], leaf_paths)
 
-    def test_weighted_budget_respects_per_sam_cap(self):
+    def test_weighted_budget_uses_full_sam_budget_without_cap(self):
         corpus = _make_corpus(
             "BFS",
             max_trie_depth=4,
@@ -1018,24 +1016,17 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             min_trie_share=0.0,
             match_specificity_weight=1.0,
             match_confidence_weight=0.0,
-            max_per_sam_share=0.5,
         )
         loaded_token_count = corpus.load_external_corpus_named(
             "strong", [[1, 2, 3, 4, 50, 51, 52]]
         )
         corpus.commit_external_corpus_load("strong", loaded_token_count)
-        loaded_token_count = corpus.load_external_corpus_named(
-            "weak", [[3, 4, 60, 61, 62]]
-        )
-        corpus.commit_external_corpus_load("weak", loaded_token_count)
 
         ids, masks = _batch_get(corpus, [[1, 2, 3, 4]])
         leaf_paths = corpus.leaf_paths_from_mask(
             ids.tolist(), masks.reshape(5, 5).tolist()
         )
-        self.assertIn([4, 50, 51], leaf_paths)
-        self.assertNotIn([4, 50, 51, 52], leaf_paths)
-        self.assertIn([4, 60, 61], leaf_paths)
+        self.assertIn([4, 50, 51, 52], leaf_paths)
 
     def test_weighted_budget_preserves_trie_floor(self):
         corpus = _make_corpus(
@@ -1046,7 +1037,6 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             min_trie_share=0.4,
             match_specificity_weight=1.0,
             match_confidence_weight=0.0,
-            max_per_sam_share=1.0,
             external_corpus_documents=[[1, 2, 3, 20, 21, 22, 23, 24]],
         )
         corpus.batch_put([[1, 2, 3, 10, 11, 12]])

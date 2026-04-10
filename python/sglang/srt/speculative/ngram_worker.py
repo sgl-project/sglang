@@ -60,7 +60,6 @@ class NGRAMWorker:
             min_trie_share=server_args.speculative_ngram_min_trie_share,
             match_specificity_weight=server_args.speculative_ngram_match_specificity_weight,
             match_confidence_weight=server_args.speculative_ngram_match_confidence_weight,
-            max_per_sam_share=server_args.speculative_ngram_max_per_sam_share,
         )
         if server_args.speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (

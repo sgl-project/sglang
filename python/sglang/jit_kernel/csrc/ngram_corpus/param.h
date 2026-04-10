@@ -31,7 +31,6 @@ struct Param {
   double min_trie_share = 0.0;
   double match_specificity_weight = 0.7;
   double match_confidence_weight = 0.3;
-  double max_per_sam_share = 1.0;
   std::string match_type;
 
   std::vector<size_t> batch_draft_token_num;
@@ -109,8 +108,7 @@ struct Param {
        << ", external_corpus_max_tokens = " << external_corpus_max_tokens
        << ", trie_source_prior = " << trie_source_prior << ", min_trie_share = " << min_trie_share
        << ", match_specificity_weight = " << match_specificity_weight
-       << ", match_confidence_weight = " << match_confidence_weight
-       << ", max_per_sam_share = " << max_per_sam_share << ", match_type = " << match_type;
+       << ", match_confidence_weight = " << match_confidence_weight << ", match_type = " << match_type;
     ss << ", batch_draft_token_num(" << batch_draft_token_num.size() << ") = ";
     for (int i = 0; i < batch_draft_token_num.size(); ++i) {
       ss << i << "|" << batch_draft_token_num[i] << ",";

@@ -26,7 +26,6 @@ class NgramCorpus:
         min_trie_share=0.0,
         match_specificity_weight=0.7,
         match_confidence_weight=0.3,
-        max_per_sam_share=1.0,
     ) -> None:
         cls = get_ngram_corpus_cls()
         self._obj = cls(
@@ -42,7 +41,6 @@ class NgramCorpus:
             min_trie_share=min_trie_share,
             match_specificity_weight=match_specificity_weight,
             match_confidence_weight=match_confidence_weight,
-            max_per_sam_share=max_per_sam_share,
         )
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num

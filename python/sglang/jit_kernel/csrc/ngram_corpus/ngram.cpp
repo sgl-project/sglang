@@ -1,8 +1,8 @@
 #include "ngram.h"
 
+#include "trie.h"
 #include <algorithm>
 #include <cmath>
-#include "trie.h"
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -152,11 +152,6 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   }
   if (!(param_.match_specificity_weight + param_.match_confidence_weight > 0.0)) {
     throw std::runtime_error("match quality weights must sum to a positive value");
-  }
-  if (!(param_.max_per_sam_share > 0.0 && param_.max_per_sam_share <= 1.0)) {
-    throw std::runtime_error(
-        "max_per_sam_share must be greater than 0 and less than or equal to 1, current value: " +
-        std::to_string(param_.max_per_sam_share));
   }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
@@ -323,8 +318,7 @@ Result Ngram::batchMatch(
     auto trie_quality = trie_->summarizeMatchQuality(trie_anchors, param_);
 
     if (max_total_sam_budget == 0) {
-      auto res =
-          (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
+      auto res = (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
       continue;
@@ -348,7 +342,8 @@ Result Ngram::batchMatch(
     size_t trie_budget = trie_base_budget;
     size_t flexible_budget = max_total_sam_budget;
     if (trie_quality.has_match && flexible_budget > 0) {
-      const auto trie_floor_budget = std::max(trie_base_budget, ceilShare(param_.min_trie_share, total_draft_token_num));
+      const auto trie_floor_budget =
+          std::max(trie_base_budget, ceilShare(param_.min_trie_share, total_draft_token_num));
       const auto reserved_for_trie = std::min(flexible_budget, trie_floor_budget - trie_base_budget);
       trie_budget += reserved_for_trie;
       flexible_budget -= reserved_for_trie;
@@ -360,21 +355,19 @@ Result Ngram::batchMatch(
       size_t trie_source_idx = no_source;
       if (trie_quality.has_match) {
         trie_source_idx = sources.size();
-        sources.push_back(WeightedBudgetSource{
-            computeSourceScore(trie_quality, param_.trie_source_prior, param_), flexible_budget, 0});
+        sources.push_back(
+            WeightedBudgetSource{
+                computeSourceScore(trie_quality, param_.trie_source_prior, param_), flexible_budget, 0});
       }
 
       std::vector<size_t> sam_source_indices(sam_matches.size(), no_source);
-      const auto per_sam_cap =
-          max_total_sam_budget == 0 ? size_t{0}
-                                    : std::max<size_t>(1, ceilShare(param_.max_per_sam_share, max_total_sam_budget));
       for (size_t sam_idx = 0; sam_idx < sam_matches.size(); ++sam_idx) {
         const auto score = computeSourceScore(sam_matches[sam_idx].quality, 1.0, param_);
         if (score <= 0.0) {
           continue;
         }
         sam_source_indices[sam_idx] = sources.size();
-        sources.push_back(WeightedBudgetSource{score, std::min(flexible_budget, per_sam_cap), 0});
+        sources.push_back(WeightedBudgetSource{score, flexible_budget, 0});
       }
 
       allocateLargestRemainder(flexible_budget, &sources);
@@ -396,7 +389,8 @@ Result Ngram::batchMatch(
       if (sam_match.budget == 0) {
         continue;
       }
-      auto sam_res = (sam_match.sam->*sam_anchored_build_fn)(sam_match.anchors, suffix.back(), sam_match.budget, param_);
+      auto sam_res =
+          (sam_match.sam->*sam_anchored_build_fn)(sam_match.anchors, suffix.back(), sam_match.budget, param_);
       combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
     }
 

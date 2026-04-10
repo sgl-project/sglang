@@ -527,7 +527,6 @@ class ServerArgs:
     speculative_ngram_min_trie_share: float = 0.0
     speculative_ngram_match_specificity_weight: float = 0.7
     speculative_ngram_match_confidence_weight: float = 0.3
-    speculative_ngram_max_per_sam_share: float = 1.0
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -3397,10 +3396,6 @@ class ServerArgs:
                 raise ValueError(
                     "The speculative ngram match weights must sum to a positive value."
                 )
-            if not 0 < self.speculative_ngram_max_per_sam_share <= 1:
-                raise ValueError(
-                    "--speculative-ngram-max-per-sam-share must be greater than 0 and less than or equal to 1."
-                )
             if self.speculative_ngram_external_corpus_path is not None:
                 if self.speculative_ngram_external_sam_budget <= 0:
                     raise ValueError(
@@ -5294,12 +5289,6 @@ class ServerArgs:
             type=float,
             default=ServerArgs.speculative_ngram_match_confidence_weight,
             help="Weight assigned to continuation sharpness when scoring trie and SAM importance.",
-        )
-        parser.add_argument(
-            "--speculative-ngram-max-per-sam-share",
-            type=float,
-            default=ServerArgs.speculative_ngram_max_per_sam_share,
-            help="Maximum fraction of the external SAM budget that a single SAM may receive after weighting.",
         )
 
         # Multi-layer Eagle speculative decoding

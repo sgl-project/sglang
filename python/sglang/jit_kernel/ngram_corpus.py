@@ -56,7 +56,6 @@ def get_ngram_corpus_cls():
             min_trie_share: float = 0.0,
             match_specificity_weight: float = 0.7,
             match_confidence_weight: float = 0.3,
-            max_per_sam_share: float = 1.0,
         ) -> None:
             mt = _MATCH_TYPE_MAP.get(match_type)
             if mt is None:
@@ -76,7 +75,6 @@ def get_ngram_corpus_cls():
                 min_trie_share,
                 match_specificity_weight,
                 match_confidence_weight,
-                max_per_sam_share,
             )
             self._draft_token_num = draft_token_num
 

@@ -1,5 +1,5 @@
-import os
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -449,8 +449,6 @@ class TestNgramExternalSamArgs(CustomTestCase):
                 "0.6",
                 "--speculative-ngram-match-confidence-weight",
                 "0.4",
-                "--speculative-ngram-max-per-sam-share",
-                "0.8",
             ]
         )
         self.assertEqual(
@@ -463,7 +461,6 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertEqual(server_args.speculative_ngram_min_trie_share, 0.2)
         self.assertEqual(server_args.speculative_ngram_match_specificity_weight, 0.6)
         self.assertEqual(server_args.speculative_ngram_match_confidence_weight, 0.4)
-        self.assertEqual(server_args.speculative_ngram_max_per_sam_share, 0.8)
 
     def _make_dummy_ngram_args(self, **overrides):
         args = ServerArgs(model_path="dummy")
@@ -514,13 +511,6 @@ class TestNgramExternalSamArgs(CustomTestCase):
                 speculative_ngram_trie_source_prior=-0.1,
             )._handle_speculative_decoding()
         self.assertIn("trie-source-prior", str(context.exception))
-
-    def test_max_per_sam_share_must_be_in_range(self):
-        with self.assertRaises(ValueError) as context:
-            self._make_dummy_ngram_args(
-                speculative_ngram_max_per_sam_share=1.1,
-            )._handle_speculative_decoding()
-        self.assertIn("max-per-sam-share", str(context.exception))
 
 
 if __name__ == "__main__":

@@ -84,8 +84,8 @@ class Trie {
   std::vector<std::pair<const TrieNode*, int32_t>>
   match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
 
-  MatchQuality summarizeMatchQuality(
-      const std::vector<std::pair<const TrieNode*, int32_t>>& anchors, const Param& param) const;
+  MatchQuality
+  summarizeMatchQuality(const std::vector<std::pair<const TrieNode*, int32_t>>& anchors, const Param& param) const;
 
   Result buildRecencyFromAnchors(
       const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,

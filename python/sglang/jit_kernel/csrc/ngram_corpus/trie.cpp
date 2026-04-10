@@ -215,8 +215,8 @@ Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_
   return getExpandableAnchors_(state);
 }
 
-MatchQuality Trie::summarizeMatchQuality(
-    const std::vector<std::pair<const TrieNode*, int32_t>>& anchors, const Param& param) const {
+MatchQuality
+Trie::summarizeMatchQuality(const std::vector<std::pair<const TrieNode*, int32_t>>& anchors, const Param& param) const {
   MatchQuality quality;
   if (anchors.empty()) {
     return quality;
@@ -224,8 +224,7 @@ MatchQuality Trie::summarizeMatchQuality(
 
   const auto& [best_node, best_depth] = anchors.front();
   quality.has_match = true;
-  quality.specificity =
-      std::min(1.0, static_cast<double>(best_depth) / std::max<size_t>(1, param.max_trie_depth));
+  quality.specificity = std::min(1.0, static_cast<double>(best_depth) / std::max<size_t>(1, param.max_trie_depth));
 
   const int top_k = std::max(1, static_cast<int>(param.max_bfs_breadth));
   double top_mass = 0.0;
