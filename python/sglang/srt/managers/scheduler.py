@@ -2580,8 +2580,6 @@ class Scheduler(
         new_batch.prepare_for_extend()
 
         # Record prefill stats for logging after forward.
-        # At scheduling time prefix_indices has not yet been updated to include
-        # the current chunk, so we pass extend_input_len as chunk_deduct.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
             self.running_batch.reqs,
