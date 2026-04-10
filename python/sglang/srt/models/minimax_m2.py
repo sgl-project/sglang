@@ -17,7 +17,7 @@
 
 import logging
 from contextlib import nullcontext
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import triton
@@ -770,6 +770,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
 
@@ -812,6 +813,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -820,10 +822,17 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ) -> torch.Tensor:
-        # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+                **kwargs,
+            )
         )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attn(
@@ -1007,14 +1016,15 @@ class MiniMaxM2Model(nn.Module):
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
-                    if i in self.layers_to_capture:
-                        aux_hidden_states.append(hidden_states + residual)
                     layer = self.layers[i]
                     hidden_states, residual = layer(
                         positions=positions,
                         forward_batch=forward_batch,
                         hidden_states=hidden_states,
                         residual=residual,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states if i in self.layers_to_capture else None
+                        ),
                     )
 
         if not self.pp_group.is_last_rank:
