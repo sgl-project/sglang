@@ -243,12 +243,6 @@ Result SuffixAutomaton::buildRecencyFromAnchors(
   return fillResult(last_token, draft_token_num + 1, tree, root);
 }
 
-Result SuffixAutomaton::buildRecency(
-    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
-  auto anchors = match(context, len, param.max_trie_depth);
-  return buildRecencyFromAnchors(anchors, last_token, draft_token_num, param);
-}
-
 Result SuffixAutomaton::buildFrequencyFromAnchors(
     const std::vector<SamAnchor>& anchors, int32_t last_token, size_t draft_token_num, const Param& param) const {
   struct CompareByProb {
@@ -314,12 +308,6 @@ Result SuffixAutomaton::buildFrequencyFromAnchors(
     }
   }
   return fillResult(last_token, draft_token_num + 1, tree, root);
-}
-
-Result SuffixAutomaton::buildFrequency(
-    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
-  auto anchors = match(context, len, param.max_trie_depth);
-  return buildFrequencyFromAnchors(anchors, last_token, draft_token_num, param);
 }
 
 }  // namespace ngram

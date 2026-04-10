@@ -288,18 +288,6 @@ Result Trie::buildRecencyFromAnchors(
   return fillResult(last_token, draft_token_num + 1, tree, root);
 }
 
-Result Trie::buildRecency(
-    const int32_t* context,
-    size_t len,
-    int32_t last_token,
-    size_t draft_token_num,
-    const Param& param,
-    MatchState& state,
-    size_t total_len) const {
-  auto anchors = match(context, len, state, total_len);
-  return buildRecencyFromAnchors(anchors, last_token, draft_token_num, param);
-}
-
 Result Trie::buildFrequencyFromAnchors(
     const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
     int32_t last_token,
@@ -361,18 +349,6 @@ Result Trie::buildFrequencyFromAnchors(
   }
 
   return fillResult(last_token, draft_token_num + 1, tree, root);
-}
-
-Result Trie::buildFrequency(
-    const int32_t* context,
-    size_t len,
-    int32_t last_token,
-    size_t draft_token_num,
-    const Param& param,
-    MatchState& state,
-    size_t total_len) const {
-  auto anchors = match(context, len, state, total_len);
-  return buildFrequencyFromAnchors(anchors, last_token, draft_token_num, param);
 }
 
 }  // namespace ngram

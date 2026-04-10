@@ -59,24 +59,6 @@ class Trie {
 
   void insert(const int32_t* tokens, size_t len);
 
-  Result buildRecency(
-      const int32_t* context,
-      size_t len,
-      int32_t last_token,
-      size_t draft_token_num,
-      const Param& param,
-      MatchState& state,
-      size_t total_len) const;
-
-  Result buildFrequency(
-      const int32_t* context,
-      size_t len,
-      int32_t last_token,
-      size_t draft_token_num,
-      const Param& param,
-      MatchState& state,
-      size_t total_len) const;
-
   // Stateful suffix matcher. If `state` still represents the previous step for
   // this request, infer the newly appended suffix from (`context`, `total_len`)
   // and advance anchors incrementally; otherwise rebuild the cached anchors from
