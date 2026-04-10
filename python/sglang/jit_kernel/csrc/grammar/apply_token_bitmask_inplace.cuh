@@ -81,6 +81,12 @@ __global__ void __launch_bounds__(THREADS_PER_THREAD_BLOCK) LogitsBitmaskKernel(
       continue;
     }
 
+    if (bitmask_val == kPackedMask) {
+      *reinterpret_cast<PackedT*>(logits_gmem_ptr + offset) =
+          PackedNegativeInfinity<T, PackedT>();
+      continue;
+    }
+
     *reinterpret_cast<PackedT*>(logits_reg) =
         *reinterpret_cast<PackedT*>(logits_gmem_ptr + offset);
     const T neg_inf = NegativeInfinity<T>();
