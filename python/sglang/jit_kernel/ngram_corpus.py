@@ -150,7 +150,7 @@ def get_ngram_corpus_cls():
                 return {}
             out: Dict[str, int] = {}
             for line in result.split("\n"):
-                corpus_id, token_count = line.split(",", 1)
+                corpus_id, token_count = line.split("\t", 1)
                 out[corpus_id] = int(token_count)
             return out
 
