@@ -935,6 +935,7 @@ class LTX2TransformerBlock(nn.Module):
             mask=video_self_attention_mask,
             pe=video_rotary_emb,
             all_perturbed=skip_video_self_attn,
+            gather_context_kv_for_sp=audio_replicated_for_sp,
         )
         hidden_states = hidden_states + attn_hidden_states * vgate_msa
 
