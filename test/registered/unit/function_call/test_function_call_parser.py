@@ -2276,6 +2276,39 @@ class TestGlm4MoeDetector(unittest.TestCase):
             self.assertIsInstance(result, StreamingParseResult)
             self.assertEqual(result.calls, [])
 
+    def test_whitespace_preserved_in_arg_values(self):
+        """Test that leading/trailing whitespace in arg values is not stripped."""
+        tools_with_string = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="apply_diff",
+                    description="Apply a diff",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call>apply_diff\n"
+            "<arg_key>old_string</arg_key>\n"
+            "<arg_value>    indented code</arg_value>\n"
+            "<arg_key>new_string</arg_key>\n"
+            "<arg_value>        also indented</arg_value>\n"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, tools_with_string)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["old_string"], "    indented code")
+        self.assertEqual(params["new_string"], "        also indented")
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -2551,6 +2584,39 @@ class TestGlm47MoeDetector(unittest.TestCase):
             tools_with_array,
         )
         check_single_todos(result, expected_output)
+
+    def test_whitespace_preserved_in_arg_values(self):
+        """Test that leading/trailing whitespace in arg values is not stripped."""
+        tools_with_string = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="apply_diff",
+                    description="Apply a diff",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["old_string", "new_string"],
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call>apply_diff"
+            "<arg_key>old_string</arg_key>"
+            "<arg_value>    indented code</arg_value>"
+            "<arg_key>new_string</arg_key>"
+            "<arg_value>        also indented</arg_value>"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, tools_with_string)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["old_string"], "    indented code")
+        self.assertEqual(params["new_string"], "        also indented")
 
 
 class TestJsonArrayParser(unittest.TestCase):
