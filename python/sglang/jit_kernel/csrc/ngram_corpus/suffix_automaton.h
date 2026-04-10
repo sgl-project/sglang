@@ -42,13 +42,6 @@ class SuffixAutomaton {
   int64_t tokenCount() const {
     return pos_;
   }
-
-  Result buildRecency(
-      const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
-
-  Result buildFrequency(
-      const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
-
   std::vector<SamAnchor> match(const int32_t* context, size_t len, size_t max_depth) const;
 
   MatchQuality summarizeMatchQuality(const std::vector<SamAnchor>& anchors, const Param& param) const;
