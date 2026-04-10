@@ -3,13 +3,20 @@
 Stores expert weights in multiple precisions (e.g., BF16 + INT4).
 Classifies experts per-batch based on token load, runs separate
 group-GEMMs per precision, sums outputs.
+
+Dispatch approach (following TRT-LLM reference):
+  - All groups keep full [num_experts, ...] weight tensors
+  - Per-group: zero topk_weights for non-group experts
+  - Kernel naturally skips experts with zero weights (no token-expert pairs)
+  - No weight subsetting or expert ID remapping at runtime
+  - Stable tensor shapes → CUDA graph compatible
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -38,45 +45,29 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
     return cfg
 
 
-def _subset_for_group(
+def _zero_non_group_weights(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     group_expert_ids: List[int],
     num_experts: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
-    """Remap topk_ids to local expert indices and zero non-group weights.
+) -> torch.Tensor:
+    """Zero topk_weights for experts NOT in this group.
 
-    Given global topk_ids and a list of expert IDs belonging to this group,
-    returns (local_topk_weights, local_topk_ids, num_group_experts) where:
-    - local_topk_ids maps global expert IDs → 0..len(group_expert_ids)-1
-    - local_topk_weights is zeroed for tokens not routed to this group
+    The kernel still sees all num_experts in the weight tensor, but experts
+    outside this group have zero routing weight → zero contribution to output.
     """
-    num_group_experts = len(group_expert_ids)
-
-    # Build global→local remap: non-group experts map to 0 (will be zeroed)
-    global_to_local = torch.zeros(num_experts, dtype=torch.int64, device=device)
-    for local_idx, global_idx in enumerate(group_expert_ids):
-        global_to_local[global_idx] = local_idx
-
-    local_topk_ids = global_to_local[topk_ids]
-
-    # Zero weights for tokens routed to experts outside this group
-    active_mask = torch.zeros(num_experts, dtype=torch.bool, device=device)
+    active_mask = torch.zeros(num_experts, dtype=torch.bool, device=topk_weights.device)
     active_mask[group_expert_ids] = True
     mask = active_mask[topk_ids]
-    local_topk_weights = topk_weights * mask.to(topk_weights.dtype)
-
-    return local_topk_weights, local_topk_ids, num_group_experts
+    return topk_weights * mask.to(topk_weights.dtype)
 
 
 class HeterFusedMoE(nn.Module):
     """Multi-precision MoE layer with per-batch dynamic expert assignment.
 
-    Architecture: composition with shared routing, separate weight stores.
-    Each precision group has its own weight tensors. At forward time, token
-    routing weights are masked per-group so each kernel processes only its
-    assigned experts.
+    Each precision group has its own full [num_experts, ...] weight tensors.
+    At forward time, routing weights are zeroed for non-group experts so each
+    kernel processes only its assigned experts (zero weights → skipped naturally).
     """
 
     def __init__(
@@ -108,11 +99,7 @@ class HeterFusedMoE(nn.Module):
         self._init_group_weights()
 
     def _init_group_weights(self) -> None:
-        """Create weight containers per precision group.
-
-        For BF16 groups: standard w13_weight [E, 2*I, H] + w2_weight [E, H, I]
-        For INT4 groups: packed qweights + scales (Marlin format)
-        """
+        """Create full [num_experts, ...] weight containers per precision group."""
         E = self.num_experts
         H = self.hidden_size
         I = self.intermediate_size
@@ -127,17 +114,12 @@ class HeterFusedMoE(nn.Module):
                 self._init_int4_weights(prefix, E, H, I, gcfg)
             elif num_bits == 8:
                 # DEPRECATED: Triton INT8 on A100 achieves ~6% of peak tensor core
-                # utilization due to layout constraints and missing pipelining.
-                # See: https://github.com/triton-lang/triton/issues/2818
-                #      https://github.com/triton-lang/triton/issues/1397
-                # Use num_bits=4 (Marlin) instead. Kept for forward-compat with
-                # Hopper FP8 path (future work).
+                # utilization. See: https://github.com/triton-lang/triton/issues/2818
+                # Use num_bits=4 (Marlin) instead.
                 import warnings
 
                 warnings.warn(
                     "INT8 (num_bits=8) is deprecated for HeterMoE on A100. "
-                    "Triton INT8 achieves only ~6% of peak tensor core throughput "
-                    "due to Ampere layout constraints (triton-lang/triton#2818). "
                     "Use num_bits=4 (Marlin INT4) instead.",
                     DeprecationWarning,
                     stacklevel=2,
@@ -162,7 +144,6 @@ class HeterFusedMoE(nn.Module):
         self, prefix: str, E: int, H: int, I: int, gcfg: Dict
     ) -> None:
         group_size = gcfg.get("group_size", 128)
-        # Marlin packing: 8 INT4 values per int32 → hidden_size // 8
         pack_factor = 8
         w13_qw = nn.Parameter(
             torch.empty(
@@ -212,7 +193,6 @@ class HeterFusedMoE(nn.Module):
         self.register_parameter(f"{prefix}_w2_weight_scale", w2_scale)
 
     def init_fake_weights(self, seed: int = 0) -> None:
-        """Fill all weight tensors with random data for testing."""
         gen = torch.Generator(device=self.device)
         gen.manual_seed(seed)
         for name, param in self.named_parameters():
@@ -238,17 +218,6 @@ class HeterFusedMoE(nn.Module):
         topk_ids: torch.Tensor,
         router_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass with heterogeneous precision.
-
-        Args:
-            hidden_states: [num_tokens, hidden_size]
-            topk_weights:  [num_tokens, top_k]
-            topk_ids:      [num_tokens, top_k]
-            router_logits: [num_tokens, num_experts] (needed for fused_marlin_moe)
-
-        Returns:
-            output: [num_tokens, hidden_size]
-        """
         assignment = self.policy.assign(topk_ids, self.num_experts, self.group_ratios)
 
         output = torch.zeros_like(hidden_states)
@@ -258,36 +227,40 @@ class HeterFusedMoE(nn.Module):
             if len(expert_ids_list) == 0:
                 continue
 
-            local_weights, local_ids, n_group = _subset_for_group(
+            # Zero routing weights for non-group experts; keep original topk_ids
+            group_weights = _zero_non_group_weights(
                 topk_weights,
                 topk_ids,
                 expert_ids_list,
                 self.num_experts,
-                hidden_states.device,
             )
-            eidx = torch.tensor(expert_ids_list, device=hidden_states.device)
 
             num_bits = gcfg.get("num_bits", 16)
             prefix = f"group{group_idx}"
 
             if num_bits == 16:
                 group_out = self._run_bf16_group(
-                    prefix, hidden_states, local_weights, local_ids, eidx
+                    prefix,
+                    hidden_states,
+                    group_weights,
+                    topk_ids,
                 )
             elif num_bits == 4:
                 group_out = self._run_int4_group(
                     prefix,
                     hidden_states,
-                    local_weights,
-                    local_ids,
-                    eidx,
+                    group_weights,
+                    topk_ids,
                     router_logits,
                     gcfg,
                 )
             elif num_bits == 8:
-                # DEPRECATED: see _init_group_weights for rationale
+                # DEPRECATED: see _init_group_weights
                 group_out = self._run_int8_group(
-                    prefix, hidden_states, local_weights, local_ids, eidx
+                    prefix,
+                    hidden_states,
+                    group_weights,
+                    topk_ids,
                 )
             else:
                 raise ValueError(f"Unsupported num_bits={num_bits}")
@@ -300,40 +273,29 @@ class HeterFusedMoE(nn.Module):
         self,
         prefix: str,
         hidden_states: torch.Tensor,
-        local_weights: torch.Tensor,
-        local_ids: torch.Tensor,
-        expert_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        w13 = getattr(self, f"{prefix}_w13_weight")[expert_idx]
-        w2 = getattr(self, f"{prefix}_w2_weight")[expert_idx]
-        return outplace_fused_experts(
-            hidden_states,
-            w13,
-            w2,
-            local_weights,
-            local_ids,
-        )
+        w13 = getattr(self, f"{prefix}_w13_weight")
+        w2 = getattr(self, f"{prefix}_w2_weight")
+        return outplace_fused_experts(hidden_states, w13, w2, topk_weights, topk_ids)
 
     def _run_int4_group(
         self,
         prefix: str,
         hidden_states: torch.Tensor,
-        local_weights: torch.Tensor,
-        local_ids: torch.Tensor,
-        expert_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
         router_logits: Optional[torch.Tensor],
         gcfg: Dict,
     ) -> torch.Tensor:
-        w13_qw = getattr(self, f"{prefix}_w13_qweight")[expert_idx]
-        w2_qw = getattr(self, f"{prefix}_w2_qweight")[expert_idx]
-        w13_scales = getattr(self, f"{prefix}_w13_scales")[expert_idx]
-        w2_scales = getattr(self, f"{prefix}_w2_scales")[expert_idx]
+        w13_qw = getattr(self, f"{prefix}_w13_qweight")
+        w2_qw = getattr(self, f"{prefix}_w2_qweight")
+        w13_scales = getattr(self, f"{prefix}_w13_scales")
+        w2_scales = getattr(self, f"{prefix}_w2_scales")
 
         if router_logits is None:
             raise ValueError("router_logits required for Marlin INT4 kernel")
-
-        # Marlin takes gating_output [M, num_experts] — subset to group's experts
-        local_gating = router_logits[:, expert_idx]
 
         return fused_marlin_moe(
             hidden_states=hidden_states,
@@ -341,9 +303,9 @@ class HeterFusedMoE(nn.Module):
             w2=w2_qw,
             w1_scale=w13_scales,
             w2_scale=w2_scales,
-            gating_output=local_gating,
-            topk_weights=local_weights,
-            topk_ids=local_ids,
+            gating_output=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
             num_bits=4,
             is_k_full=True,
             inplace=False,
@@ -353,20 +315,19 @@ class HeterFusedMoE(nn.Module):
         self,
         prefix: str,
         hidden_states: torch.Tensor,
-        local_weights: torch.Tensor,
-        local_ids: torch.Tensor,
-        expert_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        w13 = getattr(self, f"{prefix}_w13_weight")[expert_idx]
-        w2 = getattr(self, f"{prefix}_w2_weight")[expert_idx]
-        w13_scale = getattr(self, f"{prefix}_w13_weight_scale")[expert_idx]
-        w2_scale = getattr(self, f"{prefix}_w2_weight_scale")[expert_idx]
+        w13 = getattr(self, f"{prefix}_w13_weight")
+        w2 = getattr(self, f"{prefix}_w2_weight")
+        w13_scale = getattr(self, f"{prefix}_w13_weight_scale")
+        w2_scale = getattr(self, f"{prefix}_w2_weight_scale")
         return outplace_fused_experts(
             hidden_states,
             w13,
             w2,
-            local_weights,
-            local_ids,
+            topk_weights,
+            topk_ids,
             use_int8_w8a8=True,
             per_channel_quant=True,
             w1_scale=w13_scale,

@@ -196,64 +196,35 @@ def run_all(device):
             device,
         )
 
-        # mix{a16w4 cold, a16w16 hot}: subset weights + remap IDs per group
+        # mix{a16w4 cold, a16w16 hot}: full weight tensors, zero non-group weights
         plan = policy.assign(topk_ids, E, [COLD_RATIO, 1.0 - COLD_RATIO])
         cold_expert_list = plan.group_assignments[0]
         hot_expert_list = plan.group_assignments[1]
-
-        cold_eidx = torch.tensor(cold_expert_list, device=device)
-        hot_eidx = torch.tensor(hot_expert_list, device=device)
-
-        # Build global→local remap for each group
-        cold_g2l = torch.zeros(E, dtype=torch.long, device=device)
-        for li, gi in enumerate(cold_expert_list):
-            cold_g2l[gi] = li
-        hot_g2l = torch.zeros(E, dtype=torch.long, device=device)
-        for li, gi in enumerate(hot_expert_list):
-            hot_g2l[gi] = li
 
         cold_mask = torch.zeros(E, dtype=torch.bool, device=device)
         cold_mask[cold_expert_list] = True
         hot_mask = torch.zeros(E, dtype=torch.bool, device=device)
         hot_mask[hot_expert_list] = True
 
-        cold_local_ids = cold_g2l[topk_ids]
-        cold_local_w = topk_w * cold_mask[topk_ids].to(topk_w.dtype)
-        hot_local_ids = hot_g2l[topk_ids]
-        hot_local_w = topk_w * hot_mask[topk_ids].to(topk_w.dtype)
-
-        # Subset weights to group's experts only
-        cold_int4_w1 = int4_w1[cold_eidx]
-        cold_int4_w2 = int4_w2[cold_eidx]
-        cold_int4_s1 = int4_s1[cold_eidx]
-        cold_int4_s2 = int4_s2[cold_eidx]
-        cold_gating = gating[:, cold_eidx]
-
-        hot_bf16_w13 = bf16_w13[hot_eidx]
-        hot_bf16_w2 = bf16_w2[hot_eidx]
+        cold_w = topk_w * cold_mask[topk_ids].to(topk_w.dtype)
+        hot_w = topk_w * hot_mask[topk_ids].to(topk_w.dtype)
 
         def mix_w4_w16():
             fused_marlin_moe(
                 x,
-                cold_int4_w1,
-                cold_int4_w2,
-                cold_int4_s1,
-                cold_int4_s2,
-                cold_gating,
-                cold_local_w,
-                cold_local_ids,
+                int4_w1,
+                int4_w2,
+                int4_s1,
+                int4_s2,
+                gating,
+                cold_w,
+                topk_ids,
                 num_bits=4,
                 is_k_full=True,
             )
-            outplace_fused_experts(
-                x,
-                hot_bf16_w13,
-                hot_bf16_w2,
-                hot_local_w,
-                hot_local_ids,
-            )
+            outplace_fused_experts(x, bf16_w13, bf16_w2, hot_w, topk_ids)
 
-        lat_mix = bench(mix_w4_w16, device, use_cuda_graph=False)
+        lat_mix = bench(mix_w4_w16, device, use_cuda_graph=True)
 
         row = (M, M_global, lat_bf16, lat_int4, lat_int8, lat_mix)
         rows.append(row)
