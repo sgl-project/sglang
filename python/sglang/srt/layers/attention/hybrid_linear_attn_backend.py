@@ -218,10 +218,7 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
-        has_mamba_track_mask = bool(
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        )
+        has_mamba_track_mask = track_conv_indices is not None
 
         return ForwardMetadata(
             query_start_loc=query_start_loc,
