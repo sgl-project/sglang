@@ -189,10 +189,12 @@ class MooncakeTransferEngine:
                 device_name if device_name is not None else "",
             )
         else:
+            protocol = envs.MOONCAKE_PROTOCOL.get()
+            engine_protocol = "rdma" if protocol == "tcp" else protocol
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
-                "rdma",
+                engine_protocol,
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:
