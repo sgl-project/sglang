@@ -2205,25 +2205,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     (0,), dtype=torch.bool, device=self.device
                 )
             else:
-                track_mask_cpu = []
-                track_indices_cpu = []
-                for i, req in enumerate(self.reqs):
-                    need_track = (self.seq_lens_cpu[i].item() % mamba_track_interval == 0)
-                    if need_track:
-                        if req.pending_radix_mamba_slot is not None:
-                            track_indices_cpu.append(req.pending_radix_mamba_slot[0].item())
-                        else:
-                            need_track = False
-                    if not need_track:
-                        track_indices_cpu.append(0)
-                    track_mask_cpu.append(need_track)
-                self.mamba_track_mask = (
-                    torch.tensor(track_mask_cpu, dtype=torch.bool, pin_memory=True)
+                # Vectorized: no per-request .item() or GPU sync
+                interval_mask = (
+                    (self.seq_lens_cpu % mamba_track_interval == 0)
+                    .pin_memory()
                     .to(device=self.device, non_blocking=True)
                 )
-                self.mamba_track_indices = (
-                    torch.tensor(track_indices_cpu, dtype=torch.int64, pin_memory=True)
-                    .to(device=self.device, non_blocking=True)
+                _zero = torch.zeros(1, dtype=torch.int64, device=self.device)
+                slot_indices = torch.stack([
+                    req.pending_radix_mamba_slot.to(torch.int64)
+                    if req.pending_radix_mamba_slot is not None else _zero
+                    for req in self.reqs
+                ]).squeeze(1)
+                has_slot = torch.tensor(
+                    [req.pending_radix_mamba_slot is not None for req in self.reqs],
+                    dtype=torch.bool, pin_memory=True,
+                ).to(device=self.device, non_blocking=True)
+                self.mamba_track_mask = interval_mask & has_slot
+                self.mamba_track_indices = torch.where(
+                    self.mamba_track_mask, slot_indices, torch.zeros_like(slot_indices)
                 )
 
     def maybe_wait_verify_done(self):
