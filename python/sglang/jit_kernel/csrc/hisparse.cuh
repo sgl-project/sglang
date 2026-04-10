@@ -24,15 +24,29 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
 
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
-  const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
-  uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
-  const int total_chunks = item_size_bytes / sizeof(uint64_t);
+  // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
+  const int total_pairs = item_size_bytes / 16;  // number of 16-byte chunks
+  {
+    const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
+    uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
+    for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
+      uint64_t lo, hi;
+      const uint64_t* s = src + j * 2;
+      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
+      uint64_t* d = dst + j * 2;
+      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
+    }
+  }
 
-#pragma unroll
-  for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
+  // Tail: 64-bit for remaining 8-byte chunk (if item_size not multiple of 16)
+  const int tail_8B = (item_size_bytes - total_pairs * 16) / 8;
+  if (tail_8B > 0 && lane_id < tail_8B) {
+    const uint64_t* __restrict__ src8 =
+        reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
+    uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
     uint64_t tmp;
-    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
-    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");
+    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
+    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
   }
 }
 
@@ -53,11 +67,24 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
   return accumulator;
 }
 
+// Shared memory size calculation for dynamic allocation.
+// Layout: int32_t region (4-byte aligned) followed by int16_t region (2-byte aligned).
+template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
+struct SmemLayout {
+  static constexpr int HASH_SIZE = NUM_TOP_K * 2;
+  static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
+  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit
+  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 2;
+  // int16_t region: lru_slots_out + hash_vals
+  static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
+  static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
+};
+
 // Each block processes one request
-// req_pool_indices are int64_t (pool indices can be large), seq_lens are int32_t
+// req_pool_indices are int64_t (pool indices can be large), seq_lens can be int32_t or int64_t
 // Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
 // newest_slot is at HOT_BUFFER_SIZE (first position of extra page)
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, typename SeqLensT>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -69,7 +96,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     void* __restrict__ device_buffer_v,
     int32_t* __restrict__ top_k_device_locs,
     const int64_t* __restrict__ req_pool_indices,
-    const int32_t* __restrict__ seq_lens,
+    const SeqLensT* __restrict__ seq_lens,
     int16_t* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
     int64_t buffer_stride_0,
@@ -118,21 +145,29 @@ __global__ void load_cache_to_device_buffer_kernel(
     return;
   }
 
-  // Top-k token positions; reused as miss-token scratch in the copy phase
-  __shared__ int32_t s_top_k_tokens[NUM_TOP_K];
-  // Prefix-sum offsets for hit counting and miss counting
-  __shared__ int32_t s_chunk_offset[NUM_BUFFER_CHUNKS + 1];
-  // Prefix-sum offsets for evictable counting
-  __shared__ int32_t s_evict_chunk_offset[NUM_BUFFER_CHUNKS + 1];
-  // Compacted slot ordering: [hits fwd→  ...  ←evictables bwd]
-  __shared__ int16_t s_lru_slots_out[HOT_BUFFER_SIZE];
-  // Open-addressing hash table: top-k token_id → top-k index
-  constexpr int HASH_SIZE = NUM_TOP_K * 2;
-  __shared__ int32_t s_hash_keys[HASH_SIZE];
-  __shared__ int16_t s_hash_vals[HASH_SIZE];
+  // Dynamic shared memory layout: int32_t arrays first, then int16_t arrays.
+  extern __shared__ char smem_raw[];
+  using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
+  constexpr int HASH_SIZE = Layout::HASH_SIZE;
 
-  __shared__ int32_t s_total_hits;
-  __shared__ int32_t s_newest_hit;
+  int32_t* smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
+  // Top-k token positions; reused as miss-token scratch in the copy phase
+  int32_t* s_top_k_tokens = smem_i32;
+  // Prefix-sum offsets for hit counting and miss counting
+  int32_t* s_chunk_offset = s_top_k_tokens + NUM_TOP_K;
+  // Prefix-sum offsets for evictable counting
+  int32_t* s_evict_chunk_offset = s_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+  // Open-addressing hash table: top-k token_id → top-k index (keys)
+  int32_t* s_hash_keys = s_evict_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+  // Scalar counters
+  int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
+  int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+
+  int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
+  // Compacted slot ordering: [hits fwd→  ...  ←evictables bwd]
+  int16_t* s_lru_slots_out = smem_i16;
+  // Open-addressing hash table: top-k token_id → top-k index (values)
+  int16_t* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
 
   // Initialize shared memory: counters, hash table, prefix-sum offsets.
   if (tid == 0) {
@@ -246,20 +281,6 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  // Write back LRU order: evictables at front (LRU), hits at back (MRU).
-  {
-    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
-    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
-      if (i < total_evictable) {
-        // Evictables: source at backward end, dest at LRU front
-        req_lru_slots[i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
-      } else {
-        // Hits: source at forward end, dest at MRU back
-        req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
-      }
-    }
-  }
-
   // Reset offsets for the miss counting phase (only NUM_TOKEN_CHUNKS + 1 entries needed).
   for (int i = tid; i < NUM_TOKEN_CHUNKS + 1; i += BLOCK_SIZE) {
     s_chunk_offset[i] = 0;
@@ -316,6 +337,23 @@ __global__ void load_cache_to_device_buffer_kernel(
   __syncthreads();
 
   total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  // Write back LRU order: evictables at front (LRU), hits at back (MRU).
+  {
+    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
+    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+      if (i < total_misses) {
+        // Misses: just loaded from host, place right before hits
+        req_lru_slots[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else if (i < total_evictable) {
+        // Remaining evictables: truly stale, dest at LRU front
+        req_lru_slots[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else {
+        // Hits: source at forward end, dest at MRU back
+        req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
+      }
+    }
+  }
+
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
@@ -363,28 +401,47 @@ void load_cache_to_device_buffer(
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
-  LaunchKernel(bs, BLOCK_SIZE, device)(
-      load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA>,
-      static_cast<const int32_t*>(top_k_tokens.data_ptr()),
-      static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-      static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-      static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
-      host_cache_k.data_ptr(),
-      (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
-      device_buffer_k.data_ptr(),
-      (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
-      static_cast<int32_t*>(top_k_device_locs.data_ptr()),
-      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
-      static_cast<const int32_t*>(seq_lens.data_ptr()),
-      static_cast<int16_t*>(lru_slots.data_ptr()),
-      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-      buffer_stride_0,
-      host_stride,
-      lru_slot_stride_0,
-      top_k_tokens_stride,
-      top_k_device_locs_stride,
-      page_size,
-      item_size_bytes);
+  // Generic lambda: both int32 and int64 kernel variants are compiled;
+  // the correct one is selected at runtime based on seq_lens dtype.
+  auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr) {
+    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+    if constexpr (smem_bytes > 48u * 1024u) {
+      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    }
+    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+        kernel_fn,
+        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+        host_cache_k.data_ptr(),
+        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+        device_buffer_k.data_ptr(),
+        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+        seq_lens_ptr,
+        static_cast<int16_t*>(lru_slots.data_ptr()),
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        buffer_stride_0,
+        host_stride,
+        lru_slot_stride_0,
+        top_k_tokens_stride,
+        top_k_device_locs_stride,
+        page_size,
+        item_size_bytes);
+  };
+
+  const auto dtype = seq_lens.dtype();
+  if (dtype.code == kDLInt && dtype.bits == 64) {
+    launch(
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int64_t>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()));
+  } else {
+    launch(
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int32_t>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()));
+  }
 }
 
 }  // namespace

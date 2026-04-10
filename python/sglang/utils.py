@@ -31,6 +31,56 @@ from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
+KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
+    "hunyuan3d": "Hunyuan3D2Pipeline",
+    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
+}
+
+
+def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
+    raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
+    if not raw_value:
+        return {}
+
+    if raw_value.startswith("{"):
+        payload = json.loads(raw_value)
+    else:
+        with open(os.path.expanduser(raw_value), encoding="utf-8") as f:
+            payload = json.load(f)
+
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for source_model_id, spec in payload.items():
+        if isinstance(spec, str):
+            normalized[source_model_id] = {"overlay_repo_id": spec}
+        elif isinstance(spec, dict) and spec.get("overlay_repo_id"):
+            normalized[source_model_id] = dict(spec)
+    return normalized
+
+
+def has_diffusion_overlay_registry_match(
+    model_path: str, registry: dict[str, dict[str, Any]] | None = None
+) -> bool:
+    registry = (
+        load_diffusion_overlay_registry_from_env() if registry is None else registry
+    )
+    if model_path in registry:
+        return True
+    if not os.path.exists(model_path):
+        return False
+    base_name = os.path.basename(os.path.normpath(model_path))
+    return any(base_name == key.rsplit("/", 1)[-1] for key in registry)
+
+
+def is_known_non_diffusers_diffusion_model(model_path: str) -> bool:
+    model_path_lower = model_path.lower()
+    return any(
+        pattern in model_path_lower
+        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
+    )
+
 
 def execute_once(func):
     has_run = None

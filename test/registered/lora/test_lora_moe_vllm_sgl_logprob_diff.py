@@ -25,7 +25,7 @@ from sglang.test.lora_utils import (
 from sglang.test.runners import SRTRunner
 
 register_cuda_ci(
-    est_time=25,
+    est_time=50,
     suite="stage-b-test-1-gpu-large",
 )
 

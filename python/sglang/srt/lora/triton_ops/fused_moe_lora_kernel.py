@@ -186,7 +186,7 @@ def _fused_moe_lora_kernel(
             mask=token_mask[:, None] & (offs_k[None, :] < k_remaining),
             other=0.0,
         )
-        accumulator += tl.dot(a, b)
+        accumulator += tl.dot(a, b.to(a.dtype))
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_bk
