@@ -2212,14 +2212,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     need_track = (self.seq_lens_cpu[i].item() % mamba_track_interval == 0)
                     if need_track:
                         if req.pending_radix_mamba_slot is not None:
-                            self.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
-                            req.pending_radix_mamba_slot = None
-                        radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
-                        if radix_slot is None:
-                            need_track = False
+                            track_indices_cpu.append(req.pending_radix_mamba_slot[0].item())
                         else:
-                            req.pending_radix_mamba_slot = radix_slot
-                            track_indices_cpu.append(radix_slot[0].item())
+                            radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
+                            if radix_slot is None:
+                                need_track = False
+                            else:
+                                req.pending_radix_mamba_slot = radix_slot
+                                track_indices_cpu.append(radix_slot[0].item())
                     if not need_track:
                         track_indices_cpu.append(0)
                     track_mask_cpu.append(need_track)
