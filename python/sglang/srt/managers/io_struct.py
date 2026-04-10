@@ -1981,6 +1981,8 @@ class GetLoadsReqOutput(BaseReq):
     max_total_num_tokens: int = field(
         metadata={"metric": ("gauge", "Maximum token capacity")}
     )
+    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
+    # not just KV token usage. Rename requires API deprecation.
     token_usage: float = field(metadata={"metric": ("gauge", "Token pool usage ratio")})
     gen_throughput: float = field(
         metadata={"metric": ("gauge", "Generation throughput tokens/sec")}

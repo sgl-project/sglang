@@ -53,6 +53,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_hopper_with_cuda_12_3,
     is_mps,
+    is_musa,
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
@@ -2584,7 +2585,10 @@ class ServerArgs:
 
     def _handle_page_size(self):
         if self.page_size is None:
-            self.page_size = 1
+            if not is_musa():
+                self.page_size = 1
+            else:
+                self.page_size = 64
 
     def _handle_amd_specifics(self):
         if is_hip():

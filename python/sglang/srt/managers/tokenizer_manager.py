@@ -149,9 +149,32 @@ class ReqState:
     last_output_offset: int = 0
     last_text_offset: int = 0
 
+    # Buffer non-streaming text until the final response.
+    buffer_text: bool = False
+    text: str = ""
+    text_chunks: List[str] = dataclasses.field(default_factory=list)
+
+    def append_text(self, chunk: str):
+        if self.buffer_text:
+            self.text_chunks.append(chunk)
+        else:
+            self.text += chunk
+
+    def get_text(self) -> str:
+        if self.buffer_text:
+            return "".join(self.text_chunks)
+        return self.text
+
+    def get_crash_dump_output(self) -> Dict[Any, Any]:
+        out = {}
+        if self.text or self.text_chunks:
+            out["text"] = self.get_text()
+        if self.output_ids:
+            out["output_ids"] = self.output_ids.copy()
+        return out
+
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
-    text: str = ""
     output_ids: List[int] = dataclasses.field(default_factory=list)
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
     input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
@@ -173,6 +196,24 @@ class ReqState:
     output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
+
+
+def make_req_state(
+    out_list: List[Dict[Any, Any]],
+    finished: bool,
+    event: asyncio.Event,
+    obj: Union[GenerateReqInput, EmbeddingReqInput],
+    time_stats: APIServerReqTimeStats,
+) -> ReqState:
+    is_streaming_request = getattr(obj, "stream", False)
+    return ReqState(
+        out_list,
+        finished,
+        event,
+        obj,
+        time_stats,
+        buffer_text=not is_streaming_request,
+    )
 
 
 def _slice_streaming_output_meta_info(
@@ -1669,53 +1710,73 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
+            state.finished = recv_obj.finished_reasons[i] is not None
             if isinstance(recv_obj, BatchStrOutput):
-                state.text += recv_obj.output_strs[i]
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.incremental_streaming_output and is_stream:
-                    output_offset = state.last_output_offset
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[output_offset:]
-                    _slice_streaming_output_meta_info(meta_info, output_offset)
-                    state.last_output_offset = len(state.output_ids)
-                    output_text = state.text[state.last_text_offset :]
-                    state.last_text_offset = len(state.text)
+                incremental = (
+                    self.server_args.incremental_streaming_output and is_stream
+                )
+                output_offset = state.last_output_offset
+                state.append_text(recv_obj.output_strs[i])
+                state.output_ids.extend(recv_obj.output_ids[i])
+
+                if is_stream:
+                    if incremental:
+                        output_token_ids = state.output_ids[output_offset:]
+                        _slice_streaming_output_meta_info(meta_info, output_offset)
+                        state.last_output_offset = len(state.output_ids)
+                        text = state.get_text()
+                        output_text = text[state.last_text_offset :]
+                        state.last_text_offset = len(text)
+                    else:
+                        output_token_ids = state.output_ids.copy()
+                        output_text = state.get_text()
+                    out_dict = {
+                        "text": output_text,
+                        "output_ids": output_token_ids,
+                        "meta_info": meta_info,
+                    }
+                elif state.finished:
+                    out_dict = {
+                        "text": state.get_text(),
+                        "output_ids": state.output_ids.copy(),
+                        "meta_info": meta_info,
+                    }
                 else:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids.copy()
-                    output_text = state.text
-
-                out_dict = {
-                    "text": output_text,
-                    "output_ids": output_token_ids,
-                    "meta_info": meta_info,
-                }
-
+                    out_dict = None
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
-                if self.server_args.incremental_streaming_output and is_stream:
-                    output_offset = state.last_output_offset
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[output_offset:]
-                    _slice_streaming_output_meta_info(meta_info, output_offset)
-                    state.last_output_offset = len(state.output_ids)
-                else:
-                    state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids.copy()
+                incremental = (
+                    self.server_args.incremental_streaming_output and is_stream
+                )
+                output_offset = state.last_output_offset
+                state.output_ids.extend(recv_obj.output_ids[i])
 
-                out_dict = {
-                    "output_ids": output_token_ids,
-                    "meta_info": meta_info,
-                }
+                if is_stream:
+                    if incremental:
+                        output_token_ids = state.output_ids[output_offset:]
+                        _slice_streaming_output_meta_info(meta_info, output_offset)
+                        state.last_output_offset = len(state.output_ids)
+                    else:
+                        output_token_ids = state.output_ids.copy()
+                    out_dict = {
+                        "output_ids": output_token_ids,
+                        "meta_info": meta_info,
+                    }
+                elif state.finished:
+                    out_dict = {
+                        "output_ids": state.output_ids.copy(),
+                        "meta_info": meta_info,
+                    }
+                else:
+                    out_dict = None
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
-
-            state.finished = recv_obj.finished_reasons[i] is not None
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
@@ -1754,8 +1815,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 if self.server_args.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
-            state.out_list.append(out_dict)
-            state.event.set()
+            if out_dict is not None:
+                state.out_list.append(out_dict)
+                state.event.set()
 
             # Log metrics and dump
             if self.enable_metrics and state.obj.log_metrics:
@@ -2167,7 +2229,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 unfinished_requests.append(
                     (
                         state.obj,
-                        state.out_list[-1] if state.out_list else {},
+                        (
+                            state.out_list[-1]
+                            if state.out_list
+                            else state.get_crash_dump_output()
+                        ),
                         convert_time_to_realtime(state.time_stats.created_time),
                         convert_time_to_realtime(state.time_stats.finished_time),
                     )
@@ -2277,7 +2343,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         if is_stream:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
         out = {
-            "text": state.text,
+            "text": state.get_text(),
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
@@ -2397,7 +2463,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
         if not hasattr(obj, "is_single") or obj.is_single:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
-            state = ReqState([], False, asyncio.Event(), obj, time_stats)
+            state = make_req_state(
+                [],
+                False,
+                asyncio.Event(),
+                obj,
+                time_stats,
+            )
             self.rid_to_state[obj.rid] = state
 
             if self.server_args.enable_trace:
@@ -2413,7 +2485,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         else:
             for i in range(len(obj.rid)):
                 time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
-                state = ReqState([], False, asyncio.Event(), obj[i], time_stats)
+                state = make_req_state(
+                    [],
+                    False,
+                    asyncio.Event(),
+                    obj[i],
+                    time_stats,
+                )
                 self.rid_to_state[obj.rid[i]] = state
 
                 if self.server_args.enable_trace:
