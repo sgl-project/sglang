@@ -125,7 +125,7 @@ def apply_rotary_embedding(
     return output
 
 
-if current_platform.is_npu():
+if current_platform.is_npu() or current_platform.is_xpu():
     from .npu_fallback import apply_rotary_embedding_native
 
     apply_rotary_embedding = apply_rotary_embedding_native

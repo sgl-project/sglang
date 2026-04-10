@@ -211,13 +211,14 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
+        # For MPS, MUSA, NPU, and XPU, don't pass device_id as it doesn't support device indices
         extra_args = (
             {}
             if (
                 current_platform.is_mps()
                 or current_platform.is_musa()
                 or current_platform.is_npu()
+                or current_platform.is_xpu()
             )
             else dict(device_id=device_id)
         )
@@ -519,6 +520,9 @@ def maybe_init_distributed_environment_and_model_parallel(
     elif current_platform.is_npu():
         device = torch.device(f"npu:{local_rank}")
         torch.npu.set_device(device)
+    elif current_platform.is_xpu():
+        device = torch.device(f"xpu:{local_rank}")
+        torch.xpu.set_device(device)
 
 
 def model_parallel_is_initialized() -> bool:

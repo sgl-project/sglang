@@ -125,9 +125,10 @@ class DenoisingStage(PipelineStage):
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
         # TODO(will): hack, should use the actual one in dit
+        attn_dtype = torch.bfloat16 if current_platform.is_xpu() else torch.float16
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
-            dtype=torch.float16,
+            dtype=attn_dtype,
         )
 
         # cfg
@@ -913,10 +914,12 @@ class DenoisingStage(PipelineStage):
         if server_args.use_fsdp_inference:
             return
 
-        # Offload the unused model if it's on CUDA
+        active_device_type = get_local_torch_device().type
+
+        # Offload the inactive model before loading the next one on any accelerator.
         if (
             model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
+            and next(model_to_offload.parameters()).device.type == active_device_type
         ):
             model_to_offload.to("cpu")
 
