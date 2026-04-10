@@ -30,7 +30,6 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer, GapTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -41,7 +40,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
+RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
