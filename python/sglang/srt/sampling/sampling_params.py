@@ -68,7 +68,9 @@ class SamplingParams:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
         if stop_token_ids:
-            self.stop_token_ids = set(stop_token_ids)
+            self.stop_token_ids = {
+                token_id for token_id in stop_token_ids if token_id is not None
+            } or None
         else:
             self.stop_token_ids = None
         self.stop_regex_strs = stop_regex
@@ -144,6 +146,18 @@ class SamplingParams:
                     f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
+        if self.stop_token_ids is not None:
+            for token_id in self.stop_token_ids:
+                if not isinstance(token_id, int) or isinstance(token_id, bool):
+                    raise ValueError(
+                        f"stop_token_ids must be a list of integers, got "
+                        f"{token_id!r} of type {type(token_id).__name__}."
+                    )
+                if not 0 <= token_id < vocab_size:
+                    raise ValueError(
+                        f"stop_token_ids must be in [0, {vocab_size - 1}], got "
+                        f"{token_id}."
+                    )
         if self.logit_bias is not None:
             for token_id in self.logit_bias:
                 if not 0 <= int(token_id) < vocab_size:
