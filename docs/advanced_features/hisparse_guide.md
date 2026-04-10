@@ -73,7 +73,6 @@ python3 -m sglang.launch_server \
     --context-length 81920 \
     --chunked-prefill-size 65536 \
     --tp-size 8 --dp-size 8 --enable-dp-attention \
-    --page-size 64 \
     --mem-fraction-static 0.85 \
     --disaggregation-mode prefill \
     --disaggregation-ib-device mlx5_0,mlx5_1,mlx5_2,mlx5_3 \
@@ -89,7 +88,6 @@ python3 -m sglang.launch_server \
     --port 8000 --host 0.0.0.0 \
     --context-length 81920 \
     --tp-size 8 --dp-size 8 --enable-dp-attention \
-    --page-size 64 \
     --mem-fraction-static 0.85 \
     --kv-cache-dtype bfloat16 \
     --nsa-decode-backend flashmla_sparse \
@@ -131,3 +129,7 @@ python3 -m sglang.bench_serving \
     - `host_to_device_ratio` should be configured based on the host machine's available memory. For example:
       - **~1 TB** host memory → `host_to_device_ratio: 5`
       - **~2 TB** host memory → `host_to_device_ratio: 10`
+
+## Acknowledgments
+
+We would like to thank the SGLang team and community for the implementation and generous support, especially Zhiqiang Xie, Zhangheng Huang, Tingwei Huang, Shangming Cai, Teng Ma, and many others. We also thank the Alibaba Cloud TairKVCache team and the AntGroup SCT Inference team for their valuable contributions.
