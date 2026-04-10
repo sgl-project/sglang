@@ -1327,10 +1327,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     model_config: ModelConfig = None
     forward_mode: ForwardMode = None
     enable_overlap: bool = False
-    # Tell whether the current running batch is full so that we can skip
-    # the check of whether to prefill new requests.
-    # This is an optimization to reduce the overhead of the prefill check.
-    batch_is_full: bool = False
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
@@ -1490,6 +1486,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    def is_full(self):
+        return len(self.reqs) >= get_global_server_args().pp_max_micro_batch_size
 
     def is_dllm(self):
         return self.dllm_config is not None

@@ -28,8 +28,6 @@ class SchedulerDllmMixin:
 
     def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
         """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
-        if self.enable_priority_preemption:
-            self.running_batch.batch_is_full = False
 
         # Early exit if batch is full or no requests available
         if self._should_skip_prefill():
@@ -51,6 +49,10 @@ class SchedulerDllmMixin:
         can_run_list = adder.can_run_list
         if not can_run_list:
             return None
+
+        # A successful admission means conditions changed; clear the
+        # NO_TOKEN watermark so we re-evaluate on the next round.
+        self._available_size_at_last_no_token = -1
 
         # Record metrics and update state
         set_time_batch(can_run_list, "set_forward_entry_time")
@@ -113,20 +115,21 @@ class SchedulerDllmMixin:
 
     def _should_skip_prefill(self: Scheduler) -> bool:
         """Check if DLLM prefill should be skipped."""
-        if (
-            self.running_batch.batch_is_full or not self.waiting_queue
-        ) and self.dllm_manager.is_empty():
-            return True
+        # When DLLM manager has queued work or preemption is enabled,
+        # always enter the prefill path.
+        if not self.dllm_manager.is_empty() or self.enable_priority_preemption:
+            return False
 
-        running_bs = len(self.running_batch.reqs)
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.dllm_manager.is_empty()
-            and not self.enable_priority_preemption
+            self._available_size_at_last_no_token >= 0
+            and self._get_available_token_budget()
+            <= self._available_size_at_last_no_token
         ):
-            self.running_batch.batch_is_full = True
             return True
-
+        if not self.waiting_queue:
+            return True
+        if self.get_num_allocatable_reqs(len(self.running_batch.reqs)) <= 0:
+            return True
         return False
 
     def _create_dllm_prefill_adder(self: Scheduler, running_bs: int) -> PrefillAdder:
@@ -240,11 +243,12 @@ class SchedulerDllmMixin:
         for req in reqs:
             # Check if batch is full
             running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                self.running_batch.batch_is_full = True
+            adder_is_full = len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                running_bs
+            )
 
             # Try preemption if batch is full
-            if self.running_batch.batch_is_full:
+            if adder_is_full:
                 if (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
@@ -261,7 +265,9 @@ class SchedulerDllmMixin:
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    self.running_batch.batch_is_full = True
+                    self._available_size_at_last_no_token = (
+                        self._get_available_token_budget()
+                    )
                 break
 
         return res
