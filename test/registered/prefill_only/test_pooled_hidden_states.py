@@ -30,7 +30,6 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=240, suite="stage-b-test-1-gpu-small")
 
 _SEQCLS_MODEL = "Qwen/Qwen3-0.6B"
-_QWEN3_EOT_TOKEN_ID = 151643
 _CAUSAL_LM_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 _NUM_LABELS = 4
 
@@ -197,7 +196,7 @@ class TestPooledHiddenStatesMISEngine(CustomTestCase):
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            multi_item_scoring_delimiter=_QWEN3_EOT_TOKEN_ID,
+            enable_mis=True,
             json_model_override_args=json.dumps(
                 {
                     "architectures": ["Qwen3ForSequenceClassification"],

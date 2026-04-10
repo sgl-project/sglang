@@ -313,7 +313,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.processor = _processor
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-                self._initialize_multi_item_delimiter_text()
         else:
             self.mm_processor = self.processor = None
 
@@ -326,7 +325,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-                self._initialize_multi_item_delimiter_text()
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
@@ -1007,6 +1005,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids=token_type_ids,
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
+                multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -1033,6 +1032,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 lora_id=obj.lora_id,
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
+                multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
