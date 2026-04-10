@@ -1,11 +1,116 @@
 #include "ngram.h"
 
+#include <algorithm>
+#include <cmath>
 #include "trie.h"
 #include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace ngram {
+
+namespace {
+
+struct WeightedBudgetSource {
+  double score = 0.0;
+  size_t cap = 0;
+  size_t budget = 0;
+};
+
+double computeSourceScore(const MatchQuality& quality, double source_prior, const Param& param) {
+  if (!quality.has_match) {
+    return 0.0;
+  }
+  const double total_weight = param.match_specificity_weight + param.match_confidence_weight;
+  if (total_weight <= 0.0) {
+    return 0.0;
+  }
+  // Implemented source-importance formula:
+  //   score = source_prior * (w_specificity * specificity + w_confidence * confidence)
+  //
+  // where:
+  // - specificity is normalized match depth / matched_len for the best anchor
+  // - confidence is normalized top-1 next-token mass at that anchor
+  // - the w_* terms are normalized from the user-provided match weights below
+  const double specificity_weight = param.match_specificity_weight / total_weight;
+  const double confidence_weight = param.match_confidence_weight / total_weight;
+  return source_prior * (specificity_weight * quality.specificity + confidence_weight * quality.confidence);
+}
+
+size_t ceilShare(double share, size_t total_budget) {
+  if (share <= 0.0 || total_budget == 0) {
+    return 0;
+  }
+  return std::min(total_budget, static_cast<size_t>(std::ceil(share * static_cast<double>(total_budget) - 1e-12)));
+}
+
+void allocateLargestRemainder(size_t total_budget, std::vector<WeightedBudgetSource>* sources) {
+  size_t remaining_budget = total_budget;
+  while (remaining_budget > 0) {
+    double total_score = 0.0;
+    std::vector<size_t> active;
+    active.reserve(sources->size());
+    for (size_t i = 0; i < sources->size(); ++i) {
+      const auto& source = (*sources)[i];
+      if (source.score > 0.0 && source.budget < source.cap) {
+        active.push_back(i);
+        total_score += source.score;
+      }
+    }
+    if (active.empty() || total_score <= 0.0) {
+      break;
+    }
+
+    std::vector<std::pair<double, size_t>> remainders;
+    remainders.reserve(active.size());
+    size_t distributed = 0;
+    for (const auto idx : active) {
+      auto& source = (*sources)[idx];
+      const auto remaining_cap = source.cap - source.budget;
+      const double ideal = static_cast<double>(remaining_budget) * source.score / total_score;
+      const auto whole = std::min(remaining_cap, static_cast<size_t>(ideal));
+      source.budget += whole;
+      distributed += whole;
+      if (source.budget < source.cap) {
+        remainders.emplace_back(ideal - static_cast<double>(whole), idx);
+      }
+    }
+
+    remaining_budget -= distributed;
+    if (remaining_budget == 0 || remainders.empty()) {
+      break;
+    }
+
+    std::sort(remainders.begin(), remainders.end(), [sources](const auto& lhs, const auto& rhs) {
+      if (lhs.first != rhs.first) {
+        return lhs.first > rhs.first;
+      }
+      if ((*sources)[lhs.second].score != (*sources)[rhs.second].score) {
+        return (*sources)[lhs.second].score > (*sources)[rhs.second].score;
+      }
+      return lhs.second < rhs.second;
+    });
+
+    size_t assigned = 0;
+    for (const auto& [_, idx] : remainders) {
+      if (remaining_budget == 0) {
+        break;
+      }
+      auto& source = (*sources)[idx];
+      if (source.budget >= source.cap) {
+        continue;
+      }
+      ++source.budget;
+      --remaining_budget;
+      ++assigned;
+    }
+    if (assigned == 0) {
+      break;
+    }
+  }
+}
+
+}  // namespace
 
 Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.max_trie_depth > 1)) {
@@ -25,6 +130,33 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.draft_token_num > 0)) {
     throw std::runtime_error(
         "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
+  }
+  if (param_.trie_source_prior < 0.0) {
+    throw std::runtime_error(
+        "trie_source_prior must be greater than or equal to 0, current value: " +
+        std::to_string(param_.trie_source_prior));
+  }
+  if (!(param_.min_trie_share >= 0.0 && param_.min_trie_share <= 1.0)) {
+    throw std::runtime_error(
+        "min_trie_share must be between 0 and 1, current value: " + std::to_string(param_.min_trie_share));
+  }
+  if (param_.match_specificity_weight < 0.0) {
+    throw std::runtime_error(
+        "match_specificity_weight must be greater than or equal to 0, current value: " +
+        std::to_string(param_.match_specificity_weight));
+  }
+  if (param_.match_confidence_weight < 0.0) {
+    throw std::runtime_error(
+        "match_confidence_weight must be greater than or equal to 0, current value: " +
+        std::to_string(param_.match_confidence_weight));
+  }
+  if (!(param_.match_specificity_weight + param_.match_confidence_weight > 0.0)) {
+    throw std::runtime_error("match quality weights must sum to a positive value");
+  }
+  if (!(param_.max_per_sam_share > 0.0 && param_.max_per_sam_share <= 1.0)) {
+    throw std::runtime_error(
+        "max_per_sam_share must be greater than 0 and less than or equal to 1, current value: " +
+        std::to_string(param_.max_per_sam_share));
   }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
@@ -149,17 +281,18 @@ Result Ngram::batchMatch(
 
   std::unique_lock<std::mutex> lock(mutex_);
 
-  using TrieResultBuildFn =
-      Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
-  using SamResultBuildFn = Result (SuffixAutomaton::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
-  TrieResultBuildFn trie_result_build_fn;
-  SamResultBuildFn sam_result_build_fn;
+  using TrieAnchoredBuildFn =
+      Result (Trie::*)(const std::vector<std::pair<const TrieNode*, int32_t>>&, int32_t, size_t, const Param&) const;
+  using SamAnchoredBuildFn =
+      Result (SuffixAutomaton::*)(const std::vector<SamAnchor>&, int32_t, size_t, const Param&) const;
+  TrieAnchoredBuildFn trie_anchored_build_fn;
+  SamAnchoredBuildFn sam_anchored_build_fn;
   if (param_.match_type == "BFS") {
-    trie_result_build_fn = &Trie::buildRecency;
-    sam_result_build_fn = &SuffixAutomaton::buildRecency;
+    trie_anchored_build_fn = &Trie::buildRecencyFromAnchors;
+    sam_anchored_build_fn = &SuffixAutomaton::buildRecencyFromAnchors;
   } else if (param_.match_type == "PROB") {
-    trie_result_build_fn = &Trie::buildFrequency;
-    sam_result_build_fn = &SuffixAutomaton::buildFrequency;
+    trie_anchored_build_fn = &Trie::buildFrequencyFromAnchors;
+    sam_anchored_build_fn = &SuffixAutomaton::buildFrequencyFromAnchors;
   } else {
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
@@ -167,10 +300,16 @@ Result Ngram::batchMatch(
   // All budget values are loop-invariant (mutex_ held, sams_ won't change).
   const size_t num_sams = sams_.size();
   const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
-  const size_t total_sam_budget =
+  const size_t max_total_sam_budget =
       num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
-  const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};
-  const size_t trie_budget = total_draft_token_num - (per_sam_budget * num_sams);
+  const size_t trie_base_budget = total_draft_token_num - max_total_sam_budget;
+  std::vector<std::pair<std::string, const SuffixAutomaton*>> ordered_sams;
+  ordered_sams.reserve(sams_.size());
+  for (const auto& [corpus_id, sam] : sams_) {
+    ordered_sams.emplace_back(corpus_id, sam.get());
+  }
+  std::sort(
+      ordered_sams.begin(), ordered_sams.end(), [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
 
   Result merged;
   for (size_t i = 0; i < state_ids.size(); ++i) {
@@ -180,21 +319,84 @@ Result Ngram::batchMatch(
     }
 
     auto& state = match_state_[state_ids[i]];
+    auto trie_anchors = trie_->match(suffix.data(), suffix.size(), state, total_lens[i]);
+    auto trie_quality = trie_->summarizeMatchQuality(trie_anchors, param_);
 
-    if (total_sam_budget == 0 || per_sam_budget == 0) {
-      auto res = (trie_.get()->*trie_result_build_fn)(
-          suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
+    if (max_total_sam_budget == 0) {
+      auto res =
+          (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), total_draft_token_num, param_);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
       merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
       continue;
     }
 
-    auto combined = (trie_.get()->*trie_result_build_fn)(
-        suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
+    struct SamMatchView {
+      const SuffixAutomaton* sam = nullptr;
+      std::vector<SamAnchor> anchors;
+      MatchQuality quality;
+      size_t budget = 0;
+    };
 
-    for (const auto& [_, sam] : sams_) {
-      auto sam_res =
-          (sam.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
+    std::vector<SamMatchView> sam_matches;
+    sam_matches.reserve(ordered_sams.size());
+    for (const auto& [_, sam] : ordered_sams) {
+      auto anchors = sam->match(suffix.data(), suffix.size(), param_.max_trie_depth);
+      auto quality = sam->summarizeMatchQuality(anchors, param_);
+      sam_matches.push_back(SamMatchView{sam, std::move(anchors), quality, 0});
+    }
+
+    size_t trie_budget = trie_base_budget;
+    size_t flexible_budget = max_total_sam_budget;
+    if (trie_quality.has_match && flexible_budget > 0) {
+      const auto trie_floor_budget = std::max(trie_base_budget, ceilShare(param_.min_trie_share, total_draft_token_num));
+      const auto reserved_for_trie = std::min(flexible_budget, trie_floor_budget - trie_base_budget);
+      trie_budget += reserved_for_trie;
+      flexible_budget -= reserved_for_trie;
+    }
+
+    if (flexible_budget > 0) {
+      std::vector<WeightedBudgetSource> sources;
+      const auto no_source = std::numeric_limits<size_t>::max();
+      size_t trie_source_idx = no_source;
+      if (trie_quality.has_match) {
+        trie_source_idx = sources.size();
+        sources.push_back(WeightedBudgetSource{
+            computeSourceScore(trie_quality, param_.trie_source_prior, param_), flexible_budget, 0});
+      }
+
+      std::vector<size_t> sam_source_indices(sam_matches.size(), no_source);
+      const auto per_sam_cap =
+          max_total_sam_budget == 0 ? size_t{0}
+                                    : std::max<size_t>(1, ceilShare(param_.max_per_sam_share, max_total_sam_budget));
+      for (size_t sam_idx = 0; sam_idx < sam_matches.size(); ++sam_idx) {
+        const auto score = computeSourceScore(sam_matches[sam_idx].quality, 1.0, param_);
+        if (score <= 0.0) {
+          continue;
+        }
+        sam_source_indices[sam_idx] = sources.size();
+        sources.push_back(WeightedBudgetSource{score, std::min(flexible_budget, per_sam_cap), 0});
+      }
+
+      allocateLargestRemainder(flexible_budget, &sources);
+
+      if (trie_source_idx != no_source) {
+        trie_budget += sources[trie_source_idx].budget;
+      }
+      for (size_t sam_idx = 0; sam_idx < sam_matches.size(); ++sam_idx) {
+        const auto source_idx = sam_source_indices[sam_idx];
+        if (source_idx != no_source) {
+          sam_matches[sam_idx].budget = sources[source_idx].budget;
+        }
+      }
+    }
+
+    auto combined = (trie_.get()->*trie_anchored_build_fn)(trie_anchors, suffix.back(), trie_budget, param_);
+
+    for (const auto& sam_match : sam_matches) {
+      if (sam_match.budget == 0) {
+        continue;
+      }
+      auto sam_res = (sam_match.sam->*sam_anchored_build_fn)(sam_match.anchors, suffix.back(), sam_match.budget, param_);
       combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
     }
 

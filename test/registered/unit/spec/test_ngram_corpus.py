@@ -849,6 +849,26 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         ids, _ = _batch_get(corpus, [[1, 2, 3]])
         self.assertEqual(ids.tolist(), [3, 20])
 
+    def test_no_sam_behavior_ignores_weight_knobs(self):
+        baseline = _make_corpus("BFS")
+        weighted = _make_corpus(
+            "BFS",
+            trie_source_prior=3.0,
+            min_trie_share=1.0,
+            match_specificity_weight=0.2,
+            match_confidence_weight=0.8,
+            max_per_sam_share=0.4,
+        )
+        for corpus in (baseline, weighted):
+            corpus.batch_put(SEED_SEQUENCES)
+            corpus.synchronize()
+
+        baseline_ids, baseline_masks = _batch_get(baseline, QUERY_SEQUENCES)
+        weighted_ids, weighted_masks = _batch_get(weighted, QUERY_SEQUENCES)
+
+        np.testing.assert_array_equal(baseline_ids, weighted_ids)
+        np.testing.assert_array_equal(baseline_masks, weighted_masks)
+
 
 class TestNgramCorpusMatchBenchmark(CustomTestCase):
     """Benchmark incremental advance vs full rebuild in match()."""
@@ -960,6 +980,84 @@ class TestNgramCorpusMultiSam(CustomTestCase):
         # Both SAMs should contribute candidates
         self.assertIn([3, 10, 11], leaf_paths)
         self.assertIn([3, 20, 21], leaf_paths)
+
+    def test_weighted_budget_favors_more_specific_sam(self):
+        corpus = _make_corpus(
+            "BFS",
+            max_trie_depth=4,
+            draft_token_num=5,
+            external_sam_budget=4,
+            min_trie_share=0.0,
+            match_specificity_weight=1.0,
+            match_confidence_weight=0.0,
+            max_per_sam_share=1.0,
+        )
+        loaded_token_count = corpus.load_external_corpus_named(
+            "strong", [[1, 2, 3, 4, 50, 51, 52]]
+        )
+        corpus.commit_external_corpus_load("strong", loaded_token_count)
+        loaded_token_count = corpus.load_external_corpus_named(
+            "weak", [[3, 4, 60, 61, 62]]
+        )
+        corpus.commit_external_corpus_load("weak", loaded_token_count)
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3, 4]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(5, 5).tolist()
+        )
+        self.assertIn([4, 50, 51, 52], leaf_paths)
+        self.assertIn([4, 60], leaf_paths)
+        self.assertNotIn([4, 60, 61], leaf_paths)
+
+    def test_weighted_budget_respects_per_sam_cap(self):
+        corpus = _make_corpus(
+            "BFS",
+            max_trie_depth=4,
+            draft_token_num=5,
+            external_sam_budget=4,
+            min_trie_share=0.0,
+            match_specificity_weight=1.0,
+            match_confidence_weight=0.0,
+            max_per_sam_share=0.5,
+        )
+        loaded_token_count = corpus.load_external_corpus_named(
+            "strong", [[1, 2, 3, 4, 50, 51, 52]]
+        )
+        corpus.commit_external_corpus_load("strong", loaded_token_count)
+        loaded_token_count = corpus.load_external_corpus_named(
+            "weak", [[3, 4, 60, 61, 62]]
+        )
+        corpus.commit_external_corpus_load("weak", loaded_token_count)
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3, 4]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(5, 5).tolist()
+        )
+        self.assertIn([4, 50, 51], leaf_paths)
+        self.assertNotIn([4, 50, 51, 52], leaf_paths)
+        self.assertIn([4, 60, 61], leaf_paths)
+
+    def test_weighted_budget_preserves_trie_floor(self):
+        corpus = _make_corpus(
+            "BFS",
+            draft_token_num=6,
+            external_sam_budget=5,
+            trie_source_prior=0.0,
+            min_trie_share=0.4,
+            match_specificity_weight=1.0,
+            match_confidence_weight=0.0,
+            max_per_sam_share=1.0,
+            external_corpus_documents=[[1, 2, 3, 20, 21, 22, 23, 24]],
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11, 12]])
+        corpus.synchronize()
+
+        ids, masks = _batch_get(corpus, [[1, 2, 3]])
+        leaf_paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(6, 6).tolist()
+        )
+        self.assertIn([3, 10, 11], leaf_paths)
+        self.assertIn([3, 20, 21, 22], leaf_paths)
 
     def test_remove_reduces_candidates(self):
         corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)

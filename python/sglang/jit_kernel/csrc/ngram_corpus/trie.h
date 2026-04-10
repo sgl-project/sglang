@@ -77,17 +77,33 @@ class Trie {
       MatchState& state,
       size_t total_len) const;
 
-  void squeeze(size_t count);
-
-  void reset();
-
- private:
   // Stateful suffix matcher. If `state` still represents the previous step for
   // this request, infer the newly appended suffix from (`context`, `total_len`)
   // and advance anchors incrementally; otherwise rebuild the cached anchors from
   // `context`. Returns only the suffix matches that are currently expandable.
   std::vector<std::pair<const TrieNode*, int32_t>>
   match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
+
+  MatchQuality summarizeMatchQuality(
+      const std::vector<std::pair<const TrieNode*, int32_t>>& anchors, const Param& param) const;
+
+  Result buildRecencyFromAnchors(
+      const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
+      int32_t last_token,
+      size_t draft_token_num,
+      const Param& param) const;
+
+  Result buildFrequencyFromAnchors(
+      const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
+      int32_t last_token,
+      size_t draft_token_num,
+      const Param& param) const;
+
+  void squeeze(size_t count);
+
+  void reset();
+
+ private:
   // Recompute all cached anchors from the current tail. After this, for every
   // d in [1, min(len, max_trie_depth)], anchors[d - 1] represents the suffix of
   // length d ending at context[len - 1].

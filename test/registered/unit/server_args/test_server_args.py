@@ -1,3 +1,4 @@
+import os
 import json
 import tempfile
 import unittest
@@ -440,6 +441,16 @@ class TestNgramExternalSamArgs(CustomTestCase):
                 "4",
                 "--speculative-ngram-external-corpus-max-tokens",
                 "128",
+                "--speculative-ngram-trie-source-prior",
+                "1.5",
+                "--speculative-ngram-min-trie-share",
+                "0.2",
+                "--speculative-ngram-match-specificity-weight",
+                "0.6",
+                "--speculative-ngram-match-confidence-weight",
+                "0.4",
+                "--speculative-ngram-max-per-sam-share",
+                "0.8",
             ]
         )
         self.assertEqual(
@@ -448,6 +459,11 @@ class TestNgramExternalSamArgs(CustomTestCase):
         )
         self.assertEqual(server_args.speculative_ngram_external_sam_budget, 4)
         self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
+        self.assertEqual(server_args.speculative_ngram_trie_source_prior, 1.5)
+        self.assertEqual(server_args.speculative_ngram_min_trie_share, 0.2)
+        self.assertEqual(server_args.speculative_ngram_match_specificity_weight, 0.6)
+        self.assertEqual(server_args.speculative_ngram_match_confidence_weight, 0.4)
+        self.assertEqual(server_args.speculative_ngram_max_per_sam_share, 0.8)
 
     def _make_dummy_ngram_args(self, **overrides):
         args = ServerArgs(model_path="dummy")
@@ -468,13 +484,43 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
 
     def test_external_corpus_max_tokens_must_be_positive(self):
+        with patch.dict(os.environ, {"FLASHINFER_DISABLE_VERSION_CHECK": "1"}):
+            with self.assertRaises(ValueError) as context:
+                self._make_dummy_ngram_args(
+                    speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+                    speculative_ngram_external_sam_budget=2,
+                    speculative_ngram_external_corpus_max_tokens=0,
+                )._handle_speculative_decoding()
+        self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+    def test_min_trie_share_must_be_between_zero_and_one(self):
         with self.assertRaises(ValueError) as context:
             self._make_dummy_ngram_args(
-                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
-                speculative_ngram_external_sam_budget=2,
-                speculative_ngram_external_corpus_max_tokens=0,
+                speculative_ngram_min_trie_share=1.1,
             )._handle_speculative_decoding()
-        self.assertIn("external-corpus-max-tokens", str(context.exception))
+        self.assertIn("min-trie-share", str(context.exception))
+
+    def test_match_weights_must_sum_positive(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_match_specificity_weight=0.0,
+                speculative_ngram_match_confidence_weight=0.0,
+            )._handle_speculative_decoding()
+        self.assertIn("match weights", str(context.exception))
+
+    def test_trie_source_prior_must_be_non_negative(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_trie_source_prior=-0.1,
+            )._handle_speculative_decoding()
+        self.assertIn("trie-source-prior", str(context.exception))
+
+    def test_max_per_sam_share_must_be_in_range(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_max_per_sam_share=1.1,
+            )._handle_speculative_decoding()
+        self.assertIn("max-per-sam-share", str(context.exception))
 
 
 if __name__ == "__main__":

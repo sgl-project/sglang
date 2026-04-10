@@ -215,15 +215,43 @@ Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_
   return getExpandableAnchors_(state);
 }
 
-Result Trie::buildRecency(
-    const int32_t* context,
-    size_t len,
+MatchQuality Trie::summarizeMatchQuality(
+    const std::vector<std::pair<const TrieNode*, int32_t>>& anchors, const Param& param) const {
+  MatchQuality quality;
+  if (anchors.empty()) {
+    return quality;
+  }
+
+  const auto& [best_node, best_depth] = anchors.front();
+  quality.has_match = true;
+  quality.specificity =
+      std::min(1.0, static_cast<double>(best_depth) / std::max<size_t>(1, param.max_trie_depth));
+
+  const int top_k = std::max(1, static_cast<int>(param.max_bfs_breadth));
+  double top_mass = 0.0;
+  double total_mass = 0.0;
+  int count = 0;
+  for (auto* child : best_node->sorted_children) {
+    const auto mass = static_cast<double>(child->freq);
+    if (count == 0) {
+      top_mass = mass;
+    }
+    total_mass += mass;
+    if (++count >= top_k) {
+      break;
+    }
+  }
+  if (total_mass > 0.0) {
+    quality.confidence = top_mass / total_mass;
+  }
+  return quality;
+}
+
+Result Trie::buildRecencyFromAnchors(
+    const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
     int32_t last_token,
     size_t draft_token_num,
-    const Param& param,
-    MatchState& state,
-    size_t total_len) const {
-  auto anchors = match(context, len, state, total_len);
+    const Param& param) const {
   const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
   double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
 
@@ -261,7 +289,7 @@ Result Trie::buildRecency(
   return fillResult(last_token, draft_token_num + 1, tree, root);
 }
 
-Result Trie::buildFrequency(
+Result Trie::buildRecency(
     const int32_t* context,
     size_t len,
     int32_t last_token,
@@ -270,6 +298,14 @@ Result Trie::buildFrequency(
     MatchState& state,
     size_t total_len) const {
   auto anchors = match(context, len, state, total_len);
+  return buildRecencyFromAnchors(anchors, last_token, draft_token_num, param);
+}
+
+Result Trie::buildFrequencyFromAnchors(
+    const std::vector<std::pair<const TrieNode*, int32_t>>& anchors,
+    int32_t last_token,
+    size_t draft_token_num,
+    const Param& param) const {
   struct CompareByLastDouble {
     bool operator()(
         const std::tuple<double, const TrieNode*, double>& a,
@@ -326,6 +362,18 @@ Result Trie::buildFrequency(
   }
 
   return fillResult(last_token, draft_token_num + 1, tree, root);
+}
+
+Result Trie::buildFrequency(
+    const int32_t* context,
+    size_t len,
+    int32_t last_token,
+    size_t draft_token_num,
+    const Param& param,
+    MatchState& state,
+    size_t total_len) const {
+  auto anchors = match(context, len, state, total_len);
+  return buildFrequencyFromAnchors(anchors, last_token, draft_token_num, param);
 }
 
 }  // namespace ngram

@@ -523,6 +523,11 @@ class ServerArgs:
     speculative_ngram_external_corpus_path: Optional[str] = None
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
+    speculative_ngram_trie_source_prior: float = 0.0
+    speculative_ngram_min_trie_share: float = 0.0
+    speculative_ngram_match_specificity_weight: float = 0.7
+    speculative_ngram_match_confidence_weight: float = 0.3
+    speculative_ngram_max_per_sam_share: float = 1.0
     enable_multi_layer_eagle: bool = False
 
     # Expert parallelism
@@ -3368,6 +3373,34 @@ class ServerArgs:
                     "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
                     "You can override this by explicitly setting --speculative-num-draft-tokens."
                 )
+            if self.speculative_ngram_trie_source_prior < 0:
+                raise ValueError(
+                    "--speculative-ngram-trie-source-prior must be greater than or equal to 0."
+                )
+            if not 0 <= self.speculative_ngram_min_trie_share <= 1:
+                raise ValueError(
+                    "--speculative-ngram-min-trie-share must be between 0 and 1."
+                )
+            if self.speculative_ngram_match_specificity_weight < 0:
+                raise ValueError(
+                    "--speculative-ngram-match-specificity-weight must be greater than or equal to 0."
+                )
+            if self.speculative_ngram_match_confidence_weight < 0:
+                raise ValueError(
+                    "--speculative-ngram-match-confidence-weight must be greater than or equal to 0."
+                )
+            if (
+                self.speculative_ngram_match_specificity_weight
+                + self.speculative_ngram_match_confidence_weight
+                <= 0
+            ):
+                raise ValueError(
+                    "The speculative ngram match weights must sum to a positive value."
+                )
+            if not 0 < self.speculative_ngram_max_per_sam_share <= 1:
+                raise ValueError(
+                    "--speculative-ngram-max-per-sam-share must be greater than 0 and less than or equal to 1."
+                )
             if self.speculative_ngram_external_corpus_path is not None:
                 if self.speculative_ngram_external_sam_budget <= 0:
                     raise ValueError(
@@ -5237,6 +5270,36 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
             help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-trie-source-prior",
+            type=float,
+            default=ServerArgs.speculative_ngram_trie_source_prior,
+            help="Relative prior for the live trie when weighting trie and external SAM draft budget.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-min-trie-share",
+            type=float,
+            default=ServerArgs.speculative_ngram_min_trie_share,
+            help="Minimum fraction of the draft budget reserved for trie when it has an expandable continuation.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-match-specificity-weight",
+            type=float,
+            default=ServerArgs.speculative_ngram_match_specificity_weight,
+            help="Weight assigned to suffix-match specificity when scoring trie and SAM importance.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-match-confidence-weight",
+            type=float,
+            default=ServerArgs.speculative_ngram_match_confidence_weight,
+            help="Weight assigned to continuation sharpness when scoring trie and SAM importance.",
+        )
+        parser.add_argument(
+            "--speculative-ngram-max-per-sam-share",
+            type=float,
+            default=ServerArgs.speculative_ngram_max_per_sam_share,
+            help="Maximum fraction of the external SAM budget that a single SAM may receive after weighting.",
         )
 
         # Multi-layer Eagle speculative decoding

@@ -176,9 +176,40 @@ std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len
   return anchors;
 }
 
-Result SuffixAutomaton::buildRecency(
-    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
-  auto anchors = match(context, len, param.max_trie_depth);
+MatchQuality SuffixAutomaton::summarizeMatchQuality(const std::vector<SamAnchor>& anchors, const Param& param) const {
+  MatchQuality quality;
+  if (anchors.empty()) {
+    return quality;
+  }
+
+  const auto& best_anchor = anchors.front();
+  quality.has_match = true;
+  quality.specificity =
+      std::min(1.0, static_cast<double>(best_anchor.matched_len) / std::max<size_t>(1, param.max_trie_depth));
+
+  const auto& children = states_[best_anchor.state].children_by_freq;
+  const int top_k = std::max(1, static_cast<int>(param.max_bfs_breadth));
+  double top_mass = 0.0;
+  double total_mass = 0.0;
+  int count = 0;
+  for (const auto& [_, child_state] : children) {
+    const auto mass = static_cast<double>(states_[child_state].occ_count);
+    if (count == 0) {
+      top_mass = mass;
+    }
+    total_mass += mass;
+    if (++count >= top_k) {
+      break;
+    }
+  }
+  if (total_mass > 0.0) {
+    quality.confidence = top_mass / total_mass;
+  }
+  return quality;
+}
+
+Result SuffixAutomaton::buildRecencyFromAnchors(
+    const std::vector<SamAnchor>& anchors, int32_t last_token, size_t draft_token_num, const Param& param) const {
   const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
   const double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
   std::vector<Node> tree(draft_token_num + 1);
@@ -212,9 +243,14 @@ Result SuffixAutomaton::buildRecency(
   return fillResult(last_token, draft_token_num + 1, tree, root);
 }
 
-Result SuffixAutomaton::buildFrequency(
+Result SuffixAutomaton::buildRecency(
     const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
   auto anchors = match(context, len, param.max_trie_depth);
+  return buildRecencyFromAnchors(anchors, last_token, draft_token_num, param);
+}
+
+Result SuffixAutomaton::buildFrequencyFromAnchors(
+    const std::vector<SamAnchor>& anchors, int32_t last_token, size_t draft_token_num, const Param& param) const {
   struct CompareByProb {
     bool operator()(
         const std::tuple<int, int32_t, int, double>& lhs, const std::tuple<int, int32_t, int, double>& rhs) const {
@@ -278,6 +314,12 @@ Result SuffixAutomaton::buildFrequency(
     }
   }
   return fillResult(last_token, draft_token_num + 1, tree, root);
+}
+
+Result SuffixAutomaton::buildFrequency(
+    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
+  auto anchors = match(context, len, param.max_trie_depth);
+  return buildFrequencyFromAnchors(anchors, last_token, draft_token_num, param);
 }
 
 }  // namespace ngram
