@@ -186,7 +186,7 @@ def test_large_vocab(dtype):
 
 def test_all_allowed():
     logits = torch.randn(64, dtype=torch.float32, device="cuda")
-    bitmask = torch.full((2,), 0xFFFFFFFF, dtype=torch.int32, device="cuda")
+    bitmask = torch.full((2,), -1, dtype=torch.int32, device="cuda")
     expected = logits.clone()
     apply_token_bitmask_inplace_jit(logits, bitmask)
     torch.cuda.synchronize()
