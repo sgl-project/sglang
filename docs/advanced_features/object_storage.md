@@ -84,6 +84,7 @@ python -m sglang.launch_server \
 | `concurrency` | int | Number of concurrent download streams. Higher values can improve throughput for large models. | 4 |
 | `memory_limit` | int | Memory limit (in bytes) for the streaming buffer. | System-dependent |
 
+With `distributed` streaming, SGLang clones each weight tensor from the Run:AI iterator so loaders never retain views into reused internal buffers.
 
 ## Performance Considerations
 
