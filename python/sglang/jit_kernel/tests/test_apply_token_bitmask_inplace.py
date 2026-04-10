@@ -25,7 +25,7 @@ def _reference_apply(logits, bitmask, indices=None):
     rows = list(range(batch)) if indices is None else indices.tolist()
     out = logits.clone()
     for row_idx, batch_idx in enumerate(rows):
-        bm_row = row_idx if indices is None else row_idx
+        bm_row = row_idx
         for v in range(min(vocab, bm_cols * BITS_PER_BLOCK)):
             word = v // BITS_PER_BLOCK
             bit = v % BITS_PER_BLOCK

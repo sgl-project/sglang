@@ -46,25 +46,19 @@ def apply_token_bitmask_inplace_jit(
             rows to apply the mask to. If None, bitmask rows map 1:1 to
             logits rows.
     """
-    if isinstance(indices, list):
-        indices = torch.tensor(indices, dtype=torch.int32, device=logits.device)
     if indices is not None:
-        indices = indices.to(dtype=torch.int32, device=logits.device)
+        if isinstance(indices, list):
+            indices = torch.tensor(indices, dtype=torch.int32, device=logits.device)
+        else:
+            indices = indices.to(dtype=torch.int32, device=logits.device)
 
-    logits_shape = (
-        (logits.size(0), logits.size(1)) if logits.dim() == 2 else (1, logits.size(0))
-    )
-    bitmask_shape = (
-        (bitmask.size(0), bitmask.size(1))
-        if bitmask.dim() == 2
-        else (1, bitmask.size(0))
-    )
+    num_logits_rows = logits.size(0) if logits.dim() == 2 else 1
 
     use_indices = indices is not None and indices.numel() > 0
     if use_indices:
         num_rows = indices.size(0)
     else:
-        num_rows = logits_shape[0]
+        num_rows = num_logits_rows
 
     dummy_indices = torch.empty(0, dtype=torch.int32, device=logits.device)
     indices_tensor = indices if use_indices else dummy_indices
