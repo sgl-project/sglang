@@ -827,7 +827,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         self._lora_runner = MoeRunner(
             runner_backend,
-            runner_backend,
             base_layer.moe_runner_config,
             lora_enabled=True,
         )
