@@ -51,24 +51,18 @@ def _reroute_for_group(
     group_expert_ids: List[int],
     num_experts: int,
 ) -> tuple:
-    """Reroute tokens so only this group's experts appear in topk_ids.
+    """Reroute tokens so only this group's experts remain in topk_ids.
 
-    Non-group expert slots are remapped to group_expert_ids[0] with zero weight,
-    so moe_align_block_size assigns zero blocks to non-group experts and the
-    kernel truly skips them (no GEMM tiles launched for empty experts).
+    Non-group expert slots set to -1 with zero weight. moe_align_block_size
+    treats -1 as filtered (same as EP non-local experts), so those pairs
+    get zero blocks and the kernel skips them entirely.
     """
     device = topk_weights.device
     active_mask = torch.zeros(num_experts, dtype=torch.bool, device=device)
     active_mask[group_expert_ids] = True
 
-    # Remap non-group expert IDs → first group expert (dummy, will be zeroed)
-    remap = torch.arange(num_experts, device=device)
-    dummy_expert = group_expert_ids[0]
-    non_group_mask = ~active_mask
-    remap[non_group_mask] = dummy_expert
-
-    group_topk_ids = remap[topk_ids]
     in_group = active_mask[topk_ids]
+    group_topk_ids = torch.where(in_group, topk_ids, torch.tensor(-1, device=device))
     group_topk_weights = topk_weights * in_group.to(topk_weights.dtype)
 
     return group_topk_weights, group_topk_ids

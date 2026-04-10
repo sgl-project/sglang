@@ -201,20 +201,18 @@ def run_all(device):
         cold_expert_list = plan.group_assignments[0]
         hot_expert_list = plan.group_assignments[1]
 
-        # Remap: non-group experts → dummy group expert, zero their weights
+        # Non-group experts → -1 (filtered by moe_align_block_size, zero blocks)
         cold_active = torch.zeros(E, dtype=torch.bool, device=device)
         cold_active[cold_expert_list] = True
-        cold_remap = torch.arange(E, device=device)
-        cold_remap[~cold_active] = cold_expert_list[0]
-        cold_ids = cold_remap[topk_ids]
-        cold_w = topk_w * cold_active[topk_ids].to(topk_w.dtype)
+        cold_in = cold_active[topk_ids]
+        cold_ids = torch.where(cold_in, topk_ids, torch.tensor(-1, device=device))
+        cold_w = topk_w * cold_in.to(topk_w.dtype)
 
         hot_active = torch.zeros(E, dtype=torch.bool, device=device)
         hot_active[hot_expert_list] = True
-        hot_remap = torch.arange(E, device=device)
-        hot_remap[~hot_active] = hot_expert_list[0]
-        hot_ids = hot_remap[topk_ids]
-        hot_w = topk_w * hot_active[topk_ids].to(topk_w.dtype)
+        hot_in = hot_active[topk_ids]
+        hot_ids = torch.where(hot_in, topk_ids, torch.tensor(-1, device=device))
+        hot_w = topk_w * hot_in.to(topk_w.dtype)
 
         def mix_w4_w16():
             fused_marlin_moe(
