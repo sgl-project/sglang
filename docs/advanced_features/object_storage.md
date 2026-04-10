@@ -16,6 +16,17 @@ When loading models from object storage, SGLang uses a two-phase approach:
 3. **Azure Blob**: `az://some-azure-container/path/`
 4. **S3 compatible**: `s3://bucket-name/path/to/model/`
 
+### Anonymous (unsigned) S3 / MinIO
+
+`boto3` signs S3 requests by default. For **public** buckets or endpoints that do not expect SigV4 (typical **local MinIO** or custom S3-compatible storage with anonymous read), SGLang may patch boto3 so **only** `s3` clients use `signature_version=UNSIGNED`.
+
+This is applied **automatically** when **both** are true:
+
+1. **No standard AWS credentials** are detected (no `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, no web identity / container credential env vars, and no static keys in the shared credentials file — default `~/.aws/credentials` or `AWS_SHARED_CREDENTIALS_FILE`).
+2. **EC2 instance metadata is disabled**: `AWS_EC2_METADATA_DISABLED=true` (or `1` / `yes`), so boto3 will not resolve an IAM role via IMDS.
+
+If metadata is left enabled on EC2, unsigned mode is **not** applied, so IAM role credentials continue to work.
+
 ## Quick Start
 
 ### Basic Usage
