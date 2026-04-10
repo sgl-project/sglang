@@ -311,13 +311,14 @@ class SchedulerRuntimeCheckerMixin:
                 (
                     num_used,
                     _,
-                    token_usage,
-                    _,
+                    full_token_usage,
+                    mamba_usage,
                     _,
                     _,
                     _,
                     _,
                 ) = self._get_mamba_token_info()
+                token_usage = max(full_token_usage, mamba_usage)
             else:
                 num_used, token_usage, _, _ = self._get_token_info()
 

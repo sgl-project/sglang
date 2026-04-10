@@ -88,8 +88,14 @@ class StandardDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.moe_ep_size = get_moe_expert_parallel_world_size()
-        self.enable_flashinfer_cutlass_moe = (
-            get_moe_runner_backend().is_flashinfer_cutlass()
+        backend = get_moe_runner_backend()
+        self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
+        # FlashInfer CUTLASS and CuteDSL handle EP internally with global expert IDs.
+        # Skip local expert mapping so topk_ids stay in global space.
+        self.skip_local_expert_mapping = (
+            backend.is_flashinfer_cutlass()
+            or backend.is_flashinfer_cutedsl()
+            or backend.is_flashinfer_trtllm_routed()
         )
         self.enable_flashinfer_trtllm_routed_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -149,8 +155,7 @@ class StandardDispatcher(BaseDispatcher):
 
         if (
             self.moe_ep_size > 1
-            and not self.enable_flashinfer_cutlass_moe
-            and not self.enable_flashinfer_trtllm_routed_moe
+            and not self.skip_local_expert_mapping
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
             if self.local_expert_mapping is None:
