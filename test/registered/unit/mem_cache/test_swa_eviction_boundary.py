@@ -352,6 +352,109 @@ class TestSWAEvictionBoundary(unittest.TestCase):
         # No non-tombstone node should be created (the core assertion for this bug)
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before)
 
+    def test_case1_evicted_within_matched(self):
+        """Case 1: swa_evicted_seqlen <= total_prefix_length.
+
+        Insert a first request to populate tree nodes, then insert a second
+        request with overlapping prefix. The second request's swa_evicted
+        falls within the matched (already in tree) portion, so all new
+        tokens are non-tombstone.
+        """
+        page_size = 8
+        window = 2
+        tree, allocator, req_to_token_pool = _build_swa_tree(
+            page_size=page_size,
+            sliding_window_size=window,
+            kv_size=1024,
+            kv_size_swa=512,
+        )
+
+        # First request: insert 16 tokens into tree (2 pages)
+        first_len = page_size * 2
+        first_ids = list(range(first_len))
+        kv1 = _swa_alloc(allocator, first_len)
+        req_to_token_pool.write((0, slice(0, first_len)), kv1)
+        req1 = _make_mock_req(
+            req_pool_idx=0,
+            origin_input_ids=first_ids,
+            output_ids=[],
+            cache_protected_len=0,
+            tree=tree,
+        )
+        tree.cache_finished_req(req1, is_insert=True)
+        tree.sanity_check()
+
+        # Second request: overlapping prefix (16 tokens) + 8 new tokens = 24
+        second_len = page_size * 3
+        second_ids = list(range(second_len))
+        kv2 = _swa_alloc(allocator, second_len)
+        req_to_token_pool.write((1, slice(0, second_len)), kv2)
+
+        req2 = _make_mock_req(
+            req_pool_idx=1,
+            origin_input_ids=second_ids,
+            output_ids=[],
+            cache_protected_len=0,
+            tree=tree,
+        )
+        batch = _make_mock_batch(tree, allocator, req_to_token_pool)
+
+        # Evict only first page of req2's SWA (swa_evicted=8 < total_prefix_length=16)
+        # Use a pre_len that produces small eviction
+        req2.swa_evicted_seqlen = page_size  # manually set to 8
+        swa_evictable_before = tree.swa_evictable_size_
+
+        tree.cache_finished_req(req2, is_insert=True)
+
+        # New tokens [16, 24) should all be non-tombstone (case 1: evicted <= matched)
+        new_tokens = second_len - first_len  # 8
+        self.assertEqual(
+            tree.swa_evictable_size_,
+            swa_evictable_before + new_tokens,
+        )
+        tree.sanity_check()
+
+    def test_page_size_leq_window_no_regression(self):
+        """When page_size <= sliding_window_size, the -page_size fix should not
+        cause any regression. The eviction formula still works correctly and
+        cache_finished_req produces correct accounting.
+        """
+        page_size = 4
+        window = 8  # page_size < window
+        tree, allocator, req_to_token_pool = _build_swa_tree(
+            page_size=page_size,
+            sliding_window_size=window,
+            kv_size=1024,
+            kv_size_swa=512,
+        )
+
+        for seq_len in [13, 17, 25, 33]:
+            alloc_pages = (seq_len + page_size - 1) // page_size * page_size
+            kv_indices = _swa_alloc(allocator, alloc_pages)
+            if kv_indices is None:
+                break
+            req_pool_idx = 0
+            req_to_token_pool.write((req_pool_idx, slice(0, alloc_pages)), kv_indices)
+
+            req = _make_mock_req(
+                req_pool_idx=req_pool_idx,
+                origin_input_ids=list(range(seq_len)),
+                output_ids=[],
+                cache_protected_len=0,
+                tree=tree,
+            )
+            batch = _make_mock_batch(tree, allocator, req_to_token_pool)
+
+            pre_len = seq_len - 1
+            ScheduleBatch._evict_swa(batch, req, pre_len)
+
+            insert_length = (seq_len // page_size) * page_size
+            # With page_size <= window, eviction should always stay well below
+            self.assertLess(req.swa_evicted_seqlen, insert_length)
+
+            tree.cache_finished_req(req, is_insert=True)
+            tree.sanity_check()
+
 
 if __name__ == "__main__":
     unittest.main()
