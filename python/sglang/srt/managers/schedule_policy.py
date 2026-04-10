@@ -751,15 +751,9 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        # Reserve an extra page_size for page-alignment overhead: the paged allocator
-        # rounds up to page boundaries, consuming up to one extra page vs logical count.
-        total_tokens = (
-            req.extend_input_len
-            + min(
-                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            + self.page_size
+        total_tokens = req.extend_input_len + min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -829,17 +823,6 @@ class PrefillAdder:
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size
-                # Align (prefix_len + trunc_len) to page boundary so that each
-                # chunk inserts page-aligned tokens into the radix tree.
-                # Without this, non-aligned chunk boundaries cause page
-                # calculation drift across successive chunks.
-                now_input_len = trunc_len + len(req.prefix_indices)
-                now_input_len = now_input_len // self.page_size * self.page_size
-                trunc_len = now_input_len - len(req.prefix_indices)
-
-                if trunc_len <= 0:
-                    return AddReqResult.OTHER
-
                 if truncation_align_size is not None:
                     if trunc_len < truncation_align_size:
                         return AddReqResult.OTHER
