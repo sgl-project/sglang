@@ -348,6 +348,18 @@ class LTX2AVDenoisingStage(DenoisingStage):
     ) -> bool:
         return False
 
+    @staticmethod
+    def _use_ltx23_legacy_ti2v_sp_rope_semantics(
+        batch: Req, *, stage: str, is_ltx23_variant: bool
+    ) -> bool:
+        return (
+            is_ltx23_variant
+            and stage == "one_stage"
+            and get_sp_world_size() > 1
+            and batch.image_latent is not None
+            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
+        )
+
     def _get_condition_image_encoder(
         self,
         server_args: ServerArgs,
@@ -562,6 +574,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         )
         do_ti2v = self._should_apply_ltx2_ti2v(batch)
+        use_legacy_ti2v_sp_rope_semantics = (
+            self._use_ltx23_legacy_ti2v_sp_rope_semantics(
+                batch, stage=stage, is_ltx23_variant=is_ltx23_variant
+            )
+        )
         replicate_audio_for_sp = self._should_replicate_ltx23_audio_for_sp(
             batch,
             server_args,
@@ -696,6 +713,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         if (
                             getattr(batch, "did_sp_shard_latents", False)
                             and hasattr(current_model, "rope")
+                            and not use_legacy_ti2v_sp_rope_semantics
                         ):
                             video_coords = current_model.rope.prepare_video_coords(
                                 batch_size=int(latent_model_input.shape[0]),
