@@ -8,7 +8,7 @@ try to come up with tests that touches:
 some tests can be constructed with fake weights(layers) and fake inputs refer to plan.md for designing the tests
 other tests requries the use of real model weights and inputs... reduce the frequency of these large tests
 
-you should make yourself guidelines for both unit tests and e2e integration tests
+you should make yourself guidelines for both unit tests and e2e integration tests in this folder!
 these two usually have different metrics for accuracy, for example, unit tests with fake inputs simply needs to compute MSE for accuracy
     however, e2e integration tests require either simple perplexity or to run lm-eval for downstream scoring
 
