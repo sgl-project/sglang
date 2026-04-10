@@ -11,11 +11,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(
-    est_time=300,
-    suite="stage-c-test-4-gpu-h100",
-    disabled="Temporarily disable the flaky test.",
-)
+register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-h100")
+
 QWEN3_30B_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
 GSM8K_BASELINE_ACCURACY = 0.85

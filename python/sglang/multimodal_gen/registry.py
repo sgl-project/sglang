@@ -76,6 +76,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
+    Flux2SamplingParams,
     FluxSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
@@ -89,7 +90,10 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
-from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
+from sglang.multimodal_gen.configs.sample.ltx_2 import (
+    LTX2SamplingParams,
+    LTX23SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -122,9 +126,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model_index,
-    verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.utils import KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
 
 logger = init_logger(__name__)
 
@@ -154,7 +158,18 @@ def _discover_and_register_pipelines():
         package.__path__, package.__name__ + "."
     ):
         if not ispkg:
-            pipeline_module = importlib.import_module(module_name)
+            try:
+                pipeline_module = importlib.import_module(module_name)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping pipeline module %s during discovery due to import failure: %s",
+                    module_name,
+                    exc,
+                )
+                logger.debug(
+                    "Pipeline import failure details for %s", module_name, exc_info=True
+                )
+                continue
             if hasattr(pipeline_module, "EntryClass"):
                 entry_cls = pipeline_module.EntryClass
                 entry_cls_list = (
@@ -256,6 +271,37 @@ def get_model_short_name(model_id: str) -> str:
         return model_id
 
 
+def _normalize_hf_cache_path(path: str) -> str:
+    """Normalize a local HuggingFace cache path before substring matching.
+
+    We match registered repo ids like ``org/repo`` against cache fragments like ``models--org--repo`` that appear in snapshot/blob paths.
+    """
+    return os.path.normpath(path).lower().replace("\\", "/")
+
+
+def has_registered_diffusion_model_path(model_path: str) -> bool:
+    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+
+    if model_path in _MODEL_HF_PATH_TO_NAME:
+        return True
+
+    model_short_name = get_model_short_name(model_path.lower())
+    for registered_model_hf_id in all_model_hf_paths:
+        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
+        if registered_model_name in model_short_name:
+            return True
+
+    normalized_model_path = _normalize_hf_cache_path(model_path)
+    for registered_model_hf_id in all_model_hf_paths:
+        cache_repo_fragment = (
+            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
+        )
+        if cache_repo_fragment in normalized_model_path:
+            return True
+
+    return False
+
+
 @lru_cache(maxsize=1)
 def _get_config_info(
     model_path: str, model_id: Optional[str] = None
@@ -297,12 +343,29 @@ def _get_config_info(
             model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
             return _CONFIG_REGISTRY.get(model_id)
 
-    # 3. Use detectors
-    if os.path.exists(model_path):
-        config = verify_model_config_and_directory(model_path)
-    else:
-        config = maybe_download_model_index(model_path)
+    # 2b. Match local HuggingFace cache snapshot/blob paths such as:
+    #   .../models--org--repo/snapshots/<hash>
+    # This lets users pass a local HF cache snapshot directory directly even
+    # when its basename is only the snapshot hash.
+    # Example:
+    #    /xxx/models--black-forest-labs--FLUX.2-dev-NVFP4/snapshots/142b87e70bc3006937b7093d89ff287b5f59f071
+    # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
+    normalized_model_path = _normalize_hf_cache_path(model_path)
+    for registered_model_hf_id in all_model_hf_paths:
+        cache_repo_fragment = (
+            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
+        )
+        if cache_repo_fragment in normalized_model_path:
+            logger.debug(
+                "Resolved HuggingFace cache path '%s' to registered model '%s'.",
+                model_path,
+                registered_model_hf_id,
+            )
+            model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
+            return _CONFIG_REGISTRY.get(model_id)
 
+    # 3. Use detectors
+    config = maybe_download_model_index(model_path)
     pipeline_name = config.get("_class_name", "").lower()
 
     matched_model_names = []
@@ -321,7 +384,11 @@ def _get_config_info(
         model_id = matched_model_names[0]
         return _CONFIG_REGISTRY.get(model_id)
     else:
-        raise RuntimeError(f"No model info found for model path: {model_path}")
+        logger.debug(
+            f"No model info found for model path: {model_path}. "
+            f"Please check the model path or specify the model_id explicitly."
+        )
+        return None
 
 
 # --- Part 3: Main Resolver ---
@@ -467,10 +534,7 @@ def get_model_info(
     else:
         # Try to get from model_index.json
         try:
-            if os.path.exists(model_path):
-                config = verify_model_config_and_directory(model_path)
-            else:
-                config = maybe_download_model_index(model_path)
+            config = maybe_download_model_index(model_path)
         except Exception as e:
             logger.error(f"Could not read model config for '{model_path}': {e}")
             if backend == Backend.AUTO:
@@ -544,9 +608,18 @@ def _register_configs():
     register_configs(
         sampling_param_cls=LTX2SamplingParams,
         pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower(),
+            lambda path: "ltx-2" in path.lower() and "ltx-2.3" not in path.lower(),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LTX23SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.3"],
+        model_detectors=[
+            lambda path: "ltx-2.3" in path.lower(),
         ],
     )
 
@@ -695,10 +768,11 @@ def _register_configs():
         ],
     )
     register_configs(
-        sampling_param_cls=FluxSamplingParams,
+        sampling_param_cls=Flux2SamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
+            "black-forest-labs/FLUX.2-dev-NVFP4",
         ],
         model_detectors=[
             lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
@@ -843,24 +917,18 @@ def _register_configs():
 _register_configs()
 
 
-# Known non-diffusers multimodal model patterns
-# Maps pattern -> pipeline_name for models that don't have model_index.json
-_NON_DIFFUSERS_MULTIMODAL_PATTERNS: Dict[str, str] = {
-    "hunyuan3d": "Hunyuan3D2Pipeline",
-}
-
-
 def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
     model_path_lower = model_path.lower()
     return any(
-        pattern in model_path_lower for pattern in _NON_DIFFUSERS_MULTIMODAL_PATTERNS
+        pattern in model_path_lower
+        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
     )
 
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
     model_path_lower = model_path.lower()
-    for pattern, pipeline_name in _NON_DIFFUSERS_MULTIMODAL_PATTERNS.items():
+    for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
         if pattern in model_path_lower:
             return pipeline_name
     return None

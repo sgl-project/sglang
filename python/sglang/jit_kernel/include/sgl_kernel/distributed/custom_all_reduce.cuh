@@ -194,8 +194,8 @@ struct CustomAllReduceBase : public tvm::ffi::Object {
         for (const auto j : irange(new_registered_count)) {
           /// NOTE: structural binding will cause intern compiler error...
           const auto elem = array[j];
-          const auto offset = get<0>(elem);
-          const auto ipc_handle = get<1>(elem);
+          const auto offset = elem.get<0>();
+          const auto ipc_handle = elem.get<1>();
           data[j].input[i] = pointer::offset(open_cached(ipc_handle), offset);
         }
       }

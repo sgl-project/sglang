@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -22,7 +22,7 @@ register_cuda_ci(est_time=341, suite="stage-b-test-1-gpu-large")
 class TestMLADeepseekV3ChannelInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-channel-int8-test"
+        cls.model = "lmsys/sglang-ci-dsv3-channel-int8-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -48,25 +48,25 @@ class TestMLADeepseekV3ChannelInt8(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.61)
+        self.assertGreaterEqual(metrics["score"], 0.61)
 
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestDeepseekV3MTPChannelInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-channel-int8-test"
+        cls.model = "lmsys/sglang-ci-dsv3-channel-int8-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -80,7 +80,7 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-draft-model-path",
-                    "sgl-project/sglang-ci-dsv3-channel-int8-test-NextN",
+                    "lmsys/sglang-ci-dsv3-channel-int8-test-NextN",
                     "--speculative-num-steps",
                     "2",
                     "--speculative-eagle-topk",
@@ -104,20 +104,20 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -129,7 +129,7 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
 class TestMLADeepseekV3BlockInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-block-int8-test"
+        cls.model = "lmsys/sglang-ci-dsv3-block-int8-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -155,24 +155,24 @@ class TestMLADeepseekV3BlockInt8(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.62)
+        self.assertGreater(metrics["score"], 0.62)
 
 
 class TestDeepseekV3MTPBlockInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "sgl-project/sglang-ci-dsv3-block-int8-test"
+        cls.model = "lmsys/sglang-ci-dsv3-block-int8-test"
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
@@ -208,20 +208,20 @@ class TestDeepseekV3MTPBlockInt8(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

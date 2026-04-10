@@ -90,8 +90,13 @@ class RayEngine(Engine):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
-    ) -> SchedulerInitResult:
-        """Launch schedulers as Ray actors."""
+    ) -> tuple[SchedulerInitResult, None]:
+        """Launch schedulers as Ray actors.
+
+        Returns:
+            Tuple of (RaySchedulerInitResult, None).
+            scheduler_procs is None since Ray uses actors instead of mp.Process.
+        """
         if server_args.dp_size > 1:
             raise NotImplementedError(
                 "Ray support for dp_size > 1 is not yet implemented. "
@@ -183,8 +188,11 @@ class RayEngine(Engine):
             except Exception as e:
                 logger.error(f"Ray scheduler actor terminated with error: {e}")
 
-        return RaySchedulerInitResult(
-            scheduler_infos=scheduler_infos,
-            wait_for_completion=wait_for_completion,
-            scheduler_actors=scheduler_actors,
+        return (
+            RaySchedulerInitResult(
+                scheduler_infos=scheduler_infos,
+                wait_for_completion=wait_for_completion,
+                scheduler_actors=scheduler_actors,
+            ),
+            None,
         )
