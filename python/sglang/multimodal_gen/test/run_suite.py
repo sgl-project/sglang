@@ -250,7 +250,9 @@ def _is_retryable_failure(full_output: str) -> bool:
     return is_perf_assertion or is_flaky_ci_assertion or is_oom_error
 
 
-def _print_attempt_tail_summary(attempt_reports: list[dict], assigned_count: int) -> None:
+def _print_attempt_tail_summary(
+    attempt_reports: list[dict], assigned_count: int
+) -> None:
     if len(attempt_reports) == 1 and attempt_reports[0]["returncode"] in (0, 5):
         return
 
