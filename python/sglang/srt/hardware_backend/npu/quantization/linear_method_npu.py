@@ -9,7 +9,10 @@ from sglang.srt.utils import is_npu, is_npu_before_atlas_a5
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+_is_npu = is_npu()
 _is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
+if _is_npu:
+    import torch_npu
 
 def fp8_matmul_npu(
     input: torch.Tensor,
@@ -107,6 +110,52 @@ class NPUW8A8MxFp8LinearMethod(_NPULinearMethodBase):
         )
 
         return out.reshape(*orig_shape[:-1], out.shape[-1])
+
+
+class NPUW4A4MxFp4LinearMethod(_NPULinearMethodBase):
+    def __init__(self, group_size: int = 32):
+        super().__init__()
+        self.group_size = group_size
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
+        weight_scale = layer.weight_scale.data.transpose(-1, -2).contiguous()
+        k_group, n = weight_scale.shape
+        layer.weight_scale.data = (
+            weight_scale.view(k_group // 2, 2, n).permute(0, 2, 1).contiguous()
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        original_shape = x.shape
+        k = original_shape[-1]
+        x = x.reshape(-1, k).contiguous()
+
+        x_fp4, x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            x,
+            dst_type=torch_npu.float4_e2m1fn_x2,
+            round_mode="round",
+        )
+
+        out = torch.ops.npu.npu_quant_matmul(
+            x_fp4,
+            layer.weight,
+            scale=layer.weight_scale,
+            pertoken_scale=x_scale,
+            bias=bias,
+            output_dtype=x.dtype,
+            group_sizes=(1, 1, self.group_size),
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+            x1_dtype=torch_npu.float4_e2m1fn_x2,
+            x2_dtype=torch_npu.float4_e2m1fn_x2,
+        )
+
+        return out.reshape(*original_shape[:-1], out.shape[-1])
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):

@@ -17,6 +17,8 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignor
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
+    ModelSlimW4A4MxFp4,
+    ModelSlimW4A4MxFp4MoE,
     ModelSlimW4A8Int8MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
@@ -193,6 +195,10 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimW4A4Int4(
                 quant_config=self.quant_description, prefix=layer_name
             )
+        elif quant_type == "W4A4_MXFP4":
+            return ModelSlimW4A4MxFp4(
+                quant_config=self.quant_description, prefix=layer_name
+            )
         elif quant_type == "W8A8_MXFP8":
             return ModelSlimW8A8MxFp8(
                 quant_config=self.quant_description, prefix=layer_name
@@ -223,6 +229,7 @@ class ModelSlimConfig(QuantizationConfig):
         # are supported + check if the layer is being ignored.
         moe_quant_schemes = [
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
+            ("W4A4_MXFP4", ModelSlimW4A4MxFp4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
             ("W8A8_MXFP8", ModelSlimW8A8MxFp8MoE),

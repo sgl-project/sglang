@@ -132,10 +132,10 @@ class DeepEPMoE(FusedMoE):
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
 
-            self.npu_use_mxfp8 = False
+            self.npu_use_mxfp = False
             if _is_npu and isinstance(quant_config, ModelSlimConfig):
-                if quant_config.model_quant_type == "W8A8_MXFP8":
-                    self.npu_use_mxfp8 = True
+                if quant_config.model_quant_type in ("W8A8_MXFP8", "W4A4_MXFP4", "W4A8_MXFP"):
+                    self.npu_use_mxfp = True
 
         self.deepep_mode = get_deepep_mode()
 
@@ -400,7 +400,7 @@ class DeepEPMoE(FusedMoE):
                     output_dtype,
                 )
             else:
-                if not self.npu_use_mxfp8:
+                if not self.npu_use_mxfp:
                     input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
                     if not input_quant and not isinstance(
                         self.quant_method,
