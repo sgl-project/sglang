@@ -476,8 +476,8 @@ class MMEncoder:
         if self.model_type in ["qwen2_audio", "qwen2_5_omni"]:
             input_length = (feature_lens - 1) // 2 + 1
             return (input_length - 2) // 2 + 1
-        # qwen3_omni_moe
-        elif self.model_type == "qwen3_omni_moe":
+        # qwen3_asr / qwen3_omni_moe (same audio encoder architecture)
+        elif self.model_type in ["qwen3_asr", "qwen3_omni_moe"]:
             input_lengths_leave = feature_lens % 100
             feat_lengths = (input_lengths_leave - 1) // 2 + 1
             output_lengths = (
@@ -867,10 +867,11 @@ class MMEncoder:
             )
             # Get additional video metadata
             if (
-                self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+                self.model_type
+                in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
                 and video_processor_kwargs.get("video_metadata", None) is not None
             ):
-                # For qwen3-vl models, we need to store the video timestamps
+                # For qwen3-vl/qwen3.5 models, we need to store the video timestamps
                 video_metadata = video_processor_kwargs["video_metadata"]
                 try:
                     merge_size = (

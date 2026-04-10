@@ -11,6 +11,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 
 
 class PoolingType(IntEnum):
@@ -23,6 +24,54 @@ class EmbeddingPoolerOutput:
     # Pooler can return list[tensor] instead of tensor if the dimension of each tensor in the batch is different
     # due to different per-request matryoshka dim truncation
     embeddings: torch.Tensor | list[torch.Tensor]
+
+
+def score_and_pool(
+    score_head: nn.Module,
+    pooler: "Pooler",
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    input_ids: torch.Tensor,
+) -> EmbeddingPoolerOutput:
+    """Apply a classification/score head with multi-item scoring (MIS) support.
+
+    When ``multi_item_scoring_delimiter`` is configured and found in
+    ``input_ids``, takes the MIS path: extract hidden states at the positions
+    just before each delimiter, apply the score head only to those positions,
+    then split results per-request using ``forward_batch.extend_seq_lens``.
+
+    Otherwise, takes the normal single-item path: apply the score head to all
+    hidden states, then pool (matching the original classification model
+    forward logic).
+    """
+    delimiter_token = get_global_server_args().multi_item_scoring_delimiter
+    if delimiter_token is not None and forward_batch.is_prefill_only:
+        delim_positions = (input_ids == delimiter_token).nonzero(as_tuple=True)[0]
+        # A delimiter at flat index 0 has no preceding hidden state to pool
+        delim_positions = delim_positions[delim_positions > 0]
+
+        if delim_positions.numel() > 0:
+            # Score only the tokens that precede a delimiter
+            scores = score_head(hidden_states[delim_positions - 1])
+
+            # Split per-request so the scheduler gets one tensor per request.
+            # Use CPU sequence lengths to avoid per-iteration GPU<->CPU sync
+            # from `.item()` calls on device tensors.
+            seq_lens = forward_batch.extend_seq_lens_cpu
+            start = 0
+            per_request = []
+            for seq_len in seq_lens:
+                end = start + seq_len
+                mask = (delim_positions >= start) & (delim_positions < end)
+                per_request.append(scores[mask])
+                start = end
+
+            return EmbeddingPoolerOutput(embeddings=per_request)
+
+    # Standard classification path: score all tokens, then pool.
+    logits = score_head(hidden_states)
+    pooled_logits = pooler(logits, forward_batch).embeddings
+    return EmbeddingPoolerOutput(embeddings=pooled_logits)
 
 
 class Pooler(nn.Module):

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import logging
-from typing import List, Tuple
+from collections.abc import Iterable, Sequence
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -19,6 +20,8 @@ class NgramCorpus:
         draft_token_num=8,
         match_type="BFS",
         capacity=1000000,
+        external_sam_budget=0,
+        external_corpus_max_tokens=10000000,
     ) -> None:
         cls = get_ngram_corpus_cls()
         self._obj = cls(
@@ -28,9 +31,24 @@ class NgramCorpus:
             max_bfs_breadth=max_bfs_breadth,
             draft_token_num=draft_token_num,
             match_type=match_type,
+            external_sam_budget=external_sam_budget,
+            external_corpus_max_tokens=external_corpus_max_tokens,
         )
         self.default_mask = np.ones((1, 1), dtype=np.int64)
         self.draft_token_num = draft_token_num
+        self.external_corpus_max_tokens = external_corpus_max_tokens
+        self._req_id_to_state_id: Dict[str, int] = {}
+        self._next_state_id: int = 0
+        self._corpus_token_counts: Dict[str, int] = {}
+        self._total_loaded_tokens: int = 0
+
+    def _get_state_id(self, req_id: str) -> int:
+        sid = self._req_id_to_state_id.get(req_id)
+        if sid is None:
+            sid = self._next_state_id
+            self._next_state_id += 1
+            self._req_id_to_state_id[req_id] = sid
+        return sid
 
     def batch_put(self, batch_tokens: List[List[int]]):
         self._obj.insert(batch_tokens)
@@ -38,11 +56,65 @@ class NgramCorpus:
     def synchronize(self):
         self._obj.synchronize()  # type: ignore
 
+    @property
+    def remaining_token_budget(self) -> int:
+        return self.external_corpus_max_tokens - self._total_loaded_tokens
+
+    def load_external_corpus_named(
+        self, corpus_id: str, chunks: Iterable[Sequence[int]]
+    ) -> int:
+        if corpus_id in self._corpus_token_counts:
+            raise ValueError(
+                f"External corpus '{corpus_id}' already exists. Remove it before "
+                f"adding a new corpus with the same id."
+            )
+        # Note(kpham-sgl): remaining_token_budget is stale (e.g if there are removes
+        # during the load), which makes the budget more conservative than it should be.
+        # This is acceptable because otherwise load_external_corpus_named would need to check the budget after each chunk,
+        # which would be inefficient.
+        _, loaded_token_count = self._obj.load_external_corpus_named(
+            corpus_id, chunks, self.remaining_token_budget
+        )
+        return loaded_token_count
+
+    # Commit corpus bookkeeping after successful load. Call only at background thread join.
+    # (or after synchronous load_external_corpus_named returns)
+    def commit_external_corpus_load(
+        self, corpus_id: str, loaded_token_count: int
+    ) -> None:
+        self._corpus_token_counts[corpus_id] = loaded_token_count
+        self._total_loaded_tokens += loaded_token_count
+
+    def remove_external_corpus(self, corpus_id: str) -> None:
+        self._obj.remove_corpus(corpus_id)
+        old_count = self._corpus_token_counts.pop(corpus_id, 0)
+        self._total_loaded_tokens -= old_count
+
+    def list_external_corpora(self) -> List[str]:
+        return self._obj.list_corpora()
+
     def reset(self):
         self._obj.reset()  # type: ignore
+        self._req_id_to_state_id.clear()
+        self._next_state_id = 0
 
-    def batch_get(self, batch_tokens: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
-        return self._obj.match(batch_tokens)
+    def batch_get(
+        self,
+        req_ids: List[str],
+        batch_tokens: List[List[int]],
+        total_lens: List[int],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
+
+    def erase_match_state(self, req_ids: List[str]):
+        state_ids = []
+        for rid in req_ids:
+            sid = self._req_id_to_state_id.pop(rid, None)
+            if sid is not None:
+                state_ids.append(sid)
+        if state_ids:
+            self._obj.erase_states(state_ids)
 
     def leaf_paths_from_mask(
         self, tokens: List[int], tree_mask: List[List[int]]
@@ -119,6 +191,11 @@ if __name__ == "__main__":
     corpus.batch_put(token_ids)
 
     corpus.synchronize()
-    decoding_ids, decoding_masks = corpus.batch_get([[1, 2, 3], [3, 44], [3, 6, 999]])
+    queries = [[1, 2, 3], [3, 44], [3, 6, 999]]
+    decoding_ids, decoding_masks = corpus.batch_get(
+        req_ids=[f"query-{i}" for i in range(len(queries))],
+        batch_tokens=queries,
+        total_lens=[len(q) for q in queries],
+    )
 
     corpus.debug_result(decoding_ids, decoding_masks)

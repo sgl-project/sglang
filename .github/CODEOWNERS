@@ -68,7 +68,7 @@
 /sgl-model-gateway/src/tool_parser @slin1237 @CatherineSue
 /sgl-model-gateway/src/wasm @slin1237
 /sgl-model-gateway/examples/wasm @slin1237
-/test/registered/core/test_score_api.py @sundar24295s @chanh @fortunecookiee
+/test/registered/prefill_only @sundar24295s @chanh @fortunecookiee
 /benchmark/prefill_only/bench_score.py @sundar24295s @chanh @fortunecookiee
 /test/srt/ascend @ping1jing2 @iforgetmyname
 /test/srt/test_modelopt* @Edwardf0t1

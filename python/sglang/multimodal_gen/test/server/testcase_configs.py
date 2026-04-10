@@ -248,6 +248,7 @@ class DiffusionTestCase:
     server_args: DiffusionServerArgs
     sampling_params: DiffusionSamplingParams
     run_perf_check: bool = True
+    run_consistency_check: bool = True
     run_models_api_check: bool = True
     run_t2v_input_reference_check: bool = True
     run_lora_basic_api_check: bool = False
@@ -498,15 +499,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         run_lora_basic_api_check=True,
         run_lora_dynamic_switch_check=True,
         run_multi_lora_api_check=True,
-    ),
-    DiffusionTestCase(
-        "sana_image_t2i",
-        DiffusionServerArgs(
-            model_path="Efficient-Large-Model/Sana_600M_1024px_diffusers",
-            modality="image",
-        ),
-        T2I_sampling_params,
-        run_perf_check=False,
     ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
@@ -777,6 +769,7 @@ if not current_platform.is_hip():
                 enable_warmup=False,
             ),
             HUNYUAN3D_SHAPE_sampling_params,
+            run_consistency_check=False,
         ),
     )
 # Skip turbowan on AMD: Triton requires 81920 shared memory, but AMD only has 65536.
@@ -851,6 +844,10 @@ TWO_GPU_CASES_A = [
             custom_validator="video",
             num_gpus=2,
             lora_path="Cseti/wan2.2-14B-Arcane_Jinx-lora-v1",
+            extras=[
+                "--lora-weight-name",
+                "985347-wan22_14B-low-Nfj1nx-e65.safetensors",
+            ],
         ),
         DiffusionSamplingParams(
             prompt="Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
@@ -935,7 +932,6 @@ TWO_GPU_CASES_A = [
             model_path="Lightricks/LTX-2",
             modality="video",
             num_gpus=2,
-            dit_layerwise_offload=True,
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         T2V_sampling_params,
@@ -1039,6 +1035,15 @@ TWO_GPU_CASES_B = [
             num_gpus=2,
         ),
         TI2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "ltx_2.3_one_stage_ti2v",
+        DiffusionServerArgs(
+            model_path="Lightricks/LTX-2.3",
+            modality="video",
+            num_gpus=2,
+        ),
+        TI2V_sampling_params,
     ),
 ]
 
