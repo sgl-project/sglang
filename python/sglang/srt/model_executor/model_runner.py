@@ -717,8 +717,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        from sglang.srt.utils import get_local_ip_auto
-
         self.remote_instance_transfer_engine = TransferEngine()
         local_ip = get_local_ip_auto()
         self.remote_instance_transfer_engine.initialize(
