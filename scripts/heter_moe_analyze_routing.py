@@ -24,14 +24,19 @@ NUM_LAYERS = 48
 
 
 def load_and_group_dumps(input_dir):
-    """Load all .pt files grouped by timestamp (= one collection round)."""
+    """Load rank-0 .pt files grouped by collection round.
+
+    TP ranks have slightly different timestamps, so we filter rank=0 only.
+    Each rank-0 file = one collection round (one batch size).
+    """
     files = sorted(f for f in os.listdir(input_dir) if f.endswith(".pt"))
-    groups = defaultdict(list)
+    rank0_files = []
     for fname in files:
         parts = fname.replace("expert_distribution_recorder_", "").replace(".pt", "")
         ts, rank = parts.rsplit("_", 1)
-        groups[ts].append((int(rank), os.path.join(input_dir, fname)))
-    return dict(sorted(groups.items()))
+        if rank == "0":
+            rank0_files.append((ts, os.path.join(input_dir, fname)))
+    return rank0_files
 
 
 def aggregate_records(records, num_layers=NUM_LAYERS, num_experts=NUM_EXPERTS):
@@ -71,18 +76,15 @@ def main():
     )
     args = parser.parse_args()
 
-    groups = load_and_group_dumps(args.input_dir)
-    print(f"Found {len(groups)} collection rounds in {args.input_dir}")
+    rank0_files = load_and_group_dumps(args.input_dir)
+    print(
+        f"Found {len(rank0_files)} collection rounds (rank-0 only) in {args.input_dir}"
+    )
 
     os.makedirs(args.output_dir, exist_ok=True)
-    round_idx = 0
 
-    for ts, rank_files in groups.items():
-        # Only process rank 0 (TP0 sees all experts for non-EP)
-        rank_files.sort()
-        rank0_file = rank_files[0][1]
-
-        d = torch.load(rank0_file, weights_only=False)
+    for round_idx, (ts, filepath) in enumerate(rank0_files):
+        d = torch.load(filepath, weights_only=False)
         records = d["records"]
 
         prefill_records = [r for r in records if r["forward_mode"] == 1]
@@ -110,8 +112,6 @@ def main():
                 json.dump(dc_json, f, indent=2)
             print_summary("decode", dc_counts)
             print(f"    → {dc_path}")
-
-        round_idx += 1
 
     print(f"\nAll analyzed stats saved to {args.output_dir}/")
 
