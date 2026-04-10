@@ -345,8 +345,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
         server_args: ServerArgs,
         *,
         is_ltx23_variant: bool,
+        do_ti2v: bool,
     ) -> bool:
-        return False
+        return (
+            is_ltx23_variant
+            and do_ti2v
+            and get_sp_world_size() > 1
+            and batch.extra.get("ltx2_phase") is None
+        )
 
     def _get_condition_image_encoder(
         self,
@@ -566,6 +572,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
             batch,
             server_args,
             is_ltx23_variant=is_ltx23_variant,
+            do_ti2v=do_ti2v,
         )
         batch.ltx23_audio_replicated_for_sp = bool(replicate_audio_for_sp)
 
