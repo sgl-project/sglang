@@ -30,8 +30,11 @@ from numpy import float64
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -485,7 +488,9 @@ class SWARadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        self.dec_lock_ref(
+            req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        )
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -536,8 +541,11 @@ class SWARadixCache(BasePrefixCache):
 
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
-        swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
+        self.dec_lock_ref(
+            req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+        )
+        result = self.inc_lock_ref(new_last_node)
+        swa_uuid_for_lock = result.swa_uuid_for_lock
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if len(new_indices) < len(kv_indices):
@@ -647,7 +655,7 @@ class SWARadixCache(BasePrefixCache):
             num_tokens_evicted=full_num_evicted, swa_num_tokens_evicted=swa_num_evicted
         )
 
-    def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         """
         Increment the lock reference count for the node. Returns the swa_uuid_for_lock, which needs
         to be passed to dec_lock_ref.
@@ -655,7 +663,7 @@ class SWARadixCache(BasePrefixCache):
         It locks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         """
         if self.disable:
-            return None
+            return IncLockRefResult()
 
         swa_lock_size = 0
         swa_uuid_for_lock = None
@@ -686,17 +694,21 @@ class SWARadixCache(BasePrefixCache):
                         node.swa_uuid = gen_swa_uuid()
                     swa_uuid_for_lock = node.swa_uuid
             node = node.parent
-        return swa_uuid_for_lock
+        return IncLockRefResult(swa_uuid_for_lock=swa_uuid_for_lock)
 
-    def dec_lock_ref(self, node: TreeNode, swa_uuid_for_lock: Optional[int] = None):
+    def dec_lock_ref(
+        self, node: TreeNode, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         """
         Decrement the lock reference count for the node.
         It unlocks the full_lock_ref for nodes between the [last node, root), exclusive.
         It unlocks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         If swa_uuid_for_lock is None, it unlocks to the root, exclusive.
         """
+        swa_uuid_for_lock = params.swa_uuid_for_lock if params is not None else None
+
         if self.disable:
-            return
+            return DecLockRefResult()
 
         dec_lock_swa = True
         while node != self.root_node:
@@ -724,6 +736,8 @@ class SWARadixCache(BasePrefixCache):
                     dec_lock_swa = False
 
             node = node.parent
+
+        return DecLockRefResult()
 
     def sanity_check(self):
         self.full_lru_list.sanity_check(self)

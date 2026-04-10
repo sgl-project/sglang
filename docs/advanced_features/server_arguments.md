@@ -84,7 +84,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--tokenizer-mode` | Tokenizer mode. 'auto' will use the fast tokenizer if available, and 'slow' will always use the slow tokenizer. | `auto` | `auto`, `slow` |
 | `--tokenizer-worker-num` | The worker num of the tokenizer manager. | `1` | Type: int |
 | `--skip-tokenizer-init` | If set, skip init tokenizer and pass input_ids in generate request. | `False` | bool flag (set to enable) |
-| `--load-format` | The format of the model weights to load. "auto" will try to load the weights in the safetensors format and fall back to the pytorch bin format if safetensors format is not available. "pt" will load the weights in the pytorch bin format. "safetensors" will load the weights in the safetensors format. "npcache" will load the weights in pytorch format and store a numpy cache to speed up the loading. "dummy" will initialize the weights with random values, which is mainly for profiling."gguf" will load the weights in the gguf format. "bitsandbytes" will load the weights using bitsandbytes quantization."layered" loads weights layer by layer so that one can quantize a layer before loading another to make the peak memory envelope smaller. "flash_rl" will load the weights in flash_rl format. "fastsafetensors" and "private" are also supported. | `auto` | `auto`, `pt`, `safetensors`, `npcache`, `dummy`, `sharded_state`, `gguf`, `bitsandbytes`, `layered`, `flash_rl`, `remote`, `remote_instance`, `fastsafetensors`, `private` |
+| `--load-format` | The format of the model weights to load. "auto" will try to load the weights in the safetensors format and fall back to the pytorch bin format if safetensors format is not available. "pt" will load the weights in the pytorch bin format. "safetensors" will load the weights in the safetensors format. "npcache" will load the weights in pytorch format and store a numpy cache to speed up the loading. "dummy" will initialize the weights with random values, which is mainly for profiling."gguf" will load the weights in the gguf format. "bitsandbytes" will load the weights using bitsandbytes quantization."layered" loads weights layer by layer so that one can quantize a layer before loading another to make the peak memory envelope smaller. "flash_rl" will load the weights in flash_rl format. "fastsafetensors" and "private" are also supported. "runai_streamer" enables direct model loading from object storage and shared file systems.| `auto` | `auto`, `pt`, `safetensors`, `npcache`, `dummy`, `sharded_state`, `gguf`, `bitsandbytes`, `layered`, `flash_rl`, `remote`, `remote_instance`, `fastsafetensors`, `private`, `runai_streamer` |
 | `--model-loader-extra-config` | Extra config for model loader. This will be passed to the model loader corresponding to the chosen load_format. | `{}` | Type: str |
 | `--trust-remote-code` | Whether or not to allow for custom models defined on the Hub in their own modeling files. | `False` | bool flag (set to enable) |
 | `--context-length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). | `None` | Type: int |
@@ -158,7 +158,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--pp-max-micro-batch-size` | The maximum micro batch size in pipeline parallelism. | `None` | Type: int |
 | `--pp-async-batch-depth` | The async batch depth of pipeline parallelism. | `0` | Type: int |
 | `--stream-interval` | The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher | `1` | Type: int |
-| `--stream-output` | Whether to output as a sequence of disjoint segments. | `False` | bool flag (set to enable) |
+| `--incremental-streaming-output` | Whether to output as a sequence of disjoint segments. | `False` | bool flag (set to enable) |
 | `--random-seed` | The random seed. | `None` | Type: int |
 | `--constrained-json-whitespace-pattern` | (outlines and llguidance backends only) Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model to generate consecutive whitespaces, set the pattern to [\n\t ]* | `None` | Type: str |
 | `--constrained-json-disable-any-whitespace` | (xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output. | `False` | bool flag (set to enable) |
@@ -185,6 +185,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--crash-dump-folder` | Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled. | `None` | Type: str |
 | `--show-time-cost` | Show time cost of custom marks. | `False` | bool flag (set to enable) |
 | `--enable-metrics` | Enable log prometheus metrics. | `False` | bool flag (set to enable) |
+| `--enable-mfu-metrics` | Enable estimated MFU-related prometheus metrics. | `False` | bool flag (set to enable) |
 | `--enable-metrics-for-all-schedulers` | Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) to record request metrics separately. This is especially useful when dp_attention is enabled, as otherwise all metrics appear to come from TP 0. | `False` | bool flag (set to enable) |
 | `--tokenizer-metrics-custom-labels-header` | Specify the HTTP header for passing custom labels for tokenizer metrics. | `x-custom-labels` | Type: str |
 | `--tokenizer-metrics-allowed-custom-labels` | The custom labels allowed for tokenizer metrics. The labels are specified via a dict in '--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': 'value2'} is allowed if '--tokenizer-metrics-allowed-custom-labels label1 label2' is set. | `None` | List[str] |
@@ -211,7 +212,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--api-key` | Set API key of the server. It is also used in the OpenAI API compatible server. | `None` | Type: str |
-| `--admin-api-key` | Set **admin API key** for administrative/control endpoints (e.g., weights update, cache flush, `/get_server_info`). Endpoints marked as admin-only require `Authorization: Bearer <admin_api_key>` when this is set. | `None` | Type: str |
+| `--admin-api-key` | Set **admin API key** for administrative/control endpoints (e.g., weights update, cache flush, `/server_info`). Endpoints marked as admin-only require `Authorization: Bearer <admin_api_key>` when this is set. | `None` | Type: str |
 | `--served-model-name` | Override the model name returned by the v1/models endpoint in OpenAI API server. | `None` | Type: str |
 | `--weight-version` | Version identifier for the model weights. Defaults to 'default' if not specified. | `default` | Type: str |
 | `--chat-template` | The builtin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server. | `None` | Type: str |
@@ -268,8 +269,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--mm-attention-backend` | Set multimodal attention backend. | `None` | `sdpa`, `fa3`, `fa4`, `triton_attn`, `ascend_attn`, `aiter_attn` |
 | `--nsa-prefill-backend` | Choose the NSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek NSA-style attention). | `flashmla_sparse` | `flashmla_sparse`, `flashmla_kv`, `flashmla_auto`, `fa3`, `tilelang`, `aiter`, `trtllm` |
 | `--nsa-decode-backend` | Choose the NSA backend for the decode stage when running DeepSeek NSA-style attention. Overrides `--attention-backend` for decoding. | `fa3` | `flashmla_sparse`, `flashmla_kv`, `fa3`, `tilelang`, `aiter`, `trtllm` |
-| `--fp8-gemm-backend` | Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (FlashInfer TRTLLM backend; SM100/SM103 only), 'flashinfer_cutlass' (FlashInfer CUTLASS backend, SM120 only), 'flashinfer_deepgemm' (Hopper SM90 only, uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). **NOTE**: This replaces the deprecated environment variables SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8. | `auto` | `auto`, `deep_gemm`, `flashinfer_trtllm`, `flashinfer_cutlass`, `flashinfer_deepgemm`, `cutlass`, `triton`, `aiter` |
-| `--fp4-gemm-backend` | Choose the runner backend for NVFP4 GEMM operations. Options: 'flashinfer_cutlass' (default), 'auto' (auto-selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). All backends are from FlashInfer; when FlashInfer is unavailable, sgl-kernel CUTLASS is used as an automatic fallback. **NOTE**: This replaces the deprecated environment variable SGLANG_FLASHINFER_FP4_GEMM_BACKEND. | `flashinfer_cutlass` | `auto`, `flashinfer_cudnn`, `flashinfer_cutlass`, `flashinfer_trtllm` |
+| `--fp8-gemm-backend` | Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (FlashInfer TRTLLM backend; SM100/SM103 only), 'flashinfer_cutlass' (FlashInfer CUTLASS backend, SM120 only), 'flashinfer_deepgemm' (Hopper SM90 only, uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), 'triton' (fallback, widely compatible), 'aiter' (ROCm only).| `auto` | `auto`, `deep_gemm`, `flashinfer_trtllm`, `flashinfer_cutlass`, `flashinfer_deepgemm`, `cutlass`, `triton`, `aiter` |
+| `--fp4-gemm-backend` | Choose the runner backend for NVFP4 GEMM operations. Options: 'flashinfer_cutlass' (default), 'auto' (auto-selects between flashinfer_cudnn/flashinfer_cutlass based on CUDA/cuDNN version), 'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), 'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). All backends are from FlashInfer; when FlashInfer is unavailable, sgl-kernel CUTLASS is used as an automatic fallback.| `flashinfer_cutlass` | `auto`, `flashinfer_cudnn`, `flashinfer_cutlass`, `flashinfer_trtllm` |
 | `--disable-flashinfer-autotune` | Flashinfer autotune is enabled by default. Set this flag to disable the autotune. | `False` | bool flag (set to enable) |
 
 ## Speculative decoding
@@ -294,12 +295,10 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Ngram speculative decoding
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--speculative-ngram-min-match-window-size` | The minimum window size for pattern matching in ngram speculative decoding. | `1` | Type: int |
-| `--speculative-ngram-max-match-window-size` | The maximum window size for pattern matching in ngram speculative decoding. | `12` | Type: int |
 | `--speculative-ngram-min-bfs-breadth` | The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding. | `1` | Type: int |
 | `--speculative-ngram-max-bfs-breadth` | The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding. | `10` | Type: int |
-| `--speculative-ngram-match-type` | The match type for cache tree. | `BFS` | `BFS`, `PROB` |
-| `--speculative-ngram-branch-length` | The branch length for ngram speculative decoding. | `18` | Type: int |
+| `--speculative-ngram-match-type` | Ngram tree-building mode. `BFS` selects recency-based expansion and `PROB` selects frequency-based expansion. This setting is forwarded to the ngram cache implementation. | `BFS` | `BFS`, `PROB` |
+| `--speculative-ngram-max-trie-depth` | Maximum suffix length stored and matched by the ngram trie. | `18` | Type: int |
 | `--speculative-ngram-capacity` | The cache capacity for ngram speculative decoding. | `10000000` | Type: int |
 
 ## Multi-layer Eagle speculative decoding
@@ -538,6 +537,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--mm-process-config` | Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`. | `{}` | Type: JSON / Dict |
 | `--mm-enable-dp-encoder` | Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically. | `False` | bool flag (set to enable) |
 | `--limit-mm-data-per-request` | Limit the number of multimodal inputs per request. e.g. '{"image": 1, "video": 1, "audio": 1}' | `None` | Type: JSON / Dict |
+| `--enable-mm-global-cache` | Enable Mooncake-backed global multimodal embedding cache on encoder servers so repeated images can reuse cached ViT embeddings instead of recomputing them. | `False` | bool flag (set to enable) |
 
 ## For checkpoint decryption
 | Argument | Description | Defaults | Options |

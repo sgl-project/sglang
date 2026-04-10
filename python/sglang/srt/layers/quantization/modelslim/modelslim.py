@@ -13,7 +13,6 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
@@ -58,13 +57,13 @@ def npu_wrapper_rmsnorm_forward(func):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
-
         if not x.is_contiguous():
             x = x.contiguous()
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
+
             out, residual_out = add_rmsnorm_bias(
                 x,
                 residual,
@@ -142,12 +141,7 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if should_ignore_layer(
-                prefix,
-                ignore=self.ignore,
-                fused_mapping=self.packed_modules_mapping,
-            ):
-                return UnquantizedLinearMethod()
+            # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
             if "vision_model" in prefix:
                 key = "vision_model"
@@ -163,87 +157,71 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
-
-            if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
+            if self.is_layer_skipped(
+                prefix, packed_modules_mapping_subset
+            ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
                 return UnquantizedLinearMethod()
-            scheme = self.get_linear_scheme(
-                layer=layer, layer_name=prefix_in_quant_config
-            )
-            layer.scheme = scheme
+            layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
         return None
 
-    def _get_scheme_from_parts(
-        self,
-        layer_name: str,
-    ) -> ModelSlimLinearScheme:
-
-        quant_type = self.quant_description.get(layer_name + ".weight", "")
-        if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
-            return ModelSlimW8A8Int8(
-                quant_config=self.quant_description, prefix=layer_name
-            )
-        elif quant_type == "W4A4_DYNAMIC":
-            return ModelSlimW4A4Int4(
-                quant_config=self.quant_description, prefix=layer_name
-            )
-        raise NotImplementedError("No modelslim compatible scheme was found.")
-
     def get_linear_scheme(
-        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+        self, layer: torch.nn.Module, prefix: Optional[str] = None
     ) -> Optional[ModelSlimLinearScheme]:
         """
         get_scheme method adjusted for modelslim, taken from
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
         """
-        scheme = self._get_scheme_from_parts(
-            layer_name=layer_name,
-        )
 
-        # Ascend doesn't support device capability
-        logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
-        return scheme
+        linear_quant_schemes = [
+            ("W4A4_DYNAMIC", ModelSlimW4A4Int4),
+            ("W8A8", ModelSlimW8A8Int8),
+            ("W8A8_DYNAMIC", ModelSlimW8A8Int8),
+        ]
+
+        quant_schemes = [self.quant_description.get(prefix + ".weight", "")]
+
+        for scheme_name, scheme_class in linear_quant_schemes:
+            if any(s == scheme_name for s in quant_schemes):
+                logger.info_once(f"Using {scheme_class.__name__}")
+                return scheme_class(quant_config=self.quant_description, prefix=prefix)
+
+        logger.warning(
+            f"Unsupported Linear modelslim scheme: "
+            f"{quant_schemes} in layer: {prefix}"
+        )
+        return None
 
     def get_moe_scheme(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[ModelSlimMoEScheme]:
-        # TODO: @dsikka: refactor this to use schemes as other kernels
-        # are supported + check if the layer is being ignored.
+        moe_quant_schemes = [
+            ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
+            ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
+            ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
+        ]
 
-        prefix_in_quant_config = prefix + ".0.gate_proj.weight"
-        is_moe_w4a4_dynamic = (
-            self.quant_description.get(prefix_in_quant_config, "STATIC")
-            == "W4A4_DYNAMIC"
+        moe_weight_suffixes = [".0.gate_proj.weight", ".0.w2.weight"]
+        quant_schemes = [
+            self.quant_description.get(prefix + suffix, "")
+            for suffix in moe_weight_suffixes
+        ]
+
+        for scheme_name, scheme_class in moe_quant_schemes:
+            if any(s == scheme_name for s in quant_schemes):
+                logger.info_once(f"Using {scheme_class.__name__}")
+                return scheme_class(self)
+
+        logger.warning(
+            f"Unsupported FusedMoe modelslim scheme: "
+            f"{quant_schemes} in layer: {prefix}"
         )
-        is_moe_w4a8_dynamic = (
-            self.quant_description.get(prefix_in_quant_config, "STATIC")
-            == "W4A8_DYNAMIC"
-        )
-        is_moe_w8a8_dynamic = (
-            self.quant_description.get(prefix_in_quant_config, "STATIC")
-            == "W8A8_DYNAMIC"
-        )
-        if is_moe_w4a4_dynamic:
-            logger.info_once("Using ModelSlimW4A4Int4MoE")
-            return ModelSlimW4A4Int4MoE(self)
-        elif is_moe_w4a8_dynamic:
-            logger.info_once("Using ModelSlimW4A8Int8MoE")
-            return ModelSlimW4A8Int8MoE(self)
-        elif is_moe_w8a8_dynamic:
-            logger.info_once("Using ModelSlimW8A8Int8MoE")
-            return ModelSlimW8A8Int8MoE(self)
-        else:
-            logger.warning(
-                f"Unsupported FusedMoe modelslim scheme: "
-                f"{self.quant_description.get(prefix_in_quant_config.strip())} "
-                f"in layer: {prefix}"
-            )
-            return None
+        return None
 
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})

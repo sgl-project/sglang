@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -116,6 +117,7 @@ class VAELoader(ComponentLoader):
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
+            vae = current_platform.optimize_vae(vae)
             return vae
 
         # Load from ModelRegistry (standard VAE classes)
@@ -153,4 +155,5 @@ class VAELoader(ComponentLoader):
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 
+        vae = current_platform.optimize_vae(vae)
         return vae

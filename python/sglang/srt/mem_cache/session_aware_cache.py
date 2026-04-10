@@ -7,8 +7,12 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
+    DecLockRefResult,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
+    InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -94,8 +98,11 @@ class SessionSlot:
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
 
-        self.req_pool_idx = None
-        self.mamba_pool_idx = None
+        # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
+        # from the slot. During chunked prefill, a request may be rejected by
+        # the scheduler (e.g. budget exhausted) and retried in the next cycle.
+        # Each retry calls match_prefix -> restore_to_req again, so the slot
+        # must remain intact for idempotent restoration.
 
 
 def _is_streaming(req: Optional[Req]) -> bool:
@@ -174,8 +181,10 @@ class SessionAwareCache(BasePrefixCache):
 
         slot.restore_to_req(req)
 
-        max_prefix_len = len(params.key.token_ids)
-        prefix_len = min(req.kv_committed_len, max_prefix_len)
+        # logprob_start_len is already forced to -1 for streaming sessions
+        # (in Req.init_next_round_input), so the prefix key is not truncated
+        # and we can directly reuse the committed KV length.
+        prefix_len = min(req.kv_committed_len, max(len(params.key.token_ids) - 1, 0))
         device_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :prefix_len
         ].to(dtype=torch.int64)
@@ -201,24 +210,36 @@ class SessionAwareCache(BasePrefixCache):
         slot.save_from_req(req, is_first=is_first)
 
     def cache_unfinished_req(self, req: Req, **kwargs):
-        if _is_streaming(req) and req.session.session_id in self.slots:
-            return
+        if _is_streaming(req):
+            # in chunked_prefill for streaming, we skip the stash path which triggers radix.
+            # only the last chunk in first turn trigger a full prompt radix insert.
+            if kwargs.get("chunked", False):
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, : len(req.fill_ids)
+                ]
+                req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+                return
+            if req.session.session_id in self.slots:
+                # Subsequent turns: slot exists, skip inner entirely.
+                return
+            # First turn (no slot): fall through to inner for lock management,
+            # tree insertion, and cache_protected_len updates between chunks.
         self.inner.cache_unfinished_req(req, **kwargs)
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
 
-    def inc_lock_ref(self, node: Any):
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         if isinstance(node, _VirtualNode):
-            return None
+            return IncLockRefResult()
         return self.inner.inc_lock_ref(node)
 
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: Optional[str] = None):
+    def dec_lock_ref(
+        self, node: Any, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         if isinstance(node, _VirtualNode):
-            return
-        if swa_uuid_for_lock is not None:
-            return self.inner.dec_lock_ref(node, swa_uuid_for_lock)
-        return self.inner.dec_lock_ref(node)
+            return DecLockRefResult()
+        return self.inner.dec_lock_ref(node, params)
 
     # -- Session lifecycle --
 
@@ -230,7 +251,10 @@ class SessionAwareCache(BasePrefixCache):
 
         if slot.last_node is not None:
             if slot.swa_uuid_for_lock is not None:
-                self.inner.dec_lock_ref(slot.last_node, slot.swa_uuid_for_lock)
+                self.inner.dec_lock_ref(
+                    slot.last_node,
+                    DecLockRefParams(swa_uuid_for_lock=slot.swa_uuid_for_lock),
+                )
             else:
                 self.inner.dec_lock_ref(slot.last_node)
 
@@ -298,11 +322,14 @@ class SessionAwareCache(BasePrefixCache):
     def pretty_print(self):
         return self.inner.pretty_print()
 
-    def init_load_back(self, last_host_node, host_hit_length):
-        return self.inner.init_load_back(last_host_node, host_hit_length)
+    def init_load_back(self, params: InitLoadBackParams):
+        return self.inner.init_load_back(params)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()
+
+    def flush_write_through_acks(self) -> None:
+        return self.inner.flush_write_through_acks()
 
     def check_hicache_events(self):
         return self.inner.check_hicache_events()

@@ -130,11 +130,38 @@ class RequestLogger:
                 decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
             obj.text = decoded
 
+    def log_openai_received_request(
+        self,
+        obj: Any,
+        request: Optional["fastapi.Request"] = None,
+    ) -> None:
+        """Log the raw OpenAI request payload before request adaptation/tokenization."""
+        max_length, _, _ = self.metadata
+        max_length = max_length if max_length is not None else 2048
+        headers = _extract_whitelisted_headers(request)
+
+        if hasattr(obj, "model_dump"):
+            obj_to_log = obj.model_dump(exclude_none=True)
+        else:
+            obj_to_log = obj
+
+        if self.log_requests_format == "json":
+            log_data = {
+                "obj": _transform_data_for_logging(obj_to_log, max_length=max_length),
+            }
+            if headers:
+                log_data["headers"] = headers
+            log_json(self.targets, "request.received.openai", log_data)
+        else:
+            headers_str = f", headers={headers}" if headers else ""
+            self._log(
+                f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length)}{headers_str}"
+            )
+
     def log_finished_request(
         self,
         obj: Union["GenerateReqInput", "EmbeddingReqInput"],
         out: Any,
-        is_multimodal_gen: bool = False,
         request: Optional["fastapi.Request"] = None,
     ) -> None:
         if not self.log_requests:
@@ -153,20 +180,15 @@ class RequestLogger:
             }
             if headers:
                 log_data["headers"] = headers
-            if not is_multimodal_gen:
-                log_data["out"] = _transform_data_for_logging(
-                    out, max_length, out_skip_names
-                )
+            log_data["out"] = _transform_data_for_logging(
+                out, max_length, out_skip_names
+            )
             log_json(self.targets, "request.finished", log_data)
         else:
             obj_str = _dataclass_to_string_truncated(
                 obj, max_length, skip_names=skip_names
             )
-            out_str = (
-                ""
-                if is_multimodal_gen
-                else f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
-            )
+            out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
             headers_str = f", headers={headers}" if headers else ""
             self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
 

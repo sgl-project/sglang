@@ -156,7 +156,7 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
         if not hardware_jobs:
             summary = "✅ No critical failures detected in scheduled runs"
             if workflow_url:
-                summary += f"\n<{workflow_url}|View CI Monitor Run>"
+                summary += f"\n<{workflow_url}|View CI Failure Monitor run>"
             color = "good"
         else:
             # Ping relevant people when there are failures
@@ -177,7 +177,9 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
                     summary_lines.append(f"  • {test_type}: {job_list}")
 
             if workflow_url:
-                summary_lines.append(f"\n<{workflow_url}|View Full CI Monitor Report>")
+                summary_lines.append(
+                    f"\n<{workflow_url}|View full CI Failure Monitor report>"
+                )
             summary = "\n".join(summary_lines)
             color = "danger"
 
@@ -188,7 +190,7 @@ def post_ci_failures_to_slack(report_file: str) -> bool:
             attachments=[
                 {
                     "color": color,
-                    "footer": "SGLang CI Monitor",
+                    "footer": "SGLang CI Failure Monitor",
                     "footer_icon": "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
                     "ts": int(datetime.now().timestamp()),
                 }

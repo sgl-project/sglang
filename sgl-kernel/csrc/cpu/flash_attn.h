@@ -190,6 +190,7 @@ struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
 
       // m_i: max value per row
       float m_i = _mm512_reduce_max_ps(vmax);
+      m_i = std::max(m_i, m_prime[m]);
       vmax = _mm512_set1_ps(m_i);
 
       // m_delta <- exp(m' - m_i)

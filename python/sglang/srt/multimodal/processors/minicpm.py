@@ -5,6 +5,7 @@ import torch
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.models.minicpmo import MiniCPMO
 from sglang.srt.models.minicpmv import MiniCPMV
@@ -19,6 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
     models = [MiniCPMV, MiniCPMO]
     support_dynamic_frame_expansion = True
+    gpu_image_decode = False  # MiniCPM HF processor does not support tensor inputs
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -157,17 +159,17 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                             mm_end_id=self.audio_end_id,
                         )
 
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids_tensor.flatten().tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_end_id": self.audio_end_id,
-            "im_token_id": self.im_token_id,
-            "im_start_id": self.im_start_id,
-            "im_end_id": self.im_end_id,
-            "slice_start_id": self.slice_start_id,
-            "slice_end_id": self.slice_end_id,
-        }
+        return MultimodalProcessorOutput(
+            mm_items=mm_items,
+            input_ids=input_ids_tensor.flatten().tolist(),
+            audio_start_id=self.audio_start_id,
+            audio_end_id=self.audio_end_id,
+            im_token_id=self.im_token_id,
+            im_start_id=self.im_start_id,
+            im_end_id=self.im_end_id,
+            slice_start_id=self.slice_start_id,
+            slice_end_id=self.slice_end_id,
+        )
 
     async def process_mm_data_async(
         self,
@@ -222,6 +224,8 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                 f"{len(pixel_values)} vs. {len(tgt_sizes)}"
             )
 
+        # Track slices per image (like vLLM's num_slices)
+        slices_per_image: List[int] = []
         pixel_values_flat: List[torch.Tensor] = []
         tgt_sizes_flat: List[torch.Tensor] = []
         for pixel_b, tgt_b in zip(pixel_values, tgt_sizes):
@@ -230,6 +234,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                 raise ValueError(
                     "Inconsistent N lengths, found: " f"{len(pixel_b)} vs {len(tgt_b)}"
                 )
+            slices_per_image.append(len(pixel_b))
             for pixel_n, tgt_n in zip(pixel_b, tgt_b):
                 pixel_values_flat += [pixel_n]
                 tgt_sizes_flat += [tgt_n]
@@ -249,14 +254,23 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         image_offsets.extend(slice_offsets)
         image_offsets = sorted(image_offsets)
 
+        # Create one item per image, each with its own slices and offsets
         if len(pixel_values) != 0:
-            item = MultimodalDataItem(
-                feature=pixel_values,
-                offsets=image_offsets,
-                model_specific_data={"tgt_size": tgt_sizes_flat},
-                modality=Modality.IMAGE,
-            )
-            items += [item]
+            pv_idx = 0
+            offset_idx = 0
+            for num_slices in slices_per_image:
+                items.append(
+                    MultimodalDataItem(
+                        feature=pixel_values[pv_idx : pv_idx + num_slices],
+                        offsets=image_offsets[offset_idx : offset_idx + num_slices],
+                        model_specific_data={
+                            "tgt_size": tgt_sizes_flat[pv_idx : pv_idx + num_slices]
+                        },
+                        modality=Modality.IMAGE,
+                    )
+                )
+                pv_idx += num_slices
+                offset_idx += num_slices
 
         if (
             "audio_features" in res
@@ -278,14 +292,14 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                 modality=Modality.AUDIO,
             )
             items += [item]
-        return {
-            "mm_items": items,
-            "input_ids": input_ids.tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_end_id": self.audio_end_id,
-            "im_token_id": self.im_token_id,
-            "im_start_id": self.im_start_id,
-            "im_end_id": self.im_end_id,
-            "slice_start_id": self.slice_start_id,
-            "slice_end_id": self.slice_end_id,
-        }
+        return MultimodalProcessorOutput(
+            mm_items=items,
+            input_ids=input_ids.tolist(),
+            audio_start_id=self.audio_start_id,
+            audio_end_id=self.audio_end_id,
+            im_token_id=self.im_token_id,
+            im_start_id=self.im_start_id,
+            im_end_id=self.im_end_id,
+            slice_start_id=self.slice_start_id,
+            slice_end_id=self.slice_end_id,
+        )

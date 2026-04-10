@@ -15,6 +15,7 @@ from torch import nn
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
 from sglang.multimodal_gen.configs.models import ModelConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
@@ -294,9 +295,15 @@ class TokenizerLoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
+        # Flux.2 aligns to the tokenizer defaults from the original baseline.
+        # TODO: abstract this
+        if isinstance(server_args.pipeline_config, Flux2PipelineConfig):
+            return AutoProcessor.from_pretrained(component_model_path)
+
         return AutoTokenizer.from_pretrained(
             component_model_path,
-            padding_size="right",
+            padding_side="right",
+            use_fast=True,
         )
 
 

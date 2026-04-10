@@ -8,7 +8,7 @@ on:
       - 'docker/npu.Dockerfile'
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 16 * * *" # Execute at 0:00 a.m. Beijing Time every day
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
