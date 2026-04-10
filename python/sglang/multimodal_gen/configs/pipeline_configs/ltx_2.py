@@ -384,55 +384,6 @@ class LTX2PipelineConfig(PipelineConfig):
             return sequence_model_parallel_all_gather(latents.contiguous(), dim=1)
         return super().gather_latents_for_sp(latents, batch=batch)
 
-    def shard_audio_latents_for_sp(self, batch, audio_latents):
-        sp_world_size = get_sp_world_size()
-        if sp_world_size <= 1:
-            return audio_latents, False
-        if not (isinstance(audio_latents, torch.Tensor) and audio_latents.ndim == 3):
-            return audio_latents, False
-
-        sp_rank = get_sp_parallel_rank()
-        seq_len = int(audio_latents.shape[1])
-        batch.sp_audio_orig_num_frames = int(seq_len)
-
-        pad_frames = (sp_world_size - (seq_len % sp_world_size)) % sp_world_size
-        if pad_frames:
-            pad = torch.zeros(
-                (audio_latents.shape[0], pad_frames, audio_latents.shape[2]),
-                device=audio_latents.device,
-                dtype=audio_latents.dtype,
-            )
-            audio_latents = torch.cat([audio_latents, pad], dim=1)
-            seq_len += int(pad_frames)
-
-        local_frames = seq_len // sp_world_size
-        start_frame = sp_rank * local_frames
-        end_frame = start_frame + local_frames
-        valid_local_frames = max(
-            min(int(batch.sp_audio_orig_num_frames) - int(start_frame), int(local_frames)),
-            0,
-        )
-        audio_latents = audio_latents[:, start_frame:end_frame, :]
-
-        batch.sp_audio_latent_num_frames = int(local_frames)
-        batch.sp_audio_start_frame = int(start_frame)
-        batch.sp_audio_valid_token_count = int(valid_local_frames)
-        return audio_latents, True
-
-    def gather_audio_latents_for_sp(self, audio_latents, batch):
-        if get_sp_world_size() <= 1:
-            return audio_latents
-        if not (isinstance(audio_latents, torch.Tensor) and audio_latents.ndim == 3):
-            return audio_latents
-
-        audio_latents = sequence_model_parallel_all_gather(
-            audio_latents.contiguous(), dim=1
-        )
-        orig_num_frames = int(getattr(batch, "sp_audio_orig_num_frames", 0))
-        if orig_num_frames > 0:
-            audio_latents = audio_latents[:, :orig_num_frames, :]
-        return audio_latents
-
     def maybe_pack_audio_latents(self, latents, batch_size, batch):
         # If already packed (3D shape [B, T, C*F]), skip packing
         if latents.dim() == 3:
