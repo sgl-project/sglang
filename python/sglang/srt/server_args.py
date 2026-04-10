@@ -405,6 +405,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
+    metrics_http_port: Optional[int] = None
     enable_mfu_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
@@ -3507,6 +3508,8 @@ class ServerArgs:
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
+            "KimiVLForConditionalGeneration",
+            "KimiK25ForConditionalGeneration",
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
@@ -4512,6 +4515,14 @@ class ServerArgs:
             "--enable-metrics",
             action="store_true",
             help="Enable log prometheus metrics.",
+        )
+        parser.add_argument(
+            "--metrics-http-port",
+            type=int,
+            default=ServerArgs.metrics_http_port,
+            help="Port for the Prometheus metrics HTTP server. "
+            "Only used in gRPC mode (--grpc-mode); in HTTP mode, metrics are served on the main --port. "
+            "Defaults to --port + 1 when --enable-metrics is set.",
         )
         parser.add_argument(
             "--enable-mfu-metrics",

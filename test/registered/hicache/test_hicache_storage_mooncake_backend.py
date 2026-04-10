@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     is_in_ci,
 )
 
-register_cuda_ci(est_time=300, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=230, suite="stage-b-test-2-gpu-large")
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):

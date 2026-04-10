@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=200, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=140, suite="stage-c-test-4-gpu-h100")
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 MMMU_ACCURACY_THRESHOLD = 0.65
