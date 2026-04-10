@@ -8,16 +8,20 @@ from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
+_JSON_DECODER = JSONDecoder()
 
-def _find_common_prefix(s1: str, s2: str) -> str:
-    prefix = ""
-    min_length = min(len(s1), len(s2))
-    for i in range(0, min_length):
-        if s1[i] == s2[i]:
-            prefix += s1[i]
-        else:
-            break
-    return prefix
+
+def dumps_args(arguments: Any) -> str:
+    """Serialize arguments to a JSON string using orjson."""
+    return orjson.dumps(arguments, option=orjson.OPT_NON_STR_KEYS).decode()
+
+
+def _find_common_prefix(s1: str, s2: str, start: int = 0) -> str:
+    i = start
+    min_len = min(len(s1), len(s2))
+    while i < min_len and s1[i] == s2[i]:
+        i += 1
+    return s1[:i]
 
 
 def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
@@ -44,7 +48,7 @@ def _partial_json_loads(input_str: str, flags: Allow) -> Tuple[Any, int]:
         msg = getattr(e, "msg", str(e))
         if "Extra data" in msg or "pop from empty list" in msg:
             start = WHITESPACE.match(input_str, 0).end()
-            obj, end = JSONDecoder().raw_decode(input_str, start)
+            obj, end = _JSON_DECODER.raw_decode(input_str, start)
             return obj, end
         raise
 

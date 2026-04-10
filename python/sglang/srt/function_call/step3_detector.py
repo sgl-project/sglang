@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import dumps_args
 
 logger = logging.getLogger(__name__)
 
@@ -334,7 +335,7 @@ class Step3Detector(BaseFormatDetector):
                 # Build the JSON content without the closing brace for streaming
                 if not self._current_parameters:
                     # First parameters - send opening brace and content
-                    params_content = json.dumps(new_params, ensure_ascii=False)
+                    params_content = dumps_args(new_params)
                     if len(params_content) > 2:  # More than just "{}"
                         # Send everything except the closing brace
                         diff = params_content[:-1]
@@ -342,8 +343,8 @@ class Step3Detector(BaseFormatDetector):
                         diff = "{"
                 else:
                     # Subsequent parameters - calculate the incremental diff
-                    old_json = json.dumps(self._current_parameters, ensure_ascii=False)
-                    new_json = json.dumps(new_params, ensure_ascii=False)
+                    old_json = dumps_args(self._current_parameters)
+                    new_json = dumps_args(new_params)
 
                     # Remove closing braces for comparison
                     old_without_brace = old_json[:-1]

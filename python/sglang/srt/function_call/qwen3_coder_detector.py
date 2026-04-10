@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import dumps_args
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +221,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         ToolCallItem(
                             tool_index=tool_idx,
                             name=func_name,
-                            parameters=json.dumps(parsed_params, ensure_ascii=False),
+                            parameters=dumps_args(parsed_params),
                         )
                     )
                     tool_idx += 1
@@ -358,10 +359,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
                         # Construct JSON fragment: "key": value
                         # Note: We must be careful with json.dumps to ensure valid JSON streaming
-                        json_key_val = f"{json.dumps(param_name)}: {json.dumps(converted_val, ensure_ascii=False)}"
+                        json_key_val = f"{json.dumps(param_name)}:{json.dumps(converted_val, ensure_ascii=False)}"
 
                         if self.current_tool_param_count > 0:
-                            fragment = f", {json_key_val}"
+                            fragment = f",{json_key_val}"
                         else:
                             fragment = json_key_val
 

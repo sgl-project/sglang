@@ -47,7 +47,7 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.utils import get_json_schema_constraint
+from sglang.srt.function_call.utils import dumps_args, get_json_schema_constraint
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
@@ -1150,10 +1150,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
                     # Create a ToolCallItem from the JSON data
+                    params_json = dumps_args(tool["parameters"])
                     call_info = ToolCallItem(
                         tool_index=i,  # Use the loop index as tool_index
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                        parameters=params_json,
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
@@ -1164,9 +1165,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
-                                arguments=json.dumps(
-                                    tool["parameters"], ensure_ascii=False
-                                ),
+                                arguments=params_json,
                             ),
                         )
                     )
@@ -1473,9 +1472,14 @@ class OpenAIServingChat(OpenAIServingBase):
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
             return None
 
-        # Get expected vs actual arguments
+        # Get expected vs actual arguments.
+        # Most detectors store arguments as a dict, (dsv32) as a pre-serialized string.
         expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
-        expected_call = json.dumps(expected_args, ensure_ascii=False)
+        expected_call = (
+            expected_args
+            if isinstance(expected_args, str)
+            else dumps_args(expected_args)
+        )
         actual_call = detector.streamed_args_for_tool[tool_index]
 
         # Check if there are remaining arguments to send

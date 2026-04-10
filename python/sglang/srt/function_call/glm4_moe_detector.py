@@ -325,7 +325,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._stream_state = StreamState.IN_KEY
                     self._current_key = ""
                     self._xml_tag_buffer = ""
-                    json_output += "{" if self._is_first_param else ", "
+                    json_output += "{" if self._is_first_param else ","
                     self._is_first_param = False
 
             elif self._stream_state == StreamState.IN_KEY:
@@ -334,7 +334,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                     self._xml_tag_buffer = ""
                     self._stream_state = StreamState.WAITING_VALUE
                     json_output += (
-                        json.dumps(self._current_key, ensure_ascii=False) + ": "
+                        json.dumps(self._current_key, ensure_ascii=False) + ":"
                     )
 
             elif self._stream_state == StreamState.WAITING_VALUE:

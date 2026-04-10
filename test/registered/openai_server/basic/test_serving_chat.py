@@ -281,7 +281,7 @@ class ServingChatTestCase(unittest.TestCase):
             }
         ]
         mock_detector.streamed_args_for_tool = [
-            '{"location": "San Francisco"'  # Partial arguments streamed so far
+            '{"location":"San Francisco"'  # Partial arguments streamed so far
         ]
         mock_parser.detector = mock_detector
 
@@ -314,7 +314,7 @@ class ServingChatTestCase(unittest.TestCase):
         tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
         self.assertEqual(len(tool_calls), 1)
         arguments = tool_calls[0]["function"]["arguments"]
-        self.assertIn(', "unit": "celsius"}', arguments)
+        self.assertIn(',"unit":"celsius"}', arguments)
 
         self.assertIn(
             '"finish_reason":null',
@@ -334,7 +334,7 @@ class ServingChatTestCase(unittest.TestCase):
             {"name": "get_weather", "arguments": {"location": "San Francisco"}}
         ]
         mock_detector.streamed_args_for_tool = [
-            '{"location": "San Francisco"}'  # All arguments already streamed
+            '{"location":"San Francisco"}'  # All arguments already streamed
         ]
         mock_parser.detector = mock_detector
 
@@ -360,6 +360,52 @@ class ServingChatTestCase(unittest.TestCase):
 
         # Should return None since no completion is needed
         self.assertIsNone(result, "Should return None when no completion is needed")
+
+    def test_unstreamed_tool_args_pre_serialized_string(self):
+        """Test recovery when detector stores arguments as a pre-serialized string (e.g. deepseekv32)."""
+
+        mock_parser = Mock()
+        mock_detector = Mock()
+
+        # DeepSeekV32 stores arguments as a pre-serialized JSON string, not a dict
+        mock_detector.prev_tool_call_arr = [
+            {
+                "name": "get_weather",
+                "arguments": '{"location":"San Francisco","unit":"celsius"}',
+            }
+        ]
+        mock_detector.streamed_args_for_tool = [
+            '{"location":"San Francisco"'  # Partial arguments streamed so far
+        ]
+        mock_parser.detector = mock_detector
+
+        content = {
+            "meta_info": {
+                "id": "chatcmpl-test123",
+            }
+        }
+
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content=content,
+            request=request,
+            index=0,
+        )
+
+        # Should return a chunk with remaining arguments
+        self.assertIsNotNone(result, "Should return chunk with remaining arguments")
+
+        chunk = json.loads(result[6:])
+        tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
+        self.assertEqual(len(tool_calls), 1)
+        arguments = tool_calls[0]["function"]["arguments"]
+        self.assertIn(',"unit":"celsius"}', arguments)
 
     def test_unstreamed_tool_args_no_parser_data(self):
         """Test that no completion chunk is sent when parser has no tool call data."""

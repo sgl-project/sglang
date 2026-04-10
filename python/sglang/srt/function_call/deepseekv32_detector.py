@@ -12,7 +12,11 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
+from sglang.srt.function_call.utils import (
+    _find_common_prefix,
+    _partial_json_loads,
+    dumps_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +167,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     except json.JSONDecodeError:
                         parameters[param_name] = param_value.strip()
 
-        return json.dumps(parameters, ensure_ascii=False)
+        return dumps_args(parameters)
 
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """

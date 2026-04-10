@@ -10,7 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _is_complete_json
+from sglang.srt.function_call.utils import _is_complete_json, dumps_args
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ class MistralDetector(BaseFormatDetector):
                 self.prev_tool_call_arr = []
                 self.streamed_args_for_tool = []
 
-            args_json = json.dumps(args_obj, ensure_ascii=False)
+            args_json = dumps_args(args_obj)
             tool_id = self.current_tool_id
 
             # Ensure arrays are large enough.

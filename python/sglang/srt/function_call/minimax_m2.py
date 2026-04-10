@@ -402,9 +402,9 @@ class MinimaxM2Detector(BaseFormatDetector):
                 items = []
                 for key, value in new_params.items():
                     items.append(
-                        f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
+                        f"{json.dumps(key, ensure_ascii=False)}:{json.dumps(value, ensure_ascii=False)}"
                     )
-                json_fragment = "{" + ", ".join(items)
+                json_fragment = "{" + ",".join(items)
 
                 calls.append(
                     ToolCallItem(
@@ -424,10 +424,10 @@ class MinimaxM2Detector(BaseFormatDetector):
                     for key in new_keys:
                         value = new_params[key]
                         continuation_parts.append(
-                            f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
+                            f"{json.dumps(key, ensure_ascii=False)}:{json.dumps(value, ensure_ascii=False)}"
                         )
 
-                    json_fragment = ", " + ", ".join(continuation_parts)
+                    json_fragment = "," + ",".join(continuation_parts)
 
                     calls.append(
                         ToolCallItem(

@@ -14,6 +14,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import dumps_args
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,7 @@ class InternlmDetector(BaseFormatDetector):
                     tool_call = ToolCallItem(
                         tool_index=tool_indices[name],
                         name=name,
-                        parameters=json.dumps(parameters, ensure_ascii=False),
+                        parameters=dumps_args(parameters),
                     )
                     calls.append(tool_call)
 
