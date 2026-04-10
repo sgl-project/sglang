@@ -33,6 +33,9 @@ def apply_svd_lowrank_to_temporal_state(
 
     cpu_state = state.detach().to(device="cpu", dtype=torch.float32)
 
+    # Total energy = squared Frobenius norm of original state
+    total_energy = torch.sum(cpu_state**2).item()
+
     q = min(rank + oversample, min(cpu_state.shape[-2:]))
 
     try:
@@ -45,5 +48,38 @@ def apply_svd_lowrank_to_temporal_state(
 
     u, s, v = u[..., :rank], s[..., :rank], v[..., :rank]
     approx = (u * s.unsqueeze(-2)) @ v.transpose(-2, -1)
+
+    # Energy retained by the rank-k approximation = sum of squared singular values kept.
+    # Energy lost = 1 - retained/total.  Relative Frobenius error = ||orig - approx||/||orig||.
+    retained_energy = torch.sum(s**2).item()
+    error_norm = torch.norm(cpu_state - approx).item()
+    orig_norm = total_energy**0.5
+
+    if total_energy > 0:
+        energy_ratio = retained_energy / total_energy
+        relative_error = error_norm / orig_norm
+    else:
+        energy_ratio = 1.0
+        relative_error = 0.0
+
+    logger.info(
+        "SVD compression (pool_idx=%d, rank=%d): "
+        "energy_retained=%.6f, energy_lost=%.6f, "
+        "relative_frobenius_error=%.6f, "
+        "orig_norm=%.4f, error_norm=%.4f, "
+        "state_shape=%s, "
+        "u_shape=%s, s_shape=%s, v_shape=%s",
+        idx,
+        rank,
+        energy_ratio,
+        1.0 - energy_ratio,
+        relative_error,
+        orig_norm,
+        error_norm,
+        tuple(cpu_state.shape),
+        tuple(u.shape),
+        tuple(s.shape),
+        tuple(v.shape),
+    )
 
     temporal[:, idx] = approx.to(device=orig_device, dtype=orig_dtype)
