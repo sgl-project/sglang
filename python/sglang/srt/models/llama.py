@@ -73,6 +73,7 @@ class LlamaMLP(nn.Module):
         reduce_results: bool = True,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -93,6 +94,7 @@ class LlamaMLP(nn.Module):
             reduce_results=reduce_results,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -793,6 +795,18 @@ class LlamaForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):

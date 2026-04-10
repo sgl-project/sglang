@@ -31,24 +31,6 @@ def _jit_moe_wna16_marlin_module(dtype: torch.dtype) -> Module:
     )
 
 
-@cache_once
-def _jit_moe_wna16_marlin_fp4_module(dtype: torch.dtype) -> Module:
-    """Separate JIT module with NVFP4 (kFE2M1f) kernel instantiations enabled."""
-    args = make_cpp_args(dtype)
-    return load_jit(
-        "moe_wna16_marlin_fp4",
-        *args,
-        cuda_files=["gemm/marlin_moe/moe_wna16_marlin.cuh"],
-        extra_cuda_cflags=["-DSGL_MOE_MARLIN_FP4"],
-        cuda_wrappers=[
-            (
-                "moe_wna16_marlin_gemm",
-                f"moe_wna16_marlin_gemm<{args}>",
-            )
-        ],
-    )
-
-
 def _or_empty(
     t: Optional[torch.Tensor], device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -152,11 +134,7 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    is_fp4 = global_scale_or_none is not None and global_scale_or_none.numel() > 0
-    if is_fp4:
-        module = _jit_moe_wna16_marlin_fp4_module(a.dtype)
-    else:
-        module = _jit_moe_wna16_marlin_module(a.dtype)
+    module = _jit_moe_wna16_marlin_module(a.dtype)
     module.moe_wna16_marlin_gemm(
         a,
         c,

@@ -27,12 +27,12 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
 
 def _is_registered_diffusion_model(model_path: str) -> bool:
     try:
-        # if diffusion dependencies are not installed
-        from sglang.multimodal_gen.registry import get_model_info
+        from sglang.multimodal_gen.registry import has_registered_diffusion_model_path
     except ImportError:
+        # if diffusion dependencies are not installed
         return False
 
-    return get_model_info(model_path, backend="sglang") is not None
+    return has_registered_diffusion_model_path(model_path)
 
 
 def _is_diffusers_model_dir(model_dir: str) -> bool:
@@ -78,6 +78,9 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if is_known_non_diffusers_diffusion_model(model_path):
         return True
 
+    if _is_registered_diffusion_model(model_path):
+        return True
+
     try:
         if envs.SGLANG_USE_MODELSCOPE.get():
             from modelscope import model_file_download
@@ -93,9 +96,7 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return _is_diffusers_model_dir(os.path.dirname(file_path))
     except Exception as e:
         logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
-        # For gated repos, file download fails but model card is still accessible.
-        # Check library_name from HF metadata as a fallback.
-        return _is_gated_diffusion_repo(model_path)
+        return False
 
 
 def get_model_path(extra_argv):

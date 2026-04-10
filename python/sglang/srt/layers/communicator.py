@@ -195,8 +195,10 @@ class AttnTpContext:
         self.allow_input_scattered = False
         self.input_scattered_ = False
         self.attn_inputs_: Optional[AttentionInputs] = None
+        self.is_nsa = False
 
     def init_context(self, q_lora_rank, is_nsa):
+        self.is_nsa = is_nsa
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
@@ -483,8 +485,12 @@ class LayerCommunicator:
                             None,
                         )
                     elif _use_aiter and _is_gfx95_supported and ("fp8" in quant_format):
-
-                        hidden_states, _, _, _res = fused_rms_fp8_group_quant(
+                        # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant.
+                        # When NSA is active, also preserve the unquantized bf16
+                        # output as a 3-tuple (fp8, scale, bf16) so the NSA
+                        # indexer can skip redundant FP8 dequantization.
+                        _nsa_needs_bf16 = get_attn_tp_context().is_nsa
+                        hidden_states, _unq_bf16, _, _res = fused_rms_fp8_group_quant(
                             hidden_states,
                             self.input_layernorm.weight,
                             self.input_layernorm.variance_epsilon,
@@ -494,8 +500,14 @@ class LayerCommunicator:
                             group_size=128,
                             dtype_quant=torch.float8_e4m3fn,
                             res1=None,
-                            output_unquantized_inp1=False,
+                            output_unquantized_inp1=_nsa_needs_bf16,
                         )
+                        if _nsa_needs_bf16:
+                            hidden_states = (
+                                hidden_states[0],
+                                hidden_states[1],
+                                _unq_bf16,
+                            )
 
                     else:
                         hidden_states = self.input_layernorm(hidden_states)
@@ -512,22 +524,30 @@ class LayerCommunicator:
                             residual,
                         )
                     elif _use_aiter and _is_gfx95_supported and ("fp8" in quant_format):
-                        # RMSNorm + FP8 per-group quant
-                        # return hidden_states：
-                        #   out_fp8  : FP8 activation →  a8w8 GEMM
-                        #   out_bs   : block-scale →  gemm_a8w8_blockscale.x_scale
-                        hidden_states, _, _, residual = fused_rms_fp8_group_quant(
-                            hidden_states,
-                            self.input_layernorm.weight,
-                            self.input_layernorm.variance_epsilon,
-                            inp2=None,
-                            inp2_weight=None,
-                            inp2_epsilon=None,
-                            group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
-                            res1=residual,
-                            output_unquantized_inp1=False,
+                        # aiter (ROCm gfx95) fused RMSNorm + FP8 group quant
+                        # with residual addition. When NSA is active, pack
+                        # the unquantized bf16 as a 3-tuple (fp8, scale, bf16).
+                        _nsa_needs_bf16 = get_attn_tp_context().is_nsa
+                        hidden_states, _unq_bf16, _, residual = (
+                            fused_rms_fp8_group_quant(
+                                hidden_states,
+                                self.input_layernorm.weight,
+                                self.input_layernorm.variance_epsilon,
+                                inp2=None,
+                                inp2_weight=None,
+                                inp2_epsilon=None,
+                                group_size=128,
+                                dtype_quant=torch.float8_e4m3fn,
+                                res1=residual,
+                                output_unquantized_inp1=_nsa_needs_bf16,
+                            )
                         )
+                        if _nsa_needs_bf16:
+                            hidden_states = (
+                                hidden_states[0],
+                                hidden_states[1],
+                                _unq_bf16,
+                            )
                     else:
                         hidden_states, residual = self.input_layernorm(
                             hidden_states,
