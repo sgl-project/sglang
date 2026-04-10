@@ -722,9 +722,9 @@ class FluxPosEmbed(nn.Module):
             use_real=False,
             repeat_interleave_real=False,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
         )
 

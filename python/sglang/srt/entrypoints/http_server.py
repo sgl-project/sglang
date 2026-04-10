@@ -127,7 +127,6 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
-    PinPrefixReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -153,9 +152,6 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
-)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -196,15 +192,6 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
-    # Dict{
-    #   rank: Tuple(
-    #           session_id,
-    #           Dict{
-    #               name: Tuple (d_ptr, numel, element_size)
-    #           }
-    #         )
-    # }
-    remote_instance_transfer_engine_info: Optional[Dict] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -217,6 +204,32 @@ def set_global_state(global_state: _GlobalState):
 
 def get_global_state() -> _GlobalState:
     return _global_state
+
+
+async def _init_granian_worker() -> ServerArgs:
+    main_pid = get_main_process_id()
+    port_args, server_args, scheduler_info = read_from_shared_memory(
+        f"multi_tokenizer_args_{main_pid}"
+    )
+
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
+    tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+
+    set_global_state(
+        _GlobalState(
+            tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
+            scheduler_info=scheduler_info,
+        )
+    )
+    return server_args
 
 
 async def init_multi_tokenizer() -> ServerArgs:
@@ -275,6 +288,10 @@ async def lifespan(fast_api_app: FastAPI):
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
+        thread_label = "Tokenizer"
+    elif envs.SGLANG_GRANIAN_PARENT_PID.get() is not None:
+        server_args = await _init_granian_worker()
+        warmup_thread_kwargs = dict(server_args=server_args)
         thread_label = "Tokenizer"
     else:
         # Initialize multi-tokenizer support for worker processes
@@ -354,7 +371,6 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.tokenizer_manager,
             _global_state.template_manager,
             enable_prompt_tokens_details=True,
-            enable_force_include_usage=True,
             tool_server=tool_server,
         )
     except Exception:
@@ -747,6 +763,64 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     )
 
 
+@app.post("/add_external_corpus")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def add_external_corpus(request: Request):
+    """Add an external corpus for ngram speculative decoding."""
+    from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
+
+    try:
+        obj = AddExternalCorpusReqInput(**(await request.json()))
+    except TypeError as e:
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    result = await _global_state.tokenizer_manager.add_external_corpus(obj)
+    return ORJSONResponse(
+        {
+            "success": result.success,
+            "corpus_id": result.corpus_id,
+            "message": result.message,
+            "loaded_token_count": result.loaded_token_count,
+        },
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/remove_external_corpus")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def remove_external_corpus(request: Request):
+    """Remove an external corpus by ID."""
+    body = await request.json()
+    corpus_id = body.get("corpus_id")
+    if not corpus_id:
+        return ORJSONResponse(
+            {"success": False, "message": "corpus_id is required."},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    result = await _global_state.tokenizer_manager.remove_external_corpus(corpus_id)
+    return ORJSONResponse(
+        {"success": result.success, "message": result.message},
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.get("/list_external_corpora")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_external_corpora():
+    """List all active external corpora."""
+    result = await _global_state.tokenizer_manager.list_external_corpora()
+    return ORJSONResponse(
+        {
+            "success": result.success,
+            "corpus_ids": result.corpus_ids,
+            "message": result.message,
+        },
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend_deprecated():
@@ -855,25 +929,6 @@ async def hicache_storage_backend_status():
         "hicache_storage_prefetch_policy": _global_state.tokenizer_manager.server_args.hicache_storage_prefetch_policy,
         "hicache_write_policy": _global_state.tokenizer_manager.server_args.hicache_write_policy,
     }
-
-
-@app.api_route("/hicache/pin_prefix", methods=["POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pin_prefix(obj: PinPrefixReqInput):
-    """Pin a prefix by token_ids to resist eviction."""
-    if not _global_state.tokenizer_manager.server_args.admin_api_key:
-        return _admin_api_key_missing_response()
-    ret = await _global_state.tokenizer_manager.pin_prefix(
-        obj.token_ids, obj.ttl_seconds
-    )
-    return ORJSONResponse(
-        content={
-            "status": "ok" if ret.success else "error",
-            "nodes_pinned": ret.nodes_pinned,
-            "message": ret.message,
-        },
-        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
-    )
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
@@ -1030,26 +1085,39 @@ async def send_weights_to_remote_instance(
 @app.get("/get_remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_remote_instance_transfer_engine_info(rank: int = None):
+    """Get the server information (deprecated - use /remote_instance_transfer_engine_info instead)."""
+    logger.warning(
+        "Endpoint '/get_remote_instance_transfer_engine_info' is deprecated and will be removed in a future version. "
+        "Please use '/remote_instance_transfer_engine_info' instead."
+    )
+    return await remote_instance_transfer_engine_info(rank=rank)
+
+
+@app.get("/remote_instance_transfer_engine_info")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def remote_instance_transfer_engine_info(rank: int = None):
     if rank is None or rank < 0:
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
+        return ORJSONResponse(
+            {"error": {"message": "Missing or invalid rank parameter"}},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
-    if (
-        _global_state.remote_instance_transfer_engine_info is None
-        or len(_global_state.remote_instance_transfer_engine_info) == 0
-    ):
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
-
+    server_args = _global_state.tokenizer_manager.server_args
     try:
-        result = {
-            "rank": rank,
-            "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
-                rank
-            ],
-        }
-        return result
-    except Exception as e:
-        logger.error(f"Exception: {e}")
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
+        resp = requests.get(
+            f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
+            params={"rank": rank},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        logger.warning(f"Failed to get transfer engine info for rank {rank}: {e}")
+
+    return ORJSONResponse(
+        {"error": {"message": f"Failed to get transfer engine info for rank {rank}"}},
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.post("/init_weights_update_group")
@@ -1574,7 +1642,7 @@ async def retrieve_model(model: str):
 
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
-    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
+    """Endpoint for the scoring API. Supports CausalLM (logprob-based) and SequenceClassification (class logit-based) models. See Engine.score() for documentation."""
     return await raw_request.app.state.openai_serving_score.handle_request(
         request, raw_request
     )
@@ -1979,6 +2047,53 @@ def _wait_weights_ready():
     )
 
 
+def _close_main_process_sockets():
+    """Close the main process's ZMQ sockets before spawning Granian workers.
+
+    Granian workers create their own TokenizerManager with fresh ZMQ sockets.
+    The main process must release its sockets first to avoid binding conflicts
+    on the same IPC addresses.
+    """
+    if _global_state is None or _global_state.tokenizer_manager is None:
+        return
+    tm = _global_state.tokenizer_manager
+    for attr in ("recv_from_detokenizer", "send_to_scheduler"):
+        sock = getattr(tm, attr, None)
+        if sock is None:
+            continue
+        inner = getattr(sock, "socket", None)
+        if inner is not None:
+            inner.close()
+        elif hasattr(sock, "close"):
+            sock.close()
+        setattr(tm, attr, None)
+
+
+def _run_granian_server(server_args: ServerArgs):
+    """Launch Granian with HTTP/2 support"""
+    from granian import Granian
+    from granian.constants import HTTPModes, Interfaces, Loops
+
+    granian_kwargs = dict(
+        target="sglang.srt.entrypoints.http_server:app",
+        address=server_args.host,
+        port=server_args.port,
+        interface=Interfaces.ASGI,
+        http=HTTPModes.auto,
+        loop=Loops.uvloop,
+        log_level=server_args.log_level_http or server_args.log_level or "info",
+        workers=1,
+    )
+
+    ssl_enabled = server_args.ssl_certfile and server_args.ssl_keyfile
+    if ssl_enabled:
+        granian_kwargs["ssl_cert"] = server_args.ssl_certfile
+        granian_kwargs["ssl_key"] = server_args.ssl_keyfile
+
+    server = Granian(**granian_kwargs)
+    server.serve()
+
+
 def _setup_and_run_http_server(
     server_args: ServerArgs,
     tokenizer_manager,
@@ -1993,18 +2108,12 @@ def _setup_and_run_http_server(
 
     Called by launch_server after subprocesses have been launched.
     """
-    # Parse info got from the schedulers
-    remote_instance_transfer_engine_info = (
-        parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos)
-    )
-
     # Set global states
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
-            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
         )
     )
 
@@ -2014,6 +2123,35 @@ def _setup_and_run_http_server(
 
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
+
+    # Use Granian for HTTP/2 server
+    if server_args.enable_http2:
+        # Reuse the multi-tokenizer shared memory mechanism to pass
+        # init args (port_args, server_args, scheduler_info) to
+        # Granian workers, which are independent processes.
+        multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+            port_args, server_args, scheduler_infos[0]
+        )
+        try:
+            if server_args.ssl_certfile:
+                logger.info(
+                    f"SSL enabled: certfile={server_args.ssl_certfile}, "
+                    f"keyfile={server_args.ssl_keyfile}"
+                )
+            logger.info(
+                f"Starting Granian HTTP/2 server on "
+                f"{server_args.host}:{server_args.port}"
+            )
+            # Propagate the main process PID via os.environ so Granian
+            # workers (forked or spawned) can locate the shared memory
+            # segment created above.
+            envs.SGLANG_GRANIAN_PARENT_PID.set(os.getpid())
+            _close_main_process_sockets()
+            _run_granian_server(server_args)
+        finally:
+            if multi_tokenizer_args_shm is not None:
+                multi_tokenizer_args_shm.unlink()
+        return
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
