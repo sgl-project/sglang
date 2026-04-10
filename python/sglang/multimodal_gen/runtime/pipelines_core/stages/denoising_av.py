@@ -347,11 +347,21 @@ class LTX2AVDenoisingStage(DenoisingStage):
         is_ltx23_variant: bool,
         do_ti2v: bool,
     ) -> bool:
+        return False
+
+    @staticmethod
+    def _use_ltx23_legacy_ti2v_sp_path(
+        batch: Req,
+        *,
+        stage: str,
+        is_ltx23_variant: bool,
+        do_ti2v: bool,
+    ) -> bool:
         return (
             is_ltx23_variant
             and do_ti2v
+            and stage == "one_stage"
             and get_sp_world_size() > 1
-            and batch.extra.get("ltx2_phase") is None
         )
 
     def _get_condition_image_encoder(
@@ -568,6 +578,12 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         )
         do_ti2v = self._should_apply_ltx2_ti2v(batch)
+        use_legacy_ti2v_sp_path = self._use_ltx23_legacy_ti2v_sp_path(
+            batch,
+            stage=stage,
+            is_ltx23_variant=is_ltx23_variant,
+            do_ti2v=do_ti2v,
+        )
         replicate_audio_for_sp = self._should_replicate_ltx23_audio_for_sp(
             batch,
             server_args,
@@ -580,6 +596,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
             get_sp_world_size() > 1
             and isinstance(batch.audio_latents, torch.Tensor)
             and hasattr(server_args.pipeline_config, "shard_audio_latents_for_sp")
+            and not use_legacy_ti2v_sp_path
             and not replicate_audio_for_sp
         ):
             batch.audio_latents, batch.did_sp_shard_audio_latents = (
@@ -682,6 +699,8 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         stage1_guider_params = self._get_ltx2_stage1_guider_params(
                             batch, server_args, stage
                         )
+                        if use_legacy_ti2v_sp_path:
+                            stage1_guider_params = None
                         latent_num_frames = latent_num_frames_for_model
 
                         # Audio latent dims
@@ -701,8 +720,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         video_coords = None
                         audio_coords = None
                         if (
+                            not use_legacy_ti2v_sp_path
+                            and (
                             getattr(batch, "did_sp_shard_latents", False)
                             and hasattr(current_model, "rope")
+                            )
                         ):
                             video_coords = current_model.rope.prepare_video_coords(
                                 batch_size=int(latent_model_input.shape[0]),
@@ -716,8 +738,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 ),
                             )
                         if (
+                            not use_legacy_ti2v_sp_path
+                            and (
                             getattr(batch, "did_sp_shard_audio_latents", False)
                             and hasattr(current_model, "audio_rope")
+                            )
                         ):
                             audio_coords = current_model.audio_rope.prepare_audio_coords(
                                 batch_size=int(audio_latent_model_input.shape[0]),
@@ -775,30 +800,38 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 * timestep_scale_multiplier
                             ).expand(batch_size)
 
-                        video_self_attention_mask = self._build_ltx2_sp_padding_mask(
-                            batch,
-                            seq_len=video_num_tokens,
-                            batch_size=batch_size,
-                            key="sp_video_valid_token_count",
-                            device=latent_model_input.device,
-                        )
-                        audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
-                            batch,
-                            seq_len=audio_num_frames_latent,
-                            batch_size=batch_size,
-                            key="sp_audio_valid_token_count",
-                            device=audio_latent_model_input.device,
-                        )
-                        a2v_cross_attention_mask = audio_self_attention_mask
-                        v2a_cross_attention_mask = video_self_attention_mask
+                        if use_legacy_ti2v_sp_path:
+                            video_self_attention_mask = None
+                            audio_self_attention_mask = None
+                            a2v_cross_attention_mask = None
+                            v2a_cross_attention_mask = None
+                        else:
+                            video_self_attention_mask = self._build_ltx2_sp_padding_mask(
+                                batch,
+                                seq_len=video_num_tokens,
+                                batch_size=batch_size,
+                                key="sp_video_valid_token_count",
+                                device=latent_model_input.device,
+                            )
+                            audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
+                                batch,
+                                seq_len=audio_num_frames_latent,
+                                batch_size=batch_size,
+                                key="sp_audio_valid_token_count",
+                                device=audio_latent_model_input.device,
+                            )
+                            a2v_cross_attention_mask = audio_self_attention_mask
+                            v2a_cross_attention_mask = video_self_attention_mask
 
                         use_official_cfg_path = stage1_guider_params is None
                         if use_official_cfg_path:
                             encoder_hidden_states = batch.prompt_embeds[0]
                             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                            # Official LTX pipelines rely on packed prompt embeddings
-                            # with padded positions zeroed out, not an explicit KV mask.
-                            encoder_attention_mask = None
+                            encoder_attention_mask = (
+                                batch.prompt_attention_mask
+                                if use_legacy_ti2v_sp_path
+                                else None
+                            )
                             if batch.do_classifier_free_guidance:
                                 latent_model_input = torch.cat(
                                     [latent_model_input] * 2, dim=0
@@ -834,6 +867,14 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 if prompt_timestep_audio is not None:
                                     prompt_timestep_audio = self._repeat_batch_dim(
                                         prompt_timestep_audio, cfg_batch_size
+                                    )
+                                if encoder_attention_mask is not None:
+                                    encoder_attention_mask = torch.cat(
+                                        [
+                                            batch.negative_attention_mask,
+                                            encoder_attention_mask,
+                                        ],
+                                        dim=0,
                                     )
                                 if video_self_attention_mask is not None:
                                     video_self_attention_mask = self._repeat_batch_dim(
@@ -935,7 +976,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             # then apply CFG on denoised (x0) predictions.
                             encoder_hidden_states = batch.prompt_embeds[0]
                             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                            encoder_attention_mask = None
+                            encoder_attention_mask = (
+                                batch.prompt_attention_mask
+                                if use_legacy_ti2v_sp_path
+                                else None
+                            )
                             with set_forward_context(
                                 current_timestep=i, attn_metadata=attn_metadata
                             ):
@@ -976,7 +1021,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     neg_audio_encoder_hidden_states = (
                                         batch.negative_audio_prompt_embeds[0]
                                     )
-                                    neg_encoder_attention_mask = None
+                                    neg_encoder_attention_mask = (
+                                        batch.negative_attention_mask
+                                        if use_legacy_ti2v_sp_path
+                                        else None
+                                    )
 
                                     v_neg, a_v_neg = current_model(
                                         hidden_states=latent_model_input,
