@@ -41,7 +41,7 @@ def _rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
     assert dim % 2 == 0
     scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
-    out = torch.einsum("...n,d->...nd", pos, omega)
+    out = torch.einsum("...n,d->...nd", pos, omega)  # codespell:ignore nd
     return out.float()
 
 
