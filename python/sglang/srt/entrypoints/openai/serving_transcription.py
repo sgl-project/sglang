@@ -21,6 +21,7 @@ See ``transcription_adapters/`` for built-in implementations.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import math
@@ -42,6 +43,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionVerboseResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.streaming_asr import (
+    StreamingASRState,
+    split_audio_chunks,
+)
 from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
 from sglang.srt.managers.io_struct import GenerateReqInput
 
@@ -178,6 +183,15 @@ class OpenAIServingTranscription(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming transcription request."""
+        if self._adapter.supports_chunked_streaming:
+            # No background abort_task: each chunk is a separate request;
+            # client disconnection is detected via is_disconnected() in the loop.
+            return StreamingResponse(
+                self._generate_chunked_asr_stream(
+                    adapted_request, request, raw_request
+                ),
+                media_type="text/event-stream",
+            )
         return StreamingResponse(
             self._generate_transcription_stream(adapted_request, request, raw_request),
             media_type="text/event-stream",
@@ -237,6 +251,117 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
+            error = self.create_streaming_error_response(str(e))
+            yield f"data: {error}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    async def _generate_chunked_asr_stream(
+        self,
+        adapted_request: GenerateReqInput,
+        request: TranscriptionRequest,
+        raw_request: Request,
+    ) -> AsyncGenerator[str, None]:
+        """Chunk-based streaming for ASR with prefix rollback.
+
+        Audio is split into chunks and each chunk is processed as an
+        independent request. Partial transcripts are emitted via SSE
+        with prefix rollback to reduce boundary jitter.
+
+        TODO:
+        - Token-level streaming within chunks (stream=True)
+        - Encoder window caching across chunks
+        - Cross-chunk KV cache reuse
+        - WebSocket endpoint for real-time audio input
+        """
+        created_time = int(time.time())
+        request_id = f"{self._request_id_prefix()}{uuid.uuid4().hex}"
+        model = request.model
+        state = StreamingASRState(**self._adapter.chunked_streaming_config)
+        first_word = True
+
+        try:
+            chunks = split_audio_chunks(request.audio_data, state.chunk_size_sec)
+
+            for i, chunk_audio in enumerate(chunks):
+                if await raw_request.is_disconnected():
+                    logger.info("[streaming_asr] client disconnected, stopping")
+                    break
+                is_last = i == len(chunks) - 1
+                prompt = self._adapter.prompt_template + state.get_prefix_text()
+
+                chunk_request = GenerateReqInput(
+                    text=prompt,
+                    audio_data=chunk_audio,
+                    sampling_params=adapted_request.sampling_params,
+                    stream=False,
+                    modalities=["audio"],
+                    routing_key=self.extract_routing_key(raw_request),
+                )
+
+                try:
+                    ret = None
+                    async for ret in self.tokenizer_manager.generate_request(
+                        chunk_request, raw_request
+                    ):
+                        break
+                except asyncio.CancelledError:
+                    raise
+                except ValueError as e:
+                    logger.warning(
+                        "[streaming_asr] chunk %d failed with ValueError: %s", i, e
+                    )
+                    continue
+
+                if ret is None:
+                    logger.warning("[streaming_asr] empty response for chunk %d", i)
+                    continue
+
+                text = self._adapter.postprocess_text(ret.get("text", ""))
+
+                if is_last:
+                    state.full_transcript = text
+                    delta = state.finalize()
+                else:
+                    delta = state.update(text)
+
+                if delta:
+                    for word in delta.split(" "):
+                        if not word:
+                            continue
+                        content = word if first_word else " " + word
+                        first_word = False
+                        chunk_resp = TranscriptionStreamResponse(
+                            id=request_id,
+                            created=created_time,
+                            model=model,
+                            choices=[
+                                TranscriptionStreamChoice(
+                                    delta=DeltaMessage(content=content),
+                                    finish_reason=None,
+                                )
+                            ],
+                        )
+                        yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+            # Send final stop
+            chunk_resp = TranscriptionStreamResponse(
+                id=request_id,
+                created=created_time,
+                model=model,
+                choices=[
+                    TranscriptionStreamChoice(
+                        delta=DeltaMessage(),
+                        finish_reason="stop",
+                    )
+                ],
+            )
+            yield f"data: {chunk_resp.model_dump_json()}\n\n"
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("[streaming_asr] unrecoverable error")
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
