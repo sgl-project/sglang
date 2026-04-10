@@ -161,6 +161,59 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         )
 
 
+class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
+    """Adapter for diffusion ModelOpt FP8 checkpoints."""
+
+    def __init__(
+        self,
+        *,
+        server_args: ServerArgs,
+        quant_config: Optional[QuantizationConfig],
+    ) -> None:
+        self.server_args = server_args
+        self.quant_config = quant_config
+
+    @staticmethod
+    def _maybe_disable_incompatible_dit_offload_modes(
+        server_args: ServerArgs,
+        quant_config: Optional[QuantizationConfig],
+    ) -> None:
+        if quant_config is None:
+            return
+
+        quant_name_getter = getattr(type(quant_config), "get_name", None)
+        quant_name = quant_name_getter() if callable(quant_name_getter) else None
+        if quant_name != "modelopt_fp8":
+            return
+
+        disabled_args: list[str] = []
+
+        if server_args.dit_cpu_offload:
+            server_args.dit_cpu_offload = False
+            disabled_args.append("dit_cpu_offload")
+
+        if server_args.dit_layerwise_offload:
+            server_args.dit_layerwise_offload = False
+            disabled_args.append("dit_layerwise_offload")
+
+        if not disabled_args:
+            return
+
+        logger.warning(
+            "ModelOpt FP8 diffusion checkpoints currently require the transformer "
+            "FP8 weights to stay GPU-resident in their column-major layout; "
+            "disabling %s for this run. Text encoder / VAE offload settings are "
+            "left unchanged.",
+            ", ".join(disabled_args),
+        )
+
+    def prepare(self) -> None:
+        _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(
+            server_args=self.server_args,
+            quant_config=self.quant_config,
+        )
+
+
 def resolve_transformer_safetensors_to_load(
     server_args: ServerArgs, component_model_path: str
 ) -> list[str]:
@@ -292,7 +345,11 @@ def _build_transformer_quant_adapters(
             cls_name=cls_name,
             server_args=server_args,
             quant_config=quant_config,
-        )
+        ),
+        _ModelOptFp8OffloadAdapter(
+            server_args=server_args,
+            quant_config=quant_config,
+        ),
     ]
     if nunchaku_config is not None:
         adapters.append(
@@ -303,6 +360,27 @@ def _build_transformer_quant_adapters(
             )
         )
     return adapters
+
+
+def _resolve_quant_config_from_transformer_override(
+    transformer_weights_path: str,
+) -> Optional[QuantizationConfig]:
+    """Resolve quant config from an override transformer repo or directory."""
+    override_quantized_path = maybe_download_model(transformer_weights_path)
+    if not os.path.isdir(override_quantized_path):
+        return None
+
+    override_config_path = os.path.join(override_quantized_path, "config.json")
+    if not os.path.isfile(override_config_path):
+        return None
+
+    with open(override_config_path, encoding="utf-8") as f:
+        override_hf_config = json.load(f)
+
+    return get_quant_config(
+        override_hf_config,
+        override_quantized_path,
+    )
 
 
 def _resolve_quant_config(
@@ -317,20 +395,28 @@ def _resolve_quant_config(
     priority: model config.json -> safetensors metadata -> format-specific fallback
     """
     quant_config = get_quant_config(hf_config, component_model_path)
-    if quant_config is None and server_args.transformer_weights_path:
-        for safetensors_file in safetensors_list:
-            quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
-            if quant_config is not None:
-                return quant_config
+    if quant_config is not None or not server_args.transformer_weights_path:
+        return quant_config
 
-        param_names_mapping_dict = (
-            server_args.pipeline_config.dit_config.arch_config.param_names_mapping
-        )
-        quant_config = build_nvfp4_config_from_safetensors_list(
-            safetensors_list, param_names_mapping_dict
-        )
+    quant_config = _resolve_quant_config_from_transformer_override(
+        server_args.transformer_weights_path
+    )
+    if quant_config is not None:
+        return quant_config
+
+    for safetensors_file in safetensors_list:
+        quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
         if quant_config is not None:
             return quant_config
+
+    param_names_mapping_dict = (
+        server_args.pipeline_config.dit_config.arch_config.param_names_mapping
+    )
+    quant_config = build_nvfp4_config_from_safetensors_list(
+        safetensors_list, param_names_mapping_dict
+    )
+    if quant_config is not None:
+        return quant_config
 
     return quant_config
 
