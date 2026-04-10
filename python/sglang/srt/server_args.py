@@ -1491,8 +1491,10 @@ class ServerArgs:
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
-                self.nsa_prefill_backend = "trtllm"
-                self.nsa_decode_backend = "trtllm"
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "trtllm"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "trtllm"
             else:
                 # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
                 if not user_set_prefill:
@@ -2131,7 +2133,9 @@ class ServerArgs:
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
+                "DeepseekV32ForCausalLM",
                 "GptOssForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
@@ -3503,6 +3507,8 @@ class ServerArgs:
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
+            "KimiVLForConditionalGeneration",
+            "KimiK25ForConditionalGeneration",
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
@@ -5188,7 +5194,7 @@ class ServerArgs:
             type=str,
             choices=["normal", "low_latency", "auto"],
             default="auto",
-            help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+            help="Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
