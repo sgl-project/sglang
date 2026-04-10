@@ -58,6 +58,7 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     EmbeddingReqInput,
+    ExKVCacheParams,
     FreezeGCReq,
     GenerateReqInput,
     HealthCheckOutput,
@@ -985,6 +986,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
+            kvcache_params = (
+                ExKVCacheParams(**obj.kvcache_params) if obj.kvcache_params else None
+            )
+
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text,
                 input_ids,
@@ -1004,6 +1009,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 input_embeds=input_embeds,
                 positional_embed_overrides=obj.positional_embed_overrides,
                 session_params=session_params,
+                kvcache_params=kvcache_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
@@ -1692,6 +1698,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     "meta_info": meta_info,
                 }
 
+                if recv_obj.kvcache_params[i] is not None:
+                    out_dict["kvcache_params"] = recv_obj.kvcache_params[i].to_dict()
+
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 is_stream = getattr(state.obj, "stream", False)
                 if self.server_args.incremental_streaming_output and is_stream:
@@ -1708,6 +1717,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     "output_ids": output_token_ids,
                     "meta_info": meta_info,
                 }
+
+                if recv_obj.kvcache_params[i] is not None:
+                    out_dict["kvcache_params"] = recv_obj.kvcache_params[i].to_dict()
+
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
                 out_dict = {

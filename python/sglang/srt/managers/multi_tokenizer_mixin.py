@@ -198,6 +198,7 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
+            kvcache_params=_extract_field_by_index(output, "kvcache_params", i),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -282,6 +283,7 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
+            kvcache_params=_extract_field_by_index(output, "kvcache_params", i),
         )
     else:
         new_output = output
