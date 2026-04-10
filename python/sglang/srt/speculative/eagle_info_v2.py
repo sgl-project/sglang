@@ -8,6 +8,11 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
@@ -23,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
@@ -88,6 +94,25 @@ class EagleDraftInputV2Mixin:
 
         # Now seq_lens is correct
         batch.maybe_wait_verify_done()
+
+        # Accumulate penalty
+        # This is a relaxed version of penalties for speculative decoding.
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            output_ids = torch.tensor(
+                [
+                    (
+                        req.output_ids[-1]
+                        if len(req.output_ids)
+                        else req.origin_input_ids[-1]
+                    )
+                    for req in batch.reqs
+                ],
+                dtype=torch.int64,
+                device=batch.device,
+            )
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                output_ids
+            )
 
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_kv_lens_cpu = []
@@ -234,14 +259,12 @@ class EagleVerifyInputV2Mixin:
 
             # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
-                batch.mamba_track_indices = torch.tensor(
+                batch.mamba_track_indices = torch.stack(
                     [
                         req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
                         for req in batch.reqs
-                    ],
-                    dtype=torch.int64,
-                    device=device,
-                )
+                    ]
+                ).to(torch.int64)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
@@ -293,6 +316,28 @@ class EagleVerifyInputV2Mixin:
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
         device = batch.input_ids.device
+
+        # Apply penalty
+        # This is a relaxed version of penalties for speculative decoding.
+        if sampling_info.acc_additive_penalties is not None:
+            next_token_logits.add_(
+                torch.repeat_interleave(
+                    sampling_info.acc_additive_penalties, self.draft_token_num, dim=0
+                )
+            )
+        if sampling_info.acc_scaling_penalties is not None:
+            apply_scaling_penalties(
+                next_token_logits,
+                torch.repeat_interleave(
+                    sampling_info.acc_scaling_penalties, self.draft_token_num, dim=0
+                ),
+            )
+        if sampling_info.logit_bias is not None:
+            next_token_logits.add_(
+                torch.repeat_interleave(
+                    sampling_info.logit_bias, self.draft_token_num, dim=0
+                )
+            )
 
         # Apply grammar mask if provided
         if vocab_mask is not None:
@@ -371,6 +416,20 @@ class EagleVerifyInputV2Mixin:
                 threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
             )
+
+            # Sync sampling results across TP ranks: different GPUs may
+            # produce slightly different target_probs due to floating-point
+            # non-determinism in softmax/top_k/top_p, causing different
+            # sampled tokens. Broadcast from rank 0 to ensure consistency.
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(accept_length, src=0)
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation

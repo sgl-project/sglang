@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -177,7 +176,6 @@ def apply_rope_inplace_with_kvcache(
 
 
 # NOTE: this name is intentionally set as the old kernel in `sgl_kernel`
-@maybe_wrap_jit_kernel_debug
 def apply_rope_with_cos_sin_cache_inplace(
     q: torch.Tensor,
     k: torch.Tensor,

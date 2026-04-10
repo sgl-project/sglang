@@ -41,6 +41,7 @@ Its core features include:
    :caption: Advanced Features
 
    advanced_features/server_arguments.md
+   advanced_features/object_storage.md
    advanced_features/hyperparameter_tuning.md
    advanced_features/attention_backend.md
    advanced_features/speculative_decoding.ipynb
@@ -87,15 +88,11 @@ Its core features include:
    diffusion/api/cli
    diffusion/api/openai_api
    diffusion/performance/index
+   diffusion/performance/ring_sp_performance
    diffusion/performance/attention_backends
-   diffusion/performance/profiling
    diffusion/performance/cache/index
-   diffusion/performance/cache/cache_dit
-   diffusion/performance/cache/teacache
-   diffusion/support_new_models
+   diffusion/quantization
    diffusion/contributing
-   diffusion/ci_perf
-   diffusion/environment_variables
 
 .. toctree::
    :maxdepth: 1
@@ -105,7 +102,7 @@ Its core features include:
    platforms/cpu_server.md
    platforms/tpu.md
    platforms/nvidia_jetson.md
-   platforms/ascend_npu_support.rst
+   platforms/ascend/ascend_npu_support.rst
    platforms/xpu.md
 
 .. toctree::

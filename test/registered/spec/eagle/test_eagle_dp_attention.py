@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.environ import envs
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN,
@@ -21,7 +21,8 @@ from sglang.test.test_utils import (
 )
 
 # EAGLE3 with DP attention (tp=2, dp=2, requires 4 GPUs)
-register_cuda_ci(est_time=200, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=100, suite="stage-c-test-4-gpu-h100")
+register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
 
 class TestEAGLE3EngineDPAttention(CustomTestCase):
@@ -50,7 +51,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
             "--moe-dense-tp-size",
             "1",
             "--attention-backend",
-            "fa3",
+            "triton" if is_in_amd_ci() else "fa3",
             "--mem-fraction-static",
             "0.75",
             "--cuda-graph-max-bs",
@@ -75,18 +76,18 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         server_data = server_info.json()
 
         # Try to get avg_spec_accept_length
@@ -103,12 +104,20 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (EAGLE3 DP Attention)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
+                f'{metrics["score"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.91)
+            if is_in_amd_ci():
+                # AMD triton backend produces slightly lower accuracy than FA3 on NVIDIA
+                self.assertGreater(metrics["score"], 0.88)
+            else:
+                self.assertGreater(metrics["score"], 0.91)
             if avg_spec_accept_length is not None:
-                self.assertGreater(avg_spec_accept_length, 2.5)
+                if is_in_amd_ci():
+                    # AMD triton backend produces slightly lower accept length than FA3 on NVIDIA
+                    self.assertGreater(avg_spec_accept_length, 2.0)
+                else:
+                    self.assertGreater(avg_spec_accept_length, 2.5)
 
     def test_bs_1_speed(self):
         """Test batch size 1 speed with EAGLE3 DP Attention"""

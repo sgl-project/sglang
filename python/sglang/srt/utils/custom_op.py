@@ -161,7 +161,7 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = debug_torch_op(self.op_name)
+            self._impl = debug_torch_op(self.op_func, self.op_name)
             assert self._impl is not None
         return self._impl
 
@@ -290,7 +290,7 @@ def register_custom_op_from_extern(
         wrapper.__name__ = fn.__name__
         wrapper.__qualname__ = fn.__qualname__
         wrapper.__module__ = fn.__module__
-        wrapper.__signature__ = new_sig
+        wrapper.__signature__ = new_sig  # type: ignore[attr-defined]
         # Build annotations without computed args, preserving return type
         wrapper.__annotations__ = {
             k: v
@@ -334,4 +334,4 @@ def register_custom_op_from_extern(
         fake_impl=fake_impl,
     )
 
-    return debug_torch_op(name)
+    return debug_torch_op(fn, name)

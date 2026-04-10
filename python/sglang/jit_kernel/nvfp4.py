@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
 import os
-import pathlib
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.debug_utils import maybe_wrap_jit_kernel_debug
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -18,43 +15,6 @@ if TYPE_CHECKING:
 
 _FLOAT4_E2M1_MAX = 6.0
 _FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-
-
-def _find_package_root(package: str) -> Optional[pathlib.Path]:
-    spec = importlib.util.find_spec(package)
-    if spec is None or spec.origin is None:
-        return None
-    return pathlib.Path(spec.origin).resolve().parent
-
-
-def _resolve_cutlass_include_paths() -> list[str]:
-    include_paths: list[str] = []
-
-    flashinfer_root = _find_package_root("flashinfer")
-    if flashinfer_root is not None:
-        candidates = [
-            flashinfer_root / "data" / "cutlass" / "include",
-            flashinfer_root / "data" / "cutlass" / "tools" / "util" / "include",
-        ]
-        for path in candidates:
-            if path.exists():
-                include_paths.append(str(path))
-
-    deep_gemm_root = _find_package_root("deep_gemm")
-    if deep_gemm_root is not None:
-        candidate = deep_gemm_root / "include"
-        if candidate.exists():
-            include_paths.append(str(candidate))
-
-    # De-duplicate while preserving order.
-    unique_paths = []
-    seen = set()
-    for path in include_paths:
-        if path in seen:
-            continue
-        seen.add(path)
-        unique_paths.append(path)
-    return unique_paths
 
 
 def _nvfp4_cuda_flags() -> list[str]:
@@ -71,7 +31,7 @@ def _nvfp4_cuda_flags() -> list[str]:
     ]
 
 
-def _get_nvfp4_cuda_arch_list() -> str:
+def _nvfp4_arch_env():
     if not torch.cuda.is_available():
         raise RuntimeError("NVFP4 JIT kernels require CUDA.")
     major, minor = torch.cuda.get_device_capability()
@@ -84,32 +44,11 @@ def _get_nvfp4_cuda_arch_list() -> str:
     # JIT compilation targets only the current device, unlike AOT fat-binaries;
     # adding extra architectures here would clash with the single SGL_CUDA_ARCH
     # value injected by load_jit().
-    return f"{major}.{minor}a"
-
-
-@contextmanager
-def _nvfp4_arch_env():
-    key = "TVM_FFI_CUDA_ARCH_LIST"
-    old_val = os.environ.get(key)
-    os.environ[key] = _get_nvfp4_cuda_arch_list()
-    try:
-        yield
-    finally:
-        if old_val is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = old_val
+    return override_jit_cuda_arch(major, minor, suffix="a")
 
 
 @cache_once
 def _jit_nvfp4_quant_module() -> Module:
-    extra_include_paths = _resolve_cutlass_include_paths()
-    if not extra_include_paths:
-        raise RuntimeError(
-            "Cannot find CUTLASS headers required for NVFP4 JIT quantization. "
-            "Please install flashinfer or deep_gemm with CUTLASS headers."
-        )
-
     with _nvfp4_arch_env():
         return load_jit(
             "nvfp4_quant",
@@ -119,20 +58,13 @@ def _jit_nvfp4_quant_module() -> Module:
             cuda_wrappers=[
                 ("scaled_fp4_quant", "scaled_fp4_quant_sm100a_sm120a"),
             ],
-            extra_include_paths=extra_include_paths,
             extra_cuda_cflags=_nvfp4_cuda_flags(),
+            extra_dependencies=["cutlass"],
         )
 
 
 @cache_once
 def _jit_nvfp4_expert_quant_module() -> Module:
-    extra_include_paths = _resolve_cutlass_include_paths()
-    if not extra_include_paths:
-        raise RuntimeError(
-            "Cannot find CUTLASS headers required for NVFP4 JIT expert quantization. "
-            "Please install flashinfer or deep_gemm with CUTLASS headers."
-        )
-
     with _nvfp4_arch_env():
         return load_jit(
             "nvfp4_expert_quant",
@@ -146,20 +78,13 @@ def _jit_nvfp4_expert_quant_module() -> Module:
                     "silu_and_mul_scaled_fp4_experts_quant_sm100a",
                 ),
             ],
-            extra_include_paths=extra_include_paths,
+            extra_dependencies=["cutlass"],
             extra_cuda_cflags=_nvfp4_cuda_flags(),
         )
 
 
 @cache_once
 def _jit_nvfp4_scaled_mm_module() -> Module:
-    extra_include_paths = _resolve_cutlass_include_paths()
-    if not extra_include_paths:
-        raise RuntimeError(
-            "Cannot find CUTLASS headers required for NVFP4 JIT GEMM. "
-            "Please install flashinfer or deep_gemm with CUTLASS headers."
-        )
-
     with _nvfp4_arch_env():
         return load_jit(
             "nvfp4_scaled_mm",
@@ -168,20 +93,13 @@ def _jit_nvfp4_scaled_mm_module() -> Module:
                 "gemm/nvfp4/nvfp4_scaled_mm_entry.cuh",
             ],
             cuda_wrappers=[("cutlass_scaled_fp4_mm", "cutlass_scaled_fp4_mm")],
-            extra_include_paths=extra_include_paths,
+            extra_dependencies=["cutlass"],
             extra_cuda_cflags=_nvfp4_cuda_flags(),
         )
 
 
 @cache_once
 def _jit_nvfp4_blockwise_moe_module() -> Module:
-    extra_include_paths = _resolve_cutlass_include_paths()
-    if not extra_include_paths:
-        raise RuntimeError(
-            "Cannot find CUTLASS headers required for NVFP4 JIT MoE grouped GEMM. "
-            "Please install flashinfer or deep_gemm with CUTLASS headers."
-        )
-
     with _nvfp4_arch_env():
         return load_jit(
             "nvfp4_blockwise_moe",
@@ -191,12 +109,12 @@ def _jit_nvfp4_blockwise_moe_module() -> Module:
             cuda_wrappers=[
                 ("cutlass_fp4_group_mm", "cutlass_fp4_group_mm_sm100a_sm120a")
             ],
-            extra_include_paths=extra_include_paths,
+            extra_dependencies=["cutlass"],
             extra_cuda_cflags=_nvfp4_cuda_flags(),
         )
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def cutlass_scaled_fp4_mm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -213,7 +131,7 @@ def cutlass_scaled_fp4_mm(
     return out
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def cutlass_fp4_group_mm(
     a_fp4: torch.Tensor,
     b_fp4: torch.Tensor,
@@ -293,7 +211,7 @@ def _scaled_fp4_quant_custom_op(
     module.scaled_fp4_quant(output, input, output_scale, input_global_scale)
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def scaled_fp4_quant(
     input: torch.Tensor, input_global_scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -363,7 +281,7 @@ def _scaled_fp4_experts_quant_custom_op(
     )
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -448,7 +366,7 @@ def _scaled_fp4_grouped_quant_custom_op(
     )
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def scaled_fp4_grouped_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -509,7 +427,7 @@ def _silu_and_mul_scaled_fp4_grouped_quant_custom_op(
     )
 
 
-@maybe_wrap_jit_kernel_debug
+@debug_kernel_api
 def silu_and_mul_scaled_fp4_grouped_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,

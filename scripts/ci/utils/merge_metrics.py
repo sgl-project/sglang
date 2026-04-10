@@ -25,6 +25,7 @@ def find_partition_files(input_dir: str) -> list[str]:
     patterns = [
         os.path.join(input_dir, "**/metrics-*.json"),
         os.path.join(input_dir, "**/diffusion-metrics-*.json"),
+        os.path.join(input_dir, "**/comparison-metrics-*.json"),
     ]
     files = set()
     for pattern in patterns:

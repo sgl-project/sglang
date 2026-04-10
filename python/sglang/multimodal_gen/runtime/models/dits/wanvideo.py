@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
-from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -51,6 +50,9 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.utils import (
+    _use_aiter,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -62,6 +64,9 @@ from sglang.srt.utils import add_prefix
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+
+if _use_aiter:
+    from aiter.ops.rope import rope_cached_2c_fwd_inplace
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -548,6 +553,25 @@ class WanTransformerBlock(nn.Module):
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
+        elif _use_aiter:
+            query_shape = query.shape
+            key_shape = key.shape
+            num_tokens = query.shape[:-2].numel()
+            q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
+            k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
+            cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
+            sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
+            rope_cached_2c_fwd_inplace(
+                q_sbhd,
+                k_sbhd,
+                cos_sbhd,
+                sin_sbhd,
+                1,  # GPTJ rotate style
+                True,  # reuse_freqs_front_part
+                False,  # nope_first
+            )
+            query = q_sbhd.view(query_shape)
+            key = k_sbhd.view(key_shape)
         else:
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
@@ -775,6 +799,25 @@ class WanTransformerBlock_VSA(nn.Module):
             query, key = apply_flashinfer_rope_qk_inplace(
                 query, key, cos_sin_cache, is_neox=False
             )
+        elif _use_aiter:
+            query_shape = query.shape
+            key_shape = key.shape
+            num_tokens = query.shape[:-2].numel()
+            q_sbhd = query.view(num_tokens, 1, query_shape[-2], query_shape[-1])
+            k_sbhd = key.view(num_tokens, 1, key_shape[-2], key_shape[-1])
+            cos_sbhd = cos.contiguous().view(num_tokens, 1, 1, -1)
+            sin_sbhd = sin.contiguous().view(num_tokens, 1, 1, -1)
+            rope_cached_2c_fwd_inplace(
+                q_sbhd,
+                k_sbhd,
+                cos_sbhd,
+                sin_sbhd,
+                1,  # GPTJ rotate style
+                True,  # reuse_freqs_front_part
+                False,  # nope_first
+            )
+            query = q_sbhd.view(query_shape)
+            key = k_sbhd.view(key_shape)
         else:
             query, key = _apply_rotary_emb(
                 query, cos, sin, is_neox_style=False
@@ -916,9 +959,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             rope_dim_list=self.rope_dim_list,
             rope_theta=10000,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
         )
 
@@ -1091,7 +1134,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             encoder_hidden_states.to(orig_dtype)
             if not current_platform.is_amp_supported()
             else encoder_hidden_states
-        )  # cast to orig_dtype for MPS
+        )  # cast to orig_dtype if amp is not supported
 
         assert encoder_hidden_states.dtype == orig_dtype
 
@@ -1170,31 +1213,21 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         if ctx is None:
             return False
 
-        # Wan uses WanTeaCacheParams with additional fields
-        teacache_params = ctx.teacache_params
-        assert isinstance(
-            teacache_params, WanTeaCacheParams
-        ), "teacache_params is not a WanTeaCacheParams"
-
         # Initialize Wan-specific parameters
+        teacache_params = ctx.teacache_params
         use_ret_steps = teacache_params.use_ret_steps
-        cutoff_steps = teacache_params.get_cutoff_steps(ctx.num_inference_steps)
-        ret_steps = teacache_params.ret_steps
+        start_skipping, end_skipping = teacache_params.get_skip_boundaries(
+            ctx.num_inference_steps, ctx.do_cfg
+        )
 
-        # Adjust ret_steps and cutoff_steps for non-CFG mode
-        # (WanTeaCacheParams uses *2 factor assuming CFG)
-        if not ctx.do_cfg:
-            ret_steps = ret_steps // 2
-            cutoff_steps = cutoff_steps // 2
+        # Determine boundary step
+        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
 
         timestep_proj = kwargs["timestep_proj"]
         temb = kwargs["temb"]
         modulated_inp = timestep_proj if use_ret_steps else temb
 
         self.is_cfg_negative = ctx.is_cfg_negative
-
-        # Wan uses ret_steps/cutoff_steps for boundary detection
-        is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
 
         # Use shared helper to compute cache decision
         should_calc = self._compute_teacache_decision(
