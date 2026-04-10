@@ -280,7 +280,7 @@ def run_all(device):
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(10, 6))
-        ms = PER_EXPERT_BATCH_SIZES
+        ms = [r[0] for r in rows]
         ax.plot(
             ms, [r[2] for r in rows], "o-", label="a16w16", color="#1f77b4", linewidth=2
         )
