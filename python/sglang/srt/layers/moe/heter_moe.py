@@ -96,7 +96,6 @@ class HeterFusedMoE(nn.Module):
 
         For BF16 groups: standard w13_weight [E, 2*I, H] + w2_weight [E, H, I]
         For INT4 groups: packed qweights + scales (Marlin format)
-        For INT8 groups: int8 weights + per-channel scales
         """
         E = self.num_experts
         H = self.hidden_size
@@ -111,6 +110,22 @@ class HeterFusedMoE(nn.Module):
             elif num_bits == 4:
                 self._init_int4_weights(prefix, E, H, I, gcfg)
             elif num_bits == 8:
+                # DEPRECATED: Triton INT8 on A100 achieves ~6% of peak tensor core
+                # utilization due to layout constraints and missing pipelining.
+                # See: https://github.com/triton-lang/triton/issues/2818
+                #      https://github.com/triton-lang/triton/issues/1397
+                # Use num_bits=4 (Marlin) instead. Kept for forward-compat with
+                # Hopper FP8 path (future work).
+                import warnings
+
+                warnings.warn(
+                    "INT8 (num_bits=8) is deprecated for HeterMoE on A100. "
+                    "Triton INT8 achieves only ~6% of peak tensor core throughput "
+                    "due to Ampere layout constraints (triton-lang/triton#2818). "
+                    "Use num_bits=4 (Marlin INT4) instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
                 self._init_int8_weights(prefix, E, H, I)
             else:
                 raise ValueError(f"Unsupported num_bits={num_bits} in group {idx}")
@@ -250,6 +265,7 @@ class HeterFusedMoE(nn.Module):
                     gcfg,
                 )
             elif num_bits == 8:
+                # DEPRECATED: see _init_group_weights for rationale
                 group_out = self._run_int8_group(
                     prefix, hidden_states, masked_weights, topk_ids
                 )

@@ -25,11 +25,25 @@ as contrary to prior work where expert precision assignment is either fixed or o
 |----------|--------------------------------------|-----------------------------------------------------------------------------|----------------------------------------------------------|
 | a16w16   | fused_moe_kernel (Triton)            | python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py  | BF16 activations, BF16 weights; true fused group-GEMM    |
 | a16w4    | fused_marlin_moe (JIT Marlin)        | python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py          | BF16 activations, INT4 packed weights; GPTQ/AWQ; separate kernel |
-| a8w8     | fused_moe_kernel (Triton, use_int8_w8a8=True) | python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py | TRUE fused group-GEMM (same kernel as BF16, INT8 flag); per_token_quant_int8() for activation |
+| a8w8     | fused_moe_kernel (Triton, use_int8_w8a8=True) | python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py | DEPRECATED on A100 — see below |
 
 NOTE: a16w16 and a8w8 share the SAME Triton fused_moe_kernel — INT8 is a compile-time flag (tl.constexpr).
     a16w4 uses a completely DIFFERENT kernel (fused_marlin_moe with JIT Marlin).
     int8_scaled_mm from sgl-kernel is for DENSE linear layers only, NOT used in MoE path.
 
-primary scheme pair for v1: {a16w16, a16w4} — simplest, no activation quantization needed for either
-optional extension:         {a8w8, a16w4}   — requires per-token INT8 activation quantization for hot path
+primary scheme pair: {a16w16, a16w4} — no activation quantization needed for either
+
+a8w8 DEPRECATED on A100:
+    Triton INT8 achieves ~6% of peak A100 INT8 tensor core throughput (77 TFLOPS vs 1248 peak).
+    Root causes:
+      - Ampere tensor cores require row-major A × col-major B for INT8; Triton transposes slowly
+      - No pipelining for mixed-type operands in Triton codegen
+      - Default block sizes untuned for INT8
+      - Extra per_token_quant_int8 kernel launch overhead
+    Marlin INT4 (a16w4) is faster at ALL batch sizes despite using BF16 tensor cores (624 TFLOPS peak)
+    because INT4 weights are 2x smaller (bandwidth-bound) and Marlin achieves 75-85% utilization.
+    References:
+      https://github.com/triton-lang/triton/issues/2818  (INT8 perf bad, open)
+      https://github.com/triton-lang/triton/issues/1397  (mixed-type pipelining, open)
+      https://github.com/triton-lang/triton/issues/634   (77 vs 221 TFLOPS on A100)
+    Future: on Hopper (H100), FP8 replaces INT8 with native HW support and mature Triton codegen.

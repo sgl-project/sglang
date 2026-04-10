@@ -302,24 +302,32 @@ class TestHeterFusedMoETwoGroupsBF16:
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 class TestHeterFusedMoEInt8Group:
-    """Test with INT8 group."""
+    """DEPRECATED: INT8 path kept for functional correctness only.
+
+    Triton INT8 on A100 achieves ~6% of peak tensor core throughput.
+    See: https://github.com/triton-lang/triton/issues/2818
+    Use Marlin INT4 (num_bits=4) for production workloads.
+    """
 
     def _make_layer(self):
         from sglang.srt.layers.moe.heter_moe import HeterFusedMoE
+        import warnings
 
-        config = {
-            "groups": [{"name": "int8_all", "num_bits": 8, "size_ratio": 1.0}],
-            "policy": "token_count",
-        }
-        layer = HeterFusedMoE(
-            num_experts=8,
-            hidden_size=64,
-            intermediate_size=32,
-            top_k=2,
-            heter_config=config,
-            dtype=torch.bfloat16,
-            device=torch.device("cuda"),
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            config = {
+                "groups": [{"name": "int8_all", "num_bits": 8, "size_ratio": 1.0}],
+                "policy": "token_count",
+            }
+            layer = HeterFusedMoE(
+                num_experts=8,
+                hidden_size=64,
+                intermediate_size=32,
+                top_k=2,
+                heter_config=config,
+                dtype=torch.bfloat16,
+                device=torch.device("cuda"),
+            )
         layer.init_fake_weights(seed=42)
         return layer
 
