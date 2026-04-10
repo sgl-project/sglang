@@ -66,7 +66,10 @@ class LoRAManager:
         lora_paths: Optional[List[LoRARef]] = None,
     ):
         self.base_model: torch.nn.Module = base_model
-        self.base_hf_config: AutoConfig = base_hf_config
+        if hasattr(base_hf_config, "get_text_config"):
+            self.base_hf_config: AutoConfig = base_hf_config.get_text_config()
+        else:
+            self.base_hf_config: AutoConfig = base_hf_config
         self.max_loras_per_batch: int = max_loras_per_batch
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype

@@ -448,18 +448,10 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-    def apply_weights(
-        self,
-        layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
-    ) -> "CombineInput":
+    def get_triton_quant_info(self, layer):
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
-        quant_info = TritonMoeQuantInfo(
+        return TritonMoeQuantInfo(
             w13_weight=layer.w13_weight_packed,
             w2_weight=layer.w2_weight_packed,
             use_int4_w4a16=True,
@@ -467,6 +459,17 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
             w2_scale=layer.w2_weight_scale,
             block_shape=[0, self.group_size],
         )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
 
 

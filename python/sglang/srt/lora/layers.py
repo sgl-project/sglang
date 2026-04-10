@@ -809,10 +809,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
 
         # initialize triton_lora moe runner for batches with lora enabled
+        from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 
+        qm = base_layer.quant_method
+        if hasattr(qm, "runner") and qm.runner is not None:
+            runner_backend = qm.runner.runner_backend
+        else:
+            runner_backend = MoeRunnerBackend.TRITON
+
         self._lora_runner = MoeRunner(
-            base_layer.quant_method.runner.runner_backend,
+            runner_backend,
             base_layer.moe_runner_config,
             lora_enabled=True,
         )
