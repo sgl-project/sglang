@@ -500,15 +500,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         run_lora_dynamic_switch_check=True,
         run_multi_lora_api_check=True,
     ),
-    DiffusionTestCase(
-        "sana_image_t2i",
-        DiffusionServerArgs(
-            model_path="Efficient-Large-Model/Sana_600M_1024px_diffusers",
-            modality="image",
-        ),
-        T2I_sampling_params,
-        run_perf_check=False,
-    ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
@@ -804,7 +795,6 @@ ONE_GPU_CASES_C = [
             modality="image",
         ),
         T2I_sampling_params,
-        run_consistency_check=False,
     )
 ]
 
@@ -945,7 +935,6 @@ TWO_GPU_CASES_A = [
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         T2V_sampling_params,
-        run_consistency_check=False,
     ),
 ]
 

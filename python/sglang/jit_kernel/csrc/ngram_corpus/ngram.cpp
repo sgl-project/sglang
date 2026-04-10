@@ -92,12 +92,21 @@ void Ngram::finishExternalCorpusLoad(const std::string& corpus_id) {
   }
   // Only lock briefly to install the completed SAM.
   std::unique_lock<std::mutex> lock(mutex_);
-  sams_[corpus_id] = std::move(staging_sam_);
+  if (sams_.find(corpus_id) != sams_.end()) {
+    throw std::runtime_error(
+        "External corpus '" + corpus_id + "' already exists. Remove it before adding a new corpus with the same id.");
+  }
+  sams_.emplace(corpus_id, std::move(staging_sam_));
 }
 
 void Ngram::removeExternalCorpus(const std::string& corpus_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   sams_.erase(corpus_id);
+}
+
+void Ngram::resetStagingSam() {
+  // staging_sam_ is only accessed from the loading thread — no lock needed.
+  staging_sam_.reset();
 }
 
 void Ngram::clearExternalCorpus() {

@@ -17,98 +17,13 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=720, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=880, suite="stage-c-test-8-gpu-h200")
 
 FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
+GLM5_MODEL_PATH = "zai-org/GLM-5-FP8"
 
 
 class TestDeepseekV32DPMTP(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = FULL_DEEPSEEK_V32_MODEL_PATH
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = [
-            "--trust-remote-code",
-            "--tp",
-            "8",
-            "--dp",
-            "8",
-            "--enable-dp-attention",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--mem-frac",
-            "0.7",
-            "--model-loader-extra-config",
-            '{"enable_multithread_load": true, "num_threads": 64}',
-        ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_a_gsm8k(
-        self,
-    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
-        requests.get(self.base_url + "/flush_cache")
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=500,
-            num_threads=500,
-            num_shots=20,
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-
-        server_info = requests.get(self.base_url + "/server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32 mtp)\n"
-                f'{metrics["score"]=:.3f}\n'
-                f"{avg_spec_accept_length=:.2f}\n"
-            )
-            self.assertGreater(metrics["score"], 0.94)
-            self.assertGreater(avg_spec_accept_length, 2.7)
-
-    def test_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
-        acc_length, speed = send_one_prompt(args)
-
-        print(f"{acc_length=:.2f} {speed=:.2f}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32 mtp)\n"
-                f"{acc_length=:.2f}\n"
-                f"{speed=:.2f} token/s\n"
-            )
-
-            self.assertGreater(acc_length, 2.7)
-            self.assertGreater(speed, 90)
-
-
-class TestDeepseekV32DPMTPV2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = FULL_DEEPSEEK_V32_MODEL_PATH
@@ -217,89 +132,6 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_a_gsm8k(
-        self,
-    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
-        requests.get(self.base_url + "/flush_cache")
-
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=500,
-            num_threads=500,
-            num_shots=20,
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-
-        server_info = requests.get(self.base_url + "/server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32 mtp)\n"
-                f'{metrics["score"]=:.3f}\n'
-                f"{avg_spec_accept_length=:.2f}\n"
-            )
-            self.assertGreater(metrics["score"], 0.94)
-            self.assertGreater(avg_spec_accept_length, 2.7)
-
-    def test_bs_1_speed(self):
-        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
-        acc_length, speed = send_one_prompt(args)
-
-        print(f"{acc_length=:.2f} {speed=:.2f}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32 mtp)\n"
-                f"{acc_length=:.2f}\n"
-                f"{speed=:.2f} token/s\n"
-            )
-
-            self.assertGreater(acc_length, 2.7)
-            self.assertGreater(speed, 160)
-
-
-class TestDeepseekV32TPMTPV2(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = FULL_DEEPSEEK_V32_MODEL_PATH
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = [
-            "--trust-remote-code",
-            "--tp",
-            "8",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "4",
-            "--mem-frac",
-            "0.7",
-            "--model-loader-extra-config",
-            '{"enable_multithread_load": true, "num_threads": 64}',
-        ]
         with envs.SGLANG_ENABLE_SPEC_V2.override(True):
             cls.process = popen_launch_server(
                 cls.model,
@@ -360,6 +192,177 @@ class TestDeepseekV32TPMTPV2(CustomTestCase):
 
             self.assertGreater(acc_length, 2.7)
             self.assertGreater(speed, 180)
+
+
+class TestGLM5DPMTP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = GLM5_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--tp",
+            "8",
+            "--dp",
+            "8",
+            "--enable-dp-attention",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--mem-frac",
+            "0.8",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
+        ]
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=other_args,
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=500,
+            num_threads=500,
+            num_shots=20,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        server_info = requests.get(self.base_url + "/server_info")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (glm-5 mtp)\n"
+                f'{metrics["score"]=:.3f}\n'
+                f"{avg_spec_accept_length=:.2f}\n"
+            )
+            self.assertGreater(metrics["score"], 0.94)
+            self.assertGreater(avg_spec_accept_length, 2.7)
+
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+
+        print(f"{acc_length=:.2f} {speed=:.2f}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_bs_1_speed (glm-5 mtp)\n"
+                f"{acc_length=:.2f}\n"
+                f"{speed=:.2f} token/s\n"
+            )
+
+            self.assertGreater(acc_length, 2.7)
+            self.assertGreater(speed, 70)
+
+
+class TestGLM5TPMTP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = GLM5_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--trust-remote-code",
+            "--tp",
+            "8",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--mem-frac",
+            "0.8",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 64}',
+        ]
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=other_args,
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        requests.get(self.base_url + "/flush_cache")
+
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=500,
+            num_threads=500,
+            num_shots=20,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        server_info = requests.get(self.base_url + "/server_info")
+        avg_spec_accept_length = server_info.json()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (glm-5 mtp)\n"
+                f'{metrics["score"]=:.3f}\n'
+                f"{avg_spec_accept_length=:.2f}\n"
+            )
+            self.assertGreater(metrics["score"], 0.94)
+            self.assertGreater(avg_spec_accept_length, 2.7)
+
+    def test_bs_1_speed(self):
+        args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
+        acc_length, speed = send_one_prompt(args)
+
+        print(f"{acc_length=:.2f} {speed=:.2f}")
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_bs_1_speed (glm-5 mtp)\n"
+                f"{acc_length=:.2f}\n"
+                f"{speed=:.2f} token/s\n"
+            )
+
+            self.assertGreater(acc_length, 2.7)
+            self.assertGreater(speed, 150)
 
 
 if __name__ == "__main__":
