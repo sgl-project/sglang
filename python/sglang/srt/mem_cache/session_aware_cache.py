@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -125,6 +126,80 @@ class SessionAwareCache(BasePrefixCache):
         self.inner = inner
         self.slots: Dict[str, SessionSlot] = {}
 
+    def _debug_enabled(self) -> bool:
+        return envs.SGLANG_STREAMING_SESSION_DEBUG_LOG.get()
+
+    def _slot_summary(self, session_id: str, slot: Optional[SessionSlot] = None) -> str:
+        slot = self.slots.get(session_id) if slot is None else slot
+        if slot is None:
+            return "slot=None"
+        return (
+            f"slot.req_pool_idx={slot.req_pool_idx}, "
+            f"slot.kv_committed_len={slot.kv_committed_len}, "
+            f"slot.kv_allocated_len={slot.kv_allocated_len}, "
+            f"slot.cache_protected_len={slot.cache_protected_len}, "
+            f"slot.swa_evicted_seqlen={slot.swa_evicted_seqlen}"
+        )
+
+    @staticmethod
+    def _req_summary(req: Optional[Req]) -> str:
+        if req is None:
+            return "req=None"
+        return (
+            f"rid={getattr(req, 'rid', None)}, "
+            f"req_pool_idx={req.req_pool_idx}, "
+            f"kv_committed_len={req.kv_committed_len}, "
+            f"kv_allocated_len={req.kv_allocated_len}, "
+            f"cache_protected_len={req.cache_protected_len}, "
+            f"kv_committed_freed={getattr(req, 'kv_committed_freed', None)}, "
+            f"kv_overallocated_freed={getattr(req, 'kv_overallocated_freed', None)}"
+        )
+
+    def _log_debug(
+        self,
+        event: str,
+        session_id: str,
+        req: Optional[Req] = None,
+        slot: Optional[SessionSlot] = None,
+        **extra,
+    ) -> None:
+        if not self._debug_enabled():
+            return
+        extras = ", ".join(f"{key}={value}" for key, value in extra.items())
+        logger.info(
+            "[streaming-debug] %s session=%s %s %s%s",
+            event,
+            session_id,
+            self._slot_summary(session_id, slot),
+            self._req_summary(req),
+            f" {extras}" if extras else "",
+        )
+
+    def debug_slot_summaries(self) -> list[str]:
+        return [
+            f"{session_id}: {self._slot_summary(session_id, slot)}"
+            for session_id, slot in self.slots.items()
+            if slot.is_holding_kv
+        ]
+
+    def held_page_ids(self) -> set[int]:
+        page_ids: set[int] = set()
+        for slot in self.slots.values():
+            if not slot.is_holding_kv:
+                continue
+            start = ceil_align(slot.cache_protected_len, self.page_size)
+            end = ceil_align(slot.kv_allocated_len, self.page_size)
+            if start >= end:
+                continue
+            kv_indices = self.req_to_token_pool.req_to_token[slot.req_pool_idx, start:end]
+            if kv_indices.numel() == 0:
+                continue
+            if self.page_size > 1:
+                page_ids.update(torch.unique(kv_indices // self.page_size).tolist())
+            else:
+                page_ids.update(kv_indices.tolist())
+        return page_ids
+
     # -- Forward PrefixCacheTrait properties to inner cache --
 
     @property
@@ -193,7 +268,9 @@ class SessionAwareCache(BasePrefixCache):
         if req.to_finish is not None:
             return self.inner.match_prefix(params)
 
+        self._log_debug("restore-before", session_id, req=req, slot=slot)
         slot.restore_to_req(req)
+        self._log_debug("restore-after", session_id, req=req, slot=slot)
 
         # logprob_start_len is already forced to -1 for streaming sessions
         # (in Req.init_next_round_input), so the prefix key is not truncated
@@ -232,9 +309,10 @@ class SessionAwareCache(BasePrefixCache):
                     kv_indices = self.req_to_token_pool.req_to_token[
                         req.req_pool_idx, :end
                     ]
-                    self.token_to_kv_pool_allocator.free(kv_indices)
+                self.token_to_kv_pool_allocator.free(kv_indices)
                 self.req_to_token_pool.free_slots.append(req.req_pool_idx)
                 req.req_pool_idx = None
+            self._log_debug("cache-finished-abort", session_id, req=req, slot=slot)
             return
 
         if is_first:
@@ -242,6 +320,13 @@ class SessionAwareCache(BasePrefixCache):
             self.slots[session_id] = slot
 
         slot.save_from_req(req, is_first=is_first)
+        self._log_debug(
+            "cache-finished-save",
+            session_id,
+            req=req,
+            slot=slot,
+            is_first=is_first,
+        )
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if _is_streaming(req):
@@ -346,6 +431,7 @@ class SessionAwareCache(BasePrefixCache):
         slot = self.slots.pop(session_id, None)
         if slot is None:
             return
+        self._log_debug("release-start", session_id, req=req, slot=slot)
         protected_len, lock_node = self._resolve_release_state(slot, req)
         tokens_freed = (
             max(0, slot.kv_allocated_len - protected_len)
@@ -354,6 +440,15 @@ class SessionAwareCache(BasePrefixCache):
         )
         logger.info(
             "Session KV released: %s (%d tokens freed)", session_id, tokens_freed
+        )
+        self._log_debug(
+            "release-resolved",
+            session_id,
+            req=req,
+            slot=slot,
+            protected_len=protected_len,
+            lock_node=lock_node,
+            tokens_freed=tokens_freed,
         )
 
         if lock_node is not None:

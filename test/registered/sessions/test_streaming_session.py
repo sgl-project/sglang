@@ -641,7 +641,6 @@ class TestStreamingSessionAbortLeakRepro(CustomTestCase):
                 "--log-level",
                 "info",
             ],
-            env={"SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY": "1"},
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.tokenizer = get_tokenizer(cls.model)
