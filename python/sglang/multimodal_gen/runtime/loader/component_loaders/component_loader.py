@@ -311,7 +311,7 @@ class TokenizerLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
         # Some pipelines keep the slot name `tokenizer` in model_index.json even
-        # when the declared class is a processor. e.g.m FLUX.2:
+        # when the declared class is a processor. e.g. FLUX.2:
         # `tokenizer: ["transformers", "PixtralProcessor"]`.
         # Honor the declared component class instead of guessing from the slot name.
         if (

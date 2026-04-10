@@ -2,14 +2,12 @@ import dataclasses
 import glob
 import os
 from collections.abc import Generator, Iterable
-from contextlib import nullcontext
 from typing import cast
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import init_device_mesh
-from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModel
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
@@ -44,33 +42,6 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
-
-
-class Flux2TextEncoderWrapper(nn.Module):
-    """FLUX.2 needs local cuDNN SDPA to match the official Mistral3 text encoder."""
-
-    uses_sglang_forward_context = False
-
-    def __init__(self, model: nn.Module) -> None:
-        super().__init__()
-        self.model = model
-
-    def forward(self, input_ids, attention_mask=None, use_cache=None, **kwargs):
-        forward_kwargs = dict(kwargs)
-        forward_kwargs["input_ids"] = input_ids
-        if attention_mask is not None:
-            forward_kwargs["attention_mask"] = attention_mask
-        if use_cache is not None:
-            forward_kwargs["use_cache"] = use_cache
-
-        execution_device = input_ids.device
-        sdpa_context = (
-            sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
-            if execution_device.type == "cuda"
-            else nullcontext()
-        )
-        with sdpa_context:
-            return self.model(**forward_kwargs)
 
 
 class TextEncoderLoader(ComponentLoader):
@@ -270,8 +241,6 @@ class TextEncoderLoader(ComponentLoader):
             encoder_dtype,
             cpu_offload_flag=cpu_offload_flag,
         )
-        if self.component_architecture == "Mistral3ForConditionalGeneration":
-            return Flux2TextEncoderWrapper(model)
         return model
 
     def load_model(

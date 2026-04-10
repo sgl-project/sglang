@@ -14,10 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import inspect
+from contextlib import nullcontext
 from typing import Iterable, Optional, Union
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import Cache, DynamicCache, LlavaConfig, Mistral3Config, MistralConfig
 from transformers.masking_utils import (
     create_causal_mask,
@@ -71,10 +73,6 @@ class MistralAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
-
         self.head_dim = (
             getattr(config, "head_dim", None)
             or config.hidden_size // config.num_attention_heads
@@ -84,7 +82,6 @@ class MistralAttention(nn.Module):
         )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
-        self.is_causal = True
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
         )
@@ -325,19 +322,21 @@ class Mistral3Model(nn.Module):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        output_hidden_states: Optional[bool] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        vision_feature_layer: Optional[Union[int, list[int]]] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
-        output_hidoutput_hidden_statesden_states: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[tuple, Mistral3ModelOutputWithPast]:
+        del pixel_values, vision_feature_layer, return_dict
         output_attentions = False
         output_hidden_states = True
 
@@ -377,6 +376,7 @@ class Mistral3ForConditionalGeneration(nn.Module):
         "^language_model.lm_head": "lm_head",
     }
     _tied_weights_keys = ["lm_head.weight"]
+    uses_sglang_forward_context = False
 
     def __init__(self, config: LlavaConfig):
         super().__init__()
@@ -423,19 +423,28 @@ class Mistral3ForConditionalGeneration(nn.Module):
         """
         output_hidden_states = True
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            cache_position=cache_position,
-            image_sizes=image_sizes,
-            **kwargs,
+        execution_tensor = input_ids if input_ids is not None else inputs_embeds
+        sdpa_context = (
+            sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
+            if execution_tensor is not None and execution_tensor.device.type == "cuda"
+            else nullcontext()
         )
+        with sdpa_context:
+            # FLUX.2 uses the text-only Mistral3 path but still expects the
+            # same local SDPA kernel choice as the official HF implementation.
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position,
+                image_sizes=image_sizes,
+                **kwargs,
+            )
 
         return Mistral3CausalLMOutputWithPast(
             hidden_states=outputs.hidden_states,
