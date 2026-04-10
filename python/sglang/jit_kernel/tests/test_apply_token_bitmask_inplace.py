@@ -41,9 +41,7 @@ def _reference_apply(logits, bitmask, indices=None):
 
 
 def test_basic_bitmask():
-    bool_mask = torch.tensor(
-        [0, 1, 0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.bool
-    )
+    bool_mask = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1, 0, 1], dtype=torch.bool)
     logits = torch.tensor(
         [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
         dtype=torch.float32,
@@ -72,9 +70,7 @@ def test_dtypes(dtype):
     bitmask_bits = torch.randint(0, 2, (vocab_size,), dtype=torch.int32)
     packed = torch.zeros(bm_width, dtype=torch.int32)
     for i in range(vocab_size):
-        packed[i // BITS_PER_BLOCK] |= bitmask_bits[i].item() << (
-            i % BITS_PER_BLOCK
-        )
+        packed[i // BITS_PER_BLOCK] |= bitmask_bits[i].item() << (i % BITS_PER_BLOCK)
     bitmask = packed.to("cuda")
 
     expected = logits.clone()
@@ -144,7 +140,7 @@ def test_with_indices(dtype):
 
 
 # ---------------------------------------------------------------------------
-# Large vocab (128k) — representative of modern LLMs
+# Large vocab (128k) - representative of modern LLMs
 # ---------------------------------------------------------------------------
 
 
@@ -170,13 +166,13 @@ def test_large_vocab(dtype):
             bit = v % BITS_PER_BLOCK
             allowed = (bitmask[b, word].item() >> bit) & 1
             if allowed:
-                assert logits[b, v] == logits_ref[b, v], (
-                    f"Allowed token modified at [{b},{v}]"
-                )
+                assert (
+                    logits[b, v] == logits_ref[b, v]
+                ), f"Allowed token modified at [{b},{v}]"
             else:
-                assert logits[b, v] == float("-inf"), (
-                    f"Masked token not -inf at [{b},{v}]"
-                )
+                assert logits[b, v] == float(
+                    "-inf"
+                ), f"Masked token not -inf at [{b},{v}]"
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +213,7 @@ def test_cross_validate_aot():
     bm_width = (vocab_size + BITS_PER_BLOCK - 1) // BITS_PER_BLOCK
 
     for dtype in [torch.float32, torch.float16, torch.bfloat16]:
-        logits_jit = torch.randn(
-            batch_size, vocab_size, dtype=dtype, device="cuda"
-        )
+        logits_jit = torch.randn(batch_size, vocab_size, dtype=dtype, device="cuda")
         logits_aot = logits_jit.clone()
         bitmask = torch.randint(
             -(2**31),

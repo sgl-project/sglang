@@ -58,26 +58,20 @@ def _make_bitmask(batch_size, vocab_size, density, device="cuda"):
 def bench():
     results = []
 
-    configs = list(
-        itertools.product(BATCH_SIZES, VOCAB_SIZES, DTYPES, MASK_DENSITIES)
-    )
+    configs = list(itertools.product(BATCH_SIZES, VOCAB_SIZES, DTYPES, MASK_DENSITIES))
 
     for batch_size, vocab_size, dtype, density in configs:
         bm_width = (vocab_size + BITS_PER_BLOCK - 1) // BITS_PER_BLOCK
         bitmask = _make_bitmask(batch_size, vocab_size, density)
 
         # --- JIT CUDA ---
-        logits_jit = torch.randn(
-            batch_size, vocab_size, dtype=dtype, device="cuda"
-        )
+        logits_jit = torch.randn(batch_size, vocab_size, dtype=dtype, device="cuda")
         jit_us, _, _ = run_benchmark(
             lambda: apply_token_bitmask_inplace_jit(logits_jit, bitmask)
         )
 
         # --- Triton ---
-        logits_triton = torch.randn(
-            batch_size, vocab_size, dtype=dtype, device="cuda"
-        )
+        logits_triton = torch.randn(batch_size, vocab_size, dtype=dtype, device="cuda")
         triton_us, _, _ = run_benchmark(
             lambda: apply_token_bitmask_inplace_triton(logits_triton, bitmask)
         )
@@ -87,9 +81,7 @@ def bench():
         try:
             from sgl_kernel import apply_token_bitmask_inplace_cuda
 
-            logits_aot = torch.randn(
-                batch_size, vocab_size, dtype=dtype, device="cuda"
-            )
+            logits_aot = torch.randn(batch_size, vocab_size, dtype=dtype, device="cuda")
             aot_us, _, _ = run_benchmark(
                 lambda: apply_token_bitmask_inplace_cuda(logits_aot, bitmask)
             )
