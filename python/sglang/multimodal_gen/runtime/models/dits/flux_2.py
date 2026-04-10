@@ -852,7 +852,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
     # FLUX.2 stays closer to the official diffusers output with Torch SDPA.
     # The generic FA path still produces a measurable image-level drift here.
-    _supported_attention_backends = {AttentionBackendEnum.TORCH_SDPA}
+    _supported_attention_backends = {AttentionBackendEnum.TORCH_SDPA, AttentionBackendEnum.FA}
 
     def post_load_weights(self) -> None:
         if not isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
