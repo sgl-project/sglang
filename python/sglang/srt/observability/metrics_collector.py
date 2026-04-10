@@ -130,6 +130,9 @@ class SchedulerStats:
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
 
+    # GPU memory
+    available_gpu_memory_gb: float = 0.0
+
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
     routing_key_running_req_counts: List[int] = field(default_factory=list)
@@ -395,6 +398,14 @@ class SchedulerMetricsCollector:
         self.max_running_requests_under_SLO = Gauge(
             name="sglang:max_running_requests_under_SLO",
             documentation="The maximum number of running requests under SLO.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # GPU memory
+        self.available_gpu_memory_gb = Gauge(
+            name="sglang:available_gpu_memory_gb",
+            documentation="Available GPU memory in GB.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1020,6 +1031,9 @@ class SchedulerMetricsCollector:
                 self.max_running_requests_under_SLO,
                 stats.max_running_requests_under_SLO,
             )
+
+        # GPU memory
+        self._log_gauge(self.available_gpu_memory_gb, stats.available_gpu_memory_gb)
 
         # Engine startup time
         self._log_gauge(self.engine_startup_time, stats.engine_startup_time)
