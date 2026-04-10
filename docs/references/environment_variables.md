@@ -19,6 +19,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_FORWARD_UNKNOWN_TOOLS`            | Forward unknown tool calls to clients instead of dropping them                                                                   | `false` (drop unknown tools) |
 | `SGLANG_REQ_WAITING_TIMEOUT`              | Timeout (in seconds) for requests waiting in the queue before being scheduled                                                    | `-1`                         |
 | `SGLANG_REQ_RUNNING_TIMEOUT`              | Timeout (in seconds) for requests running in the decode batch                                                                    | `-1`                         |
+| `SGLANG_CACHE_DIR`                        | Cache directory for model weights and other data | `~/.cache/sglang` |
 
 ## Performance Tuning
 
@@ -45,6 +46,9 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH` | Enable NCCL for gathering when preparing mlp sync batch under overlap scheduler (without this flag gloo is used for gathering) | `false` |
 | `SGLANG_SYMM_MEM_PREALLOC_GB_SIZE` | Size of preallocated GPU buffer (in GB) for NCCL symmetric memory pool to limit memory fragmentation. Only have an effect when server arg `--enable-symm-mem` is set. | `-1` |
 | `SGLANG_CUSTOM_ALLREDUCE_ALGO` | The algorithm of custom all-reduce. Set to `oneshot` or `1stage` to force use one-shot. Set to `twoshot` or `2stage` to force use two-shot. | `` |
+| `SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM prefill attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
+| `SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR` | Skip-softmax threshold scale factor for TRT-LLM decode attention in flashinfer. `None` means standard attention. See https://arxiv.org/abs/2512.12087 | `None` |
+| `SGLANG_USE_SGL_FA3_KERNEL`               | Use sgl-kernel implementation for FlashAttention v3 | `true` |
 
 
 ## DeepGEMM Configuration (Advanced Optimization)
@@ -74,11 +78,11 @@ SGLang supports various environment variables that can be used to configure its 
 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
-| `SGLANG_MORI_FP8_DISP` | Use FP8 for dispatch | `"false"` |
-| `SGLANG_MORI_FP4_DISP` | Use MXFP4 for dispatch | `"false"` |
+| `SGLANG_MORI_DISPATCH_DTYPE` | Override MoRI-EP dispatch quantization type. `auto` uses auto-detection from weight dtype; `bf16`/`fp8`/`fp4` forces the specified type for all layers | `"auto"` |
 | `SGLANG_MORI_FP8_COMB` | Use FP8 for combine | `"false"` |
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
+| `SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS` | This argument devives `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` which indicates customized amount of tokens preallocated for a rank, valid range from 1 to world_size*SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, by default `0` means maximum. Setting a smaller value will reduce memory footprint but too small value could cause buffer overflow. | `0` |
 | `SGLANG_MORI_QP_PER_TRANSFER` | Number of RDMA Queue Pairs (QPs) used per transfer operation | `1` |
 | `SGLANG_MORI_POST_BATCH_SIZE` | Number of RDMA work requests posted in a single batch to each QP | `-1` |
 | `SGLANG_MORI_NUM_WORKERS` | Number of worker threads in the RDMA executor thread pool | `1` |
@@ -120,12 +124,9 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_INT4_WEIGHT` | Enable INT4 weight quantization | `false` |
 | `SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2` | Apply per token group quantization kernel with fused silu and mul and masked m | `false` |
 | `SGLANG_FORCE_FP8_MARLIN` | Force using FP8 MARLIN kernels even if other FP8 kernels are available | `false` |
-| `SGLANG_FLASHINFER_FP4_GEMM_BACKEND` (deprecated) | Select backend for `mm_fp4` on Blackwell GPUs. **DEPRECATED**: Please use `--fp4-gemm-backend` instead. | `` |
 | `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN` | Quantize q_b_proj from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
 | `SGLANG_MOE_NVFP4_DISPATCH` | Use nvfp4 for moe dispatch (on flashinfer_cutlass or flashinfer_cutedsl moe runner backend) | `"false"` |
 | `SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE` | Quantize moe of nextn layer from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
-| `SGLANG_ENABLE_FLASHINFER_FP8_GEMM` (deprecated) | Use flashinfer kernels when running blockwise fp8 GEMM on Blackwell GPUs. **DEPRECATED**: Please use `--fp8-gemm-backend=flashinfer_trtllm` (SM100/SM103) or `--fp8-gemm-backend=flashinfer_cutlass` (SM120/SM121 and newer) instead. | `false` |
-| `SGLANG_SUPPORT_CUTLASS_BLOCK_FP8` (deprecated) | Use Cutlass kernels when running blockwise fp8 GEMM on Hopper or Blackwell GPUs. **DEPRECATED**: Please use `--fp8-gemm-backend=cutlass` instead. | `false` |
 | `SGLANG_QUANT_ALLOW_DOWNCASTING` | Allow weight dtype downcasting during loading (e.g., fp32 → fp16). By default, SGLang rejects this kind of downcasting when using quantization. | `false` |
 | `SGLANG_FP8_IGNORED_LAYERS` | A comma-separated list of layer names to ignore during FP8 quantization. For example: `model.layers.0,model.layers.1.,qkv_proj`. | `""` |
 
@@ -139,6 +140,15 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_PP_LAYER_PARTITION` | Pipeline parallel layer partition specification | Not set |
 | `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` | Set one visible device per process for distributed computing | `false` |
 
+## PD Disaggregation — Staging Buffer (Heterogeneous TP)
+
+| Environment Variable | Description | Default Value |
+| --- | --- | --- |
+| `SGLANG_DISAGG_STAGING_BUFFER` | Enable GPU staging buffer for heterogeneous TP KV transfer. Required when prefill and decode use different TP/attention-TP sizes. Only for non-MLA models (e.g. GQA, MHA). | `false` |
+| `SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB` | Prefill-side per-worker staging buffer size in MB. Used for gathering KV head slices before bulk RDMA transfer. | `64` |
+| `SGLANG_DISAGG_STAGING_POOL_SIZE_MB` | Decode-side ring buffer pool total size in MB. Shared buffer receiving RDMA data from all prefill ranks. Larger values support higher concurrency. | `4096` |
+| `SGLANG_STAGING_USE_TORCH` | Force using PyTorch gather/scatter fallback instead of Triton fused kernels for staging operations. Useful for debugging. | `false` |
+
 ## Testing & Debugging (Internal/CI)
 
 *These variables are primarily used for internal testing, continuous integration, or debugging.*
@@ -151,6 +161,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_TEST_RETRACT_NO_PREFILL_BS` | When SGLANG_TEST_RETRACT is enabled, no prefill is performed if the batch size exceeds SGLANG_TEST_RETRACT_NO_PREFILL_BS. | `2 ** 31`     |
 | `SGLANG_RECORD_STEP_TIME` | Record step time for profiling | `false` |
 | `SGLANG_TEST_REQUEST_TIME_STATS` | Test request time statistics | `false` |
+| `SGLANG_DEBUG_SYMM_MEM` | Enable debug checks that verify tensors passed to NCCL communication ops are allocated in the symmetric memory pool. Logs warnings (rank 0 only) with stack traces for any tensor not in the pool. | `false` |
 | `SGLANG_KERNEL_API_LOGLEVEL` | Controls crash-debug kernel API logging. `0` disables logging, `1` logs API names, `3` logs tensor metadata, `5` adds tensor statistics, and `10` also writes pre-call dump snapshots. | `0` |
 | `SGLANG_KERNEL_API_LOGDEST` | Destination for crash-debug kernel API logs. Use `stdout`, `stderr`, or a file path. `%i` is replaced with the process PID. | `stdout` |
 | `SGLANG_KERNEL_API_DUMP_DIR` | Output directory for level-10 kernel API input/output dumps. `%i` is replaced with the process PID. | `sglang_kernel_api_dumps` |

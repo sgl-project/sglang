@@ -1,6 +1,7 @@
 from typing import List, Union
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -59,6 +60,28 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
 
+    def compute_mrope_positions(self, input_ids, mm_items):
+        image_grid_thw = None
+        video_grid_thw = None
+        for item in mm_items:
+            if "image_grid_thw" in item.model_specific_data:
+                image_grid_thw = item.model_specific_data["image_grid_thw"]
+            if "video_grid_thw" in item.model_specific_data:
+                video_grid_thw = item.model_specific_data["video_grid_thw"]
+
+        import torch
+
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
+        attention_mask = torch.ones_like(input_ids_tensor)
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=input_ids_tensor,
+            hf_config=self.hf_config,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+        )
+        return mrope_positions.squeeze(1), mrope_position_delta
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -90,13 +113,11 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
         mrope_positions = mrope_positions.squeeze(1)
 
-        mm_inputs = {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.video_token_id,
-            "mrope_positions": mrope_positions,
-            "mrope_position_delta": mrope_position_delta,
-        }
-
-        return mm_inputs
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )

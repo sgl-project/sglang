@@ -30,7 +30,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
-    apply_qk_norm,
+    apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -47,11 +47,15 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
 
 try:
     from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
@@ -560,14 +564,26 @@ class QwenImageCrossAttention(nn.Module):
                 )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            self.to_add_out = ReplicatedLinear(
+                self.inner_dim,
+                self.dim,
+                bias=out_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
+            )
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+                ReplicatedLinear(
+                    self.inner_dim,
+                    self.dim,
+                    bias=out_bias,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
             )
         else:
             self.to_out = None
@@ -614,26 +630,7 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
-        # Apply QK normalization
-        if self.qk_norm:
-            img_query, img_key = apply_qk_norm(
-                q=img_query,
-                k=img_key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
-                allow_inplace=True,
-            )
-            txt_query, txt_key = apply_qk_norm(
-                q=txt_query,
-                k=txt_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=txt_query.shape[-1],
-                allow_inplace=True,
-            )
-
-        # Apply RoPE
+        img_cache = txt_cache = None
         if image_rotary_emb is not None:
             if not (
                 isinstance(image_rotary_emb[0], torch.Tensor)
@@ -643,6 +640,28 @@ class QwenImageCrossAttention(nn.Module):
 
             img_cache, txt_cache = image_rotary_emb
 
+        if self.qk_norm:
+            img_query, img_key = apply_qk_norm_with_optional_rope(
+                q=img_query,
+                k=img_key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=img_query.shape[-1],
+                cos_sin_cache=img_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+            txt_query, txt_key = apply_qk_norm_with_optional_rope(
+                q=txt_query,
+                k=txt_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=txt_query.shape[-1],
+                cos_sin_cache=txt_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+        elif img_cache is not None and txt_cache is not None:
             img_query, img_key = apply_flashinfer_rope_qk_inplace(
                 img_query, img_key, img_cache, is_neox=False
             )
@@ -706,8 +725,12 @@ class QwenImageTransformerBlock(nn.Module):
         # Image processing modules
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.img_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.img_norm1 = LayerNormScaleShift(
@@ -730,8 +753,12 @@ class QwenImageTransformerBlock(nn.Module):
         # Text processing modules
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(
-                dim, 6 * dim, bias=True
+            ReplicatedLinear(
+                dim,
+                6 * dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=f"{prefix}.txt_mod",
             ),  # For scale, shift, gate for norm1 and norm2
         )
         self.txt_norm1 = LayerNormScaleShift(
@@ -803,30 +830,52 @@ class QwenImageTransformerBlock(nn.Module):
 
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
-            actual_batch = x.shape[0]
-            shift0, shift1 = (
-                shift[:actual_batch],
-                shift[actual_batch : 2 * actual_batch],
-            )
-            scale0, scale1 = (
-                scale[:actual_batch],
-                scale[actual_batch : 2 * actual_batch],
-            )
-            gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
-            if not x.is_contiguous():
-                x = x.contiguous()
-            if not index.is_contiguous():
-                index = index.contiguous()
-            if is_scale_residual:
-                if not residual_x.is_contiguous():
-                    residual_x = residual_x.contiguous()
-                if not gate_x.is_contiguous():
-                    gate_x = gate_x.contiguous()
-                x, residual_out, gate_result = (
-                    fuse_residual_layernorm_scale_shift_gate_select01_kernel(
+            # ROCm currently fails to compile the select01 Triton kernel, so
+            # keep using the torch.where fallback there.
+            if x.is_cuda and not current_platform.is_hip():
+                actual_batch = x.shape[0]
+                shift0, shift1 = (
+                    shift[:actual_batch],
+                    shift[actual_batch : 2 * actual_batch],
+                )
+                scale0, scale1 = (
+                    scale[:actual_batch],
+                    scale[actual_batch : 2 * actual_batch],
+                )
+                gate0, gate1 = (
+                    gate[:actual_batch],
+                    gate[actual_batch : 2 * actual_batch],
+                )
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                if not index.is_contiguous():
+                    index = index.contiguous()
+                if is_scale_residual:
+                    if not residual_x.is_contiguous():
+                        residual_x = residual_x.contiguous()
+                    if not gate_x.is_contiguous():
+                        gate_x = gate_x.contiguous()
+                    x, residual_out, gate_result = (
+                        fuse_residual_layernorm_scale_shift_gate_select01_kernel(
+                            x,
+                            residual=residual_x,
+                            residual_gate=gate_x,
+                            weight=getattr(norm_module.norm, "weight", None),
+                            bias=getattr(norm_module.norm, "bias", None),
+                            scale0=scale0.contiguous(),
+                            shift0=shift0.contiguous(),
+                            gate0=gate0.contiguous(),
+                            scale1=scale1.contiguous(),
+                            shift1=shift1.contiguous(),
+                            gate1=gate1.contiguous(),
+                            index=index,
+                            eps=norm_module.eps,
+                        )
+                    )
+                    return x, residual_out, gate_result
+                else:
+                    x, gate_result = fuse_layernorm_scale_shift_gate_select01_kernel(
                         x,
-                        residual=residual_x,
-                        residual_gate=gate_x,
                         weight=getattr(norm_module.norm, "weight", None),
                         bias=getattr(norm_module.norm, "bias", None),
                         scale0=scale0.contiguous(),
@@ -838,39 +887,45 @@ class QwenImageTransformerBlock(nn.Module):
                         index=index,
                         eps=norm_module.eps,
                     )
-                )
-                return x, residual_out, gate_result
+                    return x, gate_result
             else:
-                x, gate_result = fuse_layernorm_scale_shift_gate_select01_kernel(
-                    x,
-                    weight=getattr(norm_module.norm, "weight", None),
-                    bias=getattr(norm_module.norm, "bias", None),
-                    scale0=scale0.contiguous(),
-                    shift0=shift0.contiguous(),
-                    gate0=gate0.contiguous(),
-                    scale1=scale1.contiguous(),
-                    shift1=shift1.contiguous(),
-                    gate1=gate1.contiguous(),
-                    index=index,
-                    eps=norm_module.eps,
+                actual_batch = x.shape[0]
+                shift0, shift1 = (
+                    shift[:actual_batch],
+                    shift[actual_batch : 2 * actual_batch],
                 )
-                return x, gate_result
+                scale0, scale1 = (
+                    scale[:actual_batch],
+                    scale[actual_batch : 2 * actual_batch],
+                )
+                gate0, gate1 = (
+                    gate[:actual_batch],
+                    gate[actual_batch : 2 * actual_batch],
+                )
+                index = index.to(dtype=torch.bool).unsqueeze(-1)
+                shift_result = torch.where(
+                    index, shift1.unsqueeze(1), shift0.unsqueeze(1)
+                )
+                scale_result = torch.where(
+                    index, scale1.unsqueeze(1), scale0.unsqueeze(1)
+                )
+                gate_result = torch.where(index, gate1.unsqueeze(1), gate0.unsqueeze(1))
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
-            if is_scale_residual:
-                modulated, residual_out = norm_module(
-                    residual=residual_x,
-                    x=x,
-                    gate=gate_x,
-                    shift=shift_result,
-                    scale=scale_result,
-                )
-                return modulated, residual_out, gate_result
-            else:
-                modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
-                return modulated, gate_result
+        if is_scale_residual:
+            modulated, residual_out = norm_module(
+                residual=residual_x,
+                x=x,
+                gate=gate_x,
+                shift=shift_result,
+                scale=scale_result,
+            )
+            return modulated, residual_out, gate_result
+        else:
+            modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
+            return modulated, gate_result
 
     def forward(
         self,
@@ -884,8 +939,8 @@ class QwenImageTransformerBlock(nn.Module):
         modulate_index: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
-        txt_mod_params = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
+        img_mod_params, _ = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
+        txt_mod_params, _ = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]
 
         if (
             self.quant_config is not None
@@ -1104,8 +1159,8 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             first_size = sample[0][0] * sample[0][1] * sample[0][2]
             total_size = sum(s[0] * s[1] * s[2] for s in sample)
             if sp_world_size > 1:
-                first_local_size = _local_seq_len(first_size)
-                tail_local_size = _local_seq_len(total_size - first_size)
+                first_local_size = _local_seq_len(first_size, sp_world_size)
+                tail_local_size = _local_seq_len(total_size - first_size, sp_world_size)
                 idx = torch.cat(
                     [
                         torch.zeros(first_local_size, device=device, dtype=torch.int),

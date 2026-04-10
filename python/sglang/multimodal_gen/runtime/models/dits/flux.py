@@ -29,7 +29,10 @@ from torch.nn import LayerNorm as LayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm_with_optional_rope,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -44,7 +47,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     CombinedTimestepGuidanceTextProjEmbeddings,
@@ -192,7 +194,7 @@ def _get_qkv_projections(
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if getattr(attn, "use_fused_added_qkv", False):
+        if attn.use_fused_added_qkv:
             added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = [
                 x.contiguous() for x in added_qkv.chunk(3, dim=-1)
@@ -354,37 +356,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
-        query, key = apply_qk_norm(
-            q=query,
-            k=key,
-            q_norm=self.norm_q,
-            k_norm=self.norm_k,
-            head_dim=self.head_dim,
-            allow_inplace=True,
-        )
-
-        if self.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
-
-            encoder_query, encoder_key = apply_qk_norm(
-                q=encoder_query,
-                k=encoder_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=self.head_dim,
-                allow_inplace=True,
-            )
-
-            bsz, seq_len, _, _ = query.shape
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
-            num_replicated_prefix = (
-                num_replicated_prefix or encoder_hidden_states.shape[1]
-            )
-
+        cos_sin_cache = None
         if freqs_cis is not None:
             cos, sin = freqs_cis
             cos_sin_cache = torch.cat(
@@ -394,8 +366,51 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=-1,
             )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
+
+        if self.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
+
+            text_seq_len = encoder_query.shape[1]
+            encoder_query, encoder_key = apply_qk_norm_with_optional_rope(
+                q=encoder_query,
+                k=encoder_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                allow_inplace=True,
+            )
+            query, key = apply_qk_norm_with_optional_rope(
+                q=query,
+                k=key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                position_offset=text_seq_len,
+                allow_inplace=True,
+            )
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+            num_replicated_prefix = (
+                num_replicated_prefix or encoder_hidden_states.shape[1]
+            )
+        else:
+            query, key = apply_qk_norm_with_optional_rope(
+                q=query,
+                k=key,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=False,
+                allow_inplace=True,
             )
 
         x = self.attn(query, key, value, num_replicated_prefix=num_replicated_prefix)
@@ -707,9 +722,9 @@ class FluxPosEmbed(nn.Module):
             use_real=False,
             repeat_interleave_real=False,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
         )
 

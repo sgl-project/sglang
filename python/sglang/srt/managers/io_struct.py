@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import uuid
 from abc import ABC
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import BaseFinishReason, Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.observability.req_time_stats import (
@@ -57,6 +59,15 @@ class BaseReq(ABC):
         else:
             self.rid = uuid.uuid4().hex
         return self.rid
+
+    def _validate_rid_uniqueness(self):
+        """Validate that request IDs within a batch are unique."""
+        if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
+            counts = Counter(self.rid)
+            duplicates = [rid for rid, count in counts.items() if count > 1]
+            raise ValueError(
+                f"Duplicate request IDs detected within the request: {duplicates}"
+            )
 
 
 @dataclass
@@ -127,6 +138,10 @@ class GenerateReqInput(BaseReq):
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+    # Embedding overrides to place at specific token positions.
+    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
+    positional_embed_overrides: Any = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -275,6 +290,8 @@ class GenerateReqInput(BaseReq):
             self._normalize_single_inputs()
         else:
             self._normalize_batch_inputs()
+
+        self._validate_rid_uniqueness()
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -588,13 +605,29 @@ class GenerateReqInput(BaseReq):
             ):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
+    def _get_positional_embed_overrides_item(
+        self, i: int
+    ) -> Optional[PositionalEmbeds]:
+        """Extract the i-th item from positional_embed_overrides."""
+        if self.positional_embed_overrides is None:
+            return None
+        if isinstance(self.positional_embed_overrides, PositionalEmbeds):
+            return self.positional_embed_overrides
+        return self.positional_embed_overrides[i]
+
     def __getitem__(self, i):
-        return GenerateReqInput(
+        # Cache sub-objects so that repeated obj[i] calls return the same instance.
+        # This avoids subtle bugs where different call sites get divergent objects.
+        cache = self.__dict__.setdefault("_sub_obj_cache", {})
+        if i in cache:
+            return cache[i]
+        sub = GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
+            positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
@@ -653,6 +686,8 @@ class GenerateReqInput(BaseReq):
             http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,
         )
+        cache[i] = sub
+        return sub
 
 
 @dataclass
@@ -662,7 +697,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # The input token ids
     input_ids: List[int]
     # The multimodal inputs
-    mm_inputs: dict
+    mm_inputs: object
     # The sampling parameters
     sampling_params: SamplingParams
     # Whether to return the logprobs
@@ -686,6 +721,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
+
+    # Embedding overrides to place at specific token positions.
+    positional_embed_overrides: Optional[PositionalEmbeds] = None
 
     # Session info for continual prompting
     session_params: Optional[SessionParams] = None
@@ -731,6 +769,8 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    token_type_ids: Optional[List[int]] = None
+
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
@@ -770,6 +810,18 @@ class EmbeddingReqInput(BaseReq):
     audio_data: Optional[MultimodalDataInputFormat] = None
     # The token ids for text; one can either specify text or input_ids.
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # Placeholder token ID used to locate embedding override positions in input token IDs.
+    embed_override_token_id: Optional[int] = None
+    # Unresolved embedding overrides: per-input list of tensors.
+    # Position resolution happens in the tokenizer manager after tokenization.
+    # Shape: [num_inputs][num_replacements] where each entry is a torch.Tensor of [hidden_size].
+    # Per-input entry may be None when only some inputs in a batch need overrides.
+    # Runtime type: Optional[List[Optional[List[torch.Tensor]]]]
+    # Typed as Any to avoid Pydantic/FastAPI schema errors (contains torch.Tensor).
+    embed_overrides: Any = None
+    # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
+    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    positional_embed_overrides: Any = None
     # Dummy sampling params for compatibility
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Dummy input embeds for compatibility
@@ -853,6 +905,8 @@ class EmbeddingReqInput(BaseReq):
 
             self._normalize_lora_paths(self.batch_size)
 
+        self._validate_rid_uniqueness()
+
     def _normalize_lora_paths(self, num):
         """Normalize LoRA paths for batch processing."""
         if self.lora_path is not None:
@@ -873,10 +927,26 @@ class EmbeddingReqInput(BaseReq):
             or has_valid_data(self.audio_data)
         )
 
+    def _get_positional_embed_overrides_item(
+        self, i: int
+    ) -> Optional[PositionalEmbeds]:
+        """Extract the i-th item from positional_embed_overrides."""
+        if self.positional_embed_overrides is None:
+            return None
+        if isinstance(self.positional_embed_overrides, PositionalEmbeds):
+            return self.positional_embed_overrides
+        return self.positional_embed_overrides[i]
+
     def __getitem__(self, i):
+        # Cache sub-objects so that repeated obj[i] calls return the same instance.
+        cache = self.__dict__.setdefault("_sub_obj_cache", {})
+        if i in cache:
+            return cache[i]
+
         if self.is_cross_encoder_request:
-            return EmbeddingReqInput(
+            sub = EmbeddingReqInput(
                 text=[self.text[i]] if self.text is not None else None,
+                positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
                 lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -884,22 +954,31 @@ class EmbeddingReqInput(BaseReq):
                 is_cross_encoder_request=True,
                 http_worker_ipc=self.http_worker_ipc,
             )
-
-        return EmbeddingReqInput(
-            text=self.text[i] if self.text is not None else None,
-            input_ids=self.input_ids[i] if self.input_ids is not None else None,
-            image_data=self.image_data[i] if self.image_data is not None else None,
-            audio_data=self.audio_data[i] if self.audio_data is not None else None,
-            video_data=self.video_data[i] if self.video_data is not None else None,
-            sampling_params=self.sampling_params[i],
-            rid=self.rid[i],
-            lora_path=self.lora_path[i] if self.lora_path is not None else None,
-            lora_id=self.lora_id[i] if self.lora_id is not None else None,
-            external_trace_header=self.external_trace_header,
-            dimensions=self.dimensions,
-            http_worker_ipc=self.http_worker_ipc,
-            received_time=self.received_time,
-        )
+        else:
+            sub = EmbeddingReqInput(
+                text=self.text[i] if self.text is not None else None,
+                input_ids=self.input_ids[i] if self.input_ids is not None else None,
+                embed_override_token_id=self.embed_override_token_id,
+                embed_overrides=(
+                    self.embed_overrides[i]
+                    if self.embed_overrides is not None
+                    else None
+                ),
+                positional_embed_overrides=self._get_positional_embed_overrides_item(i),
+                image_data=self.image_data[i] if self.image_data is not None else None,
+                audio_data=self.audio_data[i] if self.audio_data is not None else None,
+                video_data=self.video_data[i] if self.video_data is not None else None,
+                sampling_params=self.sampling_params[i],
+                rid=self.rid[i],
+                lora_path=self.lora_path[i] if self.lora_path is not None else None,
+                lora_id=self.lora_id[i] if self.lora_id is not None else None,
+                external_trace_header=self.external_trace_header,
+                dimensions=self.dimensions,
+                http_worker_ipc=self.http_worker_ipc,
+                received_time=self.received_time,
+            )
+        cache[i] = sub
+        return sub
 
 
 @dataclass
@@ -914,12 +993,15 @@ class TokenizedEmbeddingReqInput(BaseReq):
     token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
+    # Embedding overrides to place at specific token positions.
+    positional_embed_overrides: Optional[PositionalEmbeds] = None
     # For DP routing
     routed_dp_rank: Optional[int] = None
     # Priority for the request
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
     # For observability
@@ -958,6 +1040,7 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # Token counts
     prompt_tokens: List[int]
+    reasoning_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
 
@@ -1006,38 +1089,6 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
-
-
-@dataclass
-class BatchMultimodalDecodeReq(BaseBatchReq):
-    decoded_ids: List[int]
-    input_token_logprobs_val: List[float]
-    input_token_logprobs_idx: List[int]
-    output_token_logprobs_val: List[float]
-    output_token_logprobs_idx: List[int]
-    read_offsets: List[int]
-    skip_special_tokens: List[bool]
-    spaces_between_special_tokens: List[bool]
-    image_resolutions: List[List[int]]
-    resize_image_resolutions: List[List[int]]
-
-    finished_reasons: List[BaseFinishReason]
-
-    # Token counts
-    prompt_tokens: List[int]
-    completion_tokens: List[int]
-    cached_tokens: List[int]
-
-    # The information of placeholder tokens (e.g., image token)
-    # idx is the index of the token in the prompt after expansion.
-    # val is the length of padded tokens after expansion.
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
-
-    return_bytes: List[bool]
-
-    # The trainer step id. Used to know which step's weights are used for sampling.
-    token_steps: List[List[int]] = None
 
 
 @dataclass
@@ -1052,6 +1103,7 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Token counts
     prompt_tokens: List[int]
     completion_tokens: List[int]
+    reasoning_tokens: List[int]
     cached_tokens: List[int]
 
     # Logprobs
@@ -1097,36 +1149,6 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
-
-    # For observability
-    time_stats: Optional[List[SchedulerReqTimeStats]] = None
-
-
-@dataclass
-class BatchMultimodalOutput(BaseBatchReq):
-    # The finish reason
-    finished_reasons: List[dict]
-    decoded_ids: List[List[int]]
-    # The outputs
-    outputs: Union[List[str | bytes], List[List[Dict]]]
-
-    # probability values for input tokens and output tokens
-    input_token_logprobs_val: List[List[float]]
-    input_token_logprobs_idx: List[List[int]]
-    output_token_logprobs_val: List[List[float]]
-    output_token_logprobs_idx: List[List[int]]
-
-    # Token counts
-    prompt_tokens: List[int]
-    completion_tokens: List[int]
-    cached_tokens: List[int]
-
-    placeholder_tokens_idx: List[Optional[List[int]]]
-    placeholder_tokens_val: List[Optional[List[int]]]
-
-    return_bytes: List[bool]
-    # Detailed breakdown of cached tokens by source (device/host/storage)
-    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
@@ -1166,12 +1188,52 @@ class ClearHiCacheReqOutput(BaseReq):
 
 @dataclass
 class FlushCacheReqInput(BaseReq):
-    pass
+    timeout_s: Optional[float] = None
 
 
 @dataclass
 class FlushCacheReqOutput(BaseReq):
     success: bool
+    message: str = ""
+
+
+@dataclass
+class AddExternalCorpusReqInput(BaseReq):
+    corpus_id: Optional[str] = None
+    file_path: Optional[str] = None
+    documents: Optional[List[str]] = None
+    token_chunks: Optional[List[List[int]]] = None
+
+
+@dataclass
+class AddExternalCorpusReqOutput(BaseReq):
+    success: bool
+    corpus_id: str = ""
+    message: str = ""
+    loaded_token_count: int = 0
+
+
+@dataclass
+class RemoveExternalCorpusReqInput(BaseReq):
+    corpus_id: str
+
+
+@dataclass
+class RemoveExternalCorpusReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
+class ListExternalCorporaReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class ListExternalCorporaReqOutput(BaseReq):
+    success: bool
+    corpus_ids: List[str] = field(default_factory=list)
+    message: str = ""
 
 
 @dataclass
@@ -1225,21 +1287,6 @@ class DetachHiCacheStorageReqInput(BaseReq):
 @dataclass
 class DetachHiCacheStorageReqOutput(BaseReq):
     success: bool
-    message: str = ""
-
-
-@dataclass
-class PinPrefixReqInput(BaseReq):
-    """Pin a prefix by token_ids to resist eviction."""
-
-    token_ids: List[int] = field(default_factory=list)
-    ttl_seconds: int = 300  # TTL in seconds, default 5 minutes
-
-
-@dataclass
-class PinPrefixReqOutput(BaseReq):
-    success: bool
-    nodes_pinned: int = 0
     message: str = ""
 
 

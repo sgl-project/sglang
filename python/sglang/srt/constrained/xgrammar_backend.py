@@ -104,11 +104,7 @@ class XGrammarGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if (
-            logits.device.type == "cuda"
-            or logits.device.type == "npu"
-            or logits.device.type == "xpu"
-        ):
+        if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
@@ -317,6 +313,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         )
 
     def reset(self):
+        super().reset()
         self.grammar_compiler.clear_cache()
 
 

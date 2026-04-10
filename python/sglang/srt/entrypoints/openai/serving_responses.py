@@ -76,7 +76,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         template_manager: TemplateManager,
         *,
         enable_prompt_tokens_details: bool = False,
-        enable_force_include_usage: bool = False,
         tool_server: Optional[ToolServer] = None,
     ) -> None:
         super().__init__(tokenizer_manager, template_manager)
@@ -84,7 +83,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # template_manager is already set by parent class
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
-        self.enable_force_include_usage = enable_force_include_usage
 
         # Get default sampling params from model config if available
         self.default_sampling_params = {}

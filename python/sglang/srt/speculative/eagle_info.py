@@ -284,15 +284,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             or sampling_info.logit_bias is not None
         ):
             # This is a relaxed version of penalties for speculative decoding.
-            linear_penalty = torch.zeros(
-                (bs, logits_output.next_token_logits.shape[1]),
-                dtype=torch.float32,
-                device=batch.device,
+            sampling_info.penalizer_orchestrator.apply(
+                logits_output.next_token_logits, repeat=self.draft_token_num
             )
-            sampling_info.apply_logits_bias(linear_penalty)
-            logits_output.next_token_logits.add_(
-                torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-            )
+            if sampling_info.logit_bias is not None:
+                logits_output.next_token_logits.add_(
+                    torch.repeat_interleave(
+                        sampling_info.logit_bias, self.draft_token_num, dim=0
+                    )
+                )
 
         # Apply grammar mask
         if vocab_mask is not None:
@@ -392,6 +392,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
         has_finished = False
+        think_end_id = batch.model_config.think_end_id
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -403,6 +404,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 num_accepted += 1
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
+                if req.require_reasoning and think_end_id is not None:
+                    req.update_reasoning_tokens(id, think_end_id)
                 req.check_finished()
                 if req.finished():
                     has_finished = True

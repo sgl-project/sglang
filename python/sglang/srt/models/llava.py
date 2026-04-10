@@ -53,8 +53,26 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.utils import add_prefix, flatten_nested_list, logger
 
+_KNOWN_BROKEN_AUTOMODEL_CONFIG = "VoxtralRealtimeTextConfig"
+_KNOWN_BROKEN_AUTOMODEL_ERROR = "Could not find VoxtralRealtimeTextModel"
+
 
 class LlavaBaseForCausalLM(nn.Module):
+    @staticmethod
+    def _infer_image_aspect_ratio(mm_items):
+        """Determine image_aspect_ratio from processor metadata or item count."""
+        # Check if processor stored the aspect_ratio it used
+        for item in mm_items:
+            ar = item.model_specific_data.get("image_aspect_ratio")
+            if ar is not None:
+                return ar
+        # Fallback: multi-image or video → pad, single image → anyres
+        image_items = [item for item in mm_items if item.is_image()]
+        has_video = any(item.is_video() for item in mm_items)
+        if len(image_items) > 1 or has_video:
+            return "pad"
+        return "anyres"
+
     def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         image_sizes = flatten_nested_list(
             [item.image_sizes for item in image_inputs.mm_items]
@@ -63,13 +81,8 @@ class LlavaBaseForCausalLM(nn.Module):
         pad_values = [item.pad_value for item in image_inputs.mm_items]
 
         # hardcode for spatial_unpad + anyres
-        if any(
-            item.modality == Modality.MULTI_IMAGES or item.modality == Modality.VIDEO
-            for item in image_inputs.mm_items
-        ):
-            image_aspect_ratio = "pad"
-        else:
-            image_aspect_ratio = "anyres"
+        # Use per-item aspect_ratio from processor if available, else infer
+        image_aspect_ratio = self._infer_image_aspect_ratio(image_inputs.mm_items)
         offset_list = []
         image_inputs.image_pad_len = []
         for image_idx, image_s in enumerate(image_sizes):
@@ -165,13 +178,9 @@ class LlavaBaseForCausalLM(nn.Module):
             # Embed text inputs
             input_embeds = self.language_model.model.embed_tokens(input_ids)
 
-            # Got List[List[str]] extend it to List[str]
-            # The length of the List should be equal to batch size
-            modalities_list = []
+            # Compute max image offset per request to determine need_vision
             max_image_offset = []
             for im in image_inputs:
-                if im:
-                    modalities_list.extend([item.modality for item in im.mm_items])
                 if im and im.image_offsets:
                     max_image_offset.append(
                         np.max(np.array(im.image_offsets) + np.array(im.image_pad_len))
@@ -184,6 +193,18 @@ class LlavaBaseForCausalLM(nn.Module):
 
             if need_vision.any():
                 bs = forward_batch.batch_size
+
+                # Build per-image lists filtered by need_vision
+                modalities_list = []
+                aspect_ratios = []  # per-image aspect ratio
+                for i in range(bs):
+                    if need_vision[i] and image_inputs[i]:
+                        items = image_inputs[i].mm_items
+                        ar = self._infer_image_aspect_ratio(items)
+                        for item in items:
+                            modalities_list.append(item.modality)
+                            aspect_ratios.append(ar)
+
                 pixel_values = flatten_nested_list(
                     [
                         [item.feature for item in image_inputs[i].mm_items]
@@ -191,12 +212,12 @@ class LlavaBaseForCausalLM(nn.Module):
                         if need_vision[i]
                     ]
                 )
+                # Per-image sizes (each entry is [(w,h)] for one image)
                 image_sizes = [
-                    flatten_nested_list(
-                        [item.image_sizes for item in image_inputs[i].mm_items]
-                    )
+                    item.image_sizes
                     for i in range(bs)
                     if need_vision[i]
+                    for item in image_inputs[i].mm_items
                 ]
 
                 ########## Encode Image ########
@@ -225,18 +246,7 @@ class LlavaBaseForCausalLM(nn.Module):
                     new_image_features = []
                     height = width = self.num_patches_per_side
                     for image_idx, image_feature in enumerate(image_features):
-                        if modalities_list[image_idx] == Modality.IMAGE:
-                            image_aspect_ratio = (
-                                self.config.image_aspect_ratio
-                            )  # single image
-                        elif (
-                            modalities_list[image_idx] == Modality.MULTI_IMAGES
-                            or modalities_list[image_idx] == Modality.VIDEO
-                        ):
-                            image_aspect_ratio = "pad"  # multi image
-                        # image_aspect_ratio = (
-                        #     "anyres" if len(image_sizes[image_idx]) == 1 else "pad"
-                        # )
+                        image_aspect_ratio = aspect_ratios[image_idx]
                         if (
                             image_feature.shape[0] > 1
                             and "anyres" in image_aspect_ratio
@@ -385,6 +395,7 @@ class LlavaBaseForCausalLM(nn.Module):
                 extend_start_loc_cpu = forward_batch.extend_start_loc.cpu().numpy()
                 extend_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
                 prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+                # Fill in the image features using flat indexing (one pt per image)
                 pt = 0
                 for i in range(bs):
                     if not need_vision[i]:
@@ -393,20 +404,25 @@ class LlavaBaseForCausalLM(nn.Module):
                     start_idx = extend_start_loc_cpu[i]
                     seq_len = extend_seq_lens[i]
                     prefix_len = prefix_lens_cpu[i]
+                    n_images = len(image_inputs[i].image_offsets)
 
-                    # Multiple images
-                    for image_idx, image_offset in enumerate(
-                        image_inputs[i].image_offsets
-                    ):
+                    for j in range(n_images):
+                        image_offset = image_inputs[i].image_offsets[j]
+
                         if (
-                            image_offset + image_inputs[i].image_pad_len[image_idx]
+                            image_offset + image_inputs[i].image_pad_len[j]
                             <= prefix_len
                         ):
+                            pt += 1
                             continue
                         if image_offset >= prefix_len + seq_len:
+                            pt += n_images - j
                             break
 
-                        tmp_image_feature = image_features[pt][image_idx]
+                        tmp_image_feature = image_features[pt]
+                        # Squeeze batch dim from per-image features [1, feat, hidden]
+                        if tmp_image_feature.ndim == 3:
+                            tmp_image_feature = tmp_image_feature[0]
                         pad_len = tmp_image_feature.shape[0]
 
                         input_offset = image_offset - prefix_len
@@ -429,7 +445,7 @@ class LlavaBaseForCausalLM(nn.Module):
                             print(
                                 f"{start_idx=}, {image_offset=}, {prefix_len=}, {pad_len=}"
                             )
-                    pt += 1
+                        pt += 1
 
             return self.language_model(
                 input_ids, positions, forward_batch, input_embeds=input_embeds
@@ -657,7 +673,22 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
     ) -> Dict[str, str]:
         mapping = {}
         for config_cls in auto_model_type._model_mapping.keys():
-            archs = auto_model_type._model_mapping.get(config_cls, None)
+            try:
+                archs = auto_model_type._model_mapping.get(config_cls, None)
+            except ValueError as exc:
+                if (
+                    auto_model_type is not AutoModel
+                    or config_cls.__name__ != _KNOWN_BROKEN_AUTOMODEL_CONFIG
+                    or _KNOWN_BROKEN_AUTOMODEL_ERROR not in str(exc)
+                ):
+                    raise
+                logger.warning(
+                    "Skipping broken %s mapping for config %s: %s",
+                    auto_model_type.__name__,
+                    config_cls.__name__,
+                    exc,
+                )
+                continue
             if archs is not None:
                 if isinstance(archs, tuple):
                     mapping[config_cls.__name__] = tuple(

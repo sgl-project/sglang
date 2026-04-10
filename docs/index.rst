@@ -14,7 +14,7 @@ Its core features include:
 
 - **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
 - **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
+- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark/5090), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
 - **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
 - **RL & Post-Training Backbone**: SGLang is a proven rollout backend used for training many frontier models, with native RL integrations and adoption by well-known post-training frameworks such as AReaL, Miles, slime, Tunix, verl and more.
 
@@ -41,6 +41,7 @@ Its core features include:
    :caption: Advanced Features
 
    advanced_features/server_arguments.md
+   advanced_features/object_storage.md
    advanced_features/hyperparameter_tuning.md
    advanced_features/attention_backend.md
    advanced_features/speculative_decoding.ipynb
@@ -87,15 +88,11 @@ Its core features include:
    diffusion/api/cli
    diffusion/api/openai_api
    diffusion/performance/index
+   diffusion/performance/ring_sp_performance
    diffusion/performance/attention_backends
-   diffusion/performance/profiling
    diffusion/performance/cache/index
-   diffusion/performance/cache/cache_dit
-   diffusion/performance/cache/teacache
-   diffusion/support_new_models
+   diffusion/quantization
    diffusion/contributing
-   diffusion/ci_perf
-   diffusion/environment_variables
 
 .. toctree::
    :maxdepth: 1
@@ -105,7 +102,7 @@ Its core features include:
    platforms/cpu_server.md
    platforms/tpu.md
    platforms/nvidia_jetson.md
-   platforms/ascend_npu_support.rst
+   platforms/ascend/ascend_npu_support.rst
    platforms/xpu.md
 
 .. toctree::

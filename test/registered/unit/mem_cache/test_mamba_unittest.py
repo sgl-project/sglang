@@ -21,8 +21,8 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=9, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestMamba(unittest.TestCase):
@@ -99,6 +99,7 @@ class TestMamba(unittest.TestCase):
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
+            mamba_layer_ids=mamba_layers,
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=3,
         )
@@ -340,6 +341,7 @@ class TestMamba(unittest.TestCase):
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
+            mamba_layer_ids=mamba_layers,
             enable_mamba_extra_buffer=False,
             speculative_num_draft_tokens=3,
         )

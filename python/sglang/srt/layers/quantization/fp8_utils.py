@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -45,12 +44,15 @@ from sglang.srt.utils import (
     is_sm120_supported,
     offloader,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_sm100_supported = is_sm100_supported()
+_is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -92,14 +94,16 @@ if _use_aiter:
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
 
-    @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
+    from sglang.srt.utils.patch_torch import register_fake_if_exists
+
+    @register_fake_if_exists("sgl_kernel::fp8_scaled_mm")
     def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    @torch.library.register_fake("sgl_kernel::fp8_blockwise_scaled_mm")
+    @register_fake_if_exists("sgl_kernel::fp8_blockwise_scaled_mm")
     def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
         # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
         M = mat_a.shape[-2]
@@ -211,6 +215,7 @@ def _check_cutlass_block_fp8_hardware_support() -> bool:
 
 
 if is_blackwell_supported() and is_flashinfer_available():
+    from flashinfer import SfLayout
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
@@ -300,12 +305,13 @@ if is_blackwell_supported() and is_flashinfer_available():
             input,
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             alignment=alignment,
+            sf_swizzle_layout=SfLayout.layout_128x4,
         )
 
     @register_custom_op(
         op_name="flashinfer_mm_mxfp8",
         mutates_args=[],
-        fake_impl=lambda q_input, weight_t, x_scale_u8, weight_scale_t, out_dtype, backend="auto": (
+        fake_impl=lambda q_input, weight_t, x_scale_u8, weight_scale_t, out_dtype, use_8x4_sf_layout=False, backend="auto": (
             q_input.new_empty((q_input.shape[0], weight_t.shape[1]), dtype=out_dtype)
         ),
     )
@@ -315,6 +321,7 @@ if is_blackwell_supported() and is_flashinfer_available():
         x_scale_u8: torch.Tensor,
         weight_scale_t: torch.Tensor,
         out_dtype: torch.dtype,
+        use_8x4_sf_layout: bool = False,
         backend: str = "auto",
     ) -> torch.Tensor:
         return _raw_flashinfer_mm_mxfp8(
@@ -323,6 +330,7 @@ if is_blackwell_supported() and is_flashinfer_available():
             x_scale_u8,
             weight_scale_t,
             out_dtype=out_dtype,
+            use_8x4_sf_layout=use_8x4_sf_layout,
             backend=backend,
         )
 
@@ -354,10 +362,12 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
 
     For MXFP8, Triton remains the default path. We only route to FlashInfer
-    when backend is explicitly set to flashinfer_trtllm.
+    when backend is explicitly set to flashinfer_cutlass or flashinfer_trtllm.
     """
     backend = get_fp8_gemm_runner_backend()
     if backend.is_flashinfer_trtllm():
+        return flashinfer_mxfp8_blockscaled_linear
+    elif backend.is_flashinfer_cutlass():
         return flashinfer_mxfp8_blockscaled_linear
     return triton_mxfp8_blockscaled_linear
 
@@ -451,25 +461,6 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     global FP8_GEMM_RUNNER_BACKEND
 
     backend = server_args.fp8_gemm_runner_backend
-
-    # TODO(brayden): Remove env-based overrides in v0.5.7, they will be fully removed in v0.5.7.
-    # Only check environment variables when the server args is not set, server args should take priority.
-    if backend == "auto":
-        if envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get():
-            backend = "flashinfer_trtllm"
-        elif envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get():
-            backend = "cutlass"
-    else:
-        if (
-            envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get()
-            or envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get()
-        ):
-            logger.warning(
-                f"FP8 GEMM backend set to '{backend}' via --fp8-gemm-backend overrides "
-                "environment variables SGLANG_ENABLE_FLASHINFER_FP8_GEMM and "
-                "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8. Using server argument value."
-            )
-
     if backend == "auto" and is_sm120_supported():
         # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
         backend = "triton"
@@ -873,7 +864,40 @@ def _pack_mxfp8_scales(scale_u8: torch.Tensor) -> torch.Tensor:
     return packed.view(1, scale_m, scale_k, 2, 256)
 
 
-def triton_mxfp8_blockscaled_linear(
+@register_custom_op(
+    op_name="triton_mxfp8_block_scaled_matmul",
+    mutates_args=[],
+    fake_impl=lambda a, a_scale, b, b_scale, output_dtype, block_m=128, block_n=256, block_k=128, num_stages=None: (  # noqa: E501
+        a.new_empty((a.shape[0], b.shape[0]), dtype=output_dtype)
+    ),
+)
+def triton_mxfp8_block_scaled_matmul(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    block_m: int = 128,
+    block_n: int = 256,
+    block_k: int = 128,
+    num_stages: Optional[int] = None,
+) -> torch.Tensor:
+    """Opaque custom op wrapper to prevent Dynamo tracing Triton grid math."""
+    return mxfp8_block_scaled_matmul_triton(
+        a,
+        a_scale,
+        b,
+        b_scale,
+        output_dtype=output_dtype,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_stages=num_stages,
+    )
+
+
+def _raw_triton_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -881,7 +905,7 @@ def triton_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    if not (_is_cuda and (is_sm100_supported() or is_sm120_supported())):
+    if not (_is_cuda and (_is_sm100_supported or _is_sm120_supported)):
         raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100/SM120).")
 
     input_2d = input.view(-1, input.shape[-1]).contiguous()
@@ -933,8 +957,8 @@ def triton_mxfp8_blockscaled_linear(
     a_scale_packed = _pack_mxfp8_scales(x_scale_u8)
     b_scale_packed = _pack_mxfp8_scales(weight_scale)
 
-    num_stages = 1 if is_sm120_supported() else (4 if is_sm100_supported() else 1)
-    output = mxfp8_block_scaled_matmul_triton(
+    num_stages = 1 if _is_sm120_supported else (4 if _is_sm100_supported else 1)
+    output = triton_mxfp8_block_scaled_matmul(
         q_input,
         a_scale_packed,
         weight.contiguous(),
@@ -949,6 +973,35 @@ def triton_mxfp8_blockscaled_linear(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+@register_custom_op(
+    op_name="triton_mxfp8_blockscaled_linear",
+    mutates_args=[],
+    fake_impl=lambda input, weight, weight_scale, input_scale=None, bias=None, output_dtype=None: (
+        input.new_empty(
+            (*input.shape[:-1], weight.shape[0]),
+            dtype=(output_dtype if output_dtype is not None else input.dtype),
+        )
+    ),
+)
+def triton_mxfp8_blockscaled_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Opaque custom-op wrapper to prevent Dynamo guards on MXFP8 padding branches."""
+    return _raw_triton_mxfp8_blockscaled_linear(
+        input=input,
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        bias=bias,
+        output_dtype=output_dtype,
+    )
 
 
 def flashinfer_mxfp8_blockscaled_linear(
@@ -978,6 +1031,7 @@ def flashinfer_mxfp8_blockscaled_linear(
         )
     else:
         q_input = input_2d
+        x_scale_u8 = input_scale.contiguous()
 
     if output_dtype is None:
         if input_2d.dtype in (torch.float16, torch.bfloat16, torch.float32):
@@ -987,19 +1041,34 @@ def flashinfer_mxfp8_blockscaled_linear(
 
     # Ensure transposed tensors are contiguous for FlashInfer's internal runner.
     weight_t = weight.contiguous().t()
-    weight_scale_t = (
-        weight_scale.contiguous().t()
-        if weight_scale.ndim == 2
-        else weight_scale.contiguous()
-    )
-    output = flashinfer_mm_mxfp8(
-        q_input,
-        weight_t,
-        x_scale_u8,
-        weight_scale_t,
-        out_dtype=output_dtype,
-        backend="auto",
-    )
+
+    if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+
+        weight_scale_t = weight_scale.contiguous().view(-1)
+        output = flashinfer_mm_mxfp8(
+            q_input,
+            weight_t,
+            x_scale_u8,
+            weight_scale_t,
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend="trtllm",
+        )
+    elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+        weight_scale_t = (
+            weight_scale.contiguous().t()
+            if weight_scale.ndim == 2
+            else weight_scale.contiguous()
+        )
+        output = flashinfer_mm_mxfp8(
+            q_input,
+            weight_t,
+            x_scale_u8,
+            weight_scale_t,
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend="cutlass",
+        )
 
     if bias is not None:
         output += bias

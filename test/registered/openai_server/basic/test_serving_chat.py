@@ -24,8 +24,8 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class _MockTokenizerManager:
@@ -37,6 +37,7 @@ class _MockTokenizerManager:
             enable_cache_report=False,
             tool_call_parser="hermes",
             reasoning_parser=None,
+            stream_response_default_include_usage=False,
         )
         # Mock hf_config for _use_dpsk_v32_encoding check
         mock_hf_config = Mock()
