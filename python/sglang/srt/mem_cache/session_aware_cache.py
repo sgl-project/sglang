@@ -315,15 +315,19 @@ class SessionAwareCache(BasePrefixCache):
         if len(match.device_indices) == 0:
             return 0, None
 
+        max_protected_len = min(len(match.device_indices), protected_len)
         row_indices = self.req_to_token_pool.req_to_token[
-            slot.req_pool_idx, : len(match.device_indices)
+            slot.req_pool_idx, :max_protected_len
         ].to(dtype=torch.int64)
-        mismatches = (match.device_indices != row_indices).nonzero(as_tuple=False)
-        if mismatches.numel() == 0:
-            common_len = len(match.device_indices)
+        match_indices = match.device_indices[:max_protected_len]
+        mismatches = (match_indices != row_indices).nonzero(as_tuple=False)
+        if mismatches.numel() == 0 and max_protected_len == len(match.device_indices):
+            common_len = max_protected_len
             return common_len, match.last_device_node
 
-        common_len = int(mismatches[0].item())
+        common_len = (
+            int(mismatches[0].item()) if mismatches.numel() > 0 else max_protected_len
+        )
         if self.page_size > 1:
             common_len = (common_len // self.page_size) * self.page_size
         if common_len <= 0:

@@ -130,3 +130,44 @@ def test_release_session_recomputes_current_tree_owned_prefix():
     assert req_to_token_pool.free_slots == [0]
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(16, 48))
+
+
+def test_release_session_never_grows_tree_owned_prefix():
+    page_size = 16
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+
+    overmatched = MatchResult(
+        device_indices=torch.tensor(list(range(48))),
+        last_device_node="overmatched-node",
+        last_host_node="overmatched-node",
+    )
+    capped_match = MatchResult(
+        device_indices=torch.tensor(list(range(16))),
+        last_device_node="original-lock-node",
+        last_host_node="original-lock-node",
+    )
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        allocator,
+        page_size,
+        match_results=[overmatched, capped_match],
+    )
+    tree_cache = SessionAwareCache(inner)
+
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=48,
+        kv_allocated_len=48,
+        last_node="outdated-node",
+        cache_protected_len=16,
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=48, allocated=48)
+
+    tree_cache.release_session("session-a", req)
+
+    assert inner.dec_lock_ref_calls == ["original-lock-node"]
+    assert req_to_token_pool.free_slots == [0]
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(16, 48))
