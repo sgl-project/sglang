@@ -313,6 +313,27 @@ def _build_transformer_quant_adapters(
     return adapters
 
 
+def _resolve_quant_config_from_transformer_override(
+    transformer_weights_path: str,
+) -> Optional[QuantizationConfig]:
+    """Resolve quant config from an override transformer repo or directory."""
+    override_quantized_path = maybe_download_model(transformer_weights_path)
+    if not os.path.isdir(override_quantized_path):
+        return None
+
+    override_config_path = os.path.join(override_quantized_path, "config.json")
+    if not os.path.isfile(override_config_path):
+        return None
+
+    with open(override_config_path, encoding="utf-8") as f:
+        override_hf_config = json.load(f)
+
+    return get_quant_config(
+        override_hf_config,
+        override_quantized_path,
+    )
+
+
 def _resolve_quant_config(
     *,
     hf_config: dict,
@@ -325,38 +346,28 @@ def _resolve_quant_config(
     priority: model config.json -> safetensors metadata -> format-specific fallback
     """
     quant_config = get_quant_config(hf_config, component_model_path)
-    if quant_config is None and server_args.transformer_weights_path:
-        override_quantized_path = maybe_download_model(
-            server_args.transformer_weights_path
-        )
-        override_config_path = (
-            os.path.join(override_quantized_path, "config.json")
-            if os.path.isdir(override_quantized_path)
-            else None
-        )
-        if override_config_path and os.path.isfile(override_config_path):
-            with open(override_config_path, encoding="utf-8") as f:
-                override_hf_config = json.load(f)
-            quant_config = get_quant_config(
-                override_hf_config,
-                override_quantized_path,
-            )
-            if quant_config is not None:
-                return quant_config
+    if quant_config is not None or not server_args.transformer_weights_path:
+        return quant_config
 
-        for safetensors_file in safetensors_list:
-            quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
-            if quant_config is not None:
-                return quant_config
+    quant_config = _resolve_quant_config_from_transformer_override(
+        server_args.transformer_weights_path
+    )
+    if quant_config is not None:
+        return quant_config
 
-        param_names_mapping_dict = (
-            server_args.pipeline_config.dit_config.arch_config.param_names_mapping
-        )
-        quant_config = build_nvfp4_config_from_safetensors_list(
-            safetensors_list, param_names_mapping_dict
-        )
+    for safetensors_file in safetensors_list:
+        quant_config = get_quant_config_from_safetensors_metadata(safetensors_file)
         if quant_config is not None:
             return quant_config
+
+    param_names_mapping_dict = (
+        server_args.pipeline_config.dit_config.arch_config.param_names_mapping
+    )
+    quant_config = build_nvfp4_config_from_safetensors_list(
+        safetensors_list, param_names_mapping_dict
+    )
+    if quant_config is not None:
+        return quant_config
 
     return quant_config
 

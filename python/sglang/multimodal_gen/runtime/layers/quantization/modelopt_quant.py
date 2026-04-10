@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import logging
+import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import torch
-from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
@@ -106,20 +106,9 @@ class ModelOptQuantConfig(QuantizationConfig):
         return None
 
     def is_layer_excluded(self, prefix: str) -> bool:
-        import regex as re
-
-        fused_patterns = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
-        prefix_split = prefix.split(".")
         for pattern in self.exclude_modules:
-            regex_str = pattern.replace(".", r"\.").replace("*", r".*")
-            pattern_split = pattern.split(".")
+            regex_str = re.escape(pattern).replace(r"\*", r".*")
             if re.fullmatch(regex_str, prefix):
-                return True
-            if (
-                pattern_split[-1] in fused_patterns
-                and pattern_split[-1] in prefix_split[-1]
-            ):
-                assert len(prefix_split) == 5 and len(pattern_split) == 5
                 return True
         return False
 
@@ -353,11 +342,14 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         max_w_scale, quantized_weight = requantize_with_max_scale(
             layer.weight, layer.weight_scale, layer.logical_widths
         )
-        layer.weight = Parameter(quantized_weight.t(), requires_grad=False)
+        # Preserve the parameter subclass metadata while rebinding to the
+        # transposed FP8 view expected by the runtime.
+        layer.weight.data = quantized_weight.t().detach()
+        layer.weight.requires_grad_(False)
         if self.cutlass_fp8_supported:
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
-        layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
-        layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+        copy_or_rebind_param(layer, "weight_scale", max_w_scale)
+        copy_or_rebind_param(layer, "input_scale", layer.input_scale.max())
 
     def apply(
         self,
