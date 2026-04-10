@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.session_aware_cache import SessionSlot
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 
@@ -61,6 +62,8 @@ class _FakeReq:
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.pop_overallocated_calls = 0
+        self.to_finish = None
+        self.finished_reason = None
 
     def pop_overallocated_kv_cache(self):
         self.pop_overallocated_calls += 1
@@ -171,3 +174,96 @@ def test_release_session_never_grows_tree_owned_prefix():
     assert req_to_token_pool.free_slots == [0]
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(16, 48))
+
+
+def test_match_prefix_abort_does_not_restore_live_session_slot():
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        allocator,
+        page_size=16,
+        match_results=[
+            MatchResult(
+                device_indices=torch.tensor([], dtype=torch.int64),
+                last_device_node=None,
+                last_host_node=None,
+            )
+        ],
+    )
+    tree_cache = SessionAwareCache(inner)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=48,
+        kv_allocated_len=48,
+        cache_protected_len=16,
+    )
+
+    req = _FakeReq("session-a", req_pool_idx=1, committed=1, allocated=1)
+    req.to_finish = FINISH_ABORT("too long")
+
+    result = tree_cache.match_prefix(
+        SimpleNamespace(
+            req=req,
+            key=SimpleNamespace(token_ids=list(range(64))),
+        )
+    )
+
+    slot = tree_cache.slots["session-a"]
+    assert req.req_pool_idx == 1
+    assert req.kv_committed_len == 1
+    assert req.kv_allocated_len == 1
+    assert slot.req_pool_idx == 0
+    assert slot.kv_committed_len == 48
+    assert slot.kv_allocated_len == 48
+    assert len(result.device_indices) == 0
+
+
+def test_aborted_streaming_turn_preserves_slot_and_accounting(monkeypatch):
+    page_size = 16
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    tree_cache = SessionAwareCache(_FakeInnerCache(req_to_token_pool, allocator, page_size))
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=48,
+        kv_allocated_len=48,
+        cache_protected_len=16,
+        swa_evicted_seqlen=8,
+        last_node="lock-node",
+    )
+
+    req = _FakeReq("session-a", req_pool_idx=1, committed=5, allocated=23)
+    req.finished_reason = FINISH_ABORT("too long")
+
+    monkeypatch.setattr(
+        "sglang.srt.mem_cache.common.get_global_server_args",
+        lambda: SimpleNamespace(page_size=page_size, speculative_algorithm="eagle"),
+    )
+
+    release_kv_cache(req, tree_cache)
+
+    slot = tree_cache.slots["session-a"]
+    assert slot.req_pool_idx == 0
+    assert slot.kv_committed_len == 48
+    assert slot.kv_allocated_len == 48
+    assert req.req_pool_idx is None
+    assert req.pop_overallocated_calls == 0
+    assert tree_cache.session_held_tokens() == 32
+    assert tree_cache.session_held_full_tokens() == 32
+    assert tree_cache.session_held_swa_tokens() == 32
+    assert tree_cache.session_held_req_count() == 1
+    assert req_to_token_pool.free_slots == [1]
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(128, 151))
+
+    tree_cache.release_session("session-a")
+
+    assert tree_cache.session_held_tokens() == 0
+    assert tree_cache.session_held_swa_tokens() == 0
+    assert tree_cache.session_held_req_count() == 0
+    assert req_to_token_pool.free_slots == [1, 0]
+    assert len(allocator.freed) == 2
+    assert allocator.freed[1].tolist() == list(range(16, 48))
