@@ -569,7 +569,20 @@ class LTX2AVDenoisingStage(DenoisingStage):
         )
         batch.ltx23_audio_replicated_for_sp = bool(replicate_audio_for_sp)
 
-        batch.did_sp_shard_audio_latents = False
+        if (
+            get_sp_world_size() > 1
+            and isinstance(batch.audio_latents, torch.Tensor)
+            and hasattr(server_args.pipeline_config, "shard_audio_latents_for_sp")
+            and not replicate_audio_for_sp
+        ):
+            batch.audio_latents, batch.did_sp_shard_audio_latents = (
+                server_args.pipeline_config.shard_audio_latents_for_sp(
+                    batch, batch.audio_latents
+                )
+            )
+            audio_latents = batch.audio_latents
+        else:
+            batch.did_sp_shard_audio_latents = False
 
         # For LTX-2 packed token latents, SP sharding happens on the time dimension
         # (frames). The model must see local latent frames (RoPE offset is applied
@@ -695,6 +708,19 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     getattr(batch, "sp_video_start_frame", 0)
                                 ),
                             )
+                        if (
+                            getattr(batch, "did_sp_shard_audio_latents", False)
+                            and hasattr(current_model, "audio_rope")
+                        ):
+                            audio_coords = current_model.audio_rope.prepare_audio_coords(
+                                batch_size=int(audio_latent_model_input.shape[0]),
+                                num_frames=audio_num_frames_latent,
+                                device=audio_latent_model_input.device,
+                                start_frame=int(
+                                    getattr(batch, "sp_audio_start_frame", 0)
+                                ),
+                            )
+
                         batch_size = int(latent_model_input.shape[0])
                         video_num_tokens = int(latent_model_input.shape[1])
                         is_ltx23_variant = is_ltx23_native_variant(
@@ -1309,6 +1335,15 @@ class LTX2AVDenoisingStage(DenoisingStage):
         # batch.audio_latents is audio latents.
 
         audio_latents = batch.audio_latents
+        if (
+            getattr(batch, "did_sp_shard_audio_latents", False)
+            and isinstance(audio_latents, torch.Tensor)
+            and hasattr(server_args.pipeline_config, "gather_audio_latents_for_sp")
+        ):
+            audio_latents = server_args.pipeline_config.gather_audio_latents_for_sp(
+                audio_latents, batch
+            )
+            batch.audio_latents = audio_latents
 
         # NOTE: self.vae and self.audio_vae should be populated via __init__ or manual setting
         if self.vae is None or self.audio_vae is None:
