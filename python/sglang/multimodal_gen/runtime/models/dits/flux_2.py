@@ -43,7 +43,10 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -148,6 +151,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         eps: float = 1e-5,
         out_dim: int = None,
         elementwise_affine: bool = True,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -278,6 +282,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            supported_attention_backends=supported_attention_backends,
         )
 
     def forward(
@@ -400,6 +405,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         elementwise_affine: bool = True,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -459,6 +465,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            supported_attention_backends=supported_attention_backends,
         )
 
     def _patch_to_out_weight_loader(self) -> None:
@@ -545,6 +552,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -565,6 +573,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             eps=eps,
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
+            supported_attention_backends=supported_attention_backends,
             quant_config=quant_config,
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
@@ -621,6 +630,7 @@ class Flux2TransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -640,6 +650,7 @@ class Flux2TransformerBlock(nn.Module):
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
+            supported_attention_backends=supported_attention_backends,
             quant_config=quant_config,
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
@@ -839,6 +850,12 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
+    # FLUX.2 stays closer to the official diffusers output with Torch SDPA.
+    # The generic FA path still produces a measurable image-level drift here.
+    _supported_attention_backends = {
+        AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.FA,
+    }
 
     def post_load_weights(self) -> None:
         if not isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
@@ -932,6 +949,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    supported_attention_backends=self._supported_attention_backends,
                     quant_config=quant_config,
                     prefix=f"transformer_blocks.{i}",
                 )
@@ -949,6 +967,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    supported_attention_backends=self._supported_attention_backends,
                     quant_config=quant_config,
                     prefix=f"single_transformer_blocks.{i}",
                 )

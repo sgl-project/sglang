@@ -6,6 +6,13 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "AgainstEntropy": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "custom override"
+    },
     "Alcanderian": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -363,6 +370,13 @@
         "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
+    "alexnails": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
+        "reason": "top contributor"
+    },
     "alisonshao": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -494,6 +508,13 @@
         "can_rerun_failed_ci": true,
         "can_rerun_stage": true,
         "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
+    "fortunecookiee": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 0,
         "reason": "custom override"
     },
     "fy1214": {
