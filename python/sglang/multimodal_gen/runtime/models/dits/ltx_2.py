@@ -1473,9 +1473,11 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         audio_timestep: torch.Tensor,
         prompt_timestep: torch.Tensor | None,
         audio_prompt_timestep: torch.Tensor | None,
+        *,
+        use_legacy_av_ca_timestep_semantics: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ltx_variant = str(getattr(self.config.arch_config, "ltx_variant", "ltx_2"))
-        if ltx_variant != "ltx_2_3":
+        if ltx_variant != "ltx_2_3" or use_legacy_av_ca_timestep_semantics:
             return timestep, audio_timestep
 
         video_timestep = (
@@ -1518,6 +1520,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         disable_a2v_cross_attn: bool = False,
         disable_v2a_cross_attn: bool = False,
         audio_replicated_for_sp: bool = False,
+        use_legacy_av_ca_timestep_semantics: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
 
@@ -1632,6 +1635,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             audio_timestep,
             prompt_timestep,
             audio_prompt_timestep,
+            use_legacy_av_ca_timestep_semantics=use_legacy_av_ca_timestep_semantics,
         )
         temb_ca_scale_shift, _ = self.av_ca_video_scale_shift_adaln_single(
             av_ca_video_timestep.flatten(), hidden_dtype=hidden_dtype

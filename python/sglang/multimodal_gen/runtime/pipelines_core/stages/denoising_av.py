@@ -348,6 +348,18 @@ class LTX2AVDenoisingStage(DenoisingStage):
     ) -> bool:
         return False
 
+    @staticmethod
+    def _use_ltx23_legacy_ti2v_sp_av_ca_timestep_semantics(
+        batch: Req, *, stage: str, is_ltx23_variant: bool
+    ) -> bool:
+        return (
+            is_ltx23_variant
+            and stage == "one_stage"
+            and get_sp_world_size() > 1
+            and batch.image_latent is not None
+            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
+        )
+
     def _get_condition_image_encoder(
         self,
         server_args: ServerArgs,
@@ -562,6 +574,11 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         )
         do_ti2v = self._should_apply_ltx2_ti2v(batch)
+        use_legacy_ti2v_sp_av_ca_timestep_semantics = (
+            self._use_ltx23_legacy_ti2v_sp_av_ca_timestep_semantics(
+                batch, stage=stage, is_ltx23_variant=is_ltx23_variant
+            )
+        )
         replicate_audio_for_sp = self._should_replicate_ltx23_audio_for_sp(
             batch,
             server_args,
@@ -871,6 +888,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     video_coords=video_coords,
                                     audio_coords=audio_coords,
                                     audio_replicated_for_sp=replicate_audio_for_sp,
+                                    use_legacy_av_ca_timestep_semantics=use_legacy_ti2v_sp_av_ca_timestep_semantics,
                                     return_latents=False,
                                     return_dict=False,
                                 )
@@ -955,6 +973,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     video_coords=video_coords,
                                     audio_coords=audio_coords,
                                     audio_replicated_for_sp=replicate_audio_for_sp,
+                                    use_legacy_av_ca_timestep_semantics=use_legacy_ti2v_sp_av_ca_timestep_semantics,
                                     return_latents=False,
                                     return_dict=False,
                                 )
@@ -994,6 +1013,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         video_coords=video_coords,
                                         audio_coords=audio_coords,
                                         audio_replicated_for_sp=replicate_audio_for_sp,
+                                        use_legacy_av_ca_timestep_semantics=use_legacy_ti2v_sp_av_ca_timestep_semantics,
                                         return_latents=False,
                                         return_dict=False,
                                     )
@@ -1082,6 +1102,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         video_coords=video_coords,
                                         audio_coords=audio_coords,
                                         audio_replicated_for_sp=replicate_audio_for_sp,
+                                        use_legacy_av_ca_timestep_semantics=use_legacy_ti2v_sp_av_ca_timestep_semantics,
                                         return_latents=False,
                                         return_dict=False,
                                         skip_video_self_attn_blocks=tuple(
@@ -1131,6 +1152,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                         video_coords=video_coords,
                                         audio_coords=audio_coords,
                                         audio_replicated_for_sp=replicate_audio_for_sp,
+                                        use_legacy_av_ca_timestep_semantics=use_legacy_ti2v_sp_av_ca_timestep_semantics,
                                         return_latents=False,
                                         return_dict=False,
                                         disable_a2v_cross_attn=True,
