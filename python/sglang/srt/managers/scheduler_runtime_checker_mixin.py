@@ -44,7 +44,7 @@ class PoolStats:
     mamba_available_size: Optional[int] = None
     mamba_evictable_size: Optional[int] = None
 
-    def get_general_token_stats(self) -> Tuple[int, float]:
+    def get_kv_token_stats(self) -> Tuple[int, float]:
         # NOTE: mamba pool is not included in the "token usage" calculation.
         if self.is_hybrid_swa:
             num_used = max(self.full_num_used, self.swa_num_used)
@@ -55,7 +55,7 @@ class PoolStats:
 
         return num_used, token_usage
 
-    def get_general_memory_usage(self) -> float:
+    def get_max_pool_usage(self) -> float:
         usage = self.full_token_usage
         if self.is_hybrid_swa:
             usage = max(usage, self.swa_token_usage)
@@ -405,14 +405,15 @@ class SchedulerRuntimeCheckerMixin:
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
-            num_used, token_usage = self.get_pool_stats().get_general_token_stats()
+            pool_stats = self.get_pool_stats()
+            num_used, _ = pool_stats.get_kv_token_stats()
 
             priority_enabled = self.enable_priority_scheduling
             self.stats.num_running_reqs = QueueCount.from_reqs(
                 self.running_batch.reqs, priority_enabled
             )
             self.stats.num_used_tokens = num_used
-            self.stats.token_usage = round(token_usage, 2)
+            self.stats.token_usage = round(pool_stats.get_max_pool_usage(), 2)
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled

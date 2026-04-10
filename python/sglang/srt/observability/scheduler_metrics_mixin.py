@@ -343,8 +343,8 @@ class SchedulerMetricsMixin:
         self.last_prefill_tokens = prefill_stats.log_input_tokens
 
         pool_stats = self.get_pool_stats()
-        num_used, _ = pool_stats.get_general_token_stats()
-        token_usage = pool_stats.get_general_memory_usage()
+        num_used, _ = pool_stats.get_kv_token_stats()
+        max_pool_usage = pool_stats.get_max_pool_usage()
         full_token_usage = pool_stats.full_token_usage
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
@@ -418,7 +418,7 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_running_reqs_offline_batch = 0
             self.stats.num_used_tokens = num_used
-            self.stats.token_usage = token_usage
+            self.stats.token_usage = max_pool_usage
             self.stats.full_token_usage = full_token_usage
             if pool_stats.is_hybrid_swa:
                 self.stats.swa_token_usage = pool_stats.swa_token_usage
@@ -515,8 +515,8 @@ class SchedulerMetricsMixin:
         num_running_reqs_offline_batch = 0
 
         pool_stats = self.get_pool_stats()
-        num_used, _ = pool_stats.get_general_token_stats()
-        token_usage = pool_stats.get_general_memory_usage()
+        num_used, _ = pool_stats.get_kv_token_stats()
+        max_pool_usage = pool_stats.get_max_pool_usage()
         full_token_usage = pool_stats.full_token_usage
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
 
@@ -605,7 +605,7 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
             # maximum usage of all pools
-            self.stats.token_usage = token_usage
+            self.stats.token_usage = max_pool_usage
             # usage of full attention
             self.stats.full_token_usage = full_token_usage
             if pool_stats.is_hybrid_swa:
@@ -804,8 +804,7 @@ class SchedulerMetricsMixin:
         return num_pending_tokens
 
     def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
-        num_tokens, _ = self.get_pool_stats().get_general_token_stats()
-
+        num_tokens, _ = self.get_pool_stats().get_kv_token_stats()
         num_pending_tokens = self._get_num_pending_tokens()
 
         # Tokens and request count in waiting queue, bootstrap queue, prealloc queue
@@ -856,14 +855,7 @@ class SchedulerMetricsMixin:
             waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-
-        num_used_tokens, _ = self.get_pool_stats().get_general_token_stats()
-
-        token_usage = (
-            num_used_tokens / self.max_total_num_tokens
-            if self.max_total_num_tokens > 0
-            else 0.0
-        )
+        num_used_tokens, token_usage = self.get_pool_stats().get_kv_token_stats()
 
         memory = None
         if include_all or "memory" in include:
