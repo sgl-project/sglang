@@ -45,21 +45,33 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
     return cfg
 
 
-def _zero_non_group_weights(
+def _reroute_for_group(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     group_expert_ids: List[int],
     num_experts: int,
-) -> torch.Tensor:
-    """Zero topk_weights for experts NOT in this group.
+) -> tuple:
+    """Reroute tokens so only this group's experts appear in topk_ids.
 
-    The kernel still sees all num_experts in the weight tensor, but experts
-    outside this group have zero routing weight → zero contribution to output.
+    Non-group expert slots are remapped to group_expert_ids[0] with zero weight,
+    so moe_align_block_size assigns zero blocks to non-group experts and the
+    kernel truly skips them (no GEMM tiles launched for empty experts).
     """
-    active_mask = torch.zeros(num_experts, dtype=torch.bool, device=topk_weights.device)
+    device = topk_weights.device
+    active_mask = torch.zeros(num_experts, dtype=torch.bool, device=device)
     active_mask[group_expert_ids] = True
-    mask = active_mask[topk_ids]
-    return topk_weights * mask.to(topk_weights.dtype)
+
+    # Remap non-group expert IDs → first group expert (dummy, will be zeroed)
+    remap = torch.arange(num_experts, device=device)
+    dummy_expert = group_expert_ids[0]
+    non_group_mask = ~active_mask
+    remap[non_group_mask] = dummy_expert
+
+    group_topk_ids = remap[topk_ids]
+    in_group = active_mask[topk_ids]
+    group_topk_weights = topk_weights * in_group.to(topk_weights.dtype)
+
+    return group_topk_weights, group_topk_ids
 
 
 class HeterFusedMoE(nn.Module):
@@ -227,13 +239,40 @@ class HeterFusedMoE(nn.Module):
             if len(expert_ids_list) == 0:
                 continue
 
-            # Zero routing weights for non-group experts; keep original topk_ids
-            group_weights = _zero_non_group_weights(
+            group_weights, group_ids = _reroute_for_group(
                 topk_weights,
                 topk_ids,
                 expert_ids_list,
                 self.num_experts,
             )
+
+            num_bits = gcfg.get("num_bits", 16)
+            prefix = f"group{group_idx}"
+
+            if num_bits == 16:
+                group_out = self._run_bf16_group(
+                    prefix,
+                    hidden_states,
+                    group_weights,
+                    group_ids,
+                )
+            elif num_bits == 4:
+                group_out = self._run_int4_group(
+                    prefix,
+                    hidden_states,
+                    group_weights,
+                    group_ids,
+                    router_logits,
+                    gcfg,
+                )
+            elif num_bits == 8:
+                # DEPRECATED: see _init_group_weights
+                group_out = self._run_int8_group(
+                    prefix,
+                    hidden_states,
+                    group_weights,
+                    group_ids,
+                )
 
             num_bits = gcfg.get("num_bits", 16)
             prefix = f"group{group_idx}"

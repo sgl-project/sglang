@@ -196,18 +196,25 @@ def run_all(device):
             device,
         )
 
-        # mix{a16w4 cold, a16w16 hot}: full weight tensors, zero non-group weights
+        # mix{a16w4 cold, a16w16 hot}: reroute tokens so each kernel skips non-group experts
         plan = policy.assign(topk_ids, E, [COLD_RATIO, 1.0 - COLD_RATIO])
         cold_expert_list = plan.group_assignments[0]
         hot_expert_list = plan.group_assignments[1]
 
-        cold_mask = torch.zeros(E, dtype=torch.bool, device=device)
-        cold_mask[cold_expert_list] = True
-        hot_mask = torch.zeros(E, dtype=torch.bool, device=device)
-        hot_mask[hot_expert_list] = True
+        # Remap: non-group experts → dummy group expert, zero their weights
+        cold_active = torch.zeros(E, dtype=torch.bool, device=device)
+        cold_active[cold_expert_list] = True
+        cold_remap = torch.arange(E, device=device)
+        cold_remap[~cold_active] = cold_expert_list[0]
+        cold_ids = cold_remap[topk_ids]
+        cold_w = topk_w * cold_active[topk_ids].to(topk_w.dtype)
 
-        cold_w = topk_w * cold_mask[topk_ids].to(topk_w.dtype)
-        hot_w = topk_w * hot_mask[topk_ids].to(topk_w.dtype)
+        hot_active = torch.zeros(E, dtype=torch.bool, device=device)
+        hot_active[hot_expert_list] = True
+        hot_remap = torch.arange(E, device=device)
+        hot_remap[~hot_active] = hot_expert_list[0]
+        hot_ids = hot_remap[topk_ids]
+        hot_w = topk_w * hot_active[topk_ids].to(topk_w.dtype)
 
         def mix_w4_w16():
             fused_marlin_moe(
@@ -218,11 +225,11 @@ def run_all(device):
                 int4_s2,
                 gating,
                 cold_w,
-                topk_ids,
+                cold_ids,
                 num_bits=4,
                 is_k_full=True,
             )
-            outplace_fused_experts(x, bf16_w13, bf16_w2, hot_w, topk_ids)
+            outplace_fused_experts(x, bf16_w13, bf16_w2, hot_w, hot_ids)
 
         lat_mix = bench(mix_w4_w16, device, use_cuda_graph=True)
 
