@@ -42,6 +42,12 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # For disagg decode: skip mamba-based prefix truncation.
+    # When True, match_prefix returns all matched KV indices regardless of
+    # mamba_value presence on intermediate nodes. SSM state is transferred
+    # from prefill, so decode tree cache mamba_value is not needed.
+    skip_mamba_truncation: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:

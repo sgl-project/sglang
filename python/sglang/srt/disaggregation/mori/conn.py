@@ -68,6 +68,7 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     is_dummy: bool
+    decode_prefix_len: int = 0
 
     @classmethod
     def from_zmq(cls, payload: List[bytes]) -> TransferInfo:
@@ -90,6 +91,12 @@ class TransferInfo:
             int(payload[7].decode("ascii")) if len(payload) > 7 else 1
         )
         is_dummy = dst_kv_indices.size == 0 and dst_aux_index < 0
+        # decode_prefix_len: backward compatible, default 0 if not present
+        decode_prefix_len = (
+            int(payload[8].decode("ascii"))
+            if len(payload) > 8 and payload[8] != b""
+            else 0
+        )
         return cls(
             room=room,
             endpoint=endpoint,
@@ -99,6 +106,7 @@ class TransferInfo:
             dst_aux_index=dst_aux_index,
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
+            decode_prefix_len=decode_prefix_len,
         )
 
 
@@ -1033,6 +1041,7 @@ class MoriKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: int = 0,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
@@ -1058,6 +1067,7 @@ class MoriKVReceiver(CommonKVReceiver):
                         aux_bytes if not is_dummy else b"",
                         state_bytes,
                         str(self.required_dst_info_num).encode("ascii"),
+                        str(decode_prefix_len).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()

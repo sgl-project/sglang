@@ -106,10 +106,11 @@ class FakeKVReceiver(BaseKVReceiver):
         kv_indices: list[int],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: int = 0,
     ):
         self.has_sent_metadata = True
         logger.debug(
-            f"FakeKVReceiver send_metadata with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}"
+            f"FakeKVReceiver send_metadata with kv_indices: {kv_indices}, aux_index: {aux_index}, state_indices: {state_indices}, decode_prefix_len: {decode_prefix_len}"
         )
 
     def failure_exception(self):

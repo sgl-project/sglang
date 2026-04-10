@@ -136,9 +136,16 @@ class BaseKVReceiver(ABC):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: int = 0,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.
+
+        Args:
+            decode_prefix_len: Number of tokens already cached on the decode side.
+                When > 0, kv_indices contains only the incremental portion
+                (beyond the cached prefix), and the prefill side should skip
+                transferring the first decode_prefix_len tokens.
         """
         ...
 

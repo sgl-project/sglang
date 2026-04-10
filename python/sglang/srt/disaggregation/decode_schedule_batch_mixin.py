@@ -42,8 +42,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
         for i, req in enumerate(reqs):
             req_pool_indices.append(req.req_pool_idx)
 
+            # Read KV indices for the extend portion (after prefix)
+            pre_len_i = len(req.prefix_indices)
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
+                pre_len_i : pre_len_i + req.extend_input_len
             ]
             assert (
                 offset + req.extend_input_len <= total_size
@@ -60,7 +62,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                # In disagg decode, cached_tokens is already set by
+                # pop_transferred from the prefill side's metadata.
+                # Don't add decode-side prefix match to avoid double-counting.
                 req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)

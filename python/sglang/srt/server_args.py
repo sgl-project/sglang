@@ -705,6 +705,7 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
+    disaggregation_enable_decode_radix_cache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -3443,8 +3444,21 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
-            self.disable_radix_cache = True
-            logger.warning("KV cache is forced as chunk cache for decode server")
+            if self.disaggregation_enable_decode_radix_cache:
+                if not self.disable_radix_cache:
+                    logger.info(
+                        "[EXPERIMENTAL] Decode server using RadixCache for incremental "
+                        "KV transfer. Prefix matching on the decode side enables transferring "
+                        "only the incremental KV delta from prefill."
+                    )
+                else:
+                    logger.warning(
+                        "--disaggregation-enable-decode-radix-cache is set but "
+                        "radix cache is disabled. Incremental transfer will not work."
+                    )
+            else:
+                self.disable_radix_cache = True
+                logger.info("Decode server using ChunkCache (radix cache disabled).")
 
         elif self.disaggregation_mode == "prefill":
             assert (
@@ -6023,6 +6037,11 @@ class ServerArgs:
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
+        )
+        parser.add_argument(
+            "--disaggregation-enable-decode-radix-cache",
+            action="store_true",
+            help="Enable radix cache prefix matching on decode side for incremental KV transfer in PD disaggregation.",
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",

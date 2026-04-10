@@ -769,6 +769,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         num_tokens: int,
         page_size: int,
         bytes_per_page_all_layers: int,
+        state_bytes_per_req: int = 0,
     ) -> Optional[dict]:
         """Compute KV transfer metrics and observe them via the metrics collector.
 
@@ -786,7 +787,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             latency_ms = transfer_latency_s * 1000
 
             num_pages = kv_to_page_num(num_tokens, page_size)
-            total_bytes = bytes_per_page_all_layers * num_pages
+            total_bytes = bytes_per_page_all_layers * num_pages + state_bytes_per_req
             total_mb = total_bytes / (1024 * 1024)
             self.transfer_total_mb = total_mb
 

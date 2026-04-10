@@ -325,6 +325,21 @@ class CommonKVManager(BaseKVManager):
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
 
+    def get_decode_prefix_len(self, bootstrap_room: int) -> int:
+        """Get the decode_prefix_len for a given bootstrap_room from transfer_infos.
+
+        Returns the max decode_prefix_len across all session/agent entries for the room.
+        Returns 0 if not available (backward compatible).
+        """
+        if not hasattr(self, "transfer_infos"):
+            return 0
+        room_infos = self.transfer_infos.get(bootstrap_room, {})
+        if not room_infos:
+            return 0
+        return max(
+            getattr(info, "decode_prefix_len", 0) for info in room_infos.values()
+        )
+
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP POST."""
         if self.dist_init_addr:

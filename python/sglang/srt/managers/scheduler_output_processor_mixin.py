@@ -580,16 +580,21 @@ class SchedulerOutputProcessorMixin:
                     )
                 )
                 req.mamba_last_track_seqlen = seq_len
-            elif (
-                not batch.spec_algorithm.is_none()
-                and result.accept_length_per_req_cpu is not None
-            ):
+            elif not batch.spec_algorithm.is_none():
                 # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
                 actual_seq_len = req.seqlen - 1
+                # Use mamba_last_track_seqlen as the reference for the previous bucket.
+                # For the first check (when tracking hasn't started), use the input length.
+                # This avoids relying on accept_length_per_req_cpu which can be inaccurate:
+                # V1 has intermediate forward passes with accept_len=0, and V2 may not
+                # include the bonus token in accept_len, both causing missed boundary crossings.
+                if req.mamba_last_track_seqlen is not None:
+                    prev_ref = req.mamba_last_track_seqlen
+                else:
+                    prev_ref = len(req.origin_input_ids) - 1
                 if (
                     actual_seq_len // mamba_track_interval
-                    != (actual_seq_len - result.accept_length_per_req_cpu[i])
-                    // mamba_track_interval
+                    > prev_ref // mamba_track_interval
                 ):
                     req.mamba_next_track_idx = (
                         batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
@@ -599,6 +604,31 @@ class SchedulerOutputProcessorMixin:
                     req.mamba_last_track_seqlen = (
                         actual_seq_len // mamba_track_interval * mamba_track_interval
                     )
+                elif (
+                    req.mamba_last_track_seqlen is None
+                    and self.server_args.disaggregation_mode == "decode"
+                    and self.server_args.disaggregation_enable_decode_radix_cache
+                ):
+                    # First spec-decode call and no boundary crossed.
+                    # For disagg decode, the transferred mamba state has never
+                    # been checkpointed on this node. Force a swap so that the
+                    # current ping_pong buffer (populated by this forward pass)
+                    # is preserved as the initial checkpoint.
+                    # The state is at actual_seq_len rather than exactly at the
+                    # boundary, but on the decode side tree cache mamba_value is
+                    # not used for computation (skip_mamba_truncation=True).
+                    # This is gated to disagg decode only — on single-machine,
+                    # mamba_value IS used for state loading and must be exact.
+                    initial_track = (
+                        prev_ref // mamba_track_interval * mamba_track_interval
+                    )
+                    if initial_track > 0:
+                        req.mamba_next_track_idx = (
+                            batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                                req.mamba_next_track_idx
+                            )
+                        )
+                        req.mamba_last_track_seqlen = initial_track
 
     def _process_input_token_logprobs(
         self: Scheduler, req: Req, input_token_logprobs: List

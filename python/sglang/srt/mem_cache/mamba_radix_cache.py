@@ -495,8 +495,12 @@ class MambaRadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
-        value, last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, last_node, best_value_len)
+        value, actual_last_node, best_last_node, best_value_len = (
+            self._match_prefix_helper(key)
+        )
+        return self._match_post_processor(
+            params, value, actual_last_node, best_last_node, best_value_len
+        )
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -955,12 +959,18 @@ class MambaRadixCache(BasePrefixCache):
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> Tuple[List[torch.Tensor], TreeNode, int]:
+    ) -> Tuple[List[torch.Tensor], TreeNode, TreeNode, int]:
         """
         Mamba prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without mamba tombstone,
         or 2. the number of matching tokens from the matched node to the last mamba tombstone
         node is greater than or equal to the sliding window size.
+
+        Returns:
+            (value, actual_last_node, best_last_node, best_value_len)
+            - actual_last_node: the deepest node reached during tree traversal
+            - best_last_node: the deepest node that has mamba_value (for truncation)
+            - best_value_len: number of value entries up to best_last_node
         """
         node = self.root_node
         child_key = self.get_child_key_fn(key)
@@ -993,7 +1003,7 @@ class MambaRadixCache(BasePrefixCache):
             best_value_len = len(value)
             best_last_node = node
 
-        return value, best_last_node, best_value_len
+        return value, node, best_last_node, best_value_len
 
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
         """Preprocess the key before matching."""
@@ -1008,12 +1018,22 @@ class MambaRadixCache(BasePrefixCache):
         self,
         params: MatchPrefixParams,
         value: List[torch.Tensor],
-        last_node: TreeNode,
+        actual_last_node: TreeNode,
+        best_last_node: TreeNode,
         best_value_len: int,
     ) -> MatchResult:
         """Post-process the matched result."""
         cow_mamba = params.cow_mamba
         req = params.req
+        skip_mamba_truncation = params.skip_mamba_truncation
+
+        # When skip_mamba_truncation is set (disagg decode path), use the actual
+        # last matched node and all matched values. SSM state comes from prefill
+        # transfer, so we don't need mamba_value from the tree cache.
+        if skip_mamba_truncation:
+            last_node = actual_last_node
+        else:
+            last_node = best_last_node
 
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows mamba to evict nodes closer to root first
@@ -1046,26 +1066,31 @@ class MambaRadixCache(BasePrefixCache):
             mamba_branching_seqlen = None
 
         # Copy mamba state to req local space if cow is true
-        if cow_mamba and last_node.mamba_value is not None:
+        if cow_mamba and best_last_node.mamba_value is not None:
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                # try to alloc again, protect last_node from eviction
+                # try to alloc again, protect best_last_node from eviction
                 if dst_index is None:
-                    self.inc_lock_ref(last_node)
+                    self.inc_lock_ref(best_last_node)
                     self.evict(EvictParams(num_tokens=0, mamba_num=1))
                     dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                    self.dec_lock_ref(last_node)
+                    self.dec_lock_ref(best_last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = last_node.mamba_value
+                src_index = best_last_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
             else:
-                src_index = last_node.mamba_value
+                src_index = best_last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
 
-        value = value[:best_value_len]
+        if skip_mamba_truncation:
+            # Use all matched values — KV indices are valid regardless of mamba_value
+            pass
+        else:
+            value = value[:best_value_len]
+
         if value:
             value = torch.cat(value)
         else:
