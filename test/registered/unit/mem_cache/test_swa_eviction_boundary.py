@@ -30,7 +30,7 @@ register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Infrastructure helpers (shared setup, not logic)
 # ---------------------------------------------------------------------------
 
 
@@ -126,40 +126,18 @@ def _make_batch(tree, allocator, pool):
     )
 
 
-def _page_ceil(n, page_size):
-    return (n + page_size - 1) // page_size * page_size
-
-
-def _page_floor(n, page_size):
-    return n // page_size * page_size
-
-
-def _evict_and_insert(tree, allocator, pool, seq_len, page_size, req_pool_idx=0):
-    """Full flow: alloc -> _evict_swa -> cache_finished_req. Returns req."""
-    alloc_size = _page_ceil(seq_len, page_size)
-    kv_indices = _swa_alloc(allocator, alloc_size)
-    assert kv_indices is not None, f"Alloc failed: need {alloc_size}"
-    pool.write((req_pool_idx, slice(0, alloc_size)), kv_indices)
-
-    req = _make_req(req_pool_idx, list(range(seq_len)), 0, tree)
-    batch = _make_batch(tree, allocator, pool)
-
-    ScheduleBatch._evict_swa(batch, req, seq_len - 1)
-    tree.cache_finished_req(req, is_insert=True)
-    return req
-
-
 # ---------------------------------------------------------------------------
-# Group 1: Eviction formula verification
+# Tests
 # ---------------------------------------------------------------------------
 
 
-class TestEvictionFormula(unittest.TestCase):
-    """Verify _evict_swa never produces swa_evicted_seqlen >= insert_length."""
+class TestSWAEvictionBoundary(unittest.TestCase):
 
-    def test_page_gt_window_sweep(self):
-        """Sweep page_size > window combinations. The -page_size fix must prevent
-        the eviction frontier from reaching page_floor(seq_len)."""
+    # -- Eviction formula: page_size > window --
+
+    def test_formula_page_gt_window_sweep(self):
+        """Sweep page_size > window combinations. The -page_size fix must
+        prevent eviction from reaching page_floor(seq_len)."""
         for page_size in [4, 8, 16, 32, 64, 128, 256]:
             for window in [1, 2, 4, 8]:
                 if page_size <= window:
@@ -171,7 +149,7 @@ class TestEvictionFormula(unittest.TestCase):
                     kv_size_swa=max(2048, page_size * 10),
                 )
                 for seq_len in range(page_size + 1, page_size * 5):
-                    alloc_size = _page_ceil(seq_len, page_size)
+                    alloc_size = (seq_len + page_size - 1) // page_size * page_size
                     kv = _swa_alloc(allocator, alloc_size)
                     if kv is None:
                         break
@@ -181,59 +159,72 @@ class TestEvictionFormula(unittest.TestCase):
                     batch = _make_batch(tree, allocator, pool)
                     ScheduleBatch._evict_swa(batch, req, seq_len - 1)
 
-                    insert_len = _page_floor(seq_len, page_size)
+                    insert_len = seq_len // page_size * page_size
                     self.assertLess(
                         req.swa_evicted_seqlen,
                         insert_len,
-                        f"Over-eviction: page={page_size}, win={window}, "
-                        f"seq={seq_len}, evicted={req.swa_evicted_seqlen}",
+                        f"page={page_size}, win={window}, seq={seq_len}",
                     )
-
-                    # Clean up for next iteration
                     allocator.free(kv)
 
-    def test_page_leq_window(self):
-        """page_size <= window: eviction always stays well below insert boundary.
-        The -page_size fix should cause no regression."""
-        page_size = 4
-        window = 8
+    # -- Eviction formula: page_size <= window --
+
+    def test_formula_page_leq_window(self):
+        """page_size <= window: -page_size fix causes no regression."""
+        page_size, window = 4, 8
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
         )
 
         for seq_len in [13, 17, 25, 33]:
-            req = _evict_and_insert(tree, allocator, pool, seq_len, page_size)
-            insert_len = _page_floor(seq_len, page_size)
+            alloc_size = (seq_len + page_size - 1) // page_size * page_size
+            kv = _swa_alloc(allocator, alloc_size)
+            pool.write((0, slice(0, alloc_size)), kv)
+
+            req = _make_req(0, list(range(seq_len)), 0, tree)
+            batch = _make_batch(tree, allocator, pool)
+            ScheduleBatch._evict_swa(batch, req, seq_len - 1)
+
+            insert_len = seq_len // page_size * page_size
             self.assertLess(req.swa_evicted_seqlen, insert_len)
+
+            tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()
 
-    def test_page_size_1(self):
-        """page_size=1: no floor alignment. The -1 from page_size just means
-        one less token evicted, equivalent to old decode convention."""
-        page_size = 1
-        window = 4
+    # -- Eviction formula: page_size == 1 --
+
+    def test_formula_page_size_1(self):
+        """page_size=1: no floor alignment, -1 just means one less token evicted."""
+        page_size, window = 1, 4
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
         )
 
         for seq_len in range(window + 2, 30):
-            req = _evict_and_insert(tree, allocator, pool, seq_len, page_size)
-            # With page_size=1, insert_length == seq_len, so evicted < seq_len always
+            kv = _swa_alloc(allocator, seq_len)
+            pool.write((0, slice(0, seq_len)), kv)
+
+            req = _make_req(0, list(range(seq_len)), 0, tree)
+            batch = _make_batch(tree, allocator, pool)
+            ScheduleBatch._evict_swa(batch, req, seq_len - 1)
+
             self.assertLess(req.swa_evicted_seqlen, seq_len)
+            self.assertEqual(req.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
+
+            tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()
 
-    def test_eviction_noop_short_sequence(self):
-        """When seq_len is small, pre_len - window - page_size < 0 and
-        eviction should not advance (no-op)."""
-        page_size = 8
-        window = 4
+    # -- Eviction formula: no-op when seq too short --
+
+    def test_formula_noop_short_sequence(self):
+        """pre_len - window - page_size < 0: eviction stays at 0."""
+        page_size, window = 8, 4
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
         )
 
-        # seq_len = 10: pre_len=9, 9-4-8 = -3 -> evicted stays at 0
-        seq_len = page_size + window - 2
-        alloc_size = _page_ceil(seq_len, page_size)
+        seq_len = page_size + window - 2  # = 10, formula gives 10-1-4-8 = -3
+        alloc_size = (seq_len + page_size - 1) // page_size * page_size
         kv = _swa_alloc(allocator, alloc_size)
         pool.write((0, slice(0, alloc_size)), kv)
 
@@ -243,176 +234,157 @@ class TestEvictionFormula(unittest.TestCase):
 
         self.assertEqual(req.swa_evicted_seqlen, 0)
 
+    # -- Insert case 1: swa_evicted <= total_prefix_length --
 
-# ---------------------------------------------------------------------------
-# Group 2: _insert_helper case 1 / 2 / 3
-# ---------------------------------------------------------------------------
-
-
-class TestInsertCases(unittest.TestCase):
-    """Verify _insert_helper handles all three swa_evicted_seqlen positions."""
-
-    def test_case2_partial_tombstone(self):
-        """Case 2: total_prefix_length < swa_evicted < total_length.
-
-        Normal eviction with page_size > window: some new tokens are tombstone,
-        the rest are non-tombstone. Verify swa_evictable accounting.
-        """
-        page_size = 8
-        window = 2
+    def test_insert_case1_evicted_within_matched(self):
+        """Eviction within matched region. New tokens all non-tombstone."""
+        page_size, window = 8, 2
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
         )
 
-        # seq_len=25: insert_length=24, new_evicted should be 8 (1 page)
-        seq_len = page_size * 3 + 1
-        swa_evictable_before = tree.swa_evictable_size_
-
-        req = _evict_and_insert(tree, allocator, pool, seq_len, page_size)
-
-        insert_len = _page_floor(seq_len, page_size)
-        self.assertGreater(req.swa_evicted_seqlen, 0, "Should have some eviction")
-        self.assertLess(req.swa_evicted_seqlen, insert_len, "Should be partial")
-
-        # Non-tombstone portion should be added to swa_evictable
-        non_tombstone = insert_len - req.swa_evicted_seqlen
-        self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + non_tombstone)
-        # Tombstone portion should be added to full_evictable but not swa_evictable
-        self.assertGreater(tree.full_evictable_size_, 0)
-        tree.sanity_check()
-
-    def test_case1_evicted_within_matched(self):
-        """Case 1: swa_evicted_seqlen <= total_prefix_length.
-
-        Insert first request to populate tree, then a second request with
-        overlapping prefix. Use _evict_swa with a small pre_len so eviction
-        stays within the matched region. New tokens should all be non-tombstone.
-        """
-        page_size = 8
-        window = 2
-        tree, allocator, pool = _build_swa_tree(
-            page_size=page_size, sliding_window_size=window
-        )
-
-        # First request: insert 16 tokens (2 pages) into tree
+        # First request: populate tree with 16 tokens (2 pages)
         first_len = page_size * 2
-        _evict_and_insert(tree, allocator, pool, first_len, page_size, req_pool_idx=0)
+        kv1 = _swa_alloc(allocator, first_len)
+        pool.write((0, slice(0, first_len)), kv1)
+        req1 = _make_req(0, list(range(first_len)), 0, tree)
+        tree.cache_finished_req(req1, is_insert=True)
         tree.sanity_check()
 
         # Second request: 24 tokens, first 16 overlap with tree
         second_len = page_size * 3
-        alloc_size = _page_ceil(second_len, page_size)
-        kv2 = _swa_alloc(allocator, alloc_size)
-        pool.write((1, slice(0, alloc_size)), kv2)
+        kv2 = _swa_alloc(allocator, second_len)
+        pool.write((1, slice(0, second_len)), kv2)
 
         req2 = _make_req(1, list(range(second_len)), 0, tree)
         batch = _make_batch(tree, allocator, pool)
 
-        # Evict with pre_len that keeps eviction within the first 16 (matched) tokens
-        # pre_len=15: 15 - 2 - 8 = 5, floor to 8 -> 0. Eviction stays at 0.
+        # pre_len=15: 15-2-8=5, floor to 8 -> 0. Eviction stays within matched.
         ScheduleBatch._evict_swa(batch, req2, first_len - 1)
-        self.assertLessEqual(
-            req2.swa_evicted_seqlen,
-            first_len,
-            "Precondition: eviction within matched region",
-        )
+        self.assertLessEqual(req2.swa_evicted_seqlen, first_len)
 
         swa_evictable_before = tree.swa_evictable_size_
         tree.cache_finished_req(req2, is_insert=True)
 
         # New tokens [16, 24) should all be non-tombstone
-        new_tokens = _page_floor(second_len, page_size) - first_len
+        new_tokens = second_len // page_size * page_size - first_len
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + new_tokens)
         tree.sanity_check()
 
-    def test_case3_defensive_early_return(self):
-        """Case 3: swa_evicted_seqlen == total_length (defensive guard).
+    # -- Insert case 2: total_prefix_length < swa_evicted < total_length --
 
-        Simulate the OLD formula (without -page_size) to produce a boundary
-        value, then feed it through real cache_finished_req. Verify no
-        non-tombstone node is created.
-        """
-        page_size = 8
-        window = 2
+    def test_insert_case2_partial_tombstone(self):
+        """Partial eviction: some tombstone, some non-tombstone."""
+        page_size, window = 8, 2
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
         )
 
-        # seq_len=11: old formula -> evicted=8 == insert_length=8
-        seq_len = page_size + window + 1
-        alloc_size = _page_ceil(seq_len, page_size)
+        # seq_len=25: insert_length=24, evicted should be 8 (1 page)
+        seq_len = page_size * 3 + 1
+        alloc_size = (seq_len + page_size - 1) // page_size * page_size
         kv = _swa_alloc(allocator, alloc_size)
         pool.write((0, slice(0, alloc_size)), kv)
 
-        # Compute using OLD formula (without -page_size)
+        req = _make_req(0, list(range(seq_len)), 0, tree)
+        batch = _make_batch(tree, allocator, pool)
+        swa_evictable_before = tree.swa_evictable_size_
+
+        ScheduleBatch._evict_swa(batch, req, seq_len - 1)
+        insert_len = seq_len // page_size * page_size
+        self.assertGreater(req.swa_evicted_seqlen, 0, "Should have some eviction")
+        self.assertLess(req.swa_evicted_seqlen, insert_len, "Should be partial")
+
+        tree.cache_finished_req(req, is_insert=True)
+
+        non_tombstone = insert_len - req.swa_evicted_seqlen
+        self.assertEqual(tree.swa_evictable_size_, swa_evictable_before + non_tombstone)
+        self.assertGreater(tree.full_evictable_size_, 0)
+        tree.sanity_check()
+
+    # -- Insert case 3: swa_evicted == total_length (defensive) --
+
+    def test_insert_case3_defensive_early_return(self):
+        """Simulate OLD formula to trigger case 3. Defensive early return
+        must prevent non-tombstone node creation."""
+        page_size, window = 8, 2
+        tree, allocator, pool = _build_swa_tree(
+            page_size=page_size, sliding_window_size=window
+        )
+
+        # seq_len=11: OLD formula -> evicted=8 == insert_length=8
+        seq_len = page_size + window + 1
+        alloc_size = (seq_len + page_size - 1) // page_size * page_size
+        kv = _swa_alloc(allocator, alloc_size)
+        pool.write((0, slice(0, alloc_size)), kv)
+
+        # OLD formula (without -page_size)
         pre_len = seq_len - 1
-        old_evicted = max(0, _page_floor(pre_len - window, page_size))
-        insert_len = _page_floor(seq_len, page_size)
+        old_evicted = max(0, (pre_len - window) // page_size * page_size)
+        insert_len = seq_len // page_size * page_size
         self.assertEqual(
             old_evicted, insert_len, "Precondition: old formula hits boundary"
         )
 
         # Manually free SWA as _evict_swa would
-        free_slots = pool.req_to_token[0, :old_evicted]
-        allocator.free_swa(free_slots)
+        allocator.free_swa(pool.req_to_token[0, :old_evicted])
 
         req = _make_req(0, list(range(seq_len)), 0, tree)
         req.swa_evicted_seqlen = old_evicted
-
         swa_evictable_before = tree.swa_evictable_size_
+
         tree.cache_finished_req(req, is_insert=True)
 
-        # Core assertion: no non-tombstone node created
         self.assertEqual(tree.swa_evictable_size_, swa_evictable_before)
 
-
-# ---------------------------------------------------------------------------
-# Group 3: Integration / multi-step
-# ---------------------------------------------------------------------------
-
-
-class TestIntegration(unittest.TestCase):
-    """Multi-step and cross-scenario integration tests."""
+    # -- Integration: multiple decode turns --
 
     def test_multiple_decodes(self):
-        """Simulate multiple decode turns with page_size > window.
-        Each turn: alloc -> evict -> insert. Verify no over-eviction and
+        """Multiple decode turns with page_size > window. No over-eviction,
         tree stays consistent throughout."""
-        page_size = 8
-        window = 2
+        page_size, window = 8, 2
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
         )
 
         for turn in range(4):
             seq_len = page_size * (turn + 2) + 1
-            req_pool_idx = turn % pool.size
-            req = _evict_and_insert(
-                tree, allocator, pool, seq_len, page_size, req_pool_idx
-            )
+            idx = turn % pool.size
+            alloc_size = (seq_len + page_size - 1) // page_size * page_size
+            kv = _swa_alloc(allocator, alloc_size)
+            assert kv is not None, f"Alloc failed at turn {turn}"
+            pool.write((idx, slice(0, alloc_size)), kv)
 
-            insert_len = _page_floor(seq_len, page_size)
-            self.assertLess(
-                req.swa_evicted_seqlen,
-                insert_len,
-                f"Over-eviction at turn {turn}",
-            )
+            req = _make_req(idx, list(range(seq_len)), 0, tree)
+            batch = _make_batch(tree, allocator, pool)
+            ScheduleBatch._evict_swa(batch, req, seq_len - 1)
+
+            insert_len = seq_len // page_size * page_size
+            self.assertLess(req.swa_evicted_seqlen, insert_len, f"turn {turn}")
+
+            tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()
 
+    # -- Integration: page_size=1 full flow --
+
     def test_page_size_1_full_flow(self):
-        """End-to-end with page_size=1. Verify the fix is a no-op in practice
-        (eviction changes by at most 1 token)."""
-        page_size = 1
-        window = 4
+        """End-to-end with page_size=1. Fix is near no-op."""
+        page_size, window = 1, 4
         tree, allocator, pool = _build_swa_tree(
             page_size=page_size, sliding_window_size=window
         )
 
         for seq_len in [10, 20, 30]:
-            req = _evict_and_insert(tree, allocator, pool, seq_len, page_size)
-            # With page_size=1, all tokens are inserted (no page truncation)
-            expected_evicted = max(0, seq_len - 1 - window - page_size)
-            self.assertEqual(req.swa_evicted_seqlen, expected_evicted)
+            kv = _swa_alloc(allocator, seq_len)
+            pool.write((0, slice(0, seq_len)), kv)
+
+            req = _make_req(0, list(range(seq_len)), 0, tree)
+            batch = _make_batch(tree, allocator, pool)
+            ScheduleBatch._evict_swa(batch, req, seq_len - 1)
+
+            self.assertEqual(req.swa_evicted_seqlen, max(0, seq_len - 1 - window - 1))
+
+            tree.cache_finished_req(req, is_insert=True)
             tree.sanity_check()
 
 
