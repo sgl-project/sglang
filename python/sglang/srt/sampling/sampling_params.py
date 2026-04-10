@@ -67,10 +67,9 @@ class SamplingParams:
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
-        if stop_token_ids:
-            self.stop_token_ids = set(stop_token_ids)
-        else:
-            self.stop_token_ids = None
+        self.stop_token_ids = {
+            t for t in (stop_token_ids or []) if t is not None
+        } or None
         self.stop_regex_strs = stop_regex
         self.temperature = temperature
         self.top_p = top_p
