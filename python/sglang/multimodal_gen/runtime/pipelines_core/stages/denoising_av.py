@@ -348,18 +348,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
     ) -> bool:
         return False
 
-    @staticmethod
-    def _use_ltx23_legacy_ti2v_sp_prompt_mask_semantics(
-        batch: Req, *, stage: str, is_ltx23_variant: bool
-    ) -> bool:
-        return (
-            is_ltx23_variant
-            and stage == "one_stage"
-            and get_sp_world_size() > 1
-            and batch.image_latent is not None
-            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
-        )
-
     def _get_condition_image_encoder(
         self,
         server_args: ServerArgs,
@@ -574,11 +562,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         )
         do_ti2v = self._should_apply_ltx2_ti2v(batch)
-        use_legacy_ti2v_sp_prompt_mask_semantics = (
-            self._use_ltx23_legacy_ti2v_sp_prompt_mask_semantics(
-                batch, stage=stage, is_ltx23_variant=is_ltx23_variant
-            )
-        )
         replicate_audio_for_sp = self._should_replicate_ltx23_audio_for_sp(
             batch,
             server_args,
@@ -806,11 +789,9 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         if use_official_cfg_path:
                             encoder_hidden_states = batch.prompt_embeds[0]
                             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                            encoder_attention_mask = (
-                                batch.prompt_attention_mask
-                                if use_legacy_ti2v_sp_prompt_mask_semantics
-                                else None
-                            )
+                            # Official LTX pipelines rely on packed prompt embeddings
+                            # with padded positions zeroed out, not an explicit KV mask.
+                            encoder_attention_mask = None
                             if batch.do_classifier_free_guidance:
                                 latent_model_input = torch.cat(
                                     [latent_model_input] * 2, dim=0
@@ -832,14 +813,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     ],
                                     dim=0,
                                 )
-                                if encoder_attention_mask is not None:
-                                    encoder_attention_mask = torch.cat(
-                                        [
-                                            batch.negative_attention_mask,
-                                            encoder_attention_mask,
-                                        ],
-                                        dim=0,
-                                    )
                                 cfg_batch_size = int(latent_model_input.shape[0])
                                 timestep_video = self._repeat_batch_dim(
                                     timestep_video, cfg_batch_size
@@ -955,11 +928,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                             # then apply CFG on denoised (x0) predictions.
                             encoder_hidden_states = batch.prompt_embeds[0]
                             audio_encoder_hidden_states = batch.audio_prompt_embeds[0]
-                            encoder_attention_mask = (
-                                batch.prompt_attention_mask
-                                if use_legacy_ti2v_sp_prompt_mask_semantics
-                                else None
-                            )
+                            encoder_attention_mask = None
                             with set_forward_context(
                                 current_timestep=i, attn_metadata=attn_metadata
                             ):
@@ -1000,11 +969,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                     neg_audio_encoder_hidden_states = (
                                         batch.negative_audio_prompt_embeds[0]
                                     )
-                                    neg_encoder_attention_mask = (
-                                        batch.negative_attention_mask
-                                        if use_legacy_ti2v_sp_prompt_mask_semantics
-                                        else None
-                                    )
+                                    neg_encoder_attention_mask = None
 
                                     v_neg, a_v_neg = current_model(
                                         hidden_states=latent_model_input,
