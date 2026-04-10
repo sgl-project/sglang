@@ -81,19 +81,12 @@ __global__ void __launch_bounds__(THREADS_PER_THREAD_BLOCK) LogitsBitmaskKernel(
       continue;
     }
 
-    if (bitmask_val == kPackedMask) {
-      *reinterpret_cast<PackedT*>(logits_gmem_ptr + offset) =
-          PackedNegativeInfinity<T, PackedT>();
-      continue;
-    }
-
     *reinterpret_cast<PackedT*>(logits_reg) =
         *reinterpret_cast<PackedT*>(logits_gmem_ptr + offset);
+    const T neg_inf = NegativeInfinity<T>();
 #pragma unroll
     for (int i = 0; i < kAlignment; i++) {
-      if (((bitmask_val >> i) & 1)) {
-        logits_reg[i] = NegativeInfinity<T>();
-      }
+      logits_reg[i] = ((bitmask_val >> i) & 1) ? neg_inf : logits_reg[i];
     }
     *reinterpret_cast<PackedT*>(logits_gmem_ptr + offset) =
         *reinterpret_cast<PackedT*>(logits_reg);
