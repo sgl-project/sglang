@@ -141,12 +141,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         ):
             return None
-        if (
-            get_sp_world_size() > 1
-            and batch.image_latent is not None
-            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
-        ):
-            return None
         return copy.deepcopy(_LTX23_ONE_STAGE_GUIDER_PARAMS)
 
     @staticmethod
