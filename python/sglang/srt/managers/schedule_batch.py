@@ -2213,16 +2213,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     .to(device=self.device, non_blocking=True)
                 )
                 _zero = torch.zeros(1, dtype=torch.int64, device=self.device)
-                slot_indices = torch.stack(
-                    [
-                        (
-                            req.pending_radix_mamba_slot.to(torch.int64)
-                            if req.pending_radix_mamba_slot is not None
-                            else _zero
-                        )
-                        for req in self.reqs
-                    ]
-                ).squeeze(1)
+                slot_indices = (
+                    torch.stack(
+                        [
+                            (
+                                req.pending_radix_mamba_slot
+                                if req.pending_radix_mamba_slot is not None
+                                else _zero
+                            )
+                            for req in self.reqs
+                        ]
+                    )
+                    .squeeze(1)
+                    .to(torch.int64)
+                )
                 has_slot = torch.tensor(
                     [req.pending_radix_mamba_slot is not None for req in self.reqs],
                     dtype=torch.bool,

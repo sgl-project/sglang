@@ -263,14 +263,13 @@ class EagleVerifyInputV2Mixin:
             if get_global_server_args().enable_mamba_extra_buffer():
                 track_indices = []
                 track_mask = []
+                _zero = torch.zeros(1, dtype=torch.int64, device=device)[0]
                 for req in batch.reqs:
                     if req.pending_radix_mamba_slot is not None:
                         track_indices.append(req.pending_radix_mamba_slot[0])
                         track_mask.append(True)
                     else:
-                        track_indices.append(
-                            torch.zeros(1, dtype=torch.int64, device=device)[0]
-                        )
+                        track_indices.append(_zero)
                         track_mask.append(False)
                 batch.mamba_track_indices = torch.stack(track_indices).to(torch.int64)
                 batch.mamba_track_mask = torch.tensor(
