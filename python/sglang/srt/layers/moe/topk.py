@@ -36,7 +36,11 @@ try:
 except ImportError:
     pass
 
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import (
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -49,6 +53,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -789,15 +794,16 @@ def biased_grouped_topk_gpu(
         num_experts // num_expert_group if num_expert_group else num_experts
     )
 
+    # topk for routed experts only (shared experts are appended separately below)
+    topk_routed = topk - num_fused_shared_experts
     if (
         _is_cuda
         and fused_topk_deepseek is not None
-        and num_fused_shared_experts == 0
         and is_power_of_two(num_experts)
-        # flashinfer constraints
-        and topk <= 8
+        # flashinfer constraints (applied to routed experts only)
+        and topk_routed <= 8
         and topk_group <= num_expert_group
-        and topk_group * num_expert_group >= topk
+        and topk_group * num_expert_group >= topk_routed
         and (
             (experts_per_group <= 32 and experts_per_group * topk_group <= 128)
             if num_expert_group > 1
@@ -806,10 +812,10 @@ def biased_grouped_topk_gpu(
     ):
         # Pre-allocate output tensors (flashinfer mutates them in-place)
         topk_weights = torch.empty(
-            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+            (num_tokens, topk_routed), dtype=torch.float32, device=gating_output.device
         )
         topk_ids = torch.empty(
-            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+            (num_tokens, topk_routed), dtype=torch.int32, device=gating_output.device
         )
 
         # flashinfer always applies the scaling_factor internally
@@ -823,12 +829,24 @@ def biased_grouped_topk_gpu(
             correction_bias,
             num_expert_group,
             topk_group,
-            topk,
+            topk_routed,
             scaling_factor,
             topk_weights,
             topk_ids,
             True,
         )
+
+        if num_fused_shared_experts > 0:
+            # Append shared expert columns: ID = num_experts (first shared slot),
+            # weight = sum(routed) / scaling_factor (matching biased_grouped_topk_impl).
+            # DeepEP fusion will overwrite both in _remap_topk_ids_for_deepep_fusion.
+            topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
+            topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
+            if routed_scaling_factor is not None:
+                topk_weights[:, topk_routed:] = (
+                    topk_weights[:, :topk_routed].sum(dim=-1, keepdim=True)
+                    / routed_scaling_factor
+                )
 
         return topk_weights, topk_ids
 
@@ -911,7 +929,6 @@ def biased_grouped_topk_cpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    assert not apply_routed_scaling_factor_on_output, "Not implemented"
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
         gating_output,
@@ -921,7 +938,7 @@ def biased_grouped_topk_cpu(
         num_expert_group,
         topk_group,
         num_fused_shared_experts,
-        routed_scaling_factor,
+        routed_scaling_factor if apply_routed_scaling_factor_on_output else None,
         # num_token_non_padded must be None since it is not supported in kernel
         num_token_non_padded=None,
     )
@@ -936,6 +953,50 @@ else:
     biased_grouped_topk = biased_grouped_topk_gpu
     grouped_topk = grouped_topk_gpu
     fused_topk_native = fused_topk_torch_native
+
+
+def _remap_topk_for_deepep(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_fused_shared_experts: int,
+    n_routed_experts: int,
+    topk_config: TopKConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Remap TopK output to DeepEP interleaved expert layout.
+
+    DeepEP dispatch needs each rank's shared expert at a unique ID so tokens
+    route to the correct rank. The layout interleaves shared slots among
+    routed experts: [routed_0..L-1, shared, routed_L..2L-1, shared, ...].
+
+    Routed IDs:  e -> e + e // num_local_routed
+    Shared IDs:  ep_rank * num_local_experts + num_local_routed
+    Shared weight: 1 / routed_scaling_factor (compensates post-MoE scaling)
+    """
+    if topk_ids.shape[0] == 0:
+        return topk_ids, topk_weights
+
+    ep_size = get_moe_expert_parallel_world_size()
+    ep_rank = get_moe_expert_parallel_rank()
+    num_local_routed = n_routed_experts // ep_size
+    num_local_experts = num_local_routed + num_fused_shared_experts
+
+    # Remap routed IDs: insert gaps for shared expert slots (single fused op)
+    routed = topk_ids[:, :-num_fused_shared_experts]
+    topk_ids[:, :-num_fused_shared_experts] = routed + routed // num_local_routed
+
+    # Set shared expert IDs to route to home rank (vectorized)
+    topk_ids[:, -num_fused_shared_experts:] = (
+        ep_rank * num_local_experts
+        + num_local_routed
+        + torch.arange(num_fused_shared_experts, device=topk_ids.device)
+    )
+
+    # Override shared weight: 1/routed_scaling_factor so net contribution = 1.0
+    routed_scaling_factor = topk_config.routed_scaling_factor
+    if routed_scaling_factor is not None and routed_scaling_factor != 0:
+        topk_weights[:, -num_fused_shared_experts:] = 1.0 / routed_scaling_factor
+
+    return topk_ids, topk_weights
 
 
 def _post_process_topk_ids(
@@ -956,8 +1017,9 @@ def _post_process_topk_ids(
         topk_ids=topk_ids,
     )
     if _is_cuda:
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        topk_ids = _biased_grouped_topk_postprocess(
+            topk_ids, expert_location_dispatch_info, num_token_non_padded
+        )
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
@@ -979,6 +1041,18 @@ def _post_process_topk_ids(
             scale_factor,
             N,  # base id for shared experts
         )
+
+    # DeepEP: remap to interleaved expert layout where each rank's shared
+    # expert has a unique ID for dispatch routing.
+    if num_fused_shared_experts > 0 and is_deepep_class_backend():
+        topk_ids, topk_weights = _remap_topk_for_deepep(
+            topk_ids,
+            topk_weights,
+            num_fused_shared_experts,
+            router_logits.shape[1],
+            topk_config,
+        )
+
     return topk_ids, topk_weights
 
 

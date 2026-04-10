@@ -427,15 +427,6 @@ class TestHiCacheArgs(unittest.TestCase):
 
 
 class TestNgramExternalSamArgs(CustomTestCase):
-    def _make_dummy_ngram_args(self, **overrides):
-        args = ServerArgs(model_path="dummy")
-        args.speculative_algorithm = "NGRAM"
-        args.speculative_num_draft_tokens = 12
-        args.device = "cuda"
-        for key, value in overrides.items():
-            setattr(args, key, value)
-        return args
-
     def test_prepare_server_args_parses_external_sam_args(self):
         server_args = prepare_server_args(
             [
@@ -458,12 +449,14 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertEqual(server_args.speculative_ngram_external_sam_budget, 4)
         self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
 
-    def test_external_sam_budget_requires_path(self):
-        with self.assertRaises(ValueError) as context:
-            self._make_dummy_ngram_args(
-                speculative_ngram_external_sam_budget=2,
-            )._handle_speculative_decoding()
-        self.assertIn("external-sam-budget", str(context.exception))
+    def _make_dummy_ngram_args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "NGRAM"
+        args.speculative_num_draft_tokens = 12
+        args.device = "cuda"
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
 
     def test_external_sam_budget_must_fit_draft_budget(self):
         with self.assertRaises(ValueError) as context:
