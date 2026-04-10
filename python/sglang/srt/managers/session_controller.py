@@ -291,6 +291,7 @@ class SessionController:
 
     def _close(self, session_id: str):
         session = self.sessions[session_id]
+        req = None
         has_active_request = False
         if session.streaming and session.req_nodes:
             assert len(session.req_nodes) == 1
@@ -329,7 +330,7 @@ class SessionController:
             node.req.multimodal_inputs = None
 
         if isinstance(self.tree_cache, SessionAwareCache):
-            self.tree_cache.release_session(session_id)
+            self.tree_cache.release_session(session_id, req if session.streaming else None)
         del self.sessions[session_id]
         log_info_on_rank0(
             logger, f"Session closed: {session_id} (active={len(self.sessions)})"

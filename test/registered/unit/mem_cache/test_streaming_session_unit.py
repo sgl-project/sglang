@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+from sglang.srt.mem_cache.session_aware_cache import SessionSlot
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 
 
@@ -15,13 +17,23 @@ class _FakeAllocator:
 
 
 class _FakeInnerCache:
-    def __init__(self, req_to_token_pool, allocator, page_size):
+    def __init__(self, req_to_token_pool, allocator, page_size, match_results=None):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = allocator
         self.page_size = page_size
+        self.match_results = list(match_results or [])
+        self.dec_lock_ref_calls = []
 
     def cache_finished_req(self, *args, **kwargs):
         raise AssertionError("Streaming requests should not delegate to inner cache")
+
+    def match_prefix(self, *args, **kwargs):
+        if not self.match_results:
+            raise AssertionError("Unexpected match_prefix call")
+        return self.match_results.pop(0)
+
+    def dec_lock_ref(self, node, *args, **kwargs):
+        self.dec_lock_ref_calls.append(node)
 
     def supports_mamba(self):
         return False
@@ -36,6 +48,9 @@ class _FakeReq:
         self.req_pool_idx = req_pool_idx
         self.kv_committed_len = committed
         self.kv_allocated_len = allocated
+        self.origin_input_ids = list(range(committed))
+        self.output_ids = []
+        self.extra_key = None
         self.swa_evicted_seqlen = 0
         self.last_node = None
         self.cache_protected_len = 0
@@ -74,3 +89,44 @@ def test_streaming_release_kv_cache_trims_overallocated_tail(monkeypatch):
     assert slot.kv_allocated_len == 17
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(32, 40))
+
+
+def test_release_session_recomputes_current_tree_owned_prefix():
+    page_size = 16
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+
+    full_match = MatchResult(
+        device_indices=torch.tensor(list(range(16)) + list(range(64, 96))),
+        last_device_node="stale-expanded",
+        last_host_node="stale-expanded",
+    )
+    protected_match = MatchResult(
+        device_indices=torch.tensor(list(range(16))),
+        last_device_node="current-protected",
+        last_host_node="current-protected",
+    )
+    inner = _FakeInnerCache(
+        req_to_token_pool,
+        allocator,
+        page_size,
+        match_results=[full_match, protected_match],
+    )
+    tree_cache = SessionAwareCache(inner)
+
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=48,
+        kv_allocated_len=48,
+        last_node="outdated-node",
+        cache_protected_len=32,
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=48, allocated=48)
+
+    tree_cache.release_session("session-a", req)
+
+    assert inner.dec_lock_ref_calls == ["current-protected"]
+    assert req_to_token_pool.free_slots == [0]
+    assert len(allocator.freed) == 1
+    assert allocator.freed[0].tolist() == list(range(16, 48))
