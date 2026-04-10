@@ -1397,8 +1397,12 @@ class NixlKVManager(CommonKVManager):
         if handler is None:
             return
         handler.handle_chunk_arrived(
-            room, chunk_idx, page_start, num_pages,
-            agent_name, self._chunk_writer_counts,
+            room,
+            chunk_idx,
+            page_start,
+            num_pages,
+            agent_name,
+            self._chunk_writer_counts,
         )
 
     def _maybe_submit_last_scatter(self, room: int):
@@ -1587,7 +1591,10 @@ class NixlKVReceiver(CommonKVReceiver):
             return
 
         # Register staging room bootstrap info for staging handler
-        if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx.allocator is not None:
+        if (
+            self.kv_mgr.enable_staging
+            and self.kv_mgr._staging_ctx.allocator is not None
+        ):
             self.chunk_staging_infos = []
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
@@ -1692,7 +1699,10 @@ class NixlKVReceiver(CommonKVReceiver):
             )
 
             # Include staging allocator metadata if available
-            if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx.allocator is not None:
+            if (
+                self.kv_mgr.enable_staging
+                and self.kv_mgr._staging_ctx.allocator is not None
+            ):
                 _alloc = self.kv_mgr._staging_ctx.allocator
                 packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
                 staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")

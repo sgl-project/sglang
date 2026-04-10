@@ -1419,8 +1419,12 @@ class MooncakeKVManager(CommonKVManager):
                         handler is not None
                     ), "CHUNK_READY received before staging handler initialized"
                     handler.handle_chunk_arrived(
-                        room, chunk_idx, page_start, num_pages,
-                        session_id, self._chunk_writer_counts,
+                        room,
+                        chunk_idx,
+                        page_start,
+                        num_pages,
+                        session_id,
+                        self._chunk_writer_counts,
                     )
                     continue
 

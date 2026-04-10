@@ -199,9 +199,7 @@ class DecodeStagingHandler:
         once all writers for this chunk have reported in. Returns True if scatter
         was submitted.
         """
-        chunk_writer_counts[room][chunk_idx].append(
-            (page_start, num_pages, writer_id)
-        )
+        chunk_writer_counts[room][chunk_idx].append((page_start, num_pages, writer_id))
         decode_req = self._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -405,9 +403,7 @@ def handle_watermark_msg(staging_ctx, msg_parts) -> None:
     """Process a WATERMARK message and update remote watermark tracking."""
     wm_round = int(msg_parts[1].decode("ascii"))
     wm_tail = int(msg_parts[2].decode("ascii"))
-    wm_session = (
-        msg_parts[3].decode("ascii") if len(msg_parts) > 3 else ""
-    )
+    wm_session = msg_parts[3].decode("ascii") if len(msg_parts) > 3 else ""
     with staging_ctx.watermark_cv:
         prev = staging_ctx.remote_watermarks.get(wm_session, (0, 0))
         if (wm_round, wm_tail) > prev:
