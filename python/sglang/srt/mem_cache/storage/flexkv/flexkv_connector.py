@@ -349,6 +349,7 @@ class FlexKVConnector(BaseKVConnector):
             flexkv_task_id, matched_mask = self.kv_manager.get_match(
                 token_ids=token_ids_np,
                 token_mask=token_mask,
+                cpu_only=True,
             )
             hit_length = int(matched_mask.sum()) if matched_mask is not None else 0
             if not update_state_for_load:
