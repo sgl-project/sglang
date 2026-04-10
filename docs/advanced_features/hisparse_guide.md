@@ -106,7 +106,7 @@ python3 -m sglang.launch_server \
 ```bash
 python3 -m sglang.bench_serving \
     --backend sglang \
-    --dataset-path /path/to//ShareGPT_V3_unfiltered_cleaned_split.json \
+    --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
     --dataset-name random \
     --random-input 40000 \
     --random-output 20000 \
