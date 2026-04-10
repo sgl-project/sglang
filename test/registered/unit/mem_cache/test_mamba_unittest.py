@@ -388,6 +388,434 @@ class TestMamba(unittest.TestCase):
 
         return tree, allocator, req_to_token_pool, make_dummy_req
 
+    def _setup_tree_and_allocator_extra_buffer(self):
+        """Helper to create a MambaRadixCache with enable_mamba_extra_buffer=True."""
+        set_global_server_args_for_scheduler(
+            ServerArgs(
+                model_path="dummy",
+                page_size=1,
+                mamba_scheduler_strategy="extra_buffer",
+            )
+        )
+        size = 128
+        dtype = torch.bfloat16
+        head_num = 2
+        head_dim = 256
+        num_layers = 48
+        global_interval = 4
+        max_num_reqs = 10
+        mamba_cache_size = 30
+        max_context_len = 128
+        device = get_device()
+        full_attention_layer_ids = [
+            i for i in range(global_interval - 1, num_layers, global_interval)
+        ]
+        mamba_layers = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids
+        ]
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=4096,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+            )
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+
+        req_to_token_pool = HybridReqToTokenPool(
+            size=max_num_reqs,
+            mamba_size=mamba_cache_size,
+            mamba_spec_state_size=max_num_reqs,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=False,
+            cache_params=mamba2_cache_params,
+            mamba_layer_ids=mamba_layers,
+            enable_mamba_extra_buffer=True,
+            speculative_num_draft_tokens=3,
+        )
+        pool = HybridLinearKVPool(
+            size=size,
+            dtype=dtype,
+            page_size=1,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+            enable_memory_saver=False,
+            mamba_pool=req_to_token_pool.mamba_pool,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=size,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+        params = CacheInitParams(
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            enable_mamba_extra_buffer=True,
+        )
+        tree = MambaRadixCache(params=params)
+
+        rid_counter = [0]
+
+        def make_dummy_req():
+            sampling_params = SamplingParams(
+                temperature=0,
+                max_new_tokens=1,
+            )
+            req = Req(
+                rid=rid_counter[0],
+                origin_input_text="",
+                origin_input_ids=[],
+                sampling_params=sampling_params,
+            )
+            rid_counter[0] += 1
+            req_to_token_pool.alloc([req])
+            req.last_node = tree.root_node
+            tree.inc_lock_ref(tree.root_node)
+            return req
+
+        return tree, allocator, req_to_token_pool, make_dummy_req
+
+    def test_extra_buffer_pending_radix_slot_lifecycle(self):
+        """Test pending_radix_mamba_slot allocation, ownership transfer to radix
+        tree via cache_unfinished_req, and subsequent match_prefix with cow_mamba.
+        This exercises the core path changed by the ping-pong elimination."""
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator_extra_buffer()
+        )
+        mamba_pool = req_to_token_pool.mamba_pool
+        initial_mamba_avail = mamba_pool.available_size()
+
+        # --- Step 1: Simulate chunked prefill with pending_radix_mamba_slot ---
+        req1 = make_dummy_req()
+        assert req1.mamba_pool_idx is not None
+        # After alloc: 1 working slot consumed
+        self.assertEqual(mamba_pool.available_size(), initial_mamba_avail - 1)
+
+        # Simulate the scheduler allocating a pending radix slot (what prepare_for_extend does)
+        pending_slot = mamba_pool.alloc(1)
+        self.assertIsNotNone(pending_slot)
+        req1.pending_radix_mamba_slot = pending_slot
+        # Now: 1 working + 1 pending = 2 slots consumed
+        self.assertEqual(mamba_pool.available_size(), initial_mamba_avail - 2)
+
+        # Write distinctive data into the pending slot to verify it survives
+        # ownership transfer. We write to the conv state of layer 0.
+        mamba_pool.mamba_cache.conv[0][:, pending_slot[0]] = 42.0
+
+        # Simulate filling token ids and setting mamba_last_track_seqlen
+        req1.fill_ids = [1, 2, 3, 4, 5]
+        req1.origin_input_ids = [1, 2, 3, 4, 5]
+        req1.mamba_last_track_seqlen = 5
+        req1.kv_committed_len = 5
+        req1.kv_allocated_len = 5
+
+        # Allocate KV indices for the tokens
+        kv_indices = allocator.alloc(5)
+        self.assertIsNotNone(kv_indices)
+        req_to_token_pool.write(
+            (req1.req_pool_idx, slice(0, 5)),
+            kv_indices,
+        )
+
+        # cache_unfinished_req should transfer pending slot to radix tree
+        tree.cache_unfinished_req(req1, chunked=True)
+
+        # After cache_unfinished_req: pending slot is now owned by radix tree
+        self.assertIsNone(req1.pending_radix_mamba_slot)
+        # Working slot still alive
+        self.assertIsNotNone(req1.mamba_pool_idx)
+
+        tree.pretty_print()
+
+        # Note: cannot call tree.sanity_check() here because req1 holds a lock on its last_node.
+        # We verify the tree state via match_prefix instead.
+
+        # --- Step 2: Match prefix and verify cow_mamba copies the correct state ---
+        # First, release req1's lock so we start clean for req2
+        tree.dec_lock_ref(req1.last_node)
+        req_to_token_pool.free_mamba_cache(req1)
+        req_to_token_pool.free(req1)
+
+        tree.sanity_check()
+
+        req2 = make_dummy_req()
+        # dec_lock_ref the initial root_node lock from make_dummy_req
+        tree.dec_lock_ref(req2.last_node)
+        result = tree.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey([1, 2, 3, 4, 5, 6, 7]),
+                req=req2,
+                cow_mamba=True,
+            )
+        )
+        kv_indices_matched = result.device_indices
+        last_node = result.last_device_node
+        # Simulate scheduler locking the matched node
+        tree.inc_lock_ref(last_node)
+        req2.last_node = last_node
+        req2.cache_protected_len = len(kv_indices_matched)
+        self.assertEqual(len(kv_indices_matched), 5)
+        self.assertIsNotNone(req2.mamba_pool_idx)
+
+        # Verify the copied mamba state matches what we wrote (42.0)
+        self.assertTrue(
+            torch.all(
+                mamba_pool.mamba_cache.conv[0][:, req2.mamba_pool_idx]
+                == mamba_pool.mamba_cache.conv[0][:, last_node.mamba_value]
+            )
+        )
+        expected_val = torch.tensor(42.0, dtype=mamba_pool.mamba_cache.conv[0].dtype)
+        self.assertTrue(
+            torch.all(
+                mamba_pool.mamba_cache.conv[0][0, req2.mamba_pool_idx] == expected_val
+            )
+        )
+
+        # --- Step 3: cache_finished_req with pending_radix_mamba_slot ---
+        # Simulate a decode phase: req2 matched prefix [1,2,3,4,5] and decoded [6,7]
+        req2.origin_input_ids = [1, 2, 3, 4, 5]
+        req2.output_ids = [6, 7]
+        new_pending = mamba_pool.alloc(1)
+        self.assertIsNotNone(new_pending)
+        req2.pending_radix_mamba_slot = new_pending
+        mamba_pool.mamba_cache.conv[0][:, new_pending[0]] = 99.0
+        req2.mamba_last_track_seqlen = 7
+        req2.kv_committed_len = 7
+        req2.kv_allocated_len = 7
+
+        # Write the matched prefix indices + new decode KV into req2's token pool
+        req_to_token_pool.write(
+            (req2.req_pool_idx, slice(0, 5)),
+            kv_indices_matched,
+        )
+        kv_new = allocator.alloc(2)
+        self.assertIsNotNone(kv_new)
+        req_to_token_pool.write(
+            (req2.req_pool_idx, slice(5, 7)),
+            kv_new,
+        )
+
+        tree.cache_finished_req(req2)
+        req_to_token_pool.free(req2)
+
+        # After cache_finished_req: working + pending slots should be freed from req
+        self.assertIsNone(req2.mamba_pool_idx)
+        self.assertIsNone(req2.pending_radix_mamba_slot)
+
+        tree.pretty_print()
+        tree.sanity_check()
+
+        # Verify the new node has the correct mamba value (99.0)
+        result3 = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 5, 6, 7]))
+        )
+        self.assertEqual(len(result3.device_indices), 7)
+        last_node3 = result3.last_device_node
+        self.assertIsNotNone(last_node3.mamba_value)
+        self.assertTrue(
+            torch.all(
+                mamba_pool.mamba_cache.conv[0][0, last_node3.mamba_value] == 99.0
+            )
+        )
+
+        # --- Step 4: cache_finished_req without pending slot (short decode) ---
+        req3 = make_dummy_req()
+        tree.dec_lock_ref(req3.last_node)
+        result4 = tree.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey([1, 2, 3, 4, 5, 6, 7]),
+                req=req3,
+                cow_mamba=True,
+            )
+        )
+        self.assertEqual(len(result4.device_indices), 7)
+        tree.inc_lock_ref(result4.last_device_node)
+        req3.last_node = result4.last_device_node
+        req3.origin_input_ids = [1, 2, 3, 4, 5, 6, 7]
+        req3.output_ids = [8]  # short output, no tracking occurred
+        req3.mamba_last_track_seqlen = None
+        req3.pending_radix_mamba_slot = None
+        req3.cache_protected_len = 7
+        req3.kv_committed_len = 8
+        req3.kv_allocated_len = 8
+        req3.kv_committed_freed = False
+
+        # Write matched prefix + decode output KV into req3's token pool
+        req_to_token_pool.write(
+            (req3.req_pool_idx, slice(0, 7)),
+            result4.device_indices,
+        )
+        kv_extra = allocator.alloc(1)
+        self.assertIsNotNone(kv_extra)
+        req_to_token_pool.write((req3.req_pool_idx, slice(7, 8)), kv_extra)
+
+        avail_before = mamba_pool.available_size()
+        tree.cache_finished_req(req3)
+        req_to_token_pool.free(req3)
+        # Working slot freed, no pending slot to worry about
+        self.assertIsNone(req3.mamba_pool_idx)
+        self.assertIsNone(req3.pending_radix_mamba_slot)
+        # Should have freed exactly 1 mamba slot (working)
+        self.assertEqual(mamba_pool.available_size(), avail_before + 1)
+
+        tree.sanity_check()
+
+        # --- Step 5: free_mamba_cache with both working + pending ---
+        req4 = make_dummy_req()
+        tree.dec_lock_ref(req4.last_node)
+        pending_slot4 = mamba_pool.alloc(1)
+        self.assertIsNotNone(pending_slot4)
+        req4.pending_radix_mamba_slot = pending_slot4
+        avail_before = mamba_pool.available_size()
+
+        req_to_token_pool.free_mamba_cache(req4)
+        # Should free both working and pending slots
+        self.assertIsNone(req4.mamba_pool_idx)
+        self.assertIsNone(req4.pending_radix_mamba_slot)
+        self.assertEqual(mamba_pool.available_size(), avail_before + 2)
+
+        req_to_token_pool.free(req4)
+        tree.sanity_check()
+        print(tree.available_and_evictable_str())
+        print(available_and_evictable_str(tree))
+
+    def test_extra_buffer_eviction_frees_mamba_slots(self):
+        """Test that evicting radix tree nodes correctly frees mamba slots
+        that were transferred via pending_radix_mamba_slot."""
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator_extra_buffer()
+        )
+        mamba_pool = req_to_token_pool.mamba_pool
+
+        # Insert two separate prefixes via the pending slot path
+        for token_ids in [[1, 2, 3], [10, 11, 12]]:
+            req = make_dummy_req()
+            pending = mamba_pool.alloc(1)
+            self.assertIsNotNone(pending)
+            req.pending_radix_mamba_slot = pending
+            req.fill_ids = token_ids
+            req.origin_input_ids = token_ids
+            req.mamba_last_track_seqlen = len(token_ids)
+            req.kv_committed_len = len(token_ids)
+            req.kv_allocated_len = len(token_ids)
+
+            kv = allocator.alloc(len(token_ids))
+            req_to_token_pool.write(
+                (req.req_pool_idx, slice(0, len(token_ids))), kv
+            )
+            tree.cache_unfinished_req(req, chunked=True)
+
+            # After cache_unfinished_req, req.last_node points to the new cached node.
+            # Simulate request finishing by freeing working slot and req pool,
+            # and unlocking the tree node.
+            tree.dec_lock_ref(req.last_node)
+            req_to_token_pool.free_mamba_cache(req)
+            req_to_token_pool.free(req)
+
+        tree.sanity_check()
+
+        avail_before_evict = mamba_pool.available_size()
+
+        # Evict 1 mamba state
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        self.assertGreaterEqual(result.mamba_num_evicted, 1)
+        self.assertGreater(mamba_pool.available_size(), avail_before_evict)
+
+        tree.sanity_check()
+
+        # Evict the other one
+        avail_before_evict2 = mamba_pool.available_size()
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        self.assertGreaterEqual(result.mamba_num_evicted, 1)
+        self.assertGreater(mamba_pool.available_size(), avail_before_evict2)
+
+        tree.sanity_check()
+
+    def test_extra_buffer_multiple_cache_unfinished(self):
+        """Test multiple cache_unfinished_req calls (simulating chunked prefill
+        with multiple chunks), each with a fresh pending_radix_mamba_slot."""
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator_extra_buffer()
+        )
+        mamba_pool = req_to_token_pool.mamba_pool
+
+        req = make_dummy_req()
+
+        # Chunk 1: tokens [1,2,3]
+        pending1 = mamba_pool.alloc(1)
+        self.assertIsNotNone(pending1)
+        req.pending_radix_mamba_slot = pending1
+        mamba_pool.mamba_cache.conv[0][:, pending1[0]] = 10.0
+
+        req.fill_ids = [1, 2, 3]
+        req.origin_input_ids = [1, 2, 3, 4, 5, 6]
+        req.mamba_last_track_seqlen = 3
+        req.kv_committed_len = 3
+        req.kv_allocated_len = 3
+
+        kv1 = allocator.alloc(3)
+        req_to_token_pool.write((req.req_pool_idx, slice(0, 3)), kv1)
+        tree.cache_unfinished_req(req, chunked=True)
+
+        self.assertIsNone(req.pending_radix_mamba_slot)
+
+        # Verify chunk 1 mamba state is in radix tree
+        result1 = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3])))
+        self.assertEqual(len(result1.device_indices), 3)
+        self.assertTrue(
+            torch.all(
+                mamba_pool.mamba_cache.conv[0][0, result1.last_device_node.mamba_value]
+                == 10.0
+            )
+        )
+
+        # Chunk 2: tokens [1,2,3,4,5,6]
+        pending2 = mamba_pool.alloc(1)
+        self.assertIsNotNone(pending2)
+        req.pending_radix_mamba_slot = pending2
+        mamba_pool.mamba_cache.conv[0][:, pending2[0]] = 20.0
+
+        req.fill_ids = [1, 2, 3, 4, 5, 6]
+        req.mamba_last_track_seqlen = 6
+        req.kv_committed_len = 6
+        req.kv_allocated_len = 6
+
+        kv2 = allocator.alloc(3)
+        req_to_token_pool.write((req.req_pool_idx, slice(3, 6)), kv2)
+        tree.cache_unfinished_req(req, chunked=True)
+
+        self.assertIsNone(req.pending_radix_mamba_slot)
+
+        # Verify chunk 2 mamba state is in radix tree (should supersede chunk 1's)
+        result2 = tree.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 5, 6])))
+        self.assertEqual(len(result2.device_indices), 6)
+        self.assertTrue(
+            torch.all(
+                mamba_pool.mamba_cache.conv[0][0, result2.last_device_node.mamba_value]
+                == 20.0
+            )
+        )
+
+        tree.pretty_print()
+
+        # Clean up: unlock, free mamba cache and req pool, then sanity check
+        tree.dec_lock_ref(req.last_node)
+        req_to_token_pool.free_mamba_cache(req)
+        req_to_token_pool.free(req)
+
+        tree.sanity_check()
+
     def test_insert_prev_prefix_len(self):
         """Test that prev_prefix_len correctly controls which KV indices are freed
         during insert, covering: full free, partial free across multi-node, and no free.
