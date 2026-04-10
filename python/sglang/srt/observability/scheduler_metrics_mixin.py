@@ -855,7 +855,7 @@ class SchedulerMetricsMixin:
             waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-        num_used_tokens, token_usage = self.get_pool_stats().get_kv_token_stats()
+        num_used_tokens, kv_token_usage = self.get_pool_stats().get_kv_token_stats()
 
         memory = None
         if include_all or "memory" in include:
@@ -941,7 +941,7 @@ class SchedulerMetricsMixin:
             num_waiting_reqs=num_waiting_reqs,
             num_used_tokens=num_used_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
-            token_usage=round(token_usage, 4),
+            token_usage=round(kv_token_usage, 4),
             gen_throughput=round(self.stats.gen_throughput, 2),
             cache_hit_rate=round(self.stats.cache_hit_rate, 4),
             utilization=round(self.stats.utilization, 4),
