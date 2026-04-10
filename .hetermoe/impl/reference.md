@@ -1,5 +1,9 @@
-reference codebase:      ~/heter-moe-proj/TensorRT-LLM
+reference codebase:      https://github.com/hjzccc/TensorRT-LLM.git
 reference branch name:   double-fused-moe
+
+NOTE (step 0.1): the TRT-LLM repo is NOT cloned on this machine.
+    all reference understanding comes from the summary below plus the git remote.
+    this is sufficient — no need to clone TRT-LLM locally.
 
 there's no need to refine this reference codebase. you only need to understand what is a working version for 
     a mixture of {bf16, nvfp4}
@@ -139,3 +143,27 @@ tensorrt_llm.models.modeling_utils.QuantAlgo
 tensorrt_llm.logger
 torch.ops.trtllm.fused_moe                                                ← C++ kernel (nanobind)
 ```
+
+---
+## sglang equivalence mapping (added during step 0.1 refinement)
+
+| TRT-LLM concept                | SGLang equivalent                                                       | file                                                                      |
+|---------------------------------|-------------------------------------------------------------------------|---------------------------------------------------------------------------|
+| CutlassFusedMoE (parent class)  | FusedMoE                                                                | python/sglang/srt/layers/moe/fused_moe_triton/layer.py (L137)            |
+| HeterCutlassFusedMoE            | **new: HeterFusedMoE** (to be created)                                  | python/sglang/srt/layers/moe/heter_moe.py (proposed)                     |
+| torch.ops.trtllm.fused_moe (BF16) | invoke_fused_moe_kernel (Triton)                                     | python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py               |
+| torch.ops.trtllm.fused_moe (NVFP4) | fused_marlin_moe (JIT Marlin)                                       | python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py        |
+| —                               | Triton runner w/ use_int8_w8a8=True (INT8 path)                         | python/sglang/srt/layers/quantization/w8a8_int8.py                        |
+| MoeConfig.heter_config           | ServerArgs.heter_precision_config → JSON file                           | python/sglang/srt/server_args.py                                          |
+| llm_args.py validation           | _initialize_model kwargs in loader                                      | python/sglang/srt/model_loader/loader.py (L258)                          |
+| BaseDispatchPolicy               | **new: BaseHeterPolicy** (to be created)                                | python/sglang/srt/layers/moe/heter_policy.py (proposed)                   |
+| ExpertLoadPolicy                 | **new: TokenCountPolicy** (to be created)                               | python/sglang/srt/layers/moe/heter_policy.py (proposed)                   |
+| DispatchPlan                     | **new: HeterDispatchPlan** (to be created)                              | python/sglang/srt/layers/moe/heter_policy.py (proposed)                   |
+| _build_group_caches              | not needed — we load separate weight checkpoints directly per group     | (weight loading handled during model init)                                |
+| FusedMoEMethodBase               | FusedMoEMethodBase (already exists)                                     | python/sglang/srt/layers/quantization/base_config.py (L84)               |
+| get_moe_cls("HETER")            | get_moe_impl_class returns FusedMoE by default; override for heter      | python/sglang/srt/layers/moe/ep_moe/layer.py (L785)                      |
+
+key architectural difference:
+    TRT-LLM subsets ONE parent weight set into per-group caches at runtime.
+    SGLang approach: load SEPARATE pre-quantized checkpoints per group at init time.
+    this avoids runtime weight subsetting and is simpler + more memory-efficient.

@@ -17,3 +17,19 @@ as contrary to prior work where expert precision assignment is either fixed or o
     1. upon each single batch, adapt the precision based on token count per expert
         (this is because experts classified as hot expert might be cold in the next iteration)
     2. assume colocation of memory weights of different precisions in VRAM, and we only focus on speeding up serving
+
+---
+## sglang kernel mapping (added during step 0.1 refinement)
+
+| scheme   | sglang kernel                        | file                                                                        | notes                                                    |
+|----------|--------------------------------------|-----------------------------------------------------------------------------|----------------------------------------------------------|
+| a16w16   | fused_moe_kernel (Triton)            | python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py  | BF16 activations, BF16 weights; true fused group-GEMM    |
+| a16w4    | fused_marlin_moe (JIT Marlin)        | python/sglang/srt/layers/moe/fused_moe_triton/fused_marlin_moe.py          | BF16 activations, INT4 packed weights; GPTQ/AWQ; separate kernel |
+| a8w8     | fused_moe_kernel (Triton, use_int8_w8a8=True) | python/sglang/srt/layers/moe/fused_moe_triton/fused_moe_triton_kernels.py | TRUE fused group-GEMM (same kernel as BF16, INT8 flag); per_token_quant_int8() for activation |
+
+NOTE: a16w16 and a8w8 share the SAME Triton fused_moe_kernel — INT8 is a compile-time flag (tl.constexpr).
+    a16w4 uses a completely DIFFERENT kernel (fused_marlin_moe with JIT Marlin).
+    int8_scaled_mm from sgl-kernel is for DENSE linear layers only, NOT used in MoE path.
+
+primary scheme pair for v1: {a16w16, a16w4} — simplest, no activation quantization needed for either
+optional extension:         {a8w8, a16w4}   — requires per-token INT8 activation quantization for hot path

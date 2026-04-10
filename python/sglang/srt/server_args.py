@@ -340,6 +340,9 @@ class ServerArgs:
     modelopt_export_path: Optional[str] = None
     quantize_and_serve: bool = False
     rl_quant_profile: Optional[str] = None  # For flash_rl load format
+    heter_precision_config: Optional[str] = (
+        None  # Path to heterogeneous MoE precision config JSON
+    )
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -1274,9 +1277,9 @@ class ServerArgs:
                 )
                 self.cuda_graph_bs = self._generate_cpu_graph_batch_sizes()
 
-            assert (
-                self.torch_compile_max_bs > 0
-            ), "cuda_graph_bs should contain positive batch sizes"
+            assert self.torch_compile_max_bs > 0, (
+                "cuda_graph_bs should contain positive batch sizes"
+            )
             self.cuda_graph_max_bs = self.torch_compile_max_bs
 
         if self.piecewise_cuda_graph_max_tokens is None:
@@ -1592,12 +1595,12 @@ class ServerArgs:
                         else:
                             self.enable_dp_attention = True
                             self.moe_dense_tp_size = 1
-                            assert (
-                                self.dp_size == 1
-                            ), "For round-robin split mode, dp attention is not supported."
-                        assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                            assert self.dp_size == 1, (
+                                "For round-robin split mode, dp attention is not supported."
+                            )
+                        assert self.tp_size == 8, (
+                            "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                        )
                         self.attn_cp_size = self.tp_size // self.dp_size
 
                         logger.warning(
@@ -1628,9 +1631,9 @@ class ServerArgs:
                     self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
                 if self.enable_nsa_prefill_context_parallel:
-                    assert (
-                        self.disaggregation_mode != "decode"
-                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
+                    assert self.disaggregation_mode != "decode", (
+                        "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
+                    )
 
             else:
                 # DeepSeek V3/R1/V3.1
@@ -1825,9 +1828,9 @@ class ServerArgs:
                         )
 
             if self.moe_runner_backend == "triton_kernel":
-                assert (
-                    self.ep_size == 1
-                ), "Triton kernel MoE is only supported when ep_size == 1"
+                assert self.ep_size == 1, (
+                    "Triton kernel MoE is only supported when ep_size == 1"
+                )
 
         elif "MiMoV2FlashForCausalLM" in model_arch:
             if self.speculative_algorithm == "EAGLE":
@@ -1893,7 +1896,9 @@ class ServerArgs:
                 "ascend",
                 "trtllm_mha",
                 "intel_xpu",
-            }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
+            }, (
+                f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
+            )
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -1925,9 +1930,9 @@ class ServerArgs:
                 self.disable_hybrid_swa_memory = True
                 # https://docs.sglang.ai/advanced_features/attention_backend.html
                 accepted_backends = ["fa3", "triton", "trtllm_mha"]
-                assert (
-                    self.attention_backend in accepted_backends
-                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
+                assert self.attention_backend in accepted_backends, (
+                    f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
+                )
         elif model_arch in ["Olmo2ForCausalLM"]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
             logger.warning(
@@ -1946,9 +1951,9 @@ class ServerArgs:
             # Flashinfer appears to degrade performance when sliding window attention
             # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
             # but Olmo3 does.
-            assert (
-                self.attention_backend != "flashinfer"
-            ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+            assert self.attention_backend != "flashinfer", (
+                "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+            )
 
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
@@ -2189,9 +2194,9 @@ class ServerArgs:
             return
 
         if not support_mamba_cache_extra_buffer:
-            assert (
-                not self.enable_mamba_extra_buffer()
-            ), f"mamba extra_buffer is not supported for {model_arch} model"
+            assert not self.enable_mamba_extra_buffer(), (
+                f"mamba extra_buffer is not supported for {model_arch} model"
+            )
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
             if self.disable_radix_cache:
@@ -2201,23 +2206,25 @@ class ServerArgs:
                     "Please use --mamba-scheduler-strategy no_buffer instead."
                 )
 
-            assert (
-                is_cuda()
-            ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+            assert is_cuda(), (
+                "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+            )
             if self.speculative_num_draft_tokens is not None:
-                assert (
-                    self.mamba_track_interval >= self.speculative_num_draft_tokens
-                ), f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
+                assert self.mamba_track_interval >= self.speculative_num_draft_tokens, (
+                    f"mamba_track_interval {self.mamba_track_interval} must be greater than or equal to speculative_num_draft_tokens {self.speculative_num_draft_tokens}"
+                )
 
             if self.page_size is not None:
-                assert (
-                    self.mamba_track_interval % self.page_size == 0
-                ), f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
+                assert self.mamba_track_interval % self.page_size == 0, (
+                    f"mamba_track_interval {self.mamba_track_interval} must be divisible by page_size {self.page_size}"
+                )
                 assert (
                     max(FLA_CHUNK_SIZE, self.page_size)
                     % min(FLA_CHUNK_SIZE, self.page_size)
                     == 0
-                ), f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
+                ), (
+                    f"For SSM models with extra buffer, either FLA_CHUNK_SIZE or page_size must be divisible by the other, got {FLA_CHUNK_SIZE=}, {self.page_size=}"
+                )
         elif not self.disable_radix_cache:  # no_buffer
             if self.page_size is not None and self.page_size != 1:
                 logger.warning(
@@ -2343,9 +2350,9 @@ class ServerArgs:
                 "Cuda graph is disabled because of using torch Flex Attention backend"
             )
             self.disable_cuda_graph = True
-            assert (
-                self.speculative_algorithm is None
-            ), "Speculative decoding is currently not supported with Flex Attention backend"
+            assert self.speculative_algorithm is None, (
+                "Speculative decoding is currently not supported with Flex Attention backend"
+            )
 
         # Whisper's encoder token padding conflicts with prefix caching.
         # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
@@ -2656,35 +2663,35 @@ class ServerArgs:
     def _handle_context_parallelism(self):
         if self.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
-            assert (
-                self.tp_size % self.attn_cp_size == 0
-            ), "tp_size must be divisible by attn_cp_size"
-            assert (
-                self.tp_size % (self.dp_size * self.attn_cp_size) == 0
-            ), "tp_size must be divisible by dp_size * attn_cp_size"
+            assert self.tp_size % self.attn_cp_size == 0, (
+                "tp_size must be divisible by attn_cp_size"
+            )
+            assert self.tp_size % (self.dp_size * self.attn_cp_size) == 0, (
+                "tp_size must be divisible by dp_size * attn_cp_size"
+            )
 
-            assert (
-                not self.enable_aiter_allreduce_fusion
-            ), "Aiter allreduce fusion is not supported with context parallelism"
+            assert not self.enable_aiter_allreduce_fusion, (
+                "Aiter allreduce fusion is not supported with context parallelism"
+            )
 
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
-            assert (
-                self.tp_size % self.moe_dp_size == 0
-            ), "tp_size must be divisible by moe_dp_size"
-            assert (
-                self.ep_size * self.moe_dp_size <= self.tp_size
-            ), "ep_size * moe_dp_size must be less than or equal to tp_size"
+            assert self.tp_size % self.moe_dp_size == 0, (
+                "tp_size must be divisible by moe_dp_size"
+            )
+            assert self.ep_size * self.moe_dp_size <= self.tp_size, (
+                "ep_size * moe_dp_size must be less than or equal to tp_size"
+            )
             assert self.pp_size == 1, "PP is not supported with context parallelism"
 
             if self.ep_size > 1:
-                assert (
-                    self.ep_size * self.moe_dp_size == self.tp_size
-                ), "ep_size * moe_dp_size must be equal to tp_size"
+                assert self.ep_size * self.moe_dp_size == self.tp_size, (
+                    "ep_size * moe_dp_size must be equal to tp_size"
+                )
 
-            assert (
-                not self.enable_aiter_allreduce_fusion
-            ), "Aiter allreduce fusion is not supported with context parallelism"
+            assert not self.enable_aiter_allreduce_fusion, (
+                "Aiter allreduce fusion is not supported with context parallelism"
+            )
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -2700,9 +2707,9 @@ class ServerArgs:
             )
 
         if self.enable_dp_lm_head:
-            assert (
-                self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_lm_head. "
+            assert self.enable_dp_attention, (
+                "Please enable dp attention when setting enable_dp_lm_head. "
+            )
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
@@ -2726,11 +2733,15 @@ class ServerArgs:
                 "modelopt_fp8",
                 "modelopt_mixed",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            ], (
+                f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            )
             assert self.ep_size in [
                 1,
                 self.tp_size,
-            ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+            ], (
+                "The expert parallel size must be 1 or the same as the tensor parallel size"
+            )
 
         if self.moe_runner_backend == "flashinfer_trtllm":
             assert self.quantization in [
@@ -2741,7 +2752,9 @@ class ServerArgs:
                 "modelopt_mixed",
                 "compressed-tensors",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            ], (
+                f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+            )
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -2752,7 +2765,9 @@ class ServerArgs:
                 "fp8",
                 "mxfp8",
                 None,
-            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', or bfloat16 (None)."
+            ], (
+                f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', or bfloat16 (None)."
+            )
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
@@ -2771,9 +2786,9 @@ class ServerArgs:
             "fp8",
             "mxfp8",
         ]:
-            assert (
-                self.ep_size == 1
-            ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+            assert self.ep_size == 1, (
+                "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+            )
 
         # TODO(yuwei): Fix piecewise cuda graph support for bypassed topk MoE backends.
         # Exception: GptOssForCausalLM wraps the entire MoE block in its own
@@ -2824,9 +2839,9 @@ class ServerArgs:
                     f"Wrong value of {fuse_mode=}, the NPU only support 1 or 2."
                 )
             elif fuse_mode == "2":
-                assert (
-                    self.quantization == "modelslim"
-                ), "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
+                assert self.quantization == "modelslim", (
+                    "When fuse_mode is set to 2, the NPU supports only ModelSlim quantization."
+                )
         if self.moe_a2a_backend == "flashinfer":
             self.ep_size = self.tp_size
             logger.warning(
@@ -2843,9 +2858,9 @@ class ServerArgs:
                 logger.warning(
                     "SGLANG_MOE_NVFP4_DISPATCH is set to True for Flashinfer MoE A2A"
                 )
-            assert self.moe_runner_backend in [
-                "flashinfer_cutlass"
-            ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+            assert self.moe_runner_backend in ["flashinfer_cutlass"], (
+                "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+            )
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
@@ -2862,7 +2877,9 @@ class ServerArgs:
             if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
                 assert (self.chunked_prefill_size) <= get_int_env_var(
                     "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
-                ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+                ), (
+                    "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+                )
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -2887,7 +2904,9 @@ class ServerArgs:
                 assert self.eplb_algorithm in [
                     "elasticity_aware",
                     "elasticity_aware_hierarchical",
-                ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+                ], (
+                    "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+                )
 
             if self.elastic_ep_backend == "mooncake":
                 self.mooncake_ib_device = self._validate_ib_devices(
@@ -3034,7 +3053,9 @@ class ServerArgs:
         else:
             assert not MoeRunnerBackend(
                 self.speculative_moe_runner_backend
-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
+            ).is_flashinfer_trtllm(), (
+                "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
+            )
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
@@ -3447,9 +3468,9 @@ class ServerArgs:
             logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":
-            assert (
-                self.disaggregation_transfer_backend != "fake"
-            ), "Prefill server does not support 'fake' as the transfer backend"
+            assert self.disaggregation_transfer_backend != "fake", (
+                "Prefill server does not support 'fake' as the transfer backend"
+            )
 
             if self.disable_piecewise_cuda_graph:
                 self.disable_cuda_graph = True
@@ -4122,6 +4143,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.rl_quant_profile,
             help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
+        )
+        parser.add_argument(
+            "--heter-precision-config",
+            type=str,
+            default=ServerArgs.heter_precision_config,
+            help="Path to heterogeneous MoE precision config JSON. Enables mixed-precision expert dispatch.",
         )
 
         # Memory and scheduling
@@ -6314,16 +6341,18 @@ class ServerArgs:
 
     def check_server_args(self):
         # Check parallel size constraints
-        assert (
-            self.tp_size * self.pp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        assert (self.tp_size * self.pp_size) % self.nnodes == 0, (
+            "tp_size must be divisible by number of nodes"
+        )
 
         if self.pp_size > 1:
             assert (
                 self.disable_overlap_schedule
                 and self.speculative_algorithm is None
                 and not self.enable_mixed_chunk
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+            ), (
+                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
@@ -6350,32 +6379,32 @@ class ServerArgs:
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:
-            assert (
-                not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+            assert not self.enable_mixed_chunk, (
+                "enable_mixed_chunk is required for speculative decoding"
+            )
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
         if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
-            assert (
-                self.chunked_prefill_size % self.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
+            assert self.chunked_prefill_size % self.page_size == 0, (
+                "chunked_prefill_size must be divisible by page_size"
+            )
 
         # Check pdmux
         if self.enable_pdmux:
-            assert (
-                self.pp_size == 1
-            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-            assert (
-                self.chunked_prefill_size == -1
-            ), "PD-Multiplexing is not compatible with chunked prefill."
-            assert (
-                self.disaggregation_mode == "null"
-            ), "PD-Multiplexing is not compatible with disaggregation mode."
-            assert (
-                self.disable_overlap_schedule
-            ), "PD-Multiplexing is not compatible with overlap schedule."
+            assert self.pp_size == 1, (
+                "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
+            )
+            assert self.chunked_prefill_size == -1, (
+                "PD-Multiplexing is not compatible with chunked prefill."
+            )
+            assert self.disaggregation_mode == "null", (
+                "PD-Multiplexing is not compatible with disaggregation mode."
+            )
+            assert self.disable_overlap_schedule, (
+                "PD-Multiplexing is not compatible with overlap schedule."
+            )
 
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
             import torch
@@ -6400,7 +6429,9 @@ class ServerArgs:
             assert self.schedule_policy in [
                 "fcfs",
                 "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+            ], (
+                f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+            )
             if self.default_priority_value is None:
                 logger.warning(
                     "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
@@ -6438,9 +6469,9 @@ class ServerArgs:
                 "(e.g., DeepSeek V3.2, GLM-5). "
             )
 
-            assert (
-                self.disable_radix_cache
-            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+            assert self.disable_radix_cache, (
+                "Hierarchical sparse attention currently requires --disable-radix-cache."
+            )
             for attr, label in [
                 ("nsa_prefill_backend", "prefill"),
                 ("nsa_decode_backend", "decode"),
@@ -6453,9 +6484,9 @@ class ServerArgs:
                         f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
                     )
 
-        assert (
-            self.schedule_conservativeness >= 0
-        ), "schedule_conservativeness must be non-negative"
+        assert self.schedule_conservativeness >= 0, (
+            "schedule_conservativeness must be non-negative"
+        )
 
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
@@ -6539,9 +6570,9 @@ class ServerArgs:
                                 lora_name=lora_path, lora_path=lora_path, pinned=False
                             )
                     elif isinstance(lora_path, dict):
-                        assert (
-                            "lora_name" in lora_path and "lora_path" in lora_path
-                        ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                        assert "lora_name" in lora_path and "lora_path" in lora_path, (
+                            f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
+                        )
                         lora_ref = LoRARef(
                             lora_name=lora_path["lora_name"],
                             lora_path=lora_path["lora_path"],
@@ -6570,15 +6601,17 @@ class ServerArgs:
             if self.lora_target_modules:
                 self.lora_target_modules = set(self.lora_target_modules)
                 if "all" in self.lora_target_modules:
-                    assert (
-                        len(self.lora_target_modules) == 1
-                    ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                    assert len(self.lora_target_modules) == 1, (
+                        "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                    )
                     self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
 
             # Ensure sufficient information is provided for LoRA initialization.
             assert self.lora_paths or (
                 self.max_lora_rank and self.lora_target_modules
-            ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+            ), (
+                "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+            )
 
             # Validate max_loaded_loras
             if self.max_loaded_loras is not None:
@@ -6607,43 +6640,45 @@ class ServerArgs:
             "tse",
             "default",
             "custom",
-        ], f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'custom'"
+        ], (
+            f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'custom'"
+        )
 
         if rule == "tse":
-            assert (
-                len(buckets_rule) == 4
-            ), f"{arg_name} TSE rule requires exactly 4 parameters: ['tse', middle, base, count], got {len(buckets_rule)}"
+            assert len(buckets_rule) == 4, (
+                f"{arg_name} TSE rule requires exactly 4 parameters: ['tse', middle, base, count], got {len(buckets_rule)}"
+            )
             try:
                 middle = float(buckets_rule[1])
                 base = float(buckets_rule[2])
                 count = int(buckets_rule[3])
             except (ValueError, IndexError):
-                assert (
-                    False
-                ), f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
+                assert False, (
+                    f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
+                )
             assert base > 1, f"{arg_name} TSE base must be larger than 1, got: {base}"
             assert count > 0, f"{arg_name} TSE count must be positive, got: {count}"
             assert middle > 0, f"{arg_name} TSE middle must be positive, got: {middle}"
 
         elif rule == "default":
-            assert (
-                len(buckets_rule) == 1
-            ), f"{arg_name} default rule should only have one parameter: ['default'], got {len(buckets_rule)}"
+            assert len(buckets_rule) == 1, (
+                f"{arg_name} default rule should only have one parameter: ['default'], got {len(buckets_rule)}"
+            )
 
         elif rule == "custom":
-            assert (
-                len(buckets_rule) >= 2
-            ), f"{arg_name} custom rule requires at least one bucket value: ['custom', value1, ...]"
+            assert len(buckets_rule) >= 2, (
+                f"{arg_name} custom rule requires at least one bucket value: ['custom', value1, ...]"
+            )
             try:
                 bucket_values = [float(x) for x in buckets_rule[1:]]
             except ValueError:
                 assert False, f"{arg_name} custom rule bucket values must be numeric"
-            assert len(set(bucket_values)) == len(
-                bucket_values
-            ), f"{arg_name} custom rule bucket values should not contain duplicates"
-            assert all(
-                val >= 0 for val in bucket_values
-            ), f"{arg_name} custom rule bucket values should be non-negative"
+            assert len(set(bucket_values)) == len(bucket_values), (
+                f"{arg_name} custom rule bucket values should not contain duplicates"
+            )
+            assert all(val >= 0 for val in bucket_values), (
+                f"{arg_name} custom rule bucket values should be non-negative"
+            )
 
     def adjust_mem_fraction_for_vlm(self, model_config):
         vision_config = getattr(model_config.hf_config, "vision_config", None)
