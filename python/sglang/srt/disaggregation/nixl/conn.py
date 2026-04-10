@@ -1325,7 +1325,7 @@ class NixlKVManager(CommonKVManager):
         notif_map = self.agent.get_new_notifs()
         for peer_name, messages in notif_map.items():
             for msg in messages:
-                components = msg.decode("ascii").split("_")
+                components = msg.decode("ascii").split("_", 8)
                 room = int(components[0])
                 tag = components[1]
                 if tag == "kv":
