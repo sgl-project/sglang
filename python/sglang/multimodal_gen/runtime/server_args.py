@@ -432,24 +432,6 @@ class ServerArgs:
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
 
-        if (
-            tp_unspecified
-            and sp_unspecified
-            and ulysses_unspecified
-            and ring_unspecified
-            and self.num_gpus == 2
-            and self.pipeline_class_name is None
-            and self._is_ltx23_model_path(self.model_path)
-        ):
-            self.tp_size = 2
-            self.sp_degree = 1
-            self.ulysses_degree = 1
-            self.ring_degree = 1
-            logger.info(
-                "Automatically set tp_size=2 for LTX-2.3 one-stage on 2 GPUs to preserve precision"
-            )
-            return
-
         if self.tp_size is None:
             self.tp_size = 1
 

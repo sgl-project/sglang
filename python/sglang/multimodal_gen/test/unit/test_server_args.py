@@ -139,7 +139,7 @@ class TestLTX23ParallelismSelection(unittest.TestCase):
                 args, unknown_args = parser.parse_known_args(argv)
                 return ServerArgs.from_cli_args(args, unknown_args)
 
-    def test_ltx23_one_stage_prefers_tp_on_2_gpus(self):
+    def test_ltx23_one_stage_uses_sp_defaults_on_2_gpus(self):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "Lightricks/LTX-2.3",
@@ -147,19 +147,19 @@ class TestLTX23ParallelismSelection(unittest.TestCase):
             }
         )
 
-        self.assertEqual(args.tp_size, 2)
-        self.assertEqual(args.sp_degree, 1)
-        self.assertEqual(args.ulysses_degree, 1)
+        self.assertEqual(args.tp_size, 1)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.ulysses_degree, 2)
         self.assertEqual(args.ring_degree, 1)
 
-    def test_cli_ltx23_one_stage_prefers_tp_on_2_gpus(self):
+    def test_cli_ltx23_one_stage_uses_sp_defaults_on_2_gpus(self):
         args = self._from_cli_without_model_resolution(
             ["--model-path", "Lightricks/LTX-2.3", "--num-gpus", "2"]
         )
 
-        self.assertEqual(args.tp_size, 2)
-        self.assertEqual(args.sp_degree, 1)
-        self.assertEqual(args.ulysses_degree, 1)
+        self.assertEqual(args.tp_size, 1)
+        self.assertEqual(args.sp_degree, 2)
+        self.assertEqual(args.ulysses_degree, 2)
         self.assertEqual(args.ring_degree, 1)
 
     def test_explicit_parallelism_is_not_overridden(self):
