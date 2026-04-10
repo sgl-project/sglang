@@ -130,6 +130,9 @@ class LTX2VideoCausalConv3d(nn.Module):
         return hidden_states
 
 
+LocalLTX2VideoCausalConv3d = LTX2VideoCausalConv3d
+
+
 # Like LTXVideoResnetBlock3d, but uses new causal Conv3d, normal Conv3d for the conv_shortcut, and the spatial padding
 # mode is configurable
 class LTX2VideoResnetBlock3d(nn.Module):
@@ -304,7 +307,8 @@ class LTXVideoDownsampler3d(nn.Module):
             self.stride[0] * self.stride[1] * self.stride[2]
         )
 
-        self.conv = LTX2VideoCausalConv3d(
+        # Downsampler gathers full height before this conv, so it must stay local.
+        self.conv = LocalLTX2VideoCausalConv3d(
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=3,
@@ -1602,7 +1606,8 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 The stride between two consecutive horizontal tiles. This is to ensure that there are no tiling
                 artifacts produced across the width dimension.
         """
-        if get_vae_parallel_world_size() > 1:
+        # TODO: need a better way to determine if tiling is supported
+        if get_vae_parallel_world_size() >= 8:
             self.use_tiling = False
             return
         self.use_tiling = True
