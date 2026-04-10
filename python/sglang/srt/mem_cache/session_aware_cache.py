@@ -385,6 +385,16 @@ class SessionAwareCache(BasePrefixCache):
         ):
             return protected_len, lock_node
 
+        # If the closing request was aborted (e.g. input too long), its
+        # origin_input_ids was replaced with [0] and cannot reconstruct
+        # the session's token history.  Fall back to the slot's saved
+        # tree state so release_session still calls dec_lock_ref on the
+        # correct tree node.
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+        if isinstance(getattr(req, "finished_reason", None), FINISH_ABORT):
+            return protected_len, lock_node
+
         from sglang.srt.mem_cache.radix_cache import RadixKey
 
         token_ids = (req.origin_input_ids + req.output_ids)[: slot.kv_committed_len]
