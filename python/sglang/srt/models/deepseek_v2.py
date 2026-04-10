@@ -2165,15 +2165,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        # Add A-proj fusion mapping when q_lora_rank is enabled
-        # q_a_proj + kv_a_proj_with_mqa -> fused_qkv_a_proj_with_mqa
-        if self.fuse_qkv_a_proj:
-            self.stacked_params_mapping.extend(
-                [
-                    ("fused_qkv_a_proj_with_mqa", "q_a_proj", 0),
-                    ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
-                ]
-            )
+        # NOTE: Do NOT add fused_qkv_a_proj_with_mqa entries here.
+        # q_a_proj + kv_a_proj_with_mqa fusion is handled by the
+        # cached_a_proj path in do_load_weights() (deepseek_weight_loader.py),
+        # which concatenates the two weights and loads the fused result.
+        # Adding them to stacked_params_mapping would bypass that path
+        # and call ReplicatedLinear.weight_loader with a shard_id it
+        # cannot handle, causing an assertion error on shape mismatch.
         self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
