@@ -48,6 +48,15 @@ DEFAULT_FLUX2_KEEP_BF16_PATTERNS = [
     r"^context_embedder$",
     r"^norm_out\.linear$",
 ]
+DEFAULT_FLUX1_KEEP_BF16_PATTERNS = [
+    r"^transformer_blocks\.\d+\.norm1\.linear$",
+    r"^transformer_blocks\.\d+\.norm1_context\.linear$",
+    r"^transformer_blocks\.\d+\.ff\.net\.0\.proj$",
+    r"^transformer_blocks\.\d+\.ff\.net\.2$",
+    r"^transformer_blocks\.\d+\.ff_context\.net\.0\.proj$",
+    r"^transformer_blocks\.\d+\.ff_context\.net\.2$",
+    r"^single_transformer_blocks\.\d+\.norm\.linear$",
+]
 
 
 def _resolve_transformer_dir(path: str) -> str:
@@ -120,13 +129,14 @@ def _load_config(model_dir: str) -> dict:
 def get_default_keep_bf16_patterns(
     *, model_type: str, class_name: str | None
 ) -> list[str]:
-    # Most diffusion backbones can run through the generic conversion path.
-    # Validated fallback profiles live here when a family needs a few BF16
-    # modules preserved for accuracy or loader compatibility.
+    if model_type == "flux1":
+        return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if model_type == "flux2":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
     if model_type == "none":
         return []
+    if class_name == "FluxTransformer2DModel":
+        return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if class_name == "Flux2Transformer2DModel":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
     return []
@@ -193,7 +203,8 @@ def quantize_fp8_weight(
     scale = weight_scale.to(weight.device, dtype=torch.float32)
     if scale.numel() != 1:
         raise ValueError(
-            f"Only per-tensor FP8 scales are supported for diffusion checkpoints, got shape {tuple(scale.shape)}."
+            "Only per-tensor FP8 scales are supported for diffusion checkpoints, "
+            f"got shape {tuple(scale.shape)}."
         )
 
     quantized = (weight.to(torch.float32) / scale.reshape(1)).to(torch.float8_e4m3fn)
@@ -279,7 +290,8 @@ def convert_modelopt_fp8_checkpoint(
     if output_path.exists():
         if not overwrite:
             raise FileExistsError(
-                f"Output directory already exists: {output_path}. Use --overwrite to replace it."
+                f"Output directory already exists: {output_path}. "
+                "Use --overwrite to replace it."
             )
         shutil.rmtree(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -307,6 +319,14 @@ def convert_modelopt_fp8_checkpoint(
         if fallback_weight_names
         else {}
     )
+    fallback_scale_names = {
+        scale_name
+        for weight_name in fallback_weight_names
+        for scale_name in (
+            weight_name[:-7] + ".weight_scale",
+            weight_name[:-7] + ".input_scale",
+        )
+    }
 
     weights_by_file: dict[str, list[str]] = defaultdict(list)
     for weight_name, filename in source_weight_map.items():
@@ -329,6 +349,12 @@ def convert_modelopt_fp8_checkpoint(
         metadata["_quantization_metadata"] = serialized_quant_config
 
         for name in list(shard_tensors.keys()):
+            if "_quantizer." in name:
+                del shard_tensors[name]
+                continue
+            if name in fallback_scale_names:
+                del shard_tensors[name]
+                continue
             if name.endswith(".weight") and is_ignored_by_modelopt(
                 name, ignore_patterns
             ):
@@ -417,12 +443,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-type",
-        choices=["auto", "flux2", "none"],
+        choices=["auto", "flux1", "flux2", "none"],
         default="auto",
         help=(
             "Optional model-family BF16 fallback profile. 'none' uses the generic "
-            "conversion path. 'auto' only enables the validated FLUX.2 fallback "
-            "set when the export config says Flux2Transformer2DModel."
+            "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 "
+            "fallback set when the export config matches those transformer classes."
         ),
     )
     parser.add_argument(

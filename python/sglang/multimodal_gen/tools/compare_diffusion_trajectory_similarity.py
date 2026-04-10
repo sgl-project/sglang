@@ -255,6 +255,8 @@ def build_server_kwargs(args: argparse.Namespace, *, variant: str) -> dict[str, 
 
     kwargs: dict[str, Any] = {
         "model_path": args.model_path,
+        "model_id": args.model_id,
+        "backend": args.backend,
         "num_gpus": args.num_gpus,
         "dit_cpu_offload": args.dit_cpu_offload,
         "dit_layerwise_offload": args.dit_layerwise_offload,
@@ -327,6 +329,15 @@ def _to_jsonable(result: dict[str, Any]) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
+    parser.add_argument(
+        "--model-id",
+        help=(
+            "Optional model ID override passed to DiffGenerator.from_pretrained. "
+            "Use this when --model-path points to a local directory whose name "
+            "does not match a registered native SGLang model."
+        ),
+    )
+    parser.add_argument("--backend", default="sglang")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--width", type=int, required=True)
