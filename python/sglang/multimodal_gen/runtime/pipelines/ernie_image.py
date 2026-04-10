@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    maybe_download_model,
     maybe_download_model_index,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -95,6 +96,19 @@ class ErnieImagePipeline(LoRAPipeline, ComposedPipelineBase):
         return pe_component_path
 
     def _read_pe_model_max_length(self, model_path: str, server_args) -> int | None:
+        # If model_path is a Hub ID, download the full model first (or use cache)
+        # so that pe/tokenizer_config.json is available locally.
+        if not os.path.exists(model_path):
+            try:
+                model_path = maybe_download_model(
+                    model_path, force_diffusers_model=True
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to download model to read pe/tokenizer_config.json: %s", e
+                )
+                return None
+
         tokenizer_path = self._resolve_pe_tokenizer_path(model_path, server_args)
         config_path = os.path.join(tokenizer_path, "tokenizer_config.json")
         if os.path.exists(config_path):
