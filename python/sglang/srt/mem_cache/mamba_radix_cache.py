@@ -581,7 +581,7 @@ class MambaRadixCache(BasePrefixCache):
                     # In either case, free KV beyond the cached prefix and
                     # skip mamba insert.
                     self.token_to_kv_pool_allocator.free(
-                        kv_indices[req.cache_protected_len:]
+                        kv_indices[req.cache_protected_len :]
                     )
                     mamba_exist = True
             else:
@@ -665,7 +665,9 @@ class MambaRadixCache(BasePrefixCache):
                 req.req_pool_idx
             ).unsqueeze(-1)
             # no_buffer mode: fork from working slot (old behavior)
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
+            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
+                mamba_value
+            )
             if mamba_value_forked is None:
                 self.evict(EvictParams(num_tokens=0, mamba_num=1))
                 mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(

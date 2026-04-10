@@ -63,7 +63,6 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
-    EvictParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.common import (
@@ -671,7 +670,9 @@ class Req(ReqDllmMixin):
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
-        self.pending_radix_mamba_slot: Optional[torch.Tensor] = None  # shape (1), pre-allocated radix target slot
+        self.pending_radix_mamba_slot: Optional[torch.Tensor] = (
+            None  # shape (1), pre-allocated radix target slot
+        )
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
@@ -2212,14 +2213,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     .to(device=self.device, non_blocking=True)
                 )
                 _zero = torch.zeros(1, dtype=torch.int64, device=self.device)
-                slot_indices = torch.stack([
-                    req.pending_radix_mamba_slot.to(torch.int64)
-                    if req.pending_radix_mamba_slot is not None else _zero
-                    for req in self.reqs
-                ]).squeeze(1)
+                slot_indices = torch.stack(
+                    [
+                        (
+                            req.pending_radix_mamba_slot.to(torch.int64)
+                            if req.pending_radix_mamba_slot is not None
+                            else _zero
+                        )
+                        for req in self.reqs
+                    ]
+                ).squeeze(1)
                 has_slot = torch.tensor(
                     [req.pending_radix_mamba_slot is not None for req in self.reqs],
-                    dtype=torch.bool, pin_memory=True,
+                    dtype=torch.bool,
+                    pin_memory=True,
                 ).to(device=self.device, non_blocking=True)
                 self.mamba_track_mask = interval_mask & has_slot
                 self.mamba_track_indices = torch.where(

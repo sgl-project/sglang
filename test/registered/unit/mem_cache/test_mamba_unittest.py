@@ -624,9 +624,7 @@ class TestMamba(unittest.TestCase):
         last_node3 = result3.last_device_node
         self.assertIsNotNone(last_node3.mamba_value)
         self.assertTrue(
-            torch.all(
-                mamba_pool.mamba_cache.conv[0][0, last_node3.mamba_value] == 99.0
-            )
+            torch.all(mamba_pool.mamba_cache.conv[0][0, last_node3.mamba_value] == 99.0)
         )
 
         # --- Step 4: cache_finished_req without pending slot (short decode) ---
@@ -711,9 +709,7 @@ class TestMamba(unittest.TestCase):
             req.kv_allocated_len = len(token_ids)
 
             kv = allocator.alloc(len(token_ids))
-            req_to_token_pool.write(
-                (req.req_pool_idx, slice(0, len(token_ids))), kv
-            )
+            req_to_token_pool.write((req.req_pool_idx, slice(0, len(token_ids))), kv)
             tree.cache_unfinished_req(req, chunked=True)
 
             # After cache_unfinished_req, req.last_node points to the new cached node.

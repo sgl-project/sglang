@@ -19,7 +19,6 @@ from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -159,7 +158,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     track_indices.append(req.pending_radix_mamba_slot[0])
                     track_mask.append(True)
                 else:
-                    track_indices.append(torch.zeros(1, dtype=torch.int64, device=batch.device)[0])
+                    track_indices.append(
+                        torch.zeros(1, dtype=torch.int64, device=batch.device)[0]
+                    )
                     track_mask.append(False)
             batch.mamba_track_indices = torch.stack(track_indices).to(torch.int64)
             batch.mamba_track_mask = torch.tensor(
