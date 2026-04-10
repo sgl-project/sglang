@@ -33,7 +33,9 @@ GROUP_SIZE = 128
 NUM_BITS = 4
 COLD_RATIO = 0.8
 WARMUP, ITERS = 50, 200
-BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+# M = per-expert batch size (tokens per expert, uniform distribution)
+# Global batch = M * E / TOP_K
+PER_EXPERT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 OUT_DIR = "/data/heter-moe/profiles/groupgemm"
 
 # L2 flush: allocate a buffer larger than L2 cache (A100 = 40MB L2)
@@ -87,12 +89,25 @@ def make_int4_weights(device):
     return w1, w2, s1, s2
 
 
-def make_inputs(M, device):
-    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-    topk_w = torch.ones(M, TOP_K, dtype=torch.bfloat16, device=device) / TOP_K
-    topk_ids = torch.randint(0, E, (M, TOP_K), device=device)
-    gating = torch.randn(M, E, dtype=torch.bfloat16, device=device)
-    return x, topk_w, topk_ids, gating
+def make_inputs(m_per_expert, device):
+    """Create inputs where each expert gets exactly m_per_expert tokens.
+
+    Global M = m_per_expert * E / TOP_K (each token routed to TOP_K experts).
+    topk_ids constructed so expert i appears exactly m_per_expert times.
+    """
+    M_global = m_per_expert * E // TOP_K
+    x = torch.randn(M_global, K, dtype=torch.bfloat16, device=device)
+    topk_w = torch.ones(M_global, TOP_K, dtype=torch.bfloat16, device=device) / TOP_K
+
+    # Build topk_ids so each expert gets exactly m_per_expert tokens:
+    # Total slots = M_global * TOP_K = m_per_expert * E
+    # Fill with E experts, each repeated m_per_expert times, then reshape
+    all_expert_ids = torch.arange(E, device=device).repeat(m_per_expert)
+    all_expert_ids = all_expert_ids[torch.randperm(len(all_expert_ids), device=device)]
+    topk_ids = all_expert_ids.reshape(M_global, TOP_K)
+
+    gating = torch.randn(M_global, E, dtype=torch.bfloat16, device=device)
+    return x, topk_w, topk_ids, gating, M_global
 
 
 def mask_weights(topk_w, topk_ids, active_experts):
@@ -159,10 +174,19 @@ def run_all(device, use_graph=False):
     print(f"{'=' * 80}\n")
 
     rows = []
-    header = ("M", "a16w16", "a16w4", "a8w8", "mix_w4_w16", "mix_w8_w16", "mix_w4_w8")
+    header = (
+        "M_per_expert",
+        "M_global",
+        "a16w16",
+        "a16w4",
+        "a8w8",
+        "mix_w4_w16",
+        "mix_w8_w16",
+        "mix_w4_w8",
+    )
 
-    for M in BATCH_SIZES:
-        x, topk_w, topk_ids, gating = make_inputs(M, device)
+    for M in PER_EXPERT_BATCH_SIZES:
+        x, topk_w, topk_ids, gating, M_global = make_inputs(M, device)
 
         # Pure a16w16
         lat_bf16 = bench(
@@ -278,6 +302,7 @@ def run_all(device, use_graph=False):
 
         row = (
             M,
+            M_global,
             lat_bf16,
             lat_int4,
             lat_int8,
@@ -287,7 +312,8 @@ def run_all(device, use_graph=False):
         )
         rows.append(row)
         print(
-            f"M={M:>5}  bf16={lat_bf16:7.3f}  int4={lat_int4:7.3f}  int8={lat_int8:7.3f}  "
+            f"M/e={M:>5} (global={M_global:>6})  "
+            f"bf16={lat_bf16:7.3f}  int4={lat_int4:7.3f}  int8={lat_int8:7.3f}  "
             f"mix_w4w16={lat_mix_w4_w16:7.3f}  mix_w8w16={lat_mix_w8_w16:7.3f}  "
             f"mix_w4w8={lat_mix_w4_w8:7.3f}"
         )
@@ -300,19 +326,18 @@ def run_all(device, use_graph=False):
         w = csv.writer(f)
         w.writerow(header)
         for r in rows:
-            w.writerow([r[0]] + [f"{v:.3f}" for v in r[1:]])
+            w.writerow([r[0], r[1]] + [f"{v:.3f}" for v in r[2:]])
     print(f"\nCSV: {csv_path}")
 
     # Print summary table
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 100)
     print(
-        f"{'M':>5} | {'a16w16':>8} {'a16w4':>8} {'a8w8':>8} | "
-        f"{'mix4+16':>8} {'mix8+16':>8} {'mix4+8':>8} | "
-        f"{'best':>8}"
+        f"{'M/e':>5} {'Mglob':>6} | {'a16w16':>8} {'a16w4':>8} {'a8w8':>8} | "
+        f"{'mix4+16':>8} {'mix8+16':>8} {'mix4+8':>8} | {'best':>8}"
     )
-    print("-" * 90)
+    print("-" * 100)
     for r in rows:
-        M, bf16, int4, int8, m4_16, m8_16, m4_8 = r
+        M, M_g, bf16, int4, int8, m4_16, m8_16, m4_8 = r
         all_lats = {
             "a16w16": bf16,
             "a16w4": int4,
@@ -323,11 +348,11 @@ def run_all(device, use_graph=False):
         }
         best = min(all_lats, key=all_lats.get)
         print(
-            f"{M:>5} | {bf16:8.3f} {int4:8.3f} {int8:8.3f} | "
+            f"{M:>5} {M_g:>6} | {bf16:8.3f} {int4:8.3f} {int8:8.3f} | "
             f"{m4_16:8.3f} {m8_16:8.3f} {m4_8:8.3f} | {best:>8}"
         )
-    print("=" * 90)
-    print(f"(all latencies in ms, cold_ratio={COLD_RATIO}, {graph_label})")
+    print("=" * 100)
+    print(f"(M/e = tokens per expert, uniform distribution, {graph_label})")
 
     # Plot
     try:
@@ -340,9 +365,16 @@ def run_all(device, use_graph=False):
         labels = ["a16w16", "a16w4", "a8w8", "mix{w4,w16}", "mix{w8,w16}", "mix{w4,w8}"]
         colors = ["#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#d62728", "#8c564b"]
         for i, label in enumerate(labels):
-            vals = [r[i + 1] for r in rows]
-            ax.plot(BATCH_SIZES, vals, "o-", label=label, color=colors[i], linewidth=2)
-        ax.set_xlabel("Batch Size (M)")
+            vals = [r[i + 2] for r in rows]
+            ax.plot(
+                PER_EXPERT_BATCH_SIZES,
+                vals,
+                "o-",
+                label=label,
+                color=colors[i],
+                linewidth=2,
+            )
+        ax.set_xlabel("Tokens per Expert (M/e)")
         ax.set_ylabel("Latency (ms)")
         ax.set_title(f"MoE Kernel Latency ({graph_label}, E={E}, K={K}, N={N})")
         ax.set_xscale("log", base=2)
@@ -370,17 +402,17 @@ if __name__ == "__main__":
     summary_path = "/data/heter-moe/results/kernel_comparison_summary.txt"
     with open(summary_path, "w") as f:
         for label, rows in [
-            ("NO CUDA GRAPH (fair apples-to-apples)", rows_no_graph),
-            ("WITH CUDA GRAPH (where supported)", rows_graph),
+            ("NO CUDA GRAPH (fair)", rows_no_graph),
+            ("WITH CUDA GRAPH", rows_graph),
         ]:
-            f.write(f"\n{'=' * 90}\n{label}\n{'=' * 90}\n")
+            f.write(f"\n{'=' * 100}\n{label}\n{'=' * 100}\n")
             f.write(
-                f"{'M':>5} | {'a16w16':>8} {'a16w4':>8} {'a8w8':>8} | "
+                f"{'M/e':>5} {'Mglob':>6} | {'a16w16':>8} {'a16w4':>8} {'a8w8':>8} | "
                 f"{'mix4+16':>8} {'mix8+16':>8} {'mix4+8':>8} | {'best':>8}\n"
             )
-            f.write("-" * 90 + "\n")
+            f.write("-" * 100 + "\n")
             for r in rows:
-                M, bf16, int4, int8, m4_16, m8_16, m4_8 = r
+                M, M_g, bf16, int4, int8, m4_16, m8_16, m4_8 = r
                 all_lats = {
                     "a16w16": bf16,
                     "a16w4": int4,
@@ -391,8 +423,8 @@ if __name__ == "__main__":
                 }
                 best = min(all_lats, key=all_lats.get)
                 f.write(
-                    f"{M:>5} | {bf16:8.3f} {int4:8.3f} {int8:8.3f} | "
+                    f"{M:>5} {M_g:>6} | {bf16:8.3f} {int4:8.3f} {int8:8.3f} | "
                     f"{m4_16:8.3f} {m8_16:8.3f} {m4_8:8.3f} | {best:>8}\n"
                 )
-            f.write(f"(all latencies in ms, cold_ratio={COLD_RATIO})\n")
-    print(f"\nCombined summary: {summary_path}")
+            f.write(f"(M/e = tokens per expert, uniform, cold_ratio={COLD_RATIO})\n")
+    print(f"\nSummary: {summary_path}")
