@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -258,7 +259,13 @@ class EagleVerifyInputV2Mixin:
                 for req in batch.reqs:
                     if req.pending_radix_mamba_slot is not None:
                         req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
+                        req.pending_radix_mamba_slot = None
                     radix_slot = req_to_token_pool.mamba_pool.alloc(1)
+                    if radix_slot is None:
+                        batch.tree_cache.evict(
+                            EvictParams(num_tokens=0, mamba_num=1)
+                        )
+                        radix_slot = req_to_token_pool.mamba_pool.alloc(1)
                     assert radix_slot is not None, (
                         "Not enough space for mamba radix slot in eagle v2 verify"
                     )

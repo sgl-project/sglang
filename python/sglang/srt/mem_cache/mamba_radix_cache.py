@@ -654,9 +654,8 @@ class MambaRadixCache(BasePrefixCache):
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
         if self.enable_mamba_extra_buffer:
-            assert req.pending_radix_mamba_slot is not None, (
-                "pending_radix_mamba_slot must be set for cache_unfinished_req in extra_buffer mode"
-            )
+            if req.pending_radix_mamba_slot is None:
+                return _skip_cache_unfinished_req(req)
             # Data is already in the pending radix slot (written by track kernel).
             # Transfer ownership directly to the radix tree — no fork needed.
             mamba_value = req.pending_radix_mamba_slot.clone()

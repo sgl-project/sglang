@@ -14,6 +14,7 @@ from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -151,7 +152,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             for req in batch.reqs:
                 if req.pending_radix_mamba_slot is not None:
                     batch.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
+                    req.pending_radix_mamba_slot = None
                 radix_slot = batch.req_to_token_pool.mamba_pool.alloc(1)
+                if radix_slot is None:
+                    batch.tree_cache.evict(
+                        EvictParams(num_tokens=0, mamba_num=1)
+                    )
+                    radix_slot = batch.req_to_token_pool.mamba_pool.alloc(1)
                 assert radix_slot is not None, (
                     "Not enough space for mamba radix slot in eagle verify"
                 )

@@ -571,6 +571,8 @@ class SchedulerOutputProcessorMixin:
     ) -> None:
         seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         if get_global_server_args().enable_mamba_extra_buffer():
+            if req.pending_radix_mamba_slot is None:
+                return
             mamba_track_interval = get_global_server_args().mamba_track_interval
             if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
                 req.mamba_last_track_seqlen = seq_len
