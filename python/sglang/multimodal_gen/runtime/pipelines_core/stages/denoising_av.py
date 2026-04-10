@@ -348,18 +348,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
     ) -> bool:
         return False
 
-    @staticmethod
-    def _disable_ltx23_ti2v_sp_attention_masks(
-        batch: Req, *, stage: str, is_ltx23_variant: bool
-    ) -> bool:
-        return (
-            is_ltx23_variant
-            and stage == "one_stage"
-            and get_sp_world_size() > 1
-            and batch.image_latent is not None
-            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
-        )
-
     def _get_condition_image_encoder(
         self,
         server_args: ServerArgs,
@@ -574,9 +562,6 @@ class LTX2AVDenoisingStage(DenoisingStage):
             server_args.pipeline_config.vae_config.arch_config
         )
         do_ti2v = self._should_apply_ltx2_ti2v(batch)
-        disable_ti2v_sp_attention_masks = self._disable_ltx23_ti2v_sp_attention_masks(
-            batch, stage=stage, is_ltx23_variant=is_ltx23_variant
-        )
         replicate_audio_for_sp = self._should_replicate_ltx23_audio_for_sp(
             batch,
             server_args,
@@ -783,32 +768,22 @@ class LTX2AVDenoisingStage(DenoisingStage):
                                 * timestep_scale_multiplier
                             ).expand(batch_size)
 
-                        if disable_ti2v_sp_attention_masks:
-                            video_self_attention_mask = None
-                            audio_self_attention_mask = None
-                            a2v_cross_attention_mask = None
-                            v2a_cross_attention_mask = None
-                        else:
-                            video_self_attention_mask = (
-                                self._build_ltx2_sp_padding_mask(
-                                    batch,
-                                    seq_len=video_num_tokens,
-                                    batch_size=batch_size,
-                                    key="sp_video_valid_token_count",
-                                    device=latent_model_input.device,
-                                )
-                            )
-                            audio_self_attention_mask = (
-                                self._build_ltx2_sp_padding_mask(
-                                    batch,
-                                    seq_len=audio_num_frames_latent,
-                                    batch_size=batch_size,
-                                    key="sp_audio_valid_token_count",
-                                    device=audio_latent_model_input.device,
-                                )
-                            )
-                            a2v_cross_attention_mask = audio_self_attention_mask
-                            v2a_cross_attention_mask = video_self_attention_mask
+                        video_self_attention_mask = self._build_ltx2_sp_padding_mask(
+                            batch,
+                            seq_len=video_num_tokens,
+                            batch_size=batch_size,
+                            key="sp_video_valid_token_count",
+                            device=latent_model_input.device,
+                        )
+                        audio_self_attention_mask = self._build_ltx2_sp_padding_mask(
+                            batch,
+                            seq_len=audio_num_frames_latent,
+                            batch_size=batch_size,
+                            key="sp_audio_valid_token_count",
+                            device=audio_latent_model_input.device,
+                        )
+                        a2v_cross_attention_mask = audio_self_attention_mask
+                        v2a_cross_attention_mask = video_self_attention_mask
 
                         use_official_cfg_path = stage1_guider_params is None
                         if use_official_cfg_path:
