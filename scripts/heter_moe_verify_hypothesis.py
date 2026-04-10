@@ -5,7 +5,7 @@ Tests three claims:
   2. Large batch (compute-bound): a8w8 < mix{a8w8,a16w16} < a16w16
   3. Optimal mixed: mix{a16w4 cold, a8w8 hot} across all batch sizes
 
-Usage: PYTHONPATH=python CUDA_VISIBLE_DEVICES=4 python3 scripts/heter_moe_verify_hypothesis.py
+Usage: PYTHONPATH=python CUDA_VISIBLE_DEVICES=7 python3 scripts/heter_moe_verify_hypothesis.py
 """
 
 import csv
@@ -32,9 +32,26 @@ K, N, E, TOP_K = 2048, 768, 128, 8
 GROUP_SIZE = 128
 NUM_BITS = 4
 COLD_RATIO = 0.8
-WARMUP, ITERS = 30, 100
+WARMUP, ITERS = 50, 200
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 OUT_DIR = "/data/heter-moe/profiles/groupgemm"
+
+# L2 flush: allocate a buffer larger than L2 cache (A100 = 40MB L2)
+_L2_FLUSH_SIZE = 50 * 1024 * 1024  # 50MB > 40MB L2
+_l2_flush_buf = None
+
+
+def get_l2_flush_buf(device):
+    global _l2_flush_buf
+    if _l2_flush_buf is None or _l2_flush_buf.device != device:
+        _l2_flush_buf = torch.empty(_L2_FLUSH_SIZE, dtype=torch.int8, device=device)
+    return _l2_flush_buf
+
+
+def flush_l2(device):
+    """Write to a large buffer to evict all L2 cache lines."""
+    buf = get_l2_flush_buf(device)
+    buf.zero_()
 
 
 def make_bf16_weights(device):
@@ -84,16 +101,43 @@ def mask_weights(topk_w, topk_ids, active_experts):
     return topk_w * mask[topk_ids].to(topk_w.dtype)
 
 
-def bench(fn, warmup=WARMUP, iters=ITERS):
-    for _ in range(warmup):
+def bench(fn, device, warmup=WARMUP, iters=ITERS, use_cuda_graph=True):
+    # Warmup (eager)
+    for _ in range(3):
         fn()
     torch.cuda.synchronize()
+
+    graph = None
+    if use_cuda_graph:
+        try:
+            # Capture CUDA graph to eliminate launch overhead
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                fn()
+            torch.cuda.synchronize()
+            # Warmup the graph replay
+            for _ in range(warmup):
+                graph.replay()
+            torch.cuda.synchronize()
+        except Exception:
+            graph = None
+
+    if graph is None:
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+
     times = []
     for _ in range(iters):
+        flush_l2(device)
+        torch.cuda.synchronize()
         s = torch.cuda.Event(enable_timing=True)
         e = torch.cuda.Event(enable_timing=True)
         s.record()
-        fn()
+        if graph is not None:
+            graph.replay()
+        else:
+            fn()
         e.record()
         torch.cuda.synchronize()
         times.append(s.elapsed_time(e))
@@ -115,10 +159,11 @@ def run_all(device):
 
         # Pure a16w16
         lat_bf16 = bench(
-            lambda: outplace_fused_experts(x, bf16_w13, bf16_w2, topk_w, topk_ids)
+            lambda: outplace_fused_experts(x, bf16_w13, bf16_w2, topk_w, topk_ids),
+            device,
         )
 
-        # Pure a16w4
+        # Pure a16w4 — CUDA graph capture often fails for Marlin JIT kernel
         lat_int4 = bench(
             lambda: fused_marlin_moe(
                 x,
@@ -131,7 +176,9 @@ def run_all(device):
                 topk_ids,
                 num_bits=4,
                 is_k_full=True,
-            )
+            ),
+            device,
+            use_cuda_graph=False,
         )
 
         # Pure a8w8
@@ -146,7 +193,8 @@ def run_all(device):
                 per_channel_quant=True,
                 w1_scale=int8_s13,
                 w2_scale=int8_s2,
-            )
+            ),
+            device,
         )
 
         # Mixed assignments via policy
@@ -172,7 +220,7 @@ def run_all(device):
             )
             outplace_fused_experts(x, bf16_w13, bf16_w2, hot_w, topk_ids)
 
-        lat_mix_w4_w16 = bench(mix_w4_w16)
+        lat_mix_w4_w16 = bench(mix_w4_w16, device, use_cuda_graph=False)
 
         # mix{a8w8 cold, a16w16 hot}
         def mix_w8_w16():
@@ -189,7 +237,7 @@ def run_all(device):
             )
             outplace_fused_experts(x, bf16_w13, bf16_w2, hot_w, topk_ids)
 
-        lat_mix_w8_w16 = bench(mix_w8_w16)
+        lat_mix_w8_w16 = bench(mix_w8_w16, device, use_cuda_graph=False)
 
         # mix{a16w4 cold, a8w8 hot}
         def mix_w4_w8():
@@ -217,7 +265,7 @@ def run_all(device):
                 w2_scale=int8_s2,
             )
 
-        lat_mix_w4_w8 = bench(mix_w4_w8)
+        lat_mix_w4_w8 = bench(mix_w4_w8, device, use_cuda_graph=False)
 
         row = (
             M,
