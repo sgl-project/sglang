@@ -201,11 +201,11 @@ def run_all(device):
         cold_expert_list = plan.group_assignments[0]
         hot_expert_list = plan.group_assignments[1]
 
-        # Non-group experts → -1 (filtered by moe_align_block_size, zero blocks)
+        # Sentinel: E for Marlin (can't handle -1), -1 for Triton (EP-style)
         cold_active = torch.zeros(E, dtype=torch.bool, device=device)
         cold_active[cold_expert_list] = True
         cold_in = cold_active[topk_ids]
-        cold_ids = torch.where(cold_in, topk_ids, torch.tensor(-1, device=device))
+        cold_ids = torch.where(cold_in, topk_ids, torch.tensor(E, device=device))
         cold_w = topk_w * cold_in.to(topk_w.dtype)
 
         hot_active = torch.zeros(E, dtype=torch.bool, device=device)

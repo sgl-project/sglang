@@ -50,19 +50,22 @@ def _reroute_for_group(
     topk_ids: torch.Tensor,
     group_expert_ids: List[int],
     num_experts: int,
+    sentinel: int = -1,
 ) -> tuple:
     """Reroute tokens so only this group's experts remain in topk_ids.
 
-    Non-group expert slots set to -1 with zero weight. moe_align_block_size
-    treats -1 as filtered (same as EP non-local experts), so those pairs
-    get zero blocks and the kernel skips them entirely.
+    Non-group slots set to sentinel with zero weight. Use sentinel=-1 for
+    Triton kernels (EP-style filtering) or sentinel=num_experts for Marlin
+    (which doesn't handle -1).
     """
     device = topk_weights.device
     active_mask = torch.zeros(num_experts, dtype=torch.bool, device=device)
     active_mask[group_expert_ids] = True
 
     in_group = active_mask[topk_ids]
-    group_topk_ids = torch.where(in_group, topk_ids, torch.tensor(-1, device=device))
+    group_topk_ids = torch.where(
+        in_group, topk_ids, torch.tensor(sentinel, device=device)
+    )
     group_topk_weights = topk_weights * in_group.to(topk_weights.dtype)
 
     return group_topk_weights, group_topk_ids
@@ -233,14 +236,17 @@ class HeterFusedMoE(nn.Module):
             if len(expert_ids_list) == 0:
                 continue
 
+            num_bits = gcfg.get("num_bits", 16)
+            sentinel = self.num_experts if num_bits == 4 else -1
+
             group_weights, group_ids = _reroute_for_group(
                 topk_weights,
                 topk_ids,
                 expert_ids_list,
                 self.num_experts,
+                sentinel=sentinel,
             )
 
-            num_bits = gcfg.get("num_bits", 16)
             prefix = f"group{group_idx}"
 
             if num_bits == 16:
