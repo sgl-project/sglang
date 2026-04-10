@@ -64,7 +64,7 @@ class TestAscendWarmups(CustomTestCase):
 
     def test_warmups_with_voice_chat(self):
         # Call the get_server_info API to verify that the warmups parameter configuration takes effect.
-        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/get_server_info")
+        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/server_info")
         self.assertEqual(response.status_code, 200)
         self.assertEqual("voice_chat", response.json().get("warmups"))
 

@@ -22,6 +22,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
+
 
 def get_open_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -30,6 +32,7 @@ def get_open_port():
 
 
 def worker(world_size, rank, port):
+    envs.SGLANG_USE_1STAGE_ALLREDUCE.set("1")
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
@@ -58,12 +61,6 @@ def worker(world_size, rank, port):
         if custom_ar is None or custom_ar.disabled:
             if rank == 0:
                 print("✗ Custom AR not available or disabled")
-            dist.destroy_process_group()
-            return
-
-        if not hasattr(custom_ar, "deterministic_all_reduce"):
-            if rank == 0:
-                print("✗ Deterministic kernel not available")
             dist.destroy_process_group()
             return
     except Exception as e:
@@ -115,18 +112,7 @@ def worker(world_size, rank, port):
         # Clone the same input
         inp = base_input.clone()
 
-        # Use deterministic kernel
-        # Check if input fits in buffer, use registered mode if too large
-        input_size_bytes = inp.numel() * inp.element_size()
-        use_registered = input_size_bytes > custom_ar.max_size
-
-        if use_registered:
-            # For large inputs, register buffer first
-            custom_ar.register_buffer(inp)
-            result = custom_ar.deterministic_all_reduce(inp, registered=True)
-        else:
-            # For smaller inputs, use unregistered mode (copies to internal buffer)
-            result = custom_ar.deterministic_all_reduce(inp, registered=False)
+        result = custom_ar.custom_all_reduce(inp)
         torch.cuda.synchronize()
 
         # Store checksum
@@ -179,22 +165,7 @@ def worker(world_size, rank, port):
             # Flatten for all-reduce: (bs * hidden_dim,)
             batch_flat = batch.view(-1)
 
-            # Use deterministic kernel
-            # Check if input fits in buffer, use registered mode if too large
-            input_size_bytes = batch_flat.numel() * batch_flat.element_size()
-            use_registered = input_size_bytes > custom_ar.max_size
-
-            if use_registered:
-                # For large inputs, register buffer first
-                custom_ar.register_buffer(batch_flat)
-                result_flat = custom_ar.deterministic_all_reduce(
-                    batch_flat, registered=True
-                )
-            else:
-                # For smaller inputs, use unregistered mode
-                result_flat = custom_ar.deterministic_all_reduce(
-                    batch_flat, registered=False
-                )
+            result_flat = custom_ar.custom_all_reduce(batch_flat)
             torch.cuda.synchronize()
 
             # Reshape back to (bs, hidden_dim)

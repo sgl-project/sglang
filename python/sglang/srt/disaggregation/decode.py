@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
@@ -45,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     kv_to_page_indices,
     poll_and_all_reduce,
+    poll_and_all_reduce_with_staging,
     prepare_abort,
 )
 from sglang.srt.environ import envs
@@ -195,9 +197,18 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
-        effective_mamba_size = (
-            mamba_size if mamba_size is not None else size
-        ) + pre_alloc_size
+        if mamba_size is not None:
+            effective_mamba_size = min(mamba_size, size + pre_alloc_size)
+            if mamba_size > size + pre_alloc_size:
+                logger.warning(
+                    "mamba_size (%d) exceeds size + pre_alloc_size (%d), "
+                    "capping effective_mamba_size to %d",
+                    mamba_size,
+                    size + pre_alloc_size,
+                    effective_mamba_size,
+                )
+        else:
+            effective_mamba_size = size + pre_alloc_size
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
@@ -276,12 +287,20 @@ class DecodePreallocQueue:
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
-        self.pending_reqs: List[Req] = []
+        self.pending_reqs: List[DecodeRequest] = []
         self._ensure_retry_count: Dict[str, int] = {}
-        self._max_ensure_retries: int = 20  # scheduling cycles
+        self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        if self.enable_staging and self.is_mla_backend:
+            raise RuntimeError(
+                "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
+                "(e.g. GQA, MHA). MLA models should not set this flag."
+            )
         self.kv_manager = self._init_kv_manager()
+        if self.enable_staging:
+            self.transfer_queue._init_staging_handler(self.kv_manager)
 
         if self.scheduler.tp_worker.is_hybrid_swa:
             # FIXME: current SWA allocation allocate full kv cache size in prefill
@@ -299,9 +318,16 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
-        )
+        if self.scheduler.enable_hisparse:
+            # Direct-to-host: register host pool pointers so P writes to D's host memory
+            host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                host_pool.get_contiguous_buf_infos()
+            )
+        else:
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -315,7 +341,10 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.page_size = self.token_to_kv_pool.page_size
+        # HiSparse Host pool has page_size=1; use it when hisparse is enabled
+        kv_args.page_size = (
+            1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
+        )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -357,6 +386,21 @@ class DecodePreallocQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # Staging buffer setup (only when heterogeneous TP staging is enabled)
+        if self.enable_staging and not self.is_mla_backend:
+            kv_pool_for_heads = self.token_to_kv_pool
+            if hasattr(kv_pool_for_heads, "full_kv_pool"):
+                kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
+            per_rank_kv_heads = getattr(kv_pool_for_heads, "head_num", 0)
+            if per_rank_kv_heads > 0:
+                kv_args.kv_head_num = per_rank_kv_heads
+                kv_args.total_kv_head_num = per_rank_kv_heads * attn_tp_size
+            if hasattr(kv_manager, "set_kv_buffer_tensors"):
+                kv_pool = kv_pool_for_heads
+                if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+                    kv_manager.set_kv_buffer_tensors(
+                        kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size
+                    )
         return kv_manager
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
@@ -368,17 +412,20 @@ class DecodePreallocQueue:
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
+            decode_req = self._create_receiver_and_enqueue(req)
+
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
             if _is_fake_transfer(req, self.scheduler.server_args):
-                self._create_receiver_and_enqueue(req, 0)
+                decode_req.kv_receiver.init(0)
                 return
 
             # Fast path: cache-only lookup, no network calls
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             if prefill_dp_rank is not None:
-                self._create_receiver_and_enqueue(req, prefill_dp_rank)
-            else:
-                self.pending_reqs.append(req)
+                decode_req.kv_receiver.init(prefill_dp_rank)
+                return
+
+            self.pending_reqs.append(decode_req)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         if req.disagg_prefill_dp_rank is not None:
@@ -396,7 +443,7 @@ class DecodePreallocQueue:
 
         return None
 
-    def _create_receiver_and_enqueue(self, req: Req, prefill_dp_rank: int) -> None:
+    def _create_receiver_and_enqueue(self, req: Req) -> DecodeRequest:
         backend = (
             TransferBackend.FAKE
             if _is_fake_transfer(req, self.scheduler.server_args)
@@ -408,12 +455,11 @@ class DecodePreallocQueue:
             mgr=self.kv_manager,
             bootstrap_addr=_bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
-            prefill_dp_rank=prefill_dp_rank,
         )
 
-        self.queue.append(
-            DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
-        )
+        decode_req = DecodeRequest(req=req, kv_receiver=kv_receiver)
+        self.queue.append(decode_req)
+        return decode_req
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
@@ -511,12 +557,12 @@ class DecodePreallocQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
     def _ensure_prefill_info(
-        self, addr_to_reqs: Dict[str, List[Req]]
-    ) -> Tuple[Dict[str, List[Req]], List[Req]]:
+        self, addr_to_reqs: Dict[str, List[DecodeRequest]]
+    ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
         """Non-blocking ensure parallel info for each addr.
         Returns (ready_addrs, remaining_reqs)."""
-        ready: Dict[str, List[Req]] = {}
-        remaining: List[Req] = []
+        ready: Dict[str, List[DecodeRequest]] = {}
+        remaining: List[DecodeRequest] = []
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
@@ -543,13 +589,8 @@ class DecodePreallocQueue:
             if count >= self._max_ensure_retries:
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
-                for req in reqs:
-                    prepare_abort(
-                        req, error_msg, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                    )
-                    if self.scheduler.enable_metrics:
-                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
-                    self.scheduler.stream_output([req], req.return_logprob)
+                for decode_req in reqs:
+                    decode_req.kv_receiver.abort()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -558,46 +599,48 @@ class DecodePreallocQueue:
         return ready, remaining
 
     def _resolve_pending_reqs(self) -> None:
-        """Batch-resolve prefill_dp_ranks for pending requests and create receivers."""
+        """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
         if not self.pending_reqs:
             return
 
         # Group pending requests by bootstrap_addr
-        addr_to_reqs: Dict[str, List[Req]] = {}
-        for req in self.pending_reqs:
-            addr = _bootstrap_addr(req)
-            addr_to_reqs.setdefault(addr, []).append(req)
+        addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
+        for decode_req in self.pending_reqs:
+            addr = _bootstrap_addr(decode_req.req)
+            addr_to_reqs.setdefault(addr, []).append(decode_req)
 
         # Pass 1: ensure parallel info for each addr
         ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
 
-        # Pass 2: resolve dp rank for addrs whose info is available
-        resolved = []
-        for bootstrap_addr, reqs in ready_addrs.items():
-            need_query: List[Req] = []
-            for req in reqs:
-                prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+        resolved: List[Tuple[DecodeRequest, int]] = []
+        for bootstrap_addr, decode_reqs in ready_addrs.items():
+            need_query: List[DecodeRequest] = []
+            for decode_req in decode_reqs:
+                prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
                 if prefill_dp_rank is not None:
-                    resolved.append((req, prefill_dp_rank))
+                    resolved.append((decode_req, prefill_dp_rank))
                 else:
-                    need_query.append(req)
+                    need_query.append(decode_req)
 
+            # Pass 2: resolve dp rank for addrs whose info is available
             if need_query:
-                rooms = [req.bootstrap_room for req in need_query]
+                rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
                 room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
                     bootstrap_addr, rooms
                 )
-                for req in need_query:
-                    prefill_dp_rank = room_to_rank.get(str(req.bootstrap_room))
+                for decode_req in need_query:
+                    prefill_dp_rank = room_to_rank.get(
+                        str(decode_req.req.bootstrap_room)
+                    )
                     if prefill_dp_rank is not None:
-                        resolved.append((req, int(prefill_dp_rank)))
+                        resolved.append((decode_req, int(prefill_dp_rank)))
                     else:
-                        remaining.append(req)
+                        remaining.append(decode_req)
 
         self.pending_reqs = remaining
 
-        for req, prefill_dp_rank in resolved:
-            self._create_receiver_and_enqueue(req, prefill_dp_rank)
+        for decode_req, prefill_dp_rank in resolved:
+            decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
@@ -671,16 +714,21 @@ class DecodePreallocQueue:
                 break
 
             allocatable_tokens -= required_tokens_for_request
-            self._pre_alloc(decode_req.req)
+            dst_kv_indices = self._pre_alloc(decode_req.req)
 
-            kv_indices = (
-                self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                    : len(decode_req.req.origin_input_ids)
-                ]
-                .cpu()
-                .numpy()
-            )
-            page_size = self.token_to_kv_pool_allocator.page_size
+            origin_input_len = len(decode_req.req.origin_input_ids)
+            if self.scheduler.enable_hisparse:
+                # Must cast to int32 for ZMQ serialization — from_zmq reads np.int32.
+                kv_indices = (
+                    dst_kv_indices[:origin_input_len].cpu().numpy().astype(np.int32)
+                )
+                page_size = 1  # host pool page_size
+            else:
+                kv_indices_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx
+                ][:origin_input_len]
+                kv_indices = kv_indices_full.cpu().numpy()
+                page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
@@ -717,7 +765,9 @@ class DecodePreallocQueue:
                     decode_req.req.req_pool_idx, :seq_len
                 ]
                 state_indices = kv_indices_full.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
+                # Indexer lives on device pool; always use device page_size
+                device_page_size = self.token_to_kv_pool.page_size
+                state_indices = kv_to_page_indices(state_indices, device_page_size)
             else:
                 state_indices = None
 
@@ -726,9 +776,17 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
-            decode_req.kv_receiver.init(
+            decode_req.kv_receiver.send_metadata(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
+            if (
+                self.transfer_queue.enable_staging
+                and hasattr(decode_req.kv_receiver, "require_staging")
+                and decode_req.kv_receiver.require_staging
+            ):
+                self.transfer_queue.staging_handler.register_decode_req(
+                    decode_req.req.bootstrap_room, decode_req
+                )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
@@ -807,7 +865,30 @@ class DecodePreallocQueue:
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
-        if self.token_to_kv_pool_allocator.page_size == 1:
+
+        if self.scheduler.enable_hisparse:
+            # Direct-to-host path: only allocate logical indices (no hisparse
+            # device indices) and allocate host indices for RDMA destination.
+            coordinator = self.scheduler.hisparse_coordinator
+            device = self.token_to_kv_pool_allocator.device
+            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=fill_len,
+            )
+            # Allocate host indices for the RDMA transfer target
+            host_indices = coordinator.mem_pool_host.alloc(fill_len)
+            if host_indices is None:
+                raise RuntimeError(
+                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
+                    f"in _pre_alloc (req {req.rid})"
+                )
+            host_indices = host_indices.to(device=coordinator.device)
+            coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+        elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
             device = self.token_to_kv_pool_allocator.device
@@ -830,6 +911,9 @@ class DecodePreallocQueue:
         req.fill_ids = req.origin_input_ids + req.output_ids
         req.set_extend_input_len(len(req.fill_ids))
 
+        # Return the transfer destination indices:
+        if self.scheduler.enable_hisparse:
+            return host_indices
         return kv_loc
 
 
@@ -855,12 +939,21 @@ class DecodeTransferQueue:
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
+        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.staging_handler = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
+        if self.enable_staging:
+            for dr in decode_reqs:
+                if (
+                    hasattr(dr.kv_receiver, "require_staging")
+                    and dr.kv_receiver.require_staging
+                ):
+                    self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """
@@ -919,6 +1012,9 @@ class DecodeTransferQueue:
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
+        decode_req.req.cached_tokens_device = cached_tokens[1].item()
+        decode_req.req.cached_tokens_host = cached_tokens[2].item()
+        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -943,18 +1039,39 @@ class DecodeTransferQueue:
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return True
 
+    def _poll_with_staging(self) -> list:
+        return poll_and_all_reduce_with_staging(
+            self.queue, self.staging_handler, self.gloo_group
+        )
+
+    def _init_staging_handler(self, kv_manager):
+        """Create staging handler from kv_manager. Must be called exactly once."""
+        from sglang.srt.disaggregation.common.staging_handler import (
+            DecodeStagingHandler,
+        )
+
+        self.staging_handler = DecodeStagingHandler.create(
+            kv_manager, self.scheduler, self.tp_rank
+        )
+        kv_manager._staging_handler = self.staging_handler
+
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
+
+        if self.enable_staging:
+            polls = self._poll_with_staging()
+        else:
+            polls = poll_and_all_reduce(
+                [dr.kv_receiver for dr in self.queue], self.gloo_group
+            )
 
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -970,6 +1087,8 @@ class DecodeTransferQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
@@ -985,6 +1104,10 @@ class DecodeTransferQueue:
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
+                        if self.scheduler.enable_hisparse:
+                            self.scheduler.hisparse_coordinator.request_finished(
+                                decode_req.req
+                            )
                         release_kv_cache(
                             decode_req.req, self.tree_cache, is_insert=False
                         )
@@ -1002,6 +1125,12 @@ class DecodeTransferQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
+            if self.enable_staging and self.staging_handler.is_staging_room(
+                self.queue[i].req.bootstrap_room
+            ):
+                self.staging_handler.unregister_decode_req(
+                    self.queue[i].req.bootstrap_room
+                )
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
             self.req_to_metadata_buffer_idx_allocator.free(idx)
@@ -1102,6 +1231,10 @@ class SchedulerDisaggregationDecodeMixin:
             if not new_prebuilt_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = new_prebuilt_batch
+                    if self.enable_hisparse:
+                        self.running_batch.hisparse_coordinator = (
+                            self.hisparse_coordinator
+                        )
                 else:
                     self.running_batch.merge_batch(new_prebuilt_batch)
 
@@ -1194,4 +1327,10 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            self.waiting_queue.extend(transferred_reqs)
+            if self.enable_hisparse:
+                for req in transferred_reqs:
+                    # Direct-to-host: KV data already in host pool, skip staging
+                    self.hisparse_coordinator.admit_request_direct(req)
+                self.waiting_queue.extend(transferred_reqs)
+            else:
+                self.waiting_queue.extend(transferred_reqs)

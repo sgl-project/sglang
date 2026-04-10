@@ -49,6 +49,10 @@ import uvloop
 import zmq
 
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
+from sglang.srt.entrypoints.engine_info_bootstrap_server import (
+    EngineInfoBootstrapServer,
+)
+from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -79,10 +83,6 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.managers.tokenizer_manager_multiitem_mixin import ScoreResult
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    parse_remote_instance_transfer_engine_info_from_scheduler_infos,
-)
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
@@ -98,7 +98,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.network import get_zmq_socket, is_port_available
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
@@ -116,6 +116,7 @@ class SchedulerInitResult:
     scheduler_infos: List[Dict[str, Any]]
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
+    engine_info_bootstrap_server: Optional[Any] = None
 
 
 def init_tokenizer_manager(
@@ -139,7 +140,7 @@ def init_tokenizer_manager(
     return tokenizer_manager, template_manager
 
 
-class Engine(EngineBase):
+class Engine(EngineScoreMixin, EngineBase):
     """
     The entry point to the inference engine.
 
@@ -179,6 +180,10 @@ class Engine(EngineBase):
         self.server_args = server_args
         logger.info(f"{server_args=}")
 
+        # Pre-initialize tokenizer_manager so the atexit handler in
+        # shutdown() won't hit AttributeError.
+        self.tokenizer_manager = None
+
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -201,11 +206,11 @@ class Engine(EngineBase):
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
-        self.remote_instance_transfer_engine_info = (
-            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
-                scheduler_init_result.scheduler_infos
+        # Access transfer engine info if bootstrap server is started.
+        if scheduler_init_result.engine_info_bootstrap_server is not None:
+            self.remote_instance_transfer_engine_info = (
+                scheduler_init_result.engine_info_bootstrap_server.transfer_engine_info
             )
-        )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -441,6 +446,8 @@ class Engine(EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        embed_override_token_id: Optional[int] = None,
+        embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -455,6 +462,8 @@ class Engine(EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            embed_override_token_id=embed_override_token_id,
+            embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -470,6 +479,8 @@ class Engine(EngineBase):
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
         lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None,
+        embed_override_token_id: Optional[int] = None,
+        embed_overrides: Optional[List[List[torch.Tensor]]] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
@@ -486,6 +497,8 @@ class Engine(EngineBase):
             video_data=video_data,
             dimensions=dimensions,
             lora_path=lora_path,
+            embed_override_token_id=embed_override_token_id,
+            embed_overrides=embed_overrides,
             external_trace_header=external_trace_header,
             rid=rid,
         )
@@ -642,9 +655,29 @@ class Engine(EngineBase):
             port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
+        # Start the engine info bootstrap server if per-rank info is needed.
+        engine_info_bootstrap_server = None
+        if (
+            server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
+            and server_args.node_rank == 0
+        ):
+            bootstrap_port = server_args.engine_info_bootstrap_port
+            if not is_port_available(bootstrap_port):
+                raise RuntimeError(
+                    f"engine_info_bootstrap_port {bootstrap_port} is already in use. "
+                    f"When running multiple instances on the same node, each instance must use a "
+                    f"different --engine-info-bootstrap-port."
+                )
+            engine_info_bootstrap_server = EngineInfoBootstrapServer(
+                host=server_args.host, port=bootstrap_port
+            )
+
         # Launch scheduler processes
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
+        )
+        scheduler_init_result.engine_info_bootstrap_server = (
+            engine_info_bootstrap_server
         )
 
         if (
@@ -1056,78 +1089,7 @@ class Engine(EngineBase):
     def save_sharded_model(self, **kwargs):
         self.collective_rpc("save_sharded_model", **kwargs)
 
-    def score(
-        self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
-        apply_softmax: bool = False,
-        item_first: bool = False,
-    ) -> ScoreResult:
-        """
-        Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
-        query = "<|user|>Is the following city the capital of France? "
-        items = ["Paris <|assistant|>", "London <|assistant|>", "Berlin <|assistant|>"]
-        label_token_ids = [2332, 1223] # Token IDs for "Yes" and "No"
-        item_first = False
-
-        This would pass the following prompts to the model:
-        "<|user|>Is the following city the capital of France? Paris <|assistant|>"
-        "<|user|>Is the following city the capital of France? London <|assistant|>"
-        "<|user|>Is the following city the capital of France? Berlin <|assistant|>"
-        The api would then return the probabilities of the model producing "Yes" and "No" as the next token.
-        The output would look like:
-        [[0.9, 0.1], [0.2, 0.8], [0.1, 0.9]]
-
-
-        Args:
-            query: The query text or pre-tokenized query token IDs. Must be provided.
-            items: The item text(s) or pre-tokenized item token IDs. Must be provided.
-            label_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
-            apply_softmax: Whether to normalize probabilities using softmax.
-            item_first: If True, prepend items to query. Otherwise append items to query.
-
-        Returns:
-            ScoreResult with:
-                scores: List of lists containing probabilities for each item and each label token
-                prompt_tokens: The number of prompt tokens processed.
-
-        Raises:
-            ValueError: If query is not provided, or if items is not provided,
-                      or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
-        """
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.score_request(
-                query=query,
-                items=items,
-                label_token_ids=label_token_ids,
-                apply_softmax=apply_softmax,
-                item_first=item_first,
-                request=None,
-            )
-        )
-
-    async def async_score(
-        self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
-        apply_softmax: bool = False,
-        item_first: bool = False,
-    ) -> ScoreResult:
-        """
-        Asynchronous version of score method.
-
-        See score() for detailed documentation.
-        """
-        return await self.tokenizer_manager.score_request(
-            query=query,
-            items=items,
-            label_token_ids=label_token_ids,
-            apply_softmax=apply_softmax,
-            item_first=item_first,
-            request=None,
-        )
+    # score() and async_score() are provided by EngineScoreMixin
 
 
 def _set_envs_and_config(server_args: ServerArgs):
@@ -1174,7 +1136,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.6",
+                "0.6.7.post3",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1182,7 +1144,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.0",
+                "0.4.1",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
