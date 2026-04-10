@@ -1861,19 +1861,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if mask:
             if req.pending_radix_mamba_slot is not None:
-                self.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
-                req.pending_radix_mamba_slot = None
-            radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
-            if radix_slot is None:
-                self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
-            if radix_slot is None:
-                mask = False
+                track_index = req.pending_radix_mamba_slot[0].item()
             else:
-                req.pending_radix_mamba_slot = radix_slot
-                track_index = radix_slot[0].item()
+                mask = False
         if not mask:
-            track_index = 0  # placeholder, won't be used when mask=False
+            track_index = 0
 
         mamba_track_mask_cpu.append(mask)
         mamba_track_indices_cpu.append(track_index)
@@ -2221,15 +2213,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         if req.pending_radix_mamba_slot is not None:
                             track_indices_cpu.append(req.pending_radix_mamba_slot[0].item())
                         else:
-                            radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
-                            if radix_slot is None:
-                                self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                                radix_slot = self.req_to_token_pool.mamba_pool.alloc(1)
-                            if radix_slot is None:
-                                need_track = False
-                            else:
-                                req.pending_radix_mamba_slot = radix_slot
-                                track_indices_cpu.append(radix_slot[0].item())
+                            need_track = False
                     if not need_track:
                         track_indices_cpu.append(0)
                     track_mask_cpu.append(need_track)

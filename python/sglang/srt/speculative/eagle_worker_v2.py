@@ -970,6 +970,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     seq_lens_pre_verify // mamba_track_interval
                     != seq_lens_post_verify // mamba_track_interval
                 )
+                if batch.mamba_track_mask is not None:
+                    to_track_mask = to_track_mask & batch.mamba_track_mask
                 tracking_point = (
                     seq_lens_post_verify // mamba_track_interval * mamba_track_interval
                 )

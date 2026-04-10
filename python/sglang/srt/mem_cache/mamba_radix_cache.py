@@ -722,6 +722,16 @@ class MambaRadixCache(BasePrefixCache):
         req.mamba_last_track_seqlen = None
         req.last_node = new_last_node
 
+        # Pre-allocate the next pending_radix_mamba_slot so that the next
+        # extend/decode prepare doesn't need to alloc on the hot path.
+        if self.enable_mamba_extra_buffer and req.pending_radix_mamba_slot is None:
+            pending = self.req_to_token_pool.mamba_pool.alloc(1)
+            if pending is None:
+                self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                pending = self.req_to_token_pool.mamba_pool.alloc(1)
+            if pending is not None:
+                req.pending_radix_mamba_slot = pending
+
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
         total_size, total_mamba_size = self._total_size_helper()

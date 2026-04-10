@@ -536,6 +536,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mid = mid[0]
                 req.mamba_pool_idx = mid
             mamba_indices.append(mid)
+            if self.enable_mamba_extra_buffer and req.pending_radix_mamba_slot is None:
+                pending = self.mamba_pool.alloc(1)
+                if pending is not None:
+                    req.pending_radix_mamba_slot = pending
         assert len(select_index) == len(
             mamba_indices
         ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."

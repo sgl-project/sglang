@@ -851,13 +851,13 @@ class EAGLEWorker(TpModelWorker):
             accepted_steps = accepted_length - 1
 
         if batch.mamba_track_indices is not None:
-            # If after verify, the request's seq_lens has crossed a mamba track interval,
-            # we need to update the mamba state for the request at the crossing point.
             mamba_track_interval = self.server_args.mamba_track_interval
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != batch.seq_lens // mamba_track_interval
             )
+            if batch.mamba_track_mask is not None:
+                to_track_mask = to_track_mask & batch.mamba_track_mask
             tracking_point = (
                 batch.seq_lens // mamba_track_interval * mamba_track_interval
             )

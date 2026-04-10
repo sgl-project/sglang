@@ -147,8 +147,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
 
         if get_global_server_args().enable_mamba_extra_buffer():
-            # Pre-allocate radix slots for eagle verify (all reqs are tracked)
             track_indices = []
+            track_mask = []
             for req in batch.reqs:
                 if req.pending_radix_mamba_slot is not None:
                     batch.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
@@ -159,17 +159,23 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         EvictParams(num_tokens=0, mamba_num=1)
                     )
                     radix_slot = batch.req_to_token_pool.mamba_pool.alloc(1)
-                assert radix_slot is not None, (
-                    "Not enough space for mamba radix slot in eagle verify"
-                )
+                if radix_slot is None:
+                    track_indices.append(0)
+                    track_mask.append(False)
+                    continue
                 req.pending_radix_mamba_slot = radix_slot
                 track_indices.append(radix_slot[0].item())
+                track_mask.append(True)
             batch.mamba_track_indices = torch.tensor(
                 track_indices,
                 dtype=torch.int64,
                 device=batch.device,
             )
-            batch.mamba_track_mask = None
+            batch.mamba_track_mask = torch.tensor(
+                track_mask,
+                dtype=torch.bool,
+                device=batch.device,
+            )
             batch.mamba_track_seqlens = None
 
     def generate_attn_arg_prefill(
