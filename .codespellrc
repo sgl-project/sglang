@@ -1,3 +1,3 @@
 [codespell]
-ignore-words-list = ans, als, hel, boostrap, childs, te, vas, hsa, ment, cann, thi, makro, wil, rouge, PRIS, ather
+ignore-words-list = ans, als, hel, boostrap, childs, te, vas, hsa, ment, cann, thi, makro, wil, rouge, PRIS, ather, MIS
 skip = *.json,*.jsonl,*.patch,*.txt

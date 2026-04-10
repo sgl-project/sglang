@@ -136,12 +136,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    MemoryPoolConfig,
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -1803,7 +1803,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _init_lora_cuda_graph_moe_buffers(self):
         """Phase 1 of LoRA CUDA graph init: pre-allocate MoE intermediate buffers.
 
-        Must be called before init_memory_pool() so that profile_max_num_token()
+        Must be called before init_memory_pool() so that memory profiling
         sees the reduced available memory and sizes KV cache correctly.
         All MoE LoRA layers share one set of buffers (managed by the
         lora_backend) since they execute sequentially during forward.
@@ -2148,6 +2148,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
             # "flashinfer_trtllm_routed",
             "flashinfer_mxfp4",
+            "flashinfer_cutedsl",
             # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
             # "flashinfer_cutlass",
         ]:
@@ -2738,6 +2739,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
+        if (
+            forward_batch.replace_embeds is not None
+            and forward_batch.replace_positions is not None
+        ):
+            # Token embedding overrides: get base embeddings, scatter replacements
+            if "input_embeds" not in kwargs:
+                embed_layer = self.model.get_input_embeddings()
+                kwargs["input_embeds"] = embed_layer(forward_batch.input_ids)
+            kwargs["input_embeds"][forward_batch.replace_positions] = (
+                forward_batch.replace_embeds.to(kwargs["input_embeds"].dtype)
+            )
         if not self.is_generation:
             kwargs["get_embedding"] = True
 

@@ -794,6 +794,8 @@ class Scheduler(
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
         )
@@ -1803,6 +1805,7 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
+                positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
                 custom_logit_processor=recv_req.custom_logit_processor,
                 require_reasoning=recv_req.require_reasoning,
@@ -2128,6 +2131,7 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            positional_embed_overrides=recv_req.positional_embed_overrides,
             token_type_ids=recv_req.token_type_ids,
             routed_dp_rank=recv_req.routed_dp_rank,
             priority=recv_req.priority,
@@ -2577,9 +2581,18 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        # Record prefill stats for logging after forward
+        # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
-            adder, self.running_batch.reqs, self.enable_priority_scheduling
+            adder,
+            self.running_batch.reqs,
+            self.enable_priority_scheduling,
+            num_pending_tokens=self._get_num_pending_tokens(
+                chunk_deduct=(
+                    self.chunked_req.extend_input_len
+                    if self.chunked_req is not None
+                    else 0
+                )
+            ),
         )
 
         # Mixed-style chunked prefill
