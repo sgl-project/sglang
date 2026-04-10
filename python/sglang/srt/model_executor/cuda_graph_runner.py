@@ -92,8 +92,8 @@ _is_hip = is_hip()
 if not _is_hip:
     from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
         BreakableCUDAGraph,
-        BreakableCUDAGraphContext,
-        non_graph,
+        BreakableCUDAGraphCapture,
+        eager_on_graph,
     )
 
 logger = logging.getLogger(__name__)
@@ -853,8 +853,10 @@ class CudaGraphRunner:
 
         if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
             if memory_saver_adapter.enabled:
-                raise NotImplementedError()
-            graph_ctx = BreakableCUDAGraphContext
+                raise NotImplementedError(
+                    "Breakable CUDA graph is not compatible with memory saver mode"
+                )
+            graph_ctx = BreakableCUDAGraphCapture
         else:
             graph_ctx = (
                 partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
@@ -863,7 +865,7 @@ class CudaGraphRunner:
             )
 
         if self.model_runner.server_args.debug_cuda_graph:
-            captured_fn = non_graph(True)(run_once_fn)
+            captured_fn = eager_on_graph(True)(run_once_fn)
         else:
             captured_fn = run_once_fn
 
@@ -873,6 +875,8 @@ class CudaGraphRunner:
 
     def _create_device_graph(self):
         if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+            if _is_hip:
+                raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
             return BreakableCUDAGraph()
         return torch.cuda.CUDAGraph()
 

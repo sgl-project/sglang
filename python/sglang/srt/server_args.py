@@ -1166,6 +1166,9 @@ class ServerArgs:
         # 17. Context parallel
         if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
+        # 18. CUDA Graph debug mode
+        if self.debug_cuda_graph:
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -3604,11 +3607,18 @@ class ServerArgs:
             "1" if self.enable_deterministic_inference else "0"
         )
         if self.debug_cuda_graph:
-            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
-            logger.warning(
-                "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
-                "All operations will run eagerly through the graph capture/replay path."
-            )
+            if not is_cuda():
+                logger.warning(
+                    "--debug-cuda-graph is not supported on non CUDA devices. "
+                    "Disabling breakable CUDA graph."
+                )
+                self.debug_cuda_graph = False
+            else:
+                envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
+                logger.warning(
+                    "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
+                    "All operations will run eagerly through the graph capture/replay path."
+                )
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
