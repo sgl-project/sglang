@@ -299,16 +299,24 @@ class SchedulerRuntimeCheckerMixin:
             )
         return memory_leak, token_msg
 
-    def _check_radix_cache_memory(self: Scheduler):
-        pool_stats = self._get_token_info()
-        available_size = pool_stats.full_available_size
-        evictable_size = pool_stats.full_evictable_size
+    def _check_radix_cache_memory(
+        self: Scheduler, ps: PoolStats, uncached_size: int = 0
+    ):
         protected_size = self.tree_cache.protected_size()
         session_held = self._session_held_tokens()
-        memory_leak = (available_size + evictable_size) != (
-            self.max_total_num_tokens - protected_size - session_held
+        total_accounted = (
+            ps.full_available_size
+            + ps.full_evictable_size
+            + protected_size
+            + session_held
+            + uncached_size
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {session_held=}\n"
+        memory_leak = total_accounted != self.max_total_num_tokens
+        token_msg = (
+            f"{self.max_total_num_tokens=}, available_size={ps.full_available_size}, "
+            f"evictable_size={ps.full_evictable_size}, {protected_size=}, "
+            f"{session_held=}, {uncached_size=}\n"
+        )
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:
@@ -341,10 +349,6 @@ class SchedulerRuntimeCheckerMixin:
             return
 
         pool_stats = self._get_token_info()
-        available_size = pool_stats.full_available_size
-        evictable_size = pool_stats.full_evictable_size
-        protected_size = self.tree_cache.protected_size()
-
         uncached_size = self._get_batch_uncached_size(current_batch)
 
         if (
@@ -355,20 +359,17 @@ class SchedulerRuntimeCheckerMixin:
             uncached_size += self._get_batch_uncached_size(self.running_batch)
 
         if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
-            log_msg = f"[Mem Check (BUSY)] {available_size=}, {evictable_size=}, {protected_size=}, {uncached_size=}"
+            log_msg = (
+                f"[Mem Check (BUSY)] available_size={pool_stats.full_available_size}, "
+                f"evictable_size={pool_stats.full_evictable_size}, "
+                f"protected_size={self.tree_cache.protected_size()}, {uncached_size=}"
+            )
             logger.info(log_msg)
 
-        session_held = self._session_held_tokens()
-        total_tokens = (
-            available_size
-            + evictable_size
-            + protected_size
-            + uncached_size
-            + session_held
+        memory_leak, token_msg = self._check_radix_cache_memory(
+            pool_stats, uncached_size=uncached_size
         )
-        assert (
-            total_tokens == self.max_total_num_tokens
-        ), f"Mem Leak Detected! {total_tokens=} vs {self.max_total_num_tokens=}"
+        assert not memory_leak, f"Mem Leak Detected! {token_msg}"
 
     def _check_req_pool(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -399,7 +400,9 @@ class SchedulerRuntimeCheckerMixin:
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             memory_leak, token_msg = self._check_mamba_memory()
         else:
-            memory_leak, token_msg = self._check_radix_cache_memory()
+            memory_leak, token_msg = self._check_radix_cache_memory(
+                self._get_token_info()
+            )
 
         if memory_leak:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
@@ -487,7 +490,9 @@ def create_scheduler_watchdog(
         elif scheduler.is_hybrid_ssm and scheduler.tree_cache.supports_mamba():
             _, info_msg = scheduler._check_mamba_memory()
         else:
-            _, info_msg = scheduler._check_radix_cache_memory()
+            _, info_msg = scheduler._check_radix_cache_memory(
+                scheduler._get_token_info()
+            )
         return (
             f"{scheduler.cur_batch.batch_size()=}\n"
             f"{scheduler.cur_batch.reqs=}\n"
